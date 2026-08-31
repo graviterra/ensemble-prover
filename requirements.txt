@@ -1,0 +1,16 @@
+# Mini Prover core runtime dependencies and their pinned transitive closure.
+anyio==4.14.2
+certifi==2026.7.22
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+networkx==3.6.1
+python-dotenv==1.2.1
+PyYAML==6.0.3
+typing_extensions==4.16.0
+
+# Optional integrations are intentionally excluded from the public runtime lock:
+# - sentence-transformers / FlagEmbedding: learned retrieval and reranking
+# - tiktoken: provider-specific token estimates
+# - z3-solver / cvc5: native SMT falsification backends

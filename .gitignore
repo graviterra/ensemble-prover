@@ -1,0 +1,13 @@
+# Local Python environment and secrets
+.venv/
+.env
+
+# User-supplied theorem projects
+external/
+
+# Generated prover state
+runs/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
