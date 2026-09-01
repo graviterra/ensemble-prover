@@ -30,6 +30,24 @@ search evidence rather than proofs until they pass the relevant verification
 gates. Each run records a structured, replayable dossier containing the proof
 search and verification history.
 
+## Putnam problems submitted for independent verification
+
+The following **65 problem identifiers** make up the cumulative result reported
+above. Their Lean proof files were submitted privately to the PutnamBench
+verification team for independent review on August 31, 2026. Submission does
+not imply review, acceptance, or endorsement by PutnamBench. Only the problem
+identifiers are published here; the proof files and answers are not.
+
+| Period | Problems |
+| --- | --- |
+| 1960s | `1962 A6`, `1963 B1`, `1964 B1`, `1964 B2`, `1965 A4`, `1965 A6`, `1966 A1`, `1968 A1`, `1968 B2`, `1969 A1` |
+| 1970s | `1970 B3`, `1971 A1`, `1971 B1`, `1972 A1`, `1972 A2`, `1973 B2`, `1975 B1`, `1977 A2`, `1977 A3`, `1977 A5`, `1978 A1`, `1978 A4`, `1979 B6` |
+| 1980s | `1986 A1`, `1986 B1`, `1986 B6`, `1987 A1`, `1987 A2`, `1988 B1`, `1988 B2` |
+| 1990s | `1990 A1`, `1990 A5`, `1990 A6`, `1991 A2`, `1992 A1`, `1992 A2`, `1993 A2`, `1995 A1`, `1996 A3`, `1997 A4`, `1998 B1`, `1998 B2`, `1999 A1` |
+| 2000s | `2000 A1`, `2000 B2`, `2001 A1`, `2003 B1`, `2004 A1`, `2004 B2`, `2005 A1`, `2005 B1`, `2006 A1`, `2007 B1`, `2008 A1`, `2009 A1` |
+| 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
+| 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
+
 > **Release status:** research preview. This release contains only the Mini
 > Prover runtime.
 
