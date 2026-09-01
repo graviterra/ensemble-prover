@@ -488,9 +488,8 @@ def build_structured_feedback(
         details.append(f"Unknown identifier: {parsed.unknown_identifier_name}")
         # Fix 2 (2026-05-22): when the LLM cites a hallucinated mini_*
         # helper, append the actual verified-helper inventory so the next
-        # turn can self-correct. Drives the recovery from the 6× hallucinated
-        # `outer_tsum_eval_p3_c1_v1` cascade in putnam_1978_b2_20260522_082821
-        # (run.log lines 1601, 1607, 1638, 1644, 1784, 1825).
+        # turn can self-correct. This prevents repeated hallucinated-helper
+        # cascades observed in long repair sessions.
         _inject_helper_inventory_for_unknown_identifier(
             details, parsed.unknown_identifier_name, dossier
         )

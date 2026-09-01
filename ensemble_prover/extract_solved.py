@@ -80,6 +80,9 @@ from ensemble_prover.solved_export_policy import (  # noqa: E402
     export_status_values as policy_export_status_values,
     solved_export_verified_payload as policy_solved_export_verified_payload,
 )
+from ensemble_prover.subprocess_environment import (  # noqa: E402
+    sanitized_subprocess_environment,
+)
 
 RUNS_DIR = PROJECT_ROOT / "runs" / "mini_prover"
 SOLVED_DIR = RUNS_DIR / "solved"
@@ -1462,7 +1465,9 @@ def _audit_exported_axioms(
             stderr=subprocess.STDOUT,
             timeout=max(1.0, float(timeout_s or 180.0)),
             check=False,
-            env=_export_lean_env(extra_lean_paths),
+            env=sanitized_subprocess_environment(
+                _export_lean_env(extra_lean_paths)
+            ),
         )
         output = str(proc.stdout or "")
         returncode = int(proc.returncode)
@@ -1504,7 +1509,9 @@ def _verify_exported_lean(
             stderr=subprocess.STDOUT,
             timeout=max(1.0, float(timeout_s or 180.0)),
             check=False,
-            env=_export_lean_env(extra_lean_paths),
+            env=sanitized_subprocess_environment(
+                _export_lean_env(extra_lean_paths)
+            ),
         )
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
@@ -1534,6 +1541,7 @@ def _build_export_project_imports(
         build = subprocess.run(
             ["lake", "build", *build_targets],
             cwd=str(Path(lean_project_dir)),
+            env=sanitized_subprocess_environment(),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1567,6 +1575,7 @@ def _build_export_support_projects(
             build = subprocess.run(
                 ["lake", "build", *targets],
                 cwd=str(project),
+                env=sanitized_subprocess_environment(),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

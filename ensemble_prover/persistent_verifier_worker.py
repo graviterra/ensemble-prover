@@ -23,6 +23,7 @@ from .persistent_verifier import (
     _protocol_major,
 )
 from .subprocess_cleanup import terminate_and_reap_process
+from .subprocess_environment import sanitized_subprocess_environment
 from .utils import has_sorry_or_admit
 
 logger = logging.getLogger(__name__)
@@ -215,6 +216,7 @@ class LeanLspSession:
             "lean",
             "--server",
             cwd=str(self.project_dir),
+            env=sanitized_subprocess_environment(),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

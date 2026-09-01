@@ -1229,8 +1229,8 @@ class Conversation:
         """Summarize bulky prover tool exploration before refiner takeover.
 
         Ordinary history compaction is attempt-oriented: it keeps the latest
-        assistant proof text and its local feedback. The failure mode behind
-        putnam_2003_a3_20260622_104935 was different: the prover spent many
+        assistant proof text and its local feedback. A distinct observed
+        failure mode spent many
         tool rounds and then emitted no proof text, so the refiner inherited a
         large tool-only tail. This handoff compactor removes complete
         assistant-tool/tool-result rounds and replaces them with a small,
@@ -7302,9 +7302,8 @@ async def run_conversation(
             # proof authority. The independent final Lean check still decides
             # the candidate. Zero or malformed calls remain policy failures —
             # unless the unchanged submission matches a durably accepted
-            # try_lean stub for this exact goal/preamble/context (RCA
-            # putnam_1985_b1_20260729_192312: re-verifying an identical
-            # accepted body is a wasted Lean call, and rejecting it burned
+            # try_lean stub for this exact goal/preamble/context. Re-verifying
+            # an identical accepted body is a wasted Lean call, and rejecting it burned
             # the repair continuation on rational behavior).
             durable_submission_evidence = False
             if (
@@ -12741,8 +12740,10 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help=(
-            "Supporting Lean source root. Project-declared roots are indexed; "
-            "external roots must also expose compiled .olean modules. Repeatable."
+            "Supporting Lean source root. Project-declared roots are indexed. "
+            "An external root must belong to an identifiable Lake project; its "
+            "owning Lake project may be built during preflight, and verification "
+            "requires current .olean modules after a successful build. Repeatable."
         ),
     )
     description_group = p.add_mutually_exclusive_group()
@@ -12761,10 +12762,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--lean-timeout-s",
         type=int,
-        # 2026-05-22: bumped from 60 → 300. Hit deterministic timeouts on
-        # tsum-over-ℕ+-in-ℚ elaboration in putnam_1978_b2_20260522_130021
-        # (run.log line 3019: `error=timeout lean=12.329s`). At 60s the LLM
-        # rationalized via `simp [putnam_1978_b2_solution]` placeholders
+        # Bumped from 60 → 300 after deterministic timeouts on a slow
+        # elaboration. At 60s the LLM rationalized via solution placeholders
         # blaming "deterministic timeout (as shown by the tool feedback)".
         # 300s is the comfortable upper bound; if proofs complete below
         # budget the higher cap is harmless. Override per-run via

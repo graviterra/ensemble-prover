@@ -170,9 +170,8 @@ def _copy_dossier_contents(dst: ProofDossier, src: ProofDossier) -> None:
     # Fix 1 follow-up (2026-05-22): the original Fix 1 commit
     # (d08b3958) added ``verified_helper_statement_aliases`` to
     # ProofDossier but did not extend ``_copy_dossier_contents`` to
-    # propagate it across branch/merge boundaries. The bug surfaced in
-    # putnam_2006_a1_20260522_164601: two
-    # ``reduce_to_torus_volume_p{1,2}_c1_v1`` helpers with byte-identical
+    # propagate it across branch/merge boundaries. In the observed failure,
+    # two helpers with byte-identical
     # canonical statements were both stored, while ``summary.json``
     # showed an empty alias map — because the session-dossier's
     # ``verified_helper_statement_aliases`` was rebuilt correctly during

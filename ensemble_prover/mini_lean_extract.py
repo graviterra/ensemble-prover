@@ -2189,8 +2189,8 @@ def _partition_preamble_redeclarations(
     redeclares a preamble name with equivalent text (whitespace/arrow spelling
     ignored, comments stripped) is REDUNDANT: the preamble copy is
     authoritative and compiling the duplicate produces Lean "already declared"
-    failures that poison otherwise valid proof bodies (RCA
-    putnam_1985_b1_20260729_192312). A helper that redeclares a preamble name
+    failures that poison otherwise valid proof bodies. A helper that
+    redeclares a preamble name
     with different content is a CONFLICT: it must be rejected instead of
     silently shadowing the verification environment. Both are removed from
     the compiled helper list.

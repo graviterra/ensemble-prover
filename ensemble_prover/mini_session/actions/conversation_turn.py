@@ -528,10 +528,9 @@ _GRAPH_NATIVE_MAX_TOKEN_CAPS: Dict[str, int] = {
 # default. In particular, DeepSeek's 384K capability made every transport
 # retry reserve another 384K-token completion and stranded an otherwise cheap
 # Mini run behind its cost guard. Most models fit comfortably in 20K. DeepSeek
-# v4 at provider-default or high/max reasoning is different: the
-# putnam_2025_b1 run returned
-# successful 45K--70.5K completions whose tokens were almost entirely hidden
-# reasoning. Give that mode 96K so the reasoning still has measured headroom
+# v4 at provider-default or high/max reasoning is different: observed
+# completions can use most of their tokens for hidden reasoning. Give that mode
+# 96K so the reasoning still has measured headroom
 # to reach a tool/final payload, while bounding one dispatch to one quarter of
 # the raw 384K capability.
 _DEFAULT_CONVERSATION_MAX_TOKENS = 20_480
@@ -14531,8 +14530,8 @@ class ConversationTurnAction:
                 repair_self_check_status == "no_try_lean_call"
                 and dossier is not None
             ):
-                # RCA putnam_1985_b1_20260729_192312: a model that verified
-                # its EXACT proof body with an accepted try_lean one turn
+                # A model that verified its EXACT proof body with an accepted
+                # try_lean one turn
                 # earlier and re-submits it unchanged has satisfied the
                 # behavioral self-check. The durable stub is keyed by
                 # normalized body + goal + preamble + context-helper identity,

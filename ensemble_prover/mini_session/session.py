@@ -16998,17 +16998,13 @@ class MiniSession:
                     )
                 return True
             return False
-        # H1 fix (2026-05-08, second iteration): the prior code
+        # The prior code
         # unconditionally terminated when ``stagnation_counter >=
         # max_stagnation`` because ``fallback_actions_attempted`` was
-        # never written. That killed real Putnam runs at iter=3, BEFORE
+        # never written. That killed real runs at iter=3, BEFORE
         # the LLM ever ran (deterministic prepass actions take 3
         # iterations without adding proof_state nodes; signature stays
         # constant; stagnation hits cap; loop dies).
-        #
-        # Live-trace evidence: putnam_1985_a1 / putnam_1998_b1 at
-        # 23:50:32 UTC — premise_retrieval + tactic_close × 2 fired,
-        # then session terminated with conv_turn budget untouched.
         #
         # New behavior: stagnation cap is INFORMATIVE, not terminal.
         # max_iterations and all-budgets-exhausted remain the hard
@@ -28584,20 +28580,17 @@ class MiniSession:
         # advances counter; signature drift WITHOUT progress is also
         # stagnation-protective (the live-trace fix below).
         #
-        # Live-trace fix (2026-05-08): a frontier-first dispatch that
+        # A frontier-first dispatch that
         # consumed a work-item but didn't make progress is NOT
         # stagnation — the consumed-work tracking is itself the search
         # advance signal. Each (node_id, work_type, ...) tuple gets
         # exactly one shot before being marked consumed; once all
         # frontier work is consumed, frontier-first returns nothing
         # and static-priority kicks in. Counting these as stagnation
-        # killed sessions after 3 dedup-driven no-ops, well before
-        # conv_turn budget exhausted (observed on putnam_1985_a1 and
-        # putnam_1998_b1 runs at 23:19 UTC: only 1 conv_turn fired
-        # out of a 10+10 budget, then 3 no-op child_closures via
-        # frontier-first tripped stagnation and killed the session).
+        # killed sessions after a few dedup-driven no-ops, well before
+        # conversation-turn budget exhaustion.
         #
-        # M2 also-live-trace fix (2026-05-08, post-revert): the prior
+        # The prior
         # all-stagnates-unless-signature-equal logic preserves a
         # critical safety guarantee — deterministic prepass actions
         # (premise_retrieval, tactic_close) mutate the graph each
@@ -28606,13 +28599,11 @@ class MiniSession:
         # tripped termination before the LLM ever ran. Reverted to
         # signature-equality semantics: signature unchanged AND no
         # progress = stagnation; signature drift = soft progress signal.
-        # Refinement (2026-05-09): the previous fix exempted ALL
+        # The previous fix exempted ALL
         # frontier-consumed no-progress from stagnation — too liberal.
-        # Observed on putnam_1985_a1 23:55 run iters 21-25 and
-        # putnam_1998_b1 23:55 run iters 17-20: 4-5 child_closures
-        # in a row, each burning 30s of real Lean tactic work, all
-        # no-progress, none ticking stagnation. The session ran them
-        # all because each had a unique (node_id, work_type) key.
+        # In the observed failure, several child closures ran in a row with
+        # real Lean tactic work but no progress and no stagnation ticks because
+        # each had a unique (node_id, work_type) key.
         #
         # Threshold: 1.0s. A frontier-consumed dispatch with cost < 1s
         # was a real no-op (is_applicable found nothing fresh, returned

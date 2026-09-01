@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
+from .subprocess_environment import sanitized_subprocess_environment
+
 
 _GIT_TIMEOUT_S = 5.0
 _MAX_DIRTY_PATHS = 4096
@@ -19,6 +21,7 @@ def _git_bytes(cwd: Path, *args: str) -> bytes:
     completed = subprocess.run(
         ["git", *args],
         cwd=cwd,
+        env=sanitized_subprocess_environment(),
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

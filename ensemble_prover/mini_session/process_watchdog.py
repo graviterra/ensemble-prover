@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+from ..subprocess_environment import trusted_provider_worker_environment
+
 
 _WATCHDOG_FD_ENV = "ENSEMBLE_MINI_WATCHDOG_FD"
 _WATCHDOG_NONCE_ENV = "ENSEMBLE_MINI_WATCHDOG_NONCE"
@@ -2283,7 +2285,7 @@ def _run_cli_worker_in_dedicated_supervisor(
     try:
         proc = subprocess.Popen(
             command,
-            env=env,
+            env=trusted_provider_worker_environment(env),
             pass_fds=(write_fd,),
             start_new_session=True,
         )
@@ -2600,6 +2602,7 @@ def run_cli_worker_under_watchdog(
             spec_path = handle.name
         supervisor_proc = subprocess.Popen(
             [sys.executable, "-m", __name__, "--supervisor-spec", spec_path],
+            env=trusted_provider_worker_environment(),
             pass_fds=(parent_read_fd,),
         )
         return _wait_for_supervisor(supervisor_proc)

@@ -48,8 +48,15 @@ identifiers are published here; the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** research preview. This release contains only the Mini
+> **Release status:** v1.0.1 — credential isolation and user-guide update.
+> v1.0.0 remains the Initial Public Release. Releases contain only the Mini
 > Prover runtime.
+
+## Documentation
+
+Start with the **[User Guide](docs/USER_GUIDE.md)** for installation, theorem
+project preparation, provider configuration, budgets, outputs, proof graphs,
+diagnostic replay, troubleshooting, and the complete public CLI option map.
 
 ## Highlights
 
@@ -63,7 +70,7 @@ identifiers are published here; the proof files and answers are not.
 ## Requirements
 
 - Linux
-- Standard CPython 3.11 (the verified release runtime)
+- Standard CPython 3.11 or 3.12 (release audited on 3.11)
 - Lean toolchain compatible with the target Lake project
 - An API key for the selected language-model provider
 
@@ -82,9 +89,11 @@ Create the supported virtual environment and install the pinned dependencies:
 ./scripts/setup_venv.sh
 ```
 
-Install Lean and Lake separately, following the toolchain pin in the theorem
-project you intend to verify. The release does not ship or provision Lean,
-Lake, Mathlib, PutnamBench, or downloaded package trees.
+Install Lean and Lake separately using the official
+[Lean installation guide](https://lean-lang.org/install/), following the
+`lean-toolchain` pin in the theorem project you intend to verify. The release
+does not ship or provision Lean, Lake, Mathlib, PutnamBench, or downloaded
+package trees.
 
 Copy the environment template and add only the provider keys you use:
 
@@ -163,7 +172,14 @@ evidence—not proofs—until independently checked against the target project.
 
 Run the prover on untrusted theorem projects only inside an appropriately
 isolated environment. The prover executes Lean and local subprocesses and may
-send theorem context to configured external model providers.
+send theorem context to configured external model providers. Provider keys and
+common token, secret, password, private-key, cloud-identity, auth-config, and
+credential-bearing URL variables are stripped from Lean, Lake, and other
+local-tool child environments. Credential-bearing parent and watchdog
+processes are also marked non-dumpable on Linux to block descendant `/proc`
+inspection. Untrusted Lean code still runs with the prover user's filesystem
+and network privileges, so operating-system isolation may still be required. A
+Python virtual environment is not a security boundary.
 
 ## Contributing and licensing
 

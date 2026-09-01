@@ -28,6 +28,7 @@ from .environment import dependency_environment_fingerprint
 from .policy import TheoryPolicy
 from .store import TheoryStore
 from ..theorem_project import _mask_noncode
+from ..subprocess_environment import sanitized_subprocess_environment
 
 
 _DECL_RE = re.compile(
@@ -452,7 +453,7 @@ class TheoryBundleVerifier:
             process = subprocess.Popen(
                 list(command),
                 cwd=cwd or self.lean_project_dir,
-                env=dict(env),
+                env=sanitized_subprocess_environment(env),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

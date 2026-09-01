@@ -64,6 +64,7 @@ from .lean_server import LeanREPL
 from .proof_dossier import _contains_solution_ref_for_prompt, helper_decl_name
 from .runtime_context import mark_runtime_owned_callback
 from .subprocess_cleanup import terminate_and_reap_process
+from .subprocess_environment import sanitized_subprocess_environment
 from .theorem_project import decode_theorem_target_context
 from .utils import (
     hash_text,
@@ -3533,6 +3534,7 @@ class LeanRunner:
                 "lake",
                 "build",
                 cwd=str(self.project_dir),
+                env=sanitized_subprocess_environment(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -3588,6 +3590,7 @@ class LeanRunner:
                 "build",
                 *modules,
                 cwd=str(self.project_dir),
+                env=sanitized_subprocess_environment(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -3746,6 +3749,7 @@ class LeanRunner:
                     "build",
                     *targets,
                     cwd=str(project),
+                    env=sanitized_subprocess_environment(),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
@@ -4907,6 +4911,7 @@ class LeanRunner:
                     proc = subprocess.Popen(
                         ("lake", "env", *args),
                         cwd=str(self.project_dir),
+                        env=sanitized_subprocess_environment(),
                         stdout=stdout_file,
                         stderr=stderr_file,
                         start_new_session=True,
@@ -5022,7 +5027,7 @@ class LeanRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
-                env=process_env,
+                env=sanitized_subprocess_environment(process_env),
             )
             if dispatch_observer is not None:
                 try:

@@ -515,9 +515,9 @@ class MiniRecursiveConfig:
     # degenerate strong model cannot burn unbounded premium spend.
     planner_escalation_max_calls: int = 3
     # One premium logical call previously inherited infinite request/operation
-    # timeouts and the transport's eight-attempt retry policy. Three failed
-    # calls in putnam_2017_a1 therefore ran for ~7,500s and created ~$9.31 of
-    # unbounded cost. Bound both concrete dispatch count and elapsed time;
+    # timeouts and the transport's multi-attempt retry policy, allowing several
+    # failed calls to run for hours with unbounded cost. Bound both concrete
+    # dispatch count and elapsed time;
     # the premium lane remains tighter than the ordinary composite pass.
     planner_escalation_provider_max_attempts: int = 2
     planner_escalation_request_timeout_s: float = 180.0
@@ -4901,8 +4901,8 @@ def _visible_answer_definitions_for_planner(
 ) -> str:
     """Bounded materialized official-answer definitions for the planner.
 
-    RCA putnam_1985_b1_20260729_192312 (P1-6): in visible-answer mode the LLM
-    preamble contains the materialized solution definition (e.g.
+    In visible-answer mode the LLM preamble contains the materialized solution
+    definition (e.g.
     ``fun i ↦ i - 2``), but the planner prompt carried only a sanitized
     helper/import summary, so the planner honestly reported the witness
     values as unavailable and could not plan the root. Fail-closed: anything

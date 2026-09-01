@@ -198,10 +198,8 @@ class FailureAnalyzer:
                     )
                     # Fix 2 (2026-05-22): when the LLM cites a hallucinated
                     # mini_* helper, append the verified-helper inventory so
-                    # the next turn can self-correct. Drives recovery from
-                    # the 6× hallucinated `outer_tsum_eval_p3_c1_v1` cascade
-                    # in putnam_1978_b2_20260522_082821 (run.log lines 1601,
-                    # 1607, 1638, 1644, 1784, 1825).
+                    # the next turn can self-correct. This prevents repeated
+                    # hallucinated-helper cascades in long repair sessions.
                     if key == "unknown_identifier" and dossier is not None:
                         from .feedback import (
                             helper_inventory_hint_for_unknown_identifier,

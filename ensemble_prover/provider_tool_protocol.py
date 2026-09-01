@@ -1007,9 +1007,8 @@ def _resolve_mini_reasoning_transport_control(
             return effort or "medium", {"reasoning": {"enabled": True}}
         if transport_mode == "unbounded_default" and effort in {"", "none"}:
             # Visibility recovery asks for none. The static DeepSeek v4
-            # contract omits disable/max_tokens; raising here discarded
-            # 45 minutes of Putnam 1978 A2 flash reasoning
-            # (20260818_215944) before the visibility HTTP call.
+            # contract omits disable/max_tokens; raising here once discarded a
+            # long completed reasoning response before the visibility call.
             if bool(getattr(cfg, "reasoning_control_required", False)):
                 return "none", {"reasoning": {"enabled": False}}
             return effort, {}

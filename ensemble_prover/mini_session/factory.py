@@ -5076,8 +5076,8 @@ async def prove_problem_via_session(
                     # (bogus contradiction-route helpers, statement-duplicate
                     # helpers from the 1962_a5 5×Icc→range cascade) no
                     # longer resets the stagnation counter, so the
-                    # adaptive_recursive_fallback can fire before the 21-min
-                    # swamp observed in putnam_1978_b2_20260522_082821.
+                    # adaptive_recursive_fallback can fire before an extended
+                    # no-progress swamp.
                     # Tests and direct ``build_session_for_prove_problem``
                     # callers retain the legacy default of False.
                     "strict_progress_accounting": bool(

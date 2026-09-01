@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .model import content_hash
+from ..subprocess_environment import sanitized_subprocess_environment
 
 
 def dependency_environment_fingerprint(lean_project_dir: Path) -> str:
@@ -85,6 +86,7 @@ def _git_output(root: Path, *args: str) -> Optional[str]:
         run = subprocess.run(
             ["git", *args],
             cwd=root,
+            env=sanitized_subprocess_environment(),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

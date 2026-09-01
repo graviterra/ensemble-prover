@@ -30,6 +30,7 @@ from .store import (
     TheoryStorePublicationCommitted,
 )
 from .verifier import TheoryBundleVerifier, TheoryVerificationResult
+from ..subprocess_environment import sanitized_subprocess_environment
 
 
 TheoryMode = Literal["off", "read", "build"]
@@ -651,6 +652,7 @@ class MiniTheoryLibrary:
                 lean_path_run = subprocess.run(
                     ["lake", "env", "printenv", "LEAN_PATH"],
                     cwd=project,
+                    env=sanitized_subprocess_environment(),
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -659,6 +661,7 @@ class MiniTheoryLibrary:
                 lean_bin_run = subprocess.run(
                     ["lake", "env", "which", "lean"],
                     cwd=project,
+                    env=sanitized_subprocess_environment(),
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

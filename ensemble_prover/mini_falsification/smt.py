@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 from .generators import binder_domain, leading_forall_binders, normalize_type
 from .model import content_hash
 from ..subprocess_cleanup import communicate_with_hard_timeout
+from ..subprocess_environment import sanitized_subprocess_environment
 
 
 class SmtTranslationError(ValueError):
@@ -351,6 +352,7 @@ async def run_smt_query(
         sys.executable,
         "-m",
         "ensemble_prover.mini_falsification.smt_worker",
+        env=sanitized_subprocess_environment(),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

@@ -19,6 +19,7 @@ from .subprocess_cleanup import (
     request_process_termination_nowait,
     terminate_and_reap_process,
 )
+from .subprocess_environment import sanitized_subprocess_environment
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +278,10 @@ class PersistentVerifierWorker:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
-                    env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                    env=sanitized_subprocess_environment(
+                        os.environ,
+                        overrides={"PYTHONUNBUFFERED": "1"},
+                    ),
                 )
                 self._proc = proc
                 self._stderr_task = asyncio.create_task(self._drain_stderr())

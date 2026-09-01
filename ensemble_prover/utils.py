@@ -33,8 +33,8 @@ def format_exception(exc: BaseException) -> str:
             if body:
                 # Preserve the provider's error message OUTSIDE quoted JSON:
                 # downstream prompt-safety redacts every double-quoted string
-                # literal (run putnam_1985_b1_20260729_192522's 400s became
-                # undiagnosable `body={ "<string>": ... }` skeletons). Bare
+                # literal (a provider's 400 response once became an
+                # undiagnosable `body={ "<string>": ... }` skeleton). Bare
                 # text with quotes stripped survives that redaction, so the
                 # actionable reason stays in run.log/turns.jsonl.
                 provider_error = ""

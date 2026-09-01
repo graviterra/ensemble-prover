@@ -13101,8 +13101,8 @@ class ProofDossier:
         Lean replay, route-assembly tactic candidates, or any path that
         needs every declaration in scope.
 
-        Targets the putnam_1962_a5_20260522_002435 Phase E pathology where 5
-        identical Icc → range lemmas were rendered into every LLM prompt.
+        Prevents a pathology where five identical lemmas were rendered into
+        every LLM prompt.
         """
         emitted_statement_keys: Set[str] = set()
         result: List[str] = []
