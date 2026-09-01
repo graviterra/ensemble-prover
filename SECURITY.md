@@ -2,11 +2,13 @@
 
 ## Supported versions
 
-Version 1.0.1 is the current supported release. Version 1.0.0 is the initial
-public release and is superseded because local-tool subprocesses directly
-inherited provider credentials. Security fixes are applied to the latest
-revision of the default branch; older snapshots and generated run artifacts
-are not supported release lines.
+Version 1.0.2 is the current supported release. Version 1.0.1 added subprocess
+credential isolation but is superseded because it pinned a vulnerable
+`python-dotenv` release. Version 1.0.0 is the initial public release and is
+superseded because local-tool subprocesses directly inherited provider
+credentials. Security fixes are applied to the latest revision of the default
+branch; older snapshots and generated run artifacts are not supported release
+lines.
 
 ## Reporting a vulnerability
 
