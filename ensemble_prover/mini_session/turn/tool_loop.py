@@ -821,13 +821,13 @@ class ToolLoopResult:
     recovered_finalizer_provider_defer: dict = field(default_factory=dict)
 
 
-# One concrete provider exposure per scheduler quantum. A transport retry is
-# still preserved by the conversation's durable provider continuation, but it
-# must reacquire the scheduler before another complete request timeout window
-# can begin. Authoritative pre-generation rejections retire their lease receipt,
-# so compatibility/invalid-prompt repair can still redispatch without consuming
-# a second paid-or-unknown exposure.
+# Soft policy admits one concrete provider exposure per scheduler quantum.
+# Hard policy has a finite operation lease, so it may safely spend one initial
+# exposure plus the single transport retry that the 2R lease promises. Later
+# logical calls still reacquire the scheduler, and finalizer/repair calls keep
+# their stricter single-exposure fence below.
 _CONVERSATION_PROVIDER_DISPATCH_QUANTUM = 1
+_CONVERSATION_HARD_PROVIDER_DISPATCH_QUANTUM = 2
 # Final proof serialization is an exact resumable boundary. Preserve at least
 # the OpenAI-compatible transport's historical retry opportunity, but spread
 # it across scheduler quanta so one unavailable provider cannot monopolize a
@@ -851,6 +851,9 @@ _CONVERSATION_PROVIDER_WALL_QUANTUM_S = 0.0
 _CONVERSATION_PROVIDER_CUMULATIVE_WALL_QUANTA = 1.0
 _CONVERSATION_PROVIDER_CUMULATIVE_WALL_FLOOR_S = 30.0
 _PROVIDER_CALL_QUANTUM_STATE_SCHEMA_VERSION = 4
+_PROVIDER_SETTLEMENT_RESERVE_FRACTION = 0.10
+_PROVIDER_SETTLEMENT_RESERVE_MIN_S = 5.0
+_PROVIDER_SETTLEMENT_RESERVE_MAX_S = 120.0
 
 _SEARCH_CADENCE_TOOL_NAMES = frozenset({"search_mathlib", "search_theorems"})
 _FORMAL_CADENCE_TOOL_NAMES = frozenset(
@@ -873,6 +876,102 @@ def _nonnegative_finite_float(value: Any, *, default: float = 0.0) -> float:
     if not math.isfinite(parsed) or parsed < 0.0:
         return max(0.0, float(default))
     return parsed
+
+
+def _turn_elapsed_budget_for_provider_operation_s(
+    operation_window_s: Any,
+) -> float:
+    """Add the outer-turn time that the tool loop reserves for settlement."""
+
+    operation_s = _nonnegative_finite_float(operation_window_s)
+    if operation_s <= 0.0:
+        return 0.0
+    minimum_reserve_boundary_s = (
+        _PROVIDER_SETTLEMENT_RESERVE_MIN_S
+        / _PROVIDER_SETTLEMENT_RESERVE_FRACTION
+    )
+    maximum_reserve_boundary_s = (
+        _PROVIDER_SETTLEMENT_RESERVE_MAX_S
+        / _PROVIDER_SETTLEMENT_RESERVE_FRACTION
+    )
+    if operation_s <= (
+        minimum_reserve_boundary_s - _PROVIDER_SETTLEMENT_RESERVE_MIN_S
+    ):
+        return operation_s + _PROVIDER_SETTLEMENT_RESERVE_MIN_S
+    uncapped_turn_s = operation_s / (
+        1.0 - _PROVIDER_SETTLEMENT_RESERVE_FRACTION
+    )
+    if uncapped_turn_s < maximum_reserve_boundary_s:
+        return uncapped_turn_s
+    return operation_s + _PROVIDER_SETTLEMENT_RESERVE_MAX_S
+
+
+def _client_hard_provider_operation_budget_s(client: Any) -> float:
+    """Match the client's configured hard operation deadline."""
+
+    cfg = getattr(client, "cfg", None)
+    policy = str(
+        getattr(cfg, "llm_deadline_policy", "soft") or "soft"
+    ).strip().lower()
+    if policy != "hard":
+        return 0.0
+    operation_window_s = _nonnegative_finite_float(
+        getattr(cfg, "operation_timeout_s", 0.0)
+    )
+    if operation_window_s <= 0.0:
+        operation_window_s = (
+            _nonnegative_finite_float(getattr(cfg, "timeout_s", 0.0))
+            * 2.0
+        )
+    return operation_window_s
+
+
+def _client_hard_conversation_operation_budget_s(client: Any) -> float:
+    """Give a conversation two effective HTTP request windows."""
+
+    cfg = getattr(client, "cfg", None)
+    policy = str(
+        getattr(cfg, "llm_deadline_policy", "soft") or "soft"
+    ).strip().lower()
+    if policy != "hard":
+        return 0.0
+    operation_window_s = _nonnegative_finite_float(
+        getattr(cfg, "operation_timeout_s", 0.0)
+    )
+    if operation_window_s <= 0.0:
+        request_window_s = 0.0
+        resolve_request_timeout = getattr(
+            client,
+            "_configured_request_timeout_s",
+            None,
+        )
+        if callable(resolve_request_timeout):
+            try:
+                request_window_s = _nonnegative_finite_float(
+                    resolve_request_timeout()
+                )
+            except Exception:
+                request_window_s = 0.0
+        if request_window_s <= 0.0 and not bool(
+            getattr(cfg, "request_timeout_disabled", False)
+        ):
+            request_window_s = _nonnegative_finite_float(
+                getattr(cfg, "request_timeout_s", 0.0)
+            )
+        if request_window_s <= 0.0:
+            request_window_s = _nonnegative_finite_float(
+                getattr(cfg, "timeout_s", 0.0)
+            )
+        operation_window_s = request_window_s * 2.0
+    return operation_window_s
+
+
+def _client_hard_turn_elapsed_budget_s(client: Any) -> float:
+    """Return a hard turn envelope that preserves the provider operation."""
+
+    return _turn_elapsed_budget_for_provider_operation_s(
+        _client_hard_conversation_operation_budget_s(client)
+    )
 
 
 def _nonnegative_int(value: Any, *, default: int = 0) -> int:
@@ -2923,8 +3022,11 @@ async def _call_llm_with_tools_one_round_impl(
                 max_turn_elapsed_f - (time.monotonic() - started),
             )
             settlement_reserve_s = min(
-                120.0,
-                max(5.0, remaining_turn_s * 0.10),
+                _PROVIDER_SETTLEMENT_RESERVE_MAX_S,
+                max(
+                    _PROVIDER_SETTLEMENT_RESERVE_MIN_S,
+                    remaining_turn_s * _PROVIDER_SETTLEMENT_RESERVE_FRACTION,
+                ),
             )
             operation_window_s = max(
                 0.001,
@@ -3432,6 +3534,7 @@ async def _call_llm_with_tools_one_round_impl(
         nonlocal invalid_prompt_neutralization_pending
         nonlocal provider_finalizer_continuation_active
         nonlocal provider_call_quantum_max_retries
+        nonlocal provider_dispatches_started
         nonlocal provider_quantum_authenticated_dispatches_started
         nonlocal provider_dispatch_quantum_spent
         # A recursive helper may outlive its finite cancellation settlement
@@ -3462,11 +3565,30 @@ async def _call_llm_with_tools_one_round_impl(
             # Final proof serialization has no unfinished tool dispatch. Retry
             # it through the durable scheduler continuation instead of
             # spending another full request window inside the same action.
-            # General mid-tool calls use the same one-exposure lease.
+            # Hard-policy general calls may spend their one bounded transport
+            # retry inline. Soft, finalizer, and repair calls yield after one
+            # exposure so an unavailable provider cannot monopolize a worker.
+            hard_deadline_policy = (
+                str(
+                    getattr(
+                        getattr(client, "cfg", None),
+                        "llm_deadline_policy",
+                        "soft",
+                    )
+                    or "soft"
+                )
+                .strip()
+                .lower()
+                == "hard"
+            )
             dispatch_quantum = (
                 1
                 if repair_self_check_required or finalizer_continuation
-                else _CONVERSATION_PROVIDER_DISPATCH_QUANTUM
+                else (
+                    _CONVERSATION_HARD_PROVIDER_DISPATCH_QUANTUM
+                    if hard_deadline_policy
+                    else _CONVERSATION_PROVIDER_DISPATCH_QUANTUM
+                )
             )
             configured_dispatch_limit = int(
                 provider_call_metadata.get("provider_dispatch_max_attempts", 0)
@@ -3501,17 +3623,31 @@ async def _call_llm_with_tools_one_round_impl(
             if dispatch_attempt_limit > 0
             else None
         )
+        reported_authenticated_dispatches = 0
         provider_finalizer_continuation_active = bool(
             finalizer_continuation and provider_dispatch_lease is not None
         )
 
         def _capture_authenticated_dispatches() -> None:
+            nonlocal provider_dispatches_started
             nonlocal provider_quantum_authenticated_dispatches_started
+            nonlocal reported_authenticated_dispatches
             if provider_dispatch_lease is None:
                 return
+            authenticated_dispatches = int(
+                provider_dispatch_lease.authenticated_dispatches_started
+            )
+            provider_dispatches_started += max(
+                0,
+                authenticated_dispatches - reported_authenticated_dispatches,
+            )
+            reported_authenticated_dispatches = max(
+                reported_authenticated_dispatches,
+                authenticated_dispatches,
+            )
             provider_quantum_authenticated_dispatches_started = max(
                 provider_quantum_authenticated_dispatches_started,
-                int(provider_dispatch_lease.authenticated_dispatches_started),
+                authenticated_dispatches,
             )
         request_max_tokens_override = (
             max_tokens_override

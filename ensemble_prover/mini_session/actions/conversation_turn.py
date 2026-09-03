@@ -12872,6 +12872,44 @@ class ConversationTurnAction:
             ),
         )
         temperature_metadata = temperature_decision.metadata(client=client)
+        if self.provider_dispatch_limit > 0:
+            provider_dispatches_used = max(
+                int(
+                    getattr(
+                        session,
+                        "provider_dispatches_started_total",
+                        0,
+                    )
+                    or 0
+                ),
+                int(
+                    getattr(
+                        session,
+                        "provider_calls_completed_total",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+            remaining_provider_dispatches = max(
+                0,
+                self.provider_dispatch_limit - provider_dispatches_used,
+            )
+            configured_dispatches = max(
+                0,
+                int(
+                    temperature_metadata.get(
+                        "provider_dispatch_max_attempts",
+                        0,
+                    )
+                    or 0
+                ),
+            )
+            temperature_metadata["provider_dispatch_max_attempts"] = (
+                min(configured_dispatches, remaining_provider_dispatches)
+                if configured_dispatches > 0
+                else remaining_provider_dispatches
+            )
         max_tokens_override = _selected_work_request_envelope_policy(session)
         token_cap_metadata: Dict[str, Any] = {}
         token_cap_metadata["request_envelope_policy"] = (

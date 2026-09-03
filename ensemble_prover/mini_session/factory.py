@@ -124,6 +124,10 @@ from .actions import (
 from .action import ActionBudget
 from .actions.conversation_turn import _conversation_client_role_configs
 from .session import MiniSession, _dispatch_capability_generation_nonce
+from .turn.tool_loop import (
+    _client_hard_provider_operation_budget_s,
+    _client_hard_turn_elapsed_budget_s,
+)
 
 
 _RECURSIVE_PAID_NO_ARTIFACT_KINDS = frozenset(
@@ -1741,31 +1745,11 @@ def _route_assembly_budget_seconds(*, timeout_s: float, max_invocations: int) ->
 
 
 def _client_llm_turn_elapsed_budget_s(client: Any) -> float:
-    cfg = getattr(client, "cfg", None)
-    # Role ``timeout_s`` remains provider/request configuration in soft mode;
-    # it is not an implicit whole-turn kill switch.  Only an explicit hard
-    # policy opts a MiniSession conversation turn into elapsed cancellation.
-    policy = str(getattr(cfg, "llm_deadline_policy", "soft") or "soft").strip().lower()
-    if policy != "hard":
-        return 0.0
-    # Match ``OpenAICompatClient._operation_deadline`` exactly.  When an
-    # explicit operation window is absent, ``timeout_s`` is one provider
-    # request and the client reserves a second request window for a retry.
-    # Giving ConversationTurn only the first window would cancel its tool
-    # loop before the client can execute the retry it was configured to have.
-    try:
-        operation_timeout = float(getattr(cfg, "operation_timeout_s", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        operation_timeout = 0.0
-    if operation_timeout > 0.0:
-        return operation_timeout
-    try:
-        request_timeout = float(getattr(cfg, "timeout_s", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        request_timeout = 0.0
-    if request_timeout > 0.0:
-        return request_timeout * 2.0
-    return 0.0
+    # The tool loop removes its publication/settlement reserve before passing
+    # the operation window to the client. Size the enclosing hard turn so the
+    # provider still receives its configured operation lease after that
+    # subtraction; otherwise a full first timeout consumes the promised retry.
+    return _client_hard_turn_elapsed_budget_s(client)
 
 
 def _mini_recursive_planner_deadline_kwargs(client: Any) -> Dict[str, Any]:
@@ -1780,7 +1764,7 @@ def _mini_recursive_planner_deadline_kwargs(client: Any) -> Dict[str, Any]:
         )
     except (TypeError, ValueError):
         request_timeout_s = 0.0
-    operation_timeout_s = _client_llm_turn_elapsed_budget_s(client)
+    operation_timeout_s = _client_hard_provider_operation_budget_s(client)
     if operation_timeout_s <= 0.0:
         # Soft policy deliberately does not turn one provider response into a
         # local abort. It still needs a finite cumulative scheduler lease,
@@ -1819,28 +1803,28 @@ def _mini_recursive_child_elapsed_budget_s(
 ) -> float:
     """Derive one finite whole-claim lease from its admitted work.
 
-    A recursive claim may consume at most ``turns_per_claim`` provider
-    operations across its prover/refiner handoff.  Each turn also receives one
-    bounded tactic allowance.  Size every turn for the slowest admitted lane:
-    the shared lease must cover either role without resetting at handoff or
-    shrinking the refiner's declared solving budget.
+    A recursive claim may consume at most ``turns_per_claim`` conversation
+    turns across its prover/refiner handoff. Each turn also receives one
+    bounded tactic allowance. Size every turn for the slowest admitted lane:
+    hard conversations need their settlement-aware outer envelope, while soft
+    lanes retain the finite planner-operation fallback used before this bound.
     """
 
-    provider_operation_s = 0.0
+    provider_turn_s = 0.0
     for client in clients:
-        planner_deadlines = _mini_recursive_planner_deadline_kwargs(client)
-        try:
-            candidate_operation_s = float(
-                planner_deadlines.get("planner_operation_timeout_s", 0.0) or 0.0
-            )
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(candidate_operation_s):
-            provider_operation_s = max(
-                provider_operation_s,
-                candidate_operation_s,
-            )
-    if not math.isfinite(provider_operation_s) or provider_operation_s <= 0.0:
+        candidate_turn_s = _client_hard_turn_elapsed_budget_s(client)
+        if candidate_turn_s <= 0.0:
+            planner_deadlines = _mini_recursive_planner_deadline_kwargs(client)
+            try:
+                candidate_turn_s = float(
+                    planner_deadlines.get("planner_operation_timeout_s", 0.0)
+                    or 0.0
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+        if math.isfinite(candidate_turn_s):
+            provider_turn_s = max(provider_turn_s, candidate_turn_s)
+    if not math.isfinite(provider_turn_s) or provider_turn_s <= 0.0:
         return 0.0
     turns = max(1, int(turns_per_claim or 1))
     try:
@@ -1849,7 +1833,7 @@ def _mini_recursive_child_elapsed_budget_s(
         tactic_s = 0.0
     if not math.isfinite(tactic_s):
         tactic_s = 0.0
-    return float(turns) * (provider_operation_s + tactic_s)
+    return float(turns) * (provider_turn_s + tactic_s)
 
 
 def _effective_compute_examples_tool_enabled(

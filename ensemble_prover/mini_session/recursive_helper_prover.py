@@ -31,6 +31,7 @@ from ..mini_branching import (
 )
 from .action import ActionBudget
 from .session import MiniSession, _observe_and_detach_operation_tail
+from .turn.tool_loop import _client_hard_turn_elapsed_budget_s
 
 
 _RECURSIVE_CLEANUP_OUTCOME_ATTR = "_mini_recursive_cleanup_outcome"
@@ -1517,25 +1518,7 @@ async def prove_helper_in_subsession(
         return number if number > 0.0 else 0.0
 
     def _client_llm_turn_elapsed_budget_s(client: Any) -> float:
-        cfg = getattr(client, "cfg", None)
-        if cfg is None:
-            return 0.0
-        policy = str(
-            getattr(cfg, "llm_deadline_policy", "soft") or "soft"
-        ).strip().lower()
-        if policy != "hard":
-            return 0.0
-        operation_timeout_s = _positive_float(
-            getattr(cfg, "operation_timeout_s", 0.0)
-        )
-        if operation_timeout_s > 0.0:
-            return operation_timeout_s
-        request_timeout_s = _positive_float(getattr(cfg, "timeout_s", 0.0))
-        if request_timeout_s > 0.0:
-            # Match the provider client's fallback operation window and the
-            # root factory: one request timeout plus one retry window.
-            return request_timeout_s * 2.0
-        return 0.0
+        return _client_hard_turn_elapsed_budget_s(client)
 
     def _conversation_turn_kwargs(
         *,
