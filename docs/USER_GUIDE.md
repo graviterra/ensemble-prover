@@ -643,9 +643,9 @@ source benchmark or evaluation agreement restricts answer publication.
 
 ## 13. Replay and interruption behavior
 
-The public CLI records checkpoints and replay data for durability and
-diagnostics, but it does **not** expose a supported user command for continuing
-an interrupted search. In particular, `--mini-resume`,
+The public CLI records structured turn and replay data for diagnostics, but
+it does **not** persist resumable search checkpoints or expose a supported
+user command for continuing an interrupted search. In particular, `--mini-resume`,
 `--mini-checkpoint-root`, `--mini-search-branch`, and
 `--mini-fork-from-branch` are not public CLI options in this release.
 

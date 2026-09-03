@@ -30686,6 +30686,10 @@ class MiniSession:
             ):
                 self.last_failure_reason = ""
                 return True
+            if self._renew_provider_lanes_instead_of_terminal(
+                "repair_policy_narrowing_no_applicable"
+            ):
+                return True
             self.last_failure_reason = "repair_policy_narrowing_no_applicable"
             self._increment_dossier_metric(
                 "mini_session_repair_policy_narrowing_no_recovery",
@@ -30929,6 +30933,11 @@ class MiniSession:
                             "verdict": ("action_local_transient_cooldown_released"),
                         }
                     )
+                    return True
+            if reason != "no_unresolved_work":
+                # Renewal is the last recovery move, after deterministic
+                # materialization and transient-cooldown releases.
+                if self._renew_provider_lanes_instead_of_terminal(reason):
                     return True
             self.last_failure_reason = reason
             self._increment_dossier_metric("mini_session_no_applicable_terminal", 1)
@@ -31316,6 +31325,10 @@ class MiniSession:
                         "verdict": "repair_restore_failure_selector_reanchored",
                     }
                 )
+                return True
+            if self._renew_provider_lanes_instead_of_terminal(
+                "no_recovery_budget_granted"
+            ):
                 return True
             self.last_failure_reason = "no_recovery_budget_granted"
             self._increment_dossier_metric("mini_session_no_applicable_terminal", 1)
@@ -35164,11 +35177,16 @@ class MiniSession:
             "provider_dispatches_started",
         )
         cooperative_provider_yield = bool(
-            kind == "llm_provider_quantum_exhausted"
-            or (
-                metadata.get("provider_call_quantum_exhausted")
-                and provider_calls_completed > 0
+            (
+                provider_calls_completed > 0
+                or metadata.get("provider_finalizer_continuation_exhausted")
             )
+            and metadata.get("provider_call_quantum_exhausted")
+            and kind
+            in {
+                "llm_provider_quantum_exhausted",
+                "provider_dispatch_attempt_limit_exhausted",
+            }
         )
         try:
             provider_defer_ready_at = float(
@@ -35227,6 +35245,32 @@ class MiniSession:
             kind == "provider_dispatch_attempt_limit_exhausted"
             and zero_provider_failure
             and not cooperative_provider_yield
+        ):
+            return True
+        # A dispatch the provider never answered evaluated nothing. Whether
+        # the request never left (``zero_provider_failure``) or left and timed
+        # out before any provider call completed, the model did not see this
+        # proof state, so the receipt waits on infrastructure and must not be
+        # charged against the bounded semantic retry count for that state.
+        # Charging it let a refused transport retry consume both scheduler
+        # retries and terminate a run with live work.
+        provider_never_answered = bool(
+            provider_calls_completed == 0
+            and provider_dispatches_started > 0
+            and not cooperative_provider_yield
+        )
+        if provider_never_answered and (
+            kind
+            in {
+                "provider_dispatch_attempt_limit_exhausted",
+                "transient",
+                "transport",
+                "llm_network_error",
+                "llm_provider_quantum_exhausted",
+                "llm_retry_deadline_exhausted",
+            }
+            or scoped_reason
+            in {"llm_network_error", "llm_retry_deadline_exhausted"}
         ):
             return True
         if not zero_provider_failure:
@@ -35593,6 +35637,147 @@ class MiniSession:
             self._model_call_deferred_metadata_retryable(metadata)
             or self._active_repair_lane_capacity_retryable(action_id, metadata)
         ), metadata
+
+    @staticmethod
+    def _wall_exhausted_receipt(metadata: Mapping[str, Any]) -> bool:
+        return (
+            str(metadata.get("llm_failure_kind") or "").strip()
+            == "llm_provider_cumulative_wall_exhausted"
+            or str(metadata.get("scoped_failure_reason") or "").strip()
+            == "llm_provider_cumulative_wall_exhausted"
+        )
+
+    def _renew_provider_lanes_instead_of_terminal(self, reason: str) -> bool:
+        """Renew retired lanes at a recovery exit that would end the session.
+
+        Every terminal exit of no-applicable recovery is covered, not only
+        ``no_serviceable_frontier_work``: the Aug 29 lane-retirement deaths
+        left through ``no_recovery_budget_granted`` with the recovery probe
+        still listing the retired conversations as serviceable. A renewed lane
+        is ordinary selectable work again; this is not a recovery grant, mints
+        no turn, and leaves the bounded recovery counter untouched.
+        """
+
+        renewed = self._renew_starved_provider_lane_leases(exit_reason=reason)
+        if not renewed:
+            return False
+        self.fallback_actions_attempted = False
+        self.max_iterations = max(
+            int(self.max_iterations or 0),
+            int(self.iteration or 0) + 2,
+        )
+        self.last_failure_reason = ""
+        return True
+
+    def _renew_starved_provider_lane_leases(self, *, exit_reason: str = "") -> Set[str]:
+        """Re-open wall-exhausted provider lanes when nothing else can run.
+
+        Exhausting a lane's cumulative provider wall lease retires it from
+        *immediate* redispatch so alternate frontier work receives the
+        scheduler first. That is the lease's whole purpose; it was never a
+        session terminal, and the run's wall-clock and cost governors own
+        the decision to stop. When the recovery scan finds no serviceable
+        work at all, the retirement would end the session instead. Grant
+        every retired lane a fresh lease, drop the spent receipts that the
+        release predicates refuse, and let the ordinary selector dispatch the
+        lane again. Returns the renewed lane identities.
+        """
+
+        retired = {
+            str(identity or "").strip()
+            for identity in self.provider_turn_retired_lane_identities
+            if str(identity or "").strip()
+        }
+        if not retired:
+            return set()
+        renewed_action_ids: List[str] = []
+        for action in self.actions:
+            renew = getattr(action, "renew_provider_lane_lease", None)
+            if not callable(renew):
+                continue
+            try:
+                if renew(self, retired):
+                    renewed_action_ids.append(str(getattr(action, "id", "") or ""))
+            except Exception:
+                _LOGGER.debug(
+                    "provider lane lease renewal failed for %r",
+                    getattr(action, "id", ""),
+                    exc_info=True,
+                )
+        def spent_receipt_for_renewed_lane(metadata: Mapping[str, Any]) -> bool:
+            # Only receipts attributed to a lane being renewed (or too old to
+            # carry a lane stamp) are spent; a wall receipt owned by a lane
+            # that is still retired elsewhere is not this renewal's to drop.
+            if not self._wall_exhausted_receipt(metadata):
+                return False
+            identity = str(metadata.get("provider_turn_lane_identity") or "").strip()
+            return not identity or identity in retired
+
+        dropped_receipt_action_ids: List[str] = []
+        for action_id in sorted(self.model_call_deferred_static_action_ids):
+            metadata = dict(
+                self.model_call_deferred_static_action_metadata.get(action_id) or {}
+            )
+            if not spent_receipt_for_renewed_lane(metadata):
+                continue
+            self.model_call_deferred_static_action_ids.discard(action_id)
+            self.model_call_deferred_static_action_metadata.pop(action_id, None)
+            dropped_receipt_action_ids.append(str(action_id))
+        for action_key in list(self.model_call_deferred_frontier_action_keys):
+            metadata = dict(
+                self.model_call_deferred_frontier_action_metadata.get(action_key) or {}
+            )
+            if not spent_receipt_for_renewed_lane(metadata):
+                continue
+            action_id = str(
+                metadata.get("action_id") or (action_key[-1] if action_key else "")
+            ).strip()
+            self.model_call_deferred_frontier_action_keys.discard(action_key)
+            self.model_call_deferred_frontier_action_metadata.pop(action_key, None)
+            self.consumed_frontier_action_keys.discard(action_key)
+            self.skipped_frontier_action_keys.discard(action_key)
+            work_record = metadata.get("selected_work_item_record")
+            if isinstance(work_record, Mapping) and work_record:
+                try:
+                    self.skipped_frontier_work_keys.discard(
+                        self._frontier_work_key(dict(work_record))
+                    )
+                except Exception:
+                    _LOGGER.debug(
+                        "renewal could not resolve frontier work key for %r",
+                        action_id,
+                        exc_info=True,
+                    )
+            if action_id:
+                # Same bookkeeping as an ordinary frontier release: a paired
+                # static guard is cleared only when its own ledger allows.
+                self._clear_paired_model_call_deferred_static_guard(
+                    action_id,
+                    reason="provider_lane_lease_renewed",
+                )
+            dropped_receipt_action_ids.append(action_id)
+        self.provider_turn_retired_lane_identities.difference_update(retired)
+        self._increment_dossier_metric(
+            "mini_session_provider_lane_lease_renewals",
+            len(retired),
+        )
+        self._record_event(
+            {
+                "phase": "session_no_applicable_recovery",
+                "iteration": self.iteration,
+                "stagnation_counter": self.stagnation_counter,
+                "recovery_count": self.no_applicable_recovery_count,
+                "max_recoveries": self.max_no_applicable_recoveries,
+                "recovery_exit_reason": str(exit_reason or ""),
+                "renewed_lane_identities": sorted(retired),
+                "renewed_action_ids": sorted(dict.fromkeys(renewed_action_ids)),
+                "dropped_receipt_action_ids": sorted(
+                    dict.fromkeys(dropped_receipt_action_ids)
+                ),
+                "verdict": "provider_lane_lease_renewed",
+            }
+        )
+        return retired
 
     def _unretire_wall_exhausted_provider_lanes(self) -> None:
         """Retain exhausted exact-lane receipts across recovery scans.
@@ -36212,17 +36397,20 @@ class MiniSession:
             ignore_model_call_deferred=True,
         ):
             return False
-        for alias_key in retry_keys:
-            self.model_call_deferred_frontier_retry_counts[alias_key] = max(
-                prior_retries + 1,
-                int(
-                    self.model_call_deferred_frontier_retry_counts.get(
-                        alias_key,
-                        0,
-                    )
-                    or 0
-                ),
-            )
+        released_retry_count = prior_retries
+        if not persistent_infrastructure_retry:
+            released_retry_count += 1
+            for alias_key in retry_keys:
+                self.model_call_deferred_frontier_retry_counts[alias_key] = max(
+                    released_retry_count,
+                    int(
+                        self.model_call_deferred_frontier_retry_counts.get(
+                            alias_key,
+                            0,
+                        )
+                        or 0
+                    ),
+                )
         self.model_call_deferred_frontier_action_keys.discard(action_key)
         if not persistent_infrastructure_retry:
             self.model_call_deferred_frontier_action_metadata.pop(
@@ -36249,7 +36437,7 @@ class MiniSession:
                 "action_id": str(action_id or ""),
                 "reason": str(reason or ""),
                 "retry_identity": list(retry_key),
-                "retry_count": prior_retries + 1,
+                "retry_count": released_retry_count,
                 "max_retries": max_retries,
                 "provider_retry_count": int(
                     metadata.get(
@@ -36258,7 +36446,7 @@ class MiniSession:
                     )
                     or 0
                 ),
-                "scheduler_retry_count": prior_retries + 1,
+                "scheduler_retry_count": released_retry_count,
                 "max_scheduler_retries": max_retries,
                 "scheduler_retries_unbounded": persistent_infrastructure_retry,
                 "llm_failure_kind": str(metadata.get("llm_failure_kind") or ""),
@@ -36437,17 +36625,22 @@ class MiniSession:
             )
         ):
             return False
-        for alias_identity in self._model_call_deferred_static_retry_identities(clean):
-            self.model_call_deferred_static_retry_counts[alias_identity] = max(
-                prior_retries + 1,
-                int(
-                    self.model_call_deferred_static_retry_counts.get(
-                        alias_identity,
-                        0,
-                    )
-                    or 0
-                ),
-            )
+        released_retry_count = prior_retries
+        if not persistent_infrastructure_retry:
+            released_retry_count += 1
+            for alias_identity in self._model_call_deferred_static_retry_identities(
+                clean
+            ):
+                self.model_call_deferred_static_retry_counts[alias_identity] = max(
+                    released_retry_count,
+                    int(
+                        self.model_call_deferred_static_retry_counts.get(
+                            alias_identity,
+                            0,
+                        )
+                        or 0
+                    ),
+                )
         self.model_call_deferred_static_action_ids.discard(clean)
         self._increment_dossier_metric(
             "mini_session_model_call_deferred_static_retry_releases",
@@ -36460,7 +36653,7 @@ class MiniSession:
                 "action_id": clean,
                 "reason": str(reason or ""),
                 "retry_identity": retry_identity,
-                "retry_count": prior_retries + 1,
+                "retry_count": released_retry_count,
                 "max_retries": max_retries,
                 "provider_retry_count": int(
                     metadata.get(
@@ -36469,7 +36662,7 @@ class MiniSession:
                     )
                     or 0
                 ),
-                "scheduler_retry_count": prior_retries + 1,
+                "scheduler_retry_count": released_retry_count,
                 "max_scheduler_retries": max_retries,
                 "scheduler_retries_unbounded": persistent_infrastructure_retry,
                 "llm_failure_kind": str(metadata.get("llm_failure_kind") or ""),

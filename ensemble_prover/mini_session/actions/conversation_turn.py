@@ -27,6 +27,7 @@ from typing import (
     ClassVar,
     Dict,
     FrozenSet,
+    Iterable,
     List,
     Mapping,
     Optional,
@@ -9969,6 +9970,73 @@ class ConversationTurnAction:
         )
         return target, repair_cycle
 
+    _PROVIDER_LANE_LEASE_STATE_RESET: ClassVar[Dict[str, Any]] = {
+        "provider_call_cumulative_elapsed_s": 0.0,
+        "provider_call_cumulative_deadline_monotonic": 0.0,
+        "provider_call_cumulative_wall_exhausted": False,
+        "provider_turn_lane_retired": False,
+    }
+
+    def renew_provider_lane_lease(
+        self,
+        session: Any,
+        retired_lane_identities: Optional[Iterable[str]] = None,
+    ) -> bool:
+        """Grant this action's retired conversation lane a fresh wall lease.
+
+        Spent lease time lives in this action's provider quantum checkpoint
+        and, while this action's role owns the shared conversation, in the
+        conversation's quantum state. Only state stamped with one of the
+        retired lane identities is reset (a state without any stamp is reset
+        only when it is itself flagged exhausted or retired); the sibling
+        role's live lease in the shared conversation is never touched. The
+        cap, transcript, and lane identity are untouched. Returns whether any
+        spent lease was reset.
+        """
+
+        retired = {
+            str(identity or "").strip()
+            for identity in (retired_lane_identities or ())
+            if str(identity or "").strip()
+        }
+        states: List[Dict[str, Any]] = []
+        checkpoint = getattr(self, "_provider_quantum_checkpoint", None)
+        if isinstance(checkpoint, dict) and isinstance(
+            checkpoint.get("state"), dict
+        ):
+            states.append(checkpoint["state"])
+        conv = getattr(session, "conv", None)
+        conv_state = getattr(conv, "_provider_call_quantum_state", None)
+        if (
+            isinstance(conv_state, dict)
+            and str(getattr(conv, "role", "") or "").strip() == self.role
+        ):
+            # Prove/refine share one live Conversation; the inactive sibling's
+            # parked lease belongs to the other action.
+            states.append(conv_state)
+        renewed = False
+        for state in states:
+            identity = str(state.get("provider_turn_lane_identity") or "").strip()
+            flagged = bool(
+                state.get("provider_call_cumulative_wall_exhausted")
+            ) or bool(state.get("provider_turn_lane_retired"))
+            if identity:
+                if retired_lane_identities is not None and identity not in retired:
+                    continue
+            elif not flagged:
+                continue
+            try:
+                spent_s = float(
+                    state.get("provider_call_cumulative_elapsed_s", 0.0) or 0.0
+                )
+            except (TypeError, ValueError, OverflowError):
+                spent_s = 0.0
+            if spent_s <= 0.0 and not flagged:
+                continue
+            state.update(dict(self._PROVIDER_LANE_LEASE_STATE_RESET))
+            renewed = True
+        return renewed
+
     @classmethod
     def _provider_quantum_timing_only_state(
         cls,
@@ -15119,6 +15187,14 @@ class ConversationTurnAction:
             )
             cooperative_provider_yield = bool(
                 getattr(loop_result, "provider_call_quantum_exhausted", False)
+                and (
+                    provider_calls_completed > 0
+                    or getattr(
+                        loop_result,
+                        "provider_finalizer_continuation_exhausted",
+                        False,
+                    )
+                )
                 and llm_failure_kind
                 in {
                     "llm_provider_quantum_exhausted",

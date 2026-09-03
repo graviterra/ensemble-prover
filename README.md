@@ -48,9 +48,10 @@ identifiers are published here; the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** v1.0.2 — dependency-security update. v1.0.1 added
-> credential isolation and the user guide; v1.0.0 remains the Initial Public
-> Release. Releases contain only the Mini Prover runtime.
+> **Release status:** v1.0.3 — provider retry, scheduler recovery, and lane
+> lease reliability hardening. v1.0.2 updated dependency security; v1.0.1
+> added credential isolation and the user guide. Releases contain only the
+> Mini Prover runtime.
 
 ## Documentation
 

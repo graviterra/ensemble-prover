@@ -2975,11 +2975,12 @@ async def _call_llm_with_tools_one_round_impl(
         # the 2026-06-22..25 run corpus. Reserve one extra request window
         # so at least one retry can run; overall turn wall-clock stays
         # bounded by max_turn_elapsed_s via await_with_elapsed_budget.
-        # NOTE: no production construction site currently sets a nonzero
-        # request timeout override (formalization_llm_request_timeout_s
-        # defaults to 0.0 everywhere), so this branch is inert today — the
-        # x2 exists so that wiring the override later cannot resurrect the
-        # zero-retry bug on this path.
+        # This branch is live whenever a role request-timeout override is
+        # configured (``--prover-request-timeout-s`` / ``--refiner-request-
+        # timeout-s`` set ``request_timeout_override_s``); the x2 keeps the
+        # zero-retry failure from resurfacing on this path. The admission gate
+        # in ``models._transport_retry_window_admissible`` must not charge the
+        # backoff sleep against the reserved window, or the x2 is defeated.
         return {
             "request_timeout_override_s": request_timeout_override_f,
             "operation_timeout_override_s": request_timeout_override_f * 2.0,

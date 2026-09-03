@@ -1527,6 +1527,44 @@ _CTX_OVERFLOW_SHRINK = 0.55
 # least one retry with a fresh sub-timeout. See ``_operation_deadline``.
 _OPERATION_DEADLINE_RETRY_HEADROOM = 2.0
 
+# The lease above reserves whole request windows, but the transport backoff
+# sleep and the setup time before the first dispatch are overhead outside
+# that reservation. Requiring a *full* window after them made a 2x lease refuse
+# every retry after a full first-attempt timeout (the remainder was always
+# ``window - delay``), which is precisely the zero-retry failure the headroom
+# exists to prevent. A retry that keeps this fraction of one request window
+# after the sleep is not doomed; anything less is.
+_TRANSPORT_RETRY_MIN_WINDOW_FRACTION = 0.8
+# A fixed one-second backoff can consume an entire short request window. Keep
+# timeout retries below half of the admission margin so a 2x operation lease
+# retains both a useful retry window and scheduling/setup headroom.
+_TRANSPORT_RETRY_MAX_BACKOFF_WINDOW_FRACTION = 0.1
+
+
+def _transport_retry_window_admissible(
+    *,
+    retry_window_after_backoff_s: Optional[float],
+    configured_request_window_s: Optional[float],
+) -> bool:
+    """Whether a transport-timeout retry still owns a usable request window.
+
+    ``retry_window_after_backoff_s`` is the lease remaining once the backoff
+    sleep has been subtracted. The retry is admitted when that covers at least
+    ``_TRANSPORT_RETRY_MIN_WINDOW_FRACTION`` of one configured request window,
+    so the reservation made by ``_OPERATION_DEADLINE_RETRY_HEADROOM`` survives
+    the sleep and setup jitter at any window scale, while a genuinely partial
+    window is still refused before a doomed retry starts. Without a deadline
+    or a configured window there is nothing to reserve and the retry is
+    admitted.
+    """
+
+    if retry_window_after_backoff_s is None or configured_request_window_s is None:
+        return True
+    required_window_s = (
+        float(configured_request_window_s) * _TRANSPORT_RETRY_MIN_WINDOW_FRACTION
+    )
+    return float(retry_window_after_backoff_s) >= required_window_s
+
 
 def _prompt_budget_for_cfg(
     cfg: RoleConfig,
@@ -4668,6 +4706,18 @@ class OpenAICompatClient:
                     configured_request_window = self._configured_request_timeout_s(
                         request_timeout_override_s
                     )
+                    if (
+                        isinstance(
+                            exc,
+                            (asyncio.TimeoutError, httpx.TimeoutException),
+                        )
+                        and configured_request_window is not None
+                    ):
+                        delay = min(
+                            delay,
+                            configured_request_window
+                            * _TRANSPORT_RETRY_MAX_BACKOFF_WINDOW_FRACTION,
+                        )
                     retry_window_after_backoff = (
                         float(deadline) - (time.time() + delay)
                         if deadline
@@ -4681,8 +4731,10 @@ class OpenAICompatClient:
                         )
                         and configured_request_window is not None
                         and retry_window_after_backoff is not None
-                        and retry_window_after_backoff
-                        < configured_request_window
+                        and not _transport_retry_window_admissible(
+                            retry_window_after_backoff_s=retry_window_after_backoff,
+                            configured_request_window_s=configured_request_window,
+                        )
                     ):
                         raise self._retry_deadline_exception(
                             "LLM deadline cannot admit a timed-request retry "

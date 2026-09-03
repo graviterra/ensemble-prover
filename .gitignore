@@ -11,3 +11,23 @@ runs/
 # Python bytecode
 __pycache__/
 *.py[cod]
+
+# Development worktree only (not needed by the public runtime)
+Temp/
+logs/
+.lake/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+scripts/eigenspace_analysis_results/
+scripts/eigenspace_analysis_results_v2/
+lean_project/*
+!lean_project/lean-toolchain
+!lean_project/lakefile.toml
+!lean_project/lake-manifest.json
+!lean_project/LeanProject.lean
+!lean_project/LeanProject/
+lean_project/LeanProject/*
+!lean_project/LeanProject/Basic.lean
