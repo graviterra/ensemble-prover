@@ -4421,6 +4421,7 @@ async def prove_problem_via_session(
                 )
                 return await _mini_session_run_conversation_callback(
                     theory_parent_session=recursive_theory_parent,
+                    reporting_parent_dossier=attempt_dossier,
                     recursive_lane_owner=recursive_attempt_lane_owner,
                     **conv_kwargs,
                 )
@@ -6719,6 +6720,29 @@ class _DeferredTheoryPromotion:
         return True
 
 
+# These counters report work performed; they never grant or consume proving
+# authority. Other tool_metrics (for example finalization headroom) are local
+# control state and must not be inherited from a recursive child.
+_RECURSIVE_CHILD_REPORTING_METRICS = frozenset({
+    "mini_tool_semantic_diagnostic_progress",
+    "mini_tool_semantic_no_progress_detected",
+    "mini_tool_search_cadence_skips",
+    "mini_refine_handoff_compactions",
+    "mini_refine_handoff_compacted_messages",
+    "mini_refine_handoff_compacted_chars",
+    "mini_refine_handoff_compacted_tool_rounds",
+    "mini_in_turn_tool_history_compactions",
+    "mini_in_turn_tool_history_compacted_messages",
+    "mini_in_turn_tool_history_compacted_chars",
+    "mini_in_turn_tool_history_compacted_tool_rounds",
+    "mini_final_no_tools_accepted_proof_fallbacks",
+    "mini_final_no_tools_empty_outputs",
+    "mini_final_no_tools_no_proof_artifacts",
+    "mini_final_no_tools_provider_tool_calls_observed",
+    "mini_final_no_tools_token_exhaustions",
+})
+
+
 async def _mini_session_run_conversation_callback(
     **kwargs: Any,
 ) -> Tuple[bool, Optional[str]]:
@@ -7527,6 +7551,13 @@ async def _mini_session_run_conversation_callback(
     completed_normally = False
     child_run_settled = False
     timed_out = False
+    reporting_parent_dossier = kwargs.get("reporting_parent_dossier")
+    if reporting_parent_dossier is None:
+        reporting_parent_dossier = getattr(theory_parent_session, "dossier", None)
+    reporting_baseline = {
+        key: int(getattr(session.dossier, "tool_metrics", {}).get(key, 0) or 0)
+        for key in _RECURSIVE_CHILD_REPORTING_METRICS
+    }
     try:
         from .recursive_helper_prover import _run_child_with_elapsed_budget
 
@@ -7557,6 +7588,21 @@ async def _mini_session_run_conversation_callback(
                 )
         completed_normally = True
     finally:
+        if (
+            reporting_parent_dossier is not None
+            and reporting_parent_dossier is not session.dossier
+        ):
+            # Prove/refine callbacks reuse a dossier, and a restored child can
+            # already contain earlier totals. Forward only work since entry.
+            child_metrics = getattr(session.dossier, "tool_metrics", {}) or {}
+            reporting_delta = {
+                key: max(0, int(child_metrics.get(key, 0) or 0) - before)
+                for key, before in reporting_baseline.items()
+            }
+            _merge_dossier_tool_metrics(
+                reporting_parent_dossier,
+                SimpleNamespace(tool_metrics=reporting_delta),
+            )
         if lane_ledger is not None and lane_token:
             try:
                 charged_attempts = _recursive_conversation_lane_paid_failure_count(

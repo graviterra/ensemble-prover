@@ -135,6 +135,7 @@ from .provider_tool_protocol import (
     _resolve_mini_leaf_output_cap,
 )
 from .pricing import provider_for_base_url
+from .sampling_controls import API_DEFAULT_TEMPERATURE
 from .proof_dossier import (
     ProofDossier,
     _dossier_statement_root_equivalent,
@@ -24278,12 +24279,15 @@ async def run_mini_recursive_driver(
         provider_raw_root_route_declared = False
         planner_tranche_decision_replayed = bool(
             resuming_this_pass
-            and str(resume_frame.get("phase") or "")
-            in {
-                "plan_compiled",
-                "replan_compiled",
-                "contract_repair_progress",
-            }
+            and (
+                str(resume_frame.get("phase") or "")
+                in {
+                    "plan_compiled",
+                    "replan_compiled",
+                    "contract_repair_progress",
+                }
+                or resume_contract_replan_pending
+            )
         )
         provider_tranche_receipt_active = bool(
             provider_plan_requested or planner_tranche_decision_replayed
@@ -24342,11 +24346,39 @@ async def run_mini_recursive_driver(
                 "plan_compiled",
                 "replan_compiled",
                 "contract_repair_progress",
+                "planner_job_pending",
             }
+        )
+        replaying_contract_replan_filters = bool(
+            resume_contract_replan_pending
+            or (
+                resuming_this_pass
+                and str(resume_frame.get("phase") or "") == "replan_compiled"
+                and resumed_replan_plan is not None
+            )
+        )
+        replaying_contract_repair_prefix = bool(
+            resuming_this_pass
+            and str(resume_frame.get("phase") or "")
+            == "contract_repair_progress"
+        )
+        replaying_committed_contract_filter_prefix = bool(
+            replaying_contract_replan_filters or replaying_contract_repair_prefix
+        )
+        original_filter_stats = (
+            copy.deepcopy(stats)
+            if replaying_committed_contract_filter_prefix
+            else stats
+        )
+        contract_filter_event_sink = (
+            None if replaying_committed_contract_filter_prefix else record_event
         )
 
         def apply_surface_plan_filters(
             candidate_plan: MiniSubgoalPlan,
+            *,
+            filter_stats: MiniRecursiveStats,
+            filter_event_sink: Optional[Callable[[dict[str, Any]], None]],
         ) -> MiniSubgoalPlan:
             """Apply every non-contract planner gate in canonical order."""
 
@@ -24358,15 +24390,15 @@ async def run_mini_recursive_driver(
             filtered = _filter_plan_explicitly_withdrawn_claims(
                 candidate_plan,
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
             )
             filtered = _filter_plan_declared_sanity_contract(
                 filtered,
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
                 require_complete=bool(config.planner_sanity_contract_required),
                 active_target_statements=(_current_active_root_target_statements()),
@@ -24377,8 +24409,8 @@ async def run_mini_recursive_driver(
             filtered = _filter_plan_structurally_vacuous_auxiliary_claims(
                 filtered,
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
                 active_root_targets=_current_active_root_targets(),
             )
@@ -24389,15 +24421,15 @@ async def run_mini_recursive_driver(
                 rejection_counter="plans_self_refuting_sanity_rejected",
                 affect_priority=False,
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
             )
             filtered = _filter_plan_answer_unsafe_claims(
                 filtered,
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
                 suppress_solution_placeholders=suppress_solution_placeholders,
                 opaque_mode=opaque_mode,
@@ -24411,8 +24443,8 @@ async def run_mini_recursive_driver(
                 rejection_counter="plans_wrong_polarity_rejected",
                 active_root_targets=_current_active_root_targets(),
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
             )
             filtered = _apply_heuristic_filter_non_destructively(
@@ -24422,21 +24454,21 @@ async def run_mini_recursive_driver(
                 rejection_counter="plans_unchecked_counterexample_rejected",
                 active_root_targets=_current_active_root_targets(),
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
             )
             filtered = _filter_plan_binder_hostile_claims(
                 filtered,
                 pass_index=pass_index,
-                record_event=record_event,
+                record_event=filter_event_sink,
                 planner_feedback=planner_feedback,
             )
             filtered = _filter_plan_malformed_surface_claims(
                 filtered,
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
                 helpers=get_helpers(),
             )
@@ -24446,8 +24478,8 @@ async def run_mini_recursive_driver(
                 policy_name="oversized_analytic_final",
                 rejection_counter="plans_oversized_analytic_rejected",
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
                 helpers=get_helpers(),
             )
@@ -24457,16 +24489,16 @@ async def run_mini_recursive_driver(
                 policy_name="unverified_analytic_shape",
                 rejection_counter="plans_analytic_worksheet_rejected",
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
                 helpers=get_helpers(),
             )
             return _filter_plan_giveup_retry_claims(
                 filtered,
                 pass_index=pass_index,
-                record_event=record_event,
-                stats=stats,
+                record_event=filter_event_sink,
+                stats=filter_stats,
                 planner_feedback=planner_feedback,
                 helpers=get_helpers(),
                 giveup_blocked_statements=giveup_blocked_statements,
@@ -24476,6 +24508,9 @@ async def run_mini_recursive_driver(
             )
 
         compiled_plan_receipt = plan
+        provider_tranche_original_completion_intent = _plan_completion_intent(
+            compiled_plan_receipt
+        )
         compiled_claim_count = len(plan.claims)
         # Active-root frames (candidate-substituted shells) count as root routes:
         # in opaque mode they are the only winnable terminal-claim form (the
@@ -24538,6 +24573,10 @@ async def run_mini_recursive_driver(
         mismatched_root_names: tuple[str, ...] = ()
         dependency_tainted_root_names: tuple[str, ...] = ()
         in_pass_replan_attempted = False
+        provider_tranche_completion_intent_override: Optional[
+            tuple[Optional[bool], str]
+        ] = None
+        replan_completion_intent: Optional[tuple[Optional[bool], str]] = None
         contract_repair_progress_plan = resumed_contract_repair_plan
         contract_repair_progress_indices = set(resumed_contract_repair_indices)
         contract_repair_progress_attempts = resumed_contract_repair_attempts
@@ -24545,7 +24584,11 @@ async def run_mini_recursive_driver(
             resumed_contract_repair_retry_counts
         )
         if not restored_selected_plan:
-            plan = apply_surface_plan_filters(plan)
+            plan = apply_surface_plan_filters(
+                plan,
+                filter_stats=original_filter_stats,
+                filter_event_sink=contract_filter_event_sink,
+            )
             plan_diagnostics_receipt_version = (
                 _PLAN_DIAGNOSTICS_RECEIPT_VERSION
             )
@@ -24556,7 +24599,7 @@ async def run_mini_recursive_driver(
 
         def record_dependency_contract_event(record: dict[str, Any]) -> None:
             dependency_contract_filter_records.append(dict(record or {}))
-            _record(record_event, record)
+            _record(contract_filter_event_sink, record)
 
         def refresh_helper_contract_evidence(
             identity_coverage: _ContractIdentityCoverage,
@@ -24572,7 +24615,7 @@ async def run_mini_recursive_driver(
             )
             if refreshed:
                 _record(
-                    record_event,
+                    contract_filter_event_sink,
                     {
                         "phase": ("mini_recursive_plan_dependency_contract_identity"),
                         "pass_index": pass_index,
@@ -24735,7 +24778,7 @@ async def run_mini_recursive_driver(
                 if callable(active_target_recorder):
                     active_target_recorder(active_root_targets)
                     _record(
-                        record_event,
+                        contract_filter_event_sink,
                         {
                             "phase": "mini_recursive_active_target",
                             "pass_index": pass_index,
@@ -24759,7 +24802,7 @@ async def run_mini_recursive_driver(
             )
             if provisional_promoted_names or provisional_discarded_names:
                 _record(
-                    record_event,
+                    contract_filter_event_sink,
                     {
                         "phase": "mini_recursive_plan_root_contract",
                         "pass_index": pass_index,
@@ -24832,7 +24875,7 @@ async def run_mini_recursive_driver(
                     and not resolved_route_available
                 )
                 _record(
-                    record_event,
+                    contract_filter_event_sink,
                     {
                         "phase": "mini_recursive_plan_root_contract",
                         "pass_index": pass_index,
@@ -24908,6 +24951,13 @@ async def run_mini_recursive_driver(
                 compiled_root_assembly_claim_names,
                 dependency_identities=contract_dependency_identities,
             )
+            if replaying_contract_repair_prefix:
+                # This phase resumes inside the repair loop.  Surface and
+                # canonicalization work above merely reconstructs its durable
+                # input and was already accounted before the checkpoint.  New
+                # repair attempts and all downstream adjudication remain live.
+                original_filter_stats = stats
+                contract_filter_event_sink = record_event
             if coverage.usable and any(not ok for ok in coverage.claim_elaborated):
 
                 async def publish_contract_repair_progress(
@@ -24960,7 +25010,7 @@ async def run_mini_recursive_driver(
                     client=client,
                     cost_controller=cost_controller,
                     pass_index=pass_index,
-                    stats=stats,
+                    stats=original_filter_stats,
                     record_event=record_dependency_contract_event,
                     operation_timeout_s=max(
                         10.0,
@@ -24994,7 +25044,9 @@ async def run_mini_recursive_driver(
                     # non-contract surface gate stack (polarity, sanity,
                     # counterexample, binder), not just answer safety.
                     original_contract_plan = apply_surface_plan_filters(
-                        repair_candidate_plan
+                        repair_candidate_plan,
+                        filter_stats=original_filter_stats,
+                        filter_event_sink=contract_filter_event_sink,
                     )
                     (
                         canonical_contract_plan,
@@ -25102,7 +25154,7 @@ async def run_mini_recursive_driver(
                         )
                         for index, claim in enumerate(original_contract_plan.claims)
                     )
-                    stats.contract_identity_statement_repairs_succeeded += (
+                    original_filter_stats.contract_identity_statement_repairs_succeeded += (
                         repaired_successes
                     )
                     _record(
@@ -25138,7 +25190,7 @@ async def run_mini_recursive_driver(
             ]
             if failed_root_indices:
                 _record(
-                    record_event,
+                    contract_filter_event_sink,
                     {
                         "phase": "mini_recursive_plan_root_contract",
                         "pass_index": pass_index,
@@ -25320,7 +25372,7 @@ async def run_mini_recursive_driver(
                         and coverage.claim_elaborated[index]
                     )
                 ]
-                stats.contract_identity_root_assembly_substitutions += (
+                original_filter_stats.contract_identity_root_assembly_substitutions += (
                     successful_substitutions
                 )
                 _record(
@@ -25423,7 +25475,7 @@ async def run_mini_recursive_driver(
                     claim_elaborated=coverage.claim_elaborated,
                     pass_index=pass_index,
                     record_event=record_dependency_contract_event,
-                    stats=stats,
+                    stats=original_filter_stats,
                     planner_feedback=planner_feedback,
                     elaboration_diagnostics=coverage.elaboration_diagnostics,
                     per_claim_diagnostics=coverage.per_claim_diagnostics,
@@ -25450,7 +25502,7 @@ async def run_mini_recursive_driver(
                 contract_filter_plan,
                 pass_index=pass_index,
                 record_event=record_dependency_contract_event,
-                stats=stats,
+                stats=original_filter_stats,
                 planner_feedback=planner_feedback,
                 helpers=contract_helpers if not coverage.usable else (),
                 suppress_solution_placeholders=suppress_solution_placeholders,
@@ -25488,7 +25540,7 @@ async def run_mini_recursive_driver(
                 )
                 if suspension_collisions:
                     _record(
-                        record_event,
+                        contract_filter_event_sink,
                         {
                             "phase": "mini_recursive_plan_dependency_contract",
                             "pass_index": pass_index,
@@ -25543,7 +25595,7 @@ async def run_mini_recursive_driver(
             )
             if mismatched_root_names:
                 _record(
-                    record_event,
+                    contract_filter_event_sink,
                     {
                         "phase": "mini_recursive_plan_root_contract",
                         "pass_index": pass_index,
@@ -25583,7 +25635,7 @@ async def run_mini_recursive_driver(
             )
             if dependency_tainted_root_names:
                 _record(
-                    record_event,
+                    contract_filter_event_sink,
                     {
                         "phase": "mini_recursive_plan_root_contract",
                         "pass_index": pass_index,
@@ -25593,7 +25645,7 @@ async def run_mini_recursive_driver(
                 )
             if selected_root_names:
                 _record(
-                    record_event,
+                    contract_filter_event_sink,
                     {
                         "phase": "mini_recursive_plan_root_contract",
                         "pass_index": pass_index,
@@ -25659,6 +25711,11 @@ async def run_mini_recursive_driver(
                     )
                 )
             )
+            # A brokered replan resumes by deterministically reconstructing the
+            # original filter decision.  Its checkpoint already committed that
+            # decision's telemetry, so only the new replan receipt may emit to
+            # the durable sink from this point forward.
+            contract_filter_event_sink = record_event
             # A locally resumed deferred frontier is already-paid work, often
             # just one downstream root whose siblings were exhausted in the
             # prior pass. Do not buy a fresh planner response for that partial
@@ -25695,44 +25752,49 @@ async def run_mini_recursive_driver(
                     # Preserve the original paid plan, not its filtered
                     # derivative. Resume must deterministically reconstruct
                     # the diagnosis and redispatch only the unfinished replan.
-                    await publish_driver_state(
-                        f"recursive_replan_pending:{pass_index}",
-                        phase="plan_compiled",
-                        pass_index=pass_index,
-                        plan=compiled_plan_receipt,
-                        contract_repair_plan=contract_repair_progress_plan,
-                        contract_repair_completed_indices=tuple(
-                            sorted(contract_repair_progress_indices)
-                        ),
-                        contract_repair_attempts_used=(
-                            contract_repair_progress_attempts
-                        ),
-                        contract_repair_retry_counts=(
-                            contract_repair_progress_retry_counts
-                        ),
-                        pass_helper_fingerprints_before=(
-                            verified_helper_fingerprints_before
-                        ),
-                        pass_helpers_accepted_before=pass_helpers_before,
-                    )
-                    stats.contract_identity_in_pass_replans += 1
-                    _record(
-                        record_event,
-                        {
-                            "phase": "mini_recursive_plan_dependency_contract_identity",
-                            "pass_index": pass_index,
-                            "claims_compiled": compiled_claim_count,
-                            "claims_surviving": len(plan.claims),
-                            "root_route_surviving": current_root_route,
-                            "root_route_removed_by_filters": (
-                                root_route_removed_by_filters
+                    if not resume_contract_replan_pending:
+                        await publish_driver_state(
+                            f"recursive_replan_pending:{pass_index}",
+                            phase="plan_compiled",
+                            pass_index=pass_index,
+                            plan=compiled_plan_receipt,
+                            contract_repair_plan=contract_repair_progress_plan,
+                            contract_repair_completed_indices=tuple(
+                                sorted(contract_repair_progress_indices)
                             ),
-                            "declared_route_names_removed_by_filters": list(
-                                declared_route_names_removed_by_filters
+                            contract_repair_attempts_used=(
+                                contract_repair_progress_attempts
                             ),
-                            "verdict": "contract_identity_in_pass_replan_started",
-                        },
-                    )
+                            contract_repair_retry_counts=(
+                                contract_repair_progress_retry_counts
+                            ),
+                            pass_helper_fingerprints_before=(
+                                verified_helper_fingerprints_before
+                            ),
+                            pass_helpers_accepted_before=pass_helpers_before,
+                        )
+                        stats.contract_identity_in_pass_replans += 1
+                        _record(
+                            record_event,
+                            {
+                                "phase": (
+                                    "mini_recursive_plan_dependency_contract_identity"
+                                ),
+                                "pass_index": pass_index,
+                                "claims_compiled": compiled_claim_count,
+                                "claims_surviving": len(plan.claims),
+                                "root_route_surviving": current_root_route,
+                                "root_route_removed_by_filters": (
+                                    root_route_removed_by_filters
+                                ),
+                                "declared_route_names_removed_by_filters": list(
+                                    declared_route_names_removed_by_filters
+                                ),
+                                "verdict": (
+                                    "contract_identity_in_pass_replan_started"
+                                ),
+                            },
+                        )
                     contract_replan_material = {
                         "compiled_plan": _recursive_plan_state_record(
                             compiled_plan_receipt
@@ -26043,6 +26105,12 @@ async def run_mini_recursive_driver(
                         if resumed_replan_plan is not None
                         else None
                     )
+                if replan is not None:
+                    replan_completion_intent = _plan_completion_intent(replan)
+                    if replan_completion_intent[0] is False:
+                        provider_tranche_completion_intent_override = (
+                            replan_completion_intent
+                        )
                 replan_compiled_count = len(replan.claims) if replan else 0
                 replan_declared_root_names = tuple(
                     str(claim.name or "")
@@ -26062,7 +26130,13 @@ async def run_mini_recursive_driver(
                     else ()
                 )
                 replan_filtered = (
-                    apply_surface_plan_filters(replan) if replan is not None else None
+                    apply_surface_plan_filters(
+                        replan,
+                        filter_stats=stats,
+                        filter_event_sink=record_event,
+                    )
+                    if replan is not None
+                    else None
                 )
                 if replan_filtered is None:
                     _record(
@@ -26160,7 +26234,9 @@ async def run_mini_recursive_driver(
                         if repaired_replan != replan_original:
                             # MP-FU-014: replan repairs get the same gates.
                             replan_original = apply_surface_plan_filters(
-                                repaired_replan
+                                repaired_replan,
+                                filter_stats=stats,
+                                filter_event_sink=record_event,
                             )
                             (
                                 replan_canonical,
@@ -26309,7 +26385,9 @@ async def run_mini_recursive_driver(
                             dataclass_replace(
                                 replan_original,
                                 claims=tuple(replan_substituted_claims),
-                            )
+                            ),
+                            filter_stats=stats,
+                            filter_event_sink=record_event,
                         )
                         (
                             replan_canonical,
@@ -26821,6 +26899,14 @@ async def run_mini_recursive_driver(
                         and replan_has_root
                         and not replan_regresses_root_routes
                     )
+                    if (
+                        replan_adopted
+                        and replan_completion_intent is not None
+                        and replan_completion_intent[0] is True
+                    ):
+                        provider_tranche_completion_intent_override = (
+                            replan_completion_intent
+                        )
                     if replan_adopted:
                         plan = replan_filtered
                         compiled_claim_count = replan_compiled_count
@@ -26914,6 +27000,13 @@ async def run_mini_recursive_driver(
                             "verdict": "contract_identity_in_pass_replan_completed",
                         },
                     )
+                    if resume_contract_replan_pending:
+                        # The pending cursor describes the pre-replan plan.  Once
+                        # the exact broker receipt has been deterministically
+                        # consumed, neither its claim index nor its stable claim
+                        # key is meaningful for the replacement route.
+                        resume_frame = {}
+                        resuming_this_pass = False
         # Dependency-contract filtering may infer prerequisites, so compare
         # durable obligations only after the plan has reached its executable
         # form.  A reused planner label with a different statement or
@@ -27018,7 +27111,11 @@ async def run_mini_recursive_driver(
             (
                 plan_complete_declared,
                 plan_complete_source,
-            ) = _plan_completion_intent(plan)
+            ) = (
+                provider_tranche_completion_intent_override
+                if provider_tranche_completion_intent_override is not None
+                else provider_tranche_original_completion_intent
+            )
             continuation_needed = bool(
                 plan_complete_declared is False
                 or (
@@ -33397,6 +33494,14 @@ async def _request_plan(
                 reason="mini_recursive_planner_temperature",
             )
         temperature_metadata = temperature_decision.metadata(client=plan_request_client)
+        visibility_temperature_metadata = dataclass_replace(
+            temperature_decision,
+            value=0.0,
+            phase_key="planner_visibility_recovery",
+            source="visibility_recovery_override",
+            reason="planner_visibility_recovery_requires_visible_json",
+            api_default=False,
+        ).metadata(client=plan_request_client)
         planner_reasoning_effort = mini_reasoning_effort(
             plan_request_client, minimum="high"
         )
@@ -33466,11 +33571,28 @@ async def _request_plan(
             if planner_io_deadlines_enabled
             else None
         )
+        saved_temperature_is_api_default = False
         if saved_request_io_policy is not None:
             planner_io_policy = saved_request_io_policy
             planner_io_max_tokens = int(planner_io_policy["max_tokens"])
             planner_io_reasoning_effort = str(planner_io_policy["reasoning_effort"])
-            planner_io_temperature = planner_io_policy["temperature"]
+            saved_planner_io_temperature = planner_io_policy["temperature"]
+            if (
+                planner_io_stage == "visibility_recovery"
+                and saved_planner_io_temperature != 0.0
+            ):
+                # Visibility recovery is a deterministic protocol stage. A
+                # checkpoint claiming different request bytes is not that
+                # stage and must not be dispatched under its identity.
+                return None
+            saved_temperature_is_api_default = (
+                saved_planner_io_temperature is None
+            )
+            planner_io_temperature = (
+                API_DEFAULT_TEMPERATURE
+                if saved_temperature_is_api_default
+                else saved_planner_io_temperature
+            )
             planner_dispatch_max_attempts = int(
                 planner_io_policy["provider_dispatch_max_attempts"]
             )
@@ -33484,6 +33606,23 @@ async def _request_plan(
                 if planner_io_deadlines_enabled
                 else None
             )
+        if planner_io_stage == "visibility_recovery":
+            planner_io_temperature_metadata = visibility_temperature_metadata
+        elif saved_request_io_policy is not None:
+            planner_io_temperature_metadata = dataclass_replace(
+                temperature_decision,
+                value=(
+                    None
+                    if saved_temperature_is_api_default
+                    else planner_io_temperature
+                ),
+                source="saved_request_io_policy",
+                reason="resumed_exact_planner_request_io_policy",
+                sample_temperature=None,
+                api_default=saved_temperature_is_api_default,
+            ).metadata(client=plan_request_client)
+        else:
+            planner_io_temperature_metadata = temperature_metadata
         if planner_io_deadlines_enabled and planner_budget_remaining_s() <= 0.0:
             _record(
                 record_event,
@@ -33509,7 +33648,7 @@ async def _request_plan(
                     # sent below.
                     max_tokens_override=planner_io_max_tokens,
                     metadata={
-                        **temperature_metadata,
+                        **planner_io_temperature_metadata,
                         "provider_dispatch_max_attempts": (
                             planner_dispatch_max_attempts
                         ),
@@ -33817,7 +33956,7 @@ async def _request_plan(
                     call_kind="chat_raw_json_plan_visibility_recovery",
                     max_tokens_override=visibility_max_tokens,
                     metadata={
-                        **temperature_metadata,
+                        **visibility_temperature_metadata,
                         "phase": "planner_visibility_recovery",
                         "pass_index": int(pass_index),
                         "provider_dispatch_max_attempts": (
@@ -34224,7 +34363,7 @@ async def _request_plan(
                             call_kind="chat_raw_json_plan_visibility_recovery",
                             max_tokens_override=visibility_max_tokens,
                             metadata={
-                                **temperature_metadata,
+                                **visibility_temperature_metadata,
                                 "phase": "planner_visibility_recovery",
                                 "pass_index": int(pass_index),
                                 "provider_dispatch_max_attempts": (

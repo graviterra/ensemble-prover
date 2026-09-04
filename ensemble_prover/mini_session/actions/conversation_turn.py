@@ -1954,6 +1954,8 @@ _TURN_BUDGET_METADATA_KEYS: tuple[str, ...] = (
     "provider_calls_completed",
     "provider_dispatches_started",
     "semantic_no_progress_detected",
+    "search_cadence_violation_batches",
+    "search_cadence_stall_detected",
     "semantic_no_progress_reason",
     "semantic_no_progress_signature",
     "semantic_diagnostic_progress_count",
@@ -8364,6 +8366,8 @@ class ConversationTurnAction:
             "proof_tool_attempts",
             "consecutive_no_formal_progress",
             "consecutive_search_tool_calls",
+            "search_cadence_violation_batches",
+            "search_cadence_stall_detected",
             "semantic_result_counts",
             "semantic_no_progress_detected",
             "semantic_no_progress_reason",
@@ -8404,6 +8408,7 @@ class ConversationTurnAction:
             "tool_repeat_detected",
             "semantic_no_progress_detected",
             "banked_mixed_finalizer_pending",
+            "search_cadence_stall_detected",
             "provider_call_cumulative_wall_exhausted",
             "invalid_prompt_neutralization_pending",
         }
@@ -8419,6 +8424,7 @@ class ConversationTurnAction:
             "consecutive_no_formal_progress",
             "consecutive_search_tool_calls",
             "semantic_diagnostic_progress_count",
+            "search_cadence_violation_batches",
             "semantic_diagnostic_best_phase",
             "semantic_diagnostic_best_goal_count",
             "partial_try_lean_promotions",
@@ -9537,6 +9543,10 @@ class ConversationTurnAction:
     ) -> Dict[str, Any]:
         """Validate one ordinary provider/tool continuation checkpoint."""
 
+        from ensemble_prover.mini_session.turn.tool_loop import (
+            _SEARCH_CADENCE_VIOLATION_BATCH_CAP,
+        )
+
         if raw in (None, {}):
             return {}
         if not isinstance(raw, Mapping) or set(raw) != {
@@ -9559,6 +9569,8 @@ class ConversationTurnAction:
         ):
             raw_state = dict(raw_state)
             raw_state.setdefault("consecutive_search_tool_calls", 0)
+            raw_state.setdefault("search_cadence_violation_batches", 0)
+            raw_state.setdefault("search_cadence_stall_detected", False)
             raw_state.setdefault("provider_chain_resume_target_id", "")
             raw_state.setdefault("invalid_prompt_neutralization_pending", False)
         state = self._bounded_json_copy(
@@ -9715,6 +9727,8 @@ class ConversationTurnAction:
             > int(state.get("max_tool_calls_per_turn"))
             or int(state.get("semantic_diagnostic_progress_count"))
             > int(state.get("max_tool_calls_per_turn"))
+            or int(state.get("search_cadence_violation_batches"))
+            > _SEARCH_CADENCE_VIOLATION_BATCH_CAP
         ):
             raise StateSnapshotCompatibilityError(
                 "conversation provider quantum tool counters are malformed"
@@ -9974,7 +9988,6 @@ class ConversationTurnAction:
         "provider_call_cumulative_elapsed_s": 0.0,
         "provider_call_cumulative_deadline_monotonic": 0.0,
         "provider_call_cumulative_wall_exhausted": False,
-        "provider_turn_lane_retired": False,
     }
 
     def renew_provider_lane_lease(
@@ -10033,6 +10046,10 @@ class ConversationTurnAction:
                 spent_s = 0.0
             if spent_s <= 0.0 and not flagged:
                 continue
+            # Retirement authority belongs to session/outcome metadata, not
+            # the exact provider-quantum checkpoint schema.  Drop a legacy
+            # contaminating flag instead of injecting it into serialized state.
+            state.pop("provider_turn_lane_retired", None)
             state.update(dict(self._PROVIDER_LANE_LEASE_STATE_RESET))
             renewed = True
         return renewed
@@ -11178,6 +11195,63 @@ class ConversationTurnAction:
         ).strip()
         return bool(checkpoint_identity and live_identity == checkpoint_identity)
 
+    def _authenticated_live_provider_resume(self, session: Any) -> bool:
+        """Whether this dispatch resumes the exact already-charged provider lane."""
+
+        conv = getattr(session, "conv", None)
+        raw_state = getattr(conv, "_provider_call_quantum_state", None)
+        if (
+            conv is None
+            or str(getattr(conv, "role", "") or "").strip() != self.role
+            or not isinstance(raw_state, Mapping)
+        ):
+            return False
+        target, repair_cycle = self._provider_quantum_live_binding(session)
+        from ensemble_prover.mini_session.turn.tool_loop import (
+            _provider_turn_lane_identity,
+            _validated_provider_call_quantum_state,
+        )
+
+        validated_state = _validated_provider_call_quantum_state(
+            conv,
+            goal_statement_override=target,
+            dossier=getattr(session, "dossier", None),
+            preserve_recognized_legacy_v1=True,
+            max_tool_calls_per_turn=self.max_tool_calls_per_turn,
+        )
+        lane_identity = str(
+            validated_state.get("provider_turn_lane_identity") or ""
+        ).strip()
+        expected_identity = _provider_turn_lane_identity(
+            conv,
+            target,
+            repair_cycle_identity=repair_cycle,
+            role_override=self.role,
+        )
+        if not lane_identity or lane_identity != expected_identity:
+            return False
+        role_counts = getattr(
+            session,
+            "_conversation_role_turn_counts",
+            {},
+        )
+        exposure_counts = getattr(
+            session,
+            "_conversation_role_turn_exposure_counts",
+            {},
+        )
+        durable_count = (
+            int(role_counts.get(self.role, 0) or 0)
+            if isinstance(role_counts, dict)
+            else 0
+        )
+        exposure_count = (
+            int(exposure_counts.get(self.role, 0) or 0)
+            if isinstance(exposure_counts, dict)
+            else 0
+        )
+        return max(durable_count, exposure_count) > 0
+
     def on_outcome_applied(self, _session: Any, _outcome: MiniOutcome) -> None:
         """Retire the in-memory answer-safety recheck after application."""
         metadata = dict(getattr(_outcome, "metadata", {}) or {})
@@ -11542,6 +11616,12 @@ class ConversationTurnAction:
         # turn. Wrapping the body in try/finally is the only way to
         # guarantee this across the many early returns in the pipeline.
         self._activate_provider_quantum_checkpoint(session)
+        authenticated_provider_resume = self._authenticated_live_provider_resume(
+            session
+        )
+        self._authenticated_provider_resume_for_run = bool(
+            authenticated_provider_resume
+        )
         pending_residual_requests_at_start = _pending_residual_request_snapshot(
             getattr(session, "proof_state", None)
         )
@@ -11666,6 +11746,13 @@ class ConversationTurnAction:
             outcome = await self._run_impl(session)
             merge_verifier_replay_into_live_history()
             metadata = dict(getattr(outcome, "metadata", {}) or {})
+            metadata["conversation_turn_newly_charged"] = bool(
+                not authenticated_provider_resume
+            )
+            metadata["authenticated_provider_resume"] = bool(
+                authenticated_provider_resume
+            )
+            outcome = replace(outcome, metadata=metadata)
             recovered_candidate_accepted = bool(
                 metadata.get("recovered_finalizer_candidate_lean_accepted")
                 or getattr(outcome, "solved", False)
@@ -11817,6 +11904,7 @@ class ConversationTurnAction:
             return outcome
         finally:
             merge_verifier_replay_into_live_history()
+            self._authenticated_provider_resume_for_run = False
             session.last_turn_extraction = None
             session.last_lean_verdict = None
             session.last_llm_content = ""
@@ -11839,15 +11927,16 @@ class ConversationTurnAction:
         )
         from ensemble_prover.mini_temperature import (
             MiniTemperatureContext,
-            refresh_temperature_metadata_from_client,
             resolve_mini_temperature,
         )
+        from ensemble_prover.llm_usage import capture_provider_request_metadata
         from ensemble_prover.proof_dossier import helper_decl_name
         from ensemble_prover.mini_prover import (
             CHECK_LEAN_TOOL,
             SEARCH_MATHLIB_TOOL,
             SEARCH_THEOREMS_TOOL,
             _searcher_supports_static_mathlib,
+            _REPAIR_BOUNDARY,
             _REPAIR_FEEDBACK,
             _REPAIR_CONTINUATION,
             _repair_turn_requires_self_check,
@@ -11885,6 +11974,9 @@ class ConversationTurnAction:
         conv = session.conv
         dossier = session.dossier
         proof_state = session.proof_state
+        authenticated_provider_resume = bool(
+            getattr(self, "_authenticated_provider_resume_for_run", False)
+        )
         answer_safe_pending = dict(self._answer_safe_recheck_pending or {})
         answer_safe_pending_replay = bool(
             answer_safe_pending.get("active") is True
@@ -12262,14 +12354,24 @@ class ConversationTurnAction:
                     None,
                 )
                 if isinstance(appended_graph_prompt, dict):
+                    # The anchor starts this graph target's history segment.
+                    # Keep it as a permanent boundary: same-scope repair
+                    # feedback lives after it, while older root/graph repair
+                    # feedback must never become active again on refresh.
+                    graph_prompt_repair_semantics = _REPAIR_BOUNDARY
                     appended_graph_prompt["content"] = graph_native_prompt
                     appended_graph_prompt["_repair_semantics"] = (
-                        _REPAIR_CONTINUATION
+                        graph_prompt_repair_semantics
                     )
                 else:
+                    # Normal compaction and checkpoints preserve the scoped
+                    # anchor.  If it is missing, durable scope identity alone
+                    # cannot prove that unanchored repair feedback belongs to
+                    # this target, so fail closed with a fresh boundary.
+                    graph_prompt_repair_semantics = _REPAIR_BOUNDARY
                     appended_graph_prompt = conv.append_user(
                         graph_native_prompt,
-                        repair_semantics=_REPAIR_CONTINUATION,
+                        repair_semantics=graph_prompt_repair_semantics,
                     )
                 # The graph-selected packet carries the exact executable
                 # target and its primary proof-idea cognition.  Provider
@@ -12497,6 +12599,35 @@ class ConversationTurnAction:
                 phase_turn,
             )
             session._conversation_role_turn_counts = role_counts
+        elif authenticated_provider_resume:
+            # Cooperative provider quanta are scheduler boundaries inside an
+            # already-started semantic turn.  Retain its logical indices so
+            # physical resumptions cannot consume recursive prove/refine
+            # capacity or advertise an impossible turn number to the model.
+            absolute_turn = max(
+                1,
+                int(getattr(session, "_conversation_turn_count", 0) or 0),
+            )
+            conv_turn_offset = absolute_turn - 1
+            phase_turn = max(
+                1,
+                int(
+                    getattr(
+                        session,
+                        "_conversation_role_turn_counts",
+                        {},
+                    ).get(role_key, 0)
+                    or 0
+                ),
+                int(
+                    getattr(
+                        session,
+                        "_conversation_role_turn_exposure_counts",
+                        {},
+                    ).get(role_key, 0)
+                    or 0
+                ),
+            )
         else:
             conv_turn_offset = int(
                 getattr(session, "_conversation_turn_count", 0)
@@ -13292,6 +13423,7 @@ class ConversationTurnAction:
             if workspace_enabled and session.proof_cache is not None
             else session.proof_cache
         )
+        provider_request_metadata: Dict[str, Any] = {}
         with tool_loop_transaction:
             remaining_turn_elapsed_s = (
                 max(0.0, turn_elapsed_s - (time.monotonic() - loop_started))
@@ -13330,61 +13462,83 @@ class ConversationTurnAction:
                 )
             else:
                 try:
-                    loop_result = await call_llm_with_tools_one_round(
-                        conv=workspace_conv,
-                        client=client,
-                        lean=session.lean,
-                        dossier=workspace_llm_dossier,
-                        authority_dossier=workspace_dossier,
-                        proof_state=workspace_proof_state,
-                        searcher=searcher,
-                        tools_list=tools_list,
-                        use_tools=use_tools,
-                        lean_check_tool_enabled=self.lean_check_tool_enabled,
-                        try_lean_tool_enabled=effective_try_lean_tool_enabled,
-                        compute_examples_tool_enabled=self.compute_examples_tool_enabled,
-                        try_skeleton_tool_enabled=try_skeleton_tool_enabled,
-                        apply_decl_to_goal_tool_enabled=(
-                            self.apply_decl_to_goal_tool_enabled
-                            and not local_micro_theory_suppresses_library
-                        ),
-                        max_tool_calls_per_turn=self.max_tool_calls_per_turn,
-                        proof_state_child_goal_limit=self.proof_state_child_goal_limit,
-                        proof_cache=turn_proof_cache,
-                        temperature_override=(
-                            temperature_decision.provider_temperature_override()
-                        ),
-                        temperature_metadata=temperature_metadata,
-                        trace_prefix=session.trace_prefix,
-                        turn=phase_turn,
-                        goal_statement_override=llm_goal_statement_override,
-                        try_lean_allow_declarations=bool(
-                            formalization_helper_contract
-                        ),
-                        try_lean_require_declaration=bool(
-                            formalization_helper_contract
-                        ),
-                        cost_controller=getattr(session, "cost_controller", None),
-                        cost_role=self.role,
-                        cost_scope=str(getattr(session, "scope", "") or ""),
-                        session_scope=str(
-                            getattr(session, "scope", "") or "problem"
-                        ),
-                        cost_action_id=self.id,
-                        max_tokens_override=max_tokens_override,
-                        max_turn_elapsed_s=(
-                            remaining_turn_elapsed_s
-                            if turn_elapsed_s > 0.0
-                            else 0.0
-                        ),
-                        request_timeout_override_s=(
-                            formalization_request_timeout_s
-                            if formalization_request_timeout_s > 0.0
-                            else None
-                        ),
-                        scheduler_call_quantum_enabled=True,
-                        publication_guard=publication_guard,
-                    )
+                    with capture_provider_request_metadata() as provider_receipt:
+                        try:
+                            loop_result = await call_llm_with_tools_one_round(
+                                conv=workspace_conv,
+                                client=client,
+                                lean=session.lean,
+                                dossier=workspace_llm_dossier,
+                                authority_dossier=workspace_dossier,
+                                proof_state=workspace_proof_state,
+                                searcher=searcher,
+                                tools_list=tools_list,
+                                use_tools=use_tools,
+                                lean_check_tool_enabled=(
+                                    self.lean_check_tool_enabled
+                                ),
+                                try_lean_tool_enabled=(
+                                    effective_try_lean_tool_enabled
+                                ),
+                                compute_examples_tool_enabled=(
+                                    self.compute_examples_tool_enabled
+                                ),
+                                try_skeleton_tool_enabled=(
+                                    try_skeleton_tool_enabled
+                                ),
+                                apply_decl_to_goal_tool_enabled=(
+                                    self.apply_decl_to_goal_tool_enabled
+                                    and not local_micro_theory_suppresses_library
+                                ),
+                                max_tool_calls_per_turn=(
+                                    self.max_tool_calls_per_turn
+                                ),
+                                proof_state_child_goal_limit=(
+                                    self.proof_state_child_goal_limit
+                                ),
+                                proof_cache=turn_proof_cache,
+                                temperature_override=(
+                                    temperature_decision.provider_temperature_override()
+                                ),
+                                temperature_metadata=temperature_metadata,
+                                trace_prefix=session.trace_prefix,
+                                turn=phase_turn,
+                                goal_statement_override=(
+                                    llm_goal_statement_override
+                                ),
+                                try_lean_allow_declarations=bool(
+                                    formalization_helper_contract
+                                ),
+                                try_lean_require_declaration=bool(
+                                    formalization_helper_contract
+                                ),
+                                cost_controller=getattr(
+                                    session, "cost_controller", None
+                                ),
+                                cost_role=self.role,
+                                cost_scope=str(
+                                    getattr(session, "scope", "") or ""
+                                ),
+                                session_scope=str(
+                                    getattr(session, "scope", "") or "problem"
+                                ),
+                                cost_action_id=self.id,
+                                max_tokens_override=max_tokens_override,
+                                max_turn_elapsed_s=(
+                                    remaining_turn_elapsed_s
+                                    if turn_elapsed_s > 0.0
+                                    else 0.0
+                                ),
+                                request_timeout_override_s=(
+                                    formalization_request_timeout_s
+                                    if formalization_request_timeout_s > 0.0
+                                    else None
+                                ),
+                                scheduler_call_quantum_enabled=True,
+                                publication_guard=publication_guard,
+                            )
+                        finally:
+                            provider_request_metadata.update(provider_receipt)
                 except asyncio.CancelledError as cancellation:
                     cancelled_tool_log = list(
                         getattr(cancellation, "mini_tool_call_log", ()) or ()
@@ -13868,10 +14022,7 @@ class ConversationTurnAction:
                         ),
                     },
                 )
-        temperature_metadata = refresh_temperature_metadata_from_client(
-            temperature_metadata,
-            client,
-        )
+        temperature_metadata.update(provider_request_metadata)
         tool_repeat_metadata: Dict[str, Any] = {}
         if bool(getattr(loop_result, "tool_repeat_detected", False)):
             tool_repeat_metadata = {
@@ -13892,6 +14043,12 @@ class ConversationTurnAction:
             ),
             "consecutive_search_tool_calls": int(
                 getattr(loop_result, "consecutive_search_tool_calls", 0) or 0
+            ),
+            "search_cadence_violation_batches": int(
+                getattr(loop_result, "search_cadence_violation_batches", 0) or 0
+            ),
+            "search_cadence_stall_detected": bool(
+                getattr(loop_result, "search_cadence_stall_detected", False)
             ),
             "semantic_diagnostic_progress_count": int(
                 getattr(loop_result, "semantic_diagnostic_progress_count", 0) or 0
@@ -14930,6 +15087,9 @@ class ConversationTurnAction:
                             _format_repair_self_check_missing_feedback(
                                 content,
                                 require_try_lean=effective_try_lean_tool_enabled,
+                                require_declaration=bool(
+                                    formalization_helper_contract
+                                ),
                                 goal_statement=str(getattr(conv, "goal_statement", "") or ""),
                                 theorem_name=str(theorem_name or ""),
                                 role=str(getattr(conv, "role", "") or self.role or "prove"),
@@ -15746,7 +15906,10 @@ class ConversationTurnAction:
             )
         )
         forced_final_no_artifact = bool(
-            getattr(loop_result, "semantic_no_progress_detected", False)
+            (
+                getattr(loop_result, "semantic_no_progress_detected", False)
+                or getattr(loop_result, "search_cadence_stall_detected", False)
+            )
             and not provider_artifact_consumed
         )
         if forced_final_no_artifact:
@@ -16414,6 +16577,8 @@ class ConversationTurnAction:
         repair_self_check_mismatch = False
         repair_self_check_terminal_continuation = False
         repair_gate_error = ""
+        repair_requires_declaration = bool(formalization_helper_contract)
+        repair_submission = content if repair_requires_declaration else proof
         try:
             from ensemble_prover.mini_prover import (
                 _feedback_lemmas_for_answer_safe_recheck,
@@ -16442,15 +16607,17 @@ class ConversationTurnAction:
             repair_self_check_mismatch = (
                 bool(getattr(loop_result, "repair_self_check_required", False))
                 and effective_try_lean_tool_enabled
-                and proof is not None
+                and repair_submission is not None
                 and repair_has_accepted_evidence
                 and not _repair_self_check_matches_submission(
                     repair_self_check_codes,
-                    proof,
+                    repair_submission,
                     (),
                     goal_statement=conv.goal_statement,
                     preamble=conv.preamble,
                     context_lemmas=repair_context_lemmas,
+                    exact_only=repair_requires_declaration,
+                    require_declaration=repair_requires_declaration,
                 )
             )
             if repair_self_check_mismatch:
@@ -16464,17 +16631,22 @@ class ConversationTurnAction:
             repair_gate_error = f"{type(exc).__name__}: {exc}"
         if repair_self_check_mismatch:
             common_payload["repair_self_check_mismatch_observed"] = True
-            if repair_self_check_terminal_continuation:
-                common_payload["repair_self_check_terminal_continuation"] = True
-            else:
-                # A mismatch is useful telemetry, but the final answer-safe
-                # Lean check below is the authority. Blocking here discards
-                # valid repaired proofs whose final body differs from a
-                # scratch probe. The terminal-continuation subset above is
-                # different: it identifies an accepted closed proof body that
-                # was pasted as a prefix and then extended with executable
-                # tactics, so the exact final proof was never checked.
-                repair_self_check_mismatch = False
+            # A declaration-repair turn promises an exact checked artifact;
+            # sharing only a proof body cannot cover a different name or
+            # statement. Ordinary turns may still use accepted scratch probes
+            # and rely on the authoritative final Lean check below.
+            if not repair_requires_declaration:
+                if repair_self_check_terminal_continuation:
+                    common_payload["repair_self_check_terminal_continuation"] = True
+                else:
+                    # A mismatch is useful telemetry, but the final answer-safe
+                    # Lean check below is the authority. Blocking here discards
+                    # valid repaired proofs whose final body differs from a
+                    # scratch probe. The terminal-continuation subset above is
+                    # different: it identifies an accepted closed proof body that
+                    # was pasted as a prefix and then extended with executable
+                    # tactics, so the exact final proof was never checked.
+                    repair_self_check_mismatch = False
 
         verdict = apply_policy_gates(
             extraction,
@@ -16526,6 +16698,7 @@ class ConversationTurnAction:
         if (
             formalization_helper_contract
             and proof is not None
+            and not repair_self_check_mismatch
             and not policy_blocks_turn
         ):
             (
@@ -17456,7 +17629,9 @@ class ConversationTurnAction:
             mismatch_feedback = (
                 _format_self_check_terminal_continuation_feedback()
                 if repair_self_check_terminal_continuation
-                else _format_self_check_mismatch_feedback()
+                else _format_self_check_mismatch_feedback(
+                    require_declaration=repair_requires_declaration
+                )
             )
             if repair_self_check_terminal_continuation:
                 increment = getattr(session, "_increment_dossier_metric", None)
@@ -17470,7 +17645,7 @@ class ConversationTurnAction:
                     dossier,
                     phase=conv.role,
                     turn_index=phase_turn,
-                    proof=proof or "",
+                    proof=str(repair_submission or ""),
                     reason=mismatch_reason,
                     metadata={
                         **dict(graph_native_attempt_metadata or {}),
@@ -18295,7 +18470,7 @@ class ConversationTurnAction:
                 })
                 if forced_final_no_artifact:
                     conv.append_user(
-                        "The semantic proof-tool budget ended this attempt, "
+                        "The tool governor ended this attempt, "
                         "and the required final response contained commentary "
                         "instead of an executable Lean artifact. Do not describe "
                         "a future tool call. On the next scheduled proof lane, "

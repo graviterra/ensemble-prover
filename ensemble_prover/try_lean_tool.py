@@ -66,7 +66,12 @@ TRY_LEAN_TOOL: Dict[str, Any] = {
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "Lean proof body to test, usually starting with `by`.",
+                    "description": (
+                        "Active-turn Lean artifact to test: usually a proof body "
+                        "starting with `by`; when the active prompt requires "
+                        "formalization, use one complete named theorem or lemma "
+                        "declaration instead."
+                    ),
                 },
                 "purpose": {
                     "type": "string",

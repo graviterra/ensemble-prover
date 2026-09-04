@@ -76,6 +76,7 @@ from .mini_recursive_outcome import is_resumable_mini_recursive_yield
 from .llm_usage import (
     CostBudgetController,
     call_with_optional_usage_callback,
+    capture_provider_request_metadata,
     metered_or_plain_call,
     reservation_pricing_targets,
     usage_totals_from_clients,
@@ -121,7 +122,6 @@ from .mini_temperature import (
     MiniPhaseTemperatures,
     MiniTemperatureContext,
     mini_temperature_metadata,
-    refresh_temperature_metadata_from_client,
     resolve_mini_temperature,
 )
 from .solved_export_policy import (
@@ -242,6 +242,7 @@ from .mini_policy import (
     _drop_stale_feedback_before_first_kept_attempt as _drop_stale_feedback_before_first_kept_attempt,
     _extract_rejected_code_fragments as _extract_rejected_code_fragments,
     _extract_transient_goal_targets as _extract_transient_goal_targets,
+    _final_submission_shape_instruction as _final_submission_shape_instruction,
     _format_invalid_helper_stub_with_main_feedback as _format_invalid_helper_stub_with_main_feedback,
     _format_no_proof_extracted_feedback as _format_no_proof_extracted_feedback,
     _format_repackaged_goal_target_feedback as _format_repackaged_goal_target_feedback,
@@ -272,6 +273,7 @@ from .mini_policy import (
     _prompt_safe_tool_call_token as _prompt_safe_tool_call_token,
     _prompt_safe_tool_name_token as _prompt_safe_tool_name_token,
     _provider_safe_chat_message as _provider_safe_chat_message,
+    _provider_safe_chat_messages as _provider_safe_chat_messages,
     _record_repair_policy_attempt as _record_repair_policy_attempt,
     _rejected_fragments_from_feedback_text as _rejected_fragments_from_feedback_text,
     _rejected_fragments_from_latest_feedback as _rejected_fragments_from_latest_feedback,
@@ -723,6 +725,22 @@ _LEAN_BLOCK_RULES = (
 )
 
 
+_DECLARATION_REQUIRED_LEAN_BLOCK_RULES = (
+    "\n"
+    "Every submitted theorem or lemma declaration must be executable Lean "
+    "code with no `sorry`, no `admit`, and no holes. The orchestration "
+    "rejects declarations whose proof leaves a goal open. Prove any "
+    "supporting bridge as a complete auxiliary declaration in the same "
+    "block, before the selected final declaration. Do not use helper stubs "
+    "as an off-ramp from formalizing and proving the selected graph work.\n"
+    "\n"
+    "Avoid refusal/impossibility commentary in the Lean block. If you need a "
+    "Mathlib name, use the available discovery and verification tools to "
+    "confirm exact signatures before citing uncertain names. Do not ask the "
+    "user to run Lean commands for you."
+)
+
+
 _LEAN_AUTHORITY_RULES = (
     "\n"
     "Lean is the only authority on whether your proof is correct. The "
@@ -782,6 +800,29 @@ _LEAN_AUTHORITY_RULES = (
 )
 
 
+_DECLARATION_REQUIRED_LEAN_AUTHORITY_RULES = _LEAN_AUTHORITY_RULES.replace(
+    "the gap in the main proof",
+    "a gap in the selected declaration",
+).replace(
+    "A helper-stub-only response is not a proof of the main proof; do not "
+    "use it as an off-ramp from the active goal.",
+    "A helper-stub-only response does not prove the selected declaration; do "
+    "not use it as an off-ramp from the active graph work.",
+).replace(
+    "Before betting a turn on a hypothesis about how the goal reduces "
+    "(e.g. expecting a particular rewrite to close, or expecting a goal "
+    "to become `refl` after a tactic), frame the hypothesis as a small "
+    "`by ...` body and test it with try_lean first; if try_lean rejects, "
+    "the hypothesis is wrong and you should not submit a proof that "
+    "depends on it.",
+    "Before betting a turn on a hypothesis about how the selected statement "
+    "reduces (for example, expecting a rewrite to close or a goal to become "
+    "`refl`), encode that hypothesis inside the complete named declaration "
+    "and test the entire declaration with `try_lean`; if `try_lean` rejects, "
+    "repair the hypothesis before submitting an artifact that depends on it.",
+)
+
+
 _PROOF_PATCH_RULES = (
     "\n"
     "When a previous long Lean proof attempt is close and the next Lean "
@@ -799,6 +840,59 @@ _PROOF_PATCH_RULES = (
     "The controller will reconstruct the full proof and Lean-check that "
     "patched proof. Use a full fenced `lean` block when the proof structure "
     "has changed globally."
+)
+
+
+_DECLARATION_REQUIRED_PROOF_PATCH_RULES = (
+    "\n"
+    "Declaration-required artifacts must be returned in full in a fenced "
+    "```lean block. Proof-patch syntax is unavailable in this mode because "
+    "it reconstructs only an ordinary proof body and cannot preserve the "
+    "required declaration header and statement. When a long declaration is "
+    "close, retain its unchanged text, apply the local diagnostic repair, "
+    "and submit the complete named declaration artifact to `try_lean`."
+)
+
+
+_PROVER_TURN_SUBMISSION_RULES = (
+    "On each proof turn, submit one Lean proof attempt for the active goal in "
+    "a fenced ```lean block. Do not spend a reply on non-Lean commentary or "
+    "lemma requests. The attempt may include fully proved helper declarations, "
+    "but it must not use helper stubs as an off-ramp from proving the goal. If a "
+    "non-Mathlib fact is needed, manufacture it as a proved local `have` or "
+    "helper declaration in the same Lean block, not as prose."
+)
+
+
+_DECLARATION_REQUIRED_PROVER_TURN_SUBMISSION_RULES = (
+    "On each declaration-required proof turn, submit one complete named Lean "
+    "declaration artifact for the selected graph work in a fenced ```lean "
+    "block. Do not spend a reply on non-Lean commentary or lemma requests. "
+    "The artifact may include fully proved auxiliary declarations before the "
+    "selected final declaration, but it must not use helper stubs as an "
+    "off-ramp from proving that declaration."
+)
+
+
+_REFINER_TURN_SUBMISSION_RULES = (
+    "On each refiner turn, submit one Lean proof attempt for the active goal, "
+    "or a `lean-patch` against the latest attempt. Do not spend a reply on "
+    "non-Lean commentary or lemma requests. The attempt may include fully "
+    "proved helper declarations, but do not use helper stubs as an off-ramp "
+    "from repairing the goal. Do not end at context-availability commentary; "
+    "manufacture or repair the next local fact inside the returned Lean "
+    "artifact."
+)
+
+
+_DECLARATION_REQUIRED_REFINER_TURN_SUBMISSION_RULES = (
+    "On each declaration-required refiner turn, submit the complete revised "
+    "named Lean declaration artifact for the selected graph work. Do not "
+    "spend a reply on non-Lean commentary or lemma requests. The artifact may "
+    "include fully proved auxiliary declarations, but do not use helper stubs "
+    "as an off-ramp from repairing the selected declaration. Do not end at "
+    "context-availability commentary; manufacture or repair the next local "
+    "fact inside the returned declaration artifact."
 )
 
 
@@ -820,12 +914,7 @@ PROVER_SYSTEM = (
     "should repair Lean errors without changing the mathematical route unless "
     "the route is actually wrong.\n"
     "\n"
-    "On each proof turn, submit one Lean proof attempt for the active goal in "
-    "a fenced ```lean block. Do not spend a reply on non-Lean commentary or "
-    "lemma requests. The attempt may include fully proved helper declarations, "
-    "but it must not use helper stubs as an off-ramp from proving the goal. If a "
-    "non-Mathlib fact is needed, manufacture it as a proved local `have` or "
-    "helper declaration in the same Lean block, not as prose."
+    + _PROVER_TURN_SUBMISSION_RULES
     + _ANSWER_PLACEHOLDER_RULES
     + _LEAN_BLOCK_RULES
     + _LEAN_AUTHORITY_RULES
@@ -847,14 +936,8 @@ REFINER_SYSTEM = (
     "\n"
     "Use your fixed refiner turn budget deliberately: repair the formalization "
     "when Lean diagnostics point to a local fix, and pivot only when checked "
-    "evidence shows the route is wrong. On each refiner turn, submit one Lean "
-    "proof attempt for the active goal, or a `lean-patch` against the latest "
-    "attempt. Do not spend a reply on non-Lean commentary or lemma requests. "
-    "The attempt may include fully proved helper declarations, but do not use "
-    "helper stubs as an off-ramp "
-    "from repairing the goal. Do not end at "
-    "context-availability commentary; manufacture or repair the next local "
-    "fact inside the returned Lean artifact."
+    "evidence shows the route is wrong. "
+    + _REFINER_TURN_SUBMISSION_RULES
     + _ANSWER_PLACEHOLDER_RULES
     + _LEAN_BLOCK_RULES
     + _LEAN_AUTHORITY_RULES
@@ -1258,6 +1341,7 @@ class Conversation:
         keep_recent_tool_rounds = max(0, int(keep_recent_tool_rounds or 0))
 
         history = list(self.history or [])
+        repair_active_at_entry = _repair_turn_requires_self_check(self)
         tool_assistant_indices = [
             idx
             for idx, msg in enumerate(history)
@@ -1383,6 +1467,16 @@ class Conversation:
                 "historical evidence: re-run Lean before relying on a signature, "
                 "diagnostic, or proof body."
         )
+        def is_existing_evidence_boundary(msg: Mapping[str, Any]) -> bool:
+            return (
+                str(msg.get("role", "") or "") == "user"
+                and str(msg.get("content", "") or "")
+                == evidence_boundary_content
+            )
+
+        existing_evidence_boundaries = [
+            msg for msg in history if is_existing_evidence_boundary(msg)
+        ]
         evidence_boundary = (
             _user_history_message(
                 evidence_boundary_content,
@@ -1395,6 +1489,29 @@ class Conversation:
             }
             else {"role": "user", "content": evidence_boundary_content}
         )
+        prior_hard_boundary: Optional[Mapping[str, Any]] = None
+        if (
+            not repair_active_at_entry
+            and reason_key in {
+                "llm_failure_retry",
+                "final_no_tools_retry",
+                "in_turn_tool_history",
+            }
+        ):
+            # A refiner handoff is a hard repair boundary. A later retry may
+            # reposition/deduplicate the evidence marker, but must not turn
+            # that boundary into a repair continuation and resurrect stale
+            # pre-handoff repair state.
+            prior_hard_boundary = next(
+                (
+                    msg
+                    for msg in existing_evidence_boundaries
+                    if msg.get(_REPAIR_SEMANTICS_KEY) != _REPAIR_CONTINUATION
+                ),
+                None,
+            )
+            if prior_hard_boundary is not None:
+                evidence_boundary = dict(prior_hard_boundary)
 
         remove_tool_assistant_indices = (
             set(tool_assistant_indices) - kept_tool_assistant_indices
@@ -1435,18 +1552,29 @@ class Conversation:
             # this does not kill an active repair cycle the way a plain EB
             # would. Skipping this left oversized unsanitized tool bodies in
             # the retry prompt.
-            first_tool = tool_assistant_indices[0]
+            history_without_old_boundaries = [
+                msg for msg in history if not is_existing_evidence_boundary(msg)
+            ]
+            redundant_boundaries = existing_evidence_boundaries[1:]
+            first_tool = next(
+                idx
+                for idx, msg in enumerate(history_without_old_boundaries)
+                if msg.get("role") == "assistant" and msg.get("tool_calls")
+            )
             self.history = [
-                *history[:first_tool],
+                *history_without_old_boundaries[:first_tool],
                 evidence_boundary,
                 *(
                     bounded_recent_tool_message(msg)
-                    for msg in history[first_tool:]
+                    for msg in history_without_old_boundaries[first_tool:]
                 ),
             ]
             return {
-                "removed_messages": 0,
-                "removed_chars": 0,
+                "removed_messages": len(redundant_boundaries),
+                "removed_chars": sum(
+                    _history_message_payload_chars(msg)
+                    for msg in redundant_boundaries
+                ),
                 "removed_tool_rounds": 0,
                 "removed_tool_messages": 0,
                 "kept_tool_rounds": len(kept_tool_assistant_indices),
@@ -1454,7 +1582,15 @@ class Conversation:
             }
 
         removed = [msg for idx, msg in enumerate(history) if idx in remove_indices]
-        removed_chars = sum(_history_message_payload_chars(msg) for msg in removed)
+        redundant_boundaries = (
+            existing_evidence_boundaries[1:]
+            if kept_tool_assistant_indices
+            else existing_evidence_boundaries
+        )
+        removed_chars = sum(
+            _history_message_payload_chars(msg)
+            for msg in [*removed, *redundant_boundaries]
+        )
         removed_tool_rounds = sum(
             1
             for msg in removed
@@ -1514,7 +1650,11 @@ class Conversation:
         }:
             summary_msg = _user_history_message(
                 "\n".join(summary_lines),
-                repair_semantics=_REPAIR_CONTINUATION,
+                repair_semantics=(
+                    _REPAIR_BOUNDARY
+                    if prior_hard_boundary is not None
+                    else _REPAIR_CONTINUATION
+                ),
             )
         else:
             summary_msg = {"role": "user", "content": "\n".join(summary_lines)}
@@ -1525,6 +1665,8 @@ class Conversation:
         inserted = False
         evidence_boundary_inserted = False
         for idx, msg in enumerate(history):
+            if is_existing_evidence_boundary(msg):
+                continue
             if idx in remove_indices:
                 if not inserted and idx >= first_removed:
                     compacted.append(summary_msg)
@@ -1538,7 +1680,7 @@ class Conversation:
             compacted.append(summary_msg)
         self.history = compacted
         return {
-            "removed_messages": len(removed),
+            "removed_messages": len(removed) + len(redundant_boundaries),
             "removed_chars": removed_chars,
             "removed_tool_rounds": removed_tool_rounds,
             "removed_tool_messages": removed_tool_messages,
@@ -1696,18 +1838,38 @@ class Conversation:
             "prove": PROVER_SYSTEM,
             "refine": REFINER_SYSTEM,
         }[self.role]
+        if bool(getattr(self, "declaration_required_submission", False)):
+            prompt = prompt.replace(
+                _PROVER_TURN_SUBMISSION_RULES,
+                _DECLARATION_REQUIRED_PROVER_TURN_SUBMISSION_RULES,
+            )
+            prompt = prompt.replace(
+                _REFINER_TURN_SUBMISSION_RULES,
+                _DECLARATION_REQUIRED_REFINER_TURN_SUBMISSION_RULES,
+            )
+            prompt = prompt.replace(
+                _LEAN_BLOCK_RULES,
+                _DECLARATION_REQUIRED_LEAN_BLOCK_RULES,
+            )
+            prompt = prompt.replace(
+                _LEAN_AUTHORITY_RULES,
+                _DECLARATION_REQUIRED_LEAN_AUTHORITY_RULES,
+            )
+            prompt = prompt.replace(
+                _PROOF_PATCH_RULES,
+                _DECLARATION_REQUIRED_PROOF_PATCH_RULES,
+            )
+            prompt = prompt.replace(
+                _HELPER_RULES,
+                _DECLARATION_REQUIRED_HELPER_RULES,
+            )
+            prompt += _DECLARATION_REQUIRED_TURN_RULES
         if not _conversation_should_redact_solution_refs(self):
             prompt = prompt.replace(_ANSWER_PLACEHOLDER_RULES, "")
             prompt = prompt.replace(
                 ", including `_solution` names",
                 "",
             )
-        if bool(getattr(self, "declaration_required_submission", False)):
-            prompt = prompt.replace(
-                _HELPER_RULES,
-                _DECLARATION_REQUIRED_HELPER_RULES,
-            )
-            prompt += _DECLARATION_REQUIRED_TURN_RULES
         if not bool(getattr(self, "allow_helper_decomposition", True)):
             prompt += (
                 "\n\nDirect-proof sub-session: do not emit `Proposed helper "
@@ -1808,11 +1970,10 @@ class Conversation:
         else:
             redact_solution_refs = _conversation_should_redact_solution_refs(self)
             msgs.extend(
-                _provider_safe_chat_message(
-                    msg,
+                _provider_safe_chat_messages(
+                    self.history,
                     redact_solution_refs=redact_solution_refs,
                 )
-                for msg in self.history
             )
         return msgs
 
@@ -5677,36 +5838,34 @@ async def run_conversation(
                     request_messages,
                     dossier,
                 )
-                try:
-                    return await _metered_or_plain_call_compat(
-                        cost_controller=cost_controller,
-                        client=client,
-                        messages=request_messages,
-                        role=str(getattr(conv, "role", "") or ""),
-                        scope="legacy",
-                        action_id=f"legacy_{getattr(conv, 'role', 'prove')}",
-                        call_kind=kind,
-                        tools=list(tools_for_cost or ()),
-                        # This is the same phase-local value passed to the
-                        # provider call.  A role's configured maximum is a
-                        # model capability and must not inflate reservation
-                        # liability for a deliberately bounded phase.
-                        max_tokens_override=max_tokens_override,
-                        metadata=temperature_call_metadata,
-                        retryable_exception_no_charge=lambda exc: (
-                            llm_retry_count < 1
-                            and _is_retryable_llm_exception(exc)
-                        ),
-                        invoke=lambda usage_callback: call(usage_callback),
-                    )
-                finally:
-                    temperature_call_metadata = refresh_temperature_metadata_from_client(
-                        temperature_call_metadata,
-                        client,
-                    )
-                    updater = getattr(recorder, "update_metadata", None)
-                    if callable(updater):
-                        updater(temperature_call_metadata)
+                with capture_provider_request_metadata() as provider_receipt:
+                    try:
+                        return await _metered_or_plain_call_compat(
+                            cost_controller=cost_controller,
+                            client=client,
+                            messages=request_messages,
+                            role=str(getattr(conv, "role", "") or ""),
+                            scope="legacy",
+                            action_id=f"legacy_{getattr(conv, 'role', 'prove')}",
+                            call_kind=kind,
+                            tools=list(tools_for_cost or ()),
+                            # This is the same phase-local value passed to the
+                            # provider call.  A role's configured maximum is a
+                            # model capability and must not inflate reservation
+                            # liability for a deliberately bounded phase.
+                            max_tokens_override=max_tokens_override,
+                            metadata=temperature_call_metadata,
+                            retryable_exception_no_charge=lambda exc: (
+                                llm_retry_count < 1
+                                and _is_retryable_llm_exception(exc)
+                            ),
+                            invoke=lambda usage_callback: call(usage_callback),
+                        )
+                    finally:
+                        temperature_call_metadata.update(provider_receipt)
+                        updater = getattr(recorder, "update_metadata", None)
+                        if callable(updater):
+                            updater(temperature_call_metadata)
 
             try:
                 return await _call_once()
@@ -6077,9 +6236,17 @@ async def run_conversation(
                                     "content": (
                                         "The previous final response used a top-level "
                                         f"Lean `{forbidden_final_command}` command, which "
-                                        "is not an executable proof body. Do not inspect "
-                                        "the environment or leave placeholders. Submit "
-                                        "one fenced Lean proof block for the active goal."
+                                        "is not an executable artifact for this turn. Do "
+                                        "not inspect the environment or leave placeholders. "
+                                        + _final_submission_shape_instruction(
+                                            require_declaration=bool(
+                                                getattr(
+                                                    conv,
+                                                    "declaration_required_submission",
+                                                    False,
+                                                )
+                                            )
+                                        )
                                     ),
                                 }
                             )
@@ -6127,6 +6294,13 @@ async def run_conversation(
                             conv.append_user(
                                 _repair_self_check_required_message(
                                     require_try_lean=effective_try_lean_tool_enabled,
+                                    require_declaration=bool(
+                                        getattr(
+                                            conv,
+                                            "declaration_required_submission",
+                                            False,
+                                        )
+                                    ),
                                     role=str(getattr(conv, "role", "") or "prove"),
                                 ),
                                 repair_semantics=_REPAIR_FEEDBACK,
@@ -6189,6 +6363,13 @@ async def run_conversation(
                                 "role": "user",
                                 "content": _repair_self_check_required_message(
                                     require_try_lean=effective_try_lean_tool_enabled,
+                                    require_declaration=bool(
+                                        getattr(
+                                            conv,
+                                            "declaration_required_submission",
+                                            False,
+                                        )
+                                    ),
                                     role=str(getattr(conv, "role", "") or "prove"),
                                 ),
                             }
@@ -7085,6 +7266,13 @@ async def run_conversation(
                     conv.append_user(
                         _repair_self_check_required_message(
                             require_try_lean=effective_try_lean_tool_enabled,
+                            require_declaration=bool(
+                                getattr(
+                                    conv,
+                                    "declaration_required_submission",
+                                    False,
+                                )
+                            ),
                             role=str(getattr(conv, "role", "") or "prove"),
                         ),
                         repair_semantics=_REPAIR_FEEDBACK,
@@ -7545,6 +7733,13 @@ async def run_conversation(
                         _format_repair_self_check_missing_feedback(
                             content,
                             require_try_lean=effective_try_lean_tool_enabled,
+                            require_declaration=bool(
+                                getattr(
+                                    conv,
+                                    "declaration_required_submission",
+                                    False,
+                                )
+                            ),
                             goal_statement=str(
                                 getattr(conv, "goal_statement", "") or ""
                             ),
@@ -15588,6 +15783,63 @@ async def _main_async(args: argparse.Namespace) -> int:
                             )
                         )
                         usage_summary = {**usage_summary, **fallback_usage}
+                        if bool(usage_summary.get("llm_cost_budget_enabled")):
+                            max_cost_usd = max(
+                                0.0,
+                                float(usage_summary.get("max_cost_usd", 0.0) or 0.0),
+                            )
+                            committed_cost_usd = max(
+                                0.0,
+                                float(
+                                    usage_summary.get(
+                                        "llm_budget_committed_cost_usd",
+                                        0.0,
+                                    )
+                                    or 0.0
+                                ),
+                            )
+                            financially_unspent_usd = max(
+                                0.0,
+                                max_cost_usd - committed_cost_usd,
+                            )
+                            accounting_incomplete = bool(
+                                usage_summary.get("llm_cost_accounting_incomplete")
+                            )
+                            exact_limit_reached = bool(
+                                committed_cost_usd >= max_cost_usd
+                            )
+                            # A zero-event fallback replaces the controller's
+                            # accounting authority, so its availability fields
+                            # must change in the same transaction. Opaque spend
+                            # cannot safely leave a cost-governed run open.
+                            cost_budget_unavailable = bool(
+                                exact_limit_reached or accounting_incomplete
+                            )
+                            terminal_cost_reason = (
+                                "llm_cost_budget_exhausted"
+                                if exact_limit_reached
+                                else "llm_cost_budget_unknown_pricing"
+                                if accounting_incomplete
+                                else ""
+                            )
+                            usage_summary.update(
+                                {
+                                    "llm_budget_remaining_usd": (
+                                        0.0
+                                        if cost_budget_unavailable
+                                        else financially_unspent_usd
+                                    ),
+                                    "llm_budget_unspent_usd": (
+                                        financially_unspent_usd
+                                    ),
+                                    "llm_cost_budget_exhausted": (
+                                        cost_budget_unavailable
+                                    ),
+                                    "llm_cost_budget_terminal_reason": (
+                                        terminal_cost_reason
+                                    ),
+                                }
+                            )
                     cost_failure_reason = str(
                         usage_summary.get("llm_cost_budget_terminal_reason")
                         or ""

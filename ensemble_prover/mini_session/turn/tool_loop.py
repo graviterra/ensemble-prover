@@ -9,6 +9,7 @@ result instead of mutating proof acceptance state.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 import json
@@ -38,11 +39,13 @@ from ...mini_lean_extract import (
     _strip_lean_comments,
 )
 from ...models import (
+    normalize_tool_calls,
     provider_defer_record_from_exception,
     response_output_items,
     response_reasoning_items,
     response_reasoning_text,
 )
+from ...pricing import base_url_matches_provider
 from ...runtime_context import (
     RuntimeCapabilityRevokedError,
     mark_runtime_owned_callback,
@@ -53,7 +56,10 @@ from ...mini_policy import (
     _REPAIR_CONTINUATION,
     _bind_provider_continuation_policy_receipt,
     _conversation_should_redact_solution_refs,
+    _final_submission_shape_instruction,
     _merge_repair_self_check_non_verdict_status,
+    _provider_chat_reasoning_envelope_is_valid,
+    _provider_chat_tool_calls_envelope_is_valid,
     _repair_self_check_non_verdict_is_compliant,
     _responses_output_matches_advertised_tool_calls,
     _user_history_message,
@@ -100,6 +106,69 @@ class SelectedProofIdeaDispatchContextError(RuntimeError):
 
     mini_selected_proof_idea_context_error = True
 
+
+def _openrouter_exact_continuation_message(
+    *,
+    client: Any,
+    response_data: Any,
+    calls_to_run: Sequence[Mapping[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Return an exact provider-authored tool turn when it is replayable.
+
+    Structured OpenRouter reasoning is signed for the complete assistant
+    message. It is only reusable when every provider call is well formed,
+    uniquely identified, and will be executed in the original order.
+    """
+
+    cfg = getattr(client, "cfg", None)
+    if not base_url_matches_provider(
+        str(getattr(cfg, "base_url", "") or ""),
+        "openrouter",
+    ):
+        return None
+    if not isinstance(response_data, dict):
+        return None
+    choices = response_data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    raw_message = first.get("message") if isinstance(first, dict) else None
+    if not isinstance(raw_message, dict):
+        return None
+    if str(raw_message.get("role") or "") != "assistant":
+        return None
+    if not _provider_chat_reasoning_envelope_is_valid(raw_message):
+        return None
+    raw_calls = raw_message.get("tool_calls")
+    if not _provider_chat_tool_calls_envelope_is_valid(raw_message):
+        return None
+    assert isinstance(raw_calls, list)
+    normalized_raw_calls = normalize_tool_calls(raw_calls)
+    normalized_run_calls = normalize_tool_calls(list(calls_to_run))
+    if (
+        len(normalized_raw_calls) != len(raw_calls)
+        or normalized_raw_calls != normalized_run_calls
+    ):
+        return None
+    call_ids = [str(call.get("id") or "") for call in normalized_raw_calls]
+    if any(not call_id for call_id in call_ids) or len(set(call_ids)) != len(call_ids):
+        return None
+    try:
+        json.dumps(raw_message, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return {
+        key: copy.deepcopy(raw_message[key])
+        for key in (
+            "role",
+            "content",
+            "reasoning_content",
+            "reasoning",
+            "reasoning_details",
+            "tool_calls",
+        )
+        if key in raw_message
+    }
 
 _FINALIZER_TACTIC_HEADS = frozenset(
     {
@@ -763,6 +832,8 @@ class ToolLoopResult:
     proof_tool_attempts: int = 0
     consecutive_no_formal_progress: int = 0
     consecutive_search_tool_calls: int = 0
+    search_cadence_violation_batches: int = 0
+    search_cadence_stall_detected: bool = False
     semantic_no_progress_detected: bool = False
     semantic_no_progress_reason: str = ""
     semantic_no_progress_signature: str = ""
@@ -856,6 +927,10 @@ _PROVIDER_SETTLEMENT_RESERVE_MIN_S = 5.0
 _PROVIDER_SETTLEMENT_RESERVE_MAX_S = 120.0
 
 _SEARCH_CADENCE_TOOL_NAMES = frozenset({"search_mathlib", "search_theorems"})
+# The first rejected batch supplies guidance; the next provider response must
+# act on it. Count batches, not calls: a provider has not seen receipts for
+# earlier searches within the same response.
+_SEARCH_CADENCE_VIOLATION_BATCH_CAP = 2
 _FORMAL_CADENCE_TOOL_NAMES = frozenset(
     {
         "apply_decl_to_goal",
@@ -2364,6 +2439,8 @@ async def _call_llm_with_tools_one_round_impl(
     proof_tool_attempts = 0
     consecutive_no_formal_progress = 0
     consecutive_search_tool_calls = 0
+    search_cadence_violation_batches = 0
+    search_cadence_stall_detected = False
     semantic_result_counts: dict[str, int] = {}
     semantic_no_progress_detected = False
     semantic_no_progress_reason = ""
@@ -2734,6 +2811,15 @@ async def _call_llm_with_tools_one_round_impl(
             ),
         )
         raw_semantic_counts = quantum_state.get("semantic_result_counts", {})
+        search_cadence_violation_batches = min(
+            _SEARCH_CADENCE_VIOLATION_BATCH_CAP,
+            _nonnegative_int(
+                quantum_state.get("search_cadence_violation_batches", 0)
+            ),
+        )
+        search_cadence_stall_detected = bool(
+            quantum_state.get("search_cadence_stall_detected", False)
+        )
         if isinstance(raw_semantic_counts, Mapping):
             semantic_result_counts = {
                 str(signature or "")[:256]: min(
@@ -3933,8 +4019,6 @@ async def _call_llm_with_tools_one_round_impl(
                 replaying_persisted_tool
                 and durable_progress_tool_replay_pending
             )
-            retrieval_only_provider_batch = False
-            provider_batch_tool_count = 0
             provider_call_started = (
                 0.0 if replaying_persisted_tool else time.monotonic()
             )
@@ -4219,18 +4303,6 @@ async def _call_llm_with_tools_one_round_impl(
                         "deepseek_simple_xml_tool_call_normalized"
                     )
                     provider_protocol_original_content = str(content or "")
-            if not replaying_persisted_tool and tool_calls:
-                provider_batch_tool_names = {
-                    str((call.get("function") or {}).get("name", "") or "")
-                    for call in tool_calls
-                    if isinstance(call, Mapping)
-                }
-                provider_batch_tool_count = len(tool_calls)
-                retrieval_only_provider_batch = bool(
-                    provider_batch_tool_names
-                    and provider_batch_tool_names
-                    <= {"search_mathlib", "search_theorems", "check_lean"}
-                )
             sent_messages = list(actual_messages or [])
             if not replaying_persisted_tool:
                 provider_calls_completed += 1
@@ -4425,9 +4497,13 @@ async def _call_llm_with_tools_one_round_impl(
                                 "content": (
                                     "The previous final response used a top-level "
                                     f"Lean `{forbidden_final_command}` command, which "
-                                    "is not an executable proof body. Do not inspect "
-                                    "the environment or leave placeholders. Submit "
-                                    "one fenced Lean proof block for the active goal."
+                                    "is not an executable artifact for this turn. Do "
+                                    "not inspect the environment or leave placeholders. "
+                                    + _final_submission_shape_instruction(
+                                        require_declaration=(
+                                            try_lean_require_declaration
+                                        )
+                                    )
                                 ),
                             }
                         )
@@ -4482,6 +4558,7 @@ async def _call_llm_with_tools_one_round_impl(
                         )
                         reminder = message_fn(
                             require_try_lean=try_lean_tool_enabled,
+                            require_declaration=try_lean_require_declaration,
                             role=str(getattr(conv, "role", "") or "prove"),
                         )
                         conv.history.append(
@@ -4616,11 +4693,10 @@ async def _call_llm_with_tools_one_round_impl(
                             (
                                 "You repeated a tool call after correction. Tools are "
                                 "now disabled for this attempt. Use the results already "
-                                "present and write the Lean proof now. Reply with exactly "
-                                "ONE fenced ```lean block containing at most named helper "
-                                "declarations followed by exactly ONE main proof (a single "
-                                "`example : … := by …` or bare `by …` block). Multiple "
-                                "main-proof blocks are rejected unchecked."
+                                "present and write the active Lean artifact now. "
+                                + _final_submission_shape_instruction(
+                                    require_declaration=try_lean_require_declaration
+                                )
                             ),
                             repair_semantics=_REPAIR_CONTINUATION,
                         )
@@ -4764,13 +4840,19 @@ async def _call_llm_with_tools_one_round_impl(
                             (
                                 "The remaining repair tool slot is reserved for "
                                 "`try_lean`. Do not call other tools now; call "
-                                "`try_lean` on the revised proof."
+                                "`try_lean` on the revised "
+                                + (
+                                    "complete named declaration."
+                                    if try_lean_require_declaration
+                                    else "proof."
+                                )
                             ),
                             repair_semantics=_REPAIR_CONTINUATION,
                         )
                     else:
                         reminder = message_fn(
                             require_try_lean=try_lean_tool_enabled,
+                            require_declaration=try_lean_require_declaration,
                             role=str(getattr(conv, "role", "") or "prove"),
                         )
                         reminder_message = {"role": "user", "content": reminder}
@@ -4794,7 +4876,8 @@ async def _call_llm_with_tools_one_round_impl(
 
             # Append the assistant's tool-call message containing only the
             # calls we'll actually execute (B1 invariant).
-            batch_tool_log_start = len(tool_call_log)
+            batch_search_cadence_skipped = False
+            batch_formal_cadence_requested = False
             assistant_tool_content = (
                 ""
                 if repair_self_check_required
@@ -4841,31 +4924,68 @@ async def _call_llm_with_tools_one_round_impl(
                     },
                 }
 
-            advertised_tool_calls = [
-                advertised_tool_call(tc, index)
-                for index, tc in enumerate(calls_to_run)
-            ]
-
-            assistant_message = {
-                "role": "assistant",
-                "content": assistant_tool_content,
-                "tool_calls": advertised_tool_calls,
-            }
-            reasoning_content = response_reasoning_text(response_data)
-            if reasoning_content:
-                # DeepSeek requires this exact field on every continuation of
-                # a thinking-mode tool-call turn. It remains provider state,
-                # never proof evidence or user-visible content.
-                assistant_message["reasoning_content"] = reasoning_content
-            reasoning_items = response_reasoning_items(response_data)
-            if reasoning_items:
-                assistant_message["_responses_reasoning_items"] = reasoning_items
-            output_items = response_output_items(response_data)
-            if output_items and _responses_output_matches_advertised_tool_calls(
-                output_items,
-                advertised_tool_calls,
-            ):
-                assistant_message["_responses_output_items"] = output_items
+            exact_openrouter_message = _openrouter_exact_continuation_message(
+                client=client,
+                response_data=response_data,
+                calls_to_run=calls_to_run,
+            )
+            if exact_openrouter_message is not None:
+                assistant_message = exact_openrouter_message
+                advertised_tool_calls = assistant_message["tool_calls"]
+                for call in advertised_tool_calls:
+                    call_id = str(call.get("id") or "")
+                    used_tool_call_ids.add(call_id)
+                    safe_tool_call_ids.append(call_id)
+            else:
+                advertised_tool_calls = [
+                    advertised_tool_call(tc, index)
+                    for index, tc in enumerate(calls_to_run)
+                ]
+                assistant_message = {
+                    "role": "assistant",
+                    "content": assistant_tool_content,
+                    "tool_calls": advertised_tool_calls,
+                }
+                cfg = getattr(client, "cfg", None)
+                raw_openrouter_message = bool(
+                    base_url_matches_provider(
+                        str(getattr(cfg, "base_url", "") or ""),
+                        "openrouter",
+                    )
+                    and isinstance(response_data, dict)
+                    and isinstance(response_data.get("choices"), list)
+                    and response_data.get("choices")
+                    and isinstance(response_data["choices"][0], dict)
+                    and isinstance(
+                        response_data["choices"][0].get("message"),
+                        dict,
+                    )
+                    and (
+                        "reasoning_content"
+                        in response_data["choices"][0]["message"]
+                        or "reasoning"
+                        in response_data["choices"][0]["message"]
+                        or "reasoning_details"
+                        in response_data["choices"][0]["message"]
+                    )
+                )
+                reasoning_content = response_reasoning_text(response_data)
+                if reasoning_content and not raw_openrouter_message:
+                    # Direct DeepSeek requires this exact field on every
+                    # continuation of a thinking-mode tool-call turn. An
+                    # incomplete OpenRouter batch cannot reuse structured
+                    # reasoning: flattening it onto reconstructed calls would
+                    # forge a continuation the provider never authored.
+                    assistant_message["reasoning_content"] = reasoning_content
+                reasoning_items = response_reasoning_items(response_data)
+                if reasoning_items:
+                    assistant_message["_responses_reasoning_items"] = reasoning_items
+                output_items = response_output_items(response_data)
+                if output_items and _responses_output_matches_advertised_tool_calls(
+                    output_items,
+                    advertised_tool_calls,
+                ):
+                    assistant_message["_responses_output_items"] = output_items
             _bind_provider_continuation_policy_receipt(assistant_message, conv)
             conv.history.append(assistant_message)
 
@@ -5007,14 +5127,27 @@ async def _call_llm_with_tools_one_round_impl(
                         replaying_durable_progress_tool and pending_tool_replay
                     )
                 args, args_parse_error = parse_tool_arguments(raw_arg_value)
+                if name in _FORMAL_CADENCE_TOOL_NAMES and not args_parse_error:
+                    # An infrastructure deferral of a well-formed formal call
+                    # is not refusal to follow cadence guidance.
+                    batch_formal_cadence_requested = True
                 tool_call_started = time.monotonic()
                 promoted_state_status: Optional[str] = None
                 compute_runner_invoked = False
                 search_runner_invoked = False
+                formal_runner_invoked = False
                 runner_raised = False
                 runner_deferred_before_launch = False
                 search_cadence_skipped = False
                 accepted_try_lean_code = ""
+
+                async def invoke_formal_runner(
+                    runner: Callable[..., Any], *runner_args: Any, **runner_kwargs: Any
+                ) -> Any:
+                    nonlocal formal_runner_invoked
+                    formal_runner_invoked = True
+                    return await runner(*runner_args, **runner_kwargs)
+
                 try:
                     if args_parse_error:
                         if name == "try_lean" and try_lean_tool_enabled:
@@ -5033,6 +5166,7 @@ async def _call_llm_with_tools_one_round_impl(
                         and consecutive_search_tool_calls >= search_cadence_cap
                     ):
                         search_cadence_skipped = True
+                        batch_search_cadence_skipped = True
                         _increment_tool_metric(
                             "mini_tool_search_cadence_skips",
                             1,
@@ -5280,7 +5414,8 @@ async def _call_llm_with_tools_one_round_impl(
                         )
                         accepted_code_out: dict[str, str] = {}
                         result_text = await await_with_elapsed_budget(
-                            primitives["run_try_lean_tool"](
+                            invoke_formal_runner(
+                                primitives["run_try_lean_tool"],
                                 lean,
                                 goal_statement=tool_goal_statement,
                                 preamble=conv.preamble,
@@ -5615,7 +5750,8 @@ async def _call_llm_with_tools_one_round_impl(
                             else []
                         )
                         result_text = await await_with_elapsed_budget(
-                            primitives["run_certify_counterexample_tool"](
+                            invoke_formal_runner(
+                                primitives["run_certify_counterexample_tool"],
                                 lean,
                                 goal_statement=tool_goal_statement,
                                 preamble=str(
@@ -5670,7 +5806,8 @@ async def _call_llm_with_tools_one_round_impl(
                         )
                     elif name == "try_skeleton" and try_skeleton_tool_enabled:
                         result_text = await await_with_elapsed_budget(
-                            primitives["run_try_skeleton_tool"](
+                            invoke_formal_runner(
+                                primitives["run_try_skeleton_tool"],
                                 lean,
                                 goal_statement=tool_goal_statement,
                                 preamble=conv.preamble,
@@ -5706,7 +5843,8 @@ async def _call_llm_with_tools_one_round_impl(
                             else []
                         )
                         result_text = await await_with_elapsed_budget(
-                            primitives["run_apply_decl_to_goal_tool"](
+                            invoke_formal_runner(
+                                primitives["run_apply_decl_to_goal_tool"],
                                 lean,
                                 preamble=conv.preamble,
                                 context_lemmas=context_lemmas,
@@ -5736,6 +5874,12 @@ async def _call_llm_with_tools_one_round_impl(
                         result_text = f"Unknown tool: {safe_name}"
                 except _TurnElapsedBudgetExhausted:
                     record_elapsed_budget_exhausted()
+                    if formal_runner_invoked:
+                        # The provider obeyed the requested cadence even when
+                        # its formal attempt outlived this action's wall lease.
+                        # A pre-dispatch expiry never enters the wrapper.
+                        consecutive_search_tool_calls = 0
+                        search_cadence_violation_batches = 0
                     if (
                         name in _SEARCH_CADENCE_TOOL_NAMES
                         and search_runner_invoked
@@ -6129,6 +6273,7 @@ async def _call_llm_with_tools_one_round_impl(
                 if tool_was_dispatched:
                     if name in _FORMAL_CADENCE_TOOL_NAMES:
                         consecutive_search_tool_calls = 0
+                        search_cadence_violation_batches = 0
                     elif name in _SEARCH_CADENCE_TOOL_NAMES:
                         consecutive_search_tool_calls = min(
                             max(0, int(max_tool_calls_per_turn or 0)),
@@ -6718,36 +6863,6 @@ async def _call_llm_with_tools_one_round_impl(
             # is the only safe point to compact within an active provider
             # transcript: never split the assistant/tool protocol pair, and
             # retain the latest actionable Lean evidence for the next round.
-            batch_tool_records = tool_call_log[batch_tool_log_start:]
-            retrieval_batch_settled = bool(
-                retrieval_only_provider_batch
-                and provider_batch_tool_count > 0
-                and len(advertised_tool_calls) == provider_batch_tool_count
-                and len(batch_tool_records) == provider_batch_tool_count
-                and not pending_tool_replay
-                and not llm_turn_elapsed_budget_exhausted
-                and not llm_failure_kind
-                and all(
-                    str(record.get("name") or "")
-                    in {"search_mathlib", "search_theorems", "check_lean"}
-                    and record.get("execution_disposition")
-                    == "completed_semantic"
-                    and not record.get("skipped_reason")
-                    for record in batch_tool_records
-                )
-            )
-            if retrieval_batch_settled:
-                consecutive_no_formal_progress += 1
-                if consecutive_no_formal_progress >= no_progress_cap:
-                    semantic_no_progress_detected = True
-                    semantic_no_progress_reason = "formal_progress_cap"
-                    semantic_no_progress_signature = (
-                        "retrieval_only_provider_batches"
-                    )
-                    _increment_tool_metric(
-                        "mini_tool_semantic_no_progress_detected",
-                        1,
-                    )
             _compact_completed_in_turn_tool_history()
 
             if (
@@ -6833,22 +6948,57 @@ async def _call_llm_with_tools_one_round_impl(
 
             seen_tool_call_signatures.update(call_signatures)
 
+            if (
+                batch_search_cadence_skipped
+                and not batch_formal_cadence_requested
+                and not replaying_persisted_tool
+            ):
+                search_cadence_violation_batches = min(
+                    _SEARCH_CADENCE_VIOLATION_BATCH_CAP,
+                    search_cadence_violation_batches + 1,
+                )
+                search_cadence_stall_detected = (
+                    search_cadence_violation_batches
+                    >= _SEARCH_CADENCE_VIOLATION_BATCH_CAP
+                )
+                if search_cadence_stall_detected:
+                    force_finalize_without_tools = True
+                    conv.history.append(
+                        _user_history_message(
+                            "Search requests repeatedly ignored the required "
+                            "formal-attempt guidance. Tools are disabled for "
+                            "this attempt. Use the retrieved evidence to "
+                            "provide your best final Lean artifact now. "
+                            + _final_submission_shape_instruction(
+                                require_declaration=try_lean_require_declaration
+                            ),
+                            repair_semantics=_REPAIR_CONTINUATION,
+                        )
+                    )
+                    primitives["trace"](
+                        trace_prefix,
+                        "  tool loop: repeated search cadence violations; "
+                        "forcing no-tools finalization",
+                    )
+                    continue
+
             if semantic_no_progress_detected:
                 force_finalize_without_tools = True
                 conv.history.append(
                     _user_history_message(
                         (
                             "Tool work has produced no bankable formal progress "
-                            "across several completed batches or proof-tool "
+                            "across several completed proof-tool "
                             "attempts. Tools are disabled for this attempt. Do "
                             "not submit another cosmetic variant: use the banked "
-                            "residual route if present, state the exact bottleneck, "
-                            "or provide your best final proof. Reply with exactly "
-                            "ONE fenced ```lean block containing at most named "
-                            "helper declarations followed by exactly ONE main "
-                            "proof (a single `example : … := by …` or bare "
-                            "`by …` block). Multiple main-proof blocks are "
-                            "rejected unchecked."
+                            "residual route if present and provide your best "
+                            "final artifact. Do not add a prose-only bottleneck "
+                            "report. If useful, describe the remaining obstacle "
+                            "in a Lean comment inside the single required fenced "
+                            "block alongside the artifact. "
+                            + _final_submission_shape_instruction(
+                                require_declaration=try_lean_require_declaration
+                            )
                         ),
                         repair_semantics=_REPAIR_CONTINUATION,
                     )
@@ -6876,6 +7026,7 @@ async def _call_llm_with_tools_one_round_impl(
                 )
                 reminder = message_fn(
                     require_try_lean=try_lean_tool_enabled,
+                    require_declaration=try_lean_require_declaration,
                     role=str(getattr(conv, "role", "") or "prove"),
                 )
                 conv.history.append({"role": "user", "content": reminder})
@@ -6904,6 +7055,7 @@ async def _call_llm_with_tools_one_round_impl(
                 )
                 reminder = message_fn(
                     require_try_lean=try_lean_tool_enabled,
+                    require_declaration=try_lean_require_declaration,
                     role=str(getattr(conv, "role", "") or "prove"),
                 )
                 conv.history.append({"role": "user", "content": reminder})
@@ -6927,11 +7079,10 @@ async def _call_llm_with_tools_one_round_impl(
                         (
                             "You used the final corrective tool step. Tools are "
                             "now disabled for this attempt. Use the results already "
-                            "present and write the Lean proof now. Reply with exactly "
-                            "ONE fenced ```lean block containing at most named helper "
-                            "declarations followed by exactly ONE main proof (a single "
-                            "`example : … := by …` or bare `by …` block). Multiple "
-                            "main-proof blocks are rejected unchecked."
+                            "present and write the active Lean artifact now. "
+                            + _final_submission_shape_instruction(
+                                require_declaration=try_lean_require_declaration
+                            )
                         ),
                         repair_semantics=_REPAIR_CONTINUATION,
                     )
@@ -6967,9 +7118,17 @@ async def _call_llm_with_tools_one_round_impl(
                         if dropped > 0
                         else ""
                     )
-                    + "). Use what you have and write the proof now."
+                    + "). Use what you have and write the active Lean artifact now. "
+                    + _final_submission_shape_instruction(
+                        require_declaration=try_lean_require_declaration
+                    )
                 )
-                conv.history.append({"role": "user", "content": msg})
+                conv.history.append(
+                    _user_history_message(
+                        msg,
+                        repair_semantics=_REPAIR_CONTINUATION,
+                    )
+                )
                 if dropped > 0:
                     primitives["trace"](
                         trace_prefix,
@@ -7437,6 +7596,12 @@ async def _call_llm_with_tools_one_round_impl(
                 "consecutive_search_tool_calls": int(
                     consecutive_search_tool_calls
                 ),
+                "search_cadence_violation_batches": int(
+                    search_cadence_violation_batches
+                ),
+                "search_cadence_stall_detected": bool(
+                    search_cadence_stall_detected
+                ),
                 "semantic_result_counts": {
                     str(signature or "")[:256]: min(
                         semantic_repeat_cap,
@@ -7593,6 +7758,8 @@ async def _call_llm_with_tools_one_round_impl(
         proof_tool_attempts=int(proof_tool_attempts),
         consecutive_no_formal_progress=int(consecutive_no_formal_progress),
         consecutive_search_tool_calls=int(consecutive_search_tool_calls),
+        search_cadence_violation_batches=int(search_cadence_violation_batches),
+        search_cadence_stall_detected=bool(search_cadence_stall_detected),
         semantic_no_progress_detected=bool(semantic_no_progress_detected),
         semantic_no_progress_reason=str(semantic_no_progress_reason or ""),
         semantic_no_progress_signature=str(

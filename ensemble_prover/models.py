@@ -26,6 +26,7 @@ from .llm_usage import (
     mark_provider_dispatched,
     mark_provider_pre_generation_rejection,
     notify_provider_dispatch_observer,
+    publish_provider_request_metadata,
     provider_usage_from_payload,
 )
 from .pricing import (
@@ -1230,6 +1231,7 @@ def _sanitize_request_messages(
     messages: List[Any],
     *,
     preserve_reasoning_content: bool = False,
+    preserve_openrouter_continuation: bool = False,
     preserve_responses_reasoning_items: bool = False,
     _retain_required_receipts: bool = False,
 ) -> List[Any]:
@@ -1248,30 +1250,108 @@ def _sanitize_request_messages(
         request_keys.add("_responses_output_items")
     receipt_key = "_mini_required_prompt_transport_receipt"
     expected_receipts: List[int] = []
+
+    def complete_openrouter_exchange(index: int, message: Dict[str, Any]) -> bool:
+        calls = normalize_tool_calls(message.get("tool_calls"))
+        expected_ids = [str(call.get("id") or "") for call in calls]
+        if (
+            not expected_ids
+            or any(not call_id for call_id in expected_ids)
+            or len(set(expected_ids)) != len(expected_ids)
+        ):
+            return False
+        observed_ids: List[str] = []
+        cursor = index + 1
+        while cursor < len(messages):
+            result = messages[cursor]
+            if not isinstance(result, dict) or result.get("role") != "tool":
+                break
+            observed_ids.append(str(result.get("tool_call_id") or ""))
+            cursor += 1
+        return (
+            len(observed_ids) == len(expected_ids)
+            and len(set(observed_ids)) == len(observed_ids)
+            and set(observed_ids) == set(expected_ids)
+        )
+
     sanitized: List[Any] = []
-    for message in messages:
+    exact_openrouter_tool_ids: set[str] = set()
+    for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
             sanitized.append(message)
             continue
+        exact_openrouter_continuation = False
+        if preserve_openrouter_continuation:
+            # Local import keeps the generic model adapter independent during
+            # module initialization while still requiring Mini's signed
+            # capture receipt before provider-authored opaque state is sent.
+            from .mini_policy import (
+                _provider_chat_reasoning_envelope_is_valid,
+                _provider_chat_tool_calls_envelope_is_valid,
+                _provider_continuation_message_is_authenticated,
+            )
+
+            exact_openrouter_continuation = bool(
+                message.get("role") == "assistant"
+                and _provider_continuation_message_is_authenticated(message)
+                and _provider_chat_reasoning_envelope_is_valid(message)
+                and _provider_chat_tool_calls_envelope_is_valid(message)
+                and complete_openrouter_exchange(message_index, message)
+            )
+            if exact_openrouter_continuation:
+                exact_fields = {
+                    key: message[key]
+                    for key in (
+                        "role",
+                        "content",
+                        "tool_calls",
+                        "reasoning_content",
+                        "reasoning",
+                        "reasoning_details",
+                    )
+                    if key in message
+                }
+                try:
+                    normalized_exact_fields, replacements = (
+                        _normalize_request_json(exact_fields)
+                    )
+                except (TypeError, ValueError):
+                    exact_openrouter_continuation = False
+                else:
+                    exact_openrouter_continuation = bool(
+                        replacements == 0
+                        and normalized_exact_fields == exact_fields
+                    )
+        message_request_keys = set(request_keys)
+        if exact_openrouter_continuation:
+            message_request_keys.update(
+                ("reasoning_content", "reasoning", "reasoning_details")
+            )
         clean = {
             key: value
             for key, value in message.items()
-            if key in request_keys
+            if key in message_request_keys
         }
         if _message_has_required_prompt_context(message):
             receipt = len(expected_receipts)
             expected_receipts.append(receipt)
             clean[receipt_key] = receipt
         if clean.get("role") == "tool" and "tool_call_id" in clean:
-            clean["tool_call_id"] = _request_safe_tool_call_id(
-                clean.get("tool_call_id", "")
-            )
-        if "tool_calls" in clean:
+            tool_call_id = str(clean.get("tool_call_id") or "")
+            if tool_call_id in exact_openrouter_tool_ids:
+                exact_openrouter_tool_ids.discard(tool_call_id)
+            else:
+                clean["tool_call_id"] = _request_safe_tool_call_id(tool_call_id)
+        if exact_openrouter_continuation:
+            exact_openrouter_tool_ids = set(_tool_call_ids(clean))
+        elif "tool_calls" in clean:
             safe_tool_calls = _request_safe_tool_calls(clean.get("tool_calls"))
             if safe_tool_calls:
                 clean["tool_calls"] = safe_tool_calls
             else:
                 clean.pop("tool_calls", None)
+        elif clean.get("role") != "tool":
+            exact_openrouter_tool_ids.clear()
         if (
             clean.get("role") == "assistant"
             and "tool_calls" in clean
@@ -1360,7 +1440,16 @@ def _repair_tool_transcript(messages: List[Any]) -> List[Any]:
             i += 1
             continue
         if role == "assistant":
-            tool_calls = normalize_tool_calls(message.get("tool_calls"))
+            raw_tool_calls = message.get("tool_calls")
+            raw_tool_calls = raw_tool_calls if isinstance(raw_tool_calls, list) else []
+            valid_raw_tool_calls = [
+                call
+                for call in raw_tool_calls
+                if isinstance(call, dict)
+                and isinstance(call.get("function"), dict)
+                and str((call.get("function") or {}).get("name") or "").strip()
+            ]
+            tool_calls = normalize_tool_calls(valid_raw_tool_calls)
             pending_ids = [
                 str(call.get("id", "") or "")
                 for call in tool_calls
@@ -1377,7 +1466,7 @@ def _repair_tool_transcript(messages: List[Any]) -> List[Any]:
                         used_ids=used_ids,
                         fallback=f"call_{i}_{call_index + 1}",
                     )
-                    clean_call = dict(call)
+                    clean_call = dict(valid_raw_tool_calls[call_index])
                     clean_call["id"] = repaired_id
                     repaired_calls.append(clean_call)
                     remapped_ids.append((original_id, repaired_id))
@@ -1646,6 +1735,7 @@ def _message_tokens(message: Any, *, model: Optional[str] = None) -> int:
         "function_call",
         "reasoning_content",
         "reasoning",
+        "reasoning_details",
         "_responses_reasoning_items",
     ):
         value = message.get(key)
@@ -1971,6 +2061,7 @@ _PROVIDER_SEMANTIC_MESSAGE_KEYS = (
     "function_call",
     "reasoning_content",
     "reasoning",
+    "reasoning_details",
     "_responses_reasoning_items",
     "_responses_output_items",
 )
@@ -2052,6 +2143,7 @@ def _assert_serialized_required_prompt_context(
     serialized_messages: List[Any],
     *,
     preserve_reasoning_content: bool = False,
+    preserve_openrouter_continuation: bool = False,
     preserve_responses_reasoning_items: bool = False,
 ) -> None:
     """Verify every required provider-semantic message is serialized exactly."""
@@ -2065,6 +2157,7 @@ def _assert_serialized_required_prompt_context(
     expected_with_receipts = _sanitize_request_messages(
         internal_messages,
         preserve_reasoning_content=preserve_reasoning_content,
+        preserve_openrouter_continuation=preserve_openrouter_continuation,
         preserve_responses_reasoning_items=preserve_responses_reasoning_items,
         _retain_required_receipts=True,
     )
@@ -2579,6 +2672,7 @@ class OpenAICompatClient:
         self._usage_unpriced_output_tokens: int = 0
         self._usage_unpriced_cached_input_tokens: int = 0
         self._usage_unpriced_cache_write_tokens: int = 0
+        self._usage_unpriced_response_count: int = 0
         self._usage_missing_responses: int = 0
         self._suppressed_unsafe_late_usage_callbacks: int = 0
         # Runtime cap learned from context-overflow errors (tokens).
@@ -3028,6 +3122,7 @@ class OpenAICompatClient:
             self._usage_cost_usd += float(record_cost)
         else:
             self._usage_cost_usd_authoritative = False
+            self._usage_unpriced_response_count += 1
             self._usage_unpriced_input_tokens += int(record.input_tokens)
             self._usage_unpriced_output_tokens += int(record.output_tokens)
             self._usage_unpriced_cached_input_tokens += int(
@@ -3102,6 +3197,7 @@ class OpenAICompatClient:
             "unpriced_output_tokens": self._usage_unpriced_output_tokens,
             "unpriced_cached_input_tokens": self._usage_unpriced_cached_input_tokens,
             "unpriced_cache_write_tokens": self._usage_unpriced_cache_write_tokens,
+            "unpriced_response_count": self._usage_unpriced_response_count,
             "usage_missing_responses": self._usage_missing_responses,
             "suppressed_unsafe_late_usage_callbacks": (
                 self._suppressed_unsafe_late_usage_callbacks
@@ -3120,6 +3216,7 @@ class OpenAICompatClient:
         self._usage_unpriced_output_tokens = 0
         self._usage_unpriced_cached_input_tokens = 0
         self._usage_unpriced_cache_write_tokens = 0
+        self._usage_unpriced_response_count = 0
         self._usage_missing_responses = 0
         self._suppressed_unsafe_late_usage_callbacks = 0
 
@@ -3705,14 +3802,20 @@ class OpenAICompatClient:
             )
             and not explicit_reasoning_off
         )
+        preserve_openrouter_continuation = base_url_matches_provider(
+            self.base_url,
+            "openrouter",
+        )
         request_messages = _sanitize_request_messages(
             messages,
             preserve_reasoning_content=preserve_reasoning_content,
+            preserve_openrouter_continuation=preserve_openrouter_continuation,
         )
         _assert_serialized_required_prompt_context(
             messages,
             request_messages,
             preserve_reasoning_content=preserve_reasoning_content,
+            preserve_openrouter_continuation=preserve_openrouter_continuation,
         )
         payload: Dict[str, Any] = {
             "model": self.cfg.model,
@@ -3926,7 +4029,106 @@ class OpenAICompatClient:
         swapped_back = False
         reduced_openrouter_affordability = False
         affordability_metadata: Dict[str, Any] = {}
+
+        def _current_request_metadata() -> Dict[str, Any]:
+            metadata = dict(sampling_metadata or {})
+            if "temperature_requested" not in metadata:
+                metadata["temperature_requested"] = payload.get("temperature")
+            metadata.update(affordability_metadata)
+            metadata["provider_compatibility_cached_drops"] = list(
+                cached_compatibility_drops
+            )
+            metadata["provider_compatibility_cached_token_limit_swap"] = (
+                cached_token_limit_swap
+            )
+            metadata["provider_compatibility_fallbacks"] = sorted(
+                key
+                for key, removed in (
+                    ("stop", removed_stop),
+                    ("temperature", removed_temp),
+                    ("top_p", removed_top_p),
+                    ("reasoning_effort", removed_reasoning_effort),
+                    (
+                        "tools_reasoning_effort_forced_none",
+                        forced_tools_effort_none,
+                    ),
+                    ("reasoning", removed_reasoning),
+                    ("thinking", removed_thinking),
+                    ("tools", removed_tools),
+                    ("tool_choice", removed_tool_choice),
+                )
+                if removed
+            )
+            initial_temperature_present = "temperature" in payload
+            final_temperature_present = "temperature" in current
+            metadata["temperature_sent"] = (
+                current.get("temperature") if final_temperature_present else None
+            )
+            dropped = bool(
+                removed_temp or "temperature" in cached_compatibility_drops
+            )
+            reason = (
+                "provider_400_retry"
+                if removed_temp
+                else "provider_capability_cache"
+                if "temperature" in cached_compatibility_drops
+                else ""
+            )
+            if (
+                not initial_temperature_present
+                and metadata.get("temperature_requested") is not None
+            ):
+                dropped = True
+                reason = (
+                    str(metadata.get("temperature_provider_drop_reason") or "")
+                    or "unsupported_sampling_controls"
+                )
+            metadata["temperature_provider_dropped"] = dropped
+            metadata["temperature_provider_drop_reason"] = reason
+            if any(
+                (
+                    removed_reasoning_effort,
+                    removed_reasoning,
+                    removed_thinking,
+                    forced_tools_effort_none,
+                    enabled_mandatory_reasoning,
+                )
+            ) or any(
+                key in cached_compatibility_drops
+                for key in ("reasoning", "reasoning_effort", "thinking")
+            ):
+                if isinstance(current.get("reasoning"), Mapping):
+                    metadata["reasoning_control_sent"] = dict(
+                        current["reasoning"]
+                    )
+                elif "reasoning_effort" in current:
+                    metadata["reasoning_control_sent"] = {
+                        "reasoning_effort": current["reasoning_effort"]
+                    }
+                elif isinstance(current.get("thinking"), Mapping):
+                    metadata["reasoning_control_sent"] = {
+                        "thinking": dict(current["thinking"])
+                    }
+                else:
+                    metadata["reasoning_control_sent"] = {}
+            if forced_tools_effort_none:
+                metadata["reasoning_control_decision"] = (
+                    "openai_chat_tools_reasoning_effort_forced_none"
+                )
+            elif enabled_mandatory_reasoning:
+                metadata["reasoning_control_decision"] = (
+                    "mandatory_openrouter_minimum_effort"
+                )
+            return metadata
+
         for _ in range(8):
+            # Publish the selected effective payload for this attempt. If its
+            # transport fails or is cancelled, settlement must still see the
+            # controls chosen for the current/last attempt rather than the
+            # original request or mutable client diagnostics. Dispatch
+            # receipts separately establish whether transport was crossed.
+            request_metadata = _current_request_metadata()
+            publish_provider_request_metadata(request_metadata)
             try:
                 resp = await self._post_with_retry(
                     url,
@@ -3936,61 +4138,7 @@ class OpenAICompatClient:
                     operation_timeout_override_s=operation_timeout_override_s,
                     late_usage_callback=late_usage_callback,
                 )
-                metadata = dict(sampling_metadata or {})
-                if "temperature_requested" not in metadata:
-                    metadata["temperature_requested"] = payload.get("temperature")
-                metadata.update(affordability_metadata)
-                metadata["provider_compatibility_cached_drops"] = list(
-                    cached_compatibility_drops
-                )
-                metadata["provider_compatibility_cached_token_limit_swap"] = (
-                    cached_token_limit_swap
-                )
-                metadata["provider_compatibility_fallbacks"] = sorted(
-                    key
-                    for key, removed in (
-                        ("stop", removed_stop),
-                        ("temperature", removed_temp),
-                        ("top_p", removed_top_p),
-                        ("reasoning_effort", removed_reasoning_effort),
-                        (
-                            "tools_reasoning_effort_forced_none",
-                            forced_tools_effort_none,
-                        ),
-                        ("reasoning", removed_reasoning),
-                        ("thinking", removed_thinking),
-                        ("tools", removed_tools),
-                        ("tool_choice", removed_tool_choice),
-                    )
-                    if removed
-                )
-                initial_temperature_present = "temperature" in payload
-                final_temperature_present = "temperature" in current
-                metadata["temperature_sent"] = (
-                    current.get("temperature") if final_temperature_present else None
-                )
-                dropped = bool(
-                    removed_temp or "temperature" in cached_compatibility_drops
-                )
-                reason = (
-                    "provider_400_retry"
-                    if removed_temp
-                    else "provider_capability_cache"
-                    if "temperature" in cached_compatibility_drops
-                    else ""
-                )
-                if (
-                    not initial_temperature_present
-                    and metadata.get("temperature_requested") is not None
-                ):
-                    dropped = True
-                    reason = (
-                        str(metadata.get("temperature_provider_drop_reason") or "")
-                        or "unsupported_sampling_controls"
-                    )
-                metadata["temperature_provider_dropped"] = dropped
-                metadata["temperature_provider_drop_reason"] = reason
-                resp.extensions["ensemble_sampling_controls"] = metadata
+                resp.extensions["ensemble_sampling_controls"] = request_metadata
                 return resp
             except httpx.HTTPStatusError as exc:
                 affordable_max_tokens = _openrouter_affordable_max_tokens(exc)
@@ -4214,7 +4362,9 @@ class OpenAICompatClient:
                             )
                         continue
                 raise
-        return await self._post_with_retry(
+        request_metadata = _current_request_metadata()
+        publish_provider_request_metadata(request_metadata)
+        response = await self._post_with_retry(
             url,
             current,
             deadline=deadline,
@@ -4222,6 +4372,8 @@ class OpenAICompatClient:
             operation_timeout_override_s=operation_timeout_override_s,
             late_usage_callback=late_usage_callback,
         )
+        response.extensions["ensemble_sampling_controls"] = request_metadata
+        return response
 
     async def _post_with_retry(
         self,
@@ -5165,6 +5317,14 @@ class OpenAICompatClient:
         effective_reasoning_effort = _resolved_reasoning_effort(
             self.cfg, reasoning_effort_override
         )
+        reasoning_control_required = bool(
+            reasoning_effort_override is not None
+            or getattr(self.cfg, "reasoning_control_required", False)
+            or str(getattr(self.cfg, "reasoning_effort", "") or "")
+            .strip()
+            .lower()
+            == "none"
+        )
         if _openai_responses_with_reasoning(
             self.base_url, effective_reasoning_effort
         ):
@@ -5172,6 +5332,7 @@ class OpenAICompatClient:
                 messages,
                 response_format=response_format,
                 reasoning_effort=str(effective_reasoning_effort),
+                reasoning_control_required=reasoning_control_required,
                 max_tokens_override=max_tokens_override,
                 deadline=deadline,
                 request_timeout_override_s=request_timeout_override_s,
@@ -5203,6 +5364,7 @@ class OpenAICompatClient:
         *,
         response_format: Optional[str],
         reasoning_effort: str,
+        reasoning_control_required: bool,
         max_tokens_override: Optional[int],
         deadline: Optional[float],
         request_timeout_override_s: Optional[float],
@@ -5231,9 +5393,31 @@ class OpenAICompatClient:
         self.last_reasoning_control_sent = {
             "reasoning": {"effort": reasoning_effort, "summary": "auto"}
         }
+        self.last_reasoning_control_required = bool(
+            reasoning_control_required
+        )
         self.last_temperature_sent = None
         self.last_temperature_provider_dropped = True
         self.last_temperature_provider_drop_reason = "responses_api_reasoning"
+        publish_provider_request_metadata(
+            {
+                "temperature_sent": None,
+                "temperature_provider_dropped": True,
+                "temperature_provider_drop_reason": "responses_api_reasoning",
+                "reasoning_control_requested": reasoning_effort,
+                "reasoning_control_decision": "openai_responses_reasoning",
+                "reasoning_control_sent": {
+                    "reasoning": {
+                        "effort": reasoning_effort,
+                        "summary": "auto",
+                    }
+                },
+                "reasoning_control_required": bool(
+                    reasoning_control_required
+                ),
+                "reasoning_capability_record": {},
+            }
+        )
         resp: Optional[httpx.Response] = None
         for _context_attempt in range(2):
             request_messages = _sanitize_request_messages(
@@ -5365,6 +5549,14 @@ class OpenAICompatClient:
             self.cfg,
             reasoning_effort_override,
         )
+        reasoning_control_required = bool(
+            reasoning_effort_override is not None
+            or getattr(self.cfg, "reasoning_control_required", False)
+            or str(getattr(self.cfg, "reasoning_effort", "") or "")
+            .strip()
+            .lower()
+            == "none"
+        )
         if _openai_responses_tools_with_reasoning(
             self.base_url,
             self.cfg.model,
@@ -5376,6 +5568,7 @@ class OpenAICompatClient:
                 tools=tools,
                 tool_choice=tool_choice,
                 reasoning_effort=str(effective_reasoning_effort or ""),
+                reasoning_control_required=reasoning_control_required,
                 max_tokens_override=max_tokens_override,
                 deadline=deadline,
                 request_timeout_override_s=request_timeout_override_s,
@@ -5408,6 +5601,7 @@ class OpenAICompatClient:
         tools: List[Dict[str, Any]],
         tool_choice: Optional[str],
         reasoning_effort: str,
+        reasoning_control_required: bool,
         max_tokens_override: Optional[int],
         deadline: Optional[float],
         request_timeout_override_s: Optional[float],
@@ -5448,10 +5642,31 @@ class OpenAICompatClient:
         self.last_reasoning_control_sent = {
             "reasoning": {"effort": str(reasoning_effort)}
         }
+        self.last_reasoning_control_required = bool(
+            reasoning_control_required
+        )
         self.last_temperature_sent = None
         self.last_temperature_provider_dropped = True
         self.last_temperature_provider_drop_reason = (
             "responses_api_reasoning"
+        )
+        publish_provider_request_metadata(
+            {
+                "temperature_sent": None,
+                "temperature_provider_dropped": True,
+                "temperature_provider_drop_reason": "responses_api_reasoning",
+                "reasoning_control_requested": str(reasoning_effort),
+                "reasoning_control_decision": (
+                    "openai_responses_tools_with_reasoning"
+                ),
+                "reasoning_control_sent": {
+                    "reasoning": {"effort": str(reasoning_effort)}
+                },
+                "reasoning_control_required": bool(
+                    reasoning_control_required
+                ),
+                "reasoning_capability_record": {},
+            }
         )
         # Bounded self-heal for provider parameter drift (audit residual R-C):
         # ``tool_choice`` and the optional encrypted-reasoning include may be

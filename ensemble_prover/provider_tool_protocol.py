@@ -909,12 +909,12 @@ def _advertised_reasoning_effort_resolution(
     )
     if not ranked:
         return "", "unavailable"
-    not_stronger = [entry for entry in ranked if entry[0] <= requested_rank]
-    if not_stronger:
-        selected = not_stronger[-1][2]
-        return selected, "downgraded"
-    selected = ranked[0][2]
-    return selected, "upgraded_to_provider_minimum"
+    satisfies_floor = [entry for entry in ranked if entry[0] >= requested_rank]
+    if satisfies_floor:
+        selected = satisfies_floor[0][2]
+        return selected, "upgraded_to_provider_minimum"
+    selected = ranked[-1][2]
+    return selected, "downgraded"
 
 
 def _strict_reasoning_on(cfg: Any) -> bool:

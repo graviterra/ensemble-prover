@@ -110,6 +110,8 @@ _PROVIDER_CHAT_MESSAGE_KEYS = frozenset(
         # these fields to be replayed alongside the following tool receipts;
         # they remain transport-only and are filtered by the provider adapter.
         "reasoning_content",
+        "reasoning",
+        "reasoning_details",
         "_responses_reasoning_items",
         "_responses_output_items",
         "_provider_continuation_policy_receipt",
@@ -125,12 +127,80 @@ _PROVIDER_CHAT_MESSAGE_KEYS = frozenset(
 )
 _PROVIDER_CONTINUATION_STATE_KEYS = (
     "reasoning_content",
+    "reasoning",
+    "reasoning_details",
     "_responses_reasoning_items",
     "_responses_output_items",
+)
+_PROVIDER_CONTINUATION_SIGNED_MESSAGE_KEYS = (
+    "role",
+    "content",
+    "tool_calls",
+    *_PROVIDER_CONTINUATION_STATE_KEYS,
 )
 _PROVIDER_CONTINUATION_POLICY_RECEIPT_KEY = (
     "_provider_continuation_policy_receipt"
 )
+_PROVIDER_CHAT_REASONING_KEYS = (
+    "reasoning_content",
+    "reasoning",
+    "reasoning_details",
+)
+
+
+def _provider_chat_reasoning_envelope_is_valid(msg: Dict[str, Any]) -> bool:
+    """Validate replayable chat reasoning without constraining future detail types."""
+
+    if not any(key in msg for key in _PROVIDER_CHAT_REASONING_KEYS):
+        return False
+    for key in ("reasoning_content", "reasoning"):
+        if key in msg and not isinstance(msg.get(key), str):
+            return False
+    if "reasoning_details" in msg:
+        details = msg.get("reasoning_details")
+        if (
+            not isinstance(details, list)
+            or not details
+            or any(not isinstance(item, dict) for item in details)
+        ):
+            return False
+    return True
+
+
+def _provider_chat_tool_calls_envelope_is_valid(msg: Dict[str, Any]) -> bool:
+    """Validate exact chat tool-call core fields while allowing extensions."""
+
+    calls = msg.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        return False
+    call_ids: List[str] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            return False
+        call_id = call.get("id")
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or call_id.strip() != call_id
+        ):
+            return False
+        if call.get("type") != "function":
+            return False
+        function = call.get("function")
+        if not isinstance(function, dict):
+            return False
+        name = function.get("name")
+        arguments = function.get("arguments")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name.strip() != name
+        ):
+            return False
+        if not isinstance(arguments, str):
+            return False
+        call_ids.append(call_id)
+    return len(set(call_ids)) == len(call_ids)
 
 
 def _provider_continuation_capture_policy(conv: Any) -> Dict[str, Any]:
@@ -158,7 +228,7 @@ def _provider_continuation_state_digest(
 ) -> str:
     state = {
         key: msg[key]
-        for key in _PROVIDER_CONTINUATION_STATE_KEYS
+        for key in _PROVIDER_CONTINUATION_SIGNED_MESSAGE_KEYS
         if key in msg
     }
     encoded = json.dumps(
@@ -186,6 +256,25 @@ def _bind_provider_continuation_policy_receipt(
         "policy": policy,
         "state_digest": _provider_continuation_state_digest(msg, policy),
     }
+
+
+def _provider_continuation_message_is_authenticated(msg: Dict[str, Any]) -> bool:
+    """Whether a replayable assistant message still matches its capture receipt."""
+
+    if not any(key in msg for key in _PROVIDER_CONTINUATION_STATE_KEYS):
+        return False
+    receipt = msg.get(_PROVIDER_CONTINUATION_POLICY_RECEIPT_KEY)
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        return False
+    policy = receipt.get("policy")
+    if not isinstance(policy, dict):
+        return False
+    try:
+        return str(receipt.get("state_digest") or "") == (
+            _provider_continuation_state_digest(msg, policy)
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _responses_output_matches_advertised_tool_calls(
@@ -221,22 +310,19 @@ def _provider_continuation_state_is_answer_safe(msg: Dict[str, Any]) -> bool:
 
     state = {
         key: msg[key]
-        for key in _PROVIDER_CONTINUATION_STATE_KEYS
+        for key in _PROVIDER_CONTINUATION_SIGNED_MESSAGE_KEYS
         if key in msg
     }
     if not state:
         return True
     receipt = msg.get(_PROVIDER_CONTINUATION_POLICY_RECEIPT_KEY)
-    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+    if not _provider_continuation_message_is_authenticated(msg):
         return False
+    assert isinstance(receipt, dict)
     policy = receipt.get("policy")
     if not isinstance(policy, dict) or policy.get("redact_solution_refs") is not True:
         return False
     try:
-        if str(receipt.get("state_digest") or "") != (
-            _provider_continuation_state_digest(msg, policy)
-        ):
-            return False
         serialized = json.dumps(
             state,
             ensure_ascii=False,
@@ -359,12 +445,40 @@ def _provider_safe_chat_message(
     msg: Dict[str, Any],
     *,
     redact_solution_refs: bool = True,
+    preserve_tool_call_id: bool = False,
 ) -> Dict[str, Any]:
     safe = {
         key: value
         for key, value in dict(msg or {}).items()
         if key in _PROVIDER_CHAT_MESSAGE_KEYS
     }
+    chat_reasoning_present = any(
+        key in safe for key in _PROVIDER_CHAT_REASONING_KEYS
+    )
+    authenticated_continuation = bool(
+        _provider_continuation_message_is_authenticated(safe)
+        and (
+            not chat_reasoning_present
+            or _provider_chat_reasoning_envelope_is_valid(safe)
+        )
+        and (
+            "tool_calls" not in safe
+            or _provider_chat_tool_calls_envelope_is_valid(safe)
+        )
+    )
+    answer_safe_continuation = bool(
+        authenticated_continuation
+        and (
+            not redact_solution_refs
+            or _provider_continuation_state_is_answer_safe(safe)
+        )
+    )
+    if answer_safe_continuation:
+        # OpenRouter and Responses continuation fields are provider-authored
+        # protocol state. Once their policy-bound digest is verified, replay
+        # the complete assistant message byte-for-byte; rewriting content,
+        # call ids, or arguments would invalidate the continuation.
+        return safe
     if redact_solution_refs and "content" in safe:
         # History is durable and can outlive the policy/configuration under
         # which it was authored.  Re-apply the current capability at the last
@@ -378,7 +492,7 @@ def _provider_safe_chat_message(
             _OFFICIAL_ANSWER_REFERENCE_HIDDEN,
             content,
         )
-    if redact_solution_refs and not _provider_continuation_state_is_answer_safe(safe):
+    if not answer_safe_continuation:
         # Opaque Responses/DeepSeek continuation state must be replayed exactly;
         # rewriting nested values would invalidate that protocol state. Drop the
         # whole continuation bundle and fall back to the answer-safe visible
@@ -386,7 +500,7 @@ def _provider_safe_chat_message(
         for key in _PROVIDER_CONTINUATION_STATE_KEYS:
             safe.pop(key, None)
         safe.pop(_PROVIDER_CONTINUATION_POLICY_RECEIPT_KEY, None)
-    if "tool_call_id" in safe:
+    if "tool_call_id" in safe and not preserve_tool_call_id:
         safe["tool_call_id"] = _prompt_safe_tool_call_token(
             safe.get("tool_call_id", ""),
             redact_solution_refs=redact_solution_refs,
@@ -429,6 +543,64 @@ def _provider_safe_chat_message(
             sanitized_calls.append(call_item)
         safe["tool_calls"] = sanitized_calls
     return safe
+
+
+def _provider_safe_chat_messages(
+    messages: Sequence[Dict[str, Any]],
+    *,
+    redact_solution_refs: bool = True,
+) -> List[Dict[str, Any]]:
+    """Sanitize history while preserving authenticated tool-result pairing."""
+
+    source = list(messages or ())
+    safe_messages: List[Dict[str, Any]] = []
+    exact_tool_ids: set[str] = set()
+    for index, message in enumerate(source):
+        role = str(message.get("role") or "")
+        raw_tool_id = str(message.get("tool_call_id") or "")
+        preserve_tool_id = bool(
+            role == "tool" and raw_tool_id in exact_tool_ids
+        )
+        safe = _provider_safe_chat_message(
+            message,
+            redact_solution_refs=redact_solution_refs,
+            preserve_tool_call_id=preserve_tool_id,
+        )
+        safe_messages.append(safe)
+        if preserve_tool_id:
+            exact_tool_ids.discard(raw_tool_id)
+            continue
+        exact_tool_ids.clear()
+        if role != "assistant" or not _provider_continuation_message_is_authenticated(
+            safe
+        ):
+            continue
+        expected_ids = [
+            str(call.get("id") or "")
+            for call in list(safe.get("tool_calls") or ())
+            if isinstance(call, dict)
+        ]
+        if (
+            not expected_ids
+            or any(not call_id for call_id in expected_ids)
+            or len(set(expected_ids)) != len(expected_ids)
+        ):
+            continue
+        observed_ids: List[str] = []
+        cursor = index + 1
+        while cursor < len(source):
+            result = source[cursor]
+            if str(result.get("role") or "") != "tool":
+                break
+            observed_ids.append(str(result.get("tool_call_id") or ""))
+            cursor += 1
+        if (
+            len(observed_ids) == len(expected_ids)
+            and len(set(observed_ids)) == len(observed_ids)
+            and set(observed_ids) == set(expected_ids)
+        ):
+            exact_tool_ids = set(expected_ids)
+    return safe_messages
 
 
 def _prompt_safe_tool_call_token(
@@ -1549,12 +1721,14 @@ def _format_repair_self_check_missing_feedback(
     content: Any = "",
     *,
     require_try_lean: bool = False,
+    require_declaration: bool = False,
     goal_statement: str = "",
     theorem_name: str = "",
     role: str = "prove",
 ) -> str:
     base = _repair_self_check_required_message(
         require_try_lean=require_try_lean,
+        require_declaration=require_declaration,
         role=role,
     )
     try:
@@ -1580,6 +1754,20 @@ def _format_repair_self_check_missing_feedback(
         )
     if root_equiv:
         return base + "\n\n" + _format_root_equivalent_helper_feedback(root_equiv)
+    if require_declaration:
+        return (
+            base
+            + "\n\n"
+            "A rejected `try_lean` call does not count as a self-check. The "
+            "final complete named `theorem` or `lemma` declaration must "
+            "exactly match the declaration artifact that `try_lean` accepted "
+            "in this turn. If no checked declaration formalizes the selected "
+            "graph work, do not submit a placeholder or proof-body-only "
+            "artifact. Either try a different complete declaration, prove any "
+            "auxiliary step inside that artifact, or let the Lean diagnostic "
+            "identify the next concrete repair. Do not answer this repair turn "
+            "with helper stubs or a scheduler request."
+        )
     return (
         base
         + "\n\n"
@@ -2072,8 +2260,30 @@ def _repair_turn_requires_self_check(conv: Any) -> bool:
 def _repair_self_check_required_message(
     *,
     require_try_lean: bool = False,
+    require_declaration: bool = False,
     role: str = "prove",
 ) -> str:
+    if require_declaration:
+        check_sentence = (
+            "you must call `try_lean` on the revised complete named "
+            "`theorem` or `lemma` declaration. "
+            if require_try_lean
+            else "you must run the configured Lean self-check on the revised "
+            "complete named `theorem` or `lemma` declaration. "
+        )
+        return (
+            f"{_REPAIR_SELF_CHECK_MARKER}\n"
+            "This is a Lean declaration-repair turn. Before submitting the "
+            "final declaration block, "
+            f"{check_sentence}"
+            "Do not just describe the repair. Use the tool result to correct "
+            "the actual declaration, then submit that checked artifact. Do "
+            "not submit broad helper-stub decomposition, an anonymous "
+            "example, or a proof-body-only placeholder. The revised "
+            "declaration must be checked, or the response should pivot to a "
+            "different checked declaration route rather than asking the "
+            "scheduler to prove a separate prerequisite."
+        )
     check_sentence = (
         "you must call `try_lean` on the revised proof. "
         if require_try_lean
@@ -2091,6 +2301,25 @@ def _repair_self_check_required_message(
         f"{check_sentence}"
         "Do not just describe the repair. Use the tool result to correct the "
         f"actual code, then submit the checked block. {mode_sentence}"
+    )
+
+
+def _final_submission_shape_instruction(*, require_declaration: bool) -> str:
+    """Return the final artifact contract for the active Mini turn mode."""
+
+    if require_declaration:
+        return (
+            "Reply with exactly ONE fenced ```lean block containing complete "
+            "named `theorem` or `lemma` declarations. The final declaration "
+            "must formalize the active selected graph work. Anonymous examples, "
+            "proof-body-only blocks, and multiple competing final declarations "
+            "are rejected unchecked."
+        )
+    return (
+        "Reply with exactly ONE fenced ```lean block containing at most named "
+        "helper declarations followed by exactly ONE main proof (a single "
+        "`example : … := by …` or bare `by …` block). Multiple main-proof "
+        "blocks are rejected unchecked."
     )
 
 
@@ -2843,7 +3072,11 @@ def _format_repackaged_goal_target_feedback(
     return "\n".join(lines)
 
 
-def _normalized_repair_code(value: Any) -> str:
+def _normalized_repair_code(
+    value: Any,
+    *,
+    preserve_declaration: bool = False,
+) -> str:
     text = str(value or "").strip()
     blocks = extract_code_fences(text)
     if blocks:
@@ -2851,13 +3084,14 @@ def _normalized_repair_code(value: Any) -> str:
     text = _strip_lean_comments(text)
     try:
         text = _strip_redundant_preamble_commands(text)
-        example_body = _extract_example_body(text)
-        if example_body is not None:
-            text = example_body
-        else:
-            decl_body = _extract_single_decl_body(text)
-            if decl_body is not None and _is_plausible_main_proof(decl_body):
-                text = decl_body
+        if not preserve_declaration:
+            example_body = _extract_example_body(text)
+            if example_body is not None:
+                text = example_body
+            else:
+                decl_body = _extract_single_decl_body(text)
+                if decl_body is not None and _is_plausible_main_proof(decl_body):
+                    text = decl_body
     except Exception:
         pass
     compact = " ".join(text.split())
@@ -2875,8 +3109,12 @@ def _repair_self_check_matches_submission(
     preamble: str = "",
     context_lemmas: Sequence[str] = (),
     exact_only: bool = False,
+    require_declaration: bool = False,
 ) -> bool:
-    submitted_norm = _normalized_repair_code(submitted)
+    submitted_norm = _normalized_repair_code(
+        submitted,
+        preserve_declaration=require_declaration,
+    )
     if not submitted_norm:
         return False
     registry_codes: List[str] = []
@@ -2925,7 +3163,10 @@ def _repair_self_check_matches_submission(
                 continue
             registry_codes.append(str(getattr(item, "normalized_code", "") or ""))
     for code in [*list(checked_codes or ()), *registry_codes]:
-        checked_norm = _normalized_repair_code(code)
+        checked_norm = _normalized_repair_code(
+            code,
+            preserve_declaration=require_declaration,
+        )
         if not checked_norm:
             continue
         if exact_only:
@@ -3124,7 +3365,19 @@ def _repair_self_check_has_terminal_continuation(
     return False
 
 
-def _format_self_check_mismatch_feedback() -> str:
+def _format_self_check_mismatch_feedback(
+    *,
+    require_declaration: bool = False,
+) -> str:
+    if require_declaration:
+        return (
+            f"{_REPAIR_SELF_CHECK_MARKER}\n"
+            "You used a Lean checking tool, but the final named declaration "
+            "artifact does not match the complete declaration accepted by "
+            "`try_lean`. Call `try_lean` on the actual final named declaration "
+            "you intend to submit, including its name, statement, and proof, "
+            "then submit that checked artifact."
+        )
     return (
         f"{_REPAIR_SELF_CHECK_MARKER}\n"
         "You used a Lean checking tool, but the final submitted proof does "

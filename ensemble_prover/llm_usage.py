@@ -471,6 +471,7 @@ _PROTECTED_USAGE_EVENT_KEYS = {
     "max_cost_usd",
     "llm_observed_usage_cost_usd",
     "llm_conservative_unknown_exposure_usd",
+    "llm_unpriced_provider_exposure_count",
     "cost_accounting_incomplete",
     "llm_cost_accounting_incomplete",
     "llm_budget_accounted_cost_is_conservative_upper_bound",
@@ -540,6 +541,40 @@ def _late_rejection_receipt_id(
 _LLM_USAGE_CONTEXT: contextvars.ContextVar[Dict[str, Any]] = (
     contextvars.ContextVar("llm_usage_context", default={})
 )
+_PROVIDER_REQUEST_METADATA_OBSERVER: contextvars.ContextVar[
+    Optional[Callable[[Mapping[str, Any]], Any]]
+] = contextvars.ContextVar(
+    "provider_request_metadata_observer",
+    default=None,
+)
+
+
+def publish_provider_request_metadata(metadata: Mapping[str, Any]) -> None:
+    """Publish finalized provider controls to the current logical request."""
+
+    observer = _PROVIDER_REQUEST_METADATA_OBSERVER.get()
+    if observer is None:
+        return
+    observer(dict(metadata or {}))
+
+
+@contextmanager
+def capture_provider_request_metadata():
+    """Capture provider-control receipts without consulting shared client state."""
+
+    receipt: Dict[str, Any] = {}
+    inherited = _PROVIDER_REQUEST_METADATA_OBSERVER.get()
+
+    def _capture(metadata: Mapping[str, Any]) -> None:
+        receipt.update(dict(metadata or {}))
+        if inherited is not None:
+            inherited(metadata)
+
+    token = _PROVIDER_REQUEST_METADATA_OBSERVER.set(_capture)
+    try:
+        yield receipt
+    finally:
+        _PROVIDER_REQUEST_METADATA_OBSERVER.reset(token)
 
 
 def _merge_usage_metadata(
@@ -1359,6 +1394,8 @@ class CostBudgetController:
         self._lock = asyncio.Lock()
         self._exact_cost_usd = 0.0
         self._unknown_cost_usd = 0.0
+        self._unpriced_provider_exposure_receipts: set[str] = set()
+        self._unpriced_provider_exposure_opaque: Counter[str] = Counter()
         self._input_tokens = 0
         self._output_tokens = 0
         self._cached_input_tokens = 0
@@ -1406,6 +1443,67 @@ class CostBudgetController:
     @property
     def reserved_cost_usd(self) -> float:
         return float(self._reserved_cost_usd)
+
+    def _unpriced_provider_exposure_count(self) -> int:
+        return len(self._unpriced_provider_exposure_receipts) + sum(
+            max(0, int(count or 0))
+            for count in self._unpriced_provider_exposure_opaque.values()
+        )
+
+    @staticmethod
+    def _unpriced_opaque_key(reservation_id: str, target_id: str) -> str:
+        return f"{reservation_id}\x1f{target_id}"
+
+    def _add_unpriced_opaque_exposure(
+        self,
+        reservation_id: str,
+        target_id: str,
+        count: int = 1,
+    ) -> None:
+        if count <= 0:
+            return
+        key = self._unpriced_opaque_key(reservation_id, target_id)
+        self._unpriced_provider_exposure_opaque[key] += int(count)
+
+    def _retire_unpriced_exposure(
+        self,
+        reservation_id: str,
+        target_id: str,
+        dispatch_ordinal: int,
+    ) -> bool:
+        if target_id and dispatch_ordinal > 0:
+            receipt_id = _provider_dispatch_receipt_id(
+                reservation_id=reservation_id,
+                target_id=target_id,
+                dispatch_ordinal=dispatch_ordinal,
+            )
+            if receipt_id in self._unpriced_provider_exposure_receipts:
+                self._unpriced_provider_exposure_receipts.discard(receipt_id)
+                return True
+        key = self._unpriced_opaque_key(reservation_id, target_id)
+        count = max(
+            0,
+            int(self._unpriced_provider_exposure_opaque.get(key, 0) or 0),
+        )
+        if count <= 0:
+            return False
+        if count == 1:
+            self._unpriced_provider_exposure_opaque.pop(key, None)
+        else:
+            self._unpriced_provider_exposure_opaque[key] = count - 1
+        return True
+
+    @staticmethod
+    def _reservation_target_is_unpriced(
+        reservation: CostReservation,
+        target_id: str,
+    ) -> bool:
+        matches = [
+            item
+            for item in reservation.estimated_models
+            if str(item.get("target_id") or "") == str(target_id or "")
+        ]
+        return bool(matches and any(not bool(item.get("pricing_known")) for item in matches))
 
     def _reservation_accounted_exposure(self, reservation_id: str) -> float:
         missing = max(
@@ -2169,6 +2267,7 @@ class CostBudgetController:
         reservation: CostReservation,
         target_id: str,
         *,
+        dispatch_ordinal: int = 0,
         estimated_dispatch_cost_usd: Optional[float] = None,
     ) -> None:
         """Conservatively account a provider dispatch after initial settlement."""
@@ -2204,7 +2303,21 @@ class CostBudgetController:
                 return
             self._events += 1
             self._usage_missing_events += 1
-            unknown_added = target_cost if self.budget_enabled else 0.0
+            if self._reservation_target_is_unpriced(reservation, clean_target):
+                if dispatch_ordinal > 0:
+                    self._unpriced_provider_exposure_receipts.add(
+                        _provider_dispatch_receipt_id(
+                            reservation_id=reservation.reservation_id,
+                            target_id=clean_target,
+                            dispatch_ordinal=dispatch_ordinal,
+                        )
+                    )
+                else:
+                    self._add_unpriced_opaque_exposure(
+                        reservation.reservation_id,
+                        clean_target,
+                    )
+            unknown_added = target_cost
             if unknown_added > 0.0:
                 target_costs = self._reservation_missing_target_costs.setdefault(
                     reservation.reservation_id,
@@ -2259,6 +2372,10 @@ class CostBudgetController:
                     "late_usage": True,
                     "usage_missing": True,
                     "missing_provider_target_ids": [clean_target],
+                    "reservation_dispatch_ordinal": max(
+                        0,
+                        int(dispatch_ordinal or 0),
+                    ),
                     "estimated_unknown_cost_usd": unknown_added,
                     "llm_budget_accounted_cost_usd": self.accounted_cost_usd,
                     "llm_budget_committed_cost_usd": self.committed_cost_usd,
@@ -2557,6 +2674,11 @@ class CostBudgetController:
             )
             if duplicate_receipt:
                 return
+            self._retire_unpriced_exposure(
+                reservation.reservation_id,
+                clean_target,
+                max(0, int(dispatch_ordinal or 0)),
+            )
             reversed_cost = missing_reversed_cost + recovered_reversed_cost
             # Provider exposure is an observability/safety ledger independent
             # of whether a dollar budget is enabled.  A definitive correlated
@@ -2981,6 +3103,57 @@ class CostBudgetController:
             if str(record.reservation_target_id or "")
             and int(record.reservation_dispatch_ordinal or 0) > 0
         }
+        unpriced_reserved_target_ids = {
+            str(item.get("target_id") or "")
+            for item in reservation.estimated_models
+            if str(item.get("target_id") or "")
+            and not bool(item.get("pricing_known"))
+        }
+        missing_unpriced_receipt_ids = {
+            _provider_dispatch_receipt_id(
+                reservation_id=reservation.reservation_id,
+                target_id=target_id,
+                dispatch_ordinal=ordinal,
+            )
+            for target_id, ordinal in exposed_receipt_costs
+            if release_reservation
+            and target_id in unpriced_reserved_target_ids
+            and (target_id, ordinal) not in observed_receipt_keys
+        }
+        unpriced_observation_receipt_ids: set[str] = set()
+        late_unpriced_observation_receipts: list[tuple[str, int]] = []
+        authoritative_observation_receipts: list[tuple[str, int]] = []
+        unpriced_opaque_observation_counts: Counter[str] = Counter()
+        for record, detail in zip(records, observation_details):
+            target_id = str(record.reservation_target_id or "")
+            ordinal = max(0, int(record.reservation_dispatch_ordinal or 0))
+            if not bool(detail.get("pricing_known")):
+                if late:
+                    late_unpriced_observation_receipts.append(
+                        (target_id, ordinal)
+                    )
+                if target_id and ordinal > 0:
+                    unpriced_observation_receipt_ids.add(
+                        _provider_dispatch_receipt_id(
+                            reservation_id=reservation.reservation_id,
+                            target_id=target_id,
+                            dispatch_ordinal=ordinal,
+                        )
+                    )
+                else:
+                    unpriced_opaque_observation_counts[target_id] += 1
+            elif late:
+                authoritative_observation_receipts.append((target_id, ordinal))
+        opaque_missing_unpriced_counts: Counter[str] = Counter()
+        if release_reservation and not precise_dispatch_receipt_costs:
+            for target_id in unpriced_reserved_target_ids:
+                missing_count = max(
+                    0,
+                    exposed_target_counts[target_id]
+                    - observed_target_counts[target_id],
+                )
+                if missing_count > 0:
+                    opaque_missing_unpriced_counts[target_id] = missing_count
         if release_reservation and precise_dispatch_ledger_present:
             missing_target_costs: Dict[str, float] = {}
             for (target_id, ordinal), dispatch_cost in exposed_receipt_costs.items():
@@ -3015,13 +3188,12 @@ class CostBudgetController:
         )
         retryable_exception_no_charge = status == "retryable_exception_no_charge"
         if charge_missing_usage:
-            if self.budget_enabled:
-                missing_unknown_cost = (
-                    sum(missing_target_costs.values())
-                    if precise_dispatch_ledger_present
-                    or missing_target_costs
-                    else float(reservation.estimated_cost_usd or 0.0)
-                )
+            missing_unknown_cost = (
+                sum(missing_target_costs.values())
+                if precise_dispatch_ledger_present
+                or missing_target_costs
+                else float(reservation.estimated_cost_usd or 0.0)
+            )
         pricing_unknown_target_costs = {
             target_id: (
                 estimated_dispatch_cost_by_target.get(target_id, 0.0) * count
@@ -3033,9 +3205,6 @@ class CostBudgetController:
             if ambiguous_unknown_pricing
             else sum(pricing_unknown_target_costs.values())
         )
-        if not self.budget_enabled:
-            pricing_unknown_cost = 0.0
-            pricing_unknown_target_costs = {}
         if ambiguous_unknown_pricing:
             # The full reservation already covers every possibly missing leaf.
             missing_unknown_cost = 0.0
@@ -3091,6 +3260,38 @@ class CostBudgetController:
                 )
                 if duplicate_receipt:
                     return
+            self._unpriced_provider_exposure_receipts.update(
+                missing_unpriced_receipt_ids
+            )
+            for target_id, ordinal in late_unpriced_observation_receipts:
+                # A late unpriced receipt refines the identity of one already
+                # exposed dispatch; migrate opaque/exact state before adding
+                # its receipt so the same provider activity is not counted
+                # twice. With no prior exposure this is a no-op and the new
+                # receipt below correctly creates one occurrence.
+                self._retire_unpriced_exposure(
+                    reservation.reservation_id,
+                    target_id,
+                    ordinal,
+                )
+            self._unpriced_provider_exposure_receipts.update(
+                unpriced_observation_receipt_ids
+            )
+            for target_id, count in (
+                opaque_missing_unpriced_counts
+                + unpriced_opaque_observation_counts
+            ).items():
+                self._add_unpriced_opaque_exposure(
+                    reservation.reservation_id,
+                    target_id,
+                    count,
+                )
+            for target_id, ordinal in authoritative_observation_receipts:
+                self._retire_unpriced_exposure(
+                    reservation.reservation_id,
+                    target_id,
+                    ordinal,
+                )
             if release_reservation:
                 reserved_cost = float(
                     self._active_reservations.pop(reservation.reservation_id, 0.0)
@@ -3405,7 +3606,11 @@ class CostBudgetController:
                 role_totals["model"] = records[-1].model
             self._refresh_terminal_reason_locked()
             unknown_exposure = float(self._unknown_cost_usd)
-            accounting_incomplete = bool(unknown_exposure > 1e-12)
+            unpriced_exposure_count = self._unpriced_provider_exposure_count()
+            quantified_unknown = bool(unknown_exposure > 1e-12)
+            accounting_incomplete = bool(
+                quantified_unknown or unpriced_exposure_count > 0
+            )
             event = {
                 "phase": "llm_usage",
                 "verdict": (
@@ -3457,10 +3662,11 @@ class CostBudgetController:
                 "llm_budget_committed_cost_usd": self.committed_cost_usd,
                 "llm_observed_usage_cost_usd": float(self._exact_cost_usd),
                 "llm_conservative_unknown_exposure_usd": unknown_exposure,
+                "llm_unpriced_provider_exposure_count": unpriced_exposure_count,
                 "cost_accounting_incomplete": accounting_incomplete,
                 "llm_cost_accounting_incomplete": accounting_incomplete,
                 "llm_budget_accounted_cost_is_conservative_upper_bound": (
-                    accounting_incomplete
+                    quantified_unknown and unpriced_exposure_count == 0
                 ),
                 "llm_budget_remaining_usd": self.remaining_usd(),
                 "llm_cost_budget_exhausted": self.exhausted(),
@@ -3618,6 +3824,18 @@ class CostBudgetController:
         pending_dispatch_receipt_token: Optional[contextvars.Token] = None
         settlement_complete = asyncio.Event()
         dispatch_observer_token: Optional[contextvars.Token] = None
+        provider_metadata_token: Optional[contextvars.Token] = None
+        provider_request_metadata: Dict[str, Any] = {}
+        inherited_provider_metadata_observer = (
+            _PROVIDER_REQUEST_METADATA_OBSERVER.get()
+        )
+
+        def _record_provider_request_metadata(
+            metadata: Mapping[str, Any],
+        ) -> None:
+            provider_request_metadata.update(dict(metadata or {}))
+            if inherited_provider_metadata_observer is not None:
+                inherited_provider_metadata_observer(metadata)
         inherited_dispatch_observer = _PROVIDER_DISPATCH_OBSERVER.get()
 
         dispatch_authority_remaining_usd: Dict[str, float] = {
@@ -4178,6 +4396,7 @@ class CostBudgetController:
                     late_call = self.record_late_dispatch(
                         reservation,
                         target_id,
+                        dispatch_ordinal=dispatch_ordinal,
                         estimated_dispatch_cost_usd=max(
                             0.0,
                             float(
@@ -4189,7 +4408,11 @@ class CostBudgetController:
                         ),
                     )
                 else:
-                    late_call = self.record_late_dispatch(reservation, target_id)
+                    late_call = self.record_late_dispatch(
+                        reservation,
+                        target_id,
+                        dispatch_ordinal=dispatch_ordinal,
+                    )
                 task = asyncio.create_task(late_call)
                 late_dispatch_tasks.setdefault(target_id, []).append(task)
                 self._pending_late_usage_tasks.add(task)
@@ -4200,6 +4423,7 @@ class CostBudgetController:
         def _reset_dispatch_context() -> None:
             nonlocal dispatch_context_token, dispatch_observer_token
             nonlocal pending_dispatch_receipt_token
+            nonlocal provider_metadata_token
             if dispatch_context_token is not None:
                 _PROVIDER_DISPATCH_MARKER.reset(dispatch_context_token)
                 dispatch_context_token = None
@@ -4211,6 +4435,11 @@ class CostBudgetController:
                     pending_dispatch_receipt_token
                 )
                 pending_dispatch_receipt_token = None
+            if provider_metadata_token is not None:
+                _PROVIDER_REQUEST_METADATA_OBSERVER.reset(
+                    provider_metadata_token
+                )
+                provider_metadata_token = None
 
         def _has_unretired_provider_exposure() -> bool:
             return any(
@@ -4228,21 +4457,10 @@ class CostBudgetController:
             reservation.metadata["llm_provider_dispatch_receipts"] = list(
                 dispatch_receipts
             )
-            try:
-                provider_temperature_metadata = _temperature_provider_metadata(client)
-                if (
-                    "temperature_requested" in reservation.metadata
-                    and reservation.metadata.get("temperature_requested") is None
-                    and provider_temperature_metadata.get(
-                        "temperature_provider_drop_reason"
-                    )
-                    == "unsupported_sampling_controls"
-                ):
-                    provider_temperature_metadata["temperature_provider_dropped"] = False
-                    provider_temperature_metadata["temperature_provider_drop_reason"] = ""
-                reservation.metadata.update(provider_temperature_metadata)
-            except Exception:
-                pass
+            # The provider publishes request-local control decisions even when
+            # its response omits token usage. Never infer them from mutable
+            # client ``last_*`` diagnostics shared by concurrent calls.
+            reservation.metadata.update(provider_request_metadata)
             task = asyncio.create_task(
                 self.settle(
                     reservation,
@@ -4335,6 +4553,11 @@ class CostBudgetController:
             )
             pending_dispatch_receipt_token = (
                 _PROVIDER_PENDING_DISPATCH_RECEIPT.set({})
+            )
+            provider_metadata_token = (
+                _PROVIDER_REQUEST_METADATA_OBSERVER.set(
+                    _record_provider_request_metadata
+                )
             )
             result = invoke(_usage_callback)
             if inspect.isawaitable(result):
@@ -4502,15 +4725,22 @@ class CostBudgetController:
             # Otherwise a later event can update accounted cost while leaving
             # the watchdog to combine it with stale observed/unknown fields.
             unknown_exposure = float(self._unknown_cost_usd)
-            accounting_incomplete = bool(unknown_exposure > 1e-12)
+            unpriced_exposure_count = self._unpriced_provider_exposure_count()
+            quantified_unknown = bool(unknown_exposure > 1e-12)
+            accounting_incomplete = bool(
+                quantified_unknown or unpriced_exposure_count > 0
+            )
             payload.update(
                 {
                     "llm_observed_usage_cost_usd": float(self._exact_cost_usd),
                     "llm_conservative_unknown_exposure_usd": unknown_exposure,
+                    "llm_unpriced_provider_exposure_count": (
+                        unpriced_exposure_count
+                    ),
                     "cost_accounting_incomplete": accounting_incomplete,
                     "llm_cost_accounting_incomplete": accounting_incomplete,
                     "llm_budget_accounted_cost_is_conservative_upper_bound": (
-                        accounting_incomplete
+                        quantified_unknown and unpriced_exposure_count == 0
                     ),
                     "llm_budget_accounted_cost_usd": float(
                         self.accounted_cost_usd
@@ -4530,7 +4760,11 @@ class CostBudgetController:
 
     def summary(self) -> Dict[str, Any]:
         unknown_exposure = float(self._unknown_cost_usd)
-        accounting_incomplete = bool(unknown_exposure > 1e-12)
+        unpriced_exposure_count = self._unpriced_provider_exposure_count()
+        quantified_unknown = bool(unknown_exposure > 1e-12)
+        accounting_incomplete = bool(
+            quantified_unknown or unpriced_exposure_count > 0
+        )
         summary: Dict[str, Any] = {
             "input_tokens": int(self._input_tokens),
             "output_tokens": int(self._output_tokens),
@@ -4547,10 +4781,11 @@ class CostBudgetController:
             "llm_observed_usage_cost_usd": float(self._exact_cost_usd),
             "estimated_unknown_cost_usd": unknown_exposure,
             "llm_conservative_unknown_exposure_usd": unknown_exposure,
+            "llm_unpriced_provider_exposure_count": unpriced_exposure_count,
             "cost_accounting_incomplete": accounting_incomplete,
             "llm_cost_accounting_incomplete": accounting_incomplete,
             "llm_budget_accounted_cost_is_conservative_upper_bound": (
-                accounting_incomplete
+                quantified_unknown and unpriced_exposure_count == 0
             ),
             "llm_budget_accounted_cost_usd": float(self.accounted_cost_usd),
             "llm_budget_committed_cost_usd": float(self.committed_cost_usd),
@@ -4929,6 +5164,8 @@ def usage_totals_from_clients(
         "cache_write_tokens": 0,
         "prompt_cache_miss_tokens": 0,
         "usage_missing_responses": 0,
+        "unpriced_response_count": 0,
+        "llm_unpriced_provider_exposure_count": 0,
         "cost_accounting_incomplete": False,
         "cost_usd": 0.0,
     }
@@ -4943,34 +5180,60 @@ def usage_totals_from_clients(
         cached_tokens = int(usage.get("cached_input_tokens", 0) or 0)
         cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
         miss_tokens = int(usage.get("prompt_cache_miss_tokens", 0) or 0)
-        missing_responses = int(usage.get("usage_missing_responses", 0) or 0)
+        missing_responses = max(
+            0,
+            int(usage.get("usage_missing_responses", 0) or 0),
+        )
+        unpriced_responses = max(
+            0,
+            int(usage.get("unpriced_response_count", 0) or 0),
+        )
         model, base_url = _client_model_base(client)
         reported_aggregate_cost = _usage_float(usage.get("cost_usd"))
+        unpriced_activity_incomplete = False
+        has_unpriced_partition = "unpriced_input_tokens" in usage
         if reported_aggregate_cost is not None and bool(
             usage.get("cost_usd_authoritative", False)
         ):
             cost = reported_aggregate_cost
+        elif has_unpriced_partition:
+            # An explicit unpriced partition is authority that those receipts
+            # could not be costed using their response models. Never re-price
+            # them with the client's configured model: provider routing may
+            # have returned a different model, and token_usage() intentionally
+            # does not pretend that aggregate counters preserve that identity.
+            fallback_input_tokens = int(
+                usage.get("unpriced_input_tokens", 0) or 0
+            )
+            fallback_output_tokens = int(
+                usage.get("unpriced_output_tokens", 0) or 0
+            )
+            fallback_cached_tokens = int(
+                usage.get("unpriced_cached_input_tokens", 0) or 0
+            )
+            unpriced_activity_incomplete = bool(
+                fallback_input_tokens > 0
+                or fallback_output_tokens > 0
+                or fallback_cached_tokens > 0
+            )
+            # Exact cost from other, priced responses remains authoritative;
+            # the occurrence counter carries the opaque remainder.
+            cost = float(reported_aggregate_cost or 0.0)
         else:
-            # Cumulative token counters do not retain per-request prompt sizes,
-            # so they cannot safely reapply long-context tiers. Request-scoped
-            # OpenAI clients publish their accumulated exact cost above.
-            has_unpriced_partition = "unpriced_input_tokens" in usage
-            fallback_input_tokens = (
-                int(usage.get("unpriced_input_tokens", 0) or 0)
-                if has_unpriced_partition
-                else input_tokens
-            )
-            fallback_output_tokens = (
-                int(usage.get("unpriced_output_tokens", 0) or 0)
-                if has_unpriced_partition
-                else output_tokens
-            )
-            fallback_cached_tokens = (
-                int(usage.get("unpriced_cached_input_tokens", 0) or 0)
-                if has_unpriced_partition
-                else cached_tokens
-            )
+            # Legacy clients without explicit partitions expose only aggregate
+            # tokens. Reconstruct cost when their configured model is known.
+            fallback_input_tokens = input_tokens
+            fallback_output_tokens = output_tokens
+            fallback_cached_tokens = cached_tokens
             pricing = lookup_known_token_pricing(base_url, model)
+            unpriced_activity_incomplete = bool(
+                pricing is None
+                and (
+                    fallback_input_tokens > 0
+                    or fallback_output_tokens > 0
+                    or fallback_cached_tokens > 0
+                )
+            )
             cost = (
                 compute_cost_usd(
                     fallback_input_tokens,
@@ -4981,13 +5244,16 @@ def usage_totals_from_clients(
                 if pricing is not None
                 else 0.0
             )
-            if has_unpriced_partition:
-                cost = float(cost or 0.0) + float(reported_aggregate_cost or 0.0)
-            else:
-                cost = max(
-                    float(cost or 0.0),
-                    float(reported_aggregate_cost or 0.0),
-                )
+            cost = max(
+                float(cost or 0.0),
+                float(reported_aggregate_cost or 0.0),
+            )
+        # Older clients exposed only token partitions. Preserve compatibility
+        # while ensuring an unknown-cost provider occurrence remains explicit
+        # even when its token counters happen to be zero.
+        if unpriced_responses <= 0 and unpriced_activity_incomplete:
+            unpriced_responses = 1
+        provider_exposure_count = unpriced_responses + missing_responses
         prefix = str(role or "llm").strip()
         totals[f"{prefix}_input_tokens"] = input_tokens
         totals[f"{prefix}_output_tokens"] = output_tokens
@@ -4995,6 +5261,10 @@ def usage_totals_from_clients(
         totals[f"{prefix}_cache_write_tokens"] = cache_write_tokens
         totals[f"{prefix}_prompt_cache_miss_tokens"] = miss_tokens
         totals[f"{prefix}_usage_missing_responses"] = missing_responses
+        totals[f"{prefix}_unpriced_response_count"] = unpriced_responses
+        totals[f"{prefix}_unpriced_provider_exposure_count"] = (
+            provider_exposure_count
+        )
         totals[f"{prefix}_cost_usd"] = cost
         totals[f"{prefix}_model"] = model
         totals["input_tokens"] += input_tokens
@@ -5003,8 +5273,32 @@ def usage_totals_from_clients(
         totals["cache_write_tokens"] += cache_write_tokens
         totals["prompt_cache_miss_tokens"] += miss_tokens
         totals["usage_missing_responses"] += missing_responses
+        totals["unpriced_response_count"] += unpriced_responses
+        totals["llm_unpriced_provider_exposure_count"] += provider_exposure_count
         totals["cost_accounting_incomplete"] = bool(
-            totals["cost_accounting_incomplete"] or missing_responses > 0
+            totals["cost_accounting_incomplete"]
+            or provider_exposure_count > 0
         )
         totals["cost_usd"] += cost
+    # The fallback replaces a zero-event controller ledger at finalization.
+    # Publish the whole authority bundle together so watchdog recovery and
+    # downstream consumers never combine client totals with stale controller
+    # aliases. Client aggregates cannot safely quantify missing/unpriced
+    # provider spend, so unknown exposure is occurrence-based rather than a
+    # fabricated monetary upper bound.
+    observed_cost = float(totals["cost_usd"])
+    incomplete = bool(totals["cost_accounting_incomplete"])
+    totals.update(
+        {
+            "llm_observed_usage_cost_usd": observed_cost,
+            "estimated_unknown_cost_usd": 0.0,
+            "llm_conservative_unknown_exposure_usd": 0.0,
+            "llm_cost_accounting_incomplete": incomplete,
+            "llm_budget_accounted_cost_is_conservative_upper_bound": False,
+            "llm_budget_accounted_cost_usd": observed_cost,
+            "llm_budget_committed_cost_usd": observed_cost,
+            "llm_usage_missing_events": int(totals["usage_missing_responses"]),
+            "llm_pricing_unknown_events": int(totals["unpriced_response_count"]),
+        }
+    )
     return totals

@@ -12256,6 +12256,7 @@ class MiniSession:
                 self.budgets[action_id] = budget
             old_max = int(budget.max_invocations)
             old_invocations = int(budget.invocations)
+            old_max_seconds = float(budget.max_total_seconds)
             granted = 0
             if budget.max_invocations >= 0:
                 new_max = max(old_max + increment, old_invocations + increment)
@@ -12275,6 +12276,14 @@ class MiniSession:
                     0.0,
                     float(budget.max_total_seconds) - old_seconds,
                 )
+
+            if budget.exhausted():
+                # Ordinary caps are extendable here; aggregate caps are not.
+                # Do not let a speculative local top-up become a successful
+                # continuation when the action still cannot dispatch.
+                budget.max_invocations = old_max
+                budget.max_total_seconds = old_max_seconds
+                continue
 
             prompt_turn_budget_granted = 0
             if action_id.startswith("conversation_turn") and hasattr(
@@ -16465,10 +16474,16 @@ class MiniSession:
             return
         budget = self.budgets.get(action.id)
         needed = 0
+        old_max_invocations: Optional[int] = None
         if budget is not None and budget.max_invocations >= 0:
+            old_max_invocations = int(budget.max_invocations)
             needed = int(budget.invocations or 0) + 1
             if int(budget.max_invocations or 0) < needed:
                 budget.max_invocations = needed
+        if budget is not None and budget.exhausted():
+            if old_max_invocations is not None:
+                budget.max_invocations = old_max_invocations
+            return
         prompt_turn_budget_granted = self._sync_conversation_prompt_budget(
             action.id,
             min_turn_budget=needed,
@@ -20818,7 +20833,44 @@ class MiniSession:
         # of the task.
         self._repair_first_scheduler_blocked = False
         repair_first_yielded_to_competitor = False
+        repair_first_outcome_reported = False
         forced_conversation = self._repair_first_conversation_action()
+
+        def record_repair_first_fairness_outcome(
+            selected: Optional[Action],
+        ) -> None:
+            nonlocal repair_first_outcome_reported
+            owner_action_id = str(
+                getattr(forced_conversation, "id", "") or ""
+            ).strip()
+            selected_action_id = str(getattr(selected, "id", "") or "").strip()
+            if (
+                not repair_first_yielded_to_competitor
+                or repair_first_outcome_reported
+                or selected is None
+            ):
+                return
+            repair_first_outcome_reported = True
+            if selected_action_id == owner_action_id:
+                self._record_event(
+                    {
+                        "phase": "session_provider_quantum_fairness",
+                        "iteration": self.iteration,
+                        "action_id": owner_action_id,
+                        "verdict": "repair_owner_resumed_no_competitor",
+                    }
+                )
+                return
+            self._record_event(
+                {
+                    "phase": "session_provider_quantum_fairness",
+                    "iteration": self.iteration,
+                    "action_id": owner_action_id,
+                    "competitor_action_id": selected_action_id,
+                    "verdict": "repair_owner_yielded_to_competitor",
+                }
+            )
+
         if forced_conversation is not None:
             should_yield = getattr(
                 forced_conversation,
@@ -20836,7 +20888,7 @@ class MiniSession:
                         "phase": "session_provider_quantum_fairness",
                         "iteration": self.iteration,
                         "action_id": forced_conversation.id,
-                        "verdict": "repair_owner_yielded_to_competitor",
+                        "verdict": "repair_owner_fairness_probe",
                     }
                 )
                 self._clear_selected_work_item()
@@ -20872,6 +20924,7 @@ class MiniSession:
             return None
         reserved_fallback = self._select_reserved_no_applicable_fallback()
         if reserved_fallback is not None:
+            record_repair_first_fairness_outcome(reserved_fallback)
             return reserved_fallback
 
         if force_cost_static_conversation and not self.repair_policy_narrowing_required:
@@ -20880,6 +20933,7 @@ class MiniSession:
                 context="cost_governed_forced_static",
             )
             if forced_static is not None:
+                record_repair_first_fairness_outcome(forced_static)
                 return forced_static
             self._increment_dossier_metric(
                 "mini_session_cost_governed_no_dispatch_lane",
@@ -21082,16 +21136,19 @@ class MiniSession:
                             "verdict": "child_adaptive_fallback_selected",
                         }
                     )
+                record_repair_first_fairness_outcome(fallback_action)
                 return fallback_action
 
         fairness_root_action = (
             self._select_scoped_frontier_root_authoring_fairness_action()
         )
         if fairness_root_action is not None:
+            record_repair_first_fairness_outcome(fairness_root_action)
             return fairness_root_action
 
         fixed_point_family_action = self._select_unseen_fixed_point_action_family()
         if fixed_point_family_action is not None:
+            record_repair_first_fairness_outcome(fixed_point_family_action)
             return fixed_point_family_action
 
         # 1. Frontier-first (placeholder until M2 populates the mapping).
@@ -21108,6 +21165,47 @@ class MiniSession:
             None
         )
         yield_frontier_to_static = False
+        frontier_fairness_outcome_reported = False
+
+        def record_frontier_fairness_outcome(selected: Optional[Action]) -> None:
+            nonlocal frontier_fairness_outcome_reported
+            owner_action_id = str(
+                getattr(yielded_frontier_action, "id", "") or ""
+            ).strip()
+            selected_action_id = str(getattr(selected, "id", "") or "").strip()
+            if (
+                yielded_frontier_action is None
+                or frontier_fairness_outcome_reported
+                or selected is None
+            ):
+                return
+            frontier_fairness_outcome_reported = True
+            if selected_action_id == owner_action_id:
+                self._record_event(
+                    {
+                        "phase": "session_frontier_fairness",
+                        "iteration": self.iteration,
+                        "action_id": owner_action_id,
+                        "selected_work_item": self._work_item_to_record(
+                            yielded_frontier_work_item
+                        ),
+                        "verdict": "frontier_owner_resumed_no_competitor",
+                    }
+                )
+                return
+            self._record_event(
+                {
+                    "phase": "session_frontier_fairness",
+                    "iteration": self.iteration,
+                    "action_id": owner_action_id,
+                    "competitor_action_id": selected_action_id,
+                    "selected_work_item": self._work_item_to_record(
+                        yielded_frontier_work_item
+                    ),
+                    "verdict": "yielded_to_static_competitor",
+                }
+            )
+
         if self.proof_state is not None:
             # Rank across the bounded global lookahead, not independently
             # inside each pagination window. Otherwise the legacy work-type
@@ -21302,6 +21400,7 @@ class MiniSession:
                                 self._clear_selected_work_item()
                                 break
                             self.selected_frontier_action_key = frontier_action_key
+                            record_repair_first_fairness_outcome(action)
                             return action
                         should_yield = getattr(
                             action, "should_yield_static_dispatch", None
@@ -21319,12 +21418,13 @@ class MiniSession:
                                     "selected_work_item": dict(
                                         self.selected_work_item_record
                                     ),
-                                    "verdict": "yielded_to_static_competitor",
+                                    "verdict": "static_competitor_probe",
                                 }
                             )
                             self._clear_selected_work_item()
                             break
                         self.selected_frontier_action_key = frontier_action_key
+                        record_repair_first_fairness_outcome(action)
                         return action
                     if yield_frontier_to_static:
                         break
@@ -21344,6 +21444,7 @@ class MiniSession:
         if not yield_frontier_to_static:
             route_drain_action = self._select_ready_root_route_assembly_action()
             if route_drain_action is not None:
+                record_repair_first_fairness_outcome(route_drain_action)
                 return route_drain_action
 
         # 2. Static priority fallback. Sort registered actions by
@@ -21564,6 +21665,7 @@ class MiniSession:
                 # The first independently applicable static action is the
                 # complete fairness quantum; it cannot yield again and replace
                 # the parked conversation owner with a sibling role.
+                record_repair_first_fairness_outcome(action)
                 return action
             should_yield = getattr(action, "should_yield_static_dispatch", None)
             if callable(should_yield) and should_yield(self):
@@ -21574,6 +21676,8 @@ class MiniSession:
                 yielded_static_action = action
                 self._clear_selected_work_item()
                 continue
+            record_frontier_fairness_outcome(action)
+            record_repair_first_fairness_outcome(action)
             return action
         if (
             yielded_frontier_action is not None
@@ -21587,10 +21691,28 @@ class MiniSession:
                     yielded_frontier_work_item
                 )
                 self.selected_frontier_action_key = yielded_frontier_action_key
+                record_frontier_fairness_outcome(yielded_frontier_action)
                 return yielded_frontier_action
             self._clear_selected_work_item()
         if yielded_static_action is not None:
+            record_frontier_fairness_outcome(yielded_static_action)
+            record_repair_first_fairness_outcome(yielded_static_action)
             return yielded_static_action
+        if (
+            yielded_frontier_action is not None
+            and not frontier_fairness_outcome_reported
+        ):
+            self._record_event(
+                {
+                    "phase": "session_frontier_fairness",
+                    "iteration": self.iteration,
+                    "action_id": str(yielded_frontier_action.id or "").strip(),
+                    "selected_work_item": self._work_item_to_record(
+                        yielded_frontier_work_item
+                    ),
+                    "verdict": "frontier_owner_restore_failed_no_competitor",
+                }
+            )
         if self.repair_policy_narrowing_required:
             self._increment_dossier_metric(
                 "mini_session_repair_policy_narrowing_blocked",
@@ -21983,6 +22105,9 @@ class MiniSession:
                     selected_work_record=ticket_record,
                 ):
                     return None
+                saved_selected_work = self.selected_work_item
+                saved_selected_action_id = self.selected_work_item_action_id
+                saved_selected_record = dict(self.selected_work_item_record)
                 if not self._restore_repair_ticket_selected_work(
                     ticket,
                     action_id=action.id,
@@ -21997,35 +22122,50 @@ class MiniSession:
                     source="repair_ticket",
                 ):
                     return None
+                if not self._safe_is_applicable(action, context="repair_ticket"):
+                    self.selected_work_item = saved_selected_work
+                    self.selected_work_item_action_id = saved_selected_action_id
+                    self.selected_work_item_record = saved_selected_record
+                    continue
                 self._grant_repair_ticket_action_budget(action, ticket)
-                if self._safe_is_applicable(action, context="repair_ticket"):
-                    self._increment_dossier_metric(
-                        "mini_session_repair_tickets_selected",
-                        1,
-                    )
-                    self._repair_ticket_selected_id = ticket.ticket_id
-                    self._record_event(
-                        {
-                            "phase": "session_repair_ticket",
-                            "iteration": self.iteration,
-                            "ticket_id": ticket.ticket_id,
-                            "target_id": ticket.target_id,
-                            "route_id": str(getattr(ticket, "route_id", "") or ""),
-                            "obligation_id": str(
-                                getattr(ticket, "obligation_id", "") or ""
-                            ),
-                            "work_type": str(getattr(ticket, "work_type", "") or ""),
-                            "proof_attempt_id": str(
-                                getattr(ticket, "proof_attempt_id", "") or ""
-                            ),
-                            "action_id": action.id,
-                            "attempts_used": int(ticket.attempts_used or 0),
-                            "next_attempt_number": int(ticket.attempts_used or 0) + 1,
-                            "max_attempts": int(ticket.max_attempts or 0),
-                            "verdict": "conversation_turn_forced",
-                        }
-                    )
-                    return action
+                budget = self.budgets.get(action.id)
+                if budget is not None and budget.exhausted():
+                    # A repair ticket orders eligible work; it does not grant
+                    # authority beyond cumulative seconds, aggregate caps, or
+                    # a bounded child whose conversation top-ups are disabled.
+                    # Undo the speculative ticket projection before trying a
+                    # different lane or reporting that none is available.
+                    self.selected_work_item = saved_selected_work
+                    self.selected_work_item_action_id = saved_selected_action_id
+                    self.selected_work_item_record = saved_selected_record
+                    continue
+                self._increment_dossier_metric(
+                    "mini_session_repair_tickets_selected",
+                    1,
+                )
+                self._repair_ticket_selected_id = ticket.ticket_id
+                self._record_event(
+                    {
+                        "phase": "session_repair_ticket",
+                        "iteration": self.iteration,
+                        "ticket_id": ticket.ticket_id,
+                        "target_id": ticket.target_id,
+                        "route_id": str(getattr(ticket, "route_id", "") or ""),
+                        "obligation_id": str(
+                            getattr(ticket, "obligation_id", "") or ""
+                        ),
+                        "work_type": str(getattr(ticket, "work_type", "") or ""),
+                        "proof_attempt_id": str(
+                            getattr(ticket, "proof_attempt_id", "") or ""
+                        ),
+                        "action_id": action.id,
+                        "attempts_used": int(ticket.attempts_used or 0),
+                        "next_attempt_number": int(ticket.attempts_used or 0) + 1,
+                        "max_attempts": int(ticket.max_attempts or 0),
+                        "verdict": "conversation_turn_forced",
+                    }
+                )
+                return action
             self._increment_dossier_metric(
                 "mini_session_repair_ticket_blocked_no_action",
                 1,
@@ -27888,7 +28028,13 @@ class MiniSession:
                     "verdict": "policy_repair_redirect_quota_refunded",
                 }
             )
-        if bool(metadata.get("refund_conversation_phase_turn")) and (
+        conversation_turn_newly_charged = bool(
+            metadata.get("conversation_turn_newly_charged", True)
+        )
+        if (
+            conversation_turn_newly_charged
+            and bool(metadata.get("refund_conversation_phase_turn"))
+        ) and (
             not bounded_conversation_budget
             or non_consuming_pre_provider_defer
             or counterexample_certification_infrastructure
@@ -27925,7 +28071,10 @@ class MiniSession:
                         "verdict": "policy_repair_redirect_phase_turn_refunded",
                     }
                 )
-        if bool(metadata.get("refund_conversation_absolute_turn")) and (
+        if (
+            conversation_turn_newly_charged
+            and bool(metadata.get("refund_conversation_absolute_turn"))
+        ) and (
             not bounded_conversation_budget
             or non_consuming_pre_provider_defer
             or cooperative_provider_yield
@@ -31026,14 +31175,18 @@ class MiniSession:
             ):
                 continue
             pool_granted = 0
+            old_graph_pool_remaining: Optional[int] = None
+            old_recursive_pool_remaining: Optional[int] = None
             if graph_pool_exhausted:
                 old_remaining = int(
                     getattr(self, "graph_recursive_decompose_remaining", 0) or 0
                 )
+                old_graph_pool_remaining = old_remaining
                 pool_granted = increment
                 self.graph_recursive_decompose_remaining = old_remaining + pool_granted
             if recursive_pool_exhausted and recursive_pool_attr:
                 old_remaining = int(getattr(self, recursive_pool_attr, 0) or 0)
+                old_recursive_pool_remaining = old_remaining
                 pool_granted += increment
                 setattr(
                     self,
@@ -31050,12 +31203,12 @@ class MiniSession:
                 old_max = int(budget.max_invocations)
                 old_invocations = int(budget.invocations)
                 granted = 0
+            old_seconds = float(budget.max_total_seconds)
             seconds_granted = 0.0
             if budget.max_total_seconds > 0 and (
                 budget.total_seconds >= budget.max_total_seconds
                 or action_budget_underfunded
             ):
-                old_seconds = float(budget.max_total_seconds)
                 estimate = float(getattr(action, "cost_estimate_s", 0.0) or 0.0)
                 seconds_granted = max(
                     30.0,
@@ -31066,6 +31219,27 @@ class MiniSession:
                 seconds_granted = max(
                     0.0, float(budget.max_total_seconds) - old_seconds
                 )
+            if budget.exhausted():
+                # Ordinary invocation/time and internal-pool top-ups are a
+                # speculative transaction. Aggregate ceilings cannot be
+                # extended by recovery, so an ineffective grant must not be
+                # recorded or leak capacity into a later scheduler pass.
+                budget.max_invocations = old_max
+                budget.max_total_seconds = old_seconds
+                if old_graph_pool_remaining is not None:
+                    self.graph_recursive_decompose_remaining = (
+                        old_graph_pool_remaining
+                    )
+                if (
+                    old_recursive_pool_remaining is not None
+                    and recursive_pool_attr
+                ):
+                    setattr(
+                        self,
+                        recursive_pool_attr,
+                        old_recursive_pool_remaining,
+                    )
+                continue
             prompt_turn_budget_granted = self._sync_conversation_prompt_budget(
                 action_id,
                 min_turn_budget=(
@@ -31250,6 +31424,7 @@ class MiniSession:
                 and self.registered_action(action_id) is not None
                 and self.budgets.get(action_id) is not None
                 and not self.budgets[action_id].exhausted()
+                and self._materialization_action_dispatch_budget_funded(action_id)
                 and action_id
                 not in self._dispatch_generation_release_suppressed_action_ids
             }
@@ -34514,6 +34689,42 @@ class MiniSession:
         except (TypeError, ValueError):
             return 0.0
 
+    def _materialization_action_dispatch_budget_funded(
+        self,
+        action_id: str,
+    ) -> bool:
+        """Whether pending materialization for one action can really dispatch."""
+
+        action = self.registered_action(action_id)
+        budget = self.budgets.get(action_id)
+        if action is None or budget is None or budget.exhausted():
+            return False
+        remaining_action_budget_s = (
+            float(budget.max_total_seconds) - float(budget.total_seconds)
+            if budget.scope in {"session", "proof_work"}
+            and budget.max_total_seconds > 0.0
+            else float("inf")
+        )
+        for action_key in tuple(
+            getattr(self, "materialization_pending_frontier_action_keys", set())
+            or set()
+        ):
+            if not action_key:
+                continue
+            keyed_action_id = str(action_key[-1] or "").partition(":context=")[0]
+            if keyed_action_id != action_id:
+                continue
+            required_dispatch_budget_s = self._frontier_required_dispatch_budget_s(
+                action,
+                {"work_type": str(action_key[1] if len(action_key) > 1 else "")},
+            )
+            if (
+                required_dispatch_budget_s > 0.0
+                and remaining_action_budget_s < required_dispatch_budget_s
+            ):
+                return False
+        return True
+
     def _serviceable_no_applicable_recovery_action_ids(
         self,
         action_ids: Sequence[str],
@@ -34732,6 +34943,33 @@ class MiniSession:
             action_id = str(candidate_id or "").strip()
             if not action_id or action_id not in wanted:
                 return
+            budget = self.budgets.get(action_id)
+            if budget is not None and budget.exhausted():
+                # Exhausted actions that are legitimately recoverable have
+                # already received a durable top-up earlier in this recovery
+                # pass. Releasing a skip key without runnable budget only
+                # reports false progress and burns another scheduler cycle.
+                return
+            action = self.registered_action(action_id)
+            required_dispatch_budget_s = self._frontier_required_dispatch_budget_s(
+                action,
+                work_item,
+            )
+            remaining_action_budget_s = (
+                float(budget.max_total_seconds) - float(budget.total_seconds)
+                if budget is not None
+                and budget.scope in {"session", "proof_work"}
+                and budget.max_total_seconds > 0.0
+                else float("inf")
+            )
+            if (
+                required_dispatch_budget_s > 0.0
+                and remaining_action_budget_s < required_dispatch_budget_s
+            ):
+                # Serviceability probes temporarily fund this threshold. A
+                # skip-only release must use the durable ledger, otherwise it
+                # consumes recovery while the selector remains unable to run.
+                return
             work_key = self._frontier_work_key(work_item)
             action_key = self._frontier_action_key(work_item, action_id)
             if action_key in self.consumed_frontier_action_keys:
@@ -34905,10 +35143,99 @@ class MiniSession:
             action = self.registered_action(action_id)
             if action is None:
                 continue
-            if action_id.startswith("conversation_turn") and not bool(
-                self.conversation_budget_topups_enabled
+            budget = self.budgets.get(action_id)
+            required_dispatch_budget_s = self._frontier_required_dispatch_budget_s(
+                action,
+                {"work_type": str(action_key[1] if len(action_key) > 1 else "")},
+            )
+            remaining_action_budget_s = (
+                float(budget.max_total_seconds) - float(budget.total_seconds)
+                if budget is not None
+                and budget.scope in {"session", "proof_work"}
+                and budget.max_total_seconds > 0.0
+                else float("inf")
+            )
+            action_budget_underfunded = bool(
+                required_dispatch_budget_s > 0.0
+                and remaining_action_budget_s < required_dispatch_budget_s
+            )
+            if (
+                action_id.startswith("conversation_turn")
+                and budget is not None
+                and (budget.exhausted() or action_budget_underfunded)
+                and not bool(self.conversation_budget_topups_enabled)
             ):
                 continue
+            if budget is not None and (
+                budget.exhausted() or action_budget_underfunded
+            ):
+                old_max = int(budget.max_invocations)
+                old_invocations = int(budget.invocations)
+                old_max_seconds = float(budget.max_total_seconds)
+                if old_max >= 0:
+                    budget.max_invocations = max(
+                        old_max + 1,
+                        old_invocations + 1,
+                    )
+                granted_seconds = 0.0
+                if (
+                    budget.max_total_seconds > 0
+                    and (
+                        budget.total_seconds >= budget.max_total_seconds
+                        or action_budget_underfunded
+                    )
+                ):
+                    estimate = float(
+                        getattr(action, "cost_estimate_s", 0.0) or 0.0
+                    )
+                    granted_seconds = max(
+                        30.0,
+                        max(1.0, estimate),
+                        required_dispatch_budget_s,
+                    )
+                    budget.max_total_seconds = (
+                        float(budget.total_seconds) + granted_seconds
+                    )
+                remaining_action_budget_s = (
+                    float(budget.max_total_seconds) - float(budget.total_seconds)
+                    if budget.scope in {"session", "proof_work"}
+                    and budget.max_total_seconds > 0.0
+                    else float("inf")
+                )
+                if budget.exhausted() or (
+                    required_dispatch_budget_s > 0.0
+                    and remaining_action_budget_s < required_dispatch_budget_s
+                ):
+                    # Aggregate ceilings are intentionally non-extendable.
+                    # Roll back speculative ordinary top-ups and preserve the
+                    # suppression transaction when they cannot enable work.
+                    budget.max_invocations = old_max
+                    budget.max_total_seconds = old_max_seconds
+                    continue
+                prompt_turn_budget_granted = (
+                    self._sync_conversation_prompt_budget(
+                        action_id,
+                        min_turn_budget=int(budget.max_invocations),
+                    )
+                )
+                budget_grants[action_id] = {
+                    "old_max_invocations": old_max,
+                    "new_max_invocations": int(budget.max_invocations),
+                    "invocations": old_invocations,
+                    "granted_invocations": (
+                        max(
+                            0,
+                            int(budget.max_invocations)
+                            - max(old_max, old_invocations),
+                        )
+                        if old_max >= 0
+                        else 0
+                    ),
+                    "granted_prompt_turn_budget": int(
+                        prompt_turn_budget_granted
+                    ),
+                    "granted_seconds": round(granted_seconds, 4),
+                }
             self.skipped_frontier_action_keys.discard(action_key)
             work_key = tuple(action_key[:5])
             if work_key in self.skipped_frontier_work_keys:
@@ -34917,35 +35244,6 @@ class MiniSession:
             released_action_keys.add(action_key)
             released_action_ids.add(action_id)
             released_logical_keys.add(logical_key)
-            budget = self.budgets.get(action_id)
-            if budget is None or not budget.exhausted():
-                continue
-            old_max = int(budget.max_invocations)
-            old_invocations = int(budget.invocations)
-            budget.max_invocations = max(old_max + 1, old_invocations + 1)
-            granted_seconds = 0.0
-            if (
-                budget.max_total_seconds > 0
-                and budget.total_seconds >= budget.max_total_seconds
-            ):
-                estimate = float(getattr(action, "cost_estimate_s", 0.0) or 0.0)
-                granted_seconds = max(30.0, max(1.0, estimate))
-                budget.max_total_seconds = float(budget.total_seconds) + granted_seconds
-            prompt_turn_budget_granted = self._sync_conversation_prompt_budget(
-                action_id,
-                min_turn_budget=int(budget.max_invocations),
-            )
-            budget_grants[action_id] = {
-                "old_max_invocations": old_max,
-                "new_max_invocations": int(budget.max_invocations),
-                "invocations": old_invocations,
-                "granted_invocations": max(
-                    0,
-                    int(budget.max_invocations) - max(old_max, old_invocations),
-                ),
-                "granted_prompt_turn_budget": int(prompt_turn_budget_granted),
-                "granted_seconds": round(granted_seconds, 4),
-            }
         if not released_action_keys:
             return {
                 "released_action_keys": 0,

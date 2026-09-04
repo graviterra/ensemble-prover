@@ -928,7 +928,7 @@ def _recover_watchdog_turn_metadata(
     turns_path = output_dir / "turns.jsonl"
     if not turns_path.is_file():
         return {}
-    last_turn: Dict[str, Any] = {}
+    last_valid_turn: Dict[str, Any] = {}
     recovered_usage: Dict[str, Any] = {}
     recovered_usage_positions: Dict[str, int] = {}
     authoritative_usage: Dict[str, Any] = {}
@@ -955,8 +955,12 @@ def _recover_watchdog_turn_metadata(
     invalid_records = 0
     invalid_usage_counters = 0
     invalid_turn_indices = 0
+    invalid_elapsed_values = 0
+    nonmonotonic_elapsed_values = 0
     first_valid_turn_index = 0
     last_valid_turn_index = 0
+    last_valid_elapsed_s: Optional[float] = None
+    max_valid_elapsed_s: Optional[float] = None
     last_invalid_record_position = 0
     last_cumulative_accounting_position = 0
     authoritative_usage_position = 0
@@ -997,9 +1001,32 @@ def _recover_watchdog_turn_metadata(
                 if first_valid_turn_index == 0:
                     first_valid_turn_index = int(raw_turn_index)
                 last_valid_turn_index = int(raw_turn_index)
+                last_valid_turn = dict(record)
+                if "elapsed_s" in record:
+                    raw_elapsed_s = record.get("elapsed_s")
+                    if (
+                        isinstance(raw_elapsed_s, (int, float))
+                        and not isinstance(raw_elapsed_s, bool)
+                        and math.isfinite(float(raw_elapsed_s))
+                        and float(raw_elapsed_s) >= 0.0
+                    ):
+                        elapsed_s = float(raw_elapsed_s)
+                        if (
+                            last_valid_elapsed_s is not None
+                            and elapsed_s < last_valid_elapsed_s
+                        ):
+                            nonmonotonic_elapsed_values += 1
+                        last_valid_elapsed_s = elapsed_s
+                        max_valid_elapsed_s = (
+                            elapsed_s
+                            if max_valid_elapsed_s is None
+                            else max(max_valid_elapsed_s, elapsed_s)
+                        )
+                    else:
+                        invalid_elapsed_values += 1
+                        last_valid_turn.pop("elapsed_s", None)
             else:
                 invalid_turn_indices += 1
-            last_turn = record
             phase = str(record.get("phase") or "")
             verdict = str(record.get("verdict") or "")
             usage_counter_event = phase == "llm_usage" and verdict in {
@@ -1107,6 +1134,7 @@ def _recover_watchdog_turn_metadata(
                 "llm_budget_committed_cost_usd",
                 "llm_observed_usage_cost_usd",
                 "llm_conservative_unknown_exposure_usd",
+                "llm_unpriced_provider_exposure_count",
                 "cost_usd",
                 "estimated_cost_usd",
                 "reservation_cost_usd",
@@ -1196,19 +1224,47 @@ def _recover_watchdog_turn_metadata(
                     committed = authority_numeric[
                         "llm_budget_committed_cost_usd"
                     ]
-                    incomplete = bool(unknown > 1e-12)
+                    raw_unpriced_count = record.get(
+                        "llm_unpriced_provider_exposure_count",
+                        0,
+                    )
+                    unpriced_count_valid = bool(
+                        isinstance(raw_unpriced_count, int)
+                        and not isinstance(raw_unpriced_count, bool)
+                        and raw_unpriced_count >= 0
+                    )
+                    unpriced_count = (
+                        int(raw_unpriced_count) if unpriced_count_valid else 0
+                    )
+                    incomplete = bool(
+                        unknown > 1e-12 or unpriced_count > 0
+                    )
+                    conservative_upper_bound = bool(
+                        unknown > 1e-12 and unpriced_count == 0
+                    )
                     coherent = bool(
-                        math.isclose(
+                        unpriced_count_valid
+                        and math.isclose(
                             accounted,
                             observed + unknown,
                             rel_tol=1e-9,
                             abs_tol=1e-9,
                         )
                         and committed + 1e-9 >= accounted
-                        and all(
-                            bool(authority_booleans[key]) == incomplete
-                            for key in boolean_usage_keys
+                        and bool(
+                            authority_booleans["cost_accounting_incomplete"]
                         )
+                        == incomplete
+                        and bool(
+                            authority_booleans["llm_cost_accounting_incomplete"]
+                        )
+                        == incomplete
+                        and bool(
+                            authority_booleans[
+                                "llm_budget_accounted_cost_is_conservative_upper_bound"
+                            ]
+                        )
+                        == conservative_upper_bound
                     )
                     if coherent:
                         # Treat the cumulative authority fields as one atomic
@@ -1218,6 +1274,9 @@ def _recover_watchdog_turn_metadata(
                         authoritative_usage = {
                             **authority_numeric,
                             **authority_booleans,
+                            "llm_unpriced_provider_exposure_count": (
+                                unpriced_count
+                            ),
                         }
                         authoritative_usage_position = line_position
                         turn_index = record.get("turn_index")
@@ -1241,6 +1300,8 @@ def _recover_watchdog_turn_metadata(
         invalid_records == 0
         and invalid_usage_counters == 0
         and invalid_turn_indices == 0
+        and invalid_elapsed_values == 0
+        and nonmonotonic_elapsed_values == 0
     )
     complete_usage_trace = bool(
         not scan_truncated
@@ -1253,12 +1314,16 @@ def _recover_watchdog_turn_metadata(
         "watchdog_recovery_invalid_records": invalid_records,
         "watchdog_recovery_invalid_usage_counters": invalid_usage_counters,
         "watchdog_recovery_invalid_turn_indices": invalid_turn_indices,
+        "watchdog_recovery_invalid_elapsed_values": invalid_elapsed_values,
+        "watchdog_recovery_nonmonotonic_elapsed_values": (
+            nonmonotonic_elapsed_values
+        ),
         "watchdog_recovery_usage_complete": complete_usage_trace,
         "watchdog_recovery_first_turn_index": first_valid_turn_index,
         "watchdog_recovery_last_turn_index": last_valid_turn_index,
         "watchdog_recovery_bytes_scanned": bytes_scanned,
         "watchdog_recovered_last_turn": selected(
-            last_turn,
+            last_valid_turn,
             (
                 "turn_index",
                 "ts",
@@ -1271,6 +1336,8 @@ def _recover_watchdog_turn_metadata(
             ),
         ),
     }
+    if max_valid_elapsed_s is not None:
+        recovered["watchdog_recovery_max_elapsed_s"] = max_valid_elapsed_s
     if complete_usage_trace and recovered_usage_events > 0:
         recovered.update(recovered_token_totals)
         recovered["llm_usage_events"] = recovered_usage_events
@@ -1319,6 +1386,7 @@ def _recover_watchdog_turn_metadata(
             authoritative_usage = {
                 "llm_observed_usage_cost_usd": legacy_observed_usage_cost,
                 "llm_conservative_unknown_exposure_usd": legacy_unknown,
+                "llm_unpriced_provider_exposure_count": 0,
                 "llm_budget_accounted_cost_usd": float(legacy_accounted),
                 "llm_budget_committed_cost_usd": float(legacy_committed),
                 "cost_accounting_incomplete": legacy_incomplete,
@@ -1348,6 +1416,7 @@ def _recover_watchdog_turn_metadata(
             "committed_cost_usd",
             "llm_budget_accounted_cost_usd",
             "llm_budget_committed_cost_usd",
+            "llm_unpriced_provider_exposure_count",
             "cost_accounting_incomplete",
             "llm_cost_accounting_incomplete",
             "llm_budget_accounted_cost_is_conservative_upper_bound",
@@ -1371,6 +1440,7 @@ def _recover_watchdog_turn_metadata(
         "llm_conservative_unknown_exposure_usd",
         "llm_budget_accounted_cost_usd",
         "llm_budget_committed_cost_usd",
+        "llm_unpriced_provider_exposure_count",
         "cost_accounting_incomplete",
         "llm_cost_accounting_incomplete",
         "llm_budget_accounted_cost_is_conservative_upper_bound",
@@ -1383,6 +1453,7 @@ def _recover_watchdog_turn_metadata(
         for key in (
             "llm_observed_usage_cost_usd",
             "llm_conservative_unknown_exposure_usd",
+            "llm_unpriced_provider_exposure_count",
             "cost_accounting_incomplete",
             "llm_cost_accounting_incomplete",
             "llm_budget_accounted_cost_is_conservative_upper_bound",
@@ -1457,6 +1528,7 @@ def _recover_watchdog_turn_metadata(
                 "llm_budget_committed_cost_usd",
                 "llm_observed_usage_cost_usd",
                 "llm_conservative_unknown_exposure_usd",
+                "llm_unpriced_provider_exposure_count",
                 "cost_accounting_incomplete",
                 "llm_cost_accounting_incomplete",
                 "llm_budget_accounted_cost_is_conservative_upper_bound",
@@ -1476,6 +1548,7 @@ def _recover_watchdog_turn_metadata(
             "llm_budget_committed_cost_usd",
             "llm_observed_usage_cost_usd",
             "llm_conservative_unknown_exposure_usd",
+            "llm_unpriced_provider_exposure_count",
             "cost_usd",
             "estimated_cost_usd",
             "reservation_cost_usd",
@@ -1495,7 +1568,13 @@ def _recover_watchdog_turn_metadata(
             ):
                 accounting.pop(key, None)
                 continue
-            accounting[key] = numeric
+            if key == "llm_unpriced_provider_exposure_count":
+                if not numeric.is_integer():
+                    accounting.pop(key, None)
+                    continue
+                accounting[key] = int(numeric)
+            else:
+                accounting[key] = numeric
         if accounting:
             recovered["watchdog_recovered_accounting"] = accounting
             if authoritative_usage_turn_index > 0:
@@ -1565,17 +1644,27 @@ def _write_failure_summary(
         recovered_last_turn_index = recovered.get(
             "watchdog_recovery_last_turn_index"
         )
+        existing_turn_count = existing.get("total_turns")
         if (
-            bool(recovered.get("watchdog_recovery_usage_complete", False))
-            and isinstance(recovered_last_turn_index, int)
+            isinstance(recovered_last_turn_index, int)
             and not isinstance(recovered_last_turn_index, bool)
             and recovered_last_turn_index > 0
         ):
-            # A complete append-only scan proves an authoritative crash cut.
-            # Publishing it allows a later watchdog pass to recognize newly
-            # appended events instead of treating its own old fallback as a
-            # timeless controller summary.
+            # The append-only turn index remains a useful crash cut even when
+            # the bounded recovery scan contains only the ledger tail.
             recovered["total_turns"] = recovered_last_turn_index
+            recovered["total_turns_is_lower_bound"] = not bool(
+                recovered.get("watchdog_recovery_usage_complete", False)
+            )
+        recovered_elapsed_s = recovered.get("watchdog_recovery_max_elapsed_s")
+        if (
+            isinstance(recovered_elapsed_s, (int, float))
+            and not isinstance(recovered_elapsed_s, bool)
+            and math.isfinite(float(recovered_elapsed_s))
+            and float(recovered_elapsed_s) >= 0.0
+        ):
+            recovered["wall_clock_s"] = float(recovered_elapsed_s)
+            recovered["wall_clock_s_is_lower_bound"] = True
         if (
             "llm_budget_accounted_cost_usd" not in recovered_accounting
             and "accounted_cost_usd" in recovered_accounting
@@ -1616,6 +1705,30 @@ def _write_failure_summary(
             "llm_conservative_unknown_exposure_usd"
         )
         existing_accounted = existing.get("llm_budget_accounted_cost_usd")
+        existing_unpriced_raw = existing.get(
+            "llm_unpriced_provider_exposure_count",
+            0,
+        )
+        existing_unpriced_valid = bool(
+            isinstance(existing_unpriced_raw, int)
+            and not isinstance(existing_unpriced_raw, bool)
+            and existing_unpriced_raw >= 0
+        )
+        existing_unpriced_count = (
+            int(existing_unpriced_raw) if existing_unpriced_valid else 0
+        )
+        existing_unknown_positive = bool(
+            isinstance(existing_unknown, (int, float))
+            and not isinstance(existing_unknown, bool)
+            and math.isfinite(float(existing_unknown))
+            and float(existing_unknown) > 1e-12
+        )
+        existing_incomplete = bool(
+            existing_unknown_positive or existing_unpriced_count > 0
+        )
+        existing_upper_bound = bool(
+            existing_unknown_positive and existing_unpriced_count == 0
+        )
         existing_authority_numbers = (
             existing_observed,
             existing_unknown,
@@ -1637,6 +1750,7 @@ def _write_failure_summary(
                 and float(value) >= 0.0
                 for value in existing_authority_numbers
             )
+            and existing_unpriced_valid
             and all(isinstance(value, bool) for value in existing_authority_flags)
             and math.isclose(
                 float(existing_accounted or 0.0),
@@ -1645,12 +1759,10 @@ def _write_failure_summary(
                 rel_tol=1e-9,
                 abs_tol=1e-9,
             )
-            and all(
-                bool(value) == bool(float(existing_unknown or 0.0) > 1e-12)
-                for value in existing_authority_flags
-            )
+            and bool(existing_authority_flags[0]) == existing_incomplete
+            and bool(existing_authority_flags[1]) == existing_incomplete
+            and bool(existing_authority_flags[2]) == existing_upper_bound
         )
-        existing_turn_count = existing.get("total_turns")
         recovered_accounting_turn_index = recovered.get(
             "watchdog_recovered_accounting_turn_index"
         )
@@ -1743,12 +1855,14 @@ def _write_failure_summary(
                 # can omit an accounting mutation that reached the summary.
                 payload[key] = int(recovered[key])
             if (
-                bool(recovered.get("watchdog_recovery_usage_complete", False))
-                and isinstance(recovered_last_turn_index, int)
+                isinstance(recovered_last_turn_index, int)
                 and not isinstance(recovered_last_turn_index, bool)
                 and recovered_last_turn_index > 0
             ):
                 payload["total_turns"] = recovered_last_turn_index
+                payload["total_turns_is_lower_bound"] = not bool(
+                    recovered.get("watchdog_recovery_usage_complete", False)
+                )
         elif (
             isinstance(existing_turn_count, int)
             and not isinstance(existing_turn_count, bool)
@@ -1805,6 +1919,9 @@ def _write_failure_summary(
             # from an older recovered turn and contradict its authority.
             payload["cost_usd"] = float(existing_observed)
             payload["estimated_unknown_cost_usd"] = float(existing_unknown)
+            payload["llm_unpriced_provider_exposure_count"] = (
+                existing_unpriced_count
+            )
             existing_committed = existing.get(
                 "llm_budget_committed_cost_usd",
                 existing_accounted,
@@ -1817,6 +1934,120 @@ def _write_failure_summary(
                 and float(existing_committed) >= float(existing_accounted)
                 else float(existing_accounted)
             )
+
+        def valid_nonnegative_int(value: Any) -> Optional[int]:
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+            ):
+                return int(value)
+            return None
+
+        def valid_nonnegative_float(value: Any) -> Optional[float]:
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and float(value) >= 0.0
+            ):
+                return float(value)
+            return None
+
+        # Resolve each value and its authority flag as one pair after the
+        # recovered/existing merge. Otherwise a stale value can survive with
+        # a lower-bound flag describing a newer ledger cut (or vice versa).
+        existing_total = valid_nonnegative_int(existing_turn_count)
+        recovered_total_candidate = valid_nonnegative_int(
+            recovered_last_turn_index
+        )
+        recovered_total = (
+            recovered_total_candidate
+            if recovered_total_candidate is not None
+            and recovered_total_candidate > 0
+            else None
+        )
+        raw_existing_total_lower_bound = existing.get(
+            "total_turns_is_lower_bound"
+        )
+        existing_total_lower_bound = (
+            raw_existing_total_lower_bound
+            if isinstance(raw_existing_total_lower_bound, bool)
+            else False
+        )
+        recovered_total_lower_bound = not bool(
+            recovered.get("watchdog_recovery_usage_complete", False)
+        )
+        if recovered_total is None:
+            resolved_total = existing_total
+            resolved_total_lower_bound = existing_total_lower_bound
+        elif existing_total is None or recovered_total > existing_total:
+            resolved_total = recovered_total
+            resolved_total_lower_bound = recovered_total_lower_bound
+        elif existing_total > recovered_total:
+            resolved_total = existing_total
+            resolved_total_lower_bound = existing_total_lower_bound
+        else:
+            resolved_total = existing_total
+            resolved_total_lower_bound = bool(
+                existing_total_lower_bound and recovered_total_lower_bound
+            )
+        if resolved_total is not None:
+            payload["total_turns"] = resolved_total
+            payload["total_turns_is_lower_bound"] = resolved_total_lower_bound
+        else:
+            payload.pop("total_turns", None)
+            payload.pop("total_turns_is_lower_bound", None)
+
+        existing_wall = valid_nonnegative_float(existing.get("wall_clock_s"))
+        recovered_wall = valid_nonnegative_float(recovered_elapsed_s)
+        raw_existing_wall_lower_bound = existing.get(
+            "wall_clock_s_is_lower_bound"
+        )
+        existing_wall_lower_bound = (
+            raw_existing_wall_lower_bound
+            if isinstance(raw_existing_wall_lower_bound, bool)
+            else False
+        )
+        if recovered_wall is None:
+            resolved_wall = existing_wall
+            resolved_wall_lower_bound = existing_wall_lower_bound
+        elif existing_wall is None:
+            resolved_wall = recovered_wall
+            resolved_wall_lower_bound = True
+        elif (
+            existing_total is not None
+            and recovered_total is not None
+            and existing_total > recovered_total
+        ):
+            if existing_wall >= recovered_wall:
+                resolved_wall = existing_wall
+                resolved_wall_lower_bound = existing_wall_lower_bound
+            else:
+                resolved_wall = recovered_wall
+                resolved_wall_lower_bound = True
+        elif (
+            existing_total is not None
+            and recovered_total is not None
+            and recovered_total > existing_total
+        ):
+            resolved_wall = max(existing_wall, recovered_wall)
+            resolved_wall_lower_bound = True
+        elif recovered_wall > existing_wall:
+            resolved_wall = recovered_wall
+            resolved_wall_lower_bound = True
+        elif existing_wall > recovered_wall:
+            resolved_wall = existing_wall
+            resolved_wall_lower_bound = existing_wall_lower_bound
+        else:
+            resolved_wall = existing_wall
+            resolved_wall_lower_bound = existing_wall_lower_bound
+        if resolved_wall is not None:
+            payload["wall_clock_s"] = resolved_wall
+            payload["wall_clock_s_is_lower_bound"] = resolved_wall_lower_bound
+        else:
+            payload.pop("wall_clock_s", None)
+            payload.pop("wall_clock_s_is_lower_bound", None)
         _write_summary_and_activation(output_dir, payload)
     except OSError:
         # The stable exit code/stderr reason remains authoritative if the
