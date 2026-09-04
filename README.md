@@ -48,10 +48,9 @@ identifiers are published here; the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** v1.0.4 — hard-deadline transport retry, dispatch-cap,
-> accounting, and recursive-lifetime corrections. v1.0.3 hardened scheduler
-> recovery and provider-lane renewal. Releases contain only the Mini Prover
-> runtime.
+> **Release status:** v1.0.5 — recursive repair, provider-continuation,
+> search-cadence, and runtime-accounting reliability fixes. Releases contain
+> only the Mini Prover runtime.
 
 ## Documentation
 
