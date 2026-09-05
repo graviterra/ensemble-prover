@@ -1,33 +1,46 @@
 # Ensemble Prover User Guide
 
-Ensemble Prover takes one theorem from a user-supplied Lean project, searches
-for a proof autonomously, checks candidates with Lean, and records the search
-in a local run directory. A successful CLI run also reconstructs the result as
-a standalone Lean source file, checks it again, and audits its axioms. The
-PutnamBench adapter additionally attempts automatic local proof-graph and
-source-navigation generation; generic theorem exports can be graphed with the
-included graph command.
+Start with a Lean theorem, a natural-language claim, or mathematical notes for
+a longer project. Mini Prover searches for proofs and checks them with Lean.
+The experimental NL frontends first translate the mathematics into Lean; the
+formalization campaign can build definitions and supporting theorems across
+multiple files before completing the root theorem.
 
-This guide covers the public `ensemble_prover.mini_prover` CLI. The live help
-is the authority for the exact options and defaults in an installed checkout:
+This guide covers release 1.07, including both experimental NL frontends.
+Older Mini-only releases do not include those modules.
+Run commands from the repository root containing `.venv/` and `ensemble_prover/`,
+not from inside the `ensemble_prover/` Python package. The live help is the
+authority for the options available in your checkout:
 
 ```bash
 .venv/bin/python -m ensemble_prover.mini_prover --help
+.venv/bin/python -m ensemble_prover.nl_input --help
+.venv/bin/python -m ensemble_prover.formalization --help
 ```
 
 ## 1. What you supply
 
-Every run needs:
+Choose the entry point that matches your input:
 
-- a Lean source file containing the target theorem;
-- the Lake project in which that theorem elaborates;
+| You have | Entry point | Instructions |
+| --- | --- | --- |
+| A Lean theorem, lemma, or conjecture in a Lake project | `ensemble_prover.mini_prover --lean-file ...` | [Lean theorem projects](#4-prepare-an-arbitrary-theorem-project) |
+| A PutnamBench Lean file | `ensemble_prover.mini_prover --putnam-file ...` | [PutnamBench adapter](#5-use-the-putnambench-adapter) |
+| One claim in natural language or LaTeX text | `ensemble_prover.nl_input` | [Single-claim translation](#18-formalize-one-natural-language-claim) |
+| Longer mathematical notes needing definitions, lemmas, and resumable work | `ensemble_prover.formalization` | [Formalization campaigns](#19-run-a-multi-file-formalization-campaign) |
+
+Every proof run needs a trusted, working Lean/Lake project and credentials for
+the selected model provider. For direct Mini Prover input, also supply:
+
+- a Lean source file containing the target theorem; and
 - the target theorem's fully qualified name, except when using the optional
-  PutnamBench adapter; and
-- an API key for the selected language-model provider.
+  PutnamBench adapter.
 
-Natural language alone is not a proof input. `--description` and
-`--description-file` may add context, but the Lean declaration remains the
-authoritative target and Lean remains the proof checker.
+The NL frontends do not require you to write the target Lean declaration first.
+They do still need an existing, built Lake project with Mathlib. Mini's
+`--description` and `--description-file` add context to an existing Lean target;
+they do **not** invoke translation. Lean remains the proof checker in every
+workflow, and a checked proof does not certify the accuracy of an NL translation.
 
 The release does not include Lean, Lake, Mathlib, PutnamBench, downloaded Lake
 packages, or any theorem project. Supply those separately.
@@ -89,7 +102,8 @@ If that command fails, fix the theorem project before starting the prover.
 
 ## 3. Configure a provider
 
-Copy the environment template:
+For a new installation, copy the environment template. Keep your existing
+`.env` if you have already configured credentials:
 
 ```bash
 cp .env.example .env
@@ -118,7 +132,7 @@ The default prover provider is DeepSeek. Select `--prover openai` explicitly
 if only `OPENAI_API_KEY` is configured. OpenRouter always requires an explicit
 `--prover-model` or `--refiner-model` using its routed model identifier.
 
-Ensemble Prover has three independently configurable model roles:
+The direct Mini Prover CLI has three independently configurable model roles:
 
 - **Prover:** performs the ordinary proof search and is always present.
 - **Refiner:** optionally takes over after prover stalls or rejected attempts.
@@ -128,6 +142,12 @@ Planner escalation defaults to `auto`. If `OPENAI_API_KEY` exists, `auto` uses
 the OpenAI API with `gpt-5.6-terra`; otherwise it disables escalation with a
 warning. Use `--planner-escalation off` to disable it deliberately, or choose
 another provider and model explicitly.
+
+The NL frontends have their own formalizer settings. The campaign currently
+uses the OpenAI API for all three of its roles: `gpt-5.6-terra` for formalization
+and independent review, and `gpt-5.6-luna` for proof search. See
+[campaign model and budget controls](#campaign-models-and-budgets); Mini's
+provider defaults above do not select the campaign's models.
 
 ### Provider examples
 
@@ -249,6 +269,8 @@ Or load UTF-8 text from a file:
 
 The two flags are mutually exclusive. Descriptions are sent to configured
 model providers and should not contain secrets.
+To start with prose instead of a Lean declaration, use one of the
+[NL entry points](#1-what-you-supply).
 
 ## 5. Use the PutnamBench adapter
 
@@ -523,7 +545,7 @@ persistent store.
 
 ## 10. Terminal output and run files
 
-Without `--output-dir`, a run is written to:
+For the direct `mini_prover` CLI, without `--output-dir`, a run is written to:
 
 ```text
 runs/mini_prover/<theorem>_<timestamp>/
@@ -562,9 +584,15 @@ responses, provider metadata, and detailed failure feedback.
 
 ## 11. Determine whether a run succeeded
 
-The CLI exits with status 0 only when the final result crosses the required
+The direct Mini Prover CLI exits with status 0 only when the final result crosses the required
 verified export boundary. An unsolved run, infrastructure failure, or failed
 solved export exits nonzero.
+
+The NL CLIs have different completion meanings: `nl_input --formalize-only`
+can exit 0 with an unproved, typechecked translation, and a campaign can exit 0
+after a normal bounded pause. For campaigns, inspect the JSON `status` and
+`stop_reason`, then explicitly export a `proved` project; see
+[campaign status and recovery](#campaign-status-and-recovery).
 
 For automation, inspect `summary.json` rather than parsing terminal banners.
 A trustworthy solved result should report the run as solved and the solved
@@ -643,7 +671,7 @@ source benchmark or evaluation agreement restricts answer publication.
 
 ## 13. Replay and interruption behavior
 
-The public CLI records structured turn and replay data for diagnostics, but
+The direct Mini Prover CLI records structured turn and replay data for diagnostics, but
 it does **not** persist resumable search checkpoints or expose a supported
 user command for continuing an interrupted search. In particular, `--mini-resume`,
 `--mini-checkpoint-root`, `--mini-search-branch`, and
@@ -687,6 +715,11 @@ Classify recent runs beneath a run root:
 
 Diagnostic replay explains recorded behavior; it does not ask a provider to
 continue proof search.
+
+The formalization campaign has a separate durable project ledger. Repeating
+`formalization run` resumes that project and reuses verified components; it
+does not restore every internal Mini search state. See
+[the campaign workflow](#19-run-a-multi-file-formalization-campaign).
 
 For a graceful stop, send one interrupt and allow cleanup to finish. Repeated
 signals may escalate before all terminal artifacts are flushed.
@@ -809,6 +842,8 @@ Configured providers may receive:
 
 - the theorem statement and reusable Lean context;
 - the optional natural-language description;
+- original NL source passages, supporting definitions, proof plans, and reviewer
+  evidence when using the NL frontends;
 - retrieved declarations;
 - generated proof attempts; and
 - structured Lean error feedback.
@@ -830,9 +865,10 @@ relevant verification gate.
 
 ## 16. Public CLI option map
 
-The following map covers the public option families without duplicating the
+The following map covers the `mini_prover` option families without duplicating the
 live help text. Run `--help` for exact defaults, allowed values, and detailed
-semantics.
+semantics. These flags are not automatically accepted by the separate campaign
+CLI.
 
 ### Help
 
@@ -954,7 +990,7 @@ semantics.
 
 ## 17. A practical first-run checklist
 
-Before starting:
+For a direct Mini Prover run, before starting:
 
 1. `pip check` passes in `.venv`.
 2. `lake env lean --version` works in the target project.
@@ -974,3 +1010,204 @@ After the run:
 3. Require a verified solved-export status before calling the result solved.
 4. Open the local dependency graph when one was generated.
 5. Keep run artifacts and proof exports private when required.
+
+## 18. Formalize one natural-language claim
+
+After [installation](#2-install-the-runtime) and
+[provider setup](#3-configure-a-provider), translate and prove a small claim:
+
+```bash
+.venv/bin/python -m ensemble_prover.nl_input \
+  --text 'For every natural number n, n + 0 = n.' \
+  --project-path lean_project \
+  --formalizer openai --formalizer-model gpt-5.6-terra \
+  -- --prover openai --prover-model gpt-5.6-luna
+```
+
+This uses `OPENAI_API_KEY` for both roles and makes paid model requests.
+Replace `lean_project` with the path to your own built Lake/Mathlib project;
+no project is bundled with this release. Text
+after `--` is passed to Mini; explicitly selecting the prover avoids accidentally
+using Mini's default DeepSeek provider.
+
+For a longer claim, save the complete statement and assumptions in a UTF-8
+file and replace `--text ...` with `--text-file my_claim.md`. LaTeX is read as
+text, not compiled. Use `--context-file ResearchContext.lean` for trusted Lean
+definitions and repeated `--import MyProject.Background` for project libraries.
+
+To inspect a translation before spending on proof search:
+
+```bash
+.venv/bin/python -m ensemble_prover.nl_input \
+  --text 'For every natural number n, n + 0 = n.' \
+  --project-path lean_project \
+  --output-dir runs/nl_input/nat_identity_review \
+  --formalize-only
+```
+
+The output directory must be new. Review `Problem.lean` and `formalization.json`
+in that directory. The theorem still has a `sorry` proof slot: exit 0 here means
+the translation passed Lean type checking, **not** that a proof was found.
+Do not combine `--formalize-only` with arguments after `--`.
+
+Prove the unchanged saved translation without another formalizer request:
+
+```bash
+.venv/bin/python -m ensemble_prover.nl_input \
+  --prove-existing runs/nl_input/nat_identity_review \
+  -- --prover openai --prover-model gpt-5.6-luna
+```
+
+This validates saved artifacts and starts a new Mini attempt; it is not a
+search-checkpoint resume. Mini writes its own proof run and verified export.
+If the translation is wrong or a clarification is needed, submit corrected,
+self-contained input as a new run rather than editing saved artifacts.
+
+This frontend labels translations `machine_proposed`; it has no independent
+semantic reviewer. For iterative multi-file theory development and independent
+model review, use the campaign below. See [the single-claim guide](nl_input.md)
+for all options, saved files, and limitations.
+
+## 19. Run a multi-file formalization campaign
+
+Use this workflow for notes, conjectures, or longer arguments that need new
+definitions and supporting proofs. You supply documents and an objective;
+the controller decomposes the work, reviews proposed statements, proves tasks
+with Mini, and checks separately compiled Lean modules.
+
+### Initialize, run, and inspect
+
+Start with the included finite-difference example and `OPENAI_API_KEY` in the
+repository-root `.env`. Replace `lean_project` below with your own built
+Lake/Mathlib project; the release includes the example text, not a Lean project:
+
+```bash
+.venv/bin/python -m ensemble_prover.formalization init \
+  --project-path lean_project \
+  --source examples/formalization/finite_differences.md \
+  --goal 'Formalize and prove the complete theorem in the supplied document.' \
+  --output runs/formalization/finite_difference_example
+
+.venv/bin/python -m ensemble_prover.formalization run \
+  runs/formalization/finite_difference_example \
+  --max-steps 20 --max-model-calls 60
+
+.venv/bin/python -m ensemble_prover.formalization status \
+  runs/formalization/finite_difference_example
+
+.venv/bin/python -m ensemble_prover.formalization task \
+  runs/formalization/finite_difference_example root
+```
+
+`init` saves input and the environment snapshot without making model requests;
+`run` performs paid model work. The chosen 20-step/60-request invocation is a
+starting allowance, not a promise to finish the example. Repeat the same `run`
+command to continue. Do not rerun `init` on an existing campaign directory.
+
+For your own problem, replace the example with `--source my_problem.md` and
+write the desired theorem in `--goal`. State the domains, quantifiers,
+assumptions, definitions, and desired conclusion explicitly. Include a proof
+sketch when available. Repeat `--source` for more files and `--import` for
+trusted, already-built project modules. Input files must be UTF-8 text:
+plain prose, Markdown, LaTeX source, or text extracted from papers. PDF/image
+extraction, URL downloading, and literature acquisition are not implemented.
+
+Sources are saved immutably at initialization; editing the original file later
+does not update the campaign. Use `revise` for corrected task instructions, or
+start a new campaign to use a changed source collection.
+
+### Campaign models and budgets
+
+The campaign CLI currently routes all roles through the OpenAI API. These are
+its defaults, independent of the Mini provider defaults:
+
+```bash
+.venv/bin/python -m ensemble_prover.formalization run \
+  runs/formalization/finite_difference_example \
+  --formalizer-model gpt-5.6-terra \
+  --reviewer-model gpt-5.6-terra \
+  --prover-model gpt-5.6-luna \
+  --max-steps 20 --max-model-calls 60
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--max-steps` | Controller steps for this invocation; default 100. |
+| `--max-model-calls` | Formalizer/reviewer requests for this invocation; default 300. It excludes nested Mini calls and individual transport retries. |
+| `--model-timeout-s` | Seconds per model operation, including retries; omitted uses shared model defaults. |
+| `--lean-timeout-s` | Lean operation timeout; default 300 seconds. |
+| `--lease-s` | Worker lease duration, renewed while running; default 300 seconds. It is not a whole-run timeout. |
+
+These limits are **not dollar spending caps or whole-campaign wall-clock
+limits**. The campaign has no CLI pass-through for Mini's `--cost-budget-usd`,
+`--prover`, or other Mini flags; use only options shown by
+`formalization run --help`. To stop, interrupt once and allow cleanup, then
+resume with `run` when ready.
+
+No smaller campaign-specific text/output cap is imposed. Provider limits still
+apply. Required plans and evidence are preserved through Mini and recursive
+helper calls; a request that cannot fit pauses explicitly instead of silently
+shortening the mathematics.
+
+### Campaign status and recovery
+
+Commands print JSON. Check `status` and any `stop_reason`, not just the exit
+code:
+
+| Result | What to do |
+| --- | --- |
+| `status: proved` | The root and its reachable compiled module dependencies validate. Export next. |
+| `status: paused`, without a provider/context error | Normal bounded or temporarily unavailable work; inspect and repeat `run` to continue. Exit 0 does not mean proved. |
+| `stop_reason: provider_error` | Resolve the credential/provider problem before resuming. The CLI exits nonzero. |
+| `stop_reason: context_overflow` | Inspect the affected task; choose a model with sufficient context or revise/decompose the task. Blind retries cannot make the same prompt smaller. |
+| `status: needs_clarification` or `blocked` | Inspect the task's saved question/error and revise the affected task. |
+| `status: invalid`, or an environment validation error | Do not trust completion. Inspect changed/missing artifacts or dependencies; never replace the recorded fingerprint to bypass the check. |
+
+Inspect `root` first. If the issue belongs to a supporting task, use its task ID
+with `task` and `revise`. Supply the full corrected instructions, not just a
+short answer that omits the original objective:
+
+```bash
+.venv/bin/python -m ensemble_prover.formalization revise \
+  runs/formalization/finite_difference_example root \
+  --description 'Prove the stated commutation theorem for arbitrary abelian groups A and B and arbitrary functions f; do not assume f is additive.'
+```
+
+Revision invalidates that task and its dependents. Completed unrelated work is
+retained. Restarting a project reuses verified components and matching saved
+proof source; it does not reconstruct every prior Mini search graph.
+
+Keep the installed Lean/Mathlib environment unchanged while running. Generated
+output directories must be separate from base compiled/search roots, and base
+libraries must not import the reserved `Formalization` module namespace. Older
+snapshots without current provenance records fail closed; start a new campaign
+rather than rewriting their trust metadata.
+
+### Export and read the results
+
+Once `status` reports `proved`, export to a new directory:
+
+```bash
+.venv/bin/python -m ensemble_prover.formalization export \
+  runs/formalization/finite_difference_example \
+  --output runs/formalization/finite_difference_example_export
+```
+
+The bundle contains Lean modules, `Root.lean`, original documents, an environment
+record, and a `README.md` with the replay command. Existing export directories
+are not overwritten. Replay still requires the recorded Lake/Mathlib
+environment; this is not a vendored dependency bundle.
+
+The campaign directory contains `project.sqlite3` (tasks and dependency state),
+`sources/` (original documents), `blobs/` (content-addressed records), `modules/`
+(checked Lean artifacts), and `proof_runs/` (Mini attempt dossiers). Treat all
+of it as private if your mathematics is private.
+
+Independent model review helps assess translation fidelity but is not a
+certificate that the Lean statement means the intended mathematics. Read the
+generated definitions and theorem before relying on the result. The system has
+real-Lean integration and live-example evidence; autonomous frontier success
+rates and FLT/million-line performance have not been established. See the
+[campaign guide](formalization-campaign.md) for trust boundaries and evaluation
+details, and the [adversarial audit](formalization-adversarial-review-20260905.md)
+for regression evidence.

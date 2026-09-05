@@ -7703,6 +7703,7 @@ private def {serializer_prefix}_elabType (source : String) :
     Lean.Elab.Term.elabType stx
   Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing
   let type ← Lean.instantiateMVars type
+  let type ← Lean.Elab.Term.levelMVarToParam type
   if type.hasMVar then
     Lean.throwError "statement type contains unresolved metavariables"
   unless ← Lean.Meta.isProp type do
@@ -7731,11 +7732,24 @@ private def {serializer_prefix}_contractType (type : Lean.Expr) :
     Lean.MetaM (Option Lean.Expr) := do
   {serializer_prefix}_contractTypeCore (← Lean.Meta.whnf type)
 
+-- Whole-statement identities already alpha-normalize universe parameters in
+-- Python. Do the same bijective, rigid renaming for batch comparisons only;
+-- never unify a generic universe with a concrete or shared candidate level.
+private def {serializer_prefix}_alphaType (type : Lean.Expr) :
+    Lean.MetaM Lean.Expr := do
+  let type ← Lean.Meta.whnf type
+  let names := (Lean.collectLevelParams {{}} type).params
+  let levels := names.mapIdx fun index _ =>
+    Lean.mkLevelParam (Lean.Name.num `_miniContractUniverse index)
+  pure (type.instantiateLevelParamsArray names levels)
+
 private def {serializer_prefix}_defeq
     (type : Lean.Expr) (source : String) :
     Lean.Elab.Term.TermElabM (Option Bool) := do
   try
     let other ← {serializer_prefix}_elabType source
+    let type ← {serializer_prefix}_alphaType type
+    let other ← {serializer_prefix}_alphaType other
     pure (some (← Lean.Meta.withNewMCtxDepth <| Lean.Meta.isDefEq type other))
   catch _ => pure none
 
@@ -7746,6 +7760,8 @@ private def {serializer_prefix}_contractDefeq
     let other ← {serializer_prefix}_elabType source
     let some left ← {serializer_prefix}_contractType type | pure none
     let some right ← {serializer_prefix}_contractType other | pure none
+    let left ← {serializer_prefix}_alphaType left
+    let right ← {serializer_prefix}_alphaType right
     pure (some (← Lean.Meta.withNewMCtxDepth <| Lean.Meta.isDefEq left right))
   catch _ => pure none
 """
@@ -7763,6 +7779,7 @@ private def {serializer_prefix}_contractDefeq
                     "      Lean.Elab.Term.elabType stx",
                     "    Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing",
                     "    let type ← Lean.instantiateMVars type",
+                    "    let type ← Lean.Elab.Term.levelMVarToParam type",
                     "    if type.hasMVar then",
                     '      Lean.throwError "statement type contains unresolved metavariables"',
                     "    unless ← Lean.Meta.isProp type do",

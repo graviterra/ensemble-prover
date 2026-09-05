@@ -70,6 +70,20 @@ class _RootProofFinalizationReceiptParticipant:
         ).strip()
         self._promoted = False
 
+    def supersedes_pending(self, previous: Any) -> bool:
+        """A later validated artifact replaces only this dossier's pending receipt.
+
+        Registration occurs after canonical acceptance (or its checked artifact
+        refresh), never merely because somebody rewrote dossier metadata. These
+        pending receipts own no I/O or published state requiring compensation.
+        """
+        return bool(
+            self._receipt_hash
+            and isinstance(previous, _RootProofFinalizationReceiptParticipant)
+            and previous._dossier is self._dossier
+            and not previous._promoted
+        )
+
     def commit(self) -> bool:
         return bool(self._receipt_hash)
 
@@ -80,9 +94,7 @@ class _RootProofFinalizationReceiptParticipant:
             != self._receipt_hash
         ):
             return False
-        self._dossier._root_proof_finalization_receipts.add(
-            self._receipt_hash
-        )
+        self._dossier._root_proof_finalization_receipts.add(self._receipt_hash)
         self._promoted = True
         return True
 

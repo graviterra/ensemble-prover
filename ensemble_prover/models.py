@@ -734,6 +734,9 @@ def _responses_payload_to_chat_completion(data: Any) -> Dict[str, Any]:
         "id": str(body.get("id") or ""),
         "object": "chat.completion",
         "model": str(body.get("model") or ""),
+        # Consumers of a completed artifact must not mistake an unknown
+        # incomplete/failed Responses status for the synthetic `stop` below.
+        "_responses_status": status,
         "choices": [
             {
                 "index": 0,

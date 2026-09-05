@@ -59,8 +59,13 @@ from typing import (
 
 from ensemble_prover.root_finalization import (
     RootFinalizationCandidate,
+    _RootProofFinalizationReceiptParticipant,
     finalize_root_solution,
     root_verification_certificate,
+)
+from ensemble_prover.mini_deadline_transaction import (
+    DeadlineMutationTransaction,
+    active_deadline_transaction,
 )
 from ensemble_prover.deadline_guard import (
     DispatchScopeDetached,
@@ -3028,8 +3033,29 @@ def _normalize_provider_exposure_metadata(metadata: Dict[str, Any]) -> None:
         metadata["zero_provider_failure"] = True
 
 
+class _SessionRootFinalizationRollbackParticipant:
+    """Restore only provisional live root authority if its receipt rolls back."""
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self._root_finalized = session.root_finalized
+        self._final_proof = session.final_proof
+        self._restored = False
+
+    def commit(self) -> bool:
+        return True
+
+    def rollback(self) -> None:
+        if not self._restored:
+            self._session.root_finalized = self._root_finalized
+            self._session.final_proof = self._final_proof
+            self._restored = True
+
+
 def _normalize_provider_blocked_failure_metadata(
     metadata: Dict[str, Any],
+    *,
+    terminal_provider_blocks: bool = False,
 ) -> None:
     """Convert recoverable provider blocks into in-process scheduler waits."""
 
@@ -3046,6 +3072,17 @@ def _normalize_provider_blocked_failure_metadata(
     elif failure_kind in _PROVIDER_BLOCKED_FAILURE_KINDS:
         blocked_reason = _PROVIDER_BLOCKED_REASON_BY_KIND[failure_kind]
     if not blocked_reason:
+        return
+    if terminal_provider_blocks:
+        # Marked NL work must return an explicit service/context pause to its
+        # caller. Waiting on this same indivisible prompt cannot repair it;
+        # ordinary Mini routing retains its existing in-process recovery.
+        metadata["terminal_failure"] = True
+        metadata["terminal_failure_reason"] = blocked_reason
+        metadata["scoped_failure_reason"] = ""
+        metadata["llm_failure_scope"] = "global"
+        metadata["llm_retryable"] = False
+        metadata["defer_selected_frontier_action"] = False
         return
     metadata["terminal_failure"] = False
     metadata["terminal_failure_reason"] = ""
@@ -24133,7 +24170,13 @@ class MiniSession:
         """
 
         metadata = dict(outcome.metadata or {})
-        _normalize_provider_blocked_failure_metadata(metadata)
+        preserves_nl_context = getattr(self.conv, "_preserves_nl_context", None)
+        _normalize_provider_blocked_failure_metadata(
+            metadata,
+            terminal_provider_blocks=(
+                callable(preserves_nl_context) and preserves_nl_context() is True
+            ),
+        )
         _normalize_provider_exposure_metadata(metadata)
         self._accrue_provider_exposure(metadata)
         root_finalization_metadata = self._apply_root_finalization(outcome)
@@ -24143,6 +24186,26 @@ class MiniSession:
             metadata,
             root_finalization_metadata,
         )
+        if (
+            root_finalization_metadata.get("root_finalization_accepted") is False
+            and callable(preserves_nl_context)
+            and preserves_nl_context() is True
+            and not metadata.get("recovered_finalizer_candidate_adjudication_pending")
+            and not str(metadata.get("llm_failure_kind") or "").strip()
+            and not metadata.get("terminal_failure")
+            and str(metadata.get("recovered_finalizer_failure_kind") or "").strip()
+        ):
+            # A subaction's provisional Lean success may be vetoed here too.
+            # Its host must receive the saved provider failure, not an empty
+            # success-shaped receipt. Unmarked nested recovery is unchanged.
+            from .actions.conversation_turn import (
+                _activated_recovered_finalizer_failure_metadata,
+            )
+
+            metadata.update(_activated_recovered_finalizer_failure_metadata(metadata))
+            _normalize_provider_blocked_failure_metadata(
+                metadata, terminal_provider_blocks=True
+            )
         effective_outcome = replace(
             outcome,
             solved=effective_solved,
@@ -25096,9 +25159,15 @@ class MiniSession:
 
         dossier = self.dossier
         refresher = getattr(dossier, "rewrite_solved_artifact", None)
-        if not callable(refresher):
+        if not callable(refresher) or not getattr(result, "accepted", False):
             return False
-        verification_certificate = dict(candidate.verification_certificate or {})
+        verification_certificate = copy.deepcopy(
+            candidate.verification_certificate or {}
+        )
+        expected_proof = sanitize_lean_artifact_text(candidate.proof)
+        if result.proof != expected_proof:
+            return False
+        root_identity = (dossier.theorem_name, dossier.root_statement)
         dependency_helper_names = tuple(
             str(name or "").strip()
             for name in list(
@@ -25108,38 +25177,78 @@ class MiniSession:
             )
             if str(name or "").strip()
         )
+        transaction = DeadlineMutationTransaction(
+            deadline_exhausted=lambda: False,
+            dossier=dossier,
+            label="already_applied_root_artifact_refresh",
+        )
         try:
-            refresher(
-                candidate.proof,
-                replay_helpers=candidate.replay_helpers,
-                support_helper_names=dependency_helper_names,
-                root_certificate_metadata={
-                    "phase": str(candidate.phase or ""),
-                    "turn_index": int(candidate.turn_index or 0),
-                    "source_action_id": str(candidate.source_action_id or ""),
-                    "route_id": str(candidate.route_id or ""),
-                    "dependency_node_ids": [
-                        str(node_id or "").strip()
-                        for node_id in list(candidate.dependency_node_ids or ())
-                        if str(node_id or "").strip()
-                    ],
-                    "dependency_helper_names": list(dependency_helper_names),
-                    "candidate_helper_names": [
-                        str(name or "").strip()
-                        for name in list(candidate.helper_names or ())
-                        if str(name or "").strip()
-                    ],
-                    "require_route_contract": bool(candidate.require_route_contract),
-                    "route_contract_status": dict(route_contract_status),
-                    "verification_status": dict(
-                        getattr(result, "verification_status", {}) or {}
-                    ),
-                    "verification_certificate": verification_certificate,
-                    "already_applied_artifact_refresh": True,
-                    **dict(candidate.metadata or {}),
-                },
-            )
-            return True
+            with transaction:
+                if not transaction.can_mutate():
+                    return False
+                expected_helpers = tuple(
+                    sanitize_lean_artifact_texts(
+                        dossier.root_replay_helper_closure(
+                            replay_helpers=sanitize_lean_artifact_texts(
+                                candidate.replay_helpers
+                            ),
+                            support_helper_names=dependency_helper_names,
+                            refresh_quality=False,
+                        )
+                    )
+                )
+                refresher(
+                    candidate.proof,
+                    replay_helpers=candidate.replay_helpers,
+                    support_helper_names=dependency_helper_names,
+                    root_certificate_metadata={
+                        "phase": str(candidate.phase or ""),
+                        "turn_index": int(candidate.turn_index or 0),
+                        "source_action_id": str(candidate.source_action_id or ""),
+                        "route_id": str(candidate.route_id or ""),
+                        "dependency_node_ids": [
+                            str(node_id or "").strip()
+                            for node_id in list(candidate.dependency_node_ids or ())
+                            if str(node_id or "").strip()
+                        ],
+                        "dependency_helper_names": list(dependency_helper_names),
+                        "candidate_helper_names": [
+                            str(name or "").strip()
+                            for name in list(candidate.helper_names or ())
+                            if str(name or "").strip()
+                        ],
+                        "require_route_contract": bool(
+                            candidate.require_route_contract
+                        ),
+                        "route_contract_status": dict(route_contract_status),
+                        "verification_status": dict(
+                            getattr(result, "verification_status", {}) or {}
+                        ),
+                        "verification_certificate": copy.deepcopy(
+                            verification_certificate
+                        ),
+                        "already_applied_artifact_refresh": True,
+                        **dict(candidate.metadata or {}),
+                    },
+                )
+                # Refresh invalidates the old receipt. Renew only for the exact
+                # accepted material; publication belongs to the outer commit.
+                if (
+                    (dossier.theorem_name, dossier.root_statement) != root_identity
+                    or dossier.final_proof != expected_proof
+                    or tuple(dossier.final_replay_helpers) != expected_helpers
+                    or dict(dossier.root_proof_certificate or {}).get(
+                        "verification_certificate"
+                    )
+                    != verification_certificate
+                ):
+                    raise ValueError(
+                        "refreshed root artifact differs from accepted candidate"
+                    )
+                transaction.add_participant(
+                    _RootProofFinalizationReceiptParticipant(dossier)
+                )
+            return transaction.committed
         except Exception as exc:
             self._record_event(
                 {
@@ -25152,6 +25261,16 @@ class MiniSession:
                 }
             )
             return False
+
+    def _enlist_root_finalization_rollback(self) -> None:
+        transaction = active_deadline_transaction()
+        if transaction is not None and transaction.enabled:
+            # Each accepted transition keeps its own previous values. Reverse
+            # rollback order restores a prior durable proof even after several
+            # provisional finalizations within the same outer transaction.
+            transaction.add_participant(
+                _SessionRootFinalizationRollbackParticipant(self)
+            )
 
     def _apply_root_finalization(self, outcome: MiniOutcome) -> Dict[str, Any]:
         candidate = self._root_candidate_from_outcome(outcome)
@@ -25370,12 +25489,19 @@ class MiniSession:
                         route_contract_status.get("verdict") or ""
                     ),
                 }
-            self.final_proof = result.proof
-            self._refresh_already_applied_root_artifacts(
+            refreshed = self._refresh_already_applied_root_artifacts(
                 candidate=candidate,
                 result=result,
                 route_contract_status=route_contract_status,
             )
+            if not refreshed:
+                self._clear_root_finalized_for_rejected_attempt()
+                return {
+                    "root_finalization_accepted": False,
+                    "root_finalization_verdict": "already_applied_artifact_refresh_failed",
+                }
+            self._enlist_root_finalization_rollback()
+            self.final_proof = result.proof
             self.root_finalized = True
             self._record_event(
                 {
@@ -25423,6 +25549,7 @@ class MiniSession:
             metadata=candidate.metadata,
         )
         if result.accepted:
+            self._enlist_root_finalization_rollback()
             self.final_proof = result.proof
             self.root_finalized = True
         else:
@@ -26594,10 +26721,15 @@ class MiniSession:
 
         action_reported_outcome = outcome
         metadata = dict(outcome.metadata or {})
-        # Provider/account/capability failures are durable service blocks,
-        # never implicit Mini termination authority. This also migrates old
-        # terminal-shaped action receipts at their first application.
-        _normalize_provider_blocked_failure_metadata(metadata)
+        # Standalone Mini can wait for a new provider route. Marked NL work
+        # instead returns a typed pause to its enclosing campaign.
+        preserves_nl_context = getattr(self.conv, "_preserves_nl_context", None)
+        _normalize_provider_blocked_failure_metadata(
+            metadata,
+            terminal_provider_blocks=(
+                callable(preserves_nl_context) and preserves_nl_context() is True
+            ),
+        )
         _normalize_provider_exposure_metadata(metadata)
         self._accrue_provider_exposure(metadata)
         # The action receipt is now durable. Remove its exact live-tracker
@@ -26689,6 +26821,11 @@ class MiniSession:
             metadata,
             root_finalization_metadata,
         )
+        nl_root_veto = bool(
+            root_finalization_metadata.get("root_finalization_accepted") is False
+            and callable(preserves_nl_context)
+            and preserves_nl_context() is True
+        )
         def queued_verifier_work_after_current_outcome() -> Tuple[
             bool,
             Optional[Action],
@@ -26768,11 +26905,14 @@ class MiniSession:
                         continue
                     held_terminal = dict(take_terminal() or {})
                     if held_terminal:
-                        if str(metadata.get("lean_verdict") or "") in {
-                            "lean_accepted",
-                            "graph_native_lean_accepted",
-                            "graph_native_formalization_accepted",
-                        }:
+                        if (
+                            str(metadata.get("lean_verdict") or "") in {
+                                "lean_accepted",
+                                "graph_native_lean_accepted",
+                                "graph_native_formalization_accepted",
+                            }
+                            and not nl_root_veto
+                        ):
                             # The original failing provider action already
                             # owns its exact scheduler defer.  Successful
                             # mathematics on another verifier lane consumes
@@ -26785,9 +26925,17 @@ class MiniSession:
                         else:
                             metadata.update(held_terminal)
                         break
+        if callable(preserves_nl_context) and preserves_nl_context() is True:
+            # Canonical adjudication can activate a banked provider failure
+            # after entry normalization. Apply the NL pause policy before
+            # deciding whether remaining paid verifier work must drain first.
+            _normalize_provider_blocked_failure_metadata(
+                metadata, terminal_provider_blocks=True
+            )
         recovered_terminal_after_verified_candidate = bool(
             metadata.get("recovered_finalizer_provider_receipt_activated")
             and metadata.get("terminal_failure")
+            and not nl_root_veto
             and str(metadata.get("lean_verdict") or "")
             in {
                 "lean_accepted",

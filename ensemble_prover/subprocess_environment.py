@@ -191,9 +191,10 @@ def trusted_provider_worker_environment(
 ) -> dict[str, str]:
     """Copy the environment for the trusted internal provider-capable worker.
 
-    This exemption is deliberately narrow: only the watchdog's internal Python
-    worker and its supervisor may retain provider credentials.  Lean, Lake,
-    solvers, Git, and other child tools must use the sanitized policy instead.
+    This exemption is deliberately narrow: the watchdog's internal Python
+    worker/supervisor and the NL frontend's fixed Mini CLI handoff may retain
+    provider credentials. Lean, Lake, solvers, Git, and other child tools must
+    use the sanitized policy instead.
     """
 
     child = _copied_environment(base, overrides=overrides)

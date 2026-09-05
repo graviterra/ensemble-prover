@@ -192,6 +192,16 @@ class DeadlineMutationTransaction:
                 # to the outermost transaction instead.
                 self._parent.add_participant(participant)
                 return
+            # Only opt-in participants may replace prior pending obligations.
+            # The hook must identify disposable, unpublished state; ordinary
+            # cache/I/O participants retain their order and rollback duties.
+            supersedes_pending = getattr(participant, "supersedes_pending", None)
+            if callable(supersedes_pending):
+                self._participants = [
+                    previous
+                    for previous in self._participants
+                    if not supersedes_pending(previous)
+                ]
             self._participants.append(participant)
 
     def _capture_local_state(

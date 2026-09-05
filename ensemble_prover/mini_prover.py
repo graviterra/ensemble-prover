@@ -1925,10 +1925,11 @@ class Conversation:
                 "a tool has shown that exact declaration exists. Use this mode only "
                 "for with-answer controls, not no-answer benchmark runs."
             )
+        preserve_context = self._preserves_nl_context()
         parts = [
-            f"Problem (natural language):\n{self.problem_text.strip()}",
-            f"Lean signature:\n{self.lean_signature.strip()}",
-            f"{preamble_label}\n{self.preamble.strip()}",
+            f"Problem (natural language):\n{self.problem_text if preserve_context else self.problem_text.strip()}",
+            f"Lean signature:\n{self.lean_signature if preserve_context else self.lean_signature.strip()}",
+            f"{preamble_label}\n{self.preamble if preserve_context else self.preamble.strip()}",
             self._turn_budget_note(),
             placeholder_note,
             (
@@ -1961,6 +1962,17 @@ class Conversation:
             "on Lean repair."
         )
 
+    def _preserves_nl_context(self) -> bool:
+        # The generated NL source opts in through its reusable preamble, so
+        # the policy survives normal session cloning and refiner handoffs.
+        # This marker grants no mathematical trust or execution authority.
+        marker = "-- ensemble-nl-input: preserve-context"
+        return any(
+            marker == line.strip()
+            for source in (self.preamble, self.lean_preamble)
+            for line in str(source or "").splitlines()
+        )
+
     def messages_for_llm(self) -> List[Dict[str, Any]]:
         msgs: List[Dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt()},
@@ -1975,6 +1987,28 @@ class Conversation:
                     redact_solution_refs=redact_solution_refs,
                 )
             )
+        if self._preserves_nl_context():
+            # History may have been compacted, restored, or switched to a
+            # refiner. Rebuild from the full conversation fields, never from
+            # a possibly shortened historic message. Transport must reject
+            # a model context that cannot fit this source instead of slicing
+            # mathematical hypotheses or the formalized target away.
+            content = self.initial_user_message()
+            anchor = next(
+                (
+                    message
+                    for message in msgs
+                    if message.get("role") == "user"
+                    and message.get("content") == content
+                ),
+                None,
+            )
+            if anchor is None:
+                anchor = {"role": "user", "content": content}
+                msgs.insert(1, anchor)
+            anchor["_required_prompt_context"] = {
+                "kind": "nl_source_and_formalized_target"
+            }
         return msgs
 
     def ensure_bootstrap(self) -> None:
@@ -2852,6 +2886,8 @@ def _messages_with_active_root_working_target(
         if (
             not replaced_initial_signature
             and item.get("role") == "user"
+            and item.get("_required_prompt_context")
+            != {"kind": "nl_source_and_formalized_target"}
             and "Problem (natural language):" in content
             and "Lean signature:" in content
         ):
@@ -11484,12 +11520,15 @@ async def prove_theorem_project(
     scratch_dir: Optional[Path] = None,
     max_prove_turns: int = 30,
     max_refine_turns: int = 25,
+    dossier_factory: Optional[Callable[[TheoremProblem], ProofDossier]] = None,
     **prove_kwargs: Any,
 ) -> Tuple[bool, Optional[str]]:
     """Resolve and prove one arbitrary theorem-project request."""
 
     if "problem" in prove_kwargs:
         raise TypeError("prove_theorem_project derives problem from request")
+    if dossier_factory is not None and prove_kwargs.get("dossier") is not None:
+        raise ValueError("provide a dossier or a post-preflight dossier_factory, not both")
     # Reject invalid proof-policy inputs before resolving paths, constructing a
     # Lean runner, activating a theory library, or running the project probe.
     require_falsification_search_bound(
@@ -11623,6 +11662,11 @@ async def prove_theorem_project(
         )
         if isinstance(prepared_problem, TheoremProblem):
             problem = prepared_problem
+        if dossier_factory is not None:
+            # Long-lived campaigns need the finalized replay graph, but its
+            # root identity must bind to Lean's checked type, not the initial
+            # source spelling that preflight may legitimately delaborate.
+            prove_kwargs["dossier"] = dossier_factory(problem)
         return await prove_problem(
             problem=problem,
             prover_client=prover_client,

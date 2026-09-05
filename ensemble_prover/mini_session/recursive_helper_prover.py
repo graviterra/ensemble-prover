@@ -1137,6 +1137,30 @@ async def prove_helper_in_subsession(
         official_answer_payload_present=parent_official_answer_payload_present,
         suppress_solution_placeholders=effective_placeholder_suppression,
     )
+    child_problem_text = child_dossier.problem_text
+    if any(
+        line.strip() == "-- ensemble-nl-input: preserve-context"
+        for preamble in (
+            getattr(parent_conv, "preamble", ""),
+            getattr(parent_conv, "lean_preamble", ""),
+        )
+        for line in str(preamble or "").splitlines()
+    ):
+        campaign_context = str(
+            getattr(parent_dossier, "problem_text", "")
+            or getattr(parent_conv, "problem_text", "")
+            or ""
+        )
+        if campaign_context:
+            # Keep one durable, unwrapped source for further descendants.
+            # Copying the already-wrapped parent conversation would repeatedly
+            # accumulate ancestor instructions and could duplicate full text.
+            child_dossier.problem_text = campaign_context
+            child_problem_text += (
+                "\n\nFull original campaign source and proof plan (background "
+                "context only; prove this child's displayed Lean target):\n"
+                + campaign_context
+            )
     if parent_target_graph_node is None:
         parent_graph = getattr(parent_dossier, "proof_graph", None)
         if parent_graph is not None and nested_node_id:
@@ -1262,7 +1286,7 @@ async def prove_helper_in_subsession(
     child_conv = Conversation(
         role="prove",
         goal_statement=target_statement,
-        problem_text=child_dossier.problem_text,
+        problem_text=child_problem_text,
         lean_signature=lean_signature,
         preamble=parent_preamble,
         lean_preamble=parent_lean_preamble,

@@ -10,10 +10,13 @@ point is `ensemble_prover.mini_prover`.
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
 file and Lake project. PutnamBench files are supported through a compatibility
 adapter, and callers may attach a natural-language problem description as
-additional model context. Natural language alone is not currently a proof
-input: the Lean statement and its project environment remain the authoritative
-contract. Programmatic callers can submit the same generic theorem-project
-request used by the CLI.
+additional model context. Release 1.07 also includes
+experimental natural-language entry points: `ensemble_prover.nl_input` for a
+single claim and `ensemble_prover.formalization` for resumable, multi-file
+projects. These translate text before proving; the resulting Lean statement
+and its project environment remain the authoritative proof contract, not a
+certificate of translation fidelity. Programmatic callers can submit the same generic
+theorem-project request used by the CLI.
 
 As of August 2026, across research and evaluation runs, the system has produced
 Lean-verified proofs for **65 distinct Putnam problems**, counting repeated
@@ -48,15 +51,17 @@ identifiers are published here; the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** v1.0.6 — recursive pass-credit and checkpoint recovery
-> fixes for long-running proof searches with changing proof environments.
-> Releases contain only the Mini Prover runtime.
+> **Release status:** 1.07 — research preview. Includes Mini Prover, experimental
+> single-claim NL input, and resumable multi-file formalization campaigns.
+> Preserves the recursive progress and checkpoint-recovery fixes from v1.0.6.
 
 ## Documentation
 
 Start with the **[User Guide](docs/USER_GUIDE.md)** for installation, theorem
-project preparation, provider configuration, budgets, outputs, proof graphs,
-diagnostic replay, troubleshooting, and the complete public CLI option map.
+project preparation, [single-claim NL input](docs/USER_GUIDE.md#18-formalize-one-natural-language-claim),
+[long formalization projects](docs/USER_GUIDE.md#19-run-a-multi-file-formalization-campaign),
+provider configuration, budgets, outputs, proof graphs, diagnostic replay,
+troubleshooting, and the public Mini CLI option map.
 
 ## Highlights
 
@@ -66,6 +71,9 @@ diagnostic replay, troubleshooting, and the complete public CLI option map.
 - Provider-call, wall-clock, and cost-budget controls
 - Persistent verified Mini theory and proof-state caches
 - Structured JSONL traces, summaries, and replay tooling
+- Natural-language/LaTeX-text translation with explicit Lean proof contracts
+- Resumable multi-file development with independent model review and checked exports
+- Complete required plan/context delivery, with explicit errors when model limits are exceeded
 
 ## Requirements
 
@@ -138,6 +146,55 @@ For a PutnamBench source file:
 The Putnam adapter expects a separately supplied compatible PutnamBench
 checkout; no benchmark data or setup environment is bundled.
 
+## Start from natural language
+
+For one claim, translate and prove using the OpenAI API:
+
+```bash
+.venv/bin/python -m ensemble_prover.nl_input \
+  --text 'For every natural number n, n + 0 = n.' \
+  --project-path /path/to/lake-project \
+  --formalizer openai --formalizer-model gpt-5.6-terra \
+  -- --prover openai --prover-model gpt-5.6-luna
+```
+
+Use `--text-file my_claim.md` for a UTF-8 document. To inspect the generated
+statement without proof search, replace the final `-- --prover ...` line with
+`--formalize-only`; a successful translation is not a proved theorem.
+
+For longer notes requiring definitions and supporting lemmas, initialize a
+resumable campaign:
+
+```bash
+.venv/bin/python -m ensemble_prover.formalization init \
+  --project-path /path/to/lake-project \
+  --source examples/formalization/finite_differences.md \
+  --goal 'Formalize and prove the complete theorem in the supplied document.' \
+  --output runs/formalization/my_project
+
+.venv/bin/python -m ensemble_prover.formalization run runs/formalization/my_project \
+  --max-steps 20 --max-model-calls 60
+
+.venv/bin/python -m ensemble_prover.formalization status runs/formalization/my_project
+```
+
+Supply your own built Lean/Lake project with Mathlib and set `OPENAI_API_KEY`.
+Campaign formalization and independent review default to `gpt-5.6-terra`;
+proof search defaults to `gpt-5.6-luna`, all through OpenAI API name routing.
+Repeat `run` to resume. Check for `status: proved` before exporting; exit 0
+can also mean a resumable budget pause. Step/request budgets are not dollar
+caps, and `--max-model-calls` excludes nested Mini proof-search calls and retries.
+
+Inputs can be plain text, Markdown, LaTeX source, or papers already converted
+to UTF-8 text. PDF/OCR extraction and URL downloading are not included. See
+the [campaign walkthrough](docs/USER_GUIDE.md#19-run-a-multi-file-formalization-campaign)
+for review, revision, budgets, trust boundaries, and export commands.
+
+These modules support long mathematical developments, but autonomous frontier
+success rates and FLT/million-line performance have not been established.
+Lean verification certifies the formal proof, not the accuracy of translation
+from natural language. Review the generated definitions and statements.
+
 ## Verify a checkout
 
 Verify the installed Python environment and CLI:
@@ -145,6 +202,8 @@ Verify the installed Python environment and CLI:
 ```bash
 .venv/bin/python -m pip check
 .venv/bin/python -m ensemble_prover.mini_prover --help
+.venv/bin/python -m ensemble_prover.nl_input --help
+.venv/bin/python -m ensemble_prover.formalization --help
 ```
 
 Verify that the user-supplied target project can resolve its own toolchain:
