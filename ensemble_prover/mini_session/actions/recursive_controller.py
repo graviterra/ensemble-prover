@@ -349,62 +349,53 @@ class RecursiveControllerAction:
             == current_signature
         )
 
-    def _recover_inflight_reservation(self, session: Any) -> int:
-        """Re-credit a recursive allocation checkpointed before completion."""
+    def _inflight_pass_credits(self, record: dict[str, Any]) -> tuple[int, int]:
+        """Validate once for both observational probes and mutating recovery."""
 
-        reservations = getattr(session, "recursive_inflight_reservations", None)
-        if not isinstance(reservations, dict):
-            return 0
-        record = reservations.get(self.id)
-        if not isinstance(record, dict):
-            return 0
-        try:
-            pool_attr = str(record.get("pool_attr") or "").strip()
-            reserved = max(0, int(record.get("reserved_passes", 0) or 0))
-            persisted_extension_grants = max(
-                0,
-                int(
-                    self._recursive_driver_state.get(
-                        "pass_extension_grants",
-                        0,
-                    )
-                    or 0
-                ),
-            )
-            credited_extension_grants = max(
-                0,
-                int(record.get("credited_extension_grants", 0) or 0),
-            )
-            authorized_ceiling = max(
-                0,
-                int(
-                    self._recursive_driver_state.get(
-                        "controller_authorized_pass_ceiling",
-                        0,
-                    )
-                    or 0
-                ),
-            )
-            pass_index = max(
-                1,
-                int(self._recursive_driver_state.get("pass_index", 1) or 1),
-            )
-        except (TypeError, ValueError) as exc:
-            raise StateSnapshotCompatibilityError(
-                "recursive reservation has malformed pass-credit provenance"
-            ) from exc
-        if pool_attr != self.budget_attr or reserved <= 0:
-            reservations.pop(self.id, None)
-            return 0
-        # The driver publishes its state to this action before asking the
-        # session coordinator to persist it.  Cancellation can therefore
-        # leave both an inflight reservation and a fully committed pass
-        # receipt.  That reservation has already been consumed: re-crediting
-        # it would make the completed pass free and allow one extra pass after
-        # resume.  Earlier phases remain unfinished work and must be
-        # re-credited before the exact mid-pass frontier is resumed.
-        pass_already_committed = self._driver_has_committed_pass()
-        max_authorized_extensions = max(0, authorized_ceiling - pass_index)
+        def counter(source: dict[str, Any], key: str) -> int:
+            value = source.get(key, 0)
+            if type(value) is not int or value < 0:
+                raise StateSnapshotCompatibilityError(
+                    "recursive reservation has malformed pass-credit provenance"
+                )
+            return value
+
+        reserved = counter(record, "reserved_passes")
+        persisted_extension_grants = counter(
+            self._recursive_driver_state, "pass_extension_grants"
+        )
+        credited_extension_grants = counter(record, "credited_extension_grants")
+        authorized_ceiling = counter(
+            self._recursive_driver_state, "controller_authorized_pass_ceiling"
+        )
+        if "pass_index" in self._recursive_driver_state:
+            cursor = counter(self._recursive_driver_state, "pass_index")
+            if cursor < 1:
+                raise StateSnapshotCompatibilityError(
+                    "recursive reservation has malformed pass-accounting cursor"
+                )
+        if "controller_authorized_pass_ceiling" in self._recursive_driver_state:
+            if authorized_ceiling < 1:
+                raise StateSnapshotCompatibilityError(
+                    "recursive reservation has invalid pass-credit authorization"
+                )
+            if "schema_version" in self._recursive_driver_state:
+                from ensemble_prover.mini_recursive import (
+                    _recursive_controller_accounting_frame,
+                )
+
+                # A versioned driver frame must pass the same accounting
+                # checks before recovery as before driver admission. Minimal
+                # legacy reservation states have no versioned driver payload.
+                _recursive_controller_accounting_frame(
+                    self._recursive_driver_state,
+                    configured_passes=authorized_ceiling,
+                )
+        # Grants are cumulative over this controller's allocation lifetime;
+        # consuming a pass advances the cursor but does not revoke its grant.
+        # At least one pass predates extensions, hence G <= C - 1. Using
+        # C - cursor rejects legitimate earned passes as soon as they are used.
+        max_authorized_extensions = max(0, authorized_ceiling - 1)
         if (
             credited_extension_grants > persisted_extension_grants
             or (
@@ -415,10 +406,29 @@ class RecursiveControllerAction:
             raise StateSnapshotCompatibilityError(
                 "recursive reservation pass-credit provenance is inconsistent"
             )
-        outstanding_extension_credit = max(
-            0,
-            persisted_extension_grants - credited_extension_grants,
-        )
+        return reserved, persisted_extension_grants - credited_extension_grants
+
+    def _recover_inflight_reservation(self, session: Any) -> int:
+        """Re-credit a recursive allocation checkpointed before completion."""
+
+        reservations = getattr(session, "recursive_inflight_reservations", None)
+        if not isinstance(reservations, dict):
+            return 0
+        record = reservations.get(self.id)
+        if not isinstance(record, dict):
+            return 0
+        pool_attr = str(record.get("pool_attr") or "").strip()
+        if pool_attr != self.budget_attr:
+            reservations.pop(self.id, None)
+            return 0
+        reserved, outstanding_extension_credit = self._inflight_pass_credits(record)
+        if reserved <= 0:
+            reservations.pop(self.id, None)
+            return 0
+        # A cancellation after a committed checkpoint must not make that pass
+        # free. Only unfinished reservations and outstanding earned grants are
+        # recoverable, and all validation precedes the first pool mutation.
+        pass_already_committed = self._driver_has_committed_pass()
         if outstanding_extension_credit:
             current = int(getattr(session, pool_attr, 0) or 0)
             setattr(
@@ -455,8 +465,8 @@ class RecursiveControllerAction:
             )
         return reserved + outstanding_extension_credit
 
-    def _inflight_reserved_passes(self, session: Any) -> int:
-        """Return a valid pending allocation without consuming it.
+    def _inflight_recoverable_passes(self, session: Any) -> int:
+        """Return pending allocation and earned credits without consuming them.
 
         ``is_applicable`` is invoked from speculative scheduler probes whose
         surrounding state may be restored afterwards.  Reservation recovery
@@ -472,9 +482,12 @@ class RecursiveControllerAction:
             return 0
         if str(record.get("pool_attr") or "").strip() != self.budget_attr:
             return 0
-        if self._driver_has_committed_pass():
+        reserved, outstanding_extension_credit = self._inflight_pass_credits(record)
+        if reserved <= 0:
             return 0
-        return max(0, int(record.get("reserved_passes", 0) or 0))
+        return outstanding_extension_credit + (
+            0 if self._driver_has_committed_pass() else reserved
+        )
 
     def _reserve_inflight(self, session: Any, reserved_passes: int) -> None:
         reservations = getattr(session, "recursive_inflight_reservations", None)
@@ -530,7 +543,7 @@ class RecursiveControllerAction:
             ):
                 return False
         available_passes = int(getattr(session, self.budget_attr, 0) or 0)
-        available_passes += self._inflight_reserved_passes(session)
+        available_passes += self._inflight_recoverable_passes(session)
         # Replaying a committed terminal receipt performs no mathematical or
         # provider work.  It must remain dispatchable after the pass that made
         # it consumed the final budget unit, otherwise the durable outcome is

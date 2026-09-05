@@ -19967,6 +19967,71 @@ def _recursive_continuation_frame_is_admissible(
     return bool(exact_context or pending_planner_receipt)
 
 
+def _recursive_controller_accounting_frame(
+    frame: Mapping[str, Any], *, configured_passes: int
+) -> dict[str, Any]:
+    """Separate controller-owned allocation history from semantic replay.
+
+    A changed proof environment invalidates plans, not already spent or earned
+    passes. Legacy standalone continuations have no controller authority and
+    keep their existing semantic admission rules.
+    """
+
+    if "controller_authorized_pass_ceiling" not in frame:
+        return {}
+    from .mini_session.state_codec import StateSnapshotCompatibilityError
+
+    def counter(record: Mapping[str, Any], key: str, default: int = 0) -> int:
+        value = record.get(key, default)
+        if type(value) is not int or value < 0:
+            raise StateSnapshotCompatibilityError(
+                "recursive controller has malformed pass-credit provenance"
+            )
+        return value
+
+    if "pass_index" not in frame:
+        raise StateSnapshotCompatibilityError(
+            "recursive controller pass-accounting cursor is missing"
+        )
+    ceiling = counter(frame, "controller_authorized_pass_ceiling")
+    cursor = counter(frame, "pass_index")
+    grants = counter(frame, "pass_extension_grants")
+    raw_stats = frame.get("stats")
+    if not isinstance(raw_stats, Mapping) or not {
+        "passes_started", "passes_completed"
+    }.issubset(raw_stats):
+        raise StateSnapshotCompatibilityError(
+            "recursive controller has malformed pass-accounting statistics"
+        )
+    accounting_stats = {
+        key: counter(raw_stats, key)
+        for key in (
+            "passes_started",
+            "passes_completed",
+            "progress_continuation_passes_granted",
+            "helpers_accepted",
+        )
+    }
+    if (
+        frame.get("schema_version") != 1
+        or not 1 <= cursor <= ceiling + 1
+        or not 1 <= ceiling <= configured_passes
+        or grants >= ceiling
+        or accounting_stats["passes_completed"] > accounting_stats["passes_started"]
+        or accounting_stats["passes_completed"] >= cursor
+    ):
+        raise StateSnapshotCompatibilityError(
+            "recursive controller pass-credit provenance is inconsistent"
+        )
+    return {
+        "pass_index": cursor,
+        "passes": ceiling,
+        "pass_extension_grants": grants,
+        "stats": accounting_stats,
+        "phase": str(frame.get("phase") or ""),
+    }
+
+
 async def run_mini_recursive_driver(
     *,
     theorem_name: str,
@@ -20228,8 +20293,12 @@ async def run_mini_recursive_driver(
     )
     resume_frame: dict[str, Any] = {}
     candidate_resume_frame: dict[str, Any] = {}
+    controller_accounting_frame: dict[str, Any] = {}
     if isinstance(continuation_state, Mapping):
         candidate_resume_frame = dict(continuation_state)
+        controller_accounting_frame = _recursive_controller_accounting_frame(
+            candidate_resume_frame, configured_passes=passes
+        )
         current_cognition_hash = current_proof_idea_cognition_hash()
         legacy_cognition_is_empty = not (
             str(selected_parent_proof_idea_context or "").strip()
@@ -20255,6 +20324,19 @@ async def run_mini_recursive_driver(
                 str(item or "")
                 for item in list(candidate_resume_frame.get("planner_feedback") or [])
             ]
+    if not resume_frame and controller_accounting_frame:
+        # Keep only allocation counters: old failure reasons, speculative
+        # assembly limits, plans and proof receipts still belong to the old
+        # semantic environment and must not constrain the new search.
+        _restore_mini_recursive_stats(stats, controller_accounting_frame["stats"])
+    accounting_frame = controller_accounting_frame or resume_frame
+    accounting_pass_already_started = bool(
+        not resume_frame
+        and controller_accounting_frame
+        and controller_accounting_frame["phase"]
+        not in {"pass_committed", "terminal_committed"}
+        and stats.passes_started > stats.passes_completed
+    )
     planner_plan_receipts = _restore_validated_planner_plan_receipts(
         resume_frame.get("planner_plan_receipts") or {}
     )
@@ -20393,7 +20475,7 @@ async def run_mini_recursive_driver(
     )
     pass_extension_grants = max(
         0,
-        int(resume_frame.get("pass_extension_grants", 0) or 0),
+        int(accounting_frame.get("pass_extension_grants", 0) or 0),
     )
 
     terminal_resume_record = resume_frame.get("terminal_result")
@@ -22134,6 +22216,10 @@ async def run_mini_recursive_driver(
                     "recursive_root_tactic_portfolio_continuation",
                     phase="root_tactic_portfolio_continuation",
                     pass_index=pass_index,
+                    pass_helper_fingerprints_before=tuple(
+                        verified_helper_fingerprints_before
+                    ),
+                    pass_helpers_accepted_before=pass_helpers_before,
                 )
             except BaseException:
                 if prior_offset is None:
@@ -22182,6 +22268,10 @@ async def run_mini_recursive_driver(
                         "recursive_root_tactic_direct_portfolio_exhausted",
                         phase="root_tactic_direct_portfolio_exhausted",
                         pass_index=pass_index,
+                        pass_helper_fingerprints_before=tuple(
+                            verified_helper_fingerprints_before
+                        ),
+                        pass_helpers_accepted_before=pass_helpers_before,
                     )
                 except BaseException:
                     root_tactic_direct_portfolio_exhausted_execution_keys.discard(
@@ -22860,8 +22950,8 @@ async def run_mini_recursive_driver(
         )
         return ready
 
-    passes = max(passes, int(resume_frame.get("passes", passes) or passes))
-    pass_index = max(1, int(resume_frame.get("pass_index", 1) or 1))
+    passes = max(passes, int(accounting_frame.get("passes", passes) or passes))
+    pass_index = max(1, int(accounting_frame.get("pass_index", 1) or 1))
     previous_pass_outcome_kind = str(
         resume_frame.get("pass_outcome_kind") or ""
     ).strip()
@@ -22900,6 +22990,8 @@ async def run_mini_recursive_driver(
 
     def completed_pass_terminal_result(
         explicit_failure_reason: str = "",
+        *,
+        fresh_verified_helper_count: Optional[int] = None,
     ) -> Optional[MiniRecursiveResult]:
         """Return the outcome made final by the just-completed pass.
 
@@ -22909,7 +23001,50 @@ async def run_mini_recursive_driver(
         call.  The receipt stores the same result the live driver will return.
         """
 
+        nonlocal passes, pass_extension_grants
+
         failure_reason = str(explicit_failure_reason or "").strip()
+        if fresh_verified_helper_count is None:
+            # Normal completion already scanned the helpers for deferred work.
+            # Canonicalization grows with the helper bank, so reuse that count;
+            # only early exits with enabled continuation need another scan.
+            fresh_verified_helper_count = (
+                len(
+                    _recursive_helper_evidence_fingerprints(current_helper_evidence_records())
+                    - verified_helper_fingerprints_before
+                )
+                if progress_continuation_enabled
+                else 0
+            )
+        if progress_continuation_enabled and fresh_verified_helper_count > 0:
+            # Every completed-pass exit settles progress, including a planner
+            # miss after an environment change interrupted verified claim work.
+            # Other recovery paths may already have extended this frontier;
+            # never credit the same pass twice.
+            if pass_index >= passes:
+                passes += 1
+                pass_extension_grants += 1
+                stats.progress_continuation_passes_granted += 1
+                _record(
+                    record_event,
+                    {
+                        "phase": "mini_recursive_progress_continuation",
+                        "pass_index": pass_index,
+                        "helpers_accepted_in_pass": int(stats.helpers_accepted or 0)
+                        - pass_helpers_before,
+                        "fresh_verified_helpers_in_pass": fresh_verified_helper_count,
+                        "passes_extended_to": passes,
+                        "continuation_mode": "while_fresh_verified_progress",
+                        "verdict": "continuation_pass_granted",
+                    },
+                )
+            if failure_reason in {
+                "recursive_progress_fixed_point",
+                "recursive_planner_empty_fixed_point",
+                "recursive_planner_transport_empty_fixed_point",
+                "recursive_helper_only_fixed_point",
+            }:
+                failure_reason = ""
         if not failure_reason and pass_index < passes:
             return None
         if not failure_reason:
@@ -23146,22 +23281,35 @@ async def run_mini_recursive_driver(
         # "recompute from current state" rather than as an empty baseline: the
         # latter makes every already-banked helper look like fresh durable
         # evidence on resume and grants an unearned continuation pass.
+        pass_evidence_frame = (
+            resume_frame
+            if resuming_this_pass
+            else candidate_resume_frame
+            if accounting_pass_already_started
+            and str(candidate_resume_frame.get("root_statement_hash") or "")
+            == text_hash(root_statement)
+            else {}
+        )
+        # These are pre-pass evidence baselines, not replayable proof receipts.
+        # A helper verified before replanning still earns progress when this
+        # unfinished pass completes on the same root. Committed passes must
+        # never earn that credit twice.
         resume_records_pass_baseline = (
-            resuming_this_pass and "pass_helpers_accepted_before" in resume_frame
+            "pass_helpers_accepted_before" in pass_evidence_frame
         )
         pass_helpers_before = (
-            int(resume_frame.get("pass_helpers_accepted_before", 0) or 0)
+            int(pass_evidence_frame.get("pass_helpers_accepted_before", 0) or 0)
             if resume_records_pass_baseline
             else int(stats.helpers_accepted or 0)
         )
         resume_records_pass_fingerprints = (
-            resuming_this_pass and "pass_helper_fingerprints_before" in resume_frame
+            "pass_helper_fingerprints_before" in pass_evidence_frame
         )
         verified_helper_fingerprints_before = (
             {
                 str(item or "")
                 for item in list(
-                    resume_frame.get("pass_helper_fingerprints_before") or []
+                    pass_evidence_frame.get("pass_helper_fingerprints_before") or []
                 )
                 if str(item or "")
             }
@@ -23184,8 +23332,9 @@ async def run_mini_recursive_driver(
                     "recursive_active_root_target_infrastructure_unavailable"
                 ),
             )
-        if not resuming_this_pass:
+        if not resuming_this_pass and not accounting_pass_already_started:
             stats.passes_started += 1
+        accounting_pass_already_started = False
         declared_route_names_removed_by_filters: tuple[str, ...] = ()
         pass_finished = False
         existing_durable_root_proof = (
@@ -30613,33 +30762,13 @@ async def run_mini_recursive_driver(
                     "verdict": "deferred_claim_frontier_continuation_granted",
                 },
             )
-        elif (
-            pass_index >= passes
-            and progress_continuation_enabled
-            and fresh_verified_helper_count > 0
-        ):
-            passes += 1
-            pass_extension_grants += 1
-            stats.progress_continuation_passes_granted += 1
-            _record(
-                record_event,
-                {
-                    "phase": "mini_recursive_progress_continuation",
-                    "pass_index": pass_index,
-                    "helpers_accepted_in_pass": int(stats.helpers_accepted or 0)
-                    - pass_helpers_before,
-                    "fresh_verified_helpers_in_pass": fresh_verified_helper_count,
-                    "passes_extended_to": passes,
-                    "continuation_mode": "while_fresh_verified_progress",
-                    "verdict": "continuation_pass_granted",
-                },
-            )
         # Commit the pass only after progress-sensitive continuation has been
         # decided.  Otherwise a crash at pass_committed can restore
         # pass_index+1 with the old pass frontier and silently lose an earned
         # continuation pass.
         terminal_result = completed_pass_terminal_result(
-            "recursive_planner_empty_fixed_point" if all_quarantined_fixed_point else ""
+            "recursive_planner_empty_fixed_point" if all_quarantined_fixed_point else "",
+            fresh_verified_helper_count=fresh_verified_helper_count,
         )
         await publish_driver_state(
             f"recursive_pass_completed:{pass_index}",
