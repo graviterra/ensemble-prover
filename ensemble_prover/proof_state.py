@@ -18136,6 +18136,37 @@ class ProofSearchState:
     def _plan_hints(self, goal: NormalizedProofGoal) -> List[str]:
         tags = set(goal.shape_tags)
         constants = set(goal.constants_used)
+        # These are syntactic hints, not a mathematical plan. An equality
+        # nested below an unchosen witness/threshold is not an extensionality
+        # goal yet. Protect filter binders from the ordinary forall scanner.
+        analysis_target = goal.target_expr.replace("∀ᶠ", "Filter.Eventually").replace(
+            "∀ᵐ", "Filter.Eventually"
+        )
+        conclusion = _strip_balanced_outer_parens(analysis_target)
+        while not re.match(r"^(?:∃|@?(?:Exists\b|Filter\.Eventually\b))", conclusion):
+            body = _strip_balanced_outer_parens(lean_statement_forall_body(conclusion))
+            if body != conclusion:
+                conclusion = body
+                continue
+            # Peel one implication at a time: taking the last arrow would
+            # erase a witness in P → ∃ k, ∀ n, Q n → R k n.
+            arrows = [
+                (index, len(arrow))
+                for arrow in ("→", "->")
+                if (index := _find_top_level_operator(conclusion, arrow)) >= 0
+            ]
+            if not arrows:
+                break
+            index, length = min(arrows)
+            conclusion = _strip_balanced_outer_parens(conclusion[index + length :].strip())
+        if re.match(r"^(?:∃|@?(?:Exists\b|Filter\.Eventually\b))", conclusion):
+            return [
+                "witness route: develop and check a construction or bound before "
+                "normalizing the inner goal; preserve quantifier order and any "
+                "required uniformity across later inputs. Unfold local definitions "
+                "to identify the substantive property. Set normalization alone "
+                "does not supply this witness or threshold."
+            ]
         hints: List[str] = []
         if {"Nat.choose", "Finset"} & constants or {"Nat.choose", "Finset"} & tags:
             hints.append("binomial/finite-sum route: retrieve choose identities, normalize ranges, then prove residual sums")

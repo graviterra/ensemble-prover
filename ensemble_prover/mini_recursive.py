@@ -33131,6 +33131,18 @@ async def _request_plan(
         allow_official_answer_visibility=allow_official_answer_visibility,
         official_answer_payload_present=official_answer_payload_present,
     )
+    # Despite its historical name, visible_answer_preamble is supplied by
+    # current_answer_safe_preamble() for generic inputs too. Those definitions
+    # give an abbreviated target its mathematical meaning. The official-answer
+    # extractor below deliberately returns nothing for these inputs, and the
+    # helper summary cannot replace their local definitions.
+    generic_preamble = ""
+    if (
+        official_answer_payload_present is False
+        and str(visible_answer_preamble or "").strip()
+        and not _solution_names_in_text(visible_answer_preamble)
+    ):
+        generic_preamble = str(visible_answer_preamble)
     planner_request_context_fingerprint = _planner_material_fingerprint(
         {
             "schema_version": 1,
@@ -33142,6 +33154,7 @@ async def _request_plan(
             "allow_official_answer_visibility": bool(allow_official_answer_visibility),
             "official_answer_payload_present": bool(official_answer_payload_present),
             "suppress_solution_placeholders": bool(suppress_solution_placeholders),
+            **({"generic_preamble_hash": text_hash(generic_preamble)} if generic_preamble else {}),
         }
     )
     try:
@@ -33228,6 +33241,11 @@ async def _request_plan(
                 f"Problem (natural language):\n{str(problem_text or '').strip()}",
                 signature_section,
                 visible_answer_definitions_section,
+                (
+                    "Lean local environment (input definitions, not an official answer):\n"
+                    + generic_preamble
+                    if generic_preamble else ""
+                ),
                 render_mini_subgoal_planner_prompt(
                     root_statement=planner_root_statement,
                     answer_safe_preamble_summary=render_answer_safe_helper_summary(
@@ -33285,6 +33303,8 @@ async def _request_plan(
             "pass_index": pass_index,
             "verdict": "plan_started",
             "planner_prompt_chars": len(prompt),
+            "generic_preamble_included": bool(generic_preamble),
+            "generic_preamble_hash": text_hash(generic_preamble) if generic_preamble else "",
             "proof_idea_lifecycle_chars": len(str(proof_idea_lifecycle_context or "")),
             "selected_parent_proof_idea_context_chars": len(
                 str(selected_parent_proof_idea_context or "")

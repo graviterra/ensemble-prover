@@ -1182,6 +1182,7 @@ def _compact_history_summary_text(text: str, *, limit: int) -> str:
 #   no_sorry_allowed     — meta-commentary about the no-sorry rule
 #   environment_hedge    — global proof/goal strategy-stuck hedge
 #   scaffold_reject      — fail_if_success / placeholder / stub markers
+#   research_stall       — proof inability plus an asserted open-problem status
 # ---------------------------------------------------------------------------
 
 
@@ -1286,6 +1287,21 @@ _GIVEUP_ENVIRONMENT_HEDGE_RE = re.compile(
     r"| \bgive\s+up\s+on\s+(?:the\s+)?(?:proof|goal|theorem|main\s+goal|root\s+goal)"
     r"| \b(?:the\s+)?(?:proof|goal|theorem|main\s+goal|root\s+goal)\s+is\s+blocked"
     r")"
+)
+
+# Research status is not a refusal by itself. Require an asserted inability
+# to supply a proof as well; quotes/instructions are removed before matching.
+_GIVEUP_PROOF_SUPPLY_RE = re.compile(
+    r"(?ix)\b(?:I|we)\s+(?:cannot|can['’]?t)\s+"
+    r"(?:provide|supply|find|give)\s+"
+    r"(?:(?:a|an|the|any|correct|complete|valid|verified|Lean(?:-verified)?)\s+){0,6}"
+    r"(?:proof|resolution)\b"
+)
+_GIVEUP_RESEARCH_STATUS_RE = re.compile(
+    r"(?ix)\b(?:open|unresolved|unsolved)\s+"
+    r"(?:[\w-]+\s+){0,10}(?:problem|conjecture|question)\b"
+    r"|\b(?:problem|conjecture|question|statement|target)\b"
+    r"[^\n.!?]{0,100}\b(?:open|unresolved|unsolved)\b"
 )
 
 # Scaffold-reject: clusters #2, #10. Stub/placeholder/fail_if_success markers.
@@ -1493,6 +1509,14 @@ def _classify_giveup_signal(
             return _silent_giveup_cluster_from_proof(proof)
         return None
 
+    inability = _GIVEUP_PROOF_SUPPLY_RE.search(text_to_check)
+    if _GIVEUP_RESEARCH_STATUS_RE.search(text_to_check):
+        research_stall = inability or _GIVEUP_ENVIRONMENT_HEDGE_RE.search(text_to_check)
+        if research_stall is not None:
+            return {
+                "cluster": "research_stall",
+                "match": str(research_stall.group(0))[:160].strip(),
+            }
     for cluster_id, pattern in _GIVEUP_CLUSTERS:
         match = pattern.search(text_to_check)
         if match is not None:
@@ -1500,6 +1524,8 @@ def _classify_giveup_signal(
                 "cluster": cluster_id,
                 "match": str(match.group(0))[:160].strip(),
             }
+    if inability is not None:
+        return {"cluster": "environment_hedge", "match": inability.group(0)[:160].strip()}
     if not require_structural_collapse:
         return _silent_giveup_cluster_from_proof(proof)
     return None
@@ -1553,6 +1579,27 @@ def _giveup_decomposition_nudge(
     depth = max(0, int(recursion_depth or 0))
     cap = max(0, int(max_recursion_depth or 0))
     at_recursion_limit = cap > 0 and depth >= cap
+
+    if cluster == "research_stall":
+        artifact_instruction = (
+            "You may submit complete named helper declarations without a root proof. "
+            "Each helper must be independently Lean-checked before reuse; this is "
+            "research progress, not a proof of the root."
+            if allow_helper_decomposition and not at_recursion_limit
+            else "Keep the selected target fixed. Test a local bridge inside its proof "
+            "with try_lean; do not request another decomposition at this layer."
+        )
+        return (
+            "Research-search recovery: no verified resolution was produced. "
+            "Recognizing an open problem is not evidence that further search is futile, "
+            "and it is not a proof of the statement or its negation. Do not fabricate "
+            "a resolution. Within the remaining budget, choose one concrete local "
+            "claim on a mathematical route and test an actual proof attempt with "
+            "try_lean. Use a failed check to isolate or revise that claim; a failed "
+            "attempt is useful diagnostic evidence, not a certified fact. A library "
+            "search or finite experiment alone cannot settle the full target. "
+            + artifact_instruction
+        )
 
     if at_recursion_limit:
         # Phase 2 (2026-05-09): at the recursion-depth cap, the nudge
@@ -1916,7 +1963,20 @@ def _format_no_proof_extracted_feedback(
     lemma_dag_candidate_helpers: Sequence[str] = (),
     role: str = "prove",
     banked_names: Sequence[str] = (),
+    allow_helper_decomposition: bool = False,
 ) -> str:
+    if allow_helper_decomposition:
+        return (
+            "No root proof was accepted from this response. Work on one concrete "
+            "mathematical step: test it with try_lean and use the diagnostic to "
+            "repair or revise the route. You may submit complete named helper "
+            "declarations without a root proof. Their statements and proofs must "
+            "pass independent Lean checking before reuse; they are research progress, "
+            "not a proof of the root. Do not submit sorry/admit stubs, assume an "
+            "unproved bridge, or repeat only a claim that the problem is difficult. "
+            "When the route closes, submit the full active-goal proof."
+            + (" Previously saved proposals remain unverified." if banked_names else "")
+        )
     if helpers or lemma_dag_candidate_helpers:
         saved = ""
         if banked_names:

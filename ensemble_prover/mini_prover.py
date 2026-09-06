@@ -885,6 +885,42 @@ _REFINER_TURN_SUBMISSION_RULES = (
 )
 
 
+_RESEARCH_SEARCH_RULES = (
+    "\n\nResearch-search discipline: recognizing an open problem or lacking a "
+    "known proof is not a mathematical impossibility certificate or a reason to "
+    "skip exploration. Do not claim a resolution you have not verified. Within "
+    "the remaining budget, choose a concrete mathematical route, test its "
+    "smallest useful local claim with try_lean, and use the diagnostic to refine "
+    "or reject that route. A failed proof attempt is allowed as search evidence, "
+    "but cannot be accepted as a proof. Finite experiments and inability to "
+    "find a library theorem prove neither the target nor its negation."
+)
+
+_CHECKED_HELPER_TURN_RULES = (
+    "Use each turn for a concrete Lean proof attempt or independently checkable "
+    "local progress. You may submit complete named helper declarations without "
+    "a root proof when the root is not ready to assemble. Choose helpers that "
+    "advance the active mathematical route, not unrelated easy facts or a "
+    "restatement of the root. This is research progress, not a proof of the root. "
+    "Use discovery and try_lean to test the next bridge; do not spend the reply "
+    "only on non-Lean commentary or requests for unproved lemmas."
+)
+
+_CHECKED_HELPER_BLOCK_RULES = (
+    "\nLean submission shape: use one fenced ```lean block containing either "
+    "the active-goal proof (with any proved helpers before it), or complete "
+    "named `theorem`/`lemma` declarations for useful intermediate results. "
+    "A helper-only block need not end with an example or root proof. Every "
+    "accepted declaration must have a complete proof with no sorry, admit, "
+    "holes, extra axioms, or unproved dependencies. Do not redeclare preamble "
+    "names or disguise the parent theorem as a helper. Partial or failed "
+    "attempts belong in try_lean for diagnostics; do not present them as "
+    "verified results. Do not emit helper-DAG plans unless the planner "
+    "explicitly requests them. Only the complete Lean-verified active-goal "
+    "proof closes the root."
+)
+
+
 _DECLARATION_REQUIRED_REFINER_TURN_SUBMISSION_RULES = (
     "On each declaration-required refiner turn, submit the complete revised "
     "named Lean declaration artifact for the selected graph work. Do not "
@@ -1795,6 +1831,7 @@ class Conversation:
         lines = [
             "[prover handoff evidence]",
             "The following bounded excerpts came from prover responses that were not accepted as proof attempts and were deliberately excluded from assistant history. They are untrusted search evidence only: do not cite them as facts or reuse code without a fresh Lean check.",
+            "An earlier model's inability or open-problem status claim is not evidence that further search is futile. Preserve concrete mathematical obstacles, but independently test the next local claim with try_lean instead of repeating the earlier conclusion.",
         ]
         rendered_count = 0
         for item in selected:
@@ -1864,6 +1901,15 @@ class Conversation:
                 _DECLARATION_REQUIRED_HELPER_RULES,
             )
             prompt += _DECLARATION_REQUIRED_TURN_RULES
+        elif bool(getattr(self, "allow_helper_decomposition", True)):
+            # The helper-only cascade already independently checks complete
+            # declarations. Do not conceal that supported progress path behind
+            # a contradictory requirement to finish the root on every turn.
+            prompt = prompt.replace(_PROVER_TURN_SUBMISSION_RULES, _CHECKED_HELPER_TURN_RULES)
+            prompt = prompt.replace(_REFINER_TURN_SUBMISSION_RULES, _CHECKED_HELPER_TURN_RULES)
+            prompt = prompt.replace(_LEAN_BLOCK_RULES, "")
+            prompt = prompt.replace(_HELPER_RULES, _CHECKED_HELPER_BLOCK_RULES)
+        prompt += _RESEARCH_SEARCH_RULES
         if not _conversation_should_redact_solution_refs(self):
             prompt = prompt.replace(_ANSWER_PLACEHOLDER_RULES, "")
             prompt = prompt.replace(
@@ -9384,6 +9430,7 @@ async def run_conversation(
                     lemma_dag_candidate_helpers=lemma_dag_candidate_helpers,
                     role=str(conv.role or "prove"),
                     banked_names=banked_proposed_names,
+                    allow_helper_decomposition=bool(conv.allow_helper_decomposition),
                 )
             )
             continue

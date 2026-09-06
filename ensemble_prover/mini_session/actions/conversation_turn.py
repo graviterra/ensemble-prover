@@ -12268,13 +12268,22 @@ class ConversationTurnAction:
                     )
                     if callable(summarize):
                         summarize()
+                    local_progress_instruction = (
+                        "You may submit complete named helper declarations without a root proof. "
+                        "Work on the next unproved local obligation; assemble the root only "
+                        "when its prerequisites are verified."
+                        if bool(getattr(conv, "allow_helper_decomposition", True))
+                        and not formalization_helper_contract
+                        else "Submit one Lean proof attempt for the selected target, "
+                        "preserving its required declaration or proof-body shape."
+                    )
                     conv.append_user(
                         f"Refiner phase begins. You have {conv.turn_budget} refiner "
                         "turn(s). Recover the blocked local proof obligation from "
                         "the problem and transcript, manufacture needed bridge "
                         "facts as local `have`/`suffices` steps or exact helper "
-                        "statements, then submit one Lean proof attempt for the "
-                        "active goal. Any helper declarations must be fully proved; "
+                        "statements. " + local_progress_instruction + " "
+                        "Any helper declarations must be fully proved; "
                         "do not replace the proof attempt with helper stubs."
                     )
             except Exception:
@@ -18604,6 +18613,7 @@ class ConversationTurnAction:
                         lemma_dag_candidate_helpers=lemma_dag_candidates,
                         role=str(getattr(conv, "role", self.role) or self.role),
                         banked_names=banked_proposed_names,
+                        allow_helper_decomposition=bool(conv.allow_helper_decomposition),
                     )
                 )
             except Exception:
@@ -20366,10 +20376,10 @@ async def _run_helpers_only_cascade(
         if lemma_dag_helpers or lemma_dag_child_node_ids or lemma_dag_ps_helpers:
             conv.append_user(
                 "The controller processed your helper declarations as "
-                "lemma-DAG decomposition work. Now submit one main proof "
-                "that assembles the root from verified helpers only. Open "
-                "proof-state child goals are not facts yet; prove or repair "
-                "them before using them in root assembly."
+                "lemma-DAG decomposition work. Work on the next unproved "
+                "local obligation. Open proof-state child goals are not facts "
+                "yet; prove or repair them before using them. Assemble the "
+                "root only when all required premises are verified."
             )
             cost = time.monotonic() - started
             raw_lemma_dag_helpers = [*lemma_dag_helpers, *lemma_dag_ps_helpers]
@@ -20932,13 +20942,15 @@ async def _run_helpers_only_cascade(
             "and recorded additional open proof-state child goals. Recursive "
             "helper proving is enabled, so the scheduler will attack those "
             "child goals with scoped LLM sub-sessions before deterministic "
-            "fallback. Then submit the main proof that assembles the root."
+            "fallback. Continue with the next unproved local obligation; "
+            "assemble the root only when all required premises are verified."
         )
     else:
         conv.append_user(
             "The controller verified helper declaration(s) from your "
-            "reply. Now submit the main proof that assembles the root "
-            "from those named helpers."
+            "reply. Continue with the next unproved local obligation; "
+            "assemble the root from those named helpers only when all "
+            "required premises are verified."
         )
     cost = time.monotonic() - started
     return MiniOutcome(
