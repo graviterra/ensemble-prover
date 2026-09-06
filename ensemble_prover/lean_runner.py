@@ -54,7 +54,10 @@ from .lean_parser import (
     is_oracle_silent_success,
     parse_lean_output,
 )
-from .lean_syntax import lean_expression_delimiters_balanced
+from .lean_syntax import (
+    _lean_surface_lexical_skip_end,
+    lean_expression_delimiters_balanced,
+)
 from .persistent_verifier import (
     PersistentVerifierPool,
     PersistentVerifierUnavailableError,
@@ -100,6 +103,216 @@ def termination_signal_from_returncode(returncode: int) -> int:
 _ALLOWED_CHECK_AXIOMS = frozenset(
     {"propext", "Classical.choice", "Quot.sound"}
 )
+
+
+def _name_anonymous_check_roots(
+    source: str, *, block_index: int
+) -> tuple[str, tuple[str, ...]]:
+    """Give scratch examples audit identities without rewriting their terms.
+
+    ``example`` elaborates a term without retaining a declaration that
+    ``#print axioms`` can inspect. A named ``def`` retains the full example
+    grammar, including equations, inferred types, and constructive values;
+    ``opaque`` cannot parse equation-style or inferred-type declarations. Change only
+    the command keyword, keeping binders, command-local scopes, and source line
+    spans intact. Root-qualified generated names remain auditable after a
+    helper's namespace closes. The caller must require a report for every name.
+
+    Lexical atoms and parenthesized syntax quotations are not commands: an
+    ``example`` mentioned in a string, comment, quoted identifier, or syntax
+    quotation must never become a fabricated audit root.
+    """
+
+    names: list[str] = []
+    parts: list[str] = []
+    last = 0
+    index = 0
+    depth = 0
+    source_digest = ""
+    comment_end = -1
+    while index < len(source):
+        skip_to = _lean_surface_lexical_skip_end(source, index)
+        if skip_to is not None:
+            if source.startswith(("/-", "--"), index):
+                comment_end = skip_to
+            index = skip_to
+            continue
+        char = source[index]
+        if char in "([{⦃⟨":
+            depth += 1
+        elif char in ")]}⦄⟩":
+            depth -= 1
+        if depth == 0 and source.startswith("example", index):
+            end = index + len("example")
+            before = source[index - 1] if index else ""
+            after = source[end] if end < len(source) else ""
+            # Recognize declaration separators positively. Lean identifier
+            # continuations include punctuation (!/?) and Unicode symbols;
+            # a Python word-boundary approximation corrupts valid names.
+            after_keyword = bool(
+                not after or after.isspace() or after in ":([{⦃"
+                or source.startswith(("/-", "--"), end)
+            )
+            if after_keyword and not (
+                # Bare and resolved Lean Name quotations (`name / ``name)
+                # are terms, even without surrounding parentheses.
+                before and index != comment_end
+                and not (before.isspace() or before in ";)]}")
+            ):
+                if not source_digest:
+                    source_digest = hash_text(source)
+                name = (
+                    f"ensemble_scratch_{source_digest}_"
+                    f"{block_index}_{len(names)}"
+                )
+                parts.extend((source[last:index], f"def _root_.{name}"))
+                names.append(name)
+                index = last = end
+                continue
+        index += 1
+    if not names:
+        return source, ()
+    parts.append(source[last:])
+    return "".join(parts), tuple(names)
+
+
+_CHECK_SOURCE_BOUNDARY_GUARD = r"""
+private partial def ensembleCheckCommandBoundary (command : Lean.Syntax) : Bool :=
+  if command.isOfKind ``Lean.Parser.Command.declaration then
+    [``Lean.Parser.Command.definition, ``Lean.Parser.Command.abbrev,
+     ``Lean.Parser.Command.theorem, ``Lean.Parser.Command.opaque,
+     ``Lean.Parser.Command.example, ``Lean.Parser.Command.instance,
+     ``Lean.Parser.Command.structure, ``Lean.Parser.Command.inductive,
+     ``Lean.Parser.Command.classInductive].contains command[1].getKind
+  else if command.isOfKind ``Lean.Parser.Command.in then
+    ensembleCheckCommandBoundary command[0] && ensembleCheckCommandBoundary command[2]
+  else if command.isOfKind ``Lean.Parser.Command.mutual then
+    command[1].getArgs.all ensembleCheckCommandBoundary
+  else
+    [``Lean.Parser.Command.namespace, ``Lean.Parser.Command.end,
+     ``Lean.Parser.Command.section, ``Lean.Parser.Command.open,
+     ``Lean.Parser.Command.variable, ``Lean.Parser.Command.universe,
+     ``Lean.Parser.Command.include, ``Lean.Parser.Command.omit,
+     ``Lean.Parser.Command.set_option, `lemma,
+     `Batteries.Tactic.Lemma.lemmaCmd].contains command.getKind
+"""
+
+
+def _check_source_boundary_file(
+    preamble: str, statement: str, proof: str, lemmas: str,
+    *, max_heartbeats: Optional[int] = None,
+) -> str:
+    """Parse candidate data before any untrusted command can be elaborated.
+
+    A proof term cannot contain a second command. Helper streams may contain
+    mathematical declarations and their scopes, but not arbitrary commands
+    that could expand to anonymous proofs invisible to the axiom audit. The
+    trusted preamble supplies ordinary notation and tactic syntax unchanged.
+    """
+    # Local import avoids nl_lean's runner import cycle and shares its exact
+    # Lean string escaping (JSON's control-character escapes are not identical).
+    from .nl_lean import _lean_string
+
+    trusted = _append_imports_to_preamble(preamble, ["Lean"])
+    trusted, target_prefix, target_omit = decode_theorem_target_context(trusted)
+    target_context = "\n".join(filter(None, (
+        target_prefix,
+        f"omit {' '.join(target_omit)} in" if target_omit else "",
+    )))
+    if isinstance(max_heartbeats, int) and max_heartbeats > 0:
+        trusted += f"\nset_option maxHeartbeats {max_heartbeats}\n"
+    return trusted + "\n\n" + _CHECK_SOURCE_BOUNDARY_GUARD + f"""
+run_cmd do
+  let input := Lean.Parser.mkInputContext {_lean_string(lemmas)} "scratch-helpers.lean"
+  let (parsedHeader, initialState, initialMessages) ← Lean.Parser.parseHeader input
+  let header : Lean.Elab.HeaderSyntax := ⟨parsedHeader.raw⟩
+  unless (header.imports (includeInit := false)).isEmpty do
+    Lean.throwError "scratch source boundary: helper imports are not permitted"
+  let mut state := initialState
+  let mut messages := initialMessages
+  repeat
+    let (command, nextState, nextMessages) := Lean.Parser.parseCommand input
+      {{ env := ← Lean.getEnv, options := ← Lean.getOptions,
+         currNamespace := ← Lean.getCurrNamespace, openDecls := ← Lean.getOpenDecls }} state messages
+    state := nextState
+    messages := nextMessages
+    if messages.hasErrors then
+      for message in messages.toList do
+        Lean.logError (← message.toString)
+      Lean.throwError "scratch source boundary: failed to parse helpers"
+    if command.isOfKind ``Lean.Parser.Command.eoi then break
+    unless ensembleCheckCommandBoundary command do
+      Lean.throwError m!"scratch source boundary: unsupported helper command {{command.getKind}}"
+    -- Only scope changes are elaborated during admission, never candidate
+    -- declarations or command macros. Later syntax sees trusted scoped notation.
+    if command.isOfKind ``Lean.Parser.Command.open then
+      let decl := command[1]
+      let nameArg := if decl.isOfKind ``Lean.Parser.Command.openSimple then some 0
+        else if decl.isOfKind ``Lean.Parser.Command.openScoped then some 1 else none
+      let opens := match nameArg with
+        | some index => decl[index].getArgs.map fun name =>
+          command.setArg 1 (decl.setArg index (Lean.mkNullNode #[name]))
+        | none => #[command]
+      for opened in opens do
+        let saved ← get
+        try
+          Lean.Elab.Command.elabCommand opened
+          if (← get).messages.hasErrors then set saved
+        catch _ => set saved
+      -- Unelaborated helper declarations may introduce new namespaces.
+      -- Defer only their open-name resolution to final checking, retaining
+      -- each successfully activated trusted scope in a mixed open command.
+    else if [``Lean.Parser.Command.namespace, ``Lean.Parser.Command.section,
+        ``Lean.Parser.Command.end].contains command.getKind then
+      Lean.Elab.Command.elabCommand command
+{target_context}
+run_cmd do
+  match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(statement)} with
+  | .error error => Lean.throwError m!"scratch source boundary: invalid target term: {{error}}"
+  | .ok _ => pure ()
+  match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(proof)} with
+  | .error error => Lean.throwError m!"scratch source boundary: invalid proof term: {{error}}"
+  | .ok _ => pure ()
+"""
+
+
+def _check_delta_audit_blocks(identity: str) -> tuple[str, str]:
+    """Inventory only constants introduced after the trusted preamble."""
+    baseline = f"ensemble_scratch_baseline_{identity}"
+    name_list_type = "Lean.mkApp (Lean.mkConst ``List [Lean.Level.zero]) (Lean.mkConst ``Lean.Name)"
+    before = f"""
+run_cmd do
+  let names := (← Lean.getEnv).constants.map₂.toList.map (·.1)
+  Lean.Elab.Command.liftCoreM <| Lean.addAndCompile <| .defnDecl {{
+    name := `{baseline}, levelParams := [], type := {name_list_type},
+    value := Lean.toExpr names, hints := .opaque, safety := .safe
+  }}
+"""
+    after = f"""
+run_cmd do
+  let names := (← Lean.getEnv).constants.map₂.toList.map (·.1)
+  let baseline ← Lean.Elab.Command.liftTermElabM <|
+    Lean.Meta.evalExpr (List Lean.Name) ({name_list_type}) (Lean.mkConst `{baseline})
+  let known := baseline.foldl (fun set name => set.insert name) ({{}} : Lean.NameSet)
+  let names := names.filter fun name => name != `{baseline} && !known.contains name
+  let allowed := [`propext, `Classical.choice, `Quot.sound]
+  let mut inventory : Array Lean.Json := #[]
+  let mut forbidden : Array Lean.Name := #[]
+  for name in names do
+    let axioms ← Lean.collectAxioms name
+    for axiomName in axioms do
+      unless allowed.contains axiomName do
+        if !forbidden.contains axiomName then forbidden := forbidden.push axiomName
+    inventory := inventory.push <| Lean.Json.mkObj [
+      ("name", Lean.toJson name.toString),
+      ("axioms", Lean.toJson (axioms.map Lean.Name.toString))]
+  Lean.logInfo ("ENSEMBLE_SCRATCH_AUDIT_ROOTS:" ++ (Lean.Json.arr inventory).compress)
+  unless forbidden.isEmpty do
+    Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
+"""
+    return before, after
+
+
 _PRINT_AXIOMS_DEPENDS_RE = re.compile(
     r"'([^']+)'\s+depends\s+on\s+axioms:\s*\[([^\]]*)\]"
 )
@@ -2699,6 +2912,7 @@ def _axiom_report_name_matches(reported: str, requested: str) -> bool:
 def _parse_complete_axiom_audit(
     output: str,
     requested_names: Sequence[str],
+    *, require_inventory: bool = False,
 ) -> tuple[Dict[str, Tuple[str, ...]], str]:
     """Parse one complete ``#print axioms`` report per requested declaration."""
 
@@ -2740,6 +2954,32 @@ def _parse_complete_axiom_audit(
         parsed[requested_name] = matched_axioms
     if missing:
         return parsed, "missing_axiom_report:" + ",".join(missing)
+    if require_inventory:
+        inventories = re.findall(r"(?m)^ENSEMBLE_SCRATCH_AUDIT_ROOTS:(.*)$", output)
+        if len(inventories) != 1:
+            return parsed, "missing_or_duplicate_axiom_inventory"
+        try:
+            inventory = json.loads(inventories[0])
+        except (ValueError, TypeError, RecursionError):
+            return parsed, "malformed_axiom_inventory"
+        if not isinstance(inventory, list) or not inventory:
+            return parsed, "malformed_axiom_inventory"
+        dynamic: Dict[str, Tuple[str, ...]] = {}
+        for entry in inventory:
+            if not isinstance(entry, dict):
+                return parsed, "malformed_axiom_inventory"
+            name, inventory_axioms = entry.get("name"), entry.get("axioms")
+            if (
+                not isinstance(name, str) or not name or name in dynamic
+                or not isinstance(inventory_axioms, list)
+                or any(not isinstance(axiom, str) or not axiom for axiom in inventory_axioms)
+            ):
+                return parsed, "malformed_axiom_inventory"
+            dynamic[name] = tuple(inventory_axioms)
+        for expected in requested:
+            if not any(_axiom_report_name_matches(actual, expected) for actual in dynamic):
+                return parsed, "incomplete_axiom_inventory:" + expected
+        parsed.update(dynamic)
     return parsed, ""
 
 
@@ -4083,8 +4323,11 @@ class LeanRunner:
         use_oracle_sem: bool = False,
         retry_repl_termination: bool = True,
         dispatch_observer: Optional[Callable[[], None]] = None,
+        operation_deadline: Optional[float] = None,
     ) -> tuple[tuple[int, str], str, str]:
         deadline_monotonic = self._execution_deadline(timeout_s)
+        if operation_deadline is not None:
+            deadline_monotonic = min(deadline_monotonic, operation_deadline)
         environment_admitted = False
 
         async def admit_environment_execution() -> None:
@@ -4568,6 +4811,12 @@ class LeanRunner:
         # `set_option ... in` wrapper. (Live trace 2001_a1_16apr_8.jsonl
         # had 49 valid proofs rejected this way.)
         audit_requested = axiom_audit_names is not None
+        delta_before, delta_after = ("", "")
+        if audit_requested and lemma_block:
+            preamble = _append_imports_to_preamble(preamble, ["Lean"])
+            delta_before, delta_after = _check_delta_audit_blocks(
+                hash_text(preamble + "\0" + lemma_block + "\0" + statement + "\0" + proof_code)
+            )
         goal_line = (
             # ``check`` also supports constructive/non-Prop targets, so a
             # theorem declaration is not universally legal. ``opaque`` has
@@ -4626,6 +4875,7 @@ class LeanRunner:
             f"{preamble}\n\n"
             f"{head_universe_decl}"
             f"{heartbeat_option}"
+            f"{delta_before}"
         )
         lemma_block_start_line = (
             before_lemmas.count("\n") + 1 if lemma_block else 0
@@ -4648,7 +4898,7 @@ class LeanRunner:
             audit_block = "\n" + "\n".join(
                 f"#print axioms {name}" for name in complete_audit_names
             ) + "\n"
-        content = f"{prefix}{scoped_block}{audit_block}"
+        content = f"{prefix}{scoped_block}{delta_after}{audit_block}"
         # 1-indexed line where the scoped block (set_option wrappers + example)
         # begins. ``Try this:`` suggestions on lines below this are accepted
         # by the parser; suggestions above are rejected as off-block linter
@@ -5189,6 +5439,7 @@ class LeanRunner:
         semaphore: Optional[asyncio.Semaphore] = None,
         retry_repl_termination: bool = True,
         dispatch_observer: Optional[Callable[[], None]] = None,
+        operation_deadline: Optional[float] = None,
     ) -> tuple[Optional[Path], Optional[_BackendExecutionResult], Optional[str]]:
         """Write generated Lean content, run it, and clean up consistently."""
         result, file_path_str, backend_key = await self._execute_content(
@@ -5201,6 +5452,7 @@ class LeanRunner:
             use_oracle_sem=(semaphore is self.suggest_sem),
             retry_repl_termination=retry_repl_termination,
             dispatch_observer=dispatch_observer,
+            **({"operation_deadline": operation_deadline} if operation_deadline is not None else {}),
         )
         returncode, out = result
         if backend_key == "disk_error":
@@ -5222,6 +5474,57 @@ class LeanRunner:
         proof_code: str,
         lemmas: List[str],
         *,
+        preamble_override: str | None = None,
+        timeout_s: Optional[float] = None,
+        fast_fail_timeout_s: Optional[float] = None,
+        max_heartbeats: Optional[int] = None,
+        check_kind: str = "full",
+        warning_as_error: bool = False,
+        dispatch_observer: Optional[Callable[[], None]] = None,
+    ) -> LeanResult:
+        """Check submitted proof artifacts with mandatory source admission."""
+        return await self._check(
+            statement, proof_code, lemmas,
+            source_boundary_required=True,
+            preamble_override=preamble_override,
+            timeout_s=timeout_s,
+            fast_fail_timeout_s=fast_fail_timeout_s,
+            max_heartbeats=max_heartbeats,
+            check_kind=check_kind,
+            warning_as_error=warning_as_error,
+            dispatch_observer=dispatch_observer,
+        )
+
+    # Preserve the original wrapper identity even when an integration replaces
+    # LeanRunner.check itself; an inherited probe must not bypass that policy.
+    _generated_probe_public_check = check
+
+    async def _check_generated_falsification_probe(
+        self, statement: str, proof_code: str, lemmas: List[str], **kwargs: Any,
+    ) -> LeanResult:
+        """Check a generated candidate hint, never an authoritative artifact.
+
+        Concrete-witness search has a short per-instance budget. Its result
+        cannot certify a disproof: the complete negation must independently
+        pass public ``check`` and the certificate's separate axiom audit.
+        Keep all kernel/axiom checks here; only source admission is omitted.
+        ``safe_helper_sources`` is not a structural source validator.
+        """
+        kwargs["check_kind"] = "mini_falsification_generated_probe"
+        return await self._check(
+            statement, proof_code, lemmas, source_boundary_required=False, **kwargs,
+        )
+
+    # An explicit replacement of the private capability remains an opt-in.
+    _generated_probe_private_check = _check_generated_falsification_probe
+
+    async def _check(
+        self,
+        statement: str,
+        proof_code: str,
+        lemmas: List[str],
+        *,
+        source_boundary_required: bool,
         preamble_override: str | None = None,
         timeout_s: Optional[float] = None,
         fast_fail_timeout_s: Optional[float] = None,
@@ -5265,7 +5568,15 @@ class LeanRunner:
             if isinstance(instance_default, int) and instance_default > 0:
                 max_heartbeats = instance_default
         goal_name = f"goal_{short_id(statement + proof_code)}"
-        lemma_block = "\n".join(lemmas) if lemmas else ""
+        audited_lemmas: list[str] = []
+        anonymous_audit_names: list[str] = []
+        for block_index, lemma in enumerate(lemmas or ()):
+            audited_lemma, anonymous_names = _name_anonymous_check_roots(
+                lemma, block_index=block_index
+            )
+            audited_lemmas.append(audited_lemma)
+            anonymous_audit_names.extend(anonymous_names)
+        lemma_block = "\n".join(audited_lemmas)
         helper_audit_names = tuple(
             dict.fromkeys(
                 name
@@ -5281,7 +5592,7 @@ class LeanRunner:
             preamble_override=preamble_override,
             warning_as_error=warning_as_error,
             max_heartbeats=max_heartbeats,
-            axiom_audit_names=helper_audit_names,
+            axiom_audit_names=(*helper_audit_names, *anonymous_audit_names),
         )
         lemma_line_spans: Tuple[Tuple[int, int], ...] = ()
         if built.lemma_block_start_line > 0:
@@ -5296,15 +5607,49 @@ class LeanRunner:
                 next_line = end_line + 1
             lemma_line_spans = tuple(spans)
         content = built.content
-        file_path, execution, write_error = await self._execute_generated_file(
-            mode=check_kind,
-            goal_name=goal_name,
-            content=content,
-            timeout_s=timeout_s,
-            fast_fail_timeout_s=fast_fail_timeout_s,
-            warning_as_error=warning_as_error,
-            dispatch_observer=dispatch_observer,
-        )
+        if not source_boundary_required:
+            # Bind execution reuse to this non-authoritative policy even if
+            # a caller supplies the same public diagnostic check_kind label.
+            content += "\n-- ensemble-generated-falsification-probe-v1\n"
+        operation_deadline = self._execution_deadline(timeout_s)
+        file_path = None
+        execution = None
+        write_error = None
+        if source_boundary_required:
+            boundary_content = _check_source_boundary_file(
+                self._resolve_preamble(preamble_override, proof_code=proof_code),
+                statement, proof_code, "\n".join(lemmas or ()),
+                max_heartbeats=max_heartbeats,
+            )
+            file_path, execution, write_error = await self._execute_generated_file(
+                mode=f"{check_kind}_source_boundary",
+                goal_name=f"{goal_name}_source_boundary",
+                content=boundary_content,
+                timeout_s=timeout_s,
+                fast_fail_timeout_s=fast_fail_timeout_s,
+                warning_as_error=warning_as_error,
+                dispatch_observer=dispatch_observer,
+                operation_deadline=operation_deadline,
+            )
+        if not source_boundary_required or (execution is not None and execution.returncode == 0):
+            remaining = self._execution_time_remaining(operation_deadline)
+            if remaining <= 0:
+                execution = _BackendExecutionResult(
+                    returncode=1,
+                    output="Lean timeout after scratch source boundary validation",
+                    backend="deadline",
+                )
+            else:
+                file_path, execution, write_error = await self._execute_generated_file(
+                    mode=check_kind,
+                    goal_name=goal_name,
+                    content=content,
+                    timeout_s=timeout_s,
+                    fast_fail_timeout_s=fast_fail_timeout_s,
+                    warning_as_error=warning_as_error,
+                    dispatch_observer=dispatch_observer,
+                    operation_deadline=operation_deadline,
+                )
         if execution is None:
             # Parse the disk-write-failed / write-error string so the
             # resulting LeanResult.parsed exposes infra_failure=True to
@@ -5332,10 +5677,13 @@ class LeanRunner:
         axiom_audit_ok: Optional[bool] = None
         unexpected_axioms: Tuple[str, ...] = ()
         axiom_audit_error = ""
-        if returncode == 0:
+        if returncode == 0 or (
+            lemma_block and re.search(r"(?m)^ENSEMBLE_SCRATCH_AUDIT_ROOTS:", out)
+        ):
             axiom_audit, axiom_audit_error = _parse_complete_axiom_audit(
                 out,
                 built.axiom_audit_names,
+                require_inventory=bool(lemma_block),
             )
             all_axioms = tuple(
                 sorted(

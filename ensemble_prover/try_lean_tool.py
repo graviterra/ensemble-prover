@@ -124,7 +124,7 @@ _PRELUDE_RESERVED_TOKENS = frozenset(
     }
 )
 _EXTRA_EXAMPLE_COMMAND_RE = re.compile(
-    r"(?<![\w'.«])"
+    r"(?<![\w'`.«!?])"
     r"(?:#\w+|import|axiom|constant|opaque|irreducible_def|structure|class|inductive|"
     r"coinductive|mutual|theorem|lemma|def|abbrev|instance|example|"
     r"namespace|section|end|variable|variables|universe|universes|"
@@ -133,7 +133,7 @@ _EXTRA_EXAMPLE_COMMAND_RE = re.compile(
     r"initialize|builtin_initialize|declare_syntax_cat|export|alias|"
     r"run_cmd|local|include|omit|recall|suppress_compilation|"
     r"unsuppress_compilation)"
-    r"(?![\w'»])"
+    r"(?![\w'.»!?])"
 )
 
 

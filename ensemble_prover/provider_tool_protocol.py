@@ -22,7 +22,7 @@ from .pricing import (
     ensure_openrouter_reasoning_capabilities_async,
     lookup_openrouter_reasoning_capabilities,
 )
-from .utils import parse_tool_arguments
+from .utils import extract_code_fences, parse_tool_arguments, strip_lean_comments
 
 
 DEEPSEEK_FINAL_RAW_NO_TOOLS_METRIC = "deepseek_final_raw_no_tools"
@@ -1417,7 +1417,7 @@ def resolve_final_no_tools_output(
         # artifacts, but they are not proof bodies for this active goal.
         if re.match(
             r"^\s*(?:by|show|calc|exact|refine|fun)(?![\w'])",
-            candidate,
+            strip_lean_comments(candidate),
         ) is None:
             continue
         accepted = candidate
@@ -1443,7 +1443,7 @@ def resolve_final_no_tools_output(
         )
         if len(explicit_lean) == 1 and str(explicit_lean[0] or "").strip():
             return FinalNoToolsResolution(
-                content=_fenced_lean(explicit_lean[0]),
+                content=_fenced_lean(explicit_lean[0].strip()),
                 event="final_no_tools_transcript_echo_lean_salvaged",
                 finish_reason=finish_reason,
                 reasoning_content_chars=reasoning_chars,
@@ -2016,20 +2016,35 @@ def _has_text_tool_call_request(content: str) -> bool:
 
 
 def _checked_code_body(code: Any) -> str:
-    body = str(code or "").strip()
-    fence = re.search(
-        r"```(?:lean|lean4)?\s*\n?(.*?)```",
-        body,
+    """Unwrap a whole legacy envelope, never a fence inside checked Lean."""
+    source = str(code or "")
+    envelope = source.strip()
+    # Older saved proof receipts used this explicit label before their fence.
+    envelope = re.sub(r"^draft:[ \t]*\r?\n", "", envelope, count=1, flags=re.I)
+    fence = re.fullmatch(
+        r"(?P<fence>`{3,})(?!`)(?:lean|lean4)?[ \t]*(?:\r?\n)?"
+        r"(?P<body>.*?)(?P=fence)",
+        envelope,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    if fence is not None:
-        body = str(fence.group(1) or "").strip()
-    return body
+    if fence is not None and len(extract_code_fences(envelope)) == 1:
+        return fence.group("body").strip()
+    return source
+
+
+def fenced_lean_artifact(code: str) -> str:
+    """Envelope exact Lean source using a fence absent from its contents.
+
+    This does not interpret or authorize the source. Downstream declaration,
+    target, and axiom checks still determine whether it is usable.
+    """
+    longest_run = max((len(match[0]) for match in re.finditer(r"`+", code)), default=0)
+    fence = "`" * max(3, longest_run + 1)
+    return f"{fence}lean\n{code}\n{fence}"
 
 
 def _fenced_lean(code: str) -> str:
-    body = _checked_code_body(code)
-    return f"```lean\n{body}\n```"
+    return fenced_lean_artifact(_checked_code_body(code))
 
 
 def deepseek_dsml_feedback_after_budget() -> str:

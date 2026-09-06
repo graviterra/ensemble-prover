@@ -75,7 +75,23 @@ async def check_concrete_negation(
     useful as a hint but is outside Mini's durable proof trust boundary.
     """
 
-    check = getattr(lean, "check", None)
+    # A generated instance result is candidate evidence only. Public scratch
+    # submissions and full-negation certification always use ordinary check.
+    public_check = getattr(lean, "check", None)
+    check = getattr(lean, "_check_generated_falsification_probe", None)
+    if callable(check):
+        from ..lean_runner import LeanRunner
+
+        # Inheriting the base capability is not an opt-in to bypass a custom
+        # public check. Select its bound callable before signature filtering.
+        # Explicit custom private capabilities retain their existing dispatch.
+        if (
+            getattr(check, "__func__", None) is LeanRunner._generated_probe_private_check
+            and getattr(public_check, "__func__", None) is not LeanRunner._generated_probe_public_check
+        ):
+            check = public_check
+    else:
+        check = public_check
     if check is None:
         return False, "lean object has no check method", "infrastructure"
     requested_timeout_s = max(0.0, float(timeout_s or 0.0))

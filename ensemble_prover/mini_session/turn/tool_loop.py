@@ -81,6 +81,7 @@ from ...provider_tool_protocol import (
     MINI_TOOL_REASONING_EFFORT,
     MiniRequestEnvelopePolicy,
     extract_simple_xml_tool_calls,
+    fenced_lean_artifact as _accepted_lean_artifact_content,
     handle_deepseek_dsml_after_budget,
     is_deepseek_client,
     mini_bounded_visible_output_reasoning_effort,
@@ -4631,9 +4632,9 @@ async def _call_llm_with_tools_one_round_impl(
                 tool_repeat_detected = True
                 tool_repeat_signature = repeated_accepted_signature
                 tool_repeat_action = "reuse_accepted_try_lean"
-                content = accepted_try_lean_receipts[
-                    repeated_accepted_signature
-                ]
+                content = _accepted_lean_artifact_content(
+                    accepted_try_lean_receipts[repeated_accepted_signature]
+                )
                 final_no_tools_event = "accepted_try_lean_exact_repeat_reused"
                 final_no_tools_used_accepted_proof = True
                 _increment_tool_metric(
@@ -6884,7 +6885,7 @@ async def _call_llm_with_tools_one_round_impl(
                 # The kernel already accepted the active target. Publish that
                 # exact artifact instead of asking the provider to restate it
                 # or allowing an earlier helper cutpoint to hide the solve.
-                content = accepted_exact_target_code
+                content = _accepted_lean_artifact_content(accepted_exact_target_code)
                 break
 
             if any(
@@ -7339,7 +7340,7 @@ async def _call_llm_with_tools_one_round_impl(
         # provider failure while merely serializing it must not erase it.
         # Cancellation and runtime-capability revocation are re-raised above.
         _retain_recovered_finalizer_failure_receipt()
-        content = accepted_fallback_code
+        content = _accepted_lean_artifact_content(accepted_fallback_code)
         llm_error = None
         llm_failure_kind = ""
         llm_retryable = False

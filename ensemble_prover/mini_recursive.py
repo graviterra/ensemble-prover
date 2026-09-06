@@ -11592,7 +11592,6 @@ def _ready_suspended_dependency_claims(
             allow_official_answer_visibility=allow_official_answer_visibility,
         )
     )
-    helper_names = _verified_helper_names(helpers)
     cap = max(1, int(max_claims or 1))
     for key, item in list(suspended_claims.items()):
         if key in skipped:
@@ -11628,26 +11627,12 @@ def _ready_suspended_dependency_claims(
                 support_statements=support_statements,
             )
             if reasons:
-                declared_deps = tuple(
-                    str(dep or "").strip()
-                    for dep in tuple(getattr(claim, "dependencies", ()) or ())
-                    if str(dep or "").strip()
-                )
-                if (
-                    declared_deps
-                    and all(
-                        dep in proved_claim_names or dep in helper_names
-                        for dep in declared_deps
-                    )
-                    and all(
-                        str(reason or "").startswith("unmet_assembly_premise:")
-                        for reason in reasons
-                    )
-                ):
-                    ready.append((key, claim))
-                    if len(ready) >= cap:
-                        break
-                    continue
+                # Availability of the declared names does not discharge a
+                # missing semantic premise. Reopening here would submit the
+                # same unchanged claim to the same admission gate on every
+                # pass. Keep it suspended; every future probe rechecks the
+                # current verified support, so relevant new evidence can still
+                # make the contract ready without another planner request.
                 continue
             ready.append((key, claim))
         if len(ready) >= cap:
@@ -14710,9 +14695,11 @@ _CONTROLLER_ROOT_ASSEMBLY_RATIONALE = (
 _CONTROLLER_ROOT_ASSEMBLY_NAME_RE = re.compile(
     r"controller_root_assembly(?:_(?:[2-9]|[1-9][0-9]+))?\Z"
 )
-# v1 recorded diagnostic-only sanity auditing. v2 records the first
-# work-admission policy that withholds incomplete required checks.
-_PLAN_DIAGNOSTICS_RECEIPT_VERSION = 2
+# v1 recorded diagnostic-only auditing. v2 introduced receipt admission but
+# treated lexical heuristics as vetoes and let `fails` bypass a missing check.
+# v3 makes prose advisory and requires missing-check migration regardless of
+# the declared status; existing valid selected work still needs no new model call.
+_PLAN_DIAGNOSTICS_RECEIPT_VERSION = 3
 
 
 def _claim_has_controller_sanity_exemption(
@@ -14747,12 +14734,11 @@ def _claim_has_controller_sanity_exemption(
 def _quantified_equality_sanity_is_adversarial(
     claim: MiniSubgoalClaim,
 ) -> bool:
-    """Require explicit distinct assignments for an implication equality.
+    """Diagnose missing explicit distinct assignments for an equality.
 
-    This is a work-admission receipt check, not mathematical validation. It
-    prevents an equal-input example from satisfying the planner protocol that
-    specifically asks it to try falsifying a quantified equality conclusion.
-    Lean and certified falsification retain all proof authority.
+    This surface heuristic cannot interpret arbitrary mathematical prose or
+    notation (including tuple assignments), so a negative result is advisory
+    only. Lean and certified falsification retain all proof authority.
     """
 
     statement = str(getattr(claim, "statement", "") or "").strip()
@@ -14814,10 +14800,10 @@ def _claim_declared_sanity_contract_reason(
     sanity_required = (
         _claim_sanity_requirement(claim).required and not controller_exempt
     )
-    if status == "fails":
-        return "declared_failed"
     if sanity_required and not check:
         return "sanity_check_required"
+    if status == "fails":
+        return "declared_failed"
     if require_complete and not controller_exempt and not status:
         return "missing_sanity_status"
     if (
@@ -14880,12 +14866,11 @@ def _filter_plan_declared_sanity_contract(
         withhold = bool(
             withhold_missing_required_checks
             and require_complete
-            and reason
-            in {
-                "sanity_check_required",
-                "non_adversarial_equality_sanity_check",
-                "passes_conflicts_with_check",
-            }
+            # A missing required receipt is observable protocol incompleteness.
+            # Interpreting an existing check through English/numeric regexes
+            # is not: outside-premise examples, contradiction arguments and
+            # alternate assignment notation must still reach formal checks.
+            and reason == "sanity_check_required"
             and int(getattr(claim, "sanity_contract_version", 0) or 0) >= 1
         )
         stats.plans_sanity_contract_diagnostics += 1
@@ -27531,22 +27516,43 @@ async def run_mini_recursive_driver(
         )
         plan_admission_migrated = False
         # Checkpoints predating the current admission receipt need one audit.
-        # v1 meant diagnostic-only sanity handling, so it cannot authorize a
-        # negotiated v1 provider claim under the stronger v2 work-admission
-        # gate. Version-0 legacy claims and controller claims remain exempt by
-        # the claim-level policy inside the filter.
+        # v1 meant diagnostic-only sanity handling; v2 could admit a missing
+        # required check when its status was `fails`. Neither receipt alone
+        # authorizes the queue under current admission. Version-0 legacy
+        # claims and controller claims retain their claim-level exemptions.
         if (
             restored_selected_plan
             and plan_diagnostics_receipt_version
             < _PLAN_DIAGNOSTICS_RECEIPT_VERSION
         ):
-            restored_claim_plan = dataclass_replace(plan, claims=tuple(claims))
-            _apply_heuristic_filter_non_destructively(
+            # Admission governs new work, not the replay of an already verified
+            # child result. Retain only its exact pending queue object; the
+            # existing environment and variant-identity gates still authorize
+            # receipt replay below. Empty receipts never confer this exemption.
+            retained_paid_claim = None
+            pending_child_receipt = resume_frame.get("child_receipt")
+            if (
+                str(resume_frame.get("phase") or "") == "child_receipt"
+                and isinstance(pending_child_receipt, Mapping)
+                and str(pending_child_receipt.get("proof") or "").strip()
+            ):
+                retained_paid_claim = next(
+                    (
+                        claim
+                        for claim in claims
+                        if _dependency_contract_suspension_key(claim)
+                        == str(resume_frame.get("next_claim_key") or "")
+                    ),
+                    None,
+                )
+            restored_claim_plan = dataclass_replace(
+                plan,
+                claims=tuple(
+                    claim for claim in claims if claim is not retained_paid_claim
+                ),
+            )
+            restored_claim_plan = _filter_plan_explicitly_withdrawn_claims(
                 restored_claim_plan,
-                _filter_plan_explicitly_withdrawn_claims,
-                policy_name="planner_self_abandonment",
-                rejection_counter="plans_planner_withdrawn_claims_withheld",
-                affect_priority=False,
                 pass_index=pass_index,
                 record_event=record_event,
                 stats=stats,
@@ -27564,7 +27570,15 @@ async def run_mini_recursive_driver(
                     config.planner_sanity_contract_required
                 ),
             )
-            claims = list(restored_claim_plan.claims)
+            admitted_claim_ids = {id(claim) for claim in restored_claim_plan.claims}
+            claims = [
+                claim
+                for claim in claims
+                if claim is retained_paid_claim or id(claim) in admitted_claim_ids
+            ]
+            restored_claim_plan = dataclass_replace(
+                restored_claim_plan, claims=tuple(claims)
+            )
             plan_admission_migrated = True
             _apply_heuristic_filter_non_destructively(
                 restored_claim_plan,
@@ -28324,8 +28338,10 @@ async def run_mini_recursive_driver(
                 if ready_statement_key and ready_statement_key in active_statement_keys:
                     continue
                 claim_name = str(getattr(ready_claim, "name", "") or "").strip()
-                if claim_name and claim_name in proved_claim_names:
-                    continue
+                # Readiness already excludes proved obligation/statement
+                # identities. A reused planner label can refer to a different
+                # proposition proved earlier in this pass; it must not erase
+                # this newly supported obligation from the executable queue.
                 claims.append(ready_claim)
                 suspended_dependency_claims.pop(key, None)
                 active_claim_keys.add(key)
@@ -28657,7 +28673,7 @@ async def run_mini_recursive_driver(
                             "recursive resume checkpoint lost its stable "
                             "next-claim identity"
                         )
-                    # The v2 admission migration may intentionally withhold
+                    # Admission migration may intentionally withhold
                     # the exact claim named by a v1 plan_ready cursor. Resume
                     # at the first surviving incomplete obligation instead of
                     # treating that policy-authorized removal as corruption.
@@ -28694,6 +28710,13 @@ async def run_mini_recursive_driver(
                             "accepted_helper_proof": "",
                         }
                     )
+                elif matching_cursor != claim_cursor:
+                    # Removing an earlier claim shifts this surviving receipt's
+                    # numeric cursor, not its stable claim/variant identity.
+                    # Keep both cursor representations aligned so replay cannot
+                    # fall through into a second child/model invocation.
+                    resume_frame = dict(resume_frame)
+                    resume_frame["next_claim_index"] = matching_cursor
                 claim_cursor = matching_cursor
             if (
                 plan_admission_migrated
