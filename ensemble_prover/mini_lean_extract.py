@@ -19,7 +19,12 @@ from .proof_dossier import (
     helper_decl_statement,
 )
 from .proof_state import lean_referenced_helper_names
-from .utils import extract_code_fences, extract_proof_candidates
+from .utils import (
+    _first_top_level_colon,
+    _top_level_token_positions,
+    extract_code_fences,
+    extract_proof_candidates,
+)
 
 
 def _extract_first_proof(llm_output: str) -> Optional[str]:
@@ -2454,13 +2459,12 @@ def _binder_names_from_example_header(header: str) -> tuple[list[str], str]:
             break
         opener, inside, remainder = group
         masked_inside = _strip_lean_comments_and_strings(inside)
-        if (
-            ":=" in masked_inside
-            or "⟨" in masked_inside
-            or "=>" in masked_inside
-        ):
+        # A binder's type is an arbitrary Lean term: lambdas, matches and
+        # nested lets there do not change the names introduced by the binder.
+        # Keep defaults unsupported, but distinguish them from nested lets.
+        if _top_level_token_positions(masked_inside, (":=",)):
             return [], str(header or "").strip()
-        colon_index = masked_inside.find(":")
+        colon_index = _first_top_level_colon(masked_inside)
         before_colon = (
             inside[:colon_index] if colon_index >= 0 else inside
         ).strip()
@@ -2481,7 +2485,9 @@ def _binder_names_from_example_header(header: str) -> tuple[list[str], str]:
     return names, rest
 
 
-def _prepend_intro_to_example_body(body: str, names: Sequence[str]) -> str:
+def _prepend_intro_to_example_body(
+    body: str, names: Sequence[str], *, body_column: int = 0
+) -> str:
     intro_names = " ".join(
         str(name or "").strip() for name in names if str(name or "").strip()
     )
@@ -2489,7 +2495,10 @@ def _prepend_intro_to_example_body(body: str, names: Sequence[str]) -> str:
     if not intro_names or not proof:
         return proof
     if proof.startswith("by"):
-        tail = proof[2:].strip()
+        # Preserve relative tactic indentation before adding the new intro.
+        # Spaces replacing `by` retain the first tactic's original column
+        # when it shares that line with `by`.
+        tail = textwrap.dedent(" " * (body_column + 2) + proof[2:]).strip()
         if not tail:
             return f"by\n  intro {intro_names}"
         indented_tail = "\n".join(
@@ -2510,8 +2519,11 @@ def _extract_example_body(chunk: str) -> Optional[str]:
     ``P → Q`` instead of being silently discarded.
     """
     s = chunk.strip()
+    example_start = len(chunk) - len(chunk.lstrip())
     if s.startswith("noncomputable"):
-        s = s[len("noncomputable") :].lstrip()
+        remainder = s[len("noncomputable") :]
+        example_start += len("noncomputable") + len(remainder) - len(remainder.lstrip())
+        s = remainder.lstrip()
     if not s.startswith("example"):
         return None
     # Skip past the keyword and look for the body separator anywhere
@@ -2526,8 +2538,16 @@ def _extract_example_body(chunk: str) -> Optional[str]:
         binder_names, rest = _binder_names_from_example_header(header)
         if not binder_names or not _strip_lean_comments(rest).lstrip().startswith(":"):
             return None
-        body = after[sep_end:].strip()
-        return _prepend_intro_to_example_body(body, binder_names) or None
+        raw_body = after[sep_end:]
+        body = raw_body.strip()
+        body_start = (
+            example_start + len("example") + sep_end
+            + len(raw_body) - len(raw_body.lstrip())
+        )
+        body_column = body_start - (chunk.rfind("\n", 0, body_start) + 1)
+        return _prepend_intro_to_example_body(
+            body, binder_names, body_column=body_column
+        ) or None
     body = after[sep_end:].strip()
     return body or None
 

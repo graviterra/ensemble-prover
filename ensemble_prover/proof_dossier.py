@@ -89,6 +89,7 @@ from .proof_lineage import (
 )
 from .utils import (
     _lean_lexical_skip_end,
+    _top_level_token_positions,
     canonical_lean_identifier,
     fresh_lean_alternative_identifier,
     has_materialization_incompatible_placeholders,
@@ -2736,6 +2737,136 @@ def _dossier_statement_is_negative_evidence(statement: str) -> bool:
         or compact.startswith("False ")
         or compact.startswith("¬")
         or compact.startswith("Not ")
+    )
+
+
+def _dossier_is_conditional_negative_auxiliary(
+    premises: Sequence[str],
+    conclusion: str,
+    *,
+    root_statement: str,
+    active_target_statements: Sequence[str] = (),
+    bound_names: Sequence[str] = (),
+) -> bool:
+    """Distinguish a conditional negative lemma from a target refutation.
+
+    For example, non-summability after finite deletion follows from an
+    existing non-summability hypothesis; it does not refute the root. Keep
+    contradictions and negations of the root/active conclusion advisory.
+    """
+
+    def negated_body(statement: str) -> str:
+        body = _dossier_strip_balanced_outer_parens(statement)
+        match = re.match(r"^(?:¬\s*|Not\s+)(.+)$", body, flags=re.DOTALL)
+        if match is None:
+            return ""
+        inner = match.group(1).strip()
+        # Negation binds more tightly than these connectives: `¬ P ∧ Q`
+        # must not be treated as `¬ (P ∧ Q)` by the auxiliary exception.
+        if _top_level_token_positions(inner, ("∧", "∨", "→", "->", "↔", "<->")):
+            return ""
+        return _dossier_strip_balanced_outer_parens(inner)
+
+    positive_conclusion = negated_body(conclusion)
+    if not positive_conclusion or not any(negated_body(p) for p in premises):
+        return False
+    if _dossier_statement_root_equivalent(
+        positive_conclusion,
+        root_statement,
+        active_target_statements=active_target_statements,
+    ):
+        return False
+    # Exact alpha comparison misses specializations of quantified goals.
+    # Compare only a known outer predicate of the negated proposition with
+    # coarse ingredients of every root conclusion. These ingredients deny
+    # the exception; they never establish equality or refutation authority.
+    from .proof_graph import (
+        _graph_bridge_variant_rejection_tokens,
+        _graph_leading_binder_analysis,
+        _graph_type_returns_prop,
+    )
+
+    operator_heads = {
+        "Eq": "=", "Ne": "≠", "LE.le": "≤", "LT.lt": "<",
+        "Membership.mem": "∈", "Dvd.dvd": "∣", "Set.Subset": "⊆",
+    }
+
+    def first_identifier(text: str) -> str:
+        match = re.match(r"@?([^\W\d][\w']*(?:\.[^\W\d][\w']*)*)", text)
+        return match.group(1) if match else ""
+
+    def rejection_tokens(text: str) -> Set[str]:
+        tokens = set(_graph_bridge_variant_rejection_tokens(text))
+        # Retain qualified user predicate suffixes that the shared graph guard
+        # strips as standard elaboration names (for example `Wrapped.Eq`).
+        tokens.update("identifier:" + name for name in _dossier_lean_identifier_tokens(text))
+        # The shared guard recognizes explicit applications. Include implicit
+        # applications as well, since checked source can use either spelling.
+        for name, operator in operator_heads.items():
+            if re.search(r"(?<![\w'.])@?" + re.escape(name) + r"(?![\w'])", text):
+                tokens.add("operator:" + operator)
+        return tokens
+
+    positive_candidates = _dossier_root_conclusion_candidates(positive_conclusion)
+    if len(positive_candidates) != 1:
+        return False
+    positive_body, positive_names = positive_candidates[0]
+    positive_body = _dossier_strip_balanced_outer_parens(positive_body)
+    positions = _top_level_token_positions(
+        positive_body, ("↔", "→", "->", "∧", "∨", "≤", "≥", "≠", "∈", "∉", "⊆", "∣", "=", "<", ">")
+    )
+    if positions:
+        if any(token in {"↔", "→", "->", "∧", "∨"} for _index, token in positions):
+            return False
+        families = {"operator:" + token for _index, token in positions}
+    else:
+        head = first_identifier(positive_body)
+        if not head or head in {*bound_names, *positive_names, "fun", "let", "if", "match"}:
+            return False
+        families = {"operator:" + operator_heads[head]} if head in operator_heads else {
+            "identifier:" + head.rsplit(".", 1)[-1]
+        }
+    for target in (root_statement, *active_target_statements):
+        predicate_names: Set[str] = set()
+        target_tail = target
+        while target_tail:
+            target_body, target_binders = _graph_leading_binder_analysis(target_tail)
+            predicate_names.update(
+                name
+                for _raw, names, type_text, _is_proof, _ambiguous in target_binders
+                if _graph_type_returns_prop(type_text)
+                for name in names
+            )
+            target_parts = _dossier_split_top_level_implications(target_body)
+            if len(target_parts) < 2:
+                break
+            # Each step discards an implication premise, so the text shrinks.
+            target_tail = target_parts[-1]
+        for candidate, target_names in _dossier_root_conclusion_candidates(target):
+            candidate_parts = _dossier_split_top_level_implications(candidate)
+            candidate_body = _dossier_strip_balanced_outer_parens(candidate_parts[-1])
+            # An outer predicate parameter can be instantiated by a constant
+            # proposition even underneath an existential or conjunction.
+            if predicate_names.intersection(_dossier_lean_identifier_tokens(candidate_body)):
+                return False
+            head = first_identifier(candidate_body)
+            # A parenthesized application can hide a bound predicate behind
+            # beta reduction. Unknown prefixes cannot show a distinct family.
+            if not head and not candidate_body.startswith(("∃", "∀")):
+                return False
+            if head in {*target_names, "fun", "let", "if", "match"}:
+                return False
+            tokens = rejection_tokens(candidate)
+            if not tokens or families & tokens:
+                return False
+    return not any(
+        _dossier_statements_root_adjacent(
+            positive_conclusion,
+            target,
+            conclusion_bound_names=bound_names,
+        )
+        for target in (root_statement, *active_target_statements)
+        if str(target or "").strip()
     )
 
 
@@ -12348,7 +12479,20 @@ class ProofDossier:
             and not root_adjacent
             and not root_has_negative_conclusion
             and (
-                _dossier_statement_is_negative_evidence(conclusion)
+                (
+                    _dossier_statement_is_negative_evidence(conclusion)
+                    and not (
+                        admission_quality.generic_novelty
+                        and "negative_evidence_helper" not in provenance_tags
+                        and _dossier_is_conditional_negative_auxiliary(
+                            premises,
+                            conclusion,
+                            root_statement=self.root_statement,
+                            active_target_statements=active_target_statements,
+                            bound_names=bound_names,
+                        )
+                    )
+                )
                 or _dossier_statement_is_existential_counterexample(
                     statement,
                     self.root_statement,
