@@ -353,6 +353,7 @@ from .provider_tool_protocol import (
     handle_deepseek_dsml_after_budget,
     is_deepseek_client,
     mini_bounded_visible_output_reasoning_effort,
+    mini_gpt6_model,
     mini_model_output_capacity,
     mini_visible_output_reasoning_effort,
     preflight_mini_reasoning_contract,
@@ -12415,6 +12416,10 @@ def _model_token_defaults(model: Optional[str]) -> Tuple[Optional[int], int]:
         return 400_000, 128_000
     if name.startswith("gpt-5.6"):
         return 1_050_000, 128_000
+    if mini_gpt6_model(name):
+        # Local default allowance for hidden reasoning plus visible output.
+        # No provider context window or maximum is asserted for this family.
+        return None, 32_768
     return None, 8192
 
 

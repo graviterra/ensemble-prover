@@ -22,6 +22,11 @@ from .utils import (
 )
 
 
+_MAX_QUERIES = 8
+_MAX_QUERY_CHARS = 320
+_MAX_TOTAL_CHARS = 1800
+
+
 COMPUTE_EXAMPLES_TOOL: Dict[str, Any] = {
     "type": "function",
     "function": {
@@ -32,7 +37,10 @@ COMPUTE_EXAMPLES_TOOL: Dict[str, Any] = {
             "not proof evidence and cannot close goals or bank helpers. Pass "
             "bounded pure expressions or one-line #eval/#reduce/#check commands; "
             "do not use declarations, imports, IO, files, processes, axioms, "
-            "or proof stubs."
+            "or proof stubs. Semicolons are unsupported by this restricted tool, "
+            "including in otherwise valid Lean let expressions. For a pure "
+            "let x := value; body, submit (fun x => body) (value) instead. "
+            "An invalid query rejects the entire batch before execution."
         ),
         "parameters": {
             "type": "object",
@@ -42,7 +50,10 @@ COMPUTE_EXAMPLES_TOOL: Dict[str, Any] = {
                     "items": {"type": "string"},
                     "description": (
                         "Small Lean expressions or one-line #eval/#reduce/#check "
-                        "commands to run. Expressions are wrapped using mode."
+                        "commands to run. Expressions are wrapped using mode. "
+                        f"At most {_MAX_QUERIES} queries, {_MAX_QUERY_CHARS} characters "
+                        f"per query, {_MAX_TOTAL_CHARS} characters total. Each query "
+                        "must fit on one line and contain no semicolons."
                     ),
                 },
                 "mode": {
@@ -273,9 +284,6 @@ _PROOF_LIKE_TYPE_HEADS = {
     "Nat.Prime",
     "Prime",
 }
-_MAX_QUERIES = 8
-_MAX_QUERY_CHARS = 320
-_MAX_TOTAL_CHARS = 1800
 _DEFAULT_TIMEOUT_S = 30.0
 _MAX_TIMEOUT_S = 45.0
 _DEFAULT_MAX_HEARTBEATS = 200000
@@ -1271,7 +1279,12 @@ def _prepare_queries(
         if has_sorry_or_admit(query):
             return [], f"query {index} contains sorry/admit"
         if ";" in query:
-            return [], f"query {index} contains unsupported semicolon syntax"
+            return [], (
+                f"query {index} contains unsupported semicolon syntax "
+                "(tool restriction, not a Lean syntax error). For a pure "
+                "let x := value; body, submit (fun x => body) (value) instead. "
+                "The entire batch was rejected; no queries were executed."
+            )
         command = default_command
         expression = query
         match = _COMMAND_RE.match(query)

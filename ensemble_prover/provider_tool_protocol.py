@@ -87,6 +87,13 @@ class MiniReasoningCapabilityUnavailable(RuntimeError):
     mini_reasoning_capability_unavailable = True
 
 
+def mini_gpt6_model(model: Any) -> bool:
+    """Recognize GPT-6 aliases without matching unrelated future families."""
+
+    name = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    return name == "gpt-6" or name.startswith("gpt-6-")
+
+
 def mini_reasoning_effort(client: Any, *, minimum: str) -> str:
     """Preserve an operator's configured effort while enforcing a phase floor.
 
@@ -114,19 +121,19 @@ def mini_reasoning_effort(client: Any, *, minimum: str) -> str:
     base_url = str(getattr(cfg, "base_url", "") or "")
     if (
         selected == "max"
-        and model.startswith("gpt-5.2")
+        and (model.startswith("gpt-5.2") or mini_gpt6_model(model))
         and (
             base_url_matches_provider(base_url, "openai")
             or base_url_matches_provider(base_url, "openrouter")
         )
     ):
-        # GPT-5.2 names its strongest supported setting ``xhigh``.
+        # These families name their strongest supported setting ``xhigh``.
         return "xhigh"
     return selected
 
 
 def mini_model_output_capacity(client: Any, *, fallback: int = 8192) -> int:
-    """Return the primary backend's advertised maximum output capacity."""
+    """Return the configured output allowance or a model-family fallback."""
 
     cfg = getattr(client, "cfg", None)
     try:
@@ -140,6 +147,9 @@ def mini_model_output_capacity(client: Any, *, fallback: int = 8192) -> int:
         return 384_000
     if model.startswith("gpt-5.2"):
         return 128_000
+    if mini_gpt6_model(model):
+        # A local reasoning allowance, not an advertised provider maximum.
+        return _MINI_GPT_REASONING_TOTAL_OUTPUT_CAP
     return max(1, int(fallback))
 
 _DSML_INVOKE_RE = re.compile(
@@ -243,9 +253,25 @@ def mini_bounded_visible_output_reasoning_effort(
     configured = str(
         getattr(cfg, "reasoning_effort", "") or ""
     ).strip().lower()
-    if configured == "none":
+    if configured == "none" or _strict_reasoning_off(cfg):
         return "none"
     requested = str(effort or "low").strip().lower()
+    base_url = str(
+        getattr(client, "base_url", "") or getattr(cfg, "base_url", "") or ""
+    )
+    if requested == "none" and (
+        _strict_reasoning_on(cfg)
+        or (
+            base_url_matches_provider(base_url, "openai")
+            and (
+                _reasoning_requested_mode(cfg) == "on"
+                or mini_gpt6_model(getattr(cfg, "model", ""))
+            )
+        )
+    ):
+        # Compact serialization may reduce effort, but must not silently turn
+        # off an explicit on request. GPT-6 also rejects none at the provider.
+        return "low"
     return requested or "low"
 
 
@@ -497,6 +523,16 @@ class MiniRequestEnvelopePolicy:
                     )
                     if family_capability is not None:
                         capability = family_capability
+                    elif (
+                        self.request_kind == "planner_visibility_recovery"
+                        and self.reasoning_mode == "bounded"
+                        and _positive_int(self.session_max_tokens_override) > 0
+                    ):
+                        # Planner admission already fixed this total allowance.
+                        # Preserve its catalog-outage fallback when resolving a
+                        # serving leaf; transport resolution below still checks
+                        # explicit-on and mandatory reasoning requirements.
+                        capability = None
                     else:
                         # A catalog outage leaves both the reasoning transport
                         # and its shared output envelope unknown. Some routes
@@ -798,7 +834,7 @@ def _resolve_mini_leaf_output_cap(
     ):
         automatic_cap = _MINI_GPT_REASONING_TOTAL_OUTPUT_CAP
         cap_source = "catalog_reasoning_headroom"
-    elif leaf_name.startswith("gpt-5") and reasoning_on:
+    elif (leaf_name.startswith("gpt-5") or mini_gpt6_model(model)) and reasoning_on:
         automatic_cap = _MINI_GPT_REASONING_TOTAL_OUTPUT_CAP
         cap_source = "hidden_reasoning_headroom"
     else:
@@ -821,11 +857,11 @@ def _resolve_mini_leaf_output_cap(
     capacity = _positive_int(getattr(cfg, "max_tokens", None))
     if capacity > 0:
         if (
-            leaf_name.startswith("gpt-5.6")
+            (leaf_name.startswith("gpt-5.6") or mini_gpt6_model(model))
             and planner_visible_floor
         ):
-            # GPT-5.6 planner stages receive the role's full advertised model
-            # output capacity.  This is independent of the reasoning setting:
+            # These planner stages receive the role's configured output
+            # allowance. This is independent of the reasoning setting:
             # disabling reasoning must not quietly reinstate an 8K/16K
             # harness-side truncation boundary on the visible plan.
             automatic_cap = capacity

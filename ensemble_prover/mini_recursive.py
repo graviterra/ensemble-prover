@@ -9932,14 +9932,51 @@ def _plan_root_assembly_claim_names(
                     # them to verified semantic facts. A nonexistent planner
                     # label must never make a root route look connected.
                     return False
+                dependency_bindings = {
+                    str(identity or "").strip()
+                    for name, identity in current_claim.dependency_semantic_identities
+                    if str(name or "").strip() == dependency
+                    and str(identity or "").strip()
+                }
+                if len(dependency_bindings) > 1:
+                    return False
+                dependency_identity = next(iter(dependency_bindings), "")
+                if dependency_identity and not dependency_identity.startswith(
+                    ("unresolved:", "ambiguous-internal:")
+                ):
+                    # A later tranche may reuse a label from a deferred route.
+                    # Resolve its frozen dependency binding against immutable
+                    # obligations, not every historical occurrence of the name.
+                    # Retained prerequisites keep their OWN originating plan.
+                    dependency_claims = [
+                        candidate
+                        for candidate in dependency_claims
+                        if candidate.origin_plan_fingerprint
+                        and candidate.obligation_id
+                        and candidate.obligation_id
+                        in {
+                            _fresh_plan_obligation_id(
+                                plan_fingerprint=candidate.origin_plan_fingerprint,
+                                route_identity=dependency_identity,
+                            ),
+                            _fresh_plan_obligation_id(
+                                plan_fingerprint=candidate.origin_plan_fingerprint,
+                                route_identity=dependency_identity,
+                                version=1,
+                                rationale=candidate.rationale,
+                                sanity_check=candidate.sanity_check,
+                            ),
+                        }
+                    ]
+                    if not dependency_claims:
+                        return False
                 if any(
                     id(candidate) not in available_claim_ids
                     for candidate in dependency_claims
                 ):
                     return False
-                # Duplicate planner names are ambiguous. Requiring the closure
-                # of every match is conservative and prevents one selected
-                # sibling from laundering an unselected dependency.
+                # Unbound legacy names and duplicate obligation matches remain
+                # ambiguous: require every match, never an arbitrary sibling.
                 pending.extend(dependency_claims)
         return True
 
@@ -27646,6 +27683,32 @@ async def run_mini_recursive_driver(
                 str(getattr(claim, "name", "") or "")
                 for claim in deferred_priority_claims.values()
             ]
+            selected_helper_count = sum(
+                str(claim.role or "helper") != "root_assembly" for claim in claims
+            )
+            selected_names = {str(claim.name or "") for claim in claims}
+            candidate_names = {str(claim.name or "") for claim in claim_candidates}
+            selected_root_present = any(
+                str(claim.role or "helper") == "root_assembly" for claim in claims
+            )
+            deferral_reasons = {}
+            for deferred_claim in deferred_priority_claims.values():
+                if (
+                    str(deferred_claim.role or "helper") == "root_assembly"
+                    and selected_root_present
+                ):
+                    reason = "alternative_root_route"
+                elif any(
+                    dependency in candidate_names and dependency not in selected_names
+                    for dependency in deferred_claim.dependencies
+                ):
+                    reason = "dependency_not_selected"
+                elif selected_helper_count >= max_claims:
+                    reason = "claim_cap"
+                else:
+                    reason = "dependency_ordering"
+                deferral_reasons[str(deferred_claim.name or "")] = reason
+            cap_deferred = "claim_cap" in deferral_reasons.values()
             _record(
                 record_event,
                 {
@@ -27656,13 +27719,21 @@ async def run_mini_recursive_driver(
                     "claim_candidates": len(claim_candidates),
                     "deferred_from_prior": deferred_from_prior,
                     "deferred_claim_names": deferred_names,
-                    "verdict": "claims_deferred_by_cap",
+                    "selected_helper_count": selected_helper_count,
+                    "deferral_reasons": deferral_reasons,
+                    "verdict": (
+                        "claims_deferred_by_cap"
+                        if cap_deferred
+                        else "claims_deferred_by_selection"
+                    ),
                 },
             )
             _add_planner_feedback(
                 planner_feedback,
                 (
-                    f"The recursive claim cap selected {len(claims)} of "
+                    "The recursive "
+                    + ("claim cap" if cap_deferred else "route/dependency selection")
+                    + f" selected {len(claims)} of "
                     f"{len(claim_candidates)} available claims on pass "
                     f"{pass_index}; deferred claims will be retried after "
                     "their prerequisites or higher-priority siblings are handled. "
@@ -27674,12 +27745,16 @@ async def run_mini_recursive_driver(
             and planner_tranche_continuation_pending
             and filtered_plan_has_root_assembly
             and not restored_selected_plan
+            and planner_tranche_claims_emitted <= provider_claims_emitted_this_tranche
         ):
-            # An explicit incomplete receipt requests more planning even when
-            # its provisional root route already typechecks. Do not let one
-            # unfinished helper monopolize the child prover before that next
-            # paid tranche arrives. Preserve all claims in the durable queue;
-            # previously selected/paid resume cursors retain their ownership.
+            # Honor one additional planner tranche before starting a child
+            # from an explicitly incomplete route. Repeated incomplete
+            # receipts must not embargo every executable claim until the
+            # entire configured claim capacity is filled. Cumulative receipt
+            # accounting survives resume and resets for a new decomposition;
+            # no new budget or checkpoint authority is needed for this bound.
+            # This is lookahead, not preemption inside a child conversation.
+            # Previously selected/paid resume cursors retain their ownership.
             for claim in claims:
                 pending_unproved_plan_claims[
                     _dependency_contract_suspension_key(claim)
@@ -33829,6 +33904,44 @@ async def _request_plan(
         saved_temperature_is_api_default = False
         if saved_request_io_policy is not None:
             planner_io_policy = saved_request_io_policy
+            if (
+                planner_io_stage == "visibility_recovery"
+                and planner_job_identity is not None
+                and planner_io_policy["reasoning_effort"] == "none"
+                and (
+                    planner_job_broker is None
+                    or planner_job_broker.status(
+                        planner_job_identity.job_id,
+                        planner_job_identity.request_fingerprint,
+                    ) == "missing"
+                )
+            ):
+                safe_visibility_effort = mini_bounded_visible_output_reasoning_effort(
+                    plan_request_client, effort="none"
+                )
+                if safe_visibility_effort != "none":
+                    # A lost process may leave an old reasoning-off recovery
+                    # checkpoint. Refresh only undispatched work, under a new
+                    # identity; pending/ready provider receipts remain exact.
+                    old_request_fingerprint = planner_job_identity.request_fingerprint
+                    planner_io_policy = {
+                        **planner_io_policy,
+                        "reasoning_effort": safe_visibility_effort,
+                    }
+                    planner_job_identity = _planner_stage_job_identity(
+                        planner_job_identity,
+                        stage="visibility_recovery",
+                        round_index=planner_job_identity.stage_round,
+                        material=planner_io_messages,
+                        io_policy=planner_io_policy,
+                    )
+                    _record(record_event, {
+                        "phase": "mini_recursive_plan",
+                        "pass_index": int(pass_index),
+                        "old_request_fingerprint": old_request_fingerprint,
+                        "reasoning_effort": safe_visibility_effort,
+                        "verdict": "planner_visibility_policy_refreshed",
+                    })
             planner_io_max_tokens = int(planner_io_policy["max_tokens"])
             planner_io_reasoning_effort = str(planner_io_policy["reasoning_effort"])
             saved_planner_io_temperature = planner_io_policy["temperature"]
@@ -33889,6 +34002,18 @@ async def _request_plan(
             )
             return None
 
+        planner_io_output_limit = (
+            _planner_request_envelope(
+                request_kind="planner_visibility_recovery",
+                reasoning_mode="bounded",
+                reasoning_effort=planner_io_reasoning_effort,
+                # Preserve the exact saved allowance on process restart.
+                session_max_tokens_override=planner_io_max_tokens,
+            )
+            if planner_io_stage == "visibility_recovery"
+            else planner_io_max_tokens
+        )
+
         async def run_primary_planner_io() -> Any:
             return await _await_with_planner_inflight_heartbeat(
                 metered_or_plain_call(
@@ -33901,7 +34026,7 @@ async def _request_plan(
                     call_kind=planner_io_call_kind,
                     # Keep financial admission identical to the bounded request
                     # sent below.
-                    max_tokens_override=planner_io_max_tokens,
+                    max_tokens_override=planner_io_output_limit,
                     metadata={
                         **planner_io_temperature_metadata,
                         "provider_dispatch_max_attempts": (
@@ -33937,7 +34062,7 @@ async def _request_plan(
                         # Structured planning is a reasoning task. Preserve the
                         # role's configured effort and enforce a high floor.
                         reasoning_effort_override=planner_io_reasoning_effort,
-                        max_tokens_override=planner_io_max_tokens,
+                        max_tokens_override=planner_io_output_limit,
                         deadline=_wall_clock_deadline(planner_io_deadline_monotonic),
                         request_timeout_override_s=planner_request_timeout_s,
                         operation_timeout_override_s=planner_operation_timeout_s,
@@ -34193,6 +34318,10 @@ async def _request_plan(
             plan_request_client,
             visibility_envelope,
         )
+        visibility_envelope = dataclass_replace(
+            visibility_envelope,
+            session_max_tokens_override=visibility_max_tokens,
+        )
         (
             planner_dispatch_max_attempts,
             planner_request_timeout_s,
@@ -34209,7 +34338,7 @@ async def _request_plan(
                     scope="mini_recursive",
                     action_id="mini_recursive_plan_visibility_recovery",
                     call_kind="chat_raw_json_plan_visibility_recovery",
-                    max_tokens_override=visibility_max_tokens,
+                    max_tokens_override=visibility_envelope,
                     metadata={
                         **visibility_temperature_metadata,
                         "phase": "planner_visibility_recovery",
@@ -34231,7 +34360,7 @@ async def _request_plan(
                         response_format="json",
                         temperature_override=0.0,
                         reasoning_effort_override=visibility_reasoning_effort,
-                        max_tokens_override=visibility_max_tokens,
+                        max_tokens_override=visibility_envelope,
                         request_timeout_override_s=planner_request_timeout_s,
                         operation_timeout_override_s=planner_operation_timeout_s,
                         usage_callback=usage_callback,
@@ -34600,6 +34729,12 @@ async def _request_plan(
                     plan_request_client,
                     visibility_envelope,
                 )
+                # Reasoning resolves per serving leaf, while output admission
+                # and the saved request share one immutable token allowance.
+                visibility_envelope = dataclass_replace(
+                    visibility_envelope,
+                    session_max_tokens_override=visibility_max_tokens,
+                )
                 (
                     planner_dispatch_max_attempts,
                     planner_request_timeout_s,
@@ -34616,7 +34751,7 @@ async def _request_plan(
                             scope="mini_recursive",
                             action_id="mini_recursive_plan_visibility_recovery",
                             call_kind="chat_raw_json_plan_visibility_recovery",
-                            max_tokens_override=visibility_max_tokens,
+                            max_tokens_override=visibility_envelope,
                             metadata={
                                 **visibility_temperature_metadata,
                                 "phase": "planner_visibility_recovery",
@@ -34639,7 +34774,7 @@ async def _request_plan(
                                     response_format="json",
                                     temperature_override=0.0,
                                     reasoning_effort_override=visibility_reasoning_effort,
-                                    max_tokens_override=visibility_max_tokens,
+                                    max_tokens_override=visibility_envelope,
                                     request_timeout_override_s=planner_request_timeout_s,
                                     operation_timeout_override_s=planner_operation_timeout_s,
                                     usage_callback=usage_callback,
