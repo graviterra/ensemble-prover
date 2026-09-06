@@ -21616,6 +21616,22 @@ class MiniSession:
             if not self._safe_is_applicable(action, context="static"):
                 self._clear_selected_work_item()
                 continue
+            useful_competitor = getattr(action, "is_useful_static_competitor", None)
+            if conversation_quantum_owner is not None and callable(useful_competitor):
+                try:
+                    useful = bool(useful_competitor(self))
+                except Exception:
+                    useful = True
+                if not useful:
+                    self._record_event({
+                        "phase": "session_provider_quantum_fairness",
+                        "iteration": self.iteration,
+                        "action_id": action.id,
+                        "owner_action_id": conversation_quantum_owner.id,
+                        "verdict": "unchanged_speculative_competitor_deferred",
+                    })
+                    self._clear_selected_work_item()
+                    continue
             if self.repair_policy_narrowing_required:
                 if not self._repair_policy_selected_work_is_narrow(action.id):
                     self._record_event(

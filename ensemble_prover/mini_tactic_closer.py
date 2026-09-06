@@ -1126,11 +1126,60 @@ def _helper_lemma_blocks(
     return blocks
 
 
+def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[TacticCandidate]:
+    """Amortize Lean startup for adjacent, closing-only helper alternatives.
+
+    Every original script remains in order. ``solve`` requires a branch to
+    close all goals, so a partial simpa cannot hide a later successful branch.
+    Other tactics (including residual-producing ones) keep separate checks.
+    """
+
+    direct_sources = {
+        "helper_exact", "helper_simpa", "helper_intro_exact",
+        "helper_intro_simpa", "helper_local_simpa",
+    }
+    output: list[TacticCandidate] = []
+    pending: list[TacticCandidate] = []
+
+    def flush() -> None:
+        if len(pending) == 1:
+            output.append(pending[0])
+        elif pending:
+            lines = ["by", "  first"]
+            for candidate in pending:
+                body = candidate.proof.removeprefix("by\n").splitlines()
+                lines.extend(("  | solve", "    | " + body[0].removeprefix("  ")))
+                lines.extend("    " + line for line in body[1:])
+            output.append(TacticCandidate(
+                proof="\n".join(lines),
+                tactic="first (closing helper alternatives): " + " | ".join(
+                    candidate.tactic for candidate in pending
+                ),
+                source="helper_application_batch",
+                helper=",".join(dict.fromkeys(
+                    candidate.helper for candidate in pending if candidate.helper
+                )),
+            ))
+        pending.clear()
+
+    for candidate in candidates:
+        if candidate.source in direct_sources and candidate.proof.startswith("by\n  "):
+            pending.append(candidate)
+            if len(pending) >= 8:
+                flush()
+        else:
+            flush()
+            output.append(candidate)
+    flush()
+    return output
+
+
 def generate_tactic_candidates(
     goal_statement: str,
     helpers: Sequence[Any],
     *,
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    batch_helper_applications: bool = False,
     suppress_solution_placeholders: bool = True,
     opaque_mode: bool = True,
     allow_official_answer_visibility: bool = False,
@@ -1299,16 +1348,25 @@ def generate_tactic_candidates(
     def add_helper_set_ext_stitch_candidates() -> None:
         if len(helper_names) < 2:
             return
-        compact_goal = " ".join(goal_text.split())
-        if "=" not in compact_goal:
+        from .proof_state import lean_statement_conclusion
+
+        analysis_text = goal_text.replace("∀ᶠ", "Filter.Eventually").replace(
+            "∀ᵐ", "Filter.Eventually"
+        )
+        compact_goal = " ".join(lean_statement_conclusion(analysis_text).split())
+        if re.match(r"^(?:∃|@?(?:Exists\b|Filter\.Eventually\b))", compact_goal):
+            return
+        if not re.search(r"(?<![:<>=])=(?!=|>)", compact_goal):
             return
         if not any(marker in compact_goal for marker in ("Set", "{", "∈")):
             return
+        intro_prefix = ("intros",) if needs_intro_candidate else ()
         stitch_helpers = helper_names[:HELPER_SET_EXT_LIMIT]
         helper_list = ", ".join(stitch_helpers)
         helper_aesop_list = _aesop_safe_rule_list(stitch_helpers[:8])
         add_lines(
             (
+                *intro_prefix,
                 "classical",
                 "ext x",
                 "constructor",
@@ -1318,13 +1376,15 @@ def generate_tactic_candidates(
                 f"  solve_by_elim [{helper_list}]",
             ),
             tactic=(
-                "classical; ext x; constructor <;> intro hx "
+                ("intros; " if intro_prefix else "")
+                + "classical; ext x; constructor <;> intro hx "
                 f"<;> solve_by_elim [{helper_list}]"
             ),
             source="helper_set_ext_stitch",
         )
         add_lines(
             (
+                *intro_prefix,
                 "classical",
                 "ext x",
                 "constructor",
@@ -1334,7 +1394,8 @@ def generate_tactic_candidates(
                 f"  aesop (add safe {helper_aesop_list})",
             ),
             tactic=(
-                "classical; ext x; constructor <;> intro hx "
+                ("intros; " if intro_prefix else "")
+                + "classical; ext x; constructor <;> intro hx "
                 f"<;> aesop (add safe {helper_aesop_list})"
             ),
             source="helper_set_ext_stitch",
@@ -1551,6 +1612,8 @@ def generate_tactic_candidates(
             add(f"simpa using {helper}", source="helper_simpa", helper=helper)
 
     add_direct_helper_preflight_candidates()
+    # Exact signature matches stay first and independently checkable.
+    direct_preflight_count = len(candidates)
 
     if cast_profile.should_attempt:
         add_cast_normalization_candidates()
@@ -1632,7 +1695,13 @@ def generate_tactic_candidates(
         add(tactic, source="structural_ext")
 
     cap = max(0, int(max_candidates or 0))
-    return candidates[:cap] if cap else []
+    bounded = candidates[:cap] if cap else []
+    if not batch_helper_applications:
+        return bounded
+    return [
+        *bounded[:direct_preflight_count],
+        *_batch_helper_applications(bounded[direct_preflight_count:]),
+    ]
 
 
 def generate_source_specific_tactic_candidates(
@@ -2041,6 +2110,12 @@ class DeterministicTacticBackend:
                 goal_statement,
                 generation_helpers,
                 max_candidates=generation_cap,
+                # Explicit lane/proof filters address individual candidates.
+                # Keep their existing identities instead of hiding members
+                # inside a differently named compound candidate.
+                batch_helper_applications=not (
+                    prefixes or excluded_prefixes or suppressed_proofs
+                ),
                 suppress_solution_placeholders=suppress_solution_placeholders,
                 opaque_mode=opaque_mode,
                 allow_official_answer_visibility=allow_official_answer_visibility,

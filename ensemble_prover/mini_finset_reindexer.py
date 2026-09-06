@@ -290,7 +290,14 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
     """Return the finite-sum/product reindexing profile for a Lean statement."""
 
     raw = _blank_lean_comments_and_strings(str(text or ""))
-    compact = " ".join(lean_statement_conclusion(raw).split())
+    # Filter binders are not ordinary forall introductions. Protect their
+    # leading token from the lightweight forall parser before profiling the
+    # conclusion; sum_congr cannot construct an eventual threshold or witness.
+    analysis_text = raw.replace("∀ᶠ", "Filter.Eventually").replace(
+        "∀ᵐ", "Filter.Eventually"
+    )
+    compact = " ".join(lean_statement_conclusion(analysis_text).split())
+    needs_witness = bool(re.match(r"^(?:∃|@?(?:Exists\b|Filter\.Eventually\b))", compact))
     full_statement = " ".join(_blank_shadowed_infinite_bigop_names(raw).split())
     finite_sum_count = len(_FINITE_SUM_RE.findall(compact))
     finite_product_count = len(_FINITE_PRODUCT_RE.findall(compact))
@@ -316,6 +323,7 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
     has_sigma = ".sigma" in compact or "Finset.sigma" in compact or "Sigma" in compact
     should_attempt = bool(
         has_equality
+        and not needs_witness
         and not has_infinite_sum
         and (finite_sum_count > 0 or finite_product_count > 0)
     )

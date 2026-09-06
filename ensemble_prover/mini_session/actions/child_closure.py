@@ -44,11 +44,12 @@ class ChildClosureAction:
     # One operation, one retry of the same exact timeout context, then one
     # dispatch that can advance to the next frontier identity.
     MINIMUM_SESSION_QUANTA: ClassVar[int] = 3
-    # Preserve scheduler interleaving without paying a full session action for
-    # every member of a deterministic tactic portfolio. The continuation
-    # cursor remains exact, so timeout/defer paths still resume at the first
-    # unattempted candidate and no solving candidate is discarded.
-    ROOT_TACTIC_PORTFOLIO_MAX_SCHEDULER_QUANTA: ClassVar[int] = 4
+    # Scale tiny portfolios across several turns; larger portfolios use the
+    # cold-start cap below. The exact continuation preserves every suffix.
+    ROOT_TACTIC_PORTFOLIO_TARGET_SCHEDULER_QUANTA: ClassVar[int] = 4
+    # A cold Lean check can take 8--10 seconds before any tactic work. Keep
+    # interleaving quanta short without discarding the persistent suffix.
+    ROOT_TACTIC_CANDIDATES_PER_QUANTUM: ClassVar[int] = 2
     SCHEDULER_BUDGET_SCHEMA_VERSION: ClassVar[int] = 2
 
     def __init__(
@@ -646,6 +647,45 @@ class ChildClosureAction:
         except Exception:
             return False
 
+    def is_useful_static_competitor(self, session: Any) -> bool:
+        """Don't repeatedly preempt a live model with an unchanged root suffix.
+
+        This is only a scheduler preference, never exhaustion or acceptance.
+        The exact persisted cursor resumes when the conversation finishes;
+        new verified support or a changed target immediately reopens a probe.
+        Actual assembly, child work, and verifier receipts remain competitors.
+        """
+
+        proof_state = getattr(session, "proof_state", None)
+        dossier = getattr(session, "dossier", None)
+        graph = getattr(dossier, "proof_graph", None)
+        if (
+            self._pending_helper_acceptance_node_ids(session)
+            or self._pending_typed_residual_node_ids(session)
+            or self._has_root_exact_helper_work(session, dossier, proof_state)
+            or self._has_ready_assembly(proof_state, graph)
+            or self._has_unconsumed_child_work(session, proof_state, graph)
+        ):
+            return True
+        try:
+            from ensemble_prover.proof_state_executor import (
+                _has_current_root_tactic_portfolio_continuation,
+            )
+
+            if not _has_current_root_tactic_portfolio_continuation(
+                conv=getattr(session, "conv", None), dossier=dossier,
+                proof_state=proof_state, timeout_s=self.timeout_s,
+                max_candidates=self.max_candidates,
+            ):
+                return True
+            root = proof_state.nodes[proof_state.root_node_id]
+            return int(root.root_tactic_portfolio_continuation.get(
+                "next_candidate_index", 0
+            )) <= 0
+        except Exception:
+            # An uncertain observational probe must not suppress work.
+            return True
+
     def _has_ready_assembly(self, proof_state: Any, graph: Any) -> bool:
         getter = getattr(proof_state, "assembly_frontier", None)
         if not callable(getter):
@@ -902,21 +942,24 @@ class ChildClosureAction:
                     "helper_acceptance",
                 ),
             )
-        # Split the complete deterministic portfolio into a small, bounded
-        # number of scheduler quanta. The exact portfolio and next offset are
+        # Split the complete deterministic portfolio into short scheduler
+        # quanta. The exact portfolio and next offset are
         # persisted on the root proof-state node, so neither interleaving nor
         # an operation deadline can remove later candidates. This amortizes
-        # graph sync/selection/recovery overhead while still yielding between
-        # substantial tactic batches for newly ready work.
+        # graph sync/selection/recovery overhead while yielding frequently
+        # enough for newly ready proof work and live model continuations.
         portfolio_bound = max(1, int(self.max_candidates or 1))
-        max_scheduler_quanta = max(
+        target_scheduler_quanta = max(
             1,
-            int(self.ROOT_TACTIC_PORTFOLIO_MAX_SCHEDULER_QUANTA),
+            int(self.ROOT_TACTIC_PORTFOLIO_TARGET_SCHEDULER_QUANTA),
         )
         candidate_attempt_limit = max(
             1,
-            (portfolio_bound + max_scheduler_quanta - 1)
-            // max_scheduler_quanta,
+            min(
+                self.ROOT_TACTIC_CANDIDATES_PER_QUANTUM,
+                (portfolio_bound + target_scheduler_quanta - 1)
+                // target_scheduler_quanta,
+            ),
         )
         execution_status: dict[str, Any] = {}
         ok, proof, helpers = await _try_proof_state_child_closures(
@@ -968,7 +1011,10 @@ class ChildClosureAction:
                 action_deadline_monotonic > 0.0
             ),
             "root_tactic_candidate_attempt_limit": candidate_attempt_limit,
-            "root_tactic_portfolio_max_scheduler_quanta": max_scheduler_quanta,
+            "root_tactic_portfolio_max_scheduler_quanta": (
+                (portfolio_bound + candidate_attempt_limit - 1)
+                // candidate_attempt_limit
+            ),
         }
         pending_residual_node_ids = self._pending_typed_residual_node_ids(
             session,
