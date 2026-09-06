@@ -35,14 +35,14 @@ def format_exception(exc: BaseException) -> str:
                 # downstream prompt-safety redacts every double-quoted string
                 # literal (a provider's 400 response once became an
                 # undiagnosable `body={ "<string>": ... }` skeleton). Bare
-                # text with quotes stripped survives that redaction, so the
+                # text with quotes normalized survives that redaction, so the
                 # actionable reason stays in run.log/turns.jsonl.
                 provider_error = ""
                 try:
                     error_obj = json.loads(body).get("error") or {}
                     message = " ".join(
                         str(error_obj.get("message") or "").split()
-                    ).replace('"', "'")[:300]
+                    ).replace('"', "'").replace("`", "'")[:300]
                     if message:
                         error_type = (
                             str(error_obj.get("type") or "").strip() or "unknown"

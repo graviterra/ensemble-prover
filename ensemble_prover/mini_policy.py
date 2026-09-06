@@ -1395,6 +1395,57 @@ def _silent_giveup_cluster_from_proof(proof: Optional[str]) -> Optional[Dict[str
     return None
 
 
+def _giveup_asserted_response_text(response: str) -> str:
+    """Exclude quoted material and instructions from assistant self-reports.
+
+    This is an attribution filter, not a proof gate. Keep unquoted assertions
+    after copied instructions so an actual refusal still reaches the classifier.
+    """
+
+    # A unified-diff hunk quotes source/instructions, including literal fence
+    # markers. Remove its lines before Markdown parsing so copied backticks
+    # cannot expose deleted instructions as assistant prose.
+    unquoted_lines: List[str] = []
+    in_patch_hunk = False
+    for line in response.splitlines():
+        if re.match(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", line):
+            in_patch_hunk = True
+            continue
+        if in_patch_hunk and (
+            not line.strip() or line.startswith((" ", "+", "-", "\\"))
+        ):
+            continue
+        in_patch_hunk = False
+        if not line.lstrip().startswith(">"):
+            unquoted_lines.append(line)
+    prose = _non_code_response_text("\n".join(unquoted_lines))
+    prose = re.sub(
+        r'"(?:\\.|[^"\\])*"|“[^”]*”|(?<!\w)\'[^\n]*?\'(?!\w)|‘(?:[^’]|’(?=\w))*’',
+        "",
+        prose,
+    )
+    asserted: List[str] = []
+    for sentence in re.split(r"[.!?;](?:\s+|$)|\n\s*\n", prose):
+        sentence = " ".join(sentence.split())
+        sentence = re.sub(r"^\s*(?:[-+*]|\d+[.)])\s*", "", sentence).strip()
+        if re.match(
+            r"(?:please\s+)?(?:do\s+not|don['’]t|never|avoid|"
+            r"you\s+(?:must|should)|submit|return|provide|use|search)\b",
+            sentence,
+            re.IGNORECASE,
+        ):
+            continue
+        if re.match(
+            r"if\b.*?,\s*(?:please\s+)?"
+            r"(?:search|try|submit|return|provide|use|do\s+not|don['’]t)\b",
+            sentence,
+            re.IGNORECASE,
+        ):
+            continue
+        asserted.append(sentence)
+    return "\n".join(asserted)
+
+
 def _classify_giveup_signal(
     llm_output: str,
     proof: Optional[str],
@@ -1419,10 +1470,11 @@ def _classify_giveup_signal(
     can fire on linguistic signal alone (per the user's "post-Lean cascade
     redirect" design).
 
-    Search scope is assistant prose outside fenced code blocks. Lean comments
-    inside proof code are treated as proof-search breadcrumbs, not policy
-    evidence. Structural placeholder-only proof bodies are still classified
-    silently after Lean rejection via ``_silent_giveup_cluster_from_proof``.
+    Search scope is asserted assistant prose outside fenced code blocks,
+    quotations, and copied instructions. Lean comments inside proof code are
+    treated as proof-search breadcrumbs, not policy evidence. Structural
+    placeholder-only proof bodies are still classified silently after Lean
+    rejection via ``_silent_giveup_cluster_from_proof``.
     """
 
     # Code review fix (2026-05-09): require_structural_collapse=False
@@ -1435,7 +1487,7 @@ def _classify_giveup_signal(
         if proof is None or not _proof_is_structural_collapse(proof):
             return None
 
-    text_to_check = _non_code_response_text(str(llm_output or ""))
+    text_to_check = _giveup_asserted_response_text(str(llm_output or ""))
     if not text_to_check.strip():
         if not require_structural_collapse:
             return _silent_giveup_cluster_from_proof(proof)

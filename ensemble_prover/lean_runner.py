@@ -7645,6 +7645,8 @@ private def {serializer_prefix}_elabType
                 "        let fvars := (← Lean.getLCtx).getFVarIds.map Lean.mkFVar",
                 "        let closed ← Lean.Meta.mkForallFVars fvars target",
                 "        let closed ← Lean.instantiateMVars closed",
+                "        if closed.hasMVar then",
+                '          Lean.throwError "residual goal depends on unresolved metavariables; choose the existential witnesses or resolve dependent holes before extracting standalone goals"',
                 "        if closed.hasSorry then",
                 '          Lean.throwError "residual proof goal contains sorry"',
                 "  catch",

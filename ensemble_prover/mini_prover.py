@@ -6349,17 +6349,37 @@ async def run_conversation(
                         )
                         llm_error = _repair_self_check_gap_error(status) or llm_error
                     if not final_resolution.event:
+                        recovery_kind = ""
                         if final_no_tools_policy_reprompted:
-                            provider_protocol_event = (
-                                "final_no_tools_policy_recovery_succeeded"
-                            )
+                            recovery_kind = "policy"
                         elif deepseek_dsml_reprompted_after_budget:
-                            provider_protocol_event = (
-                                "final_no_tools_protocol_recovery_succeeded"
-                            )
+                            recovery_kind = "protocol"
                         elif final_no_tools_recovery_attempted:
+                            recovery_kind = "visibility"
+                        if recovery_kind:
+                            # Match the maintained tool-loop telemetry: visible
+                            # text is not necessarily an extractable artifact.
+                            # Keep the exact response for normal proof and
+                            # counterexample adjudication below.
+                            recovered_helpers, recovered_main = _extract_helpers_and_main(
+                                str(content or ""),
+                                theorem_name=str(
+                                    getattr(dossier, "theorem_name", "") or ""
+                                ),
+                                goal_statement=str(
+                                    getattr(conv, "goal_statement", "") or ""
+                                ),
+                            )
+                            recovered_artifact = bool(recovered_main) or any(
+                                helper_decl_name(helper) for helper in recovered_helpers
+                            )
                             provider_protocol_event = (
-                                "final_no_tools_visibility_recovery_succeeded"
+                                f"final_no_tools_{recovery_kind}_recovery_"
+                                + (
+                                    "succeeded"
+                                    if recovered_artifact
+                                    else "unvalidated_output"
+                                )
                             )
                     break
 

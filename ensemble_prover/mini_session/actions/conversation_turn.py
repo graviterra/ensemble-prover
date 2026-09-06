@@ -14179,7 +14179,11 @@ class ConversationTurnAction:
                     getattr(loop_result, "semantic_no_progress_signature", "") or ""
                 ),
             })
-        if str(getattr(loop_result, "final_no_tools_event", "") or ""):
+        if (
+            str(getattr(loop_result, "final_no_tools_event", "") or "")
+            or str(getattr(loop_result, "final_no_tools_finish_reason", "") or "")
+            or getattr(loop_result, "final_no_tools_reasoning_content_chars", 0)
+        ):
             tool_progress_metadata.update({
                 "final_no_tools_event": str(
                     getattr(loop_result, "final_no_tools_event", "") or ""

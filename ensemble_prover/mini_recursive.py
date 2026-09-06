@@ -16726,6 +16726,17 @@ async def run_mini_recursive_attempt(
     """
 
     cfg = config or MiniRecursiveConfig()
+    # A recursive child needs the admitted planner policy/capability to
+    # decompose its own obligations. Legacy callbacks may predate these
+    # optional keywords; never retry a callback after a runtime TypeError.
+    child_planner_kwargs = {
+        key: value
+        for key, value in (
+            ("config", cfg),
+            ("planner_escalation_client", planner_escalation_client),
+        )
+        if _callable_accepts_keyword(run_conversation_fn, key)
+    }
     # These values also configure nested conversation construction, whose
     # historical defaults are 40/64.  Keep omission distinct from an explicit
     # override so the recursive driver's own config remains authoritative for
@@ -17938,6 +17949,7 @@ async def run_mini_recursive_attempt(
             soft_progress_streak_cap=soft_progress_streak_cap,
             nested_invocation_id=child_nested_invocation_id("prove"),
             session_scope="subgoal",
+            **child_planner_kwargs,
         )
         expose_child_elapsed_deadline_failure()
         raw_prover_turns_used = getattr(
@@ -18109,6 +18121,7 @@ async def run_mini_recursive_attempt(
                 soft_progress_streak_cap=soft_progress_streak_cap,
                 nested_invocation_id=child_nested_invocation_id(handoff_kind),
                 session_scope="subgoal",
+                **child_planner_kwargs,
             )
 
         if not ok and refiner_client is not None and remaining_claim_turns > 0:
@@ -18287,6 +18300,7 @@ async def run_mini_recursive_attempt(
                     )
                 ),
                 session_scope="subgoal",
+                **child_planner_kwargs,
             )
             expose_child_elapsed_deadline_failure()
             if owned_provider_continuation and not ok:
@@ -22016,6 +22030,7 @@ async def run_mini_recursive_driver(
         pass_index: int,
         after_helper: str,
         helpers: Sequence[Any],
+        publish_checkpoint: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> TacticCloseResult:
         helpers_snapshot = list(helpers or ())
         current_active_root_targets = _current_active_root_targets(helpers_snapshot)
@@ -22197,15 +22212,20 @@ async def run_mini_recursive_driver(
                 next_candidate_index
             )
             try:
-                await publish_driver_state(
-                    "recursive_root_tactic_portfolio_continuation",
-                    phase="root_tactic_portfolio_continuation",
-                    pass_index=pass_index,
-                    pass_helper_fingerprints_before=tuple(
-                        verified_helper_fingerprints_before
-                    ),
-                    pass_helpers_accepted_before=pass_helpers_before,
-                )
+                if publish_checkpoint is not None:
+                    await publish_checkpoint(
+                        "recursive_root_tactic_portfolio_continuation"
+                    )
+                else:
+                    await publish_driver_state(
+                        "recursive_root_tactic_portfolio_continuation",
+                        phase="root_tactic_portfolio_continuation",
+                        pass_index=pass_index,
+                        pass_helper_fingerprints_before=tuple(
+                            verified_helper_fingerprints_before
+                        ),
+                        pass_helpers_accepted_before=pass_helpers_before,
+                    )
             except BaseException:
                 if prior_offset is None:
                     root_tactic_portfolio_continuations.pop(
@@ -22249,15 +22269,20 @@ async def run_mini_recursive_driver(
             )
             if newly_exhausted:
                 try:
-                    await publish_driver_state(
-                        "recursive_root_tactic_direct_portfolio_exhausted",
-                        phase="root_tactic_direct_portfolio_exhausted",
-                        pass_index=pass_index,
-                        pass_helper_fingerprints_before=tuple(
-                            verified_helper_fingerprints_before
-                        ),
-                        pass_helpers_accepted_before=pass_helpers_before,
-                    )
+                    if publish_checkpoint is not None:
+                        await publish_checkpoint(
+                            "recursive_root_tactic_direct_portfolio_exhausted"
+                        )
+                    else:
+                        await publish_driver_state(
+                            "recursive_root_tactic_direct_portfolio_exhausted",
+                            phase="root_tactic_direct_portfolio_exhausted",
+                            pass_index=pass_index,
+                            pass_helper_fingerprints_before=tuple(
+                                verified_helper_fingerprints_before
+                            ),
+                            pass_helpers_accepted_before=pass_helpers_before,
+                        )
                 except BaseException:
                     root_tactic_direct_portfolio_exhausted_execution_keys.discard(
                         portfolio_execution_key
@@ -27317,6 +27342,7 @@ async def run_mini_recursive_driver(
 
         helper_only_plan_fixed_point = False
         helper_only_plan_deferred_until_root = False
+        planner_tranche_claims_deferred = False
         filtered_plan_has_root_assembly = executable_root_route_surviving
         if (
             plan.claims
@@ -27505,6 +27531,17 @@ async def run_mini_recursive_driver(
                     "verdict": "proved_claims_skipped_before_priority",
                 },
             )
+        provisional_root_claim_keys = []
+        for candidate in claim_candidates:
+            if str(candidate.role or "") != "root_assembly":
+                continue
+            source_plan = planner_plan_receipts.get(
+                planner_receipt_id_for_claim(candidate)
+            )
+            if source_plan is not None and source_plan.plan_complete is False:
+                provisional_root_claim_keys.append(
+                    _dependency_contract_suspension_key(candidate)
+                )
         claims = (
             list(claim_candidates)
             if restored_selected_plan
@@ -27512,6 +27549,7 @@ async def run_mini_recursive_driver(
                 claim_candidates,
                 max_claims=max_claims,
                 deprioritized_claim_keys=(),
+                provisional_root_claim_keys=provisional_root_claim_keys,
             )
         )
         plan_admission_migrated = False
@@ -27631,6 +27669,23 @@ async def run_mini_recursive_driver(
                     f"Deferred: {', '.join(name for name in deferred_names if name) or 'unnamed claims'}."
                 ),
             )
+        if (
+            claims
+            and planner_tranche_continuation_pending
+            and filtered_plan_has_root_assembly
+            and not restored_selected_plan
+        ):
+            # An explicit incomplete receipt requests more planning even when
+            # its provisional root route already typechecks. Do not let one
+            # unfinished helper monopolize the child prover before that next
+            # paid tranche arrives. Preserve all claims in the durable queue;
+            # previously selected/paid resume cursors retain their ownership.
+            for claim in claims:
+                pending_unproved_plan_claims[
+                    _dependency_contract_suspension_key(claim)
+                ] = claim
+            planner_tranche_claims_deferred = True
+            claims = []
         selected_root_assembly_claim_names = _plan_root_assembly_claim_names(
             plan,
             selected_claims=claims,
@@ -28235,12 +28290,16 @@ async def run_mini_recursive_driver(
                     "claims_accepted": len(plan.claims),
                     "claims_filtered": claims_filtered,
                     "verdict": (
-                        "helper_only_plan_deferred_until_root"
-                        if helper_only_plan_deferred_until_root
+                        "planner_tranche_claims_deferred"
+                        if planner_tranche_claims_deferred
                         else (
-                            "no_claims_after_filters"
-                            if compiled_claim_count > 0
-                            else "no_compiled_claims"
+                            "helper_only_plan_deferred_until_root"
+                            if helper_only_plan_deferred_until_root
+                            else (
+                                "no_claims_after_filters"
+                                if compiled_claim_count > 0
+                                else "no_compiled_claims"
+                            )
                         )
                     ),
                 },
@@ -28561,6 +28620,29 @@ async def run_mini_recursive_driver(
                         "verdict": "route_not_ready_deterministic_tactic_probe",
                     },
                 )
+
+            async def checkpoint_helper_root_tactic(reason: str) -> None:
+                # A partial root portfolio is follow-up work for this accepted
+                # helper, not a return to pre-plan execution. Keep its live
+                # queue, child cursor, and exact planner receipts in every
+                # intermediate checkpoint; a restart retries only the remaining
+                # root work and must not replay the paid planner/child calls.
+                await publish_driver_state(
+                    reason,
+                    phase="helper_accepted",
+                    pass_index=pass_index,
+                    plan=active_plan,
+                    next_claim_index=next_claim_index,
+                    completed_claim_keys=completed_claim_keys,
+                    accepted_helper_name=accepted,
+                    accepted_helper_statement=statement,
+                    accepted_helper_proof=accepted_proof,
+                    pass_helper_fingerprints_before=(
+                        verified_helper_fingerprints_before
+                    ),
+                    pass_helpers_accepted_before=pass_helpers_before,
+                )
+
             root_result = (
                 TacticCloseResult(
                     ok=False,
@@ -28576,6 +28658,7 @@ async def run_mini_recursive_driver(
                     pass_index=pass_index,
                     after_helper=accepted,
                     helpers=get_helpers(),
+                    publish_checkpoint=checkpoint_helper_root_tactic,
                 )
             )
             if root_result.ok and root_result.proof:
@@ -37567,6 +37650,7 @@ def _prioritize_claims(
     *,
     max_claims: int,
     deprioritized_claim_keys: Sequence[str] = (),
+    provisional_root_claim_keys: Sequence[str] = (),
 ) -> list[MiniSubgoalClaim]:
     items = list(claims or ())
     cap = max(1, int(max_claims or 1))
@@ -37575,6 +37659,7 @@ def _prioritize_claims(
         for key in list(deprioritized_claim_keys or ())
         if str(key or "").strip()
     }
+    provisional_roots = set(provisional_root_claim_keys or ())
     name_to_index = {str(claim.name or ""): idx for idx, claim in enumerate(items)}
     root_items = [
         (index, claim)
@@ -37612,6 +37697,14 @@ def _prioritize_claims(
             )
             root_options.append(
                 (
+                    # A completed route can refine an earlier provisional
+                    # root by adding necessary prerequisites. Its larger
+                    # closure must not make the old shortcut win again. Keep
+                    # that old route as a deferred alternative, not a rewrite.
+                    int(
+                        _dependency_contract_suspension_key(root_claim)
+                        in provisional_roots
+                    ),
                     0 if helper_closure_size <= cap else 1,
                     helper_closure_size,
                     _claim_priority_score(root_claim, source_index),

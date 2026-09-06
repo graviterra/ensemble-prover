@@ -32,6 +32,7 @@ from ...provider_dispatch_continuation import (
     provider_dispatch_resume_target,
 )
 from ...mini_lean_extract import (
+    _extract_helpers_and_main,
     _find_forbidden_lean_command,
     _has_plausible_lean_proof_head,
     _is_plausible_lean_symbolic_atom,
@@ -4354,14 +4355,14 @@ async def _call_llm_with_tools_one_round_impl(
                     banked_mixed_finalizer_pending = False
                     banked_mixed_finalizer_lane_identity = ""
                 content = final_resolution.content
+                # Ordinary prose is still a no-tool output boundary. Keep its
+                # provider stop metadata even when no recovery event is needed.
+                final_no_tools_finish_reason = final_resolution.finish_reason
+                final_no_tools_reasoning_content_chars = int(
+                    final_resolution.reasoning_content_chars or 0
+                )
                 if final_resolution.event:
                     final_no_tools_event = final_resolution.event
-                    final_no_tools_finish_reason = (
-                        final_resolution.finish_reason
-                    )
-                    final_no_tools_reasoning_content_chars = int(
-                        final_resolution.reasoning_content_chars or 0
-                    )
                     final_no_tools_used_accepted_proof = bool(
                         final_resolution.used_accepted_proof
                     )
@@ -4579,17 +4580,37 @@ async def _call_llm_with_tools_one_round_impl(
                     elif status == "no_try_lean_call":
                         llm_error = "repair_self_check_no_try_lean_call"
                 if not final_resolution.event:
+                    recovery_kind = ""
                     if final_no_tools_policy_reprompted:
-                        final_no_tools_event = (
-                            "final_no_tools_policy_recovery_succeeded"
-                        )
+                        recovery_kind = "policy"
                     elif deepseek_dsml_reprompted_after_budget:
-                        final_no_tools_event = (
-                            "final_no_tools_protocol_recovery_succeeded"
-                        )
+                        recovery_kind = "protocol"
                     elif final_no_tools_recovery_attempted:
+                        recovery_kind = "visibility"
+                    if recovery_kind:
+                        # Visibility is not proof-artifact recovery. Retain
+                        # exact prose (including counterexample claims) for
+                        # downstream adjudication, but do not label arbitrary
+                        # text or a copied diff as a successful proof handoff.
+                        recovered_helpers, recovered_main = _extract_helpers_and_main(
+                            str(content or ""),
+                            theorem_name=str(
+                                getattr(dossier, "theorem_name", "") or ""
+                            ),
+                            goal_statement=str(
+                                getattr(conv, "goal_statement", "") or ""
+                            ),
+                        )
+                        recovered_artifact = bool(recovered_main) or any(
+                            helper_decl_name(helper) for helper in recovered_helpers
+                        )
                         final_no_tools_event = (
-                            "final_no_tools_visibility_recovery_succeeded"
+                            f"final_no_tools_{recovery_kind}_recovery_"
+                            + (
+                                "succeeded"
+                                if recovered_artifact
+                                else "unvalidated_output"
+                            )
                         )
                     if final_no_tools_event:
                         final_no_tools_finish_reason = (

@@ -6871,6 +6871,10 @@ async def _mini_session_run_conversation_callback(
         conversation_budget_topups_enabled=False,
     )
     session._recursive_paid_no_artifact_attempt_count = 0
+    session.planner_escalation_client = kwargs.get(
+        "planner_escalation_client",
+        getattr(theory_parent_session, "planner_escalation_client", None),
+    )
     session._recursive_paid_no_artifact_provider_calls_applied = 0
     session._recursive_paid_no_artifact_provider_dispatches_applied = 0
     recursive_session_ref = weakref.ref(session)

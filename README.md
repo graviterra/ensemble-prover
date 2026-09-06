@@ -20,12 +20,19 @@ theorem-project request used by the CLI.
 
 As of August 2026, across research and evaluation runs, the system has produced
 Lean-verified proofs for **65 distinct Putnam problems**, counting repeated
-solves and configuration variants once. This is a cumulative demonstrated
+solves and configuration variants once. **PutnamBench has accepted all 65
+submitted proofs**, and Ensemble Prover is listed on the
+[PutnamBench leaderboard](https://trishullab.github.io/PutnamBench/leaderboard.html).
+This is a cumulative demonstrated
 result, not a claim of a controlled benchmark solve rate under one fixed model,
 configuration, or budget. The prover has been tested with **GPT-5.2**,
 **GPT-5.6 Luna-Pro**, **DeepSeek-V4-Flash**, **DeepSeek-V4-Pro**, and
 **Qwen3.7-Max**. Prover, refiner, and planner-escalation roles are independently
 configurable, so a run may use one model throughout or combine models.
+
+Ensemble Prover is an actively developed research-grade tool. It continues to
+solve Putnam problems and is now attempting frontier-mathematics problems.
+The 65 accepted proofs are a snapshot of this ongoing work.
 
 Every accepted result is checked by Lean. Model responses, plans, retrieved
 material, speculative helper claims, and falsification results are treated as
@@ -33,13 +40,13 @@ search evidence rather than proofs until they pass the relevant verification
 gates. Each run records a structured, replayable dossier containing the proof
 search and verification history.
 
-## Putnam problems submitted for independent verification
+## Putnam proofs accepted by PutnamBench
 
 The following **65 problem identifiers** make up the cumulative result reported
 above. Their Lean proof files were submitted privately to the PutnamBench
-verification team for independent review on August 31, 2026. Submission does
-not imply review, acceptance, or endorsement by PutnamBench. Only the problem
-identifiers are published here; the proof files and answers are not.
+verification team for independent review on August 31, 2026; PutnamBench has
+since accepted all 65 proofs. Only the problem identifiers are published here;
+the proof files and answers are not.
 
 | Period | Problems |
 | --- | --- |

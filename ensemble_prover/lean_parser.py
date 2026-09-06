@@ -1277,6 +1277,37 @@ def prefer_canonical_error_type(*error_types: str) -> str:
 
 
 def primary_error_type(parsed: LeanParseResult) -> str:
+    # A failed tactic or elaboration can leave Lean's recovery `sorryAx` in
+    # the checked declaration.  Report the actionable original error without
+    # clearing the separate axiom-audit failure.  This is diagnostic priority,
+    # not proof that this particular sorryAx was synthesized by recovery:
+    # direct uses of sorryAx are possible, and must still fail the audit.
+    # Other forbidden axioms and explicit sorry/admit diagnostics retain the
+    # policy-first classification.  Require actual error diagnostics rather
+    # than broad flags, which can also be recovered from quoted warning text.
+    if (
+        set(getattr(parsed, "unexpected_axioms", [])) == {"sorryAx"}
+        and not parsed.sorry_count
+        and not getattr(parsed, "infra_failure", False)
+        and not any(
+            _is_real_sorry_warning(d.message)
+            for d in parsed.diagnostics
+            if d.severity in {"error", "warning"}
+        )
+    ):
+        # Keep diagnostic boundaries: e.g. `simp` in one error followed by
+        # `made no progress` in another is not a simp-no-progress failure.
+        underlying_errors = {
+            fallback_error_type_from_text(d.message): True
+            for d in parsed.diagnostics
+            if d.severity == "error"
+        }
+        underlying_error = _first_matching_error_type(
+            underlying_errors,
+            unsolved_goal_count=int(underlying_errors.get("unsolved_goals", False)),
+        )
+        if underlying_error:
+            return underlying_error
     return _first_matching_error_type(
         {
             "forbidden_axioms": bool(

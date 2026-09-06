@@ -1254,7 +1254,7 @@ def _sanitize_request_messages(
     receipt_key = "_mini_required_prompt_transport_receipt"
     expected_receipts: List[int] = []
 
-    def complete_openrouter_exchange(index: int, message: Dict[str, Any]) -> bool:
+    def complete_provider_exchange(index: int, message: Dict[str, Any]) -> bool:
         calls = normalize_tool_calls(message.get("tool_calls"))
         expected_ids = [str(call.get("id") or "") for call in calls]
         if (
@@ -1278,13 +1278,29 @@ def _sanitize_request_messages(
         )
 
     sanitized: List[Any] = []
-    exact_openrouter_tool_ids: set[str] = set()
+    exact_provider_tool_ids: set[str] = set()
     for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
             sanitized.append(message)
             continue
-        exact_openrouter_continuation = False
-        if preserve_openrouter_continuation:
+        output_items = message.get("_responses_output_items")
+        reasoning_items = message.get("_responses_reasoning_items")
+        responses_tool_continuation = bool(
+            preserve_responses_reasoning_items
+            and message.get("role") == "assistant"
+            and (
+                (message.get("tool_calls") and (output_items or reasoning_items))
+                or (
+                    isinstance(output_items, list)
+                    and any(
+                        isinstance(item, dict) and item.get("type") == "function_call"
+                        for item in output_items
+                    )
+                )
+            )
+        )
+        exact_provider_continuation = False
+        if preserve_openrouter_continuation or responses_tool_continuation:
             # Local import keeps the generic model adapter independent during
             # module initialization while still requiring Mini's signed
             # capture receipt before provider-authored opaque state is sent.
@@ -1292,16 +1308,44 @@ def _sanitize_request_messages(
                 _provider_chat_reasoning_envelope_is_valid,
                 _provider_chat_tool_calls_envelope_is_valid,
                 _provider_continuation_message_is_authenticated,
+                _responses_output_matches_advertised_tool_calls,
             )
 
-            exact_openrouter_continuation = bool(
+            responses_envelope_valid = bool(
+                responses_tool_continuation
+                and _provider_chat_tool_calls_envelope_is_valid(message)
+                and (
+                    not output_items
+                    or (
+                        isinstance(output_items, list)
+                        and all(isinstance(item, dict) for item in output_items)
+                        and _responses_output_matches_advertised_tool_calls(
+                            output_items, message.get("tool_calls") or ()
+                        )
+                    )
+                )
+                and (
+                    not reasoning_items
+                    or (
+                        isinstance(reasoning_items, list)
+                        and all(isinstance(item, dict) for item in reasoning_items)
+                    )
+                )
+            )
+            exact_provider_continuation = bool(
                 message.get("role") == "assistant"
                 and _provider_continuation_message_is_authenticated(message)
-                and _provider_chat_reasoning_envelope_is_valid(message)
                 and _provider_chat_tool_calls_envelope_is_valid(message)
-                and complete_openrouter_exchange(message_index, message)
+                and complete_provider_exchange(message_index, message)
+                and (
+                    responses_envelope_valid
+                    or (
+                        preserve_openrouter_continuation
+                        and _provider_chat_reasoning_envelope_is_valid(message)
+                    )
+                )
             )
-            if exact_openrouter_continuation:
+            if exact_provider_continuation:
                 exact_fields = {
                     key: message[key]
                     for key in (
@@ -1311,6 +1355,8 @@ def _sanitize_request_messages(
                         "reasoning_content",
                         "reasoning",
                         "reasoning_details",
+                        "_responses_reasoning_items",
+                        "_responses_output_items",
                     )
                     if key in message
                 }
@@ -1319,14 +1365,22 @@ def _sanitize_request_messages(
                         _normalize_request_json(exact_fields)
                     )
                 except (TypeError, ValueError):
-                    exact_openrouter_continuation = False
+                    exact_provider_continuation = False
                 else:
-                    exact_openrouter_continuation = bool(
+                    exact_provider_continuation = bool(
                         replacements == 0
                         and normalized_exact_fields == exact_fields
                     )
+        if responses_tool_continuation and not exact_provider_continuation:
+            # Opaque output items retain provider call IDs. Falling through to
+            # generic hashing would orphan their results (or replay a changed
+            # call that was never executed), so reject before dispatch.
+            raise RuntimeError(
+                "Invalid Responses tool continuation: an authenticated, "
+                "complete matching tool-call/result exchange is required"
+            )
         message_request_keys = set(request_keys)
-        if exact_openrouter_continuation:
+        if exact_provider_continuation and preserve_openrouter_continuation:
             message_request_keys.update(
                 ("reasoning_content", "reasoning", "reasoning_details")
             )
@@ -1341,12 +1395,12 @@ def _sanitize_request_messages(
             clean[receipt_key] = receipt
         if clean.get("role") == "tool" and "tool_call_id" in clean:
             tool_call_id = str(clean.get("tool_call_id") or "")
-            if tool_call_id in exact_openrouter_tool_ids:
-                exact_openrouter_tool_ids.discard(tool_call_id)
+            if tool_call_id in exact_provider_tool_ids:
+                exact_provider_tool_ids.discard(tool_call_id)
             else:
                 clean["tool_call_id"] = _request_safe_tool_call_id(tool_call_id)
-        if exact_openrouter_continuation:
-            exact_openrouter_tool_ids = set(_tool_call_ids(clean))
+        if exact_provider_continuation:
+            exact_provider_tool_ids = set(_tool_call_ids(clean))
         elif "tool_calls" in clean:
             safe_tool_calls = _request_safe_tool_calls(clean.get("tool_calls"))
             if safe_tool_calls:
@@ -1354,7 +1408,7 @@ def _sanitize_request_messages(
             else:
                 clean.pop("tool_calls", None)
         elif clean.get("role") != "tool":
-            exact_openrouter_tool_ids.clear()
+            exact_provider_tool_ids.clear()
         if (
             clean.get("role") == "assistant"
             and "tool_calls" in clean
@@ -2646,6 +2700,9 @@ class OpenAICompatClient:
                 cfg.model,
             )
         )
+        # A discovered chat transport conflict does not imply that the model
+        # supports disabling reasoning. Remember only the required transport.
+        self._responses_tools_reasoning_required = False
         # Some routes omit mandatory-reasoning metadata from OpenRouter's
         # catalog but reject ``reasoning.enabled=false`` at request time.
         self._reasoning_disable_rejected = False
@@ -4208,6 +4265,17 @@ class OpenAICompatClient:
                     .lower()
                     != "none"
                 ):
+                    if (
+                        exc.response.status_code == 400
+                        and _openai_responses_with_reasoning(
+                            self.base_url, current.get("reasoning_effort")
+                        )
+                    ):
+                        # Let chat_with_tools retry the same logical request on
+                        # Responses, with the original continuation and effort.
+                        # Changing the effort here loses the requested ability
+                        # and some models do not support 'none' at all.
+                        raise
                     if bool(
                         getattr(self.cfg, "reasoning_control_required", False)
                     ):
@@ -5560,12 +5628,46 @@ class OpenAICompatClient:
             .lower()
             == "none"
         )
-        if _openai_responses_tools_with_reasoning(
-            self.base_url,
-            self.cfg.model,
-            tools,
-            effective_reasoning_effort,
-        ):
+        positive_openai_tools_reasoning = bool(
+            tools
+            and _openai_responses_with_reasoning(
+                self.base_url, effective_reasoning_effort
+            )
+        )
+        use_responses = bool(
+            positive_openai_tools_reasoning
+            and (
+                self._responses_tools_reasoning_required
+                or self._chat_tools_require_reasoning_effort_none
+            )
+        )
+        if not use_responses:
+            try:
+                resp = await self._chat_request(
+                    messages,
+                    temperature_override=temperature_override,
+                    top_p_override=top_p_override,
+                    max_tokens_override=max_tokens_override,
+                    reasoning_effort_override=reasoning_effort_override,
+                    deadline=deadline,
+                    request_timeout_override_s=request_timeout_override_s,
+                    operation_timeout_override_s=operation_timeout_override_s,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    usage_callback=usage_callback,
+                )
+            except httpx.HTTPStatusError as exc:
+                if not (
+                    positive_openai_tools_reasoning
+                    and exc.response.status_code == 400
+                    and _tools_reasoning_effort_conflict(exc)
+                ):
+                    raise
+                # Persist discovery before dispatch: a deadline/quantum yield
+                # must not make the next invocation repay the same chat 400.
+                self._responses_tools_reasoning_required = True
+                use_responses = True
+        if use_responses:
             resp = await self._responses_tools_request(
                 messages,
                 tools=tools,
@@ -5576,20 +5678,6 @@ class OpenAICompatClient:
                 deadline=deadline,
                 request_timeout_override_s=request_timeout_override_s,
                 operation_timeout_override_s=operation_timeout_override_s,
-                usage_callback=usage_callback,
-            )
-        else:
-            resp = await self._chat_request(
-                messages,
-                temperature_override=temperature_override,
-                top_p_override=top_p_override,
-                max_tokens_override=max_tokens_override,
-                reasoning_effort_override=reasoning_effort_override,
-                deadline=deadline,
-                request_timeout_override_s=request_timeout_override_s,
-                operation_timeout_override_s=operation_timeout_override_s,
-                tools=tools,
-                tool_choice=tool_choice,
                 usage_callback=usage_callback,
             )
         content, data = self._process_response(resp, usage_callback=usage_callback)
