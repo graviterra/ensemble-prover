@@ -25559,6 +25559,11 @@ class MiniSession:
             return {
                 "root_finalization_accepted": True,
                 "root_finalization_verdict": "root_finalization_already_applied",
+                "hydrated_from_existing_root_finalization": bool(
+                    (candidate.metadata or {}).get(
+                        "hydrated_from_existing_root_finalization"
+                    )
+                ),
                 "root_finalization_verification_status": dict(
                     result.verification_status or {}
                 ),
@@ -25613,6 +25618,11 @@ class MiniSession:
         return {
             "root_finalization_accepted": bool(result.accepted),
             "root_finalization_verdict": result.verdict,
+            "hydrated_from_existing_root_finalization": bool(
+                (candidate.metadata or {}).get(
+                    "hydrated_from_existing_root_finalization"
+                )
+            ),
             "root_finalization_verification_status": dict(
                 result.verification_status or {}
             ),
@@ -26636,6 +26646,11 @@ class MiniSession:
             # success tombstone is too late to enforce exactly-once mutation.
             self._applying_action_dispatch_ids.add(action_dispatch_id)
         self._apply_transition_active = True
+        prior_formal_evidence = (
+            tuple(self._action_start_frontier_formal_evidence)
+            if self._action_start_frontier_formal_signature
+            else None
+        )
         try:
             try:
                 effective = self._apply_outcome_once(outcome)
@@ -26696,6 +26711,20 @@ class MiniSession:
                         "Falsification backend-timeout observation failed",
                         exc_info=True,
                     )
+            # Sweep milestones observe only the effective, committed outcome.
+            # A rejected/rolled-back action or duplicate dispatch must never
+            # unlock a problem's acceptance deadline.
+            try:
+                from ensemble_prover.mini_accepted_progress import (
+                    committed_acceptance_records,
+                )
+
+                for acceptance_record in committed_acceptance_records(
+                    self, effective, prior_formal_evidence=prior_formal_evidence
+                ):
+                    self._record_event(acceptance_record)
+            except Exception:
+                _LOGGER.debug("Accepted proof receipt publication failed", exc_info=True)
             reconcile_helpers = getattr(
                 self,
                 "theory_verified_helper_reconcile_callback",

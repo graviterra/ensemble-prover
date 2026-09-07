@@ -192,7 +192,7 @@ def trusted_provider_worker_environment(
     """Copy the environment for the trusted internal provider-capable worker.
 
     This exemption is deliberately narrow: the watchdog's internal Python
-    worker/supervisor and the NL frontend's fixed Mini CLI handoff may retain
+    worker/supervisor and the NL/sweep frontends' fixed Mini CLI handoffs may retain
     provider credentials. Lean, Lake, solvers, Git, and other child tools must
     use the sanitized policy instead.
     """

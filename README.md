@@ -153,6 +153,19 @@ For a PutnamBench source file:
 The Putnam adapter expects a separately supplied compatible PutnamBench
 checkout; no benchmark data or setup environment is bundled.
 
+To sweep all locally unsolved PutnamBench problems in random order:
+
+```bash
+./scripts/sweep_putnam_unsolved.sh \
+  --putnam-dir /path/to/PutnamBench/lean4/src \
+  -- --prover openai --parallel-samples 2
+```
+
+Each attempt must commit one distinct accepted proof by 600 seconds and two by
+1,800 seconds, both measured from launch. After two timely acceptances, normal
+budgets apply. See the [sweep guide](ensemble_prover/PUTNAM_SWEEP.md) for a
+no-provider-call preview, resume commands, and counting/cleanup rules.
+
 ## Start from natural language
 
 For one claim, translate and prove using the OpenAI API:
