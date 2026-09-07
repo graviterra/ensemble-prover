@@ -4968,10 +4968,6 @@ async def prove_problem_via_session(
             parallel_live_sample_dossiers[sample_index] = sample_dossier
             if sample_count > 1:
                 _clear_parallel_sample_observability(sample_dossier)
-                _install_parallel_monotonic_metric_sink(
-                    sample_dossier,
-                    attempt_dossier,
-                )
             if sample_proof_cache is not None:
                 sample_proof_cache.set_store_failure_metric_sink(
                     sample_dossier.increment_tool_metric
@@ -5082,6 +5078,11 @@ async def prove_problem_via_session(
             # The builder may clone the supplied dossier. Register the exact
             # object MiniSession will mutate before its first awaited action.
             parallel_live_sample_dossiers[sample_index] = session.dossier
+            if sample_count > 1:
+                _install_parallel_monotonic_metric_sink(
+                    session.dossier,
+                    attempt_dossier,
+                )
             effective_premise_block = str(premise_block or "").strip()
             effective_premise_names = list(premise_names or ())
             if effective_premise_block:
@@ -5100,7 +5101,13 @@ async def prove_problem_via_session(
                         seen_names.add(name_str)
                 session.conv.known_premise_names = known_names
             try:
-                ok, proof = await session.run()
+                if sample_count > 1:
+                    from ..mini_formal_state_search import parallel_lean_admission_scope
+
+                    with parallel_lean_admission_scope(session):
+                        ok, proof = await session.run()
+                else:
+                    ok, proof = await session.run()
             finally:
                 # A receipt is a bounded local write, not Lean work. Stage in
                 # ``finally`` so cancellation preserves committed helpers,
@@ -5377,6 +5384,9 @@ async def prove_problem_via_session(
                 _run_one_sample(i, sample_temps[i]),
                 name=f"prove_sample_{i}",
             )
+            # Parent cancellation can interrupt the drain before it visits
+            # already-completed sibling failures. Always observe each result.
+            task.add_done_callback(_CONSUME_SAMPLE_TASK_EXCEPTION)
             tasks.append(task)
             task_index[task] = i
 
@@ -5729,10 +5739,6 @@ async def prove_problem_via_session(
                 attempt_dossier,
                 parallel_observability_baseline,
             )
-            _restore_parallel_monotonic_metric_snapshot(
-                attempt_dossier,
-                mirrored_attempt_metrics,
-            )
             _restore_parallel_cache_integrity_observability()
             for failure in sample_failures:
                 record_parallel_sample_failure(
@@ -5804,6 +5810,12 @@ async def prove_problem_via_session(
                     increment_metric=not conflict_recorded_by_sibling_merge,
                     certificate_hashes=tuple(parallel_terminal_certificate_hashes),
                 )
+            # Frozen terminal snapshots carry audit counts but no live sink.
+            # Reapply the mirrored total after every snapshot/helper merge.
+            _restore_parallel_monotonic_metric_snapshot(
+                attempt_dossier,
+                mirrored_attempt_metrics,
+            )
             if recorder is not None and hasattr(recorder, "record_turn"):
                 recorder.record_turn(
                     {
@@ -5924,10 +5936,6 @@ async def prove_problem_via_session(
                 attempt_dossier,
                 parallel_observability_baseline,
             )
-            _restore_parallel_monotonic_metric_snapshot(
-                attempt_dossier,
-                mirrored_attempt_metrics,
-            )
             _restore_parallel_cache_integrity_observability()
             for failure in sample_failures:
                 record_parallel_sample_failure(
@@ -5995,6 +6003,10 @@ async def prove_problem_via_session(
                         sorted(all_fail_negative_certificate_hashes)
                     ),
                 )
+            _restore_parallel_monotonic_metric_snapshot(
+                attempt_dossier,
+                mirrored_attempt_metrics,
+            )
         else:
             record_parallel_samples_zero_completed(attempt_dossier)
             structural_fanin = []

@@ -2036,6 +2036,17 @@ class GraphRecursiveDecomposeAction:
                         and recorded_name
                         and recorded_name not in merged_helper_names
                     ):
+                        visible_checker = getattr(
+                            parent_dossier,
+                            "is_verified_helper_context_visible",
+                            None,
+                        )
+                        if callable(visible_checker) and not visible_checker(recorded):
+                            self._bump_metric(
+                                session,
+                                "mini_session_graph_recursive_decompose_advisory_helpers_suppressed",
+                            )
+                            continue
                         merged_helper_names.append(recorded_name)
                 propagate_invalidated_statements(
                     parent_dossier,

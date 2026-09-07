@@ -31,6 +31,7 @@ from ...llm_usage import (
 from ...provider_dispatch_continuation import (
     provider_dispatch_resume_target,
 )
+from ...provider_response import capture_provider_response
 from ...mini_lean_extract import (
     _extract_helpers_and_main,
     _find_forbidden_lean_command,
@@ -4052,51 +4053,43 @@ async def _call_llm_with_tools_one_round_impl(
                 content = ""
                 actual_messages = current_messages
             elif can_call_tools:
-                (
-                    (content, tool_calls),
-                    actual_messages,
-                    _rescued_invalid_prompt,
-                ) = await _provider_call_with_policy(
-                    invoke=lambda request_messages, usage_callback, max_tokens_override: call_with_optional_usage_callback(
-                        client.chat_with_tools,
-                        request_messages,
-                        required_keywords=(
-                            "reasoning_effort_override",
-                            *(("max_tokens_override",) if max_tokens_override is not None else ()),
+                with capture_provider_response() as response_receipt:
+                    (
+                        (content, tool_calls),
+                        actual_messages,
+                        _rescued_invalid_prompt,
+                    ) = await _provider_call_with_policy(
+                        invoke=lambda request_messages, usage_callback, max_tokens_override: call_with_optional_usage_callback(
+                            client.chat_with_tools,
+                            request_messages,
+                            required_keywords=(
+                                "reasoning_effort_override",
+                                *(("max_tokens_override",) if max_tokens_override is not None else ()),
+                            ),
+                            tools=list(tools_list),
+                            temperature_override=temperature_override,
+                            reasoning_effort_override=(
+                                mini_visible_output_reasoning_effort(
+                                    client,
+                                    default=MINI_TOOL_REASONING_EFFORT,
+                                )
+                            ),
+                            usage_callback=usage_callback,
+                            **provider_timeout_kwargs(),
+                            **(
+                                {"max_tokens_override": max_tokens_override}
+                                if max_tokens_override is not None
+                                else {}
+                            ),
                         ),
-                        tools=list(tools_list),
-                        temperature_override=temperature_override,
-                        reasoning_effort_override=(
-                            mini_visible_output_reasoning_effort(
-                                client,
-                                default=MINI_TOOL_REASONING_EFFORT,
-                            )
-                        ),
-                        usage_callback=usage_callback,
-                        **provider_timeout_kwargs(),
-                        **(
-                            {"max_tokens_override": max_tokens_override}
-                            if max_tokens_override is not None
-                            else {}
-                        ),
-                    ),
-                    messages=current_messages,
-                    call_kind="chat_with_tools",
-                    tools_for_cost=tools_list,
-                    request_kind="tool_search",
-                    reasoning_mode="floor",
-                    reasoning_effort=MINI_TOOL_REASONING_EFFORT,
-                )
-                raw_tool_response = getattr(
-                    client,
-                    "last_raw_response_data",
-                    {},
-                )
-                response_data = (
-                    dict(raw_tool_response)
-                    if isinstance(raw_tool_response, dict)
-                    else None
-                )
+                        messages=current_messages,
+                        call_kind="chat_with_tools",
+                        tools_for_cost=tools_list,
+                        request_kind="tool_search",
+                        reasoning_mode="floor",
+                        reasoning_effort=MINI_TOOL_REASONING_EFFORT,
+                    )
+                response_data = response_receipt.resolve(client)
             elif use_tools and tools_list:
                 # Finalization serializes the proof discovered during the
                 # tool-guided phase.  Respect the action's already-budgeted
@@ -4149,47 +4142,41 @@ async def _call_llm_with_tools_one_round_impl(
                     )
                     tool_calls = []
                 else:
-                    (
-                        (content, _ignored),
-                        actual_messages,
-                        _rescued_invalid_prompt,
-                    ) = await _provider_call_with_policy(
-                        invoke=lambda request_messages, usage_callback, max_tokens_override: call_with_optional_usage_callback(
-                            client.chat_with_tools,
-                            request_messages,
-                            required_keywords=(
-                                "max_tokens_override",
-                                "reasoning_effort_override",
+                    with capture_provider_response() as response_receipt:
+                        (
+                            (content, _ignored),
+                            actual_messages,
+                            _rescued_invalid_prompt,
+                        ) = await _provider_call_with_policy(
+                            invoke=lambda request_messages, usage_callback, max_tokens_override: call_with_optional_usage_callback(
+                                client.chat_with_tools,
+                                request_messages,
+                                required_keywords=(
+                                    "max_tokens_override",
+                                    "reasoning_effort_override",
+                                ),
+                                tools=list(tools_list),
+                                tool_choice="none",
+                                temperature_override=temperature_override,
+                                reasoning_effort_override=(
+                                    mini_bounded_visible_output_reasoning_effort(
+                                        client,
+                                        effort="low",
+                                    )
+                                ),
+                                usage_callback=usage_callback,
+                                **provider_timeout_kwargs(),
+                                max_tokens_override=max_tokens_override,
                             ),
-                            tools=list(tools_list),
-                            tool_choice="none",
-                            temperature_override=temperature_override,
-                            reasoning_effort_override=(
-                                mini_bounded_visible_output_reasoning_effort(
-                                    client,
-                                    effort="low",
-                                )
-                            ),
-                            usage_callback=usage_callback,
-                            **provider_timeout_kwargs(),
-                            max_tokens_override=max_tokens_override,
-                        ),
-                        messages=current_messages,
-                        call_kind="chat_with_tools_none",
-                        tools_for_cost=tools_list,
-                        max_tokens_override=finalizer_max_tokens,
-                        request_kind="final_no_tools",
-                        reasoning_mode="bounded",
-                        reasoning_effort="low",
-                    )
-                    raw_final_response = getattr(
-                        client, "last_raw_response_data", {}
-                    )
-                    response_data = (
-                        dict(raw_final_response)
-                        if isinstance(raw_final_response, dict)
-                        else None
-                    )
+                            messages=current_messages,
+                            call_kind="chat_with_tools_none",
+                            tools_for_cost=tools_list,
+                            max_tokens_override=finalizer_max_tokens,
+                            request_kind="final_no_tools",
+                            reasoning_mode="bounded",
+                            reasoning_effort="low",
+                        )
+                    response_data = response_receipt.resolve(client)
                     ignored_tool_calls = list(_ignored or [])
                     if ignored_tool_calls:
                         _increment_tool_metric(

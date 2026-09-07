@@ -20,6 +20,7 @@ import logging
 import re
 import time
 import weakref
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
@@ -87,6 +88,33 @@ _LEAN_LOCKS: "weakref.WeakKeyDictionary[Any, weakref.WeakKeyDictionary[Any, asyn
 _FALLBACK_LEAN_LOCKS: "weakref.WeakKeyDictionary[Any, asyncio.Lock]" = (
     weakref.WeakKeyDictionary()
 )
+_PARALLEL_LEAN_LOCKS: "weakref.WeakKeyDictionary[Any, weakref.WeakKeyDictionary[Any, weakref.WeakSet[asyncio.Lock]]]" = weakref.WeakKeyDictionary()
+
+
+@dataclass(eq=False)
+class _ParallelLeanAdmissionScope:
+    owner: Any
+    locks: Any = field(default_factory=weakref.WeakKeyDictionary)
+
+
+_PARALLEL_LEAN_ADMISSION_SCOPE: ContextVar[Optional[_ParallelLeanAdmissionScope]] = (
+    ContextVar("ensemble_prover_parallel_lean_admission_scope", default=None)
+)
+
+
+@contextmanager
+def parallel_lean_admission_scope(session: Any) -> Any:
+    """Keep one sample's operation lease across its actions and descendants."""
+
+    token = _PARALLEL_LEAN_ADMISSION_SCOPE.set(
+        _ParallelLeanAdmissionScope(weakref.ref(session))
+    )
+    try:
+        yield
+    finally:
+        _PARALLEL_LEAN_ADMISSION_SCOPE.reset(token)
+
+
 _LEAN_LATE_TAILS: "weakref.WeakKeyDictionary[asyncio.Lock, Dict[str, Any]]" = (
     weakref.WeakKeyDictionary()
 )
@@ -192,21 +220,37 @@ def _provider_lock(client: Any) -> asyncio.Lock:
 
 
 def _lean_lock(lean: Any) -> asyncio.Lock:
-    """Serialize cancellation-resistant tails for one Lean adapter and loop."""
+    """Retain tail ownership per sample for the concurrent built-in runner."""
 
+    from .lean_runner import LeanRunner
     from .mini_session.session import _dispatch_capability_identity
 
     lean = _dispatch_capability_identity(lean)
     loop = asyncio.get_running_loop()
+    scope = _PARALLEL_LEAN_ADMISSION_SCOPE.get()
+    # Custom/stateful adapters keep their shared lease. Runner execution owns
+    # the aggregate capacity and subprocess cleanup; each parallel sample only
+    # needs to serialize its own dependent operations and discarded tails.
+    scoped = (
+        scope is not None
+        and type(lean) is LeanRunner
+        and lean.cfg.max_parallel > 1
+    )
+    registry = scope.locks if scoped else _LEAN_LOCKS
     try:
-        by_loop = _LEAN_LOCKS.get(lean)
+        by_loop = registry.get(lean)
         if by_loop is None:
             by_loop = weakref.WeakKeyDictionary()
-            _LEAN_LOCKS[lean] = by_loop
+            registry[lean] = by_loop
         lock = by_loop.get(loop)
         if lock is None:
             lock = asyncio.Lock()
             by_loop[loop] = lock
+            if scoped:
+                all_by_loop = _PARALLEL_LEAN_LOCKS.setdefault(
+                    lean, weakref.WeakKeyDictionary()
+                )
+                all_by_loop.setdefault(loop, weakref.WeakSet()).add(lock)
         return lock
     except TypeError:
         lock = _FALLBACK_LEAN_LOCKS.get(loop)
@@ -214,6 +258,71 @@ def _lean_lock(lean: Any) -> asyncio.Lock:
             lock = asyncio.Lock()
             _FALLBACK_LEAN_LOCKS[loop] = lock
         return lock
+
+
+def _lean_generation_locks(lean: Any) -> List[asyncio.Lock]:
+    """Include every sample lease without retaining its session or generation."""
+
+    from .mini_session.session import _dispatch_capability_identity
+
+    lean = _dispatch_capability_identity(lean)
+    loop = asyncio.get_running_loop()
+    locks = [_lean_lock(lean)]
+    try:
+        shared = _LEAN_LOCKS.get(lean, {}).get(loop)
+        if shared is not None and shared not in locks:
+            locks.append(shared)
+        locks.extend(
+            lock
+            for lock in _PARALLEL_LEAN_LOCKS.get(lean, {}).get(loop, ())
+            if lock not in locks
+        )
+    except TypeError:
+        pass
+    return locks
+
+
+def _lean_has_live_sibling_lease(lean: Any) -> bool:
+    """A generation swap must preserve healthy leases and direct requests."""
+
+    from .mini_session.session import _dispatch_capability_identity
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    lean = _dispatch_capability_identity(lean)
+    own_lock = _lean_lock(lean)
+    locks = _lean_generation_locks(lean)
+    for lock in locks:
+        if lock is own_lock or not lock.locked():
+            continue
+        tail = (_LEAN_LATE_TAILS.get(lock) or {}).get("task")
+        if tail is None or tail.done():
+            return True
+    # Graph replay and other direct runner calls can bypass admission locks.
+    # Count logical requests as well as physical executions: a dedup follower
+    # or an environment waiter still owns a result that recovery must preserve.
+    discarded_owners = {
+        (state["task"], lock)
+        for lock in locks
+        if (state := _LEAN_LATE_TAILS.get(lock))
+        and state.get("task") is not None
+        and not state["task"].done()
+    }
+    discarded_tasks = {task for task, _lock in discarded_owners}
+    request_owners = getattr(lean, "_execution_request_owners", {})
+    for task in tuple(getattr(lean, "_active_execution_requests", ())):
+        if task.done() or task in discarded_tasks:
+            continue
+        # Built-in tactic checks use wait_for child tasks. They are discarded
+        # only with the exact inherited operation owner and this generation's
+        # marked lease; sharing a sample or runner is not enough.
+        owner = request_owners.get(task)
+        if owner is not None and owner in discarded_owners:
+            continue
+        return True
+    return False
 
 
 def _late_tail_clear_callback(lock: asyncio.Lock, state: Dict[str, Any]) -> Any:
@@ -240,13 +349,26 @@ def currently_owns_lean_lock(lean: Any) -> bool:
 def bind_owned_lean_lock(lock: asyncio.Lock) -> Any:
     """Mark this task as the Lean lock owner until the token is reset."""
 
-    return _OWNED_LEAN_LOCK.set(lock)
+    from .lean_runner import _LEAN_OPERATION_OWNER
+
+    try:
+        owner_task = asyncio.current_task()
+    except RuntimeError:
+        owner_task = None
+    return (
+        _OWNED_LEAN_LOCK.set(lock),
+        _LEAN_OPERATION_OWNER.set((owner_task, lock) if owner_task else None),
+    )
 
 
 def reset_owned_lean_lock(token: Any) -> None:
     """Drop the task-local Lean lock ownership binding."""
 
-    _OWNED_LEAN_LOCK.reset(token)
+    from .lean_runner import _LEAN_OPERATION_OWNER
+
+    lock_token, owner_token = token
+    _LEAN_OPERATION_OWNER.reset(owner_token)
+    _OWNED_LEAN_LOCK.reset(lock_token)
 
 
 def _mark_lean_late_tail(
@@ -303,7 +425,10 @@ def _lean_late_tail_status(lean: Any) -> Dict[str, Any]:
     return {
         "occupied": bool(lock.locked()),
         "late_tail": True,
-        "quarantine_due": age_s >= _LEAN_LATE_TAIL_QUARANTINE_GRACE_S,
+        "quarantine_due": (
+            age_s >= _LEAN_LATE_TAIL_QUARANTINE_GRACE_S
+            and not _lean_has_live_sibling_lease(lean)
+        ),
         "age_s": age_s,
         "operation_label": str(state.get("operation_label") or ""),
     }
@@ -328,21 +453,25 @@ def _formal_lean_admission_timeout_s(
 
 
 def _abandon_quarantined_lean_tail(lean: Any) -> bool:
-    """Detach the exact revoked result-only Lean tail from loop shutdown."""
+    """Detach the revoked generation's result-only tails from loop shutdown."""
 
-    lock = _lean_lock(lean)
-    state = _LEAN_LATE_TAILS.get(lock)
-    if not state:
-        return False
-    task = state.get("task")
-    _LEAN_LATE_TAILS.pop(lock, None)
-    if task is None or task.done():
-        return False
     from .deadline_guard import _RESULT_ONLY_DEADLINE_TASKS, _ABANDONED_DEADLINE_TASKS
 
-    _RESULT_ONLY_DEADLINE_TASKS.discard(task)
-    _ABANDONED_DEADLINE_TASKS.discard(task)
-    return True
+    detached = False
+    locks = (
+        _lean_generation_locks(lean)
+        if getattr(lean, "_quiesced", False)
+        else [_lean_lock(lean)]
+    )
+    for lock in locks:
+        state = _LEAN_LATE_TAILS.pop(lock, None) or {}
+        task = state.get("task")
+        if task is None or task.done():
+            continue
+        _RESULT_ONLY_DEADLINE_TASKS.discard(task)
+        _ABANDONED_DEADLINE_TASKS.discard(task)
+        detached = True
+    return detached
 
 
 def _safe_release_lean_lock(lock: asyncio.Lock) -> None:
@@ -412,6 +541,10 @@ def _recycle_live_session_lean_for_discarded_tail(lean: Any) -> bool:
         return False
     with _LIVE_MINI_SESSION_REFS_LOCK:
         sessions = [ref() for ref in list(_LIVE_MINI_SESSION_REFS)]
+    scope = _PARALLEL_LEAN_ADMISSION_SCOPE.get()
+    owner = scope.owner() if scope is not None else None
+    if owner is not None:
+        sessions = [owner]
     status = _lean_late_tail_status(lean)
     health = {
         "operation_label": str(status.get("operation_label") or ""),
@@ -462,6 +595,8 @@ def _prepare_lean_lock_for_new_check(
     live = _live_lean_generation(lean)
     status = _lean_late_tail_status(live)
     if not status.get("late_tail"):
+        return False
+    if _lean_has_live_sibling_lease(live):
         return False
     if _recycle_live_session_lean_for_discarded_tail(live):
         return True

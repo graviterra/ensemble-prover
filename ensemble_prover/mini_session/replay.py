@@ -50,6 +50,7 @@ from ..mini_recursive_outcome import is_resumable_mini_recursive_yield
 from ..state_data import mappingproxy_backing_dict
 from .action import ActionBudget, RepairTicket
 from .capability_policy import field_is_runtime_capability
+from .planner_jobs import PlannerJobIdentity
 
 
 JSONDict = Dict[str, Any]
@@ -1820,7 +1821,97 @@ def _action_runtime_states(session: Any) -> JSONDict:
             "class": type(action).__name__,
             "state": dict(converted),
         }
+        receipt_identities = getattr(action, "_planner_job_receipt_identities", None)
+        if isinstance(receipt_identities, Mapping):
+            # The cursor may already contain a compiled plan while its raw
+            # provider receipt still awaits outcome commit. Capture that
+            # acknowledgment authority independently of the pending cursor.
+            # Request bodies are not part of broker equality; do not duplicate
+            # potentially large provider payloads in this cleanup-only ledger.
+            states[action_id]["planner_job_receipt_identities"] = [
+                {
+                    field.name: copy.deepcopy(getattr(identity, field.name))
+                    for field in dataclasses.fields(PlannerJobIdentity)
+                    if field.compare
+                }
+                for identity in receipt_identities.values()
+            ]
     return states
+
+
+def _planner_receipt_identity_from_record(
+    raw: Any, *, action: Any, action_id: str,
+) -> PlannerJobIdentity:
+    """Decode exact acknowledgment identity without granting provider I/O."""
+
+    if not isinstance(raw, Mapping):
+        raise InvalidSessionStateShape("planner receipt identity is malformed")
+    for field in dataclasses.fields(PlannerJobIdentity):
+        if field.name not in raw:
+            continue
+        value = raw[field.name]
+        if field.name in {"pass_index", "stage_round"}:
+            valid = type(value) is int and value >= 0
+        elif field.name in {
+            "active_target_statement_keys", "helper_evidence_fingerprints",
+        }:
+            valid = isinstance(value, (list, tuple)) and all(
+                isinstance(item, str) for item in value
+            )
+        else:
+            valid = isinstance(value, str)
+        if not valid:
+            raise InvalidSessionStateShape("planner receipt identity is malformed")
+    try:
+        identity = PlannerJobIdentity(**dict(raw))
+    except (TypeError, ValueError) as exc:
+        raise InvalidSessionStateShape("planner receipt identity is malformed") from exc
+    if not identity.job_id or not identity.request_fingerprint or not identity.stage:
+        raise InvalidSessionStateShape("planner receipt identity is incomplete")
+    owner = identity.owner_lane_id
+    if owner and owner != action_id and not (
+        type(action).__name__ == "GraphRecursiveDecomposeAction"
+        and owner.startswith(f"{action_id}:")
+        and owner != f"{action_id}:"
+    ):
+        raise InvalidSessionStateShape("planner receipt belongs to another action")
+    return identity
+
+
+def _planner_receipt_identities_from_runtime_record(
+    raw_record: Mapping[str, Any], *, action: Any, action_id: str,
+) -> Dict[tuple[str, str], PlannerJobIdentity]:
+    """Validate snapshot-owned receipts before replacing any live cursor."""
+
+    raw_receipts = raw_record.get("planner_job_receipt_identities", [])
+    if not isinstance(raw_receipts, list):
+        raise InvalidSessionStateShape("planner receipt ledger is malformed")
+    identities: Dict[tuple[str, str], PlannerJobIdentity] = {}
+
+    def admit(identity: PlannerJobIdentity) -> None:
+        key = (identity.job_id, identity.request_fingerprint)
+        if key in identities and identities[key] != identity:
+            raise InvalidSessionStateShape("planner receipt identities conflict")
+        identities[key] = identity
+
+    for raw_identity in raw_receipts:
+        admit(_planner_receipt_identity_from_record(
+            raw_identity, action=action, action_id=action_id,
+        ))
+    state = raw_record.get("state")
+    driver_state = state.get("recursive_driver_state") if isinstance(state, Mapping) else None
+    if isinstance(driver_state, Mapping) and driver_state.get("phase") == "planner_job_pending":
+        try:
+            pending = _planner_receipt_identity_from_record(
+                driver_state.get("planner_job_identity"), action=action, action_id=action_id,
+            )
+        except InvalidSessionStateShape:
+            # Legacy cursors can predate the supplemental receipt ledger.
+            # Malformed pending identities still acquire no receipt authority.
+            pass
+        else:
+            admit(pending)
+    return identities
 
 
 def _action_specs_compatibility(
@@ -2180,7 +2271,9 @@ def scheduler_snapshot(
             if isinstance(budget, ActionBudget)
         },
         "cost_budget": cost_budget_record,
-        "session_state": session_state,
+        # Nested ledgers are durable authority too. A captured cutpoint must
+        # not retain references to mutable reservation or retry records.
+        "session_state": copy.deepcopy(session_state),
         "proof_state": proof_state_record,
         "replay_state_complete": not replay_state_gaps,
         "replay_state_gaps": replay_state_gaps,
@@ -2273,7 +2366,12 @@ def apply_scheduler_snapshot(session: Any, snapshot: Mapping[str, Any]) -> None:
     raw_state = snapshot.get("session_state", {})
     if not isinstance(raw_state, Mapping):
         raise InvalidSessionStateShape("session state is malformed")
-    state = dict(raw_state)
+    try:
+        # Each restore owns its values independently of both the source
+        # snapshot and other sessions restored from that same cutpoint.
+        state = copy.deepcopy(dict(raw_state))
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise InvalidSessionStateShape("session state could not be copied") from exc
     _migrate_legacy_no_applicable_recovery_state(session, state)
     validate_durable_session_state_shapes(state, snapshot_encoding=True)
     runtime_states = snapshot.get("action_runtime_states", {})
@@ -2376,6 +2474,7 @@ def apply_scheduler_snapshot(session: Any, snapshot: Mapping[str, Any]) -> None:
     except (TypeError, ValueError, OverflowError, RecursionError) as exc:
         raise InvalidSessionStateShape("session collection state is malformed") from exc
     prior_runtime_states: Dict[str, Any] = {}
+    prepared_planner_receipts: Dict[str, Dict[tuple[str, str], PlannerJobIdentity]] = {}
     restore_plan: List[tuple[str, Any, Any, Any]] = []
     applied: List[tuple[str, Any, Any, Any]] = []
     prior_answer_safe_recheck_pending = copy.deepcopy(
@@ -2471,6 +2570,12 @@ def apply_scheduler_snapshot(session: Any, snapshot: Mapping[str, Any]) -> None:
                     f"action runtime state {action_id!r} has no restore contract"
                 )
             clean_action_id = str(action_id or "")
+            if hasattr(action, "_planner_job_receipt_identities"):
+                prepared_planner_receipts[clean_action_id] = (
+                    _planner_receipt_identities_from_runtime_record(
+                        raw_record, action=action, action_id=clean_action_id,
+                    )
+                )
             prior_runtime_states[clean_action_id] = copy.deepcopy(export())
             restore_plan.append(
                 (clean_action_id, action, restore, raw_record.get("state"))
@@ -2764,6 +2869,19 @@ def apply_scheduler_snapshot(session: Any, snapshot: Mapping[str, Any]) -> None:
                 delattr(session, key)
             except AttributeError:
                 pass
+    for action_id, action, _restore, _state in applied:
+        # Provider closures belong to the previous runtime cursor. Retire
+        # them only after all durable state has restored successfully, so a
+        # rejected snapshot preserves any still-valid prepared launch.
+        take_planner_launch = getattr(action, "take_pending_planner_job_launch", None)
+        if callable(take_planner_launch):
+            take_planner_launch()
+            # Restore only identities captured with this exact cutpoint, plus
+            # a valid legacy pending identity. The replaced live map carries
+            # no authority, and an advanced cursor must not lose its consumed
+            # receipts before the restored action publishes its outcome.
+            if hasattr(action, "_planner_job_receipt_identities"):
+                action._planner_job_receipt_identities = prepared_planner_receipts[action_id]
 
 
 def replay_scheduler_selection(session: Any, snapshot: Mapping[str, Any]) -> JSONDict:

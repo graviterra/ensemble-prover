@@ -41,6 +41,7 @@ from .provider_health import (
     ProviderLanePermitOwnership,
     bound_provider_lane_health_registry,
 )
+from .provider_response import publish_provider_response
 from .proof_dossier import (
     _prompt_safe_inline_text,
     prompt_safe_malformed_tool_arguments,
@@ -5682,6 +5683,7 @@ class OpenAICompatClient:
             )
         content, data = self._process_response(resp, usage_callback=usage_callback)
         self.last_raw_response_data = dict(data) if isinstance(data, dict) else {}
+        publish_provider_response(self.last_raw_response_data)
         tool_calls = extract_tool_calls(data)
         return content, tool_calls
 

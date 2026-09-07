@@ -11632,7 +11632,7 @@ async def prove_theorem_project(
                 / uuid.uuid4().hex
             ),
             timeout_s=lean_timeout_s,
-            max_parallel=1,
+            max_parallel=max(1, min(32, int(prove_kwargs.get("parallel_samples", 1) or 1))),
             backend_mode="auto",
             module_search_paths=[str(path) for path in problem.module_search_paths],
             project_imports=list(problem.project_imports),
@@ -13681,8 +13681,9 @@ def _build_argparser() -> argparse.ArgumentParser:
             "Cost scales linearly with N. Pair with `--parallel-temps` for "
             "diversification across samples. Must be >= 1. CLI runs with N>1 "
             "use cooperative in-process fan-out. Process supervision remains "
-            "enabled; overall and startup deadlines default to unlimited, "
-            "while post-result shutdown is bounded."
+            "enabled; owned Lean runners allow one check per sample, up to 32 "
+            "concurrent checks. Overall and startup deadlines default to "
+            "unlimited, while post-result shutdown is bounded."
         ),
     )
     p.add_argument(
@@ -15073,7 +15074,9 @@ async def _main_async(args: argparse.Namespace) -> int:
             project_dir=args.lean_project_dir,
             scratch_dir=str(output_dir / ".lean_tmp"),
             timeout_s=int(args.lean_timeout_s),
-            max_parallel=1,
+            # Each sample must be able to advance its independent Lean work;
+            # retain the general Lean configuration's 32-operation ceiling.
+            max_parallel=max(1, min(32, int(getattr(args, "parallel_samples", 1) or 1))),
             backend_mode="auto",
             module_search_paths=[
                 str(path) for path in getattr(problem, "module_search_paths", ())

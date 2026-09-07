@@ -19228,6 +19228,12 @@ class MiniSession:
         old_runner = getattr(owner, "lean", None)
         if not isinstance(old_runner, LeanRunner):
             return False
+        from ..mini_formal_state_search import _lean_has_live_sibling_lease
+
+        # Parallel samples share this generation. Recovery must wait until a
+        # sibling's healthy check settles before revoking the runner.
+        if _lean_has_live_sibling_lease(old_runner):
+            return False
         recycle_count = int(
             getattr(owner, "lean_capability_generation_recycles", 0) or 0
         )
@@ -29090,9 +29096,13 @@ class MiniSession:
             )
         else:
             if (
-                new_signature is not None
-                and new_signature == self.last_proof_state_signature
+                new_signature is None
+                or new_signature == self.last_proof_state_signature
             ):
+                # Child sessions and the supported proof-state-disabled mode
+                # still spend mathematical attempts. Missing optional state
+                # cannot reset stagnation or suppress fallback/fixed-point
+                # admission after every completed unsuccessful action.
                 self.stagnation_counter += 1
             else:
                 self.stagnation_counter = 0

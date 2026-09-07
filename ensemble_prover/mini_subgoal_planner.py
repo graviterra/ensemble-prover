@@ -852,7 +852,9 @@ def compile_mini_subgoal_plan(
         )
         used_names.add(name)
         named_claims.append((claim, name))
-        ordinal_registrations.append((idx, name))
+        # Parsing can discard malformed earlier entries; ordinal references
+        # still address positions in the original provider claim array.
+        ordinal_registrations.append((claim.source_index or idx, name))
         # Phase 1: a claim's REAL name/alias must win over any ordinal alias,
         # so a dependency on a claim literally named ``claim_1`` attaches to it
         # rather than to whichever claim happens to be first.
@@ -884,6 +886,8 @@ def compile_mini_subgoal_plan(
             f"c{idx}",
         )
         for alias in _dependency_alias_keys(*ordinal_aliases):
+            if alias in ambiguous_alias_keys:
+                continue
             dependency_aliases.setdefault(alias, name)
 
     for claim, name in named_claims:

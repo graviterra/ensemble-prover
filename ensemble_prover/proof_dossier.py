@@ -324,10 +324,12 @@ _PROMPT_SPLIT_GAP_RE = r"(?:[^A-Za-z0-9_])*"
 _PROMPT_SPLIT_WORD_SEP_RE = r"(?:[^A-Za-z0-9_])+"
 _PROMPT_CONTROL_SPLIT_GAP_RE = r"(?:[^A-Za-z0-9])*"
 _PROMPT_CONTROL_SPLIT_WORD_SEP_RE = r"(?:[^A-Za-z0-9])+"
-_PROMPT_SPLIT_IDENTIFIER_GAP_RE = r"(?:[^A-Za-z0-9_\s])*"
-_SPLIT_IDENTIFIER_PREFIX_RE = (
-    r"[A-Za-z_](?:" + _PROMPT_SPLIT_IDENTIFIER_GAP_RE + r"[A-Za-z0-9_'.])*"
-)
+# The old repeated (punctuation-gap, identifier-character) pairs admitted
+# exponentially many partitions of dots/apostrophes in compact audit JSON.
+# Equivalently, a prefix starts with a letter/underscore and contains no
+# whitespace. End it at its last ASCII word character: trailing punctuation
+# belongs to the following split gap, avoiding another quadratic partition.
+_SPLIT_IDENTIFIER_PREFIX_RE = r"[A-Za-z_](?:\S*[A-Za-z0-9_])?"
 _SPLIT_SOLUTION_REF_RE = re.compile(
     r"(?<![A-Za-z0-9_.])"
     r"['`]*"
@@ -353,6 +355,8 @@ _SPLIT_SOLUTION_REF_RE = re.compile(
     r"['`]*"
     r"(?![A-Za-z0-9_.])"
 )
+_SPLIT_SOLUTION_START_RE = re.compile(r"(?<![A-Za-z0-9_.])[A-Za-z_]")
+_PROMPT_WHITESPACE_RE = re.compile(r"\s")
 _SPLIT_QUOTED_SOLUTION_REF_RE = re.compile(
     r"(?<![A-Za-z0-9_.])"
     r"(?:['`][A-Za-z0-9_'.]+['`](?:\s+|[^\w\s]+)?){1,12}"
@@ -613,6 +617,44 @@ def _prompt_security_skeleton_text(text: str) -> str:
     return skeleton
 
 
+def _iter_prompt_security_matches(
+    text: str, pattern: re.Pattern[str]
+) -> Iterable[re.Match[str]]:
+    """Avoid retrying an answer-ref prefix at every punctuation boundary.
+
+    A split identifier prefix can span any non-whitespace characters between
+    its initial letter/underscore and its final identifier character. If the
+    earliest eligible start in that run cannot match, no later start in the
+    same run can match either. Skip that failed run rather than rescanning it
+    quadratically. Successful matches retain the regex's exact original spans,
+    including split suffixes that extend across whitespace.
+    """
+
+    if pattern is not _SPLIT_SOLUTION_REF_RE:
+        yield from pattern.finditer(text)
+        return
+    cursor = 0
+    while start := _SPLIT_SOLUTION_START_RE.search(text, cursor):
+        match_start = start.start()
+        # Search for the initial letter first, then rewind its quote prefix.
+        # Searching with ['`]* at every quote was quadratic on quote-only runs.
+        while match_start > cursor and text[match_start - 1] in "'`":
+            match_start -= 1
+        if match_start < start.start() and match_start > 0:
+            previous = text[match_start - 1]
+            if previous.isascii() and (previous.isalnum() or previous in "_."):
+                match_start += 1  # the first quote lacks the required boundary
+        match = pattern.match(text, match_start)
+        if match is not None:
+            yield match
+            cursor = match.end()
+            continue
+        boundary = _PROMPT_WHITESPACE_RE.search(text, start.end())
+        if boundary is None:
+            return
+        cursor = boundary.end()
+
+
 def _redact_security_skeleton_matches(
     text: str,
     patterns: Sequence[re.Pattern[str]],
@@ -630,7 +672,7 @@ def _redact_security_skeleton_matches(
         return raw
     spans: List[Tuple[int, int]] = []
     for pattern in patterns:
-        for match in pattern.finditer(skeleton):
+        for match in _iter_prompt_security_matches(skeleton, pattern):
             if predicate is not None and not bool(predicate(match)):
                 continue
             if match.start() >= len(index_map) or match.end() <= 0:
@@ -1230,7 +1272,9 @@ def _contains_solution_ref_for_prompt(text: str) -> bool:
     """Return whether prompt text contains a direct or split answer ref."""
 
     raw = _prompt_security_skeleton_text(text)
-    if _SOLUTION_REF_RE.search(raw) or _SPLIT_SOLUTION_REF_RE.search(raw):
+    if _SOLUTION_REF_RE.search(raw) or next(
+        iter(_iter_prompt_security_matches(raw, _SPLIT_SOLUTION_REF_RE)), None
+    ) is not None:
         return True
     for match in _SPLIT_QUOTED_SOLUTION_REF_RE.finditer(raw):
         normalized = re.sub(r"[^A-Za-z0-9_]+", "", match.group(0))

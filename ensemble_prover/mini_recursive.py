@@ -2174,12 +2174,144 @@ def _verified_helper_names(helpers: Sequence[Any]) -> set[str]:
     return names
 
 
+def _claim_matches_dependency_route(
+    claim: MiniSubgoalClaim,
+    route_identity: str,
+) -> bool:
+    return bool(
+        claim.origin_plan_fingerprint
+        and claim.obligation_id
+        and claim.obligation_id
+        in {
+            _fresh_plan_obligation_id(
+                plan_fingerprint=claim.origin_plan_fingerprint,
+                route_identity=route_identity,
+            ),
+            _fresh_plan_obligation_id(
+                plan_fingerprint=claim.origin_plan_fingerprint,
+                route_identity=route_identity,
+                version=1,
+                rationale=claim.rationale,
+                sanity_check=claim.sanity_check,
+            ),
+        }
+    )
+
+
+def _claim_dependency_is_proved(
+    claim: MiniSubgoalClaim,
+    dependency: str,
+    *,
+    proved_names: AbstractSet[str],
+    proved_obligation_origins: Mapping[str, str],
+    dependency_claims: Sequence[MiniSubgoalClaim] = (),
+    helpers: Sequence[Any] = (),
+) -> bool:
+    """A frozen internal edge requires its proved obligation, not its label."""
+
+    identities = {
+        str(identity or "").strip()
+        for name, identity in claim.dependency_semantic_identities
+        if str(name or "").strip() == dependency and str(identity or "").strip()
+    }
+    if len(identities) > 1:
+        return False
+    identity = next(iter(identities), "")
+    if not identity or identity.startswith("unresolved:"):
+        return dependency in proved_names
+    if identity.startswith("ambiguous-internal:"):
+        return False
+    if any(
+        origin
+        and obligation == _fresh_plan_obligation_id(
+            plan_fingerprint=origin, route_identity=identity,
+        )
+        for obligation, origin in proved_obligation_origins.items()
+    ):
+        return True
+    # Legacy v1 obligations also bind prose. Their retained claim supplies
+    # those fields; a bare helper name cannot reconstruct that evidence.
+    matching_claims = tuple(
+        candidate
+        for candidate in dependency_claims
+        if candidate.name == dependency
+        and _claim_matches_dependency_route(candidate, identity)
+    )
+    if any(
+        any(
+            proved_obligation_origins.get(alias) == candidate.origin_plan_fingerprint
+            for alias in _claim_obligation_id_aliases(
+                candidate,
+                plan_fingerprint=candidate.origin_plan_fingerprint,
+                route_identity=identity,
+            )
+        )
+        for candidate in matching_claims
+    ):
+        return True
+    # A current verified declaration can already supply this proposition
+    # without a recursive obligation receipt (e.g. an imported short fact).
+    # Its label alone is insufficient: require the exact executable type of
+    # the prerequisite identified by the frozen edge, with no fuzzy matching.
+    helper_statements = {
+        statement
+        for helper in helpers
+        for source in (_helper_source_text(helper),)
+        if helper_decl_name(source) == dependency
+        for statement in (str(helper_decl_statement(source) or "").strip(),)
+        if statement
+    }
+    return len(helper_statements) == 1 and any(
+        _claim_contract_source_statement(candidate) in helper_statements
+        for candidate in matching_claims
+    )
+
+
+def _extend_proved_dependency_obligation_aliases(
+    proved_obligation_origins: dict[str, str],
+    plans: Sequence[MiniSubgoalPlan],
+) -> None:
+    """Retain witnessed legacy evidence before selecting away its claim.
+
+    These aliases are invocation-local: durable verified bindings retain their
+    original IDs. A current or restored planner receipt supplies the precise
+    rationale/sanity prose needed to validate a v1 receipt before deriving its
+    equivalent v2 ID. A bare label or unrecognized legacy hash adds nothing.
+    """
+
+    for plan in plans:
+        routes = _plan_claim_route_identity_map(plan)
+        for claim in plan.claims:
+            route_identity = routes.get(str(claim.name or "").strip(), "")
+            origin = str(claim.origin_plan_fingerprint or "").strip()
+            if not route_identity or not _claim_matches_dependency_route(
+                claim, route_identity,
+            ):
+                continue
+            legacy_id = _fresh_plan_obligation_id(
+                plan_fingerprint=origin,
+                route_identity=route_identity,
+                version=1,
+                rationale=claim.rationale,
+                sanity_check=claim.sanity_check,
+            )
+            if proved_obligation_origins.get(legacy_id) != origin:
+                continue
+            obligation_id = _fresh_plan_obligation_id(
+                plan_fingerprint=origin,
+                route_identity=route_identity,
+            )
+            proved_obligation_origins[obligation_id] = origin
+
+
 def _missing_claim_dependencies(
     claim: MiniSubgoalClaim,
     *,
     proved_claim_names: set[str],
     helpers: Sequence[Any],
     extra_dependencies: Sequence[str] = (),
+    proved_obligation_origins: Optional[Mapping[str, str]] = None,
+    dependency_claims: Sequence[MiniSubgoalClaim] = (),
 ) -> list[str]:
     """Declared plan dependencies must be Lean-accepted before use.
 
@@ -2196,7 +2328,14 @@ def _missing_claim_dependencies(
         if not name or name in seen:
             continue
         seen.add(name)
-        if name in proved_claim_names or name in helper_names:
+        if _claim_dependency_is_proved(
+            claim,
+            name,
+            proved_names=proved_claim_names | helper_names,
+            proved_obligation_origins=proved_obligation_origins or {},
+            dependency_claims=dependency_claims,
+            helpers=helpers,
+        ):
             continue
         missing.append(name)
     return missing
@@ -9841,6 +9980,8 @@ def _plan_root_assembly_claim_names(
     selected_claims: Optional[Sequence[MiniSubgoalClaim]] = None,
     candidate_claims: Optional[Sequence[MiniSubgoalClaim]] = None,
     satisfied_dependency_names: AbstractSet[str] = frozenset(),
+    satisfied_dependency_obligation_origins: Optional[Mapping[str, str]] = None,
+    satisfied_dependency_helpers: Sequence[Any] = (),
     active_target_statements: Sequence[str] = (),
     active_target_contract_identities: Sequence[str] = (),
 ) -> tuple[str, ...]:
@@ -9922,7 +10063,16 @@ def _plan_root_assembly_claim_names(
             visited.add(current_id)
             for raw_dependency in current_claim.dependencies:
                 dependency = str(raw_dependency or "").strip()
-                if dependency in satisfied_dependency_names:
+                if _claim_dependency_is_proved(
+                    current_claim,
+                    dependency,
+                    proved_names=satisfied_dependency_names,
+                    proved_obligation_origins=(
+                        satisfied_dependency_obligation_origins or {}
+                    ),
+                    dependency_claims=claims_by_name.get(dependency, ()),
+                    helpers=satisfied_dependency_helpers,
+                ):
                     continue
                 # Dependencies outside this plan name verified dossier helpers;
                 # they are already available and need not be selected again.
@@ -9951,22 +10101,9 @@ def _plan_root_assembly_claim_names(
                     dependency_claims = [
                         candidate
                         for candidate in dependency_claims
-                        if candidate.origin_plan_fingerprint
-                        and candidate.obligation_id
-                        and candidate.obligation_id
-                        in {
-                            _fresh_plan_obligation_id(
-                                plan_fingerprint=candidate.origin_plan_fingerprint,
-                                route_identity=dependency_identity,
-                            ),
-                            _fresh_plan_obligation_id(
-                                plan_fingerprint=candidate.origin_plan_fingerprint,
-                                route_identity=dependency_identity,
-                                version=1,
-                                rationale=candidate.rationale,
-                                sanity_check=candidate.sanity_check,
-                            ),
-                        }
+                        if _claim_matches_dependency_route(
+                            candidate, dependency_identity,
+                        )
                     ]
                     if not dependency_claims:
                         return False
@@ -11602,6 +11739,8 @@ def _ready_suspended_dependency_claims(
     proved_claim_names: set[str],
     proved_claim_obligation_ids: frozenset[str] = frozenset(),
     proved_claim_statement_keys: frozenset[str] = frozenset(),
+    proved_obligation_origins: Optional[Mapping[str, str]] = None,
+    dependency_claims: Sequence[MiniSubgoalClaim] = (),
     suppress_solution_placeholders: Optional[bool] = None,
     opaque_mode: bool = True,
     allow_official_answer_visibility: bool = False,
@@ -11648,6 +11787,8 @@ def _ready_suspended_dependency_claims(
             claim,
             proved_claim_names=proved_claim_names,
             helpers=helpers,
+            proved_obligation_origins=proved_obligation_origins,
+            dependency_claims=dependency_claims,
         ):
             continue
         else:
@@ -20390,6 +20531,9 @@ async def run_mini_recursive_driver(
 
         bound_plan, receipt_id = _bind_plan_planner_receipt(plan)
         planner_plan_receipts[receipt_id] = bound_plan
+        _extend_proved_dependency_obligation_aliases(
+            proved_claim_obligation_origins, (bound_plan,),
+        )
         for claim in bound_plan.claims:
             obligation_id = str(claim.obligation_id or "").strip()
             if obligation_id:
@@ -21304,6 +21448,7 @@ async def run_mini_recursive_driver(
     proved_claim_dependencies: dict[str, tuple[str, ...]] = {}
     proved_claim_binding_keys: dict[str, set[str]] = {}
     proved_claim_obligation_ids: set[str] = set()
+    proved_claim_obligation_origins: dict[str, str] = {}
     proved_claim_statement_keys: set[str] = set()
     candidate_bindings_by_name: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for raw_binding_key, raw_binding in list(durable_claim_helper_bindings.items()):
@@ -21342,8 +21487,14 @@ async def run_mini_recursive_driver(
         )
         if obligation_id:
             proved_claim_obligation_ids.add(obligation_id)
+            proved_claim_obligation_origins[obligation_id] = str(
+                raw_binding.get("origin_plan_fingerprint") or ""
+            ).strip()
         if statement_key:
             proved_claim_statement_keys.add(statement_key)
+    _extend_proved_dependency_obligation_aliases(
+        proved_claim_obligation_origins, tuple(planner_plan_receipts.values()),
+    )
     for claim_name, candidates in candidate_bindings_by_name.items():
         # Branch merges may retain two same-label obligations.  A bare planner
         # dependency cannot disambiguate those, so fail closed instead of
@@ -21464,6 +21615,9 @@ async def run_mini_recursive_driver(
         }
         proved_claim_binding_keys[claim_name] = {binding_key}
         proved_claim_obligation_ids.add(obligation_id)
+        proved_claim_obligation_origins[obligation_id] = str(
+            claim.origin_plan_fingerprint or ""
+        ).strip()
         statement_key = canonical_dossier_statement_key(claim.statement)
         if statement_key:
             proved_claim_statement_keys.add(statement_key)
@@ -22943,6 +23097,12 @@ async def run_mini_recursive_driver(
             helpers=helper_snapshot,
             proved_claim_names=proved_claim_names,
             proved_claim_obligation_ids=frozenset(proved_claim_obligation_ids),
+            proved_obligation_origins=proved_claim_obligation_origins,
+            dependency_claims=tuple(
+                claim
+                for receipt_plan in planner_plan_receipts.values()
+                for claim in receipt_plan.claims
+            ),
             proved_claim_statement_keys=frozenset(proved_claim_statement_keys),
             suppress_solution_placeholders=suppress_solution_placeholders,
             opaque_mode=opaque_mode,
@@ -24753,6 +24913,8 @@ async def run_mini_recursive_driver(
         compiled_root_assembly_claim_names = _plan_root_assembly_claim_names(
             plan,
             active_target_statements=plan_active_target_statements,
+            satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+            satisfied_dependency_helpers=get_helpers(),
             satisfied_dependency_names=(root_route_satisfied_dependency_names()),
         )
         # Filled after Lean canonicalization. Comparing this raw surface plan
@@ -25024,6 +25186,8 @@ async def run_mini_recursive_driver(
                 canonical_contract_plan,
                 active_target_statements=plan_active_target_statements,
                 active_target_contract_identities=(active_target_contract_identities),
+                satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                satisfied_dependency_helpers=get_helpers(),
                 satisfied_dependency_names=(root_route_satisfied_dependency_names()),
             )
             compiled_root_assembly_claim_names = tuple(
@@ -25041,6 +25205,8 @@ async def run_mini_recursive_driver(
                     active_target_contract_identities=(
                         active_target_contract_identities
                     ),
+                    satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                    satisfied_dependency_helpers=get_helpers(),
                     satisfied_dependency_names=(
                         root_route_satisfied_dependency_names()
                     ),
@@ -25623,6 +25789,8 @@ async def run_mini_recursive_driver(
                 canonical_contract_plan,
                 active_target_statements=plan_active_target_statements,
                 active_target_contract_identities=(active_target_contract_identities),
+                satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                satisfied_dependency_helpers=get_helpers(),
                 satisfied_dependency_names=(root_route_satisfied_dependency_names()),
             )
             # Legacy canonicalizers provide elaboration but no isDefEq matrix.
@@ -25763,6 +25931,8 @@ async def run_mini_recursive_driver(
                 # proposition is root-related. Route closure is classified
                 # separately below so a missing premise becomes dependency
                 # taint, never a false contract mismatch.
+                satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                satisfied_dependency_helpers=get_helpers(),
                 satisfied_dependency_names=frozenset(
                     str(dependency or "").strip()
                     for claim in canonical_contract_plan.claims
@@ -25803,6 +25973,8 @@ async def run_mini_recursive_driver(
                 plan,
                 active_target_statements=plan_active_target_statements,
                 active_target_contract_identities=(active_target_contract_identities),
+                satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                satisfied_dependency_helpers=get_helpers(),
                 satisfied_dependency_names=(root_route_satisfied_dependency_names()),
             )
             selected_claim_names = {str(claim.name or "") for claim in plan.claims}
@@ -25860,6 +26032,8 @@ async def run_mini_recursive_driver(
                     active_target_contract_identities=(
                         active_target_contract_identities
                     ),
+                    satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                    satisfied_dependency_helpers=get_helpers(),
                     satisfied_dependency_names=(
                         root_route_satisfied_dependency_names()
                     ),
@@ -25869,6 +26043,8 @@ async def run_mini_recursive_driver(
                 plan,
                 active_target_statements=plan_active_target_statements,
                 active_target_contract_identities=(active_target_contract_identities),
+                satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                satisfied_dependency_helpers=get_helpers(),
                 satisfied_dependency_names=(root_route_satisfied_dependency_names()),
             )
             current_root_route_identities = _plan_root_route_identity_set(
@@ -26318,6 +26494,8 @@ async def run_mini_recursive_driver(
                     _plan_root_assembly_claim_names(
                         replan,
                         active_target_statements=(plan_active_target_statements),
+                        satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                        satisfied_dependency_helpers=get_helpers(),
                         satisfied_dependency_names=(
                             root_route_satisfied_dependency_names()
                         ),
@@ -26766,6 +26944,8 @@ async def run_mini_recursive_driver(
                                     active_target_contract_identities=(
                                         replan_active_target_contract_identities
                                     ),
+                                    satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                                    satisfied_dependency_helpers=get_helpers(),
                                     satisfied_dependency_names=(
                                         root_route_satisfied_dependency_names()
                                     ),
@@ -26780,6 +26960,8 @@ async def run_mini_recursive_driver(
                             active_target_contract_identities=(
                                 replan_active_target_contract_identities
                             ),
+                            satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                            satisfied_dependency_helpers=get_helpers(),
                             satisfied_dependency_names=(
                                 root_route_satisfied_dependency_names()
                             ),
@@ -27001,6 +27183,8 @@ async def run_mini_recursive_driver(
                         active_target_contract_identities=(
                             replan_active_target_contract_identities
                         ),
+                        satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                        satisfied_dependency_helpers=get_helpers(),
                         satisfied_dependency_names=(
                             root_route_satisfied_dependency_names()
                         ),
@@ -27044,6 +27228,8 @@ async def run_mini_recursive_driver(
                             active_target_contract_identities=(
                                 replan_active_target_contract_identities
                             ),
+                            satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                            satisfied_dependency_helpers=get_helpers(),
                             satisfied_dependency_names=(
                                 root_route_satisfied_dependency_names()
                             ),
@@ -27055,6 +27241,8 @@ async def run_mini_recursive_driver(
                         active_target_contract_identities=(
                             replan_active_target_contract_identities
                         ),
+                        satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                        satisfied_dependency_helpers=get_helpers(),
                         satisfied_dependency_names=(
                             root_route_satisfied_dependency_names()
                         ),
@@ -27164,6 +27352,8 @@ async def run_mini_recursive_driver(
                                         active_target_contract_identities=(
                                             replan_active_target_contract_identities
                                         ),
+                                        satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                                        satisfied_dependency_helpers=get_helpers(),
                                         satisfied_dependency_names=(
                                             root_route_satisfied_dependency_names()
                                         ),
@@ -27262,6 +27452,8 @@ async def run_mini_recursive_driver(
             plan,
             active_target_statements=plan_active_target_statements,
             active_target_contract_identities=(active_target_contract_identities),
+            satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+            satisfied_dependency_helpers=get_helpers(),
             satisfied_dependency_names=(root_route_satisfied_dependency_names()),
         )
         executable_root_route_surviving = bool(executable_root_route_names)
@@ -27765,6 +27957,8 @@ async def run_mini_recursive_driver(
             plan,
             selected_claims=claims,
             candidate_claims=claim_candidates,
+            satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+            satisfied_dependency_helpers=get_helpers(),
             satisfied_dependency_names=frozenset(
                 proved_claim_names | _verified_helper_names(get_helpers())
             ),
@@ -27788,6 +27982,8 @@ async def run_mini_recursive_driver(
                 plan,
                 selected_claims=claims,
                 candidate_claims=claim_candidates,
+                satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
+                satisfied_dependency_helpers=get_helpers(),
                 satisfied_dependency_names=satisfied_route_dependencies,
                 active_target_statements=(target,),
                 active_target_contract_identities=(
@@ -29279,6 +29475,8 @@ async def run_mini_recursive_driver(
                 claim,
                 proved_claim_names=proved_claim_names,
                 helpers=get_helpers(),
+                proved_obligation_origins=proved_claim_obligation_origins,
+                dependency_claims=claims,
             )
             if missing_dependencies:
                 stats.claims_dependency_skipped += 1
@@ -30861,6 +31059,8 @@ async def run_mini_recursive_driver(
                     selected_claim,
                     proved_claim_names=proved_claim_names,
                     helpers=get_helpers(),
+                    proved_obligation_origins=proved_claim_obligation_origins,
+                    dependency_claims=claims,
                 )
                 if not missing_dependencies or not all(
                     dependency in heuristic_quarantine_tainted_claim_names

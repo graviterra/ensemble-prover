@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace as dataclass_replace
 from pathlib import Path
 from typing import (
@@ -81,6 +82,10 @@ if TYPE_CHECKING:
     from .config import TacticOracleConfig
 
 logger = logging.getLogger(__name__)
+
+_LEAN_OPERATION_OWNER: ContextVar[
+    tuple[asyncio.Task[Any], asyncio.Lock] | None
+] = ContextVar("ensemble_prover_lean_operation_owner", default=None)
 
 _LEAN_ENVIRONMENT_OPERATION_TIMEOUT_FLOOR_S = 300.0
 
@@ -3414,6 +3419,10 @@ class LeanRunner:
         self._environment_transition_condition = asyncio.Condition()
         self._environment_transitioning = False
         self._environment_active_executions = 0
+        self._active_execution_requests: dict[asyncio.Task[Any], int] = {}
+        self._execution_request_owners: dict[
+            asyncio.Task[Any], tuple[asyncio.Task[Any], asyncio.Lock] | None
+        ] = {}
         self._inflight_exec_tasks: set[asyncio.Task[Any]] = set()
         self._owned_temp_files: set[Path] = set()
         self._request_dedup_hits: int = 0
@@ -4274,27 +4283,68 @@ class LeanRunner:
         except OSError as exc:
             return exc
 
+    def _register_execution_request(
+        self,
+        execution_task: Optional[asyncio.Task[Any]] = None,
+    ) -> Optional[asyncio.Task[Any]]:
+        """Track callers through queueing, coalescing, and backend settlement."""
+
+        if execution_task is None:
+            execution_task = asyncio.current_task()
+        if execution_task is not None:
+            owner = _LEAN_OPERATION_OWNER.get()
+            if execution_task not in self._active_execution_requests:
+                self._execution_request_owners[execution_task] = owner
+            elif self._execution_request_owners.get(execution_task) != owner:
+                # Mixed nested ownership cannot inherit a discarded caller's
+                # exemption. Keep it protected until every request settles.
+                self._execution_request_owners[execution_task] = None
+            self._active_execution_requests[execution_task] = (
+                self._active_execution_requests.get(execution_task, 0) + 1
+            )
+        return execution_task
+
+    def _unregister_execution_request(
+        self,
+        execution_task: Optional[asyncio.Task[Any]],
+    ) -> None:
+        """Release one nested request without dropping its outer transaction."""
+
+        if execution_task is None:
+            return
+        remaining = self._active_execution_requests.get(execution_task, 0) - 1
+        if remaining > 0:
+            self._active_execution_requests[execution_task] = remaining
+        else:
+            self._active_execution_requests.pop(execution_task, None)
+            self._execution_request_owners.pop(execution_task, None)
+
     async def _admit_uncached_execution(
         self,
         execution_task: Optional[asyncio.Task[Any]] = None,
     ) -> Optional[asyncio.Task[Any]]:
         """Join the runner lifecycle barrier for a multi-process transaction."""
 
-        async with self._environment_transition_condition:
-            while self._environment_transitioning:
-                await self._environment_transition_condition.wait()
-            if self._closed or self._quiesced:
-                raise RuntimeError(
-                    "LeanRunner is closed"
-                    if self._closed
-                    else "LeanRunner is quiesced (cancellation barrier)"
-                )
-            self._environment_active_executions += 1
-            if execution_task is None:
-                execution_task = asyncio.current_task()
-            if execution_task is not None:
-                self._inflight_exec_tasks.add(execution_task)
-            return execution_task
+        execution_task = self._register_execution_request(execution_task)
+        admitted = False
+        try:
+            async with self._environment_transition_condition:
+                while self._environment_transitioning:
+                    await self._environment_transition_condition.wait()
+                if self._closed or self._quiesced:
+                    raise RuntimeError(
+                        "LeanRunner is closed"
+                        if self._closed
+                        else "LeanRunner is quiesced (cancellation barrier)"
+                    )
+                self._environment_active_executions += 1
+                if execution_task is not None:
+                    self._inflight_exec_tasks.add(execution_task)
+                admitted = True
+                return execution_task
+        finally:
+            if not admitted:
+                self._unregister_execution_request(execution_task)
 
     async def _release_uncached_execution(
         self,
@@ -4302,14 +4352,17 @@ class LeanRunner:
     ) -> None:
         """Leave the lifecycle barrier entered by `_admit_uncached_execution`."""
 
-        if execution_task is not None:
-            self._inflight_exec_tasks.discard(execution_task)
-        async with self._environment_transition_condition:
-            self._environment_active_executions = max(
-                0,
-                self._environment_active_executions - 1,
-            )
-            self._environment_transition_condition.notify_all()
+        try:
+            if execution_task is not None:
+                self._inflight_exec_tasks.discard(execution_task)
+            async with self._environment_transition_condition:
+                self._environment_active_executions = max(
+                    0,
+                    self._environment_active_executions - 1,
+                )
+                self._environment_transition_condition.notify_all()
+        finally:
+            self._unregister_execution_request(execution_task)
 
     async def _execute_content(
         self,
@@ -4329,6 +4382,7 @@ class LeanRunner:
         if operation_deadline is not None:
             deadline_monotonic = min(deadline_monotonic, operation_deadline)
         environment_admitted = False
+        execution_task = self._register_execution_request()
 
         async def admit_environment_execution() -> None:
             nonlocal environment_admitted
@@ -4362,13 +4416,16 @@ class LeanRunner:
                 dispatch_observer=dispatch_observer,
             )
         finally:
-            if environment_admitted:
-                async with self._environment_transition_condition:
-                    self._environment_active_executions = max(
-                        0,
-                        self._environment_active_executions - 1,
-                    )
-                    self._environment_transition_condition.notify_all()
+            try:
+                if environment_admitted:
+                    async with self._environment_transition_condition:
+                        self._environment_active_executions = max(
+                            0,
+                            self._environment_active_executions - 1,
+                        )
+                        self._environment_transition_condition.notify_all()
+            finally:
+                self._unregister_execution_request(execution_task)
 
     async def _execute_content_unbarriered(
         self,
