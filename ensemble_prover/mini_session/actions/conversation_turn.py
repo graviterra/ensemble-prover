@@ -18166,6 +18166,59 @@ class ConversationTurnAction:
         # subsequent outer-loop dispatch would re-run the same salvage
         # work on stale data when conv_turn budget runs low.
         if proof is None:
+            if (
+                not content.strip()
+                and not helpers
+                and not lemma_dag_candidates
+                and not formalization_helper_contract
+                and not forced_final_no_artifact
+                and not turn_giveup
+                and (
+                    (
+                        skeleton_route_banked
+                        and "spawned_remaining_goals"
+                        in common_payload["tool_state_update_statuses"]
+                    )
+                    or durable_checked_tool_helpers
+                )
+            ):
+                # The tool loop deliberately ends at a durable progress
+                # boundary without requesting another assistant artifact.
+                # Publish that handoff before the missing-proof cascade can
+                # record an invented format failure or corrective feedback.
+                session.last_turn_extraction = None
+                handoff_metadata = {
+                    "role": self.role,
+                    "conv_turn_index_offset": conv_turn_offset,
+                    "conv_turn_index_absolute": absolute_turn,
+                    "conv_turn_index_phase": phase_turn,
+                    **_turn_budget_metadata(common_payload),
+                    "verdict": "tool_progress_handoff",
+                    "llm_response_recorded": llm_response_recorded,
+                    "llm_response": content,
+                    "tool_state_updates": common_payload["tool_state_updates"],
+                    "tool_state_closures": common_payload["tool_state_closures"],
+                    "tool_state_update_statuses": list(
+                        common_payload["tool_state_update_statuses"]
+                    ),
+                    **_repair_self_check_metadata(common_payload),
+                    **skeleton_route_metadata,
+                    **checked_bridge_metadata,
+                    **durable_progress_replay_metadata,
+                    "strong_progress": False,
+                    "unverified_decomposition_created": bool(skeleton_route_banked),
+                    "assembly_contracts_added": bool(skeleton_route_banked),
+                }
+                _emit_record(session, {**common_payload, **handoff_metadata})
+                return MiniOutcome(
+                    action_id=self.id,
+                    solved=False,
+                    proof=None,
+                    helpers_added=durable_checked_tool_helpers,
+                    progress=True,
+                    cost_seconds=time.monotonic() - started,
+                    metadata=handoff_metadata,
+                )
             if formalization_helper_contract:
                 session.last_turn_extraction = None
                 return await _run_graph_native_formalization_helper_contract(

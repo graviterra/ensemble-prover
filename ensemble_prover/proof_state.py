@@ -8078,7 +8078,16 @@ class ProofSearchState:
             )
             if effective_group not in parent.assembly_attempt_groups:
                 parent.assembly_attempt_groups.append(effective_group)
-            parent.action = "assemble_from_children"
+            # Keep the inverse lifecycle marker across repeated restores.
+            # A later valid route can reopen this node only while its exact
+            # quarantine provenance survives graph topology hydration.
+            if not _proof_state_residual_attestation_quarantine_snapshot(
+                parent.residual_attestation_quarantine_snapshot,
+                node_status=parent.status,
+                node_action=parent.action,
+                node_blocker=parent.blocker,
+            ):
+                parent.action = "assemble_from_children"
             for child_id in effective_group.child_node_ids:
                 child = self.nodes.get(child_id)
                 if child is None:
@@ -11480,6 +11489,7 @@ class ProofSearchState:
         required: Set[str] = set()
         authorized: Set[str] = set()
         route_validity: Dict[Tuple[str, str], bool] = {}
+        validated_children: Dict[str, Set[str]] = {}
         for node in self.nodes.values():
             node_source = (
                 node.goal.source_failure if node.goal is not None else ""
@@ -11527,6 +11537,8 @@ class ProofSearchState:
                     ),
                 )
             )
+            if parent_requires_attestation:
+                required.add(parent.node_id)
             parent_authorities = (
                 _residual_goal_attestation_authorities(
                     parent.residual_goal_attestation
@@ -11655,9 +11667,44 @@ class ProofSearchState:
                             expected_parent_identity
                         ),
                     ):
+                        # Older checkpoints may contain a validated receipt
+                        # that merely cloned its parent under different syntax.
+                        # Retain the ledger, but never authorize that route.
+                        if any(
+                            record["structural_identity"]
+                            == record["parent_structural_identity"]
+                            for record in records
+                        ):
+                            continue
                         route_validity[route_key] = True
-                        authorized.update(child_ids)
+                        validated_children.setdefault(parent.node_id, set()).update(
+                            child_ids
+                        )
                         break
+
+        # Receipt validity alone cannot authorize work below a quarantined
+        # parent. Start at intrinsic non-residual goals and follow validated
+        # routes, independently of serialized node order. A shared child only
+        # needs one reachable route; detached cycles never become anchors.
+        pending = [
+            parent_id
+            for parent_id in validated_children
+            if parent_id == self.root_node_id or parent_id not in required
+        ]
+        while pending:
+            parent_id = pending.pop()
+            for child_id in validated_children.get(parent_id, ()):
+                if child_id not in authorized:
+                    authorized.add(child_id)
+                    pending.append(child_id)
+        for route_key in route_validity:
+            parent_id = route_key[0]
+            if (
+                parent_id != self.root_node_id
+                and parent_id in required
+                and parent_id not in authorized
+            ):
+                route_validity[route_key] = False
         return required, authorized, route_validity
 
     def _parent_residual_attestation_ledger_is_authoritative(
@@ -17099,6 +17146,22 @@ class ProofSearchState:
             return self._residual_batch_admission(
                 status="terminal_rejected",
                 reason="attested_batch_validation_failed",
+                goal_count=goal_count,
+                parent_node=parent_node,
+                source=source,
+            )
+
+        # A residual identical to the closed parent makes the route circular,
+        # even if Lean renders it differently or the batch has other leaves.
+        # Compare only identities from the fully validated receipt above;
+        # a genuinely changed local context is part of the closed goal type.
+        if any(
+            record["structural_identity"] == record["parent_structural_identity"]
+            for record in records
+        ):
+            return self._residual_batch_admission(
+                status="terminal_rejected",
+                reason="attested_parent_equivalent_goal",
                 goal_count=goal_count,
                 parent_node=parent_node,
                 source=source,

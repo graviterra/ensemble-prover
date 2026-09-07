@@ -341,6 +341,14 @@ _COULD_NOT_PROVE_GOAL_RE = re.compile(
     r"\b([A-Za-z_][A-Za-z0-9_']*)\b could not prove the goal",
     re.IGNORECASE,
 )
+_LINARITH_CONTRADICTION_FAILED_RE = re.compile(
+    r"\b(n?linarith)\s+failed to find a contradiction\b",
+    re.IGNORECASE,
+)
+_EXACT_SEARCH_FAILED_RE = re.compile(
+    r"`(exact\?)`\s+could not close the goal\b",
+    re.IGNORECASE,
+)
 _RCASES_TACTIC_FAILED_RE = re.compile(r"\brcases tactic failed\b", re.IGNORECASE)
 _OBTAIN_TACTIC_FAILED_RE = re.compile(
     r"`?obtain`? requires either an expected type or a value",
@@ -1052,6 +1060,10 @@ def _extract_failed_tactic(raw: str) -> Optional[str]:
     m = _COULD_NOT_PROVE_GOAL_RE.search(raw)
     if m:
         return m.group(1).strip()
+    for regex in (_LINARITH_CONTRADICTION_FAILED_RE, _EXACT_SEARCH_FAILED_RE):
+        m = regex.search(raw)
+        if m:
+            return m.group(1).strip()
     if _RCASES_TACTIC_FAILED_RE.search(raw):
         return "rcases"
     if _INTERVAL_CASES_FAILED_RE.search(raw):
@@ -1176,6 +1188,8 @@ def has_tactic_failure(text: str) -> bool:
             _DECISION_TACTIC_FAILED_RE,
             _NO_PROGRESS_TACTIC_RE,
             _COULD_NOT_PROVE_GOAL_RE,
+            _LINARITH_CONTRADICTION_FAILED_RE,
+            _EXACT_SEARCH_FAILED_RE,
             _RCASES_TACTIC_FAILED_RE,
             _INTERVAL_CASES_FAILED_RE,
             _INSUFFICIENT_TARGETS_RE,
@@ -1763,7 +1777,20 @@ def parse_lean_output(
     result.missing_instance = (
         _extract_missing_instance(raw) if missing_instance_like else None
     )
-    result.failed_tactic = _extract_failed_tactic(raw) if result.tactic_failed else None
+    # Use the same diagnostic scope as the failure flag. Quoted warning text
+    # must not supply the name of a different tactic from the actual error.
+    result.failed_tactic = (
+        next(
+            (
+                name
+                for text in _classification_texts
+                if (name := _extract_failed_tactic(text))
+            ),
+            None,
+        )
+        if result.tactic_failed
+        else None
+    )
     result.unification_failure = (
         _extract_unification_failure(raw) if unification_failure_like else None
     )

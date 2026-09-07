@@ -1328,12 +1328,16 @@ async def _run_try_skeleton_tool_impl(
             clearer(str(parent.node_id or ""))
         mapped_reason = {
             "attested_residual_goal_cap_exceeded": "residual_goal_cap_exceeded",
+            "attested_parent_equivalent_goal": "unchanged_residual_goal",
         }.get(admission_reason, "residual_spawn_incomplete")
         return _reject(
             dossier=dossier,
             reason=mapped_reason,
             message=(
-                "try_skeleton rejected: validated residual goals could not be "
+                "try_skeleton left the active target unchanged. Continue the "
+                "proof with a reducing step before banking a route."
+                if admission_reason == "attested_parent_equivalent_goal"
+                else "try_skeleton rejected: validated residual goals could not be "
                 "attached completely to the proof-state graph."
             ),
             redact_solution_refs=redact_solution_refs,
