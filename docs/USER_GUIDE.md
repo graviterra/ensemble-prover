@@ -1208,6 +1208,5 @@ certificate that the Lean statement means the intended mathematics. Read the
 generated definitions and theorem before relying on the result. The system has
 real-Lean integration and live-example evidence; autonomous frontier success
 rates and FLT/million-line performance have not been established. See the
-[campaign guide](formalization-campaign.md) for trust boundaries and evaluation
-details, and the [adversarial audit](formalization-adversarial-review-20260905.md)
-for regression evidence.
+[advanced campaign guide](formalization-campaign.md) for export replay,
+concurrent workers, and environment recovery.
