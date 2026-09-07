@@ -2753,9 +2753,21 @@ def _dossier_statements_root_adjacent(
     *,
     conclusion_bound_names: Sequence[str] = (),
 ) -> bool:
+    from .mini_falsification.generators import _right_pi_term_mentions_dependency
+
+    # Unused outer binders must not shift the indices assigned to inner
+    # quantifiers: `(h : P) : ∃ n, Q n` and `∃ n, Q n` have the same
+    # conclusion. Keep all occurring names, in order, so live variables,
+    # shadowing, and free/bound identifier distinctions still use the scoped
+    # normalizer. The existing conservative dependency scanner retains names
+    # in binder annotations and uncertain syntax, but drops names whose only
+    # occurrences are shadowed by inner quantifiers.
     conclusion_norm = _dossier_contract_alpha_norm(
         conclusion,
-        context_bound_names=conclusion_bound_names,
+        context_bound_names=tuple(
+            name for name in conclusion_bound_names
+            if _right_pi_term_mentions_dependency(conclusion, name)
+        ),
     )
     if not conclusion_norm:
         return False
@@ -2764,7 +2776,10 @@ def _dossier_statements_root_adjacent(
     ):
         root_norm = _dossier_contract_alpha_norm(
             candidate,
-            context_bound_names=root_bound_names,
+            context_bound_names=tuple(
+                name for name in root_bound_names
+                if _right_pi_term_mentions_dependency(candidate, name)
+            ),
         )
         if root_norm and conclusion_norm == root_norm:
             return True
@@ -19714,6 +19729,22 @@ class ProofDossier:
             return 0.6
         return 0.5
 
+    def validate_helper_context(self, blocks: Sequence[str]) -> Tuple[str, ...]:
+        """Freeze an explicit helper scope after checking its current evidence."""
+        sources = tuple(blocks)
+        names = [helper_decl_name(block) for block in sources]
+        if (
+            any(not name or name not in self.verified_helpers for name in names)
+            or len(set(names)) != len(names)
+        ):
+            raise ValueError("helper context must contain unique registered declarations")
+        integrity = self.root_replay_integrity_status(replay_helpers=sources)
+        if not integrity.get("ready"):
+            raise ValueError("helper context contains stale or mismatched source evidence")
+        if not set(integrity.get("checked_helper_names", ())).issubset(names):
+            raise ValueError("helper context omits required replay dependencies")
+        return sources
+
     def render_context(
         self,
         *,
@@ -19723,6 +19754,7 @@ class ProofDossier:
         current_goal_statement: str = "",
         current_preamble: str = "",
         current_context_lemmas: Iterable[str] = (),
+        helper_context_override: Optional[Sequence[str]] = None,
     ) -> str:
         """Render a compact model-facing state update.
 
@@ -19733,6 +19765,19 @@ class ProofDossier:
         """
         self._refresh_verified_helper_quality()
         answer_safety_kwargs = self._answer_safety_kwargs()
+        if helper_context_override is not None:
+            helper_context_override = self.validate_helper_context(helper_context_override)
+        authorized_context_names = (
+            {helper_decl_name(block) for block in helper_context_override}
+            if helper_context_override is not None
+            else None
+        )
+
+        def helper_is_available(helper: VerifiedHelper) -> bool:
+            if authorized_context_names is not None:
+                return helper.name in authorized_context_names
+            return self._verified_helper_context_visible(helper)
+
         redact_solution_refs = effective_solution_placeholder_suppression(
             suppress_solution_placeholders=self.suppress_solution_placeholders,
             opaque_mode=bool(self.opaque_mode),
@@ -19754,7 +19799,11 @@ class ProofDossier:
                 self,
                 root_statement=self.root_statement or current_goal_statement,
                 preamble=current_preamble,
-                helper_blocks=self.verified_helper_blocks(),
+                helper_blocks=(
+                    list(helper_context_override)
+                    if helper_context_override is not None
+                    else self.verified_helper_blocks()
+                ),
                 require_helper_context_hash_match=True,
             )
         active_root_context = self.render_active_root_target_context(
@@ -19786,7 +19835,7 @@ class ProofDossier:
                 helper.source,
                 **answer_safety_kwargs,
             )
-            and self._verified_helper_context_visible(helper)
+            and helper_is_available(helper)
         ]
         suppressed_helpers = [
             helper
@@ -19795,7 +19844,7 @@ class ProofDossier:
                 helper.source,
                 **answer_safety_kwargs,
             )
-            and not self._verified_helper_context_visible(helper)
+            and not helper_is_available(helper)
         ]
         helper_limit = (
             None if max_helpers is None else max(0, int(max_helpers or 0))

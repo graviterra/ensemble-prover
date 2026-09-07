@@ -8,6 +8,7 @@ import inspect
 import json
 import math
 import re
+import textwrap
 import time
 import weakref
 from dataclasses import dataclass, replace
@@ -32,10 +33,13 @@ from .deadline_guard import (
     create_result_only_deadline_task,
     outer_guard_timeout_s,
 )
+from .contract_identity import has_lean_contract_identity
 from .lean_parser import canonical_error_type, fallback_error_type_from_text
+from .math_utils import _strip_lean_comments_and_strings
 from .lean_runner import (
     LEAN_RESIDUAL_VERIFIER_GENERATION,
     LeanRunner,
+    LeanStatementContractAnalysis,
     lean_residual_elaboration_context_hash,
 )
 from .theorem_project import (
@@ -69,7 +73,11 @@ from .proof_dossier import (
     is_answer_unsafe_statement_text,
     text_hash,
 )
-from .proof_graph import helper_decl_body, helper_decl_statement
+from .proof_graph import (
+    graph_statement_contract_ambiguities,
+    helper_decl_body,
+    helper_decl_statement,
+)
 import hashlib
 
 from .proof_state import (
@@ -3780,19 +3788,32 @@ def _parent_stub_validation_variants(statement: str, proof_stub: str) -> List[st
     ]
     if not bound_names:
         return variants
-    lines = [line.rstrip() for line in stub.splitlines()]
+    lines = stub.splitlines()
     if lines and lines[0].strip() == "by":
         body_lines = lines[1:]
-    elif stub.startswith("by "):
-        body_lines = [stub[3:].strip()]
+    elif re.match(r"by[ \t]", stub):
+        # Preserve the first tactic's original column along with all physical
+        # continuation lines.
+        body_lines = ("  " + stub[2:]).splitlines()
     else:
         body_lines = lines
+    body = "\n".join(body_lines)
+    tactic_text, _closed = _strip_lean_comments_and_strings(body)
+    if re.match(r"^(?:classical(?:\s*;\s*|\s+))*r?intros?\b", tactic_text.lstrip()):
+        # The caller already chose how to introduce the parent binders.
+        # Do not insert another introduction sequence ahead of those tactics.
+        return variants
+    first_tactic_line = next((line for line in tactic_text.splitlines() if line.strip()), "")
+    margin = first_tactic_line[:len(first_tactic_line) - len(first_tactic_line.lstrip())]
+    if not margin:
+        # Bare tactic snippets still need a body indentation after adding `by`.
+        margin = "  "
+        body = textwrap.indent(body, margin)
     prefixed_lines = ["by"]
-    prefixed_lines.extend(f"  intro {name}" for name in bound_names)
-    prefixed_lines.extend(
-        ("  " + line.strip()) if line.strip() else ""
-        for line in body_lines
-    )
+    prefixed_lines.extend(f"{margin}intro {name}" for name in bound_names)
+    # Keep the body intact: comment columns are not tactic layout, and moving
+    # or trimming a multiline string's lines changes the literal itself.
+    prefixed_lines.extend(body.splitlines())
     prefixed = "\n".join(prefixed_lines).strip()
     if prefixed and prefixed not in variants:
         variants.append(prefixed)
@@ -4959,6 +4980,67 @@ async def _accept_proof_state_helper(
                 error=str(exc),
             )
             return False
+    # A successful body check does not classify an arbitrary binder's sort.
+    # For example, a cached theorem over PNat may use the notation `ℕ+`,
+    # which the conservative surface parser cannot distinguish from a Prop.
+    # Obtain fresh typed evidence only where that ambiguity would hide the
+    # accepted theorem. Cache metadata is never authority for these fields.
+    contract_fields: Dict[str, Any] = {}
+    analyzer = getattr(lean, "analyze_statement_contracts", None)
+    if callable(analyzer) and graph_statement_contract_ambiguities(helper_statement):
+        operation_timeout = remaining_timeout()
+        if operation_timeout > 0.0:
+            contract_preamble = _proof_state_check_preamble(conv)
+            contract_environment = str(dossier.current_lean_environment_hash or "")
+            try:
+                analyses, _output, returncode = await await_acceptance_operation(
+                    analyzer(
+                        [helper_statement],
+                        preamble_override="\n\n".join(
+                            part for part in (contract_preamble, *context) if part
+                        ),
+                        timeout_s=operation_timeout,
+                    ),
+                    operation_timeout,
+                )
+                analysis = analyses[0] if len(analyses) == 1 else None
+                if (
+                    returncode == 0
+                    and isinstance(analysis, LeanStatementContractAnalysis)
+                    and has_lean_contract_identity(analysis.structural_identity)
+                    and analysis.binder_sorts
+                    and all(sort in {"proof", "data"} for sort in analysis.binder_sorts)
+                    and len(analysis.binder_types) == len(analysis.binder_sorts)
+                    and all(
+                        isinstance(value, str) and value.strip()
+                        for value in analysis.binder_types
+                    )
+                    and analysis.binder_sorts.count("proof")
+                    == len(analysis.proof_binder_types)
+                    and all(
+                        isinstance(value, str) and value.strip()
+                        for value in analysis.proof_binder_types
+                    )
+                    and contract_preamble == _proof_state_check_preamble(conv)
+                    and contract_environment
+                    == str(dossier.current_lean_environment_hash or "")
+                ):
+                    contract_fields = {
+                        "contract_identity": analysis.structural_identity,
+                        "contract_display_statement": analysis.display_type,
+                        "contract_binder_sorts": analysis.binder_sorts,
+                        "contract_proof_binder_types": analysis.proof_binder_types,
+                        "_contract_identity_statement": helper_statement,
+                        "_verification_environment_hash": contract_environment,
+                    }
+            except Exception:
+                # Contract classification enriches a proved helper; it must
+                # not erase paid body verification on an adapter/Lean failure.
+                # Cancellation still propagates, and without complete evidence
+                # the existing conservative visibility rule remains in force.
+                pass
+            if not contract_fields:
+                dossier.increment_tool_metric("mini_helper_contract_analysis_unavailable", 1)
     # The monotonic deadline is an admission boundary between atomic checks.
     # Once every required check was fully admitted and completed, publication
     # must not discard that valid certificate merely because the clock crossed
@@ -4994,6 +5076,7 @@ async def _accept_proof_state_helper(
                     if helper_decl_name(block)
                 ],
                 _defer_global_derived_refresh=defer_derived_refresh,
+                **contract_fields,
             )
         finally:
             if defer_derived_refresh and cache_seed_derived_refresh is not None:

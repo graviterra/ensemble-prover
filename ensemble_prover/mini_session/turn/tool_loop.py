@@ -1595,10 +1595,23 @@ def _named_checked_bridge_source(
     code: str,
     *,
     reserved_names: Sequence[str] = (),
+    allow_named_declarations: bool = False,
 ) -> tuple[str, str]:
-    """Name one already-accepted scratch example for durable helper storage."""
+    """Prepare one already-accepted scratch declaration for durable storage."""
 
     raw = str(code or "").strip()
+    if allow_named_declarations:
+        from ...proof_graph import helper_decl_kind
+        from ...helper_salvage import _fresh_helper_collision_name, _rename_helper_identifier
+
+        name = helper_decl_name(raw)
+        if name and helper_decl_kind(raw) in {"lemma", "theorem"}:
+            reserved = {canonical_lean_identifier(item) for item in reserved_names}
+            if canonical_lean_identifier(name) in reserved:
+                fresh_name = _fresh_helper_collision_name(name, reserved_names=reserved)
+                raw = _rename_helper_identifier(raw, name, fresh_name)
+                name = fresh_name
+            return name, raw
     match = _PLAIN_EXAMPLE_DECL_RE.match(raw)
     if match is None:
         return "", ""
@@ -2128,6 +2141,7 @@ async def _call_llm_with_tools_one_round_impl(
     trace_prefix: str = "",
     turn: int = 1,
     goal_statement_override: Optional[str] = None,
+    helper_context_override: Optional[Sequence[str]] = None,
     try_lean_allow_declarations: bool = False,
     try_lean_require_declaration: bool = False,
     cost_controller: Optional[Any] = None,
@@ -2150,6 +2164,47 @@ async def _call_llm_with_tools_one_round_impl(
     """
 
     primitives = _legacy_imports()
+    # This is a controller-authorized route closure, never provider input.
+    # Freeze it per dispatch; ordinary calls continue to use dossier policy.
+    if helper_context_override is not None:
+        helper_context_override = tuple(helper_context_override)
+        if dossier is None:
+            if helper_context_override:
+                raise ValueError("helper context requires a verification dossier")
+        else:
+            helper_context_override = dossier.validate_helper_context(helper_context_override)
+    initial_helper_names = (
+        set(getattr(dossier, "verified_helpers", {}) or {})
+        | {
+            helper_decl_name(block)
+            for block in dossier.verified_helper_blocks()
+        }
+        if helper_context_override is not None and dossier is not None
+        else set()
+    )
+
+    def tool_helper_blocks() -> List[str]:
+        visible = list(dossier.verified_helper_blocks()) if dossier is not None else []
+        if helper_context_override is None:
+            return visible
+        blocks = list(helper_context_override)
+        names = {helper_decl_name(block) for block in blocks}
+        # Only helpers verified after dispatch may extend the explicit scope.
+        # In particular, an empty override must not restore existing globals.
+        for block in visible:
+            name = helper_decl_name(block)
+            if name and name not in names and name not in initial_helper_names:
+                blocks.append(block)
+                names.add(name)
+        return blocks
+
+    def helper_context_kwargs() -> dict[str, Any]:
+        return (
+            {"helper_context_override": tuple(tool_helper_blocks())}
+            if helper_context_override is not None
+            else {}
+        )
+
     started = time.monotonic()
     supports_tool_calls = getattr(client, "supports_tool_calls", None)
     if use_tools and callable(supports_tool_calls):
@@ -3382,7 +3437,7 @@ async def _call_llm_with_tools_one_round_impl(
         if dossier is not None and callable(feedback_lemmas):
             context_lemmas = list(
                 feedback_lemmas(
-                    dossier.verified_helper_blocks(),
+                    tool_helper_blocks(),
                     conv,
                 )
             )
@@ -3396,6 +3451,7 @@ async def _call_llm_with_tools_one_round_impl(
                     preamble=str(getattr(conv, "preamble", "") or ""),
                     context_lemmas=context_lemmas,
                     session_scope=session_scope,
+                    **helper_context_kwargs(),
                 )
                 or []
             )
@@ -4489,6 +4545,7 @@ async def _call_llm_with_tools_one_round_impl(
                                     "is not an executable artifact for this turn. Do "
                                     "not inspect the environment or leave placeholders. "
                                     + _final_submission_shape_instruction(
+                                        allow_helper_only=bool(getattr(conv, "allow_helper_decomposition", True)),
                                         require_declaration=(
                                             try_lean_require_declaration
                                         )
@@ -4704,6 +4761,7 @@ async def _call_llm_with_tools_one_round_impl(
                                 "now disabled for this attempt. Use the results already "
                                 "present and write the active Lean artifact now. "
                                 + _final_submission_shape_instruction(
+                                    allow_helper_only=bool(getattr(conv, "allow_helper_decomposition", True)),
                                     require_declaration=try_lean_require_declaration
                                 )
                             ),
@@ -5393,7 +5451,7 @@ async def _call_llm_with_tools_one_round_impl(
                     elif name == "check_lean" and lean_check_tool_enabled:
                         context_lemmas = (
                             primitives["feedback_lemmas"](
-                                dossier.verified_helper_blocks(),
+                                tool_helper_blocks(),
                                 conv,
                             )
                             if dossier is not None
@@ -5415,7 +5473,7 @@ async def _call_llm_with_tools_one_round_impl(
                     elif name == "try_lean" and try_lean_tool_enabled:
                         context_lemmas = (
                             primitives["feedback_lemmas"](
-                                dossier.verified_helper_blocks(),
+                                tool_helper_blocks(),
                                 conv,
                             )
                             if dossier is not None
@@ -5474,6 +5532,10 @@ async def _call_llm_with_tools_one_round_impl(
                                 _named_checked_bridge_source(
                                     accepted_try_lean_code,
                                     reserved_names=reserved_bridge_names,
+                                    allow_named_declarations=(
+                                        try_lean_allow_declarations
+                                        and not try_lean_require_declaration
+                                    ),
                                 )
                             )
                             accepted_target_negation = False
@@ -5657,6 +5719,7 @@ async def _call_llm_with_tools_one_round_impl(
                                             conv=conv,
                                             dossier=dossier,
                                             proof_state=proof_state,
+                                            **helper_context_kwargs(),
                                             turn_index=turn,
                                             tool_call_index=tool_calls_used + 1,
                                             max_residual_goals=max(
@@ -5746,7 +5809,7 @@ async def _call_llm_with_tools_one_round_impl(
                             )
                     elif name == "certify_counterexample" and try_lean_tool_enabled:
                         authoritative_context_lemmas = (
-                            list(dossier.verified_helper_blocks())
+                            tool_helper_blocks()
                             if dossier is not None
                             else []
                         )
@@ -5824,6 +5887,7 @@ async def _call_llm_with_tools_one_round_impl(
                                 conv=conv,
                                 dossier=dossier,
                                 proof_state=proof_state,
+                                **helper_context_kwargs(),
                                 turn_index=turn,
                                 tool_call_index=tool_calls_used + 1,
                                 max_residual_goals=max(
@@ -5845,7 +5909,7 @@ async def _call_llm_with_tools_one_round_impl(
                     ):
                         context_lemmas = (
                             primitives["feedback_lemmas"](
-                                dossier.verified_helper_blocks(),
+                                tool_helper_blocks(),
                                 conv,
                             )
                             if dossier is not None
@@ -6979,6 +7043,7 @@ async def _call_llm_with_tools_one_round_impl(
                             "this attempt. Use the retrieved evidence to "
                             "provide your best final Lean artifact now. "
                             + _final_submission_shape_instruction(
+                                allow_helper_only=bool(getattr(conv, "allow_helper_decomposition", True)),
                                 require_declaration=try_lean_require_declaration
                             ),
                             repair_semantics=_REPAIR_CONTINUATION,
@@ -7006,6 +7071,7 @@ async def _call_llm_with_tools_one_round_impl(
                             "in a Lean comment inside the single required fenced "
                             "block alongside the artifact. "
                             + _final_submission_shape_instruction(
+                                allow_helper_only=bool(getattr(conv, "allow_helper_decomposition", True)),
                                 require_declaration=try_lean_require_declaration
                             )
                         ),
@@ -7090,6 +7156,7 @@ async def _call_llm_with_tools_one_round_impl(
                             "now disabled for this attempt. Use the results already "
                             "present and write the active Lean artifact now. "
                             + _final_submission_shape_instruction(
+                                allow_helper_only=bool(getattr(conv, "allow_helper_decomposition", True)),
                                 require_declaration=try_lean_require_declaration
                             )
                         ),
@@ -7129,6 +7196,7 @@ async def _call_llm_with_tools_one_round_impl(
                     )
                     + "). Use what you have and write the active Lean artifact now. "
                     + _final_submission_shape_instruction(
+                        allow_helper_only=bool(getattr(conv, "allow_helper_decomposition", True)),
                         require_declaration=try_lean_require_declaration
                     )
                 )

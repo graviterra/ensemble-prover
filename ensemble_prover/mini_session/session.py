@@ -18812,6 +18812,7 @@ class MiniSession:
             clean == "tactic_close"
             or clean == "recursive_controller"
             or clean == "adaptive_recursive_fallback"
+            or clean == "graph_root_replan"
         )
 
     @classmethod
@@ -19778,6 +19779,7 @@ class MiniSession:
             "proof_state_retrieval",
             "recursive_controller",
             "formal_state_search",
+            "graph_root_replan",
             "tactic_close",
             "finset_reindexing",
             "cast_normalization",
@@ -20965,6 +20967,19 @@ class MiniSession:
                 }
             )
             return None
+        root_replan = self.registered_action("graph_root_replan")
+        if root_replan is not None:
+            replan_budget = self.budgets.get(root_replan.id)
+            if (
+                not self._model_call_deferred_static_action_effective(root_replan.id)
+                and (replan_budget is None or not replan_budget.exhausted())
+                and self._safe_is_applicable(root_replan, context="root_replan_handoff")
+                and self._set_selected_work_item(
+                    root_replan.selected_replan_work(self), root_replan.id,
+                )
+            ):
+                record_repair_first_fairness_outcome(root_replan)
+                return root_replan
         reserved_fallback = self._select_reserved_no_applicable_fallback()
         if reserved_fallback is not None:
             record_repair_first_fairness_outcome(reserved_fallback)
@@ -28091,6 +28106,15 @@ class MiniSession:
                         ),
                     }
                 )
+        root_replan = self.registered_action("graph_root_replan")
+        if root_replan is not None:
+            root_replan.observe_proof_outcome(
+                self, outcome,
+                formal_progress=bool(
+                    final_strong_progress or conversation_fresh_formal_evidence
+                    or metadata.get("frontier_progress_retry_granted")
+                ),
+            )
         self._action_start_proof_work_semantic_identity = ""
         self._action_start_conversation_static_root_identity = ""
         if str(outcome.action_id or "").startswith("conversation_turn"):
@@ -30155,7 +30179,7 @@ class MiniSession:
                 _stable_value(vars(getattr(action, "config", None)))
                 for action in tuple(getattr(self, "actions", ()) or ())
                 if str(getattr(action, "id", "") or "")
-                in {"recursive_controller", "adaptive_recursive_fallback"}
+                in {"recursive_controller", "adaptive_recursive_fallback", "graph_root_replan"}
                 and hasattr(getattr(action, "config", None), "__dict__")
             ],
             # The recursive controller prefers THIS signature over the generic
@@ -34357,6 +34381,8 @@ class MiniSession:
 
     def _frontier_candidate_ids_for_work_type(self, work_type: str) -> List[str]:
         work_type = str(work_type or "")
+        if work_type == "root_replan":
+            return ["graph_root_replan"]
         if work_type == "assembly":
             return ["inter_turn_assembly"]
         if work_type == "lemma_dag_decomposition":

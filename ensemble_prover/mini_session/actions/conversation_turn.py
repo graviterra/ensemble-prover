@@ -3852,16 +3852,26 @@ def _required_formalization_decl_name(
 def _formalization_parent_statement(
     session: Any,
     merged: Dict[str, Any],
+    *,
+    authoritative_sources: Sequence[Dict[str, Any]] = (),
 ) -> str:
     """Recover the parent/root target that a formalization bridge must support."""
 
-    for key in (
-        "materialization_parent_statement",
-        "formalization_bridge_parent_statement",
-        "parent_repair_target_statement",
-        "original_root_statement",
-    ):
-        value = str(merged.get(key) or "").strip()
+    # Work-item records are prompt projections, not exact target authority.
+    # Resolve live/raw parents before projections can be persisted back into
+    # graph metadata. An explicit local parent also outranks a legacy root.
+    sources = (*authoritative_sources, merged)
+    for source in sources:
+        for key in (
+            "materialization_parent_statement",
+            "formalization_bridge_parent_statement",
+            "parent_repair_target_statement",
+        ):
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value
+    for source in sources:
+        value = str(source.get("original_root_statement") or "").strip()
         if value:
             return value
     conv = getattr(session, "conv", None)
@@ -3938,6 +3948,32 @@ def _selected_formalization_helper_contract(
     if node is not None and graph_node_frontier_quarantined(node):
         return {}
     selected_graph_work = {**node_metadata, **merged}
+    item_metadata_node_id = str(
+        item_record.get("graph_node_id")
+        or item_record.get("node_id")
+        or item_record.get("claim_id")
+        or item_record.get("obligation_id")
+        or ""
+    ).strip()
+    item_node_id = str(
+        getattr(selected_work_item, "graph_node_id", "")
+        or getattr(selected_work_item, "node_id", "")
+        or item_metadata_node_id
+        or ""
+    ).strip()
+    nested_node_id = str(
+        graph_record.get("graph_node_id")
+        or graph_record.get("node_id")
+        or graph_record.get("claim_id")
+        or graph_record.get("obligation_id")
+        or ""
+    ).strip()
+    item_parent_is_current = bool(
+        item_node_id
+        and item_node_id == node_id
+        and (not item_metadata_node_id or item_metadata_node_id == node_id)
+    )
+    nested_parent_is_current = not nested_node_id or nested_node_id == node_id
 
     def persist_selected_work_field(key: str, value: Any) -> None:
         selected_graph_work[key] = value
@@ -3945,12 +3981,12 @@ def _selected_formalization_helper_contract(
             record[key] = value
         except Exception:
             pass
-        if isinstance(record_graph_record, dict):
+        if isinstance(record_graph_record, dict) and nested_parent_is_current:
             try:
                 record_graph_record[key] = value
             except Exception:
                 pass
-        if isinstance(selected_item_graph_record, dict):
+        if isinstance(selected_item_graph_record, dict) and item_parent_is_current:
             try:
                 selected_item_graph_record[key] = value
             except Exception:
@@ -3982,7 +4018,12 @@ def _selected_formalization_helper_contract(
         persist_selected_work_field("target_statement", "")
     parent_statement = _formalization_parent_statement(
         session,
-        {**node_metadata, **merged},
+        record,
+        authoritative_sources=(
+            node_metadata,
+            item_record if item_parent_is_current else {},
+            graph_record if nested_parent_is_current else {},
+        ),
     )
     required_name = _required_formalization_decl_name(
         {**node_metadata, **merged},
@@ -4770,6 +4811,74 @@ async def _checked_formalization_closes_parent_target(
     except Exception:
         return False
     return bool(getattr(result, "ok", False))
+
+
+async def _checked_formalization_rewrites_parent_target(
+    *,
+    lean: Any,
+    conv: Any,
+    candidate: str,
+    replay_helpers: Sequence[str],
+    contract: Dict[str, Any],
+) -> bool:
+    """Probe a checked helper's relevance in Lean, without proving the parent.
+
+    The scratch metavariable is deliberately detached from the checked ``True``
+    goal. Only rewriting its conclusion earns support relevance; its proof is
+    never returned or used as root/obligation closure authority. Normalization
+    without the helper happens first so builtin simplification is not credited
+    to an unrelated declaration. ``intro`` keeps parent premises out of the
+    rewritten target, while retaining their legitimate local context.
+    """
+
+    helper_name = str(helper_decl_name(candidate) or "").strip()
+    parent_statement = _formalization_parent_target_statement(contract)
+    if not helper_name or not parent_statement:
+        return False
+    proof = (
+        "by\n"
+        "  run_tac\n"
+        "    let saved ← Lean.Elab.Tactic.getGoals\n"
+        "    let target ← Lean.Elab.Term.elabType "
+        f"(← `(term| ({parent_statement})))\n"
+        "    let support ← Lean.Elab.Term.elabTerm "
+        f"(← `(term| @{helper_name})) none\n"
+        "    Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing\n"
+        "    let target ← Lean.instantiateMVars target\n"
+        "    let support ← Lean.instantiateMVars support\n"
+        "    let probe ← Lean.Meta.mkFreshExprMVar target\n"
+        "    Lean.Elab.Tactic.setGoals [probe.mvarId!]\n"
+        "    Lean.Elab.Tactic.evalTactic (← `(tactic| repeat intro))\n"
+        "    Lean.Elab.Tactic.evalTactic "
+        "(← `(tactic| simp (failIfUnchanged := false) only [one_div, funext_iff]))\n"
+        "    let before ← Lean.Elab.Tactic.getMainTarget\n"
+        "    let supportName ← Lean.mkFreshUserName `bridgeSupport\n"
+        "    let (_, supportedGoal) ← (← Lean.Elab.Tactic.getMainGoal).note supportName support\n"
+        "    Lean.Elab.Tactic.setGoals [supportedGoal]\n"
+        "    let supportId := Lean.mkIdent supportName\n"
+        "    Lean.Elab.Tactic.evalTactic "
+        "(← `(tactic| simp (failIfUnchanged := false) only [one_div, funext_iff] at $supportId:ident))\n"
+        "    Lean.Elab.Tactic.evalTactic (← `(tactic| simp only [$supportId:ident]))\n"
+        "    unless (← Lean.Elab.Tactic.getGoals).isEmpty do\n"
+        "      let after ← Lean.Elab.Tactic.getMainTarget\n"
+        "      if ← Lean.Meta.isDefEq before after then\n"
+        '        throwError "helper did not rewrite parent conclusion"\n'
+        "    Lean.Elab.Tactic.setGoals saved\n"
+        "  trivial"
+    )
+    try:
+        result = await lean.check(
+            "True",
+            proof,
+            list(replay_helpers),
+            preamble_override=str(getattr(conv, "preamble", "") or ""),
+            check_kind="graph_native_formalization_parent_rewrite",
+        )
+    except Exception:
+        # Timeout, unsupported checker, or malformed parent is not relevance
+        # evidence. Preserve the original conservative bridge rejection.
+        return False
+    return bool(getattr(result, "ok", False)) and getattr(result, "returncode", 1) == 0
 
 
 def _formalization_helper_feedback(
@@ -6561,7 +6670,7 @@ async def _run_graph_native_formalization_helper_contract(
         if not callable(analyzer) or not str(statement or "").strip():
             return None
         try:
-            analyses, _output, _returncode = await analyzer(
+            analyses, _output, returncode = await analyzer(
                 [statement],
                 preamble_override="\n\n".join(
                     part
@@ -6577,10 +6686,12 @@ async def _run_graph_native_formalization_helper_contract(
             )
         except Exception:
             return None
-        analysis = next(iter(analyses or ()), None)
-        if not str(
-            getattr(analysis, "structural_identity", "") or ""
-        ).strip():
+        if returncode != 0 or not isinstance(analyses, (list, tuple)) or len(analyses) != 1:
+            return None
+        analysis = analyses[0]
+        if not has_lean_contract_identity(
+            str(getattr(analysis, "structural_identity", "") or "")
+        ):
             return None
         return analysis
 
@@ -6754,6 +6865,28 @@ async def _run_graph_native_formalization_helper_contract(
                     parent_target_binding_reason
                 ),
             }
+        elif (
+            bridge_status.get("reason")
+            == "auxiliary_bridge_statement_unrelated_to_parent"
+            and has_lean_contract_identity(
+                str(getattr(contract_analysis, "structural_identity", "") or "")
+            )
+            and await _checked_formalization_rewrites_parent_target(
+                lean=lean,
+                conv=conv,
+                candidate=candidate,
+                replay_helpers=candidate_replay_helpers,
+                contract=contract,
+            )
+        ):
+            bridge_status = {
+                "accepted": True,
+                "reason": "lean_verified_parent_rewrite_support",
+                "closes_target": False,
+                "requires_parent_assembly": True,
+                "surface_relevance_status": dict(bridge_status),
+            }
+        publication_guard()
         if not bool(bridge_status.get("accepted")):
             last_failure = str(
                 bridge_status.get("reason")
@@ -6972,6 +7105,7 @@ async def _run_graph_native_formalization_helper_contract(
                         "same-turn helper dependency requires replay-only prefix"
                     )
                     break
+            publication_guard()
             dependency_record = dossier.record_verified_helper(
                 dependency_block,
                 phase=f"{getattr(conv, 'role', 'prove')}_graph_native_formalization",
@@ -7043,6 +7177,7 @@ async def _run_graph_native_formalization_helper_contract(
                     "verdict": "graph_native_formalization_dependency_rejected",
                 })
                 continue
+        publication_guard()
         helper_record = dossier.record_verified_helper(
             candidate,
             phase=f"{getattr(conv, 'role', 'prove')}_graph_native_formalization",
@@ -12537,20 +12672,22 @@ class ConversationTurnAction:
             ) = _selected_assemble_route_contract_context(session)
         llm_dossier = dossier
         if assemble_route_goal_statement and dossier is not None:
-            try:
-                llm_dossier = copy.copy(dossier)
-                setattr(llm_dossier, "_mini_skip_proof_state_reconcile", True)
-                verified_helpers = getattr(dossier, "verified_helpers", {}) or {}
-                if isinstance(verified_helpers, dict):
-                    llm_dossier.verified_helpers = {
-                        name: verified_helpers[name]
-                        for name in assemble_route_helper_names
-                        if name in verified_helpers
-                    }
-                if hasattr(llm_dossier, "proposed_helpers"):
-                    llm_dossier.proposed_helpers = {}
-            except Exception:
-                llm_dossier = dossier
+            # Tools need the same replay dependencies as the route verifier.
+            # Keep their records for subsequent helper receipts, without
+            # promoting route-local helpers into global proof context.
+            llm_dossier = copy.copy(dossier)
+            setattr(llm_dossier, "_mini_skip_proof_state_reconcile", True)
+            verified_helpers = getattr(dossier, "verified_helpers", {}) or {}
+            closure_names = {
+                helper_decl_name(block) for block in assemble_route_helper_blocks
+            }
+            llm_dossier.verified_helpers = {
+                name: helper
+                for name, helper in verified_helpers.items()
+                if name in closure_names
+            }
+            if hasattr(llm_dossier, "proposed_helpers"):
+                llm_dossier.proposed_helpers = {}
         selected_goal_statement_override = graph_native_goal_statement or None
         llm_goal_statement_override = selected_goal_statement_override
         if assemble_route_goal_statement and not llm_goal_statement_override:
@@ -13515,8 +13652,14 @@ class ConversationTurnAction:
                                 goal_statement_override=(
                                     llm_goal_statement_override
                                 ),
+                                helper_context_override=(
+                                    tuple(assemble_route_helper_blocks)
+                                    if assemble_route_goal_statement
+                                    else None
+                                ),
                                 try_lean_allow_declarations=bool(
                                     formalization_helper_contract
+                                    or getattr(workspace_conv, "allow_helper_decomposition", True)
                                 ),
                                 try_lean_require_declaration=bool(
                                     formalization_helper_contract

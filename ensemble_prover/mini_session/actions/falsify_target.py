@@ -32,6 +32,7 @@ from ensemble_prover.mini_falsification.veto import (
     make_falsification_veto_policy,
     record_veto_outcome,
     session_has_recursive_controller,
+    stalled_search_is_parked,
 )
 from ensemble_prover.proof_dossier import (
     _statements_share_bound_lean_identity,
@@ -330,9 +331,27 @@ class FalsifyTargetAction:
                     target_statement
                 )
             )
+            search_policy = (
+                self.policy
+                if self._lane == "idle" or helper_growth_replay
+                else self._veto_policy
+            )
+            if stalled_search_is_parked(
+                dossier,
+                skip_key,
+                statement=target_statement,
+                environment_hash=falsification_environment_hash(
+                    preamble=str(session.acceptance_preamble() or ""),
+                    helpers=helpers,
+                    policy=search_policy,
+                    lean=getattr(session, "lean", None),
+                ),
+                policy_hash=search_policy.policy_hash,
+            ):
+                continue
             if helper_growth_replay:
-                # New helpers do not reopen ordinary root search, but they
-                # may enable certification of an already-found candidate.
+                # New helpers may enable certification, but repeated failures
+                # in that unchanged new environment still share the retry cap.
                 return target
             if self._lane == "foreground":
                 if foreground_veto_is_spent(dossier, skip_key):
@@ -676,6 +695,13 @@ class FalsifyTargetAction:
             "falsification_report": report.to_record(),
             "falsification_coverage_pending": report.has_pending_coverage,
             "falsification_lane": self._lane,
+            "falsification_cursor_parked": stalled_search_is_parked(
+                dossier,
+                self._skip_key_for(session, target),
+                statement=report.statement,
+                environment_hash=report.environment_hash,
+                policy_hash=report.policy_hash,
+            ),
             "authoritative_refutation": promoted,
             "terminalized_proof_state_aliases": list(
                 terminalized_proof_state_aliases

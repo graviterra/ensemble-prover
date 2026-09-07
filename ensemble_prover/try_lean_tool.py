@@ -33,6 +33,7 @@ from .proof_dossier import (
     _prompt_safe_lean_diagnostic_text,
 )
 from .proof_graph import (
+    _helper_decl_header,
     graph_statement_is_executable,
     helper_decl_body,
     helper_decl_kind,
@@ -55,6 +56,9 @@ TRY_LEAN_TOOL: Dict[str, Any] = {
             "the current theorem goal. For target-integrity or counterexample "
             "evidence, `code` may be one complete top-level "
             "`example : ... := by ...` scratch declaration. When the prompt "
+            "allows independent helper progress, you may also submit one "
+            "complete named theorem/lemma; it is checked independently and "
+            "does not establish the active goal. When the prompt "
             "explicitly says the "
             "selected graph task still needs formalization, `code` must instead "
             "be one complete theorem/lemma proposition declaration with its proof. Do not "
@@ -68,7 +72,8 @@ TRY_LEAN_TOOL: Dict[str, Any] = {
                     "type": "string",
                     "description": (
                         "Active-turn Lean artifact to test: usually a proof body "
-                        "starting with `by`; when the active prompt requires "
+                        "starting with `by`, or one complete named helper when "
+                        "the prompt allows helper progress; when it requires "
                         "formalization, use one complete named theorem or lemma "
                         "declaration instead."
                     ),
@@ -173,6 +178,30 @@ def _example_has_extra_command(src: str) -> bool:
     if leading is None:
         return True
     return _EXTRA_EXAMPLE_COMMAND_RE.search(masked, leading.end()) is not None
+
+
+def _named_declaration_has_extra_command(src: str) -> bool:
+    """Check the parsed declaration tail without narrowing supported headers."""
+
+    header = _helper_decl_header(src)
+    if header is None:
+        return True
+    masked = _strip_lean_comments_and_strings(header[2])
+    masked = re.sub(r"«[^»]*(?:»|$)", "", masked)
+    if _EXTRA_EXAMPLE_COMMAND_RE.search(masked):
+        return True
+    # `open ... in` is a valid proof-term scope, including selective opens and
+    # renaming. An unscoped `open` is a second environment command. Leave the
+    # namespace-spec grammar to Lean; only require its lexical scope boundary.
+    pending_open = False
+    for match in re.finditer(r"(?<![\w'`.«!?])(?:open|in)(?![\w'.»!?])", masked):
+        if match.group(0) == "open":
+            if pending_open:
+                return True
+            pending_open = True
+        else:
+            pending_open = False
+    return pending_open
 
 
 def _isolate_example_declaration(src: str) -> str:
@@ -595,6 +624,11 @@ async def _run_try_lean_tool_impl(
             return record_preflight_error(
                 "try_lean error: formalization declarations must be theorem or "
                 "lemma propositions with complete proofs."
+            )
+        if _named_declaration_has_extra_command(code):
+            return record_preflight_error(
+                "try_lean error: submit exactly one complete theorem or lemma "
+                "declaration and no additional Lean commands."
             )
         statement = helper_decl_statement(code)
         body = helper_decl_body(code)

@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 import time
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .lean_parser import canonical_error_type, diagnostic_preview, parse_lean_output
 from .mini_deadline_transaction import (
@@ -503,8 +503,6 @@ def _top_level_command_in_proof_body_reason(proof_stub: str) -> str:
         line = raw_line.lstrip()
         if not line:
             continue
-        if ";" in line:
-            return "semicolon_skeleton_unsupported"
         command_reason = _top_level_command_reason_from_tokens(
             _lean_ident_token_sequence(line)
         )
@@ -560,6 +558,7 @@ async def _lean_check_skeleton(
     last_result = None
     last_candidate_stub = str(proof_stub or "")
     unresolved_candidate: tuple[str, str, Any] | None = None
+    first_rejection: tuple[str, str, Any] | None = None
     for candidate_stub in _parent_stub_validation_variants(parent.target, proof_stub):
         if not str(candidate_stub or "").strip():
             continue
@@ -661,6 +660,8 @@ async def _lean_check_skeleton(
         last_reason = str(
             getattr(result, "error", "") or error_type or last_reason
         )
+        if last_reason in _CONCLUSIVE_TYPED_RESIDUAL_REJECTIONS and first_rejection is None:
+            first_rejection = (last_reason, last_candidate_stub, last_result)
         if (
             last_reason not in _CONCLUSIVE_TYPED_RESIDUAL_REJECTIONS
             and unresolved_candidate is None
@@ -692,6 +693,11 @@ async def _lean_check_skeleton(
             unresolved_candidate
         )
         return None, unresolved_reason, unresolved_result, unresolved_stub
+    if first_rejection is not None:
+        # A speculative binder wrapper must not replace the submitted proof's
+        # diagnostic when all variants were conclusively rejected by Lean.
+        reason, rejected_stub, rejected_result = first_rejection
+        return None, reason, rejected_result, rejected_stub
     return None, last_reason, last_result, last_candidate_stub
 
 
@@ -755,6 +761,7 @@ async def _run_try_skeleton_tool_impl(
     conv: Any,
     dossier: Optional[ProofDossier],
     proof_state: Optional[ProofSearchState],
+    helper_context_override: Optional[Sequence[str]] = None,
     turn_index: int = 0,
     tool_call_index: int = 0,
     max_residual_goals: int = 4,
@@ -958,7 +965,11 @@ async def _run_try_skeleton_tool_impl(
     residual_preamble = _proof_state_residual_preamble(conv)
     residual_helpers = _proof_state_residual_lemmas(
         conv,
-        _proof_state_verified_helper_blocks(dossier),
+        (
+            list(helper_context_override)
+            if helper_context_override is not None
+            else _proof_state_verified_helper_blocks(dossier)
+        ),
     )
     residual_operation_timeout = _typed_residual_operation_timeout(
         lean,

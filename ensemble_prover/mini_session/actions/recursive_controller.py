@@ -890,6 +890,8 @@ class RecursiveControllerAction:
             budget_kind=(
                 "adaptive_recursive_fallback"
                 if self.budget_attr == "adaptive_recursive_pass_budget_remaining"
+                else "graph_root_replan"
+                if self.id == "graph_root_replan"
                 else "recursive_prepass"
             ),
             config=cfg,
@@ -1396,6 +1398,8 @@ class RecursiveControllerAction:
                 "budget_kind": (
                     "adaptive_recursive_fallback"
                     if self.budget_attr == "adaptive_recursive_pass_budget_remaining"
+                    else "graph_root_replan"
+                    if self.id == "graph_root_replan"
                     else "recursive_prepass"
                 ),
                 "recursive_budget_remaining": int(

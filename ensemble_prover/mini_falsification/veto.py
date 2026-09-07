@@ -44,6 +44,7 @@ DEFAULT_FALSIFICATION_VETO_ENGINE_TIMEOUT_S = 7.5
 DEFAULT_FALSIFICATION_VETO_SEARCH_TIMEOUT_S = 8.0
 # Exponential yield, not a cap that abandons work during a long outage.
 DEFAULT_FALSIFICATION_INFRA_BACKOFF_S = (0.0, 1.0, 4.0, 16.0, 32.0)
+DEFAULT_FALSIFICATION_STALLED_CURSOR_ATTEMPTS = 3
 
 _SCHEDULER_RUNTIME_ATTR = "_mini_falsification_scheduler_runtime"
 
@@ -195,6 +196,8 @@ def scheduler_runtime(dossier: Any) -> dict[str, Any]:
     state.setdefault("coverage_pending", set())
     state.setdefault("infra_backoff", {})
     state.setdefault("helper_fingerprint", {})
+    state.setdefault("search_stalls", {})
+    state.setdefault("search_evidence", {})
     return state
 
 
@@ -210,6 +213,8 @@ def copy_scheduler_runtime(dst: Any, src: Any) -> None:
             "coverage_pending": set(source.get("coverage_pending") or ()),
             "infra_backoff": copy.deepcopy(dict(source.get("infra_backoff") or {})),
             "helper_fingerprint": dict(source.get("helper_fingerprint") or {}),
+            "search_stalls": copy.deepcopy(dict(source.get("search_stalls") or {})),
+            "search_evidence": copy.deepcopy(dict(source.get("search_evidence") or {})),
         },
     )
 
@@ -316,6 +321,111 @@ def coverage_is_pending(dossier: Any, skip_key: str) -> bool:
     return skip_key in scheduler_runtime(dossier)["coverage_pending"]
 
 
+def _search_stall_key(skip_key: str, environment_hash: str, policy_hash: str) -> str:
+    return content_hash((skip_key, environment_hash, policy_hash))
+
+
+def _search_cursor_signature(
+    dossier: Any,
+    statement: str,
+    environment_hash: str,
+) -> str:
+    getter = getattr(dossier, "falsification_cursors_for_statement", None)
+    cursors = dict(
+        getter(statement, environment_hash=environment_hash)
+        if callable(getter) else {}
+    )
+    # Only admitted durable cursors describe progress. Reapplying report
+    # metadata here could disagree with the dossier's monotone cursor merge.
+    progress = {
+        engine: {key: value for key, value in dict(cursor).items() if key != "lane_quanta"}
+        for engine, cursor in cursors.items()
+        if isinstance(cursor, dict)
+        and any(key != "lane_quanta" for key in cursor)
+    }
+    candidate_getter = getattr(
+        dossier, "lean_checked_unpromoted_refutation_candidates_for_statement", None,
+    )
+    findings = candidate_getter(statement) if callable(candidate_getter) else ()
+    candidates = {
+        content_hash((
+            candidate.get("engine", finding.get("engine", "")),
+            candidate.get("witness_terms", ()),
+            candidate.get("concrete_statement", ""),
+        ))
+        for finding in findings
+        for candidate in finding.get("candidates", ())
+    }
+    # Advisory candidates can disappear from the latest report without being
+    # disproved. Remember semantic observations for this process/environment,
+    # so omission and reappearance of the same witness cannot renew its budget.
+    evidence_key = content_hash((statement, environment_hash))
+    evidence = scheduler_runtime(dossier)["search_evidence"]
+    seen = set(evidence.get(evidence_key) or ()) | candidates
+    evidence[evidence_key] = sorted(seen)
+    return content_hash((progress, sorted(seen)))
+
+
+def stalled_search_is_parked(
+    dossier: Any,
+    skip_key: str,
+    *,
+    statement: str,
+    environment_hash: str,
+    policy_hash: str,
+) -> bool:
+    """Park unchanged optional search, never consume its witness or evidence."""
+
+    key = _search_stall_key(skip_key, environment_hash, policy_hash)
+    record = scheduler_runtime(dossier)["search_stalls"].get(key) or {}
+    return bool(
+        int(record.get("failures", 0)) >= DEFAULT_FALSIFICATION_STALLED_CURSOR_ATTEMPTS
+        and record.get("cursor_signature")
+        == _search_cursor_signature(dossier, statement, environment_hash)
+    )
+
+
+def _note_stalled_search(dossier: Any, skip_key: str, report: FalsificationReport) -> None:
+    from ..proof_dossier import (
+        _recipe_repair_cursor_matches_finding,
+        _validated_falsification_cursor,
+    )
+
+    cursor_getter = getattr(dossier, "falsification_cursors_for_statement", None)
+    if not callable(cursor_getter):
+        return
+    cursors = cursor_getter(report.statement, environment_hash=report.environment_hash)
+    for finding in report.findings:
+        if finding.outcome is not FalsificationOutcome.TRANSIENT_FAILURE:
+            continue
+        cursor = _validated_falsification_cursor(finding.cursor, engine=finding.engine)
+        if cursor is None or not _recipe_repair_cursor_matches_finding(
+            finding.to_record(), cursor,
+        ):
+            continue
+        durable = dict(cursors.get(finding.engine) or {})
+        if all(
+            durable.get(key) == value
+            for key, value in cursor.items() if key != "lane_quanta"
+        ):
+            break
+    else:
+        return
+    key = _search_stall_key(skip_key, report.environment_hash, report.policy_hash)
+    stalls = scheduler_runtime(dossier)["search_stalls"]
+    previous = dict(stalls.get(key) or {})
+    signature = _search_cursor_signature(
+        dossier, report.statement, report.environment_hash,
+    )
+    stalls[key] = {
+        "cursor_signature": signature,
+        "failures": (
+            min(DEFAULT_FALSIFICATION_STALLED_CURSOR_ATTEMPTS, int(previous.get("failures", 0)) + 1)
+            if previous.get("cursor_signature") == signature else 1
+        ),
+    }
+
+
 def record_veto_outcome(
     dossier: Any,
     skip_key: str,
@@ -325,9 +435,10 @@ def record_veto_outcome(
     capability: Any = None,
     now: float | None = None,
 ) -> None:
-    """Latch search memory without abandoning retryable work."""
+    """Latch search memory after the report's durable cursor/evidence admission."""
 
     if report.outcome is FalsificationOutcome.TRANSIENT_FAILURE:
+        _note_stalled_search(dossier, skip_key, report)
         note_infrastructure_failure(
             dossier, skip_key, capability=capability, now=now
         )
@@ -348,6 +459,7 @@ def plan_prove_mode_falsification(
     statement: str,
     local_hypotheses: Sequence[str] = (),
     preamble: str = "",
+    helpers: Sequence[Any] = (),
     policy: FalsificationPolicy,
     lean: Any = None,
     resume: bool = False,
@@ -368,6 +480,23 @@ def plan_prove_mode_falsification(
         policy=policy,
         lean=lean,
     )
+    veto_policy = make_falsification_veto_policy(policy)
+    cursor_statement = (
+        build_local_sequent(statement, local_hypotheses)
+        if local_hypotheses else statement
+    )
+    if stalled_search_is_parked(
+        dossier,
+        skip_key,
+        statement=cursor_statement,
+        environment_hash=falsification_environment_hash(
+            preamble=preamble, helpers=helpers, policy=veto_policy, lean=lean,
+        ),
+        policy_hash=veto_policy.policy_hash,
+    ):
+        return ProveModeFalsificationDecision(
+            skip_key=skip_key, skip_reason="stalled_search",
+        )
     if foreground_veto_is_spent(dossier, skip_key):
         return ProveModeFalsificationDecision(
             skip_key=skip_key,
@@ -414,6 +543,7 @@ async def run_prove_mode_falsification(
         statement=statement,
         local_hypotheses=local_hypotheses,
         preamble=preamble,
+        helpers=helpers,
         policy=campaign_service.policy,
         lean=lean,
         resume=resume,
@@ -447,8 +577,8 @@ async def run_prove_mode_falsification(
         return (_empty_report(),)
 
     reports: list[FalsificationReport] = []
-    # Transient infrastructure does not spend the latch.  It retries after
-    # backoff or a capability-generation wakeup, indefinitely.
+    # Transient infrastructure does not spend the latch. Backoff permits
+    # recovery until repeated failures at the same search cursor park it.
     veto_due = not decision.skip_reason
 
     if veto_due:
@@ -478,6 +608,7 @@ async def run_prove_mode_falsification(
             local_hypotheses=local_hypotheses,
             cursors=cursors,
         )
+        await _observe(report)
         record_veto_outcome(
             dossier,
             skip_key,
@@ -485,7 +616,6 @@ async def run_prove_mode_falsification(
             helpers=helpers,
             capability=capability,
         )
-        await _observe(report)
         reports.append(report)
     else:
         reports.append(_empty_report())
@@ -498,6 +628,17 @@ async def run_prove_mode_falsification(
         adaptive_campaign
         and adaptive_campaign_is_serviceable
         and reports[-1].authoritative_refutation is None
+        and not infra_retry_is_blocked(dossier, skip_key, capability=capability)
+        and not stalled_search_is_parked(
+            dossier,
+            skip_key,
+            statement=(
+                build_local_sequent(statement, local_hypotheses)
+                if local_hypotheses else statement
+            ),
+            environment_hash=environment_hash,
+            policy_hash=campaign_service.policy.policy_hash,
+        )
     ):
         cursor_getter = getattr(dossier, "falsification_cursors_for_statement", None)
         cursor_statement = (
@@ -519,8 +660,9 @@ async def run_prove_mode_falsification(
             local_hypotheses=local_hypotheses,
             cursors=cursors,
         )
-        if campaign_report.has_pending_coverage:
-            scheduler_runtime(dossier)["coverage_pending"].add(skip_key)
         await _observe(campaign_report)
+        record_veto_outcome(
+            dossier, skip_key, campaign_report, helpers=helpers, capability=capability,
+        )
         reports.append(campaign_report)
     return tuple(reports)

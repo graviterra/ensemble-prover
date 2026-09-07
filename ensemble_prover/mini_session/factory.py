@@ -2938,6 +2938,17 @@ def build_session_for_prove_problem(
             ),
         )
 
+    if graph_recursive_cfg is not None:
+        from .actions.graph_root_replan import GraphRootReplanAction
+
+        graph_action = session.registered_action("graph_recursive_decompose")
+        graph_action._budget_remaining(session)
+        session.register(GraphRootReplanAction(source_action=graph_action))
+        session.set_budget(
+            "graph_root_replan",
+            ActionBudget(max_invocations=-1, max_total_seconds=0.0),
+        )
+
     if not proof_state_child_tactics_enabled and (
         recursive_cfg is not None
         or graph_recursive_cfg is not None

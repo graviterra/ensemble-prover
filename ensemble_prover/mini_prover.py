@@ -2628,6 +2628,7 @@ def _messages_with_dossier_context(
     goal_statement: str = "",
     preamble: str = "",
     context_lemmas: Sequence[str] = (),
+    helper_context_override: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach the proof workbench snapshot as a synthetic user message."""
     if dossier is None:
@@ -2636,6 +2637,11 @@ def _messages_with_dossier_context(
         current_goal_statement=goal_statement,
         current_preamble=preamble,
         current_context_lemmas=context_lemmas,
+        **(
+            {"helper_context_override": helper_context_override}
+            if helper_context_override is not None
+            else {}
+        ),
     )
     if not context:
         return messages
@@ -2985,6 +2991,7 @@ def _messages_with_search_context(
     preamble: str = "",
     context_lemmas: Sequence[str] = (),
     session_scope: str = "problem",
+    helper_context_override: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Attach durable dossier context plus run-local scheduler context."""
 
@@ -3022,7 +3029,11 @@ def _messages_with_search_context(
     frame_helpers = []
     if dossier is not None:
         try:
-            frame_helpers = list(dossier.verified_helper_blocks())
+            frame_helpers = (
+                list(helper_context_override)
+                if helper_context_override is not None
+                else list(dossier.verified_helper_blocks())
+            )
         except Exception:
             frame_helpers = []
     active_targets = (
@@ -3070,6 +3081,7 @@ def _messages_with_search_context(
         goal_statement=goal_statement,
         preamble=preamble,
         context_lemmas=context_lemmas,
+        helper_context_override=helper_context_override,
     )
     if proof_state is None:
         return out
@@ -6322,6 +6334,7 @@ async def run_conversation(
                                         "is not an executable artifact for this turn. Do "
                                         "not inspect the environment or leave placeholders. "
                                         + _final_submission_shape_instruction(
+                                            allow_helper_only=bool(getattr(conv, "allow_helper_decomposition", True)),
                                             require_declaration=bool(
                                                 getattr(
                                                     conv,

@@ -2416,7 +2416,9 @@ def _repair_self_check_required_message(
     )
 
 
-def _final_submission_shape_instruction(*, require_declaration: bool) -> str:
+def _final_submission_shape_instruction(
+    *, require_declaration: bool, allow_helper_only: bool = False,
+) -> str:
     """Return the final artifact contract for the active Mini turn mode."""
 
     if require_declaration:
@@ -2426,6 +2428,16 @@ def _final_submission_shape_instruction(*, require_declaration: bool) -> str:
             "must formalize the active selected graph work. Anonymous examples, "
             "proof-body-only blocks, and multiple competing final declarations "
             "are rejected unchecked."
+        )
+    if allow_helper_only:
+        return (
+            "Reply with exactly ONE fenced ```lean block containing either "
+            "one active-goal proof (with any proved helpers before it), or "
+            "a helper-only block of complete named theorem/lemma declarations "
+            "that advance the active route. A helper-only block needs no main "
+            "proof. Every helper is independently Lean-checked; no sorry, admit, "
+            "unresolved holes, or unproved dependencies are accepted. Only a "
+            "complete verified active-goal proof closes the root."
         )
     return (
         "Reply with exactly ONE fenced ```lean block containing at most named "
