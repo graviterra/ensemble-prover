@@ -323,6 +323,10 @@ _SIMP_NO_PROGRESS_RE = re.compile(
     re.IGNORECASE,
 )
 _PARSE_ERROR_RE = re.compile(
+    # The runner wraps Parser.runParserCategory failures; the nested parser
+    # message varies (for example, "expected ','"). Match the diagnostic
+    # body start so quoted warning text in the raw stream cannot classify it.
+    r"^scratch source boundary: invalid (?:proof|target) term:|"
     r"unexpected end of input|unexpected token|expected token|"
     r"unexpected [^;\n]+(?:;|,)\s*expected [^\n]+|"
     r"expected interpolated string|invalid pattern variable|"

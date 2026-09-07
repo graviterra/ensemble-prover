@@ -1503,6 +1503,10 @@ def _execution_ended_without_complete_contract_output(
     )
 
 
+class _SharedExecutionInterrupted(Exception):
+    """The coalesced execution owner stopped; independent callers may retry."""
+
+
 def _consume_future_exception(fut: "asyncio.Future") -> None:
     """Done-callback that marks a Future's exception as retrieved.
 
@@ -4447,51 +4451,53 @@ class LeanRunner:
                 if self._closed
                 else "LeanRunner is quiesced (cancellation barrier)"
             )
-        leader = False
-        async with self._inflight_exec_lock:
-            if self._closed or self._quiesced:
-                raise RuntimeError(
-                    "LeanRunner is closed"
-                    if self._closed
-                    else "LeanRunner is quiesced (cancellation barrier)"
-                )
-            cache_key_project = str(self.project_dir.resolve())
-            with LeanREPL._GLOBAL_ENV_CACHE_LOCK:
-                execution_global_epoch = int(
-                    LeanREPL._GLOBAL_ENV_EPOCH.get(cache_key_project, 0) or 0
-                )
-                cache_key = self._execution_cache_key(
-                    mode=mode,
-                    content=content,
-                    timeout_s=timeout_s,
-                    fast_fail_timeout_s=fast_fail_timeout_s,
-                    warning_as_error=warning_as_error,
-                    use_oracle_sem=use_oracle_sem,
-                    retry_repl_termination=retry_repl_termination,
-                    environment_epoch=execution_global_epoch,
-                )
-                completed = self._completed_exec.get(cache_key)
-                if completed is not None:
-                    self._completed_exec.pop(cache_key, None)
-                    self._completed_exec[cache_key] = completed
-                    self._record_request_dedup_hit(mode)
-                    return completed
-                future = self._inflight_exec.get(cache_key)
-                if future is None:
-                    future = asyncio.get_running_loop().create_future()
-                    # Guarantee exception retrieval even if no waiter ever
-                    # attaches — otherwise set_exception on a solo leader
-                    # produces "Future exception was never retrieved"
-                    # warnings at GC.
-                    future.add_done_callback(_consume_future_exception)
-                    self._inflight_exec[cache_key] = future
-                    leader = True
-                    execution_task = asyncio.current_task()
-                    if execution_task is not None:
-                        self._inflight_exec_tasks.add(execution_task)
-                else:
-                    self._record_request_dedup_hit(mode)
-        if not leader:
+        while True:
+            leader = False
+            async with self._inflight_exec_lock:
+                if self._closed or self._quiesced:
+                    raise RuntimeError(
+                        "LeanRunner is closed"
+                        if self._closed
+                        else "LeanRunner is quiesced (cancellation barrier)"
+                    )
+                cache_key_project = str(self.project_dir.resolve())
+                with LeanREPL._GLOBAL_ENV_CACHE_LOCK:
+                    execution_global_epoch = int(
+                        LeanREPL._GLOBAL_ENV_EPOCH.get(cache_key_project, 0) or 0
+                    )
+                    cache_key = self._execution_cache_key(
+                        mode=mode,
+                        content=content,
+                        timeout_s=timeout_s,
+                        fast_fail_timeout_s=fast_fail_timeout_s,
+                        warning_as_error=warning_as_error,
+                        use_oracle_sem=use_oracle_sem,
+                        retry_repl_termination=retry_repl_termination,
+                        environment_epoch=execution_global_epoch,
+                    )
+                    completed = self._completed_exec.get(cache_key)
+                    if completed is not None:
+                        self._completed_exec.pop(cache_key, None)
+                        self._completed_exec[cache_key] = completed
+                        self._record_request_dedup_hit(mode)
+                        return completed
+                    future = self._inflight_exec.get(cache_key)
+                    if future is None:
+                        future = asyncio.get_running_loop().create_future()
+                        # Guarantee exception retrieval even if no waiter ever
+                        # attaches — otherwise set_exception on a solo leader
+                        # produces "Future exception was never retrieved"
+                        # warnings at GC.
+                        future.add_done_callback(_consume_future_exception)
+                        self._inflight_exec[cache_key] = future
+                        leader = True
+                        execution_task = asyncio.current_task()
+                        if execution_task is not None:
+                            self._inflight_exec_tasks.add(execution_task)
+                    else:
+                        self._record_request_dedup_hit(mode)
+            if leader:
+                break
             remaining = self._execution_time_remaining(deadline_monotonic)
             if remaining <= 0.0:
                 return self._execution_deadline_result(
@@ -4509,6 +4515,18 @@ class LeanRunner:
                 return self._execution_deadline_result(
                     "shared Lean execution",
                 )
+            except _SharedExecutionInterrupted:
+                task = asyncio.current_task()
+                if self._closed or self._quiesced or (task is not None and task.cancelling()):
+                    raise asyncio.CancelledError() from None
+                # Only retire the receipt we awaited. The old owner can still
+                # be cleaning up, and another subscriber may already have
+                # elected a replacement. Keep the original operation deadline.
+                async with self._inflight_exec_lock:
+                    if self._inflight_exec.get(cache_key) is future:
+                        self._inflight_exec.pop(cache_key, None)
+                if self._execution_time_remaining(deadline_monotonic) <= 0.0:
+                    return self._execution_deadline_result("shared Lean execution")
         execution_task = asyncio.current_task()
 
         file_path = self.temp_dir / f"{goal_name}_{uuid.uuid4().hex}.lean"
@@ -4522,7 +4540,8 @@ class LeanRunner:
             if execution_task is not None:
                 self._inflight_exec_tasks.discard(execution_task)
             async with self._inflight_exec_lock:
-                self._inflight_exec.pop(cache_key, None)
+                if self._inflight_exec.get(cache_key) is future:
+                    self._inflight_exec.pop(cache_key, None)
             try:
                 file_path.unlink(missing_ok=True)
             except OSError:
@@ -4776,11 +4795,11 @@ class LeanRunner:
             # own upstream cancellation fired.
             if not future.done():
                 if isinstance(exc, asyncio.CancelledError):
-                    # Cancel the coalescing Future so shielded waiters
-                    # unblock with CancelledError immediately, rather
-                    # than deadlock on a Future that will never be
-                    # resolved.
-                    future.cancel()
+                    # An independent subscriber has not been canceled. Let
+                    # it retry the interrupted execution within its own
+                    # original deadline; the owner's cancellation still
+                    # propagates below. Shutdown cancels receipts directly.
+                    future.set_exception(_SharedExecutionInterrupted())
                 else:
                     # Propagate real errors to waiters so they can
                     # fall back gracefully. _consume_future_exception
@@ -4794,7 +4813,8 @@ class LeanRunner:
             if execution_task is not None:
                 self._inflight_exec_tasks.discard(execution_task)
             async with self._inflight_exec_lock:
-                self._inflight_exec.pop(cache_key, None)
+                if self._inflight_exec.get(cache_key) is future:
+                    self._inflight_exec.pop(cache_key, None)
             try:
                 file_path.unlink(missing_ok=True)
             except OSError:
