@@ -42,6 +42,7 @@ _WATCHDOG_FD_ENV = "ENSEMBLE_MINI_WATCHDOG_FD"
 _WATCHDOG_NONCE_ENV = "ENSEMBLE_MINI_WATCHDOG_NONCE"
 _WATCHDOG_WORKER_ENV = "ENSEMBLE_MINI_WATCHDOG_WORKER"
 _WATCHDOG_OVERALL_DEADLINE_ENV = "ENSEMBLE_MINI_WATCHDOG_OVERALL_DEADLINE"
+_WATCHDOG_GRANTED_TIMEOUT_ENV = "ENSEMBLE_MINI_WATCHDOG_GRANTED_TIMEOUT_S"
 _WATCHDOG_HARD_OPERATION_DEADLINES_ENV = (
     "ENSEMBLE_MINI_WATCHDOG_HARD_OPERATION_DEADLINES"
 )
@@ -303,6 +304,17 @@ def worker_overall_deadline() -> float:
         return float(os.environ.get(_WATCHDOG_OVERALL_DEADLINE_ENV, "") or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def worker_granted_timeout_s() -> float:
+    """Return the fixed allowance admitted by this worker's supervisor."""
+    try:
+        value = float(os.environ.get(_WATCHDOG_GRANTED_TIMEOUT_ENV, "") or 0.0)
+    except (TypeError, ValueError) as error:
+        raise ProcessWatchdogProtocolError("Invalid admitted worker timeout") from error
+    if not math.isfinite(value) or value < 0:
+        raise ProcessWatchdogProtocolError("Invalid admitted worker timeout")
+    return value
 
 
 def worker_shutdown_timeout_s() -> float:
@@ -2480,6 +2492,7 @@ def _run_cli_worker_in_dedicated_supervisor(
     env[_WATCHDOG_FD_ENV] = str(write_fd)
     env[_WATCHDOG_NONCE_ENV] = nonce
     env[_WATCHDOG_OVERALL_DEADLINE_ENV] = repr(overall_deadline)
+    env[_WATCHDOG_GRANTED_TIMEOUT_ENV] = repr(overall_timeout)
     env[_WATCHDOG_HARD_OPERATION_DEADLINES_ENV] = (
         "1" if bool(hard_operation_deadlines) else "0"
     )

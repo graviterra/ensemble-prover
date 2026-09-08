@@ -291,10 +291,31 @@ def _strip_lean_comments_and_strings(text: str) -> tuple[str, bool]:
     return "".join(out), ok
 
 
+_LEAN_NONCODE_DELIMITER = re.compile(r"[/\-\'\"!]")
+
+
 def _scan_lean_code(text: str, start: int, out: List[str]) -> tuple[int, bool]:
     i = start
     n = len(text)
     while i < n:
+        # Ordinary code cannot change lexical state. Copy it in one slice;
+        # keep the existing scanner for comments, literals and interpolation.
+        marker = _LEAN_NONCODE_DELIMITER.search(text, i)
+        if marker is None:
+            out.append(text[i:])
+            return n, True
+        special = marker.start()
+        if text[special:special + 2] == '!"':
+            # Interpolation starts at its identifier, before the delimiter.
+            # Numeric prefixes are ordinary code (e.g. 123s!"{value}").
+            prefix = special
+            while prefix > i and (text[prefix - 1].isalnum() or text[prefix - 1] == "_"):
+                prefix -= 1
+            while prefix < special and not (text[prefix].isalpha() or text[prefix] == "_"):
+                prefix += 1
+            special = prefix
+        out.append(text[i:special])
+        i = special
         interp_prefix = _interpolated_string_prefix_len(text, i)
         if interp_prefix > 0:
             i, ok = _scan_interpolated_string(text, i + interp_prefix, out)

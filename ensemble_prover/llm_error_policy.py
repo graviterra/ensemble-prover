@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional
@@ -15,6 +16,32 @@ from .llm_usage import CostBudgetExceeded, ProviderDispatchAttemptLimitExceeded
 
 
 _TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def transport_failure_record_from_exception(exc: BaseException) -> dict[str, Any]:
+    """Project inert transport-cause diagnostics without changing retry policy."""
+
+    failure_type = getattr(exc, "llm_transport_failure_type", None)
+    attempt = getattr(exc, "llm_transport_failure_attempt", None)
+    timeout = getattr(exc, "llm_transport_failure_request_timeout_s", None)
+    if (
+        type(failure_type) is not str
+        or not failure_type
+        or type(attempt) is not int
+        or attempt < 1
+    ):
+        return {}
+    record: dict[str, Any] = {
+        "llm_transport_failure_type": failure_type,
+        "llm_transport_failure_attempt": attempt,
+    }
+    if timeout is None or (
+        type(timeout) in {int, float} and math.isfinite(timeout) and timeout > 0
+    ):
+        record["llm_transport_failure_request_timeout_s"] = timeout
+    return record
+
+
 _FATAL_QUOTA_MARKERS = {
     "insufficient_quota",
     "quota_exceeded",
@@ -493,6 +520,13 @@ def classify_llm_exception(
     _seen: Optional[set[int]] = None,
 ) -> LLMErrorClassification:
     """Classify one exception for mini-prover retry and termination policy."""
+
+    if type(exc).__module__ == "ensemble_prover.mini_session.planner_job_receipt":
+        from .mini_session.planner_job_receipt import restored_planner_error_classification
+
+        restored = restored_planner_error_classification(exc)
+        if restored is not None:
+            return restored
 
     seen = _seen if _seen is not None else set()
     if id(exc) in seen:

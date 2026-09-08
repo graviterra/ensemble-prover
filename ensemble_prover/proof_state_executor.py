@@ -1397,6 +1397,7 @@ def proof_state_residual_elaboration_context_hash(
     *,
     lean: Any,
     parent_proof_stub: str,
+    verified_helpers: Optional[Sequence[str]] = None,
 ) -> str:
     """Hash one residual route's exact Lean execution environment."""
 
@@ -1405,7 +1406,11 @@ def proof_state_residual_elaboration_context_hash(
         preamble_override=_proof_state_residual_preamble(conv),
         ordered_lemmas=_proof_state_residual_lemmas(
             conv,
-            _proof_state_verified_helper_blocks(dossier),
+            (
+                _proof_state_verified_helper_blocks(dossier)
+                if verified_helpers is None
+                else verified_helpers
+            ),
         ),
         proof_code=str(parent_proof_stub or ""),
     )
@@ -1417,24 +1422,29 @@ def proof_state_current_residual_route_context_hashes(
     dossier: Optional[ProofDossier],
     lean: Any,
     proof_state: Optional[ProofSearchState],
+    verified_helpers: Optional[Sequence[str]] = None,
 ) -> Dict[Tuple[str, str], str]:
     """Return exact current context hashes once for every residual route."""
 
     if proof_state is None:
         return {}
     contexts: Dict[Tuple[str, str], str] = {}
+    current_helpers = verified_helpers
     for parent in proof_state.nodes.values():
         for group in list(parent.assembly_attempt_groups or ()):
             if not proof_state_source_requires_residual_goal_attestation(
                 group.source
             ):
                 continue
+            if current_helpers is None:
+                current_helpers = _proof_state_verified_helper_blocks(dossier)
             contexts[(parent.node_id, group.assembly_id)] = (
                 proof_state_residual_elaboration_context_hash(
                     conv,
                     dossier,
                     lean=lean,
                     parent_proof_stub=group.proof_stub,
+                    verified_helpers=current_helpers,
                 )
             )
     return contexts
@@ -1688,6 +1698,7 @@ def _helper_acceptance_request_hashes(
     source: str,
     context_hash: str = "",
     refresh_quality: bool = True,
+    verified_helpers: Optional[Sequence[str]] = None,
 ) -> Tuple[str, str, str]:
     """Hash the complete answer-safe helper acceptance plan."""
 
@@ -1696,6 +1707,8 @@ def _helper_acceptance_request_hashes(
             dossier,
             refresh_quality=refresh_quality,
         )
+        if verified_helpers is None
+        else verified_helpers
     )
     exact_context_hash = hashlib.sha256(
         json.dumps(
@@ -1839,6 +1852,7 @@ def ensure_current_helper_acceptance_retries(
     conv: Any,
     dossier: ProofDossier,
     proof_state: Optional[ProofSearchState],
+    verified_helpers: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Rearm exact pending helpers whose acceptance environment changed.
 
@@ -1879,6 +1893,7 @@ def ensure_current_helper_acceptance_retries(
                 helper_block=helper_block,
                 source=str(pending.get("source") or ""),
                 context_hash=caller_context_hash,
+                verified_helpers=verified_helpers,
             )
         )
         if str(pending.get("acceptance_request_hash") or "") == request_hash:
@@ -1959,6 +1974,7 @@ def ensure_current_typed_residual_attestation_retries(
     dossier: Optional[ProofDossier],
     lean: Any,
     proof_state: Optional[ProofSearchState],
+    verified_helpers: Optional[Sequence[str]] = None,
 ) -> List[str]:
     """Materialize verifier-only retries for context-stale residual routes.
 
@@ -1974,7 +1990,11 @@ def ensure_current_typed_residual_attestation_retries(
     current_preamble = _proof_state_residual_preamble(conv)
     current_lemmas = _proof_state_residual_lemmas(
         conv,
-        _proof_state_verified_helper_blocks(dossier),
+        (
+            _proof_state_verified_helper_blocks(dossier)
+            if verified_helpers is None
+            else verified_helpers
+        ),
     )
     status_getter = getattr(
         proof_state,
@@ -1993,6 +2013,7 @@ def ensure_current_typed_residual_attestation_retries(
         dossier=dossier,
         lean=lean,
         proof_state=proof_state,
+        verified_helpers=current_lemmas,
     )
     try:
         _required, _authorized, route_validity = (
@@ -3567,6 +3588,8 @@ async def _retry_pending_typed_residual_extractions(
 def proof_state_decl_application_context_hash(
     conv: Any,
     dossier: ProofDossier,
+    *,
+    verified_helpers: Optional[Sequence[str]] = None,
 ) -> str:
     """Hash the exact preamble and helpers used by declaration application."""
 
@@ -3578,7 +3601,11 @@ def proof_state_decl_application_context_hash(
     )
     for block in _proof_state_residual_lemmas(
         conv,
-        _proof_state_verified_helper_blocks(dossier),
+        (
+            _proof_state_verified_helper_blocks(dossier)
+            if verified_helpers is None
+            else verified_helpers
+        ),
     ):
         hasher.update(b"\0")
         hasher.update(str(block or "").encode("utf-8", "replace"))

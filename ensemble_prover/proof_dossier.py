@@ -20278,8 +20278,12 @@ class ProofDossier:
         return "\n".join(lines)
 
     def to_record(self) -> Dict[str, Any]:
-        self.reconcile_proof_attempt_lineage()
-        self.reconcile_proof_idea_graph_statuses()
+        return self._to_record(reconcile=True)
+
+    def _to_record(self, *, reconcile: bool) -> Dict[str, Any]:
+        if reconcile:
+            self.reconcile_proof_attempt_lineage()
+            self.reconcile_proof_idea_graph_statuses()
         graph_record = (
             self.proof_graph.clone().to_record()
             if self.proof_graph is not None
@@ -20518,7 +20522,14 @@ class ProofDossier:
         because those fields participate in future scheduling decisions.
         """
 
-        record = self.to_record()
+        # A committed execution boundary must retain the cognition sealed by
+        # its driver. Reporting reconciliation can add attempt observations
+        # and merge claim alternatives, so it must not run during capture.
+        record = self._to_record(reconcile=False)
+        if self.proof_graph is not None:
+            from .mini_session.durable_graph_memory import exact_graph_record
+
+            record["proof_graph"] = exact_graph_record(self.proof_graph, record["proof_graph"])
         record["execution_schema_version"] = 1
         record["execution_decl_applications"] = [
             asdict(item) for item in self.decl_applications
@@ -20632,6 +20643,25 @@ class ProofDossier:
             raw_failures,
             label="dossier restored parallel sample failures",
         )
+        # These typed records are advisory planner memory, not proof receipts.
+        # The reporting inverse may merge derived consumers and normalize
+        # alternatives; execution resumes the exact validated lifecycle that
+        # the saved driver observed. Helper/root authority remains subject to
+        # the conservative inverse above and fresh checkpoint verification.
+        raw_ideas = data.get("proof_ideas", {})
+        if not isinstance(raw_ideas, dict):
+            raise ValueError("invalid execution proof-idea lifecycle")
+        ideas = {
+            idea_id: ProofIdeaRecord.from_record(raw)
+            for idea_id, raw in raw_ideas.items()
+        }
+        if any(idea_id != idea.proof_idea_id for idea_id, idea in ideas.items()):
+            raise ValueError("execution proof-idea identity mismatch")
+        dossier.proof_ideas = ideas
+        if dossier.proof_graph is not None and data.get("proof_graph") is not None:
+            from .mini_session.durable_graph_memory import restore_graph_memory
+
+            restore_graph_memory(data["proof_graph"], dossier.proof_graph)
         return dossier
 
     @classmethod

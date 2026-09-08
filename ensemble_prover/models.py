@@ -21,6 +21,7 @@ from .config import RoleConfig
 from .llm_deadline import LLMRetryDeadlineContext, LLMRetryDeadlineExceeded
 from .llm_error_policy import classify_llm_exception
 from .llm_usage import (
+    ProviderDispatchAttemptLimitExceeded,
     cost_for_record,
     emit_usage_callback,
     mark_provider_dispatched,
@@ -4473,6 +4474,8 @@ class OpenAICompatClient:
         max_transport_retries = self._MAX_TRANSPORT_ATTEMPTS
         backoff = 1.0
         json_body_retries = 0
+        previous_transport_failure: Optional[BaseException] = None
+        previous_transport_failure_record: Dict[str, Any] = {}
         operation_started_at = time.time()
         for attempt in range(max(max_http_retries, max_transport_retries)):
             attempt_started_at = time.time()
@@ -4909,6 +4912,21 @@ class OpenAICompatClient:
                     backoff = min(backoff * 2.0, 30.0)
                     continue
                 raise
+            except ProviderDispatchAttemptLimitExceeded as exc:
+                # Retry admission runs in a new loop iteration, outside the
+                # original transport exception handler. Preserve that cause
+                # while leaving the fair dispatch ceiling as the outer
+                # control exception. Never attach a stale earlier attempt.
+                if (
+                    previous_transport_failure is not None
+                    and previous_transport_failure_record.get(
+                        "llm_transport_failure_attempt"
+                    ) == attempt
+                ):
+                    for key, value in previous_transport_failure_record.items():
+                        setattr(exc, key, value)
+                    raise exc from previous_transport_failure
+                raise
             except _DetachedTransportTimeout:
                 raise _DetachedProviderRequestError(
                     f"LLM chat request detached after hard timeout "
@@ -4992,6 +5010,12 @@ class OpenAICompatClient:
                             operation_timeout_override_s=operation_timeout_override_s,
                             original_exc=exc,
                         ) from exc
+                    previous_transport_failure = exc
+                    previous_transport_failure_record = {
+                        "llm_transport_failure_type": type(exc).__name__,
+                        "llm_transport_failure_attempt": attempt + 1,
+                        "llm_transport_failure_request_timeout_s": request_timeout,
+                    }
                     # Make the ladder visible. Under soft policy the
                     # operation deadline is None, so this can legally repeat
                     # up to _MAX_TRANSPORT_ATTEMPTS times with a full request

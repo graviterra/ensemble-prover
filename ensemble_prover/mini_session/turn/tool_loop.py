@@ -21,7 +21,10 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, List, Mapping, Optional, Sequence
 
 from ...llm_deadline import llm_retry_deadline_record_from_exception
-from ...llm_error_policy import classify_llm_exception
+from ...llm_error_policy import (
+    classify_llm_exception,
+    transport_failure_record_from_exception,
+)
 from ...llm_usage import (
     ProviderDispatchAttemptLease,
     ProviderDispatchAttemptLimitExceeded,
@@ -817,6 +820,7 @@ class ToolLoopResult:
     repair_verification_tool_calls_used: int = 0
     llm_retry_count: int = 0
     llm_retry_deadline: dict = field(default_factory=dict)
+    llm_transport_failure: dict = field(default_factory=dict)
     provider_attempts: List[dict] = field(default_factory=list)
     provider_protocol_event: str = ""
     provider_protocol_original_content: str = ""
@@ -2410,6 +2414,7 @@ async def _call_llm_with_tools_one_round_impl(
     llm_terminal = False
     llm_failure_reason = ""
     llm_retry_deadline: dict = {}
+    llm_transport_failure: dict = {}
     provider_attempts: List[dict] = []
     tool_state_updates = 0
     tool_state_closures = 0
@@ -7272,6 +7277,7 @@ async def _call_llm_with_tools_one_round_impl(
             redact_solution_refs=redact_solution_refs,
         )
         llm_retry_deadline = llm_retry_deadline_record_from_exception(exc)
+        llm_transport_failure = transport_failure_record_from_exception(exc)
         provider_defer = provider_defer_record_from_exception(client, exc)
         provider_attempts = list(
             _sanitize_model_facing_value(
@@ -7341,6 +7347,7 @@ async def _call_llm_with_tools_one_round_impl(
         for label, value in (
             ("kind", llm_failure_kind),
             ("reason", llm_failure_reason),
+            ("transport", llm_transport_failure.get("llm_transport_failure_type")),
         ):
             text = str(value or "").strip()
             if text and text not in safe_llm_error:
@@ -7791,6 +7798,7 @@ async def _call_llm_with_tools_one_round_impl(
         ),
         llm_retry_count=int(llm_retry_count),
         llm_retry_deadline=dict(llm_retry_deadline or {}),
+        llm_transport_failure=dict(llm_transport_failure or {}),
         provider_defer=dict(provider_defer or {}),
         provider_attempts=list(provider_attempts or []),
         recovered_finalizer_error=str(recovered_finalizer_error or ""),

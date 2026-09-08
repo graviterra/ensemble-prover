@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -29,6 +30,7 @@ from .llm_deadline import (
 from .mini_recursive_outcome import is_resumable_mini_recursive_yield
 from .graph_execution_projection import GRAPH_PROJECTION_METRICS
 from .tactic_attempt_telemetry import MONOTONIC_LEAN_ATTEMPT_METRICS
+from .state_data import clone_json_value
 
 
 _MINI_GRAPH_RECURSIVE_DECOMPOSE_METRIC_KEYS = (
@@ -665,8 +667,15 @@ class RunRecorder:
         "llm_call_retry": "mini_session_verdict_llm_call_retry",
     }
 
-    def __init__(self, output_dir: Path) -> None:
-        self.output_dir = output_dir
+    def __init__(
+        self, output_dir: Path, *, resume_state: Optional[Dict[str, Any]] = None,
+        startup_artifacts: Optional[Dict[str, str]] = None,
+    ) -> None:
+        prepared_resume = (
+            self._prepare_generation_resume(Path(output_dir), resume_state, startup_artifacts=startup_artifacts)
+            if resume_state is not None else None
+        )
+        self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.output_dir / "run.log"
         turns_path = self.output_dir / "turns.jsonl"
@@ -1049,6 +1058,152 @@ class RunRecorder:
         self._last_mini_recursive_complete_totals: Dict[str, int] = {}
         self._formalization_banked_helper_metric_seen: Set[str] = set()
         self._compute_receipt_metric_seen: Set[str] = set()
+        self.predecessor_generation: Optional[Dict[str, Any]] = None
+        if prepared_resume is not None:
+            try:
+                self._restore_generation_metrics(*prepared_resume)
+            except BaseException:
+                self.close()
+                raise
+
+    _EXECUTION_MAP_FIELDS = (
+        "metrics", "_mini_recursive_incremental_since_complete",
+        "_last_mini_recursive_complete_totals",
+    )
+    _EXECUTION_SET_FIELDS = (
+        "_recovery_event_ids_seen", "_formalization_banked_helper_metric_seen",
+        "_compute_receipt_metric_seen",
+    )
+
+    @staticmethod
+    def _prefix_hash(path: Path, size: int) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            remaining = size
+            while remaining:
+                block = stream.read(min(remaining, 1024 * 1024))
+                if not block:
+                    raise ValueError("Predecessor trace prefix was truncated")
+                digest.update(block)
+                remaining -= len(block)
+        return digest.hexdigest()
+
+    def to_execution_record(self) -> Dict[str, Any]:
+        """Capture counters and immutable log prefixes for a new generation."""
+        prefixes = {}
+        for name, stream in (("run.log", self._log_fp), ("turns.jsonl", self._turns_fp)):
+            stream.flush()
+            os.fsync(stream.fileno())
+            size = os.fstat(stream.fileno()).st_size
+            prefixes[name] = {
+                "size": size,
+                "sha256": self._prefix_hash(self.output_dir / name, size),
+            }
+        return clone_json_value({
+            "schema_version": 1,
+            "output_dir": str(self.output_dir.resolve()),
+            "prefixes": prefixes,
+            "start_ts": self.start_ts,
+            "elapsed_s": self._last_elapsed_s,
+            "turn_count": self.turn_count,
+            "maps": {name: getattr(self, name) for name in self._EXECUTION_MAP_FIELDS},
+            "sets": {name: sorted(getattr(self, name)) for name in self._EXECUTION_SET_FIELDS},
+        }, label="recorder execution record")
+
+    @classmethod
+    def _prepare_generation_resume(
+        cls, destination: Path, record: Dict[str, Any],
+        *, startup_artifacts: Optional[Dict[str, str]] = None,
+    ) -> tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+        """Validate old evidence before creating or replacing any output file."""
+        state = clone_json_value(record, label="recorder resume state")
+        required = {"schema_version", "output_dir", "prefixes", "start_ts", "elapsed_s", "turn_count", "maps", "sets"}
+        if type(state) is not dict or set(state) != required or type(state["schema_version"]) is not int or state["schema_version"] != 1:
+            raise ValueError("Unsupported recorder generation schema")
+        if type(state["output_dir"]) is not str or not state["output_dir"]:
+            raise ValueError("Invalid predecessor generation path")
+        predecessor = Path(state["output_dir"]).resolve()
+        destination = destination.resolve()
+        checkpoint_artifacts = {"attempt_checkpoint.json", "checkpoints"}
+        from .mini_generation_artifacts import validate_startup_artifact_receipts
+        checkpoint_artifacts.update(validate_startup_artifact_receipts(destination, startup_artifacts))
+        if destination == predecessor or (
+            destination.exists()
+            and any(path.name not in checkpoint_artifacts for path in destination.iterdir())
+        ):
+            raise ValueError("Resume needs a new empty generation directory")
+        if type(state["turn_count"]) is not int or state["turn_count"] < 0:
+            raise ValueError("Invalid predecessor trace sequence")
+        for key in ("start_ts", "elapsed_s"):
+            value = state[key]
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError("Invalid predecessor generation time")
+        if type(state["maps"]) is not dict or set(state["maps"]) != set(cls._EXECUTION_MAP_FIELDS):
+            raise ValueError("Invalid recorder metric state")
+        if any(type(value) is not dict for value in state["maps"].values()):
+            raise ValueError("Invalid recorder metric map")
+        if type(state["sets"]) is not dict or set(state["sets"]) != set(cls._EXECUTION_SET_FIELDS):
+            raise ValueError("Invalid recorder receipt state")
+        for value in state["sets"].values():
+            if type(value) is not list or any(type(item) is not str for item in value):
+                raise ValueError("Invalid recorder receipt identity")
+        prefixes = state["prefixes"]
+        if type(prefixes) is not dict or set(prefixes) != {"run.log", "turns.jsonl"}:
+            raise ValueError("Invalid predecessor trace prefixes")
+        for name, identity in prefixes.items():
+            if type(identity) is not dict or set(identity) != {"size", "sha256"} or type(identity["size"]) is not int or identity["size"] < 0:
+                raise ValueError("Invalid predecessor trace prefix identity")
+            if cls._prefix_hash(predecessor / name, identity["size"]) != identity["sha256"]:
+                raise ValueError("Predecessor trace prefix hash mismatch")
+        tail = []
+        incomplete_tail_bytes = 0
+        expected_index = state["turn_count"]
+        with (predecessor / "turns.jsonl").open("rb") as stream:
+            stream.seek(prefixes["turns.jsonl"]["size"])
+            for raw in stream:
+                if not raw.endswith(b"\n"):
+                    # A process can die partway through a diagnostic append
+                    # after the validated checkpoint prefix. Preserve that
+                    # evidence in its predecessor file, but do not let its
+                    # uncommitted final fragment revoke the saved execution.
+                    incomplete_tail_bytes = len(raw)
+                    break
+                row = json.loads(raw)
+                clone_json_value(row, label="predecessor trace tail")
+                expected_index += 1
+                if type(row) is not dict or type(row.get("turn_index")) is not int or row["turn_index"] != expected_index:
+                    raise ValueError("Invalid predecessor trace tail sequence")
+                elapsed = row.get("elapsed_s")
+                if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < state["elapsed_s"]:
+                    raise ValueError("Invalid predecessor trace tail time")
+                tail.append(row)
+        full_size = (predecessor / "turns.jsonl").stat().st_size
+        link = {"output_dir": str(predecessor), "trace_size": full_size,
+                "trace_sha256": cls._prefix_hash(predecessor / "turns.jsonl", full_size)}
+        if incomplete_tail_bytes:
+            link["ignored_incomplete_trace_tail_bytes"] = incomplete_tail_bytes
+        return state, tail, link
+
+    def _restore_generation_metrics(
+        self, state: Dict[str, Any], tail: List[Dict[str, Any]], link: Dict[str, Any],
+    ) -> None:
+        self.start_ts = state["start_ts"]
+        self._last_elapsed_s = state["elapsed_s"]
+        self.turn_count = state["turn_count"]
+        for name, value in state["maps"].items():
+            setattr(self, name, value)
+        for name, value in state["sets"].items():
+            setattr(self, name, set(value))
+        for row in tail:
+            recovery_id = row.get("llm_recovery_event_id")
+            if not recovery_id or recovery_id not in self._recovery_event_ids_seen:
+                self._record_policy_metrics(row)
+                self._record_structural_metrics(row)
+                if type(recovery_id) is str and recovery_id:
+                    self._recovery_event_ids_seen.add(recovery_id)
+            self.turn_count = row["turn_index"]
+            self._last_elapsed_s = row["elapsed_s"]
+        self.predecessor_generation = link
 
     def configure_live_trace(self, mode: str) -> None:
         clean = str(mode or "compact").strip().lower()
@@ -3069,6 +3224,8 @@ class RunRecorder:
             **metrics_for_summary,
             "wall_clock_s": round(time.time() - self.start_ts, 3),
             "total_turns": self.turn_count,
+            **({"predecessor_generation": self.predecessor_generation}
+               if self.predecessor_generation is not None else {}),
         }
         activation_summary: Dict[str, Any]
         try:

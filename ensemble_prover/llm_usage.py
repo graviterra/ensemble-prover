@@ -54,6 +54,136 @@ from .runtime_context import (
 )
 from .utils import estimate_tokens, format_exception
 from .sampling_controls import is_api_default_temperature_override
+from .state_data import clone_json_value
+
+
+_COST_RESERVATION_FIELDS = (
+    "reservation_id", "request_id", "role", "scope", "action_id", "call_kind",
+    "estimated_input_tokens", "reserved_output_tokens", "estimated_cost_usd",
+    "estimated_models", "metadata", "hold_for_late_usage", "created_at",
+)
+_COST_LEDGER_FLOAT_FIELDS = (
+    "_exact_cost_usd", "_unknown_cost_usd", "_reserved_cost_usd",
+    "_cancelled_provider_inflight_estimated_cost_usd",
+)
+_COST_LEDGER_COUNT_FIELDS = (
+    "_input_tokens", "_output_tokens", "_cached_input_tokens", "_cache_write_tokens",
+    "_prompt_cache_miss_tokens", "_reasoning_output_tokens", "_events",
+    "_usage_missing_events", "_pricing_unknown_events",
+    "_cancelled_provider_inflight_events", "_retryable_exception_no_charge_events",
+    "_reservations", "_budget_rejections",
+)
+_COST_LEDGER_RESERVATION_MAP_FIELDS = (
+    "_active_reservations", "_late_usage_receipts",
+    "_cancelled_provider_inflight_cost_by_reservation",
+    "_cancelled_provider_inflight_target_costs",
+    "_reservation_missing_unknown_cost_usd", "_reservation_missing_target_costs",
+    "_reservation_pricing_unknown_cost_usd", "_reservation_pricing_unknown_target_costs",
+    "_reservation_unknown_role", "_inflight_dispatch_intents",
+)
+_COST_LEDGER_SET_FIELDS = (
+    "_unpriced_provider_exposure_receipts",
+    "_cancelled_provider_inflight_reservations", "_late_hold_reservations",
+)
+
+
+def _cost_record_mapping(value: Any, *, label: str) -> Dict[str, Any]:
+    clean = clone_json_value(value, label=label)
+    if type(clean) is not dict or any(type(key) is not str for key in clean):
+        raise ValueError(f"{label} must be a string-keyed object")
+    return clean
+
+
+def _cost_record_number(value: Any, *, label: str) -> float:
+    if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{label} must be a finite nonnegative number")
+    return float(value)
+
+
+def _cost_record_count(value: Any, *, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} must be a nonnegative integer")
+    return value
+
+
+def _cost_record_amounts(value: Any, *, label: str) -> Dict[str, float]:
+    return {
+        key: _cost_record_number(amount, label=f"{label}.{key}")
+        for key, amount in _cost_record_mapping(value, label=label).items()
+    }
+
+
+def _validate_cost_financial_record(value: Any, *, label: str) -> None:
+    """Validate financial leaves in extensible dispatch/usage receipt records."""
+
+    record = _cost_record_mapping(value, label=label)
+    for key, item in record.items():
+        path = f"{label}.{key}"
+        if key.endswith("cost_usd"):
+            _cost_record_number(item, label=path)
+        elif key.endswith("tokens") or key.endswith("ordinal"):
+            _cost_record_count(item, label=path)
+        elif key == "target_costs":
+            _cost_record_amounts(item, label=path)
+        elif type(item) is dict:
+            _validate_cost_financial_record(item, label=path)
+
+
+def _validate_cost_model_record(value: Any) -> None:
+    strings = {"target_id", "model", "base_url"}
+    flags = {"pricing_known", "reservation_active"}
+    amounts = {
+        "estimated_cost_usd", "estimated_dispatch_cost_usd",
+        "estimated_dispatch_input_cost_usd", "estimated_dispatch_output_cost_usd",
+    }
+    counts = {
+        "reserved_input_tokens", "pricing_input_tokens", "reserved_output_tokens",
+        "request_output_tokens", "candidate_output_multiplier",
+        "provider_prompt_multiplier", "provider_attempt_multiplier",
+    }
+    record = _cost_record_mapping(value, label="reservation pricing model")
+    if set(record) != strings | flags | amounts | counts:
+        raise ValueError("reservation pricing model fields do not match the schema")
+    if any(type(record[key]) is not str for key in strings):
+        raise ValueError("reservation pricing model identities must be strings")
+    if any(type(record[key]) is not bool for key in flags):
+        raise ValueError("reservation pricing model flags must be booleans")
+    for key in amounts:
+        _cost_record_number(record[key], label=key)
+    for key in counts:
+        _cost_record_count(record[key], label=key)
+
+
+def _validate_cost_financial_state(state: Dict[str, Any]) -> None:
+    amount_maps = (
+        "_active_reservations", "_cancelled_provider_inflight_cost_by_reservation",
+        "_reservation_missing_unknown_cost_usd", "_reservation_pricing_unknown_cost_usd",
+    )
+    target_maps = (
+        "_cancelled_provider_inflight_target_costs", "_reservation_missing_target_costs",
+        "_reservation_pricing_unknown_target_costs",
+    )
+    for name in amount_maps:
+        _cost_record_amounts(state[name], label=name)
+    for name in target_maps:
+        for key, value in _cost_record_mapping(state[name], label=name).items():
+            _cost_record_amounts(value, label=f"{name}.{key}")
+    roles = _cost_record_mapping(state["_reservation_unknown_role"], label="unknown roles")
+    if any(type(value) is not str for value in roles.values()):
+        raise ValueError("unknown cost roles must be strings")
+    token_fields = {name.removeprefix("_") for name in _COST_LEDGER_COUNT_FIELDS[:6]}
+    role_fields = token_fields | {"cost_usd", "estimated_unknown_cost_usd", "model"}
+    for role, value in _cost_record_mapping(state["_role_totals"], label="role totals").items():
+        totals = _cost_record_mapping(value, label=f"role totals.{role}")
+        if set(totals) != role_fields or type(totals["model"]) is not str:
+            raise ValueError("role total fields do not match the schema")
+        for name in token_fields:
+            _cost_record_count(totals[name], label=f"role totals.{role}.{name}")
+        for name in ("cost_usd", "estimated_unknown_cost_usd"):
+            _cost_record_number(totals[name], label=f"role totals.{role}.{name}")
+    for name in ("_late_usage_receipts", "_inflight_dispatch_intents"):
+        for key, value in _cost_record_mapping(state[name], label=name).items():
+            _validate_cost_financial_record(value, label=f"{name}.{key}")
 
 
 @dataclass(frozen=True)
@@ -134,6 +264,47 @@ class CostReservation:
     metadata: Dict[str, Any] = field(default_factory=dict)
     hold_for_late_usage: bool = False
     created_at: float = field(default_factory=time.time)
+
+    def to_execution_record(self) -> Dict[str, Any]:
+        """Encode an inert request identity without invoking copy hooks."""
+
+        return {
+            "schema_version": 1,
+            "reservation": _cost_record_mapping(
+                {name: getattr(self, name) for name in _COST_RESERVATION_FIELDS},
+                label="cost reservation",
+            ),
+        }
+
+    @classmethod
+    def from_execution_record(cls, record: Mapping[str, Any]) -> "CostReservation":
+        """Validate and rebuild a reservation without executable objects."""
+
+        clean = _cost_record_mapping(record, label="cost reservation record")
+        if set(clean) != {"schema_version", "reservation"} or type(clean["schema_version"]) is not int or clean["schema_version"] != 1:
+            raise ValueError("unsupported cost reservation schema")
+        values = _cost_record_mapping(clean["reservation"], label="cost reservation")
+        if set(values) != set(_COST_RESERVATION_FIELDS):
+            raise ValueError("cost reservation fields do not match the schema")
+        for name in ("reservation_id", "request_id", "role", "scope", "action_id", "call_kind"):
+            if type(values[name]) is not str:
+                raise ValueError(f"cost reservation {name} must be a string")
+        if not values["reservation_id"] or not values["request_id"]:
+            raise ValueError("cost reservation requires stable request identities")
+        for name in ("estimated_input_tokens", "reserved_output_tokens"):
+            _cost_record_count(values[name], label=name)
+        for name in ("estimated_cost_usd", "created_at"):
+            values[name] = _cost_record_number(values[name], label=name)
+        if type(values["hold_for_late_usage"]) is not bool:
+            raise ValueError("cost reservation late hold must be boolean")
+        if type(values["estimated_models"]) is not list or any(
+            type(item) is not dict for item in values["estimated_models"]
+        ):
+            raise ValueError("cost reservation pricing models must be objects")
+        for item in values["estimated_models"]:
+            _validate_cost_model_record(item)
+        _cost_record_mapping(values["metadata"], label="cost reservation metadata")
+        return cls(**values)
 
 
 class CostBudgetExceeded(RuntimeError):
@@ -1387,10 +1558,22 @@ class CostBudgetController:
         max_cost_usd: float = 0.0,
         reserve_output_tokens: int = 1024,
         event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        durable_event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         self.max_cost_usd = max(0.0, float(max_cost_usd or 0.0))
         self.reserve_output_tokens = max(0, int(reserve_output_tokens or 0))
         self.event_sink = event_sink
+        self.durable_event_sink = durable_event_sink
+        self._ledger_id = uuid.uuid4().hex
+        self._durable_journal_sequence = 0
+        self._durable_journal_hash = ""
+        self._durable_write_failed = False
+        self._active_reservation_records: Dict[str, CostReservation] = {}
+        self._inflight_dispatch_intents: Dict[str, Dict[str, Any]] = {}
+        self._restored_request_ids: set[str] = set()
+        self._replayed_journal_hashes: Dict[int, str] = {}
+        self._generation_recovery_pending = False
+        self._generation_recovery_active = False
         self._lock = asyncio.Lock()
         self._exact_cost_usd = 0.0
         self._unknown_cost_usd = 0.0
@@ -1431,6 +1614,348 @@ class CostBudgetController:
         self._role_totals: Dict[str, Dict[str, Any]] = {}
         self._pending_late_usage_tasks: set[asyncio.Task] = set()
         self._final_accounting_frozen = False
+
+    def _execution_record_locked(self) -> Dict[str, Any]:
+        fields = (
+            _COST_LEDGER_FLOAT_FIELDS + _COST_LEDGER_COUNT_FIELDS
+            + _COST_LEDGER_RESERVATION_MAP_FIELDS
+            + ("_role_totals", "_terminal_reason", "_final_accounting_frozen")
+        )
+        state = {name: getattr(self, name) for name in fields}
+        state.update({name: sorted(getattr(self, name)) for name in _COST_LEDGER_SET_FIELDS})
+        state["_unpriced_provider_exposure_opaque"] = dict(self._unpriced_provider_exposure_opaque)
+        state["_active_reservation_records"] = {
+            key: self._active_reservation_records[key].to_execution_record()
+            for key in self._active_reservations
+        }
+        return _cost_record_mapping({
+            "schema_version": 1,
+            "ledger_id": self._ledger_id,
+            "max_cost_usd": self.max_cost_usd,
+            "reserve_output_tokens": self.reserve_output_tokens,
+            "journal_sequence": self._durable_journal_sequence,
+            "journal_hash": self._durable_journal_hash,
+            "durable_write_failed": self._durable_write_failed,
+            "state": state,
+        }, label="cost ledger")
+
+    async def to_execution_record(self) -> Dict[str, Any]:
+        """Capture the complete ledger under its shared accounting lock."""
+
+        async with self._lock:
+            return self._execution_record_locked()
+
+    @classmethod
+    def from_execution_record(
+        cls,
+        record: Mapping[str, Any],
+        *,
+        event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        durable_event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> "CostBudgetController":
+        """Restore inert accounting into one fresh, shared attempt controller."""
+
+        clean = _cost_record_mapping(record, label="cost ledger")
+        required = {
+            "schema_version", "ledger_id", "max_cost_usd", "reserve_output_tokens",
+            "journal_sequence", "journal_hash", "durable_write_failed", "state",
+        }
+        if set(clean) != required or type(clean["schema_version"]) is not int or clean["schema_version"] != 1:
+            raise ValueError("unsupported cost ledger schema")
+        if type(clean["ledger_id"]) is not str or not clean["ledger_id"]:
+            raise ValueError("cost ledger identity is missing")
+        controller = cls(
+            max_cost_usd=_cost_record_number(clean["max_cost_usd"], label="cost cap"),
+            reserve_output_tokens=_cost_record_count(clean["reserve_output_tokens"], label="output reserve"),
+            event_sink=event_sink, durable_event_sink=durable_event_sink,
+        )
+        controller._restore_accounting_state(clean["state"])
+        controller._ledger_id = clean["ledger_id"]
+        controller._durable_journal_sequence = _cost_record_count(clean["journal_sequence"], label="journal sequence")
+        journal_hash = clean["journal_hash"]
+        if type(journal_hash) is not str or (
+            controller._durable_journal_sequence > 0 and not re.fullmatch(r"[0-9a-f]{64}", journal_hash)
+        ) or (controller._durable_journal_sequence == 0 and journal_hash):
+            raise ValueError("cost journal watermark is invalid")
+        if type(clean["durable_write_failed"]) is not bool:
+            raise ValueError("cost journal failure state must be boolean")
+        controller._durable_journal_hash = journal_hash
+        if controller._durable_journal_sequence:
+            controller._replayed_journal_hashes[controller._durable_journal_sequence] = journal_hash
+        controller._durable_write_failed = clean["durable_write_failed"]
+        controller._restored_request_ids = set(controller._active_reservations)
+        controller._generation_recovery_pending = True
+        return controller
+
+    async def resume_after_journal_recovery(
+        self, *, journal_sequence: int, journal_hash: str,
+    ) -> None:
+        """Reopen one restored generation after its validated journal suffix.
+
+        The exclusive attempt owner supplies the head obtained by validating
+        the complete journal. This does not reset any spend or capacity; it
+        settles interrupted requests before allowing a fresh provider call.
+        """
+
+        async with self._lock:
+            if (not self._generation_recovery_pending
+                    or type(journal_sequence) is not int
+                    or journal_sequence != self._durable_journal_sequence
+                    or type(journal_hash) is not str
+                    or journal_hash != self._durable_journal_hash):
+                raise ValueError("generation recovery requires a restored ledger at the validated journal head")
+            self._generation_recovery_pending = False
+            self._generation_recovery_active = True
+            self._durable_write_failed = False
+            self._final_accounting_frozen = False
+            await self._write_durable_event_locked(
+                "accounting_transition", details={"status": "restored_generation_reopened"},
+            )
+        try:
+            await self.recover_interrupted_requests()
+        except BaseException:
+            # A partly recovered object must never be used for new admission.
+            # A fresh validated restore can replay any acknowledged effects.
+            self._durable_write_failed = True
+            raise
+        async with self._lock:
+            self._generation_recovery_active = False
+
+    async def apply_durable_journal_record(self, record: Mapping[str, Any]) -> bool:
+        """Replay one validated financial transition without repricing or dispatch.
+
+        The coordinator supplies the complete contiguous suffix after the saved
+        watermark. Previously replayed receipts are idempotent; unknown older
+        records cannot establish their identity from a newer watermark alone.
+        """
+
+        entry = _cost_record_mapping(record, label="cost journal record")
+        fields = {"schema_version", "sequence", "previous_hash", "kind", "payload", "record_hash"}
+        if (set(entry) != fields or type(entry["schema_version"]) is not int
+                or entry["schema_version"] != 1 or entry["kind"] != "cost_ledger"):
+            raise ValueError("unsupported cost journal record schema")
+        sequence = _cost_record_count(entry["sequence"], label="cost journal sequence")
+        if not sequence:
+            raise ValueError("cost journal sequence must be positive")
+        material = {key: value for key, value in entry.items() if key != "record_hash"}
+        digest = hashlib.sha256(json.dumps(
+            material, ensure_ascii=False, allow_nan=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if entry["record_hash"] != digest:
+            raise ValueError("cost journal record hash mismatch")
+        event = _cost_record_mapping(entry["payload"], label="cost journal payload")
+        event_fields = {"schema_version", "ledger_id", "transition_id", "kind",
+                        "reservation_id", "details", "accounting_patch"}
+        if (set(event) != event_fields or type(event["schema_version"]) is not int
+                or event["schema_version"] != 1 or event["ledger_id"] != self._ledger_id
+                or type(event["transition_id"]) is not str or not event["transition_id"]
+                or type(event["reservation_id"]) is not str
+                or event["kind"] not in {"reservation", "dispatch_intent", "accounting_transition"}):
+            raise ValueError("cost journal transition identity or schema mismatch")
+        _cost_record_mapping(event["details"], label="cost journal details")
+        async with self._lock:
+            if sequence <= self._durable_journal_sequence:
+                if self._replayed_journal_hashes.get(sequence) != digest:
+                    raise ValueError("conflicting or unauthenticated old cost journal receipt")
+                return False
+            if (sequence != self._durable_journal_sequence + 1
+                    or entry["previous_hash"] != self._durable_journal_hash):
+                raise ValueError("cost journal receipt is out of order")
+            state = self._execution_record_locked()["state"]
+            self._apply_journal_patch_to_state(state, event)
+            # Validate a fresh accounting object first. Rejected receipts must
+            # not partly alter live spend, capacity, or deduplication authority.
+            prepared = CostBudgetController(max_cost_usd=self.max_cost_usd,
+                                            reserve_output_tokens=self.reserve_output_tokens)
+            prepared._restore_accounting_state(state)
+            for name in state:
+                setattr(self, name, getattr(prepared, name))
+            self._durable_journal_sequence = sequence
+            self._durable_journal_hash = digest
+            self._replayed_journal_hashes[sequence] = digest
+            self._restored_request_ids = set(self._active_reservations)
+            return True
+
+    @staticmethod
+    def _apply_journal_patch_to_state(state: Dict[str, Any], event: Dict[str, Any]) -> None:
+        patch = _cost_record_mapping(event["accounting_patch"], label="cost accounting patch")
+        if set(patch) != {"values", "entries", "membership"}:
+            raise ValueError("cost accounting patch fields do not match the schema")
+        values = _cost_record_mapping(patch["values"], label="cost patch values")
+        expected_values = set(_COST_LEDGER_FLOAT_FIELDS + _COST_LEDGER_COUNT_FIELDS) | {
+            "_terminal_reason", "_final_accounting_frozen", "_role_totals",
+            "_unpriced_provider_exposure_receipts", "_unpriced_provider_exposure_opaque",
+        }
+        if set(values) != expected_values:
+            raise ValueError("cost patch value fields do not match the schema")
+        entries = _cost_record_mapping(patch["entries"], label="cost patch entries")
+        membership = _cost_record_mapping(patch["membership"], label="cost patch membership")
+        reservation_id = event["reservation_id"]
+        expected_entries = (set(_COST_LEDGER_RESERVATION_MAP_FIELDS)
+                            | {"_active_reservation_records"}) if reservation_id else set()
+        expected_membership = {"_cancelled_provider_inflight_reservations", "_late_hold_reservations"} if reservation_id else set()
+        if set(entries) != expected_entries or set(membership) != expected_membership:
+            raise ValueError("cost patch reservation fields do not match the schema")
+        state.update(values)
+        for name, changes in entries.items():
+            changes = _cost_record_mapping(changes, label=f"cost patch {name}")
+            if set(changes) != {reservation_id}:
+                raise ValueError("cost patch changes an unrelated reservation")
+            value = changes[reservation_id]
+            if value is None:
+                state[name].pop(reservation_id, None)
+            else:
+                state[name][reservation_id] = value
+        for name, changes in membership.items():
+            changes = _cost_record_mapping(changes, label=f"cost patch {name}")
+            if set(changes) != {reservation_id} or type(changes[reservation_id]) is not bool:
+                raise ValueError("cost patch reservation membership is malformed")
+            members = set(state[name])
+            if changes[reservation_id]:
+                members.add(reservation_id)
+            else:
+                members.discard(reservation_id)
+            state[name] = sorted(members)
+
+    def _restore_accounting_state(self, record: Any) -> None:
+        state = _cost_record_mapping(record, label="cost ledger state")
+        fields = set(
+            _COST_LEDGER_FLOAT_FIELDS + _COST_LEDGER_COUNT_FIELDS
+            + _COST_LEDGER_RESERVATION_MAP_FIELDS + _COST_LEDGER_SET_FIELDS
+            + ("_role_totals", "_terminal_reason", "_final_accounting_frozen",
+               "_unpriced_provider_exposure_opaque", "_active_reservation_records")
+        )
+        if set(state) != fields:
+            raise ValueError("cost ledger fields do not match the schema")
+        _validate_cost_financial_state(state)
+        for name in _COST_LEDGER_FLOAT_FIELDS:
+            setattr(self, name, _cost_record_number(state[name], label=name))
+        for name in _COST_LEDGER_COUNT_FIELDS:
+            setattr(self, name, _cost_record_count(state[name], label=name))
+        for name in _COST_LEDGER_RESERVATION_MAP_FIELDS + ("_role_totals",):
+            setattr(self, name, _cost_record_mapping(state[name], label=name))
+        for name in _COST_LEDGER_SET_FIELDS:
+            values = state[name]
+            if type(values) is not list or any(type(value) is not str for value in values) or len(set(values)) != len(values):
+                raise ValueError(f"{name} must contain unique string identities")
+            setattr(self, name, set(values))
+        opaque = _cost_record_mapping(state["_unpriced_provider_exposure_opaque"], label="opaque exposure")
+        self._unpriced_provider_exposure_opaque = Counter({
+            key: _cost_record_count(value, label="opaque exposure count")
+            for key, value in opaque.items()
+        })
+        if type(state["_terminal_reason"]) is not str or type(state["_final_accounting_frozen"]) is not bool:
+            raise ValueError("cost ledger terminal state has invalid types")
+        self._terminal_reason = state["_terminal_reason"]
+        self._final_accounting_frozen = state["_final_accounting_frozen"]
+        records = _cost_record_mapping(state["_active_reservation_records"], label="active reservations")
+        self._active_reservation_records = {
+            key: CostReservation.from_execution_record(value)
+            for key, value in records.items()
+        }
+        if set(records) != set(self._active_reservations) or any(
+            value.reservation_id != key for key, value in self._active_reservation_records.items()
+        ):
+            raise ValueError("active cost reservation identities do not match")
+        amounts = [_cost_record_number(value, label="reservation hold") for value in self._active_reservations.values()]
+        if not math.isclose(sum(amounts), self._reserved_cost_usd, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError("active reservation amounts do not match reserved cost")
+
+    def _journal_accounting_patch_locked(self, reservation_id: str) -> Dict[str, Any]:
+        values = {
+            name: getattr(self, name)
+            for name in _COST_LEDGER_FLOAT_FIELDS + _COST_LEDGER_COUNT_FIELDS
+            + ("_terminal_reason", "_final_accounting_frozen", "_role_totals")
+        }
+        values["_unpriced_provider_exposure_receipts"] = sorted(self._unpriced_provider_exposure_receipts)
+        values["_unpriced_provider_exposure_opaque"] = dict(self._unpriced_provider_exposure_opaque)
+        entries = {
+            name: {reservation_id: getattr(self, name).get(reservation_id)}
+            for name in _COST_LEDGER_RESERVATION_MAP_FIELDS
+        } if reservation_id else {}
+        reservation = self._active_reservation_records.get(reservation_id)
+        if reservation_id:
+            entries["_active_reservation_records"] = {
+                reservation_id: reservation.to_execution_record()
+                if reservation is not None and reservation_id in self._active_reservations else None,
+            }
+        return {
+            "values": values, "entries": entries,
+            "membership": {
+                name: {reservation_id: reservation_id in getattr(self, name)}
+                for name in ("_cancelled_provider_inflight_reservations", "_late_hold_reservations")
+            } if reservation_id else {},
+        }
+
+    async def _write_durable_event_locked(
+        self, kind: str, *, reservation_id: str = "", details: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        sink = self.durable_event_sink
+        if sink is None:
+            return
+        if self._durable_write_failed:
+            raise OSError("cost durable journal is unavailable after a failed write")
+        try:
+            payload = _cost_record_mapping({
+                "schema_version": 1, "ledger_id": self._ledger_id,
+                "transition_id": uuid.uuid4().hex, "kind": kind,
+                "reservation_id": reservation_id, "details": dict(details or {}),
+                "accounting_patch": self._journal_accounting_patch_locked(reservation_id),
+            }, label="cost journal event")
+            ack = sink(payload)
+            if inspect.isawaitable(ack):
+                ack = await ack
+            ack = _cost_record_mapping(ack, label="cost journal acknowledgement")
+            sequence = _cost_record_count(ack.get("sequence"), label="journal sequence")
+            digest = ack.get("record_hash")
+            if sequence <= self._durable_journal_sequence or type(digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError("cost journal acknowledgement did not advance")
+            self._durable_journal_sequence = sequence
+            self._durable_journal_hash = digest
+        except BaseException:
+            self._durable_write_failed = True
+            raise
+
+    async def _record_dispatch_intent(
+        self, reservation: CostReservation, details: Mapping[str, Any],
+    ) -> None:
+        async with self._lock:
+            if self._generation_recovery_active:
+                raise OSError("cost ledger generation recovery is incomplete")
+            if self._durable_write_failed:
+                raise OSError("cost durable journal is unavailable after a failed write")
+            intent = _cost_record_mapping(details, label="provider dispatch intent")
+            key = str(intent.get("dispatch_authorization_id") or uuid.uuid4().hex)
+            self._inflight_dispatch_intents.setdefault(reservation.reservation_id, {})[key] = intent
+            await self._write_durable_event_locked(
+                "dispatch_intent", reservation_id=reservation.reservation_id, details=intent,
+            )
+
+    async def recover_interrupted_requests(self) -> None:
+        """Settle only restored unfinished calls, retaining unknown exposure."""
+
+        for reservation_id in tuple(self._restored_request_ids):
+            reservation = self._active_reservation_records.get(reservation_id)
+            if reservation is None:
+                self._restored_request_ids.discard(reservation_id)
+                continue
+            intents = list(self._inflight_dispatch_intents.get(reservation_id, {}).values())
+            if intents:
+                metadata = dict(reservation.metadata)
+                metadata["llm_dispatched_target_counts"] = dict(Counter(
+                    str(intent.get("target_id") or "") for intent in intents
+                ))
+                metadata["llm_provider_dispatch_receipts"] = [
+                    {**intent, "event": "dispatch"} for intent in intents
+                ]
+                reservation = replace(reservation, metadata=metadata, hold_for_late_usage=False)
+            await self.settle(
+                reservation, [],
+                status="cancelled_provider_inflight" if intents else "pre_dispatch_failure",
+                error="provider request interrupted by process restart" if intents else "",
+            )
+            self._restored_request_ids.discard(reservation_id)
 
     @property
     def budget_enabled(self) -> bool:
@@ -1974,7 +2499,25 @@ class CostBudgetController:
         reservation_estimated_models = [dict(item) for item in estimated_models]
         reservation_id = uuid.uuid4().hex
         request_id = uuid.uuid4().hex
+        reservation = CostReservation(
+            reservation_id=reservation_id,
+            request_id=request_id,
+            role=str(role or ""),
+            scope=str(scope or ""),
+            action_id=str(action_id or ""),
+            call_kind=str(call_kind or ""),
+            estimated_input_tokens=estimated_input_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            estimated_cost_usd=estimated_cost,
+            estimated_models=reservation_estimated_models,
+            metadata=reservation_metadata,
+            hold_for_late_usage=hold_for_late_usage,
+        )
         async with self._lock:
+            if self._generation_recovery_active:
+                raise OSError("cost ledger generation recovery is incomplete")
+            if self._durable_write_failed:
+                raise OSError("cost durable journal is unavailable after a failed write")
             if self._final_accounting_frozen:
                 raise CostBudgetExceeded(
                     max_cost_usd=self.max_cost_usd,
@@ -2084,21 +2627,12 @@ class CostBudgetController:
             self._reservations += 1
             self._reserved_cost_usd += estimated_cost
             self._active_reservations[reservation_id] = estimated_cost
+            self._active_reservation_records[reservation_id] = reservation
+            await self._write_durable_event_locked(
+                "reservation", reservation_id=reservation_id,
+            )
 
-        return CostReservation(
-            reservation_id=reservation_id,
-            request_id=request_id,
-            role=str(role or ""),
-            scope=str(scope or ""),
-            action_id=str(action_id or ""),
-            call_kind=str(call_kind or ""),
-            estimated_input_tokens=estimated_input_tokens,
-            reserved_output_tokens=reserved_output_tokens,
-            estimated_cost_usd=estimated_cost,
-            estimated_models=reservation_estimated_models,
-            metadata=reservation_metadata,
-            hold_for_late_usage=hold_for_late_usage,
-        )
+        return reservation
 
     async def authorize_provider_retry_dispatch(
         self,
@@ -2146,10 +2680,12 @@ class CostBudgetController:
             )
             metadata["llm_retry_authorized_target_counts"] = authorized
 
-        if unit_cost <= 0.0 or not self.budget_enabled:
-            record_authorized_retry()
-            return
         async with self._lock:
+            if self._durable_write_failed:
+                raise OSError("cost durable journal is unavailable after a failed write")
+            if unit_cost <= 0.0 or not self.budget_enabled:
+                record_authorized_retry()
+                return
             if self._final_accounting_frozen:
                 raise CostBudgetExceeded(
                     max_cost_usd=self.max_cost_usd,
@@ -2301,6 +2837,8 @@ class CostBudgetController:
         async with self._lock:
             if self._final_accounting_frozen:
                 return
+            if self._durable_write_failed:
+                raise OSError("cost durable journal is unavailable after a failed write")
             self._events += 1
             self._usage_missing_events += 1
             if self._reservation_target_is_unpriced(reservation, clean_target):
@@ -2619,6 +3157,8 @@ class CostBudgetController:
         async with self._lock:
             if self._final_accounting_frozen:
                 return
+            if self._durable_write_failed:
+                raise OSError("cost durable journal is unavailable after a failed write")
             target_costs = self._reservation_missing_target_costs.get(
                 reservation.reservation_id,
                 {},
@@ -3234,6 +3774,8 @@ class CostBudgetController:
         async with self._lock:
             if self._final_accounting_frozen:
                 return
+            if self._durable_write_failed:
+                raise OSError("cost durable journal is unavailable after a failed write")
             recovered_unknown_reversed = 0.0
             if late and len(records) == 1:
                 receipt_target = str(records[0].reservation_target_id or "")
@@ -3293,6 +3835,7 @@ class CostBudgetController:
                     ordinal,
                 )
             if release_reservation:
+                self._inflight_dispatch_intents.pop(reservation.reservation_id, None)
                 reserved_cost = float(
                     self._active_reservations.pop(reservation.reservation_id, 0.0)
                     or 0.0
@@ -4015,6 +4558,7 @@ class CostBudgetController:
                 "estimated_dispatch_cost_usd": dispatch_cost,
             }
             dispatch_authorization_records[authorization_id] = dict(receipt)
+            await self._record_dispatch_intent(reservation, receipt)
             # Preserve the caller's live pre-dispatch hook. Budget state is
             # extended first so the live hold includes new authority.
             if inherited_dispatch_observer is not None:
@@ -4545,6 +5089,18 @@ class CostBudgetController:
                 if inspect.isawaitable(reserved_result):
                     await reserved_result
             if not precise_dispatch_marker:
+                for target_id in active_target_ids:
+                    await self._record_dispatch_intent(reservation, {
+                        "target_id": target_id,
+                        "dispatch_ordinal": 1,
+                        "opaque": True,
+                        "estimated_dispatch_cost_usd": next(
+                            (float(item.get("estimated_cost_usd", 0.0))
+                             for item in reservation.estimated_models
+                             if str(item.get("target_id") or "") == target_id),
+                            reservation.estimated_cost_usd,
+                        ),
+                    })
                 provider_dispatched = True
                 dispatched_target_counts.update(active_target_ids)
             dispatch_context_token = _PROVIDER_DISPATCH_MARKER.set(_mark_dispatched)
@@ -4697,6 +5253,10 @@ class CostBudgetController:
             if self._final_accounting_frozen:
                 return
             for reservation_id in list(self._late_hold_reservations):
+                # A failed acknowledgement may still have published a release.
+                # Keep later holds unchanged until that journal head is replayed.
+                if self._durable_write_failed:
+                    raise OSError("cost durable journal is unavailable after a failed write")
                 held_cost = float(
                     self._active_reservations.pop(reservation_id, 0.0)
                     or 0.0
@@ -4706,6 +5266,15 @@ class CostBudgetController:
                     self._reserved_cost_usd - held_cost,
                 )
                 self._late_hold_reservations.discard(reservation_id)
+                # Journal each deletion while its aggregate reserved balance
+                # still matches the remaining per-request holds. A delayed
+                # receipt can acquire this lock before the caller freezes
+                # accounting, and its patch covers only its own reservation.
+                await self._write_durable_event_locked(
+                    "accounting_transition", reservation_id=reservation_id,
+                    details={"status": "late_usage_hold_released"},
+                )
+                self._active_reservation_records.pop(reservation_id, None)
 
     async def freeze_final_accounting(self) -> None:
         """Reject provider receipts arriving after the final summary cut."""
@@ -4714,6 +5283,12 @@ class CostBudgetController:
             self._final_accounting_frozen = True
 
     async def _record_event_locked(self, record: Dict[str, Any]) -> bool:
+        reservation_id = str(record.get("llm_reservation_id") or "")
+        await self._write_durable_event_locked(
+            "accounting_transition", reservation_id=reservation_id, details=record,
+        )
+        if reservation_id and reservation_id not in self._active_reservations:
+            self._active_reservation_records.pop(reservation_id, None)
         sink = self.event_sink
         if sink is None:
             return True

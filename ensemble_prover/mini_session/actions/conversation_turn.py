@@ -15461,6 +15461,9 @@ class ConversationTurnAction:
             llm_retry_deadline = dict(
                 getattr(loop_result, "llm_retry_deadline", {}) or {}
             )
+            llm_transport_failure = dict(
+                getattr(loop_result, "llm_transport_failure", {}) or {}
+            )
             provider_defer = dict(
                 getattr(loop_result, "provider_defer", {}) or {}
             )
@@ -15647,7 +15650,9 @@ class ConversationTurnAction:
                 except Exception:
                     llm_failure_compaction_record = {}
             llm_failure_compaction_metadata: Dict[str, Any] = {}
-            if llm_failure_compaction_record:
+            if llm_failure_compaction_record and llm_failure_compaction_record.get(
+                "history_changed", True,
+            ):
                 llm_failure_compaction_metadata = {
                     "llm_failure_tool_history_compacted": True,
                     "llm_failure_tool_history_compacted_messages": int(
@@ -15701,6 +15706,7 @@ class ConversationTurnAction:
                     selected_work_projection_invalidated
                 ),
                 **llm_retry_deadline,
+                **llm_transport_failure,
                 **provider_defer,
                 "provider_attempts": provider_attempts,
                 "retry_count": int(getattr(loop_result, "llm_retry_count", 0) or 0),
@@ -15783,6 +15789,7 @@ class ConversationTurnAction:
                         or refundable_cooperative_provider_yield
                     ),
                     **llm_retry_deadline,
+                    **llm_transport_failure,
                     **provider_defer,
                     "provider_attempts": provider_attempts,
                     "retry_count": int(

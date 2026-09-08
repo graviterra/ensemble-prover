@@ -111,6 +111,7 @@ from .llm_error_policy import (
     llm_failure_scope,
     planner_failure_is_transport_empty,
     projected_scoped_llm_failure_is_retryable,
+    transport_failure_record_from_exception,
 )
 from .llm_deadline import llm_retry_deadline_record_from_exception
 from .llm_usage import (
@@ -20434,21 +20435,25 @@ async def run_mini_recursive_driver(
     # Bind every durable recursive claim fact to the complete static proof
     # environment.  Planner claim names are informal labels and commonly get
     # reused, so they are never sufficient durable identity on their own.
-    route_environment_hash = _recursive_route_environment_hash(
-        theorem_name=theorem_name,
-        root_statement=root_statement,
-        lean_signature=lean_signature,
-        answer_safe_preamble=current_answer_safe_preamble(),
-        client=client,
-        config=config,
-        proof_environment_fingerprint=current_proof_environment_fingerprint(),
-        selected_parent_proof_idea_context=(selected_parent_proof_idea_context),
-        proof_idea_lifecycle_context=(current_planner_proof_idea_lifecycle_context()),
-        suppress_solution_placeholders=suppress_solution_placeholders,
-        opaque_mode=opaque_mode,
-        allow_official_answer_visibility=allow_official_answer_visibility,
-        official_answer_payload_present=official_answer_payload_present,
-    )
+    def route_hash_for_lifecycle(lifecycle: str) -> str:
+        return _recursive_route_environment_hash(
+            theorem_name=theorem_name,
+            root_statement=root_statement,
+            lean_signature=lean_signature,
+            answer_safe_preamble=current_answer_safe_preamble(),
+            client=client,
+            config=config,
+            proof_environment_fingerprint=current_proof_environment_fingerprint(),
+            selected_parent_proof_idea_context=selected_parent_proof_idea_context,
+            proof_idea_lifecycle_context=lifecycle,
+            suppress_solution_placeholders=suppress_solution_placeholders,
+            opaque_mode=opaque_mode,
+            allow_official_answer_visibility=allow_official_answer_visibility,
+            official_answer_payload_present=official_answer_payload_present,
+        )
+
+    route_identity_lifecycle_context = current_planner_proof_idea_lifecycle_context()
+    route_environment_hash = route_hash_for_lifecycle(route_identity_lifecycle_context)
     # Empty-plan recovery is keyed to mathematical evidence, not to volatile
     # scheduler/proof-idea attempt history.  Exact mid-pass replay still uses
     # ``route_environment_hash`` above; this narrower scope only decides
@@ -20459,7 +20464,9 @@ async def run_mini_recursive_driver(
         lean_signature=lean_signature,
         answer_safe_preamble=current_answer_safe_preamble(),
         client=client,
-        config=config,
+        # Extending a controller allocation changes no mathematical evidence.
+        # Exact replay above still binds the full configured pass ceiling.
+        config=dataclass_replace(config, passes=1),
         proof_environment_fingerprint="",
         selected_parent_proof_idea_context="",
         proof_idea_lifecycle_context="",
@@ -20477,6 +20484,11 @@ async def run_mini_recursive_driver(
             candidate_resume_frame, configured_passes=passes
         )
         current_cognition_hash = current_proof_idea_cognition_hash()
+        saved_route_lifecycle = candidate_resume_frame.get("route_identity_lifecycle_context")
+        candidate_route_hash = (
+            route_hash_for_lifecycle(saved_route_lifecycle)
+            if type(saved_route_lifecycle) is str else route_environment_hash
+        )
         legacy_cognition_is_empty = not (
             str(selected_parent_proof_idea_context or "").strip()
             or current_planner_proof_idea_lifecycle_context().strip()
@@ -20484,11 +20496,18 @@ async def run_mini_recursive_driver(
         if _recursive_continuation_frame_is_admissible(
             candidate_resume_frame,
             root_statement_hash=text_hash(root_statement),
-            route_environment_hash=route_environment_hash,
+            # The plan's entry lifecycle and the later checkpoint lifecycle
+            # are different observations. Recompute static/material policy
+            # using the saved entry context, and independently require exact
+            # current cognition below; never trust a saved environment hash.
+            route_environment_hash=candidate_route_hash,
             proof_idea_cognition_hash=current_cognition_hash,
             legacy_cognition_is_empty=legacy_cognition_is_empty,
         ):
             resume_frame = candidate_resume_frame
+            route_environment_hash = candidate_route_hash
+            if type(saved_route_lifecycle) is str:
+                route_identity_lifecycle_context = saved_route_lifecycle
             _restore_mini_recursive_stats(
                 stats,
                 dict(candidate_resume_frame.get("stats") or {}),
@@ -20753,6 +20772,12 @@ async def run_mini_recursive_driver(
     stats.planner_deliberations = saved_deliberations_used
     helper_only_last_granted_frontier_key = str(
         resume_frame.get("helper_only_last_granted_frontier_key") or ""
+    )
+    incomplete_helper_probe_used = bool(
+        resume_frame.get("incomplete_helper_probe_used", False)
+    )
+    incomplete_root_route_filtered = bool(
+        resume_frame.get("incomplete_root_route_filtered", False)
     )
     claim_progress_retry_counts: dict[str, int] = {
         str(key): max(0, int(value or 0))
@@ -21190,6 +21215,7 @@ async def run_mini_recursive_driver(
             "pass_outcome_kind": durable_pass_outcome_kind,
             "root_statement_hash": text_hash(root_statement),
             "route_environment_hash": route_environment_hash,
+            "route_identity_lifecycle_context": route_identity_lifecycle_context,
             "proof_idea_cognition_hash": current_proof_idea_cognition_hash(),
             "pass_index": int(pass_index or 1),
             "planner_job_identity": dict(planner_job_identity or {}),
@@ -21396,6 +21422,8 @@ async def run_mini_recursive_driver(
             "helper_only_last_granted_frontier_key": (
                 helper_only_last_granted_frontier_key
             ),
+            "incomplete_helper_probe_used": incomplete_helper_probe_used,
+            "incomplete_root_route_filtered": incomplete_root_route_filtered,
             "claim_progress_retry_counts": dict(claim_progress_retry_counts),
             "claim_progress_signatures_seen": {
                 key: sorted(values)
@@ -23795,6 +23823,7 @@ async def run_mini_recursive_driver(
             provider_plan_requested = True
             if not planner_tranche_continuation_pending:
                 planner_tranche_claims_emitted = 0
+                incomplete_root_route_filtered = False
             planner_claim_limit = max(
                 1,
                 min(
@@ -27570,6 +27599,11 @@ async def run_mini_recursive_driver(
                 tranche_record["verdict"] = "planner_tranche_completed"
             _record(record_event, tranche_record)
 
+        # Remember the final adopted route's rejection across its tranches.
+        # A later helper-only receipt cannot erase an earlier broken root.
+        incomplete_root_route_filtered = bool(
+            incomplete_root_route_filtered or declared_route_names_removed_by_filters
+        )
         helper_only_plan_fixed_point = False
         helper_only_plan_deferred_until_root = False
         planner_tranche_claims_deferred = False
@@ -28047,16 +28081,42 @@ async def run_mini_recursive_driver(
                     },
                 )
             elif planner_tranche_continuation_pending or pending_unproved_plan_claims:
-                # More planner work is coming, or earlier helper tranches
-                # are already parked. Do not spend this pass proving a
-                # route-less ladder; keep the claims so a later
-                # root_assembly can close over them.
+                # Keep the frontier for a later connected root. After one
+                # lookahead, permit one ready helper attempt per durable
+                # campaign so an incomplete planner cannot embargo all proof
+                # work. This does not authorize any root or grant another pass.
                 for claim in claims:
                     pending_unproved_plan_claims[
                         _dependency_contract_suspension_key(claim)
                     ] = claim
-                helper_only_plan_deferred_until_root = True
-                stats.helper_only_plans_deferred_until_root += 1
+                probe_claim = None
+                if (
+                    planner_tranche_continuation_pending
+                    and planner_tranche_claims_emitted
+                    > provider_claims_emitted_this_tranche
+                    and not incomplete_helper_probe_used
+                    and not incomplete_root_route_filtered
+                ):
+                    probe_claim = next(
+                        (
+                            claim
+                            for claim in claims
+                            if str(claim.role or "helper") == "helper"
+                            and set(claim.dependencies)
+                            <= satisfied_route_dependencies
+                        ),
+                        None,
+                    )
+                if probe_claim is not None:
+                    incomplete_helper_probe_used = True
+                    stats.helper_only_recovery_plans_granted += 1
+                    claims = [probe_claim]
+                    pending_unproved_plan_claims.pop(
+                        _dependency_contract_suspension_key(probe_claim), None
+                    )
+                else:
+                    helper_only_plan_deferred_until_root = True
+                    stats.helper_only_plans_deferred_until_root += 1
                 _record(
                     record_event,
                     {
@@ -28073,7 +28133,11 @@ async def run_mini_recursive_driver(
                         "tranche_continuation_pending": bool(
                             planner_tranche_continuation_pending
                         ),
-                        "verdict": "helper_only_plan_deferred_until_root",
+                        "verdict": (
+                            "incomplete_helper_probe_granted"
+                            if probe_claim is not None
+                            else "helper_only_plan_deferred_until_root"
+                        ),
                     },
                 )
             elif (
@@ -30478,6 +30542,7 @@ async def run_mini_recursive_driver(
                 if proof:
                     claim_replay_helpers = list(get_helpers())
                     route_environment_hash_before_promotion = route_environment_hash
+                    route_lifecycle_before_promotion = route_identity_lifecycle_context
                     claim_environment_promoted = False
                     if promote_claim_environment is not None:
                         if not callable(
@@ -30542,6 +30607,7 @@ async def run_mini_recursive_driver(
                             )
                             continue
                         claim_environment_promoted = True
+                        route_identity_lifecycle_context = current_planner_proof_idea_lifecycle_context()
                         route_environment_hash = _recursive_route_environment_hash(
                             theorem_name=theorem_name,
                             root_statement=root_statement,
@@ -30555,9 +30621,7 @@ async def run_mini_recursive_driver(
                             selected_parent_proof_idea_context=(
                                 selected_parent_proof_idea_context
                             ),
-                            proof_idea_lifecycle_context=(
-                                current_planner_proof_idea_lifecycle_context()
-                            ),
+                            proof_idea_lifecycle_context=route_identity_lifecycle_context,
                             suppress_solution_placeholders=(
                                 suppress_solution_placeholders
                             ),
@@ -30603,6 +30667,7 @@ async def run_mini_recursive_driver(
                             route_environment_hash = (
                                 route_environment_hash_before_promotion
                             )
+                            route_identity_lifecycle_context = route_lifecycle_before_promotion
                         raise
                     if not accepted and claim_environment_promoted:
                         await rollback_claim_environment_if_needed(
@@ -30610,6 +30675,7 @@ async def run_mini_recursive_driver(
                             proof=proof,
                         )
                         route_environment_hash = route_environment_hash_before_promotion
+                        route_identity_lifecycle_context = route_lifecycle_before_promotion
                     if accepted:
                         stats.claim_llm_solved += 1
                         stats.helpers_accepted += 1
@@ -31308,7 +31374,10 @@ def _planner_finish_reason_is_truncated(value: Any) -> bool:
 def _planner_raw_response(raw: Any) -> _PlannerRawResponse:
     content = ""
     raw_data: Mapping[str, Any] | None = None
-    if isinstance(raw, tuple):
+    # Durable planner receipts cross JSON, which represents a provider's
+    # (content, response metadata) pair as a list. Preserve both components
+    # instead of parsing the Python rendering of that list as planner text.
+    if isinstance(raw, (tuple, list)):
         content = str(raw[0] or "") if raw else ""
         if len(raw) >= 2 and isinstance(raw[1], Mapping):
             raw_data = raw[1]
@@ -34392,6 +34461,7 @@ async def _request_plan(
         classification = classify_llm_exception(exc)
         failure_scope = llm_failure_scope(classification.failure_reason)
         failure_metadata = llm_retry_deadline_record_from_exception(exc)
+        failure_metadata.update(transport_failure_record_from_exception(exc))
         failure_metadata.update(
             provider_defer_record_from_exception(plan_request_client, exc)
         )
@@ -34834,6 +34904,9 @@ async def _request_plan(
                 provider_calls_completed=1,
                 stage="reasoning_recovery",
             )
+            failure_metadata.update(
+                transport_failure_record_from_exception(reasoning_exc)
+            )
             stats.planner_call_failures += 1
             if classification.terminal:
                 stats.planner_terminal_failures += 1
@@ -35073,6 +35146,9 @@ async def _request_plan(
                     provider_calls_completed=2,
                     stage="visibility_recovery",
                 )
+                failure_metadata.update(
+                    transport_failure_record_from_exception(visibility_exc)
+                )
                 stats.planner_call_failures += 1
                 if classification.terminal:
                     stats.planner_terminal_failures += 1
@@ -35252,6 +35328,9 @@ async def _request_plan(
                     classification,
                     provider_calls_completed=1,
                     stage="parse_repair",
+                )
+                failure_metadata.update(
+                    transport_failure_record_from_exception(repair_exc)
                 )
                 if classification.terminal:
                     stats.planner_terminal_failures += 1

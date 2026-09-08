@@ -15,6 +15,8 @@ import json
 import time
 from typing import Any, ClassVar, FrozenSet, List, Mapping, Optional
 
+from ensemble_prover.state_data import clone_json_value
+
 from ..action import (
     MiniOutcome,
     action_dispatch_replaced,
@@ -636,6 +638,64 @@ class RecursiveHelperProverAction:
         if not isinstance(frame, dict) or frame.get("child_session") is not None:
             return
         self._nested_execution_frame = copy.deepcopy(frame)
+
+    def scheduler_runtime_state(self) -> dict[str, Any]:
+        frame = dict(self._nested_execution_frame)
+        if frame.get("child_session") is not None:
+            raise ValueError("Cannot checkpoint a live recursive child capability")
+        return clone_json_value({"nested_execution_frame": frame})
+
+    def apply_scheduler_runtime_state(self, state: Any) -> None:
+        clean = clone_json_value(state)
+        if type(clean) is not dict or set(clean) != {"nested_execution_frame"}:
+            raise ValueError("Invalid recursive child runtime checkpoint")
+        frame = clean["nested_execution_frame"]
+        if type(frame) is not dict or frame.get("child_session") is not None:
+            raise ValueError("Invalid recursive child runtime frame")
+        if frame and (
+            frame.get("schema_version") != CHILD_EXECUTION_SCHEMA_VERSION
+            or frame.get("owner_action_id") != self.id
+            or frame.get("child_kind") != "recursive_helper_subsession"
+            or type(frame.get("descriptor")) is not dict
+        ):
+            raise ValueError("Recursive child runtime identity mismatch")
+        self._nested_execution_frame = frame
+
+    def restore_checkpoint_children(self, session: Any, frames: dict[str, Any]) -> None:
+        """Replay a reserved child frame absent from the older parent snapshot."""
+        pending = []
+        for lane, record in frames.items():
+            runtime = record.get("action_runtime", {})
+            frame = runtime.get("nested_execution_frame", {})
+            if frame.get("owner_action_id") != self.id:
+                continue
+            descriptor = frame.get("descriptor", {})
+            if descriptor != record.get("descriptor") or descriptor.get("child_lane") != lane:
+                raise ValueError("Recursive child checkpoint descriptor mismatch")
+            node = session.proof_state.nodes.get(descriptor.get("node_id"))
+            if node is None or node.target != descriptor.get("target_statement"):
+                raise ValueError("Recursive child checkpoint target mismatch")
+            attempt = descriptor.get("attempt_number")
+            if type(attempt) is not int or attempt <= 0:
+                raise ValueError("Invalid saved recursive child attempt")
+            # Equal/newer parent counters came from a later committed action.
+            # A retained parent-recheck frame is already in that snapshot.
+            if node.recursive_attempts >= attempt:
+                continue
+            work = record.get("selected_work", {})
+            iteration = work.get("last_recursive_attempt_iteration")
+            if (work.get("node_id") != node.node_id
+                    or work.get("recursive_attempts") != attempt
+                    or type(iteration) is not int or iteration < 0):
+                raise ValueError("Invalid recursive child reservation checkpoint")
+            pending.append((runtime, node, attempt, iteration))
+        if len(pending) > 1:
+            raise ValueError("Multiple uncommitted recursive children own one action")
+        if pending:
+            runtime, node, attempt, iteration = pending[0]
+            self.apply_scheduler_runtime_state(runtime)
+            node.recursive_attempts = attempt
+            node.last_recursive_attempt_iteration = iteration
 
     def __init__(
         self,
@@ -1960,6 +2020,27 @@ class RecursiveHelperProverAction:
                     "child_reason": "node_reserved",
             }
 
+        registry = getattr(session, "checkpoint_registry", None)
+        descriptor = self._nested_execution_frame["descriptor"]
+        if registry is not None and not descriptor.get("child_lane"):
+            def checkpoint_publication_allowed() -> bool:
+                require_current_action_dispatch(session, dispatch_id)
+                return True
+
+            parent_lane = session.checkpoint_lane_key
+            child_identity = hashlib.sha256(json.dumps(
+                {"parent_lane": parent_lane, "descriptor": descriptor},
+                sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest()
+            descriptor["child_lane"] = f"{parent_lane}/helper:{child_identity}"
+            await registry.prepare_child(
+                parent_lane, descriptor, self.scheduler_runtime_state(),
+                {"node_id": node.node_id, "recursive_attempts": node.recursive_attempts,
+                 "last_recursive_attempt_iteration": node.last_recursive_attempt_iteration},
+                publication_guard=checkpoint_publication_allowed,
+            )
+            require_current_action_dispatch(session, dispatch_id)
+
         # --- Run the child sub-session, or continue a proof-bearing parent replay. ---
         depth_str = str(int(getattr(session, "recursion_depth", 0) or 0))
         resuming_parent_recheck = bool(
@@ -2054,6 +2135,7 @@ class RecursiveHelperProverAction:
                 ),
                 max_elapsed_s=self.max_elapsed_s,
                 action_deadline_epoch_s=deadline_epoch_s,
+                checkpoint_child_lane=str(descriptor.get("child_lane") or ""),
                 advisory_refutation_candidates=(
                     advisory_refutation_candidates
                 ),

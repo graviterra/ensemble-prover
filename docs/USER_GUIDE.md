@@ -356,6 +356,21 @@ Example bounded run:
 Replace those example limits with values appropriate for the theorem and
 provider.
 
+For an unattended run, the launcher supplies the same three time limits:
+
+```bash
+scripts/run_mini_unattended.sh \
+  --lean-file /path/to/lake-project/Target.lean \
+  --theorem-name Example.target \
+  --project-path /path/to/lake-project \
+  --prover openai --cost-budget-usd 10
+```
+
+Options supplied after the launcher override its preset limits, including
+`0` to disable a limit. The ordinary CLI keeps its existing defaults. The
+Putnam sweep uses its separate first-acceptance and second-acceptance deadlines;
+this launcher does not change those milestones.
+
 ### Which timeout does what?
 
 | Control | Scope |
@@ -671,16 +686,54 @@ source benchmark or evaluation agreement restricts answer publication.
 
 ## 13. Replay and interruption behavior
 
-The direct Mini Prover CLI records structured turn and replay data for diagnostics, but
-it does **not** persist resumable search checkpoints or expose a supported
-user command for continuing an interrupted search. In particular, `--mini-resume`,
-`--mini-checkpoint-root`, `--mini-search-branch`, and
-`--mini-fork-from-branch` are not public CLI options in this release.
+The direct Mini Prover CLI writes durable attempt checkpoints by default.
+After stopping a run, continue its latest generation into a new output directory:
 
-After interruption, start a new run with a new output directory. Compatible
-verified cache and Mini-theory evidence may be reused through their public
-cache interfaces, but an interrupted model call, transcript, or scheduler
-state is not resumed by the CLI.
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover \
+  --resume-from runs/mini_prover/example_target_01 \
+  --output-dir runs/mini_prover/example_target_02
+```
+
+Omit `--output-dir` to allocate a new directory automatically. Resume inherits
+the original input, models, parallel sample count, and search and cost limits.
+Explicit policy overrides must match the saved values; terminal trace settings
+and the new output directory may change. `--no-checkpoint` disables persistence
+for a new run. Older `--mini-resume` and branch/fork flag names are not supported.
+
+The saved state includes committed conversations, accepted helpers, proof work,
+recursive child frames, planner results, and the shared cost ledger. Each
+parallel sample resumes its own lane. Saved proofs pass fresh Lean checks
+before they regain authority. A process or HTTP request itself cannot be
+restored: unfinished work resumes from its durable boundary. Committed planner
+results are consumed without repeating their provider request; uncertain
+in-flight provider exposure remains charged against the attempt's cost limit.
+
+Verified theory bundles installed during the run are regenerated from the
+current library on restore. Their recorded source snapshot and the initial
+configured context must match. An incomplete final diagnostic trace row beyond
+the validated checkpoint prefix is retained in the predecessor file and
+excluded from restored trace metrics; corruption of committed evidence still
+rejects restart.
+
+Resume requires the same input, executor source, and material Lean environment.
+An incompatible or incomplete checkpoint is rejected before search resumes.
+Only the latest generation can continue, with one active writer per attempt.
+Previous generation artifacts remain unchanged. Keep the generation directories
+and their sibling `.mini_attempts` directory together at their recorded paths;
+the latter contains the shared attempt head and financial journal. A run log or
+`turns.jsonl` alone is not a resumable checkpoint.
+
+Worker time is cumulative across generations and shared across samples. A clean
+stop excludes the subsequent stopped interval. After an abrupt exit, the
+unobserved interval since the last checkpoint is conservatively counted through
+restart, because its active and stopped portions cannot be distinguished.
+Restart does not reset cost, recovery, or worker allowances. An exhausted
+attempt requires a new run with explicitly chosen limits.
+
+Legacy runs without `attempt_checkpoint.json` cannot resume their exact search.
+Start a new run to reuse compatible verified cache and Mini-theory evidence
+through the public cache interfaces.
 
 Provider-free diagnostic replay is supported:
 

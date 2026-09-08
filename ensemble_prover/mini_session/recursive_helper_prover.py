@@ -698,6 +698,7 @@ async def prove_helper_in_subsession(
     nested_attempt_number: int = 0,
     max_elapsed_s: float = 0.0,
     action_deadline_epoch_s: float = 0.0,
+    checkpoint_child_lane: str = "",
     advisory_refutation_candidates: Sequence[Mapping[str, Any]] = (),
     publication_guard: Optional[Callable[[], None]] = None,
 ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
@@ -1944,6 +1945,25 @@ async def prove_helper_in_subsession(
         refine_registered = True
     child_session.expand_max_iterations_to_action_budgets(headroom=5)
 
+    checkpoint_registry = getattr(parent_session, "checkpoint_registry", None)
+    completed_checkpoint_result = None
+    if checkpoint_registry is not None and checkpoint_child_lane:
+        child_record = checkpoint_registry.child_record(checkpoint_child_lane)
+        if child_record is None:
+            raise ValueError("Recursive child has no durable reservation")
+        await checkpoint_registry.bind_session(checkpoint_child_lane, child_session)
+        completed_checkpoint_result = child_record.get("result")
+        if completed_checkpoint_result is not None:
+            result = completed_checkpoint_result
+            if (type(result) is not dict
+                    or set(result) != {"ok", "proof", "telemetry"}
+                    or type(result["ok"]) is not bool
+                    or type(result["telemetry"]) is not dict
+                    or (result["proof"] is not None and type(result["proof"]) is not str)
+                    or result["ok"] != bool(child_session.root_finalized)
+                    or (result["ok"] and result["proof"] != child_session.final_proof)):
+                raise ValueError("Invalid completed recursive child proof checkpoint")
+
     def merge_eligible_child_verified_helpers() -> None:
         """Admit timeout/success side helpers through the parent trust gates."""
 
@@ -2043,13 +2063,24 @@ async def prove_helper_in_subsession(
             sanitize_orphan()
         except Exception:
             pass
-    ok, proof_text, action_elapsed_budget_exhausted = (
-        await _run_child_with_elapsed_budget(
-            child_session,
-            max_elapsed_s=max_elapsed_s,
-            deadline_epoch_s=action_deadline_epoch_s,
+    if completed_checkpoint_result is not None:
+        ok = completed_checkpoint_result["ok"]
+        proof_text = completed_checkpoint_result["proof"]
+        action_elapsed_budget_exhausted = False
+    elif child_session.root_finalized:
+        # Restoration has freshly checked the exact child root. A crash after
+        # that committed boundary must not spend another provider request.
+        ok, proof_text, action_elapsed_budget_exhausted = (
+            True, child_session.final_proof, False,
         )
-    )
+    else:
+        ok, proof_text, action_elapsed_budget_exhausted = (
+            await _run_child_with_elapsed_budget(
+                child_session,
+                max_elapsed_s=max_elapsed_s,
+                deadline_epoch_s=action_deadline_epoch_s,
+            )
+        )
     # Sanitize again after the prove pass so a refine pass (when
     # enabled) doesn't inherit an orphan from the prove cascade.
     if callable(sanitize_orphan):
@@ -2437,4 +2468,14 @@ async def prove_helper_in_subsession(
         "zero_provider_failure": zero_provider_failure,
         "verdict": "ran",
     }
+    if checkpoint_registry is not None and checkpoint_child_lane and completed_checkpoint_result is None:
+        def checkpoint_publication_allowed() -> bool:
+            if publication_guard is not None:
+                publication_guard()
+            return True
+
+        await checkpoint_registry.complete_child(
+            checkpoint_child_lane, {"ok": bool(ok), "proof": proof_text, "telemetry": telemetry},
+            publication_guard=checkpoint_publication_allowed,
+        )
     return ok, proof_text, telemetry

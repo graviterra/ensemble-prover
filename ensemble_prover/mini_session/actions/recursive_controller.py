@@ -24,6 +24,7 @@ from ensemble_prover.helper_quality import verified_helper_admission_quality
 from ensemble_prover.llm_error_policy import (
     is_terminal_llm_failure_reason,
     llm_failure_scope,
+    planner_failure_is_transport_empty,
     projected_scoped_llm_failure_is_retryable,
 )
 from ensemble_prover.llm_usage import llm_usage_context_metadata
@@ -136,6 +137,11 @@ class RecursiveControllerAction:
         self._recursive_fixed_point_reason = str(
             record.get("recursive_fixed_point_reason") or ""
         )
+
+    async def restore_checkpoint_children(self, session: Any, frames: dict[str, Any]) -> None:
+        from ..durable_recursive_child import restore_controller_children
+
+        await restore_controller_children(self, session, frames)
 
     def __init__(
         self,
@@ -295,10 +301,23 @@ class RecursiveControllerAction:
                 if isinstance(terminal_result, dict)
                 else ""
             )
+            transport_empty_allocation = bool(
+                self._recursive_driver_state.get("empty_planner_degeneracy_reason")
+                == "planner_transport_empty"
+                and planner_failure_is_transport_empty(
+                    terminal_failure_reason,
+                    metadata=dict(
+                        self._recursive_driver_state.get("stats") or {}
+                    ).get("last_planner_failure_metadata"),
+                )
+            )
             if (
                 str(self._recursive_driver_state.get("phase") or "")
                 == "terminal_committed"
-                and terminal_failure_reason == "recursive_passes_exhausted"
+                and (
+                    terminal_failure_reason == "recursive_passes_exhausted"
+                    or transport_empty_allocation
+                )
             ):
                 # A configured pass limit is an allocation boundary, not a
                 # mathematical fixed point.  The session may explicitly grant
@@ -309,6 +328,9 @@ class RecursiveControllerAction:
                 # that new allocation.  Clearing here made every recovered
                 # allocation enter as pass 1 and replay the same root tactic
                 # portfolio plus the same paid planner failure indefinitely.
+                # A transport-empty final pass reports its scoped provider
+                # failure instead of passes_exhausted; retain its same-evidence
+                # recovery receipt too, without granting a new allocation.
                 next_pass = max(
                     1,
                     int(self._recursive_driver_state.get("pass_index", 1) or 1),
@@ -832,6 +854,8 @@ class RecursiveControllerAction:
             if callable(persist_cutpoint):
                 persist_cutpoint()
 
+        from ..durable_recursive_child import bind_controller_checkpoint_callback
+
         attempt_coro = run_mini_recursive_attempt(
             theorem_name=session.problem.theorem_name,
             root_statement=session.problem.statement_type,
@@ -847,7 +871,7 @@ class RecursiveControllerAction:
             lean_preamble=str(getattr(session.conv, "lean_preamble", "") or ""),
             attempt_dossier=session.dossier,
             conversation_cls=Conversation,
-            run_conversation_fn=self.run_conversation_fn,
+            run_conversation_fn=bind_controller_checkpoint_callback(self, session),
             max_tool_calls_per_turn=self.max_tool_calls_per_turn,
             lean_check_tool_enabled=self.lean_check_tool_enabled,
             try_lean_tool_enabled=self.try_lean_tool_enabled,

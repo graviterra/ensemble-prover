@@ -299,7 +299,7 @@ _SESSION_NONNEGATIVE_SECONDS_STATE_KEYS = frozenset(
 )
 _SESSION_OPAQUE_SCALAR_STATE_KEYS = frozenset({"last_lean_verdict"})
 _SESSION_SCOPE_VALUES = frozenset(
-    {"problem", "attempt", "sample", "subgoal", "branch"}
+    {"problem", "attempt", "sample", "subgoal", "branch", "parallel_fanin_recursive"}
 )
 
 
@@ -2991,7 +2991,7 @@ def replay_scheduler_selection(session: Any, snapshot: Mapping[str, Any]) -> JSO
     # Replay deliberately suppresses external observability.  Do not clone
     # these capabilities first: a production RunRecorder owns open streams
     # and is correctly not deepcopyable.
-    disabled_runtime_keys = {"recorder", "on_event"}
+    disabled_runtime_keys = {"recorder", "on_event", "checkpoint_registry"}
     try:
         replay_session = copy.copy(session)
         # Preserve self/cyclic references while ensuring mutable parent

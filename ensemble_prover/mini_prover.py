@@ -72,6 +72,14 @@ from .lean_runner import LeanRunner
 from .lean_syntax import lean_expression_delimiters_balanced
 from .llm_deadline import llm_retry_deadline_record_from_exception
 from .mini_deadline_transaction import DeadlineMutationTransaction
+from .mini_checkpoint_cli import (
+    CheckpointArgumentParser,
+    WorkerBudgetExhausted,
+    checkpoint_cost_controller,
+    cli_attempt_identity,
+    remaining_worker_timeout_s,
+    resolve_resume_args,
+)
 from .mini_recursive_outcome import is_resumable_mini_recursive_yield
 from .llm_usage import (
     CostBudgetController,
@@ -1598,7 +1606,7 @@ class Conversation:
                 for idx, msg in enumerate(history_without_old_boundaries)
                 if msg.get("role") == "assistant" and msg.get("tool_calls")
             )
-            self.history = [
+            compacted_history = [
                 *history_without_old_boundaries[:first_tool],
                 evidence_boundary,
                 *(
@@ -1606,7 +1614,11 @@ class Conversation:
                     for msg in history_without_old_boundaries[first_tool:]
                 ),
             ]
+            history_changed = compacted_history != history
+            if history_changed:
+                self.history = compacted_history
             return {
+                "history_changed": history_changed,
                 "removed_messages": len(redundant_boundaries),
                 "removed_chars": sum(
                     _history_message_payload_chars(msg)
@@ -11057,6 +11069,7 @@ async def prove_problem(
     graph_execution_projection_mode: Optional[str] = None,
     graph_execution_project_environment_hash: Optional[str] = None,
     worker_ready_callback: Optional[Callable[[], None]] = None,
+    checkpoint_registry: Any = None,
 ) -> Tuple[bool, Optional[str]]:
     """Public entry point for the MiniSession prover.
 
@@ -11376,6 +11389,7 @@ async def prove_problem(
             graph_execution_project_environment_hash
         ),
         worker_ready_callback=worker_ready_callback,
+        checkpoint_registry=checkpoint_registry,
     )
 
 async def _preflight_theorem_project_input(
@@ -12783,7 +12797,7 @@ def _run_reasoning_config_record(
 # ---------------------------------------------------------------------------
 
 def _build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = CheckpointArgumentParser(
         prog="mini_prover",
         description=(
             "End-to-end autonomous recursive Lean prover (theory test bed). "
@@ -12830,6 +12844,14 @@ def _build_argparser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     input_group = p.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--resume-from", default=None,
+        help="Resume an attempt checkpoint into a new output generation, retaining its saved configuration.",
+    )
+    p.add_argument(
+        "--no-checkpoint", dest="checkpoint_enabled", action="store_false", default=True,
+        help="Disable durable execution checkpoints for this new run.",
+    )
     input_group.add_argument(
         "--lean-file",
         default=None,
@@ -14765,6 +14787,9 @@ def _allocate_default_mini_run_dir(artifact_slug: str) -> Path:
 
 
 async def _main_async(args: argparse.Namespace) -> int:
+    worker_started_monotonic = time.monotonic()
+    worker_admitted_elapsed_s = None
+    args = resolve_resume_args(args)
     # CLI namespaces can also be supplied programmatically.  Validate the
     # complete falsification numeric surface before installing handlers,
     # resolving theorem inputs, or initializing any runtime service.
@@ -14791,7 +14816,49 @@ async def _main_async(args: argparse.Namespace) -> int:
         output_dir = Path(args.output_dir).resolve()
     else:
         output_dir = _allocate_default_mini_run_dir(problem.artifact_slug)
-    recorder = RunRecorder(output_dir)
+    checkpoint_registry = None
+    try:
+        startup_artifacts = {}
+        if bool(getattr(args, "checkpoint_enabled", True)):
+            from .mini_generation_artifacts import startup_artifact_receipts
+            from .mini_session.attempt_checkpoint import AttemptCheckpointRegistry
+            from .mini_session.process_watchdog import (
+                is_watchdog_worker, worker_granted_timeout_s, worker_overall_deadline,
+            )
+
+            if is_watchdog_worker():
+                deadline = worker_overall_deadline()
+                if deadline > 0:
+                    # The watchdog starts before worker imports. Retain that
+                    # startup time and its already-admitted predecessor clock;
+                    # another wall-clock observation would charge startup twice.
+                    granted = worker_granted_timeout_s()
+                    if granted <= 0:
+                        raise ValueError("A bounded worker needs its admitted timeout")
+                    worker_started_monotonic = deadline - granted
+                    worker_admitted_elapsed_s = float(args.mini_worker_timeout_s) - granted
+                startup_artifacts = startup_artifact_receipts(
+                    output_dir, nonce=str(getattr(args, "mini_theory_startup_overlay_nonce", "") or ""),
+                )
+            checkpoint_registry = AttemptCheckpointRegistry(
+                output_dir, identity=cli_attempt_identity(args, problem),
+                resume_from=(Path(args.resume_from) if getattr(args, "resume_from", None) else None),
+                startup_artifacts=startup_artifacts,
+                worker_started_monotonic=worker_started_monotonic,
+                worker_admitted_elapsed_s=worker_admitted_elapsed_s,
+            )
+        recorder = RunRecorder(
+            output_dir,
+            resume_state=(checkpoint_registry.recorder_resume_state if checkpoint_registry is not None else None),
+            startup_artifacts=startup_artifacts,
+        )
+    except BaseException:
+        if checkpoint_registry is not None:
+            checkpoint_registry.close()
+        _uninstall_cooperative_stop()
+        raise
+    if checkpoint_registry is not None:
+        checkpoint_registry.recorder = recorder
     configure_live_trace = getattr(recorder, "configure_live_trace", None)
     if callable(configure_live_trace):
         configure_live_trace(str(getattr(args, "terminal_trace", "compact") or "compact"))
@@ -14851,17 +14918,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         print(f"Docstring:\n  {problem.docstring or '(none)'}")
         print(f"Statement type:\n  {problem.statement_type}")
         print()
-        cost_controller = CostBudgetController(
-            max_cost_usd=max(0.0, float(getattr(args, "cost_budget_usd", 0.0) or 0.0)),
-            reserve_output_tokens=max(
-                0,
-                int(
-                    getattr(args, "cost_budget_reserve_output_tokens", 1024)
-                    or 0
-                ),
-            ),
-            event_sink=recorder.record_turn,
-        )
+        cost_controller = await checkpoint_cost_controller(checkpoint_registry, recorder, args)
         mini_phase_temperature_policy = _mini_phase_temperature_policy_from_args(args)
 
         prover_timeout_s = (
@@ -15263,6 +15320,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 max_prove_turns=int(args.max_prove_turns),
                 max_refine_turns=int(args.max_refine_turns),
                 recorder=recorder,
+                checkpoint_registry=checkpoint_registry,
                 searcher=searcher,
                 mathematical_retrieval_enabled=bool(
                     getattr(args, "mathematical_retrieval", True)
@@ -16880,12 +16938,19 @@ async def _main_async(args: argparse.Namespace) -> int:
                 # ``recorder.close()`` MUST run even if write_summary fails,
                 # otherwise stdout/stderr stay redirected and file handles leak.
                 try:
-                    await _supervised_sync_resource_close(
-                        recorder.close,
-                        label="mini_session_recorder_close",
-                    )
-                except Exception:
-                    pass
+                    if checkpoint_registry is not None:
+                        await checkpoint_registry.complete_worker_generation()
+                finally:
+                    try:
+                        await _supervised_sync_resource_close(
+                            recorder.close,
+                            label="mini_session_recorder_close",
+                        )
+                    except Exception:
+                        pass
+                    finally:
+                        if checkpoint_registry is not None:
+                            checkpoint_registry.close()
         finally:
             # Release LLM HTTP connection pools even if summary writing fails.
             # ``OpenAICompatClient`` wraps an ``httpx.AsyncClient`` whose
@@ -17563,7 +17628,7 @@ def _shutdown_artifact_identity(
 
 def main() -> int:
     parser = _build_argparser()
-    args = parser.parse_args()
+    args = resolve_resume_args(parser.parse_args())
     from .mini_session.process_watchdog import (
         VERIFY_STAGED_SOLUTION_EXIT_CODE,
         begin_process_deadline,
@@ -17577,6 +17642,11 @@ def main() -> int:
         int(getattr(args, "parallel_samples", 1) or 1),
     )
     if not is_watchdog_worker():
+        try:
+            worker_timeout_s = remaining_worker_timeout_s(args)
+        except WorkerBudgetExhausted as error:
+            print(str(error), flush=True)
+            return 1
         worker_argv = list(sys.argv[1:])
         if parallel_sample_count > 1:
             # Parallel search remains cooperative inside one isolated worker,
@@ -17600,9 +17670,7 @@ def main() -> int:
             )
             worker_argv.extend(["--output-dir", str(supervised_output_dir)])
         watchdog_options = {
-            "overall_timeout_s": float(
-                getattr(args, "mini_worker_timeout_s", 0.0) or 0.0
-            ),
+            "overall_timeout_s": worker_timeout_s,
             "startup_timeout_s": float(
                 getattr(args, "mini_worker_startup_timeout_s", 0.0) or 0.0
             ),
@@ -17687,4 +17755,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Factory callbacks import this composition root by its package name.
+    # Reuse the executing CLI rather than loading a second copy from disk
+    # after a long startup, when the source checkout may have changed.
+    _executing_cli_module = sys.modules.get("__main__")
+    if _executing_cli_module is not None and vars(_executing_cli_module) is globals():
+        sys.modules["ensemble_prover.mini_prover"] = _executing_cli_module
     sys.exit(main())

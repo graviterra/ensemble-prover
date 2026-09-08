@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 ACTIVATION_SCHEMA_VERSION = 1
-ACTIVATION_CLASSIFIER_VERSION = 13
+ACTIVATION_CLASSIFIER_VERSION = 14
 ACTIVATION_ARTIFACT_NAME = "activation_telemetry.json"
 
 
@@ -654,6 +654,7 @@ def _event_labels(record: Mapping[str, Any]) -> List[str]:
             "llm_response",
             "llm_response_cancelled",
             "llm_call_failed",
+            "provider_call_quantum_yielded",
         }
         or (not session_scoped and phase != "session_action_outcome")
     )

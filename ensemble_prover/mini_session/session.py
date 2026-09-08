@@ -10249,6 +10249,8 @@ class MiniSession:
     searcher: Optional[Any] = None  # MathlibApiSearcher | None
     recorder: Optional[Any] = None  # RunRecorder | None
     cost_controller: Optional[Any] = None  # CostBudgetController | None
+    checkpoint_registry: Optional[Any] = None  # AttemptCheckpointRegistry | None
+    checkpoint_lane_key: str = ""
     trace_prefix: str = ""
 
     # Action registry + per-id budget table. ``actions`` is scanned in
@@ -10276,6 +10278,19 @@ class MiniSession:
         if broker is None and create:
             broker = PlannerJobBroker()
             setattr(owner, "_mini_planner_job_broker", broker)
+        registry = getattr(owner, "checkpoint_registry", None)
+        lane = getattr(owner, "checkpoint_lane_key", "")
+        if broker is not None and registry is not None and broker.durable_binding != (id(registry), lane):
+            from .planner_jobs import planner_result_to_record
+            async def sink(result: Any, *, publication_guard: Any) -> None:
+                await registry.persist_planner_receipt(
+                    lane, planner_result_to_record(result),
+                    publication_guard=publication_guard,
+                )
+            broker.bind_durability(
+                binding=(id(registry), lane), sink=sink,
+                receipts=registry.planner_receipt_records(lane),
+            )
         return broker
 
     def owns_planner_split_scheduler(self) -> bool:
@@ -13603,6 +13618,11 @@ class MiniSession:
             record.get("mapped_action_id") or record.get("action_id") or ""
         ).strip()
         work_type = str(record.get("work_type") or "").strip()
+        if status.get("reason") == "blocked_by_unresolved":
+            action = self.registered_action(action_id)
+            owns_child = getattr(action, "owns_checkpoint_blocked_obligation", None)
+            if callable(owns_child) and owns_child(self, str(status.get("node_id") or "")):
+                return False
         if (
             work_type == "materialize_replay_source"
             and str(status.get("reason") or "") == "status_proved"
@@ -13871,21 +13891,23 @@ class MiniSession:
             "residual_goal_attestation_status",
             None,
         )
-        try:
-            from ensemble_prover.proof_state_executor import (
-                proof_state_current_residual_route_context_hashes,
-            )
-
-            current_residual_context_hashes = (
-                proof_state_current_residual_route_context_hashes(
-                    conv=self.conv,
-                    dossier=self.dossier,
-                    lean=self.lean,
-                    proof_state=proof_state,
+        current_residual_context_hashes = {}
+        if not self._residual_dispatch_cache_ready:
+            try:
+                from ensemble_prover.proof_state_executor import (
+                    proof_state_current_residual_route_context_hashes,
                 )
-            )
-        except Exception:
-            current_residual_context_hashes = {}
+
+                current_residual_context_hashes = (
+                    proof_state_current_residual_route_context_hashes(
+                        conv=self.conv,
+                        dossier=self.dossier,
+                        lean=self.lean,
+                        proof_state=proof_state,
+                    )
+                )
+            except Exception:
+                current_residual_context_hashes = {}
         for node_id in candidate_node_ids:
             node = proof_state_nodes.get(node_id)
             if node is None or str(getattr(node, "kind", "") or "") != "child_goal":
@@ -23119,10 +23141,25 @@ class MiniSession:
                     suppressed_ready_action_id
                 )
             try:
+                # A restored child frame already owns a selected controller
+                # invocation. Ordinary graph reconciliation would advance its
+                # cognition before that sealed cursor is consumed.
+                prepared_controller_action = None
+                prepared_controller_pending = bool(getattr(
+                    self, "_checkpoint_prepared_controller_action", None
+                ))
+                if (normal_continuation and prepared_controller_pending
+                        and admitted_ready_planner_action is None
+                        and dispatchable_missing_planner_action is None):
+                    from .durable_recursive_child import select_prepared_controller_action
+
+                    prepared_controller_action = select_prepared_controller_action(self)
                 action = (
                     admitted_ready_planner_action
                     or dispatchable_missing_planner_action
-                    or (self.select_next_action() if normal_continuation else None)
+                    or prepared_controller_action
+                    or (self.select_next_action()
+                        if normal_continuation and not prepared_controller_pending else None)
                 )
             finally:
                 if suppressed_ready_action_id:
@@ -23591,6 +23628,7 @@ class MiniSession:
                     metadata=metadata,
                 )
             hook_detachments = 0
+            durable_planner_launch = None
             try:
                 dispatch_session._inflight_action_dispatch_id = ""
                 dispatch_session._stamp_outcome_dispatch_metadata(
@@ -23634,8 +23672,11 @@ class MiniSession:
                     planner_launch = take_planner_launch()
                     if planner_launch is not None:
                         broker = dispatch_session.planner_job_broker()
+                        if self.checkpoint_registry is not None:
+                            durable_planner_launch = planner_launch
                         launched = bool(
-                            broker is not None and broker.launch(planner_launch)
+                            self.checkpoint_registry is None
+                            and broker is not None and broker.launch(planner_launch)
                         )
                         dispatch_session._record_event(
                             {
@@ -23646,6 +23687,9 @@ class MiniSession:
                                     planner_launch.identity.request_fingerprint
                                 ),
                                 "verdict": (
+                                    "planner_job_awaiting_checkpoint"
+                                    if durable_planner_launch is not None
+                                    else
                                     "planner_job_launched"
                                     if launched
                                     else "planner_job_launch_deduplicated"
@@ -23689,6 +23733,23 @@ class MiniSession:
                 completed_action_id,
                 None,
             )
+            if self.checkpoint_registry is not None:
+                if not self.checkpoint_lane_key:
+                    raise ValueError("durable checkpoint lane is not registered")
+                # Settlement, apply, and action publication are complete. A
+                # failed durable write must stop before another action starts.
+                await self.checkpoint_registry.commit_session(
+                    self.checkpoint_lane_key, self
+                )
+            if durable_planner_launch is not None:
+                broker = self.planner_job_broker()
+                launched = broker.launch(durable_planner_launch)
+                self._record_event({
+                    "phase": "session_planner_job", "action_id": str(outcome.action_id or ""),
+                    "planner_job_id": durable_planner_launch.identity.job_id,
+                    "request_fingerprint": durable_planner_launch.identity.request_fingerprint,
+                    "verdict": "planner_job_launched" if launched else "planner_job_launch_deduplicated",
+                })
             if outcome.solved:
                 proof = self.final_proof or self._durable_final_proof()
                 if self.root_finalized and proof:
@@ -28364,6 +28425,9 @@ class MiniSession:
                 key: metadata.get(key)
                 for key in (
                     "llm_failure_tool_history_compacted",
+                    "llm_transport_failure_type",
+                    "llm_transport_failure_attempt",
+                    "llm_transport_failure_request_timeout_s",
                     "llm_failure_tool_history_compacted_messages",
                     "llm_failure_tool_history_compacted_tool_rounds",
                     "llm_failure_tool_history_compacted_chars",
@@ -29366,6 +29430,9 @@ class MiniSession:
             "tool_repeat_action",
             "tool_repeat_signature",
             "llm_failure_tool_history_compacted",
+            "llm_transport_failure_type",
+            "llm_transport_failure_attempt",
+            "llm_transport_failure_request_timeout_s",
             "llm_failure_tool_history_compacted_messages",
             "llm_failure_tool_history_compacted_tool_rounds",
             "llm_failure_tool_history_compacted_chars",
@@ -32361,6 +32428,24 @@ class MiniSession:
                         "verdict": "consumer_reconciliation_failed_closed",
                     }
                 )
+        frontier_verified_helpers: Optional[List[str]] = None
+
+        def current_helper_context() -> List[str]:
+            # Reconciliation can change helper visibility and graph metadata.
+            # Share one ordered view throughout this synchronous frontier;
+            # quotation must only read the previously committed quality state.
+            nonlocal frontier_verified_helpers
+            if frontier_verified_helpers is None:
+                from ensemble_prover.proof_state_executor import (
+                    _proof_state_verified_helper_blocks,
+                )
+
+                frontier_verified_helpers = _proof_state_verified_helper_blocks(
+                    self.dossier,
+                    refresh_quality=mutate,
+                )
+            return frontier_verified_helpers
+
         if mutate:
             self._residual_dispatch_cache_ready = False
             self._residual_dispatch_required_ids.clear()
@@ -32379,12 +32464,14 @@ class MiniSession:
                         dossier=self.dossier,
                         lean=self.lean,
                         proof_state=self.proof_state,
+                        verified_helpers=current_helper_context(),
                     )
                 )
                 rearmed_helper_acceptances = ensure_current_helper_acceptance_retries(
                     conv=self.conv,
                     dossier=self.dossier,
                     proof_state=self.proof_state,
+                    verified_helpers=current_helper_context(),
                 )
                 if rearmed_helper_acceptances:
                     self._record_event(
@@ -32409,6 +32496,7 @@ class MiniSession:
                     dossier=self.dossier,
                     lean=self.lean,
                     proof_state=self.proof_state,
+                    verified_helpers=current_helper_context(),
                 )
                 (
                     required_ids,
@@ -32480,13 +32568,15 @@ class MiniSession:
             helper_blocks: List[str] = []
             helper_getter = getattr(
                 self.dossier,
-                (
-                    "verified_helper_blocks"
-                    if mutate
-                    else "verified_helper_blocks_snapshot"
-                ),
+                "verified_helper_blocks_snapshot",
                 None,
             )
+            if mutate and not callable(helper_getter):
+                helper_getter = getattr(
+                    self.dossier,
+                    "verified_helper_blocks",
+                    None,
+                )
             if callable(helper_getter):
                 try:
                     helper_blocks = list(helper_getter() or ())
@@ -32550,6 +32640,7 @@ class MiniSession:
             decl_context_hash = proof_state_decl_application_context_hash(
                 self.conv,
                 self.dossier,
+                verified_helpers=current_helper_context(),
             )
             if decl_context_hash:
                 decl_application_context_hashes = {

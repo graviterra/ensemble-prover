@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
 from ensemble_prover.llm_usage import (
@@ -102,6 +102,49 @@ class PlannerJobResult:
     exception: BaseException | None = None
 
 
+def planner_result_to_record(result: PlannerJobResult) -> dict[str, Any]:
+    from ensemble_prover.state_data import clone_json_value
+    error = None
+    if result.exception is not None:
+        from .planner_job_receipt import encode_planner_error
+        error = encode_planner_error(result.exception)
+    identity = asdict(result.identity)
+    for name in ("active_target_statement_keys", "helper_evidence_fingerprints"):
+        identity[name] = list(identity[name])
+    return clone_json_value({"schema_version": 1, "identity": identity,
+                             "value": result.value, "error": error})
+
+
+def planner_result_from_record(record: dict[str, Any]) -> PlannerJobResult:
+    from ensemble_prover.state_data import clone_json_value
+    from dataclasses import fields
+    data = clone_json_value(record)
+    if (type(data) is not dict or set(data) != {"schema_version", "identity", "value", "error"}
+            or type(data["schema_version"]) is not int or data["schema_version"] != 1):
+        raise ValueError("Invalid durable planner receipt")
+    identity = data["identity"]
+    if type(identity) is not dict or set(identity) != {item.name for item in fields(PlannerJobIdentity)}:
+        raise ValueError("Invalid durable planner identity")
+    for name, value in identity.items():
+        if name in {"pass_index", "stage_round"}:
+            valid = type(value) is int and value >= 0
+        elif name in {"active_target_statement_keys", "helper_evidence_fingerprints"}:
+            valid = type(value) is list and all(type(item) is str for item in value)
+        else:
+            valid = type(value) is str
+        if not valid:
+            raise ValueError("Invalid durable planner identity field")
+    if not identity["job_id"] or not identity["request_fingerprint"]:
+        raise ValueError("Missing durable planner request identity")
+    error = None
+    if data["error"] is not None:
+        from .planner_job_receipt import decode_planner_error
+        error = decode_planner_error(data["error"])
+        if data["value"] is not None:
+            raise ValueError("Durable planner receipt has both value and error")
+    return PlannerJobResult(PlannerJobIdentity(**identity), data["value"], error)
+
+
 class PlannerJobYield(BaseException):
     """Transfer a planner launch across the action transaction boundary.
 
@@ -122,14 +165,15 @@ class PlannerJobExecutionCancelled(RuntimeError):
 @dataclass(slots=True)
 class _PlannerJobEntry:
     identity: PlannerJobIdentity
-    task: asyncio.Task[None]
+    task: asyncio.Task[None] | None
     result: PlannerJobResult | None = None
 
 
 class PlannerJobBroker:
     """Own and deliver long planner operations for one running session."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, durable_result_sink: Any = None,
+                 restored_receipts: tuple[dict[str, Any], ...] = ()) -> None:
         self._jobs: dict[tuple[str, str], _PlannerJobEntry] = {}
         self._quarantined: dict[tuple[str, str], _PlannerJobEntry] = {}
         self._launched: set[PlannerJobIdentity] = set()
@@ -137,6 +181,46 @@ class PlannerJobBroker:
         self._owner_tasks: set[asyncio.Task[Any]] = set()
         self._session_owners: dict[int, asyncio.Task[Any] | None] = {}
         self._watched_session_tasks: set[asyncio.Task[Any]] = set()
+        self._durable_result_sink = durable_result_sink
+        self._durable_failure: BaseException | None = None
+        self.durable_binding: tuple[int, str] | None = None
+        self._acknowledged: dict[tuple[str, str], PlannerJobIdentity] = {}
+        for record in restored_receipts:
+            result = planner_result_from_record(record)
+            key = self._key(result.identity.job_id, result.identity.request_fingerprint)
+            if key in self._jobs:
+                raise ValueError("Duplicate durable planner receipt")
+            self._jobs[key] = _PlannerJobEntry(result.identity, None, result)
+            self._launched.add(result.identity)
+
+    def bind_durability(self, *, binding: tuple[int, str], sink: Any,
+                        receipts: tuple[dict[str, Any], ...]) -> None:
+        """Attach a previously idle broker without replacing bound owners."""
+        if self.durable_binding == binding:
+            return
+        if (self.durable_binding is not None or self._durable_result_sink is not None
+                or self._jobs or self._quarantined or self._launched or self._acknowledged
+                or self._durable_failure is not None):
+            raise ValueError("Cannot rebind an active or previously durable planner broker")
+        staged = PlannerJobBroker(durable_result_sink=sink, restored_receipts=receipts)
+        self._jobs = staged._jobs
+        self._launched = staged._launched
+        self._durable_result_sink = sink
+        self.durable_binding = binding
+
+    def _check_durable_failure(self) -> None:
+        if self._durable_failure is not None:
+            raise self._durable_failure
+
+    def acknowledged_receipts(self) -> tuple[PlannerJobIdentity, ...]:
+        return tuple(self._acknowledged.values())
+
+    def confirm_receipts_committed(self, identities: tuple[PlannerJobIdentity, ...]) -> None:
+        for identity in identities:
+            key = self._key(identity.job_id, identity.request_fingerprint)
+            if self._acknowledged.get(key) == identity:
+                self._acknowledged.pop(key)
+                self._launched.discard(identity)
 
     @staticmethod
     def _key(job_id: str, request_fingerprint: str) -> tuple[str, str]:
@@ -145,6 +229,7 @@ class PlannerJobBroker:
     def launch(self, launch: PlannerJobLaunch) -> bool:
         """Launch an exact request once; return false for a replay."""
 
+        self._check_durable_failure()
         identity = launch.identity
         key = self._key(identity.job_id, identity.request_fingerprint)
         if (
@@ -221,12 +306,26 @@ class PlannerJobBroker:
             or entry.identity != launch.identity
         ):
             return
+        if self._durable_result_sink is not None:
+            def still_owned() -> bool:
+                current = self._jobs.get(key)
+                return current is entry and current.task is owner_task
+            try:
+                await self._durable_result_sink(result, publication_guard=still_owned)
+            except BaseException as error:
+                if still_owned():
+                    self._durable_failure = error
+                    self._changed.set()
+                return
+            if not still_owned():
+                return
         entry.result = result
         self._changed.set()
 
     def status(self, job_id: str, request_fingerprint: str) -> str:
         """Return ``missing``, ``pending``, or ``ready`` for an exact key."""
 
+        self._check_durable_failure()
         key = self._key(job_id, request_fingerprint)
         entry = self._jobs.get(key)
         if entry is not None:
@@ -245,11 +344,13 @@ class PlannerJobBroker:
         self._changed.clear()
 
     def has_pending(self) -> bool:
+        self._check_durable_failure()
         return bool(self._quarantined) or any(
             entry.result is None for entry in self._jobs.values()
         )
 
     def has_ready(self) -> bool:
+        self._check_durable_failure()
         return any(entry.result is not None for entry in self._jobs.values())
 
     def bind_owner_task(self, task: asyncio.Task[Any] | None) -> None:
@@ -320,9 +421,12 @@ class PlannerJobBroker:
 
     def cancel_all_nowait(self) -> tuple[asyncio.Task[None], ...]:
         keyed_entries = tuple(self._jobs.items())
-        entries = tuple(entry for _key, entry in keyed_entries)
+        entries = tuple(entry for _key, entry in keyed_entries if entry.task is not None)
         self._jobs.clear()
         for key, entry in keyed_entries:
+            if entry.task is None:
+                self._launched.discard(entry.identity)
+                continue
             self._quarantined[key] = entry
 
             def release_quarantine(
@@ -352,11 +456,14 @@ class PlannerJobBroker:
     ) -> PlannerJobResult | None:
         """Consume a ready result exactly once."""
 
+        self._check_durable_failure()
         key = self._key(job_id, request_fingerprint)
         entry = self._jobs.get(key)
         if entry is None or entry.result is None:
             return None
         del self._jobs[key]
+        if self._durable_result_sink is not None:
+            self._acknowledged[key] = entry.identity
         return entry.result
 
     def peek(
@@ -366,6 +473,7 @@ class PlannerJobBroker:
     ) -> PlannerJobResult | None:
         """Lease a ready result without retiring it before durable commit."""
 
+        self._check_durable_failure()
         entry = self._jobs.get(self._key(job_id, request_fingerprint))
         return entry.result if entry is not None else None
 
@@ -387,7 +495,10 @@ class PlannerJobBroker:
         # Publication is now durable. A later scheduler-authorized retry of
         # the same mathematical request is a new operation, not a replay of
         # this receipt; release its launch fence only at this commit boundary.
-        self._launched.discard(entry.identity)
+        if self._durable_result_sink is not None:
+            self._acknowledged[key] = entry.identity
+        else:
+            self._launched.discard(entry.identity)
         return True
 
     async def cancel_all(self, *, drain_timeout_s: float = 1.0) -> None:

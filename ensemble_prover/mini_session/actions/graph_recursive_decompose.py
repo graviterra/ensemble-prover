@@ -198,6 +198,7 @@ class GraphRecursiveDecomposeAction:
         return {
             "schema_version": 1,
             "recursive_driver_state": copy.deepcopy(self._recursive_driver_state),
+            "graph_subpass_context": copy.deepcopy(self._checkpoint_graph_subpass_context),
         }
 
     def apply_scheduler_runtime_state(self, state: Any) -> None:
@@ -213,7 +214,23 @@ class GraphRecursiveDecomposeAction:
             raise StateSnapshotCompatibilityError(
                 "graph recursive driver cursor is malformed"
             )
+        graph_context = record.get("graph_subpass_context", {})
+        if not isinstance(graph_context, dict):
+            raise StateSnapshotCompatibilityError(
+                "graph recursive sub-pass context is malformed"
+            )
         self._recursive_driver_state = copy.deepcopy(driver_state)
+        self._checkpoint_graph_subpass_context = copy.deepcopy(graph_context)
+
+    async def restore_checkpoint_children(self, session: Any, frames: dict[str, Any]) -> None:
+        from ..durable_recursive_child import restore_controller_children
+
+        await restore_controller_children(self, session, frames)
+
+    def owns_checkpoint_blocked_obligation(self, session: Any, node_id: str) -> bool:
+        from ..durable_recursive_child import owns_graph_child_blocker
+
+        return owns_graph_child_blocker(self, session, node_id)
 
     def __init__(
         self,
@@ -310,6 +327,7 @@ class GraphRecursiveDecomposeAction:
         )
         self._nested_execution_frame: dict[str, Any] = {}
         self._recursive_driver_state: dict[str, Any] = {}
+        self._checkpoint_graph_subpass_context: dict[str, Any] = {}
         self._pending_planner_job_launch: Optional[PlannerJobLaunch] = None
         self._planner_job_receipt_identities: dict[tuple[str, str], Any] = {}
 
@@ -333,6 +351,9 @@ class GraphRecursiveDecomposeAction:
             return
         self._nested_execution_frame = {}
         self._recursive_driver_state = {}
+        self._checkpoint_graph_subpass_context = {}
+        self._checkpoint_graph_owner_marker = None
+        self._checkpoint_prepared_controller_marker = None
 
     def take_pending_planner_job_launch(self) -> Optional[PlannerJobLaunch]:
         """Transfer prepared raw provider work after action commit."""
@@ -1308,7 +1329,8 @@ class GraphRecursiveDecomposeAction:
                     resolved_blocked = False
         # Skip proved, terminal, and still-blocked obligations (idempotency
         # and fail-closed readiness).
-        if obligation_status != "open" and not resolved_blocked:
+        if (obligation_status != "open" and not resolved_blocked
+                and not self.owns_checkpoint_blocked_obligation(session, obligation_id)):
             return False
         # Skip tombstoned obligations.
         is_tombstone = getattr(graph, "is_superseded_tombstone", None)
@@ -1933,6 +1955,60 @@ class GraphRecursiveDecomposeAction:
                     or {}
                 )
             )
+        from ..durable_recursive_child import (
+            bind_controller_checkpoint_callback,
+            restore_graph_subpass_dossier,
+        )
+
+        try:
+            restored_sub_dossier = await restore_graph_subpass_dossier(
+                self, session, obligation_id=obligation_id,
+                theorem_name=obligation_theorem_name, root_statement=statement,
+                selected_work_record=selected_work_record,
+            )
+        except ValueError as exc:
+            # A rejected saved context is a retired continuation, not a
+            # transient action failure. Settlement clears its cursor and
+            # acknowledges its planner receipt before another selection.
+            return MiniOutcome(
+                action_id=self.id, solved=False, proof=None, helpers_added=(),
+                progress=False, cost_seconds=max(0.0, time.monotonic() - started),
+                metadata={
+                    "verdict": "stale_graph_checkpoint_context_retired",
+                    "reason": str(exc),
+                    "work_type": work_type,
+                    "obligation_id": obligation_id,
+                    "preserve_action_budget": True,
+                    "selected_work_projection_invalidated": True,
+                    "selected_work_projection_zero_provider": True,
+                    "refund_local_repair_quota": True,
+                    "iteration_neutral": True,
+                    "scheduler_neutral": True,
+                    "stagnation_neutral": True,
+                    "hard_pivot_neutral": True,
+                    "strong_progress": False,
+                },
+            )
+        if restored_sub_dossier is not None:
+            sub_dossier = restored_sub_dossier
+            context = self._checkpoint_graph_subpass_context
+            child_branch_key = context["branch_key"]
+            selected_parent_proof_idea_context = context["selected_parent_context"]
+            child_proof_idea_ids = set(context["child_proof_idea_ids"])
+            child_proof_idea_branch_id = context["child_proof_idea_branch_id"]
+
+        def graph_subpass_checkpoint_context() -> dict[str, Any]:
+            return {
+                "obligation_id": obligation_id, "theorem_name": obligation_theorem_name,
+                "root_statement": statement, "branch_key": child_branch_key,
+                "selected_parent_context": selected_parent_proof_idea_context,
+                "parent_context_hash": self._recursive_attempt_context_hash(
+                    session, refresh_quality=False, selected_work_record=selected_work_record),
+                "dossier": sub_dossier.to_execution_record(),
+                "ancestor_stack": list(self._ancestor_stack(session)),
+                "child_proof_idea_ids": sorted(child_proof_idea_ids),
+                "child_proof_idea_branch_id": child_proof_idea_branch_id,
+            }
         recursive_helper_action = None
         registered_action = getattr(session, "registered_action", None)
         if callable(registered_action):
@@ -2123,7 +2199,9 @@ class GraphRecursiveDecomposeAction:
                 lean_preamble=str(getattr(session.conv, "lean_preamble", "") or ""),
                 attempt_dossier=sub_dossier,
                 conversation_cls=Conversation,
-                run_conversation_fn=self.run_conversation_fn,
+                run_conversation_fn=bind_controller_checkpoint_callback(
+                    self, session, graph_subpass_context=graph_subpass_checkpoint_context,
+                ),
                 max_tool_calls_per_turn=self.max_tool_calls_per_turn,
                 lean_check_tool_enabled=self.lean_check_tool_enabled,
                 try_lean_tool_enabled=self.try_lean_tool_enabled,
@@ -2405,6 +2483,10 @@ class GraphRecursiveDecomposeAction:
                         "strong_progress": False,
                     },
                 )
+            # Claim labels are scoped to this driver dossier. The parent owns
+            # its imported Lean declarations, but cannot reconstruct their
+            # original planner bindings after a broker or process handoff.
+            self._checkpoint_graph_subpass_context = graph_subpass_checkpoint_context()
             identity = pending.launch.identity
             identity_record = asdict(identity)
             self._planner_job_receipt_identities[

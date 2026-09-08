@@ -151,6 +151,21 @@ class _RecursiveConversationLaneLedger:
         self._attempts: Dict[str, int] = {}
         self._reservations: Dict[str, Tuple[str, int]] = {}
 
+    def bind_attempt_counts(self, counts: Dict[str, int]) -> None:
+        """Attach checkpointed data without serializing live reservations."""
+
+        if type(counts) is not dict or any(
+            type(key) is not str or not key or type(value) is not int or value < 0
+            for key, value in counts.items()
+        ):
+            raise ValueError("Malformed recursive lane attempt counts")
+        with self._lock:
+            if counts is self._attempts:
+                return
+            if self._reservations:
+                raise ValueError("Cannot restore recursive lane counts during live work")
+            self._attempts = counts
+
     def try_reserve(
         self,
         lane_key: str,
@@ -214,6 +229,13 @@ def _recursive_conversation_lane_ledger(owner: Any) -> Any:
             if ledger is None:
                 ledger = _RecursiveConversationLaneLedger()
                 owner._recursive_conversation_lane_ledger = ledger
+    if getattr(owner, "checkpoint_registry", None) is not None:
+        with _RECURSIVE_CONVERSATION_LEDGER_CREATE_LOCK:
+            counts = getattr(owner, "_recursive_conversation_lane_attempt_counts", None)
+            if counts is None:
+                counts = ledger._attempts
+                owner._recursive_conversation_lane_attempt_counts = counts
+            ledger.bind_attempt_counts(counts)
     return ledger
 
 
@@ -276,6 +298,7 @@ def _recursive_conversation_lane_key(
     recursive_max_elapsed_s: float,
     execution_policy: Mapping[str, Any],
     mini_phase_temperatures: Any = None,
+    durable_lean_environment: Optional[str] = None,
 ) -> str:
     helpers = dict(getattr(dossier, "verified_helpers", {}) or {})
     helper_fingerprints = tuple(
@@ -342,7 +365,11 @@ def _recursive_conversation_lane_key(
             )
         ),
         "helper_fingerprints": helper_fingerprints,
-        "lean_generation": generation_nonce,
+        "lean_generation": (
+            generation_nonce
+            if durable_lean_environment is None
+            else {"verified_project_hash": durable_lean_environment}
+        ),
         "provider_policy": provider_policy,
         "conversation_policy": {
             "known_premise_names": list(getattr(conv, "known_premise_names", ()) or ()),
@@ -3348,6 +3375,9 @@ def build_session_for_prove_problem(
             )
             _stage_all_session_verified_helpers(session, force=True)
     session.expand_max_iterations_to_action_budgets(headroom=5)
+    from .durable_session_record import initialize_theory_checkpoint_context
+
+    initialize_theory_checkpoint_context(session)
     return session
 
 
@@ -3418,6 +3448,20 @@ async def prove_problem_via_session(
         ),
         field="falsification_engine_timeout_s",
     )
+    checkpoint_registry = kwargs.pop("checkpoint_registry", None)
+    def _saved_outer_phase(name: str) -> Any:
+        if checkpoint_registry is None:
+            return None
+        return checkpoint_registry.outer_state.get("factory_phases", {}).get(name)
+
+    async def _commit_outer_phase(name: str, value: Any) -> None:
+        if checkpoint_registry is None:
+            return
+        outer = checkpoint_registry.outer_state
+        phases = dict(outer.get("factory_phases", {}))
+        phases[name] = value
+        await checkpoint_registry.update_outer_state({**outer, "factory_phases": phases})
+
     worker_ready_callback = kwargs.pop("worker_ready_callback", None)
     worker_ready_signaled = False
 
@@ -3926,7 +3970,12 @@ async def prove_problem_via_session(
     # search (including the startup fast lane). Durable
     # restore/merge work below has its own supervisor-enforced operation lease.
     _signal_worker_ready_once()
-    ok, proof = await _run_startup_root_fast_lane()
+    if _saved_outer_phase("startup_root_fast_lane_exhausted") is True:
+        ok, proof = False, None
+    else:
+        ok, proof = await _run_startup_root_fast_lane()
+        if not ok:
+            await _commit_outer_phase("startup_root_fast_lane_exhausted", True)
     if ok:
         return True, proof
     # The one-shot lane has finished. Drop its knobs from the shared kwargs so
@@ -4616,15 +4665,18 @@ async def prove_problem_via_session(
         ) -> Tuple[bool, Optional[str]]:
             if not bool(kwargs.get("root_tactic_prepass_enabled", False)):
                 return False, None
-            return await _try_root_tactic_close(
+            prepass_preamble = (
+                str(effective_lean_preamble)
+                if effective_lean_preamble is not None else lean_preamble
+            )
+            phase_key = "root_tactic_prepass_exhausted:" + text_hash(prepass_preamble)
+            if _saved_outer_phase(phase_key) is True:
+                return False, None
+            result = await _try_root_tactic_close(
                 phase="root_tactic_prepass",
                 theorem_name=problem.theorem_name,
                 goal_statement=problem.statement_type,
-                preamble=(
-                    str(effective_lean_preamble)
-                    if effective_lean_preamble is not None
-                    else lean_preamble
-                ),
+                preamble=prepass_preamble,
                 lean=lean,
                 dossier=attempt_dossier,
                 recorder=recorder,
@@ -4632,6 +4684,9 @@ async def prove_problem_via_session(
                 timeout_s=float(kwargs.get("root_tactic_timeout_s", 40.0) or 0.0),
                 max_candidates=int(kwargs.get("root_tactic_max_candidates", 64) or 0),
             )
+            if not result[0]:
+                await _commit_outer_phase(phase_key, True)
+            return result
 
         pre_sample_root_tactic_ran = False
         if bool(kwargs.get("root_tactic_prepass_enabled", False)):
@@ -4860,6 +4915,8 @@ async def prove_problem_via_session(
             nonlocal recursive_pass_budget_remaining
             nonlocal adaptive_recursive_pass_budget_remaining
             container = _build_post_fanin_recursive_session()
+            if checkpoint_registry is not None:
+                await checkpoint_registry.bind_session("parallel_fanin_recursive", container)
             try:
                 ok, proof = await container.run()
             finally:
@@ -5111,6 +5168,11 @@ async def prove_problem_via_session(
                         known_names.append(name_str)
                         seen_names.add(name_str)
                 session.conv.known_premise_names = known_names
+            if checkpoint_registry is not None:
+                # Initial context belongs in the first committed record.
+                # Restore overwrites this freshly constructed transcript;
+                # appending afterward would duplicate saved premise input.
+                await checkpoint_registry.bind_session(f"sample:{sample_index}", session)
             try:
                 if sample_count > 1:
                     from ..mini_formal_state_search import parallel_lean_admission_scope
@@ -6120,17 +6182,27 @@ async def prove_problem_via_session(
     premise_block = ""
     premise_names: List[str] = []
     premise_retrieval_record: Dict[str, Any] = {}
-    (
-        premise_block,
-        premise_names,
-        premise_retrieval_record,
-    ) = await _retrieve_startup_premise_context(
-        target_dossier=dossier,
-        target_searcher=searcher,
-        goal_statement=premise_goal_statement,
-        event_recorder=recorder,
-        event_trace_prefix=trace_prefix,
-    )
+    saved_premise_context = _saved_outer_phase("premise_context")
+    if saved_premise_context is None:
+        (
+            premise_block,
+            premise_names,
+            premise_retrieval_record,
+        ) = await _retrieve_startup_premise_context(
+            target_dossier=dossier,
+            target_searcher=searcher,
+            goal_statement=premise_goal_statement,
+            event_recorder=recorder,
+            event_trace_prefix=trace_prefix,
+        )
+        await _commit_outer_phase("premise_context", {
+            "block": premise_block, "names": premise_names,
+            "record": premise_retrieval_record,
+        })
+    else:
+        premise_block = saved_premise_context["block"]
+        premise_names = saved_premise_context["names"]
+        premise_retrieval_record = saved_premise_context["record"]
 
     ok, proof = await _run_attempt(
         llm_preamble=llm_preamble,
@@ -6777,6 +6849,11 @@ async def _mini_session_run_conversation_callback(
     if conv is None or client is None or lean is None:
         return False, None
     theory_parent_session = kwargs.get("theory_parent_session")
+    checkpoint_parent_action = kwargs.get("checkpoint_parent_action")
+    checkpoint_child_enabled = bool(
+        checkpoint_parent_action is not None
+        and getattr(theory_parent_session, "checkpoint_registry", None) is not None
+    )
     from .searcher_context import fork_searcher_context
 
     theory_library = getattr(theory_parent_session, "theory_library", None)
@@ -6993,6 +7070,15 @@ async def _mini_session_run_conversation_callback(
         return False, None
 
     if lane_ledger is not None:
+        durable_lean_environment = None
+        if getattr(recursive_lane_owner, "checkpoint_registry", None) is not None:
+            from .durable_session_record import session_checkpoint_identity
+
+            # A fresh process recreates the verifier capability. Its nonce is
+            # not new mathematical evidence; the actual material environment
+            # still distinguishes changed imports and project contents.
+            child_identity = await asyncio.to_thread(session_checkpoint_identity, session)
+            durable_lean_environment = child_identity["project_hash"]
         lane_key = _recursive_conversation_lane_key(
             conv=conv,
             client=client,
@@ -7004,6 +7090,7 @@ async def _mini_session_run_conversation_callback(
             temperature_override=kwargs.get("temperature_override"),
             mini_phase_temperatures=kwargs.get("mini_phase_temperatures"),
             recursive_max_elapsed_s=recursive_max_elapsed_s,
+            durable_lean_environment=durable_lean_environment,
             execution_policy={
                 "lean_check_tool_enabled": bool(
                     kwargs.get("lean_check_tool_enabled", True)
@@ -7291,7 +7378,7 @@ async def _mini_session_run_conversation_callback(
             },
         )
         lane_limit = 1 if speculative_operational_probe else 3
-        if lane_ledger.unavailable(lane_key, limit=lane_limit):
+        if lane_ledger.unavailable(lane_key, limit=lane_limit) and not checkpoint_child_enabled:
             return _record_lane_exhausted()
     session.theory_promote_verified_helpers = bool(
         getattr(
@@ -7544,12 +7631,24 @@ async def _mini_session_run_conversation_callback(
     # RecursiveHelperProverAction selected inside this nested conversation
     # inherits the enclosing deadline rather than resetting its allowance.
     session.recursive_elapsed_deadline_epoch_s = deadline_epoch_s
+    checkpoint_child = None
+    if checkpoint_child_enabled:
+        from .durable_recursive_child import prepare_controller_child
+
+        checkpoint_child = await prepare_controller_child(
+            parent=theory_parent_session, child=session, action=checkpoint_parent_action,
+            nested_invocation_id=str(kwargs.get("nested_invocation_id") or ""),
+            max_turns=max_turns, deadline_epoch_s=deadline_epoch_s,
+            graph_subpass_context=kwargs.get("checkpoint_graph_subpass_context"),
+        )
+        deadline_epoch_s = session.recursive_elapsed_deadline_epoch_s
+    checkpoint_result = checkpoint_child.replay_result() if checkpoint_child is not None else None
     if lane_ledger is not None:
         reservation = lane_ledger.try_reserve(
             lane_key,
             limit=(1 if speculative_operational_probe else 3),
         )
-        if reservation is None:
+        if reservation is None and checkpoint_result is None:
             if child_promotion_registered:
                 from ..proof_state_executor import (
                     register_verified_helper_accept_session,
@@ -7566,15 +7665,16 @@ async def _mini_session_run_conversation_callback(
                         theory_parent_session,
                     )
             return _record_lane_exhausted()
-        lane_token, lane_allowance = reservation
-        session.max_model_call_deferred_frontier_retries = max(
-            0,
-            lane_allowance - 1,
-        )
-        session.max_model_call_deferred_static_retries = max(
-            0,
-            lane_allowance - 1,
-        )
+        if reservation is not None:
+            lane_token, lane_allowance = reservation
+            session.max_model_call_deferred_frontier_retries = max(
+                0,
+                lane_allowance - 1,
+            )
+            session.max_model_call_deferred_static_retries = max(
+                0,
+                lane_allowance - 1,
+            )
     completed_normally = False
     child_run_settled = False
     timed_out = False
@@ -7588,11 +7688,14 @@ async def _mini_session_run_conversation_callback(
     try:
         from .recursive_helper_prover import _run_child_with_elapsed_budget
 
-        ok, proof, timed_out = await _run_child_with_elapsed_budget(
-            session,
-            max_elapsed_s=recursive_max_elapsed_s,
-            deadline_epoch_s=deadline_epoch_s,
-        )
+        if checkpoint_result is not None:
+            ok, proof, timed_out = checkpoint_result
+        else:
+            ok, proof, timed_out = await _run_child_with_elapsed_budget(
+                session,
+                max_elapsed_s=recursive_max_elapsed_s,
+                deadline_epoch_s=deadline_epoch_s,
+            )
         child_run_settled = True
         result = (ok, proof)
         if timed_out:
@@ -7748,6 +7851,8 @@ async def _mini_session_run_conversation_callback(
                 setattr(conv, "_last_no_proof_llm_response", latest)
         except Exception:
             pass
+    if checkpoint_child is not None:
+        await checkpoint_child.complete(ok=ok, proof=proof, timed_out=timed_out)
     return result
 
 
