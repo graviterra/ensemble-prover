@@ -17,7 +17,13 @@ from pathlib import Path
 import time
 from typing import Any
 
-from ensemble_prover.proof_dossier import ProofDossier, text_hash
+from ensemble_prover.proof_dossier import (
+    ProofDossier, helper_decl_statement, text_hash,
+    verified_helper_has_typed_binder_evidence,
+)
+from ensemble_prover.verified_helper_contract import (
+    analyze_verified_helper_contract, refresh_verified_helper_contract,
+)
 from ensemble_prover.proof_state import ProofSearchState, ProofStateWorkItem
 from ensemble_prover.root_finalization import RootFinalizationCandidate
 from ensemble_prover.state_data import clone_json_value
@@ -305,6 +311,34 @@ async def _prepare_dossier(session: Any, data: dict[str, Any]) -> ProofDossier:
                 raise ValueError("checkpoint helper source hash mismatch")
             await _verify(session.lean, statement="True", proof="by trivial",
                           helpers=[*checked, helper.source], preamble=session.conv.lean_preamble)
+            environment = str(dossier.current_lean_environment_hash or "")
+            checked_in_new_environment = helper.verification_environment_hash != environment
+            if checked_in_new_environment or not verified_helper_has_typed_binder_evidence(helper):
+                preamble = str(session.conv.lean_preamble or "")
+                contract_fields = await analyze_verified_helper_contract(
+                    session.lean, helper_decl_statement(helper.source),
+                    preamble=preamble, context=checked,
+                    environment_hash=environment, timeout_s=30.0,
+                    context_is_current=lambda: (
+                        preamble == str(session.conv.lean_preamble or "")
+                        and environment == str(dossier.current_lean_environment_hash or "")
+                    ),
+                )
+                if checked_in_new_environment and contract_fields:
+                    # Only the fresh body replay above authorizes rebinding an
+                    # ancestor-verified declaration to the checked environment.
+                    # Ordinary same-source imports still reject this change.
+                    dossier.record_verified_helper(
+                        helper.source, phase=helper.phase, turn_index=helper.turn_index,
+                        support_names=helper.support_names,
+                        replay_context_names=helper.replay_context_names,
+                        provenance_tags=helper.provenance_tags,
+                        visibility_policy=helper.visibility_policy,
+                        replace_existing_same_name=True,
+                        **contract_fields,
+                    )
+                else:
+                    refresh_verified_helper_contract(dossier, helper, contract_fields)
             checked.append(helper.source)
             checked_names.add(helper.name)
             pending.pop(helper.name)

@@ -26,11 +26,17 @@ class CheckpointArgumentParser(argparse.ArgumentParser):
         result = super().parse_args(tokens, namespace)
         explicit = set()
         for token in tokens:
+            if token == "--":
+                break
             if not token.startswith("--"):
                 continue
             option = self._parse_optional(token)
-            if option is not None and option[0] is not None:
-                explicit.add(option[0].dest)
+            # argparse returns one tuple on 3.11, but a list of candidate
+            # tuples on patched 3.12. Parsing above already rejects ambiguity.
+            candidates = option if isinstance(option, list) else [option]
+            for candidate in candidates:
+                if candidate is not None and candidate[0] is not None:
+                    explicit.add(candidate[0].dest)
         result._explicit_cli_destinations = explicit
         return result
 

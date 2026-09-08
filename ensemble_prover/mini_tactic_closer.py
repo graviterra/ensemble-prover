@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -262,8 +263,10 @@ class TacticPatternCache:
         "structural_ext",
     }
 
-    def __init__(self, *, max_entries: int = 4096) -> None:
+    def __init__(self, *, max_entries: int = 4096, record_verdicts: bool = True) -> None:
         self.max_entries = max(1, int(max_entries or 4096))
+        self._record_verdicts = bool(record_verdicts)
+        self._candidate_timeout_floors: dict[str, float] = {}
         self._successes: dict[str, TacticCandidate] = {}
         self._failures: dict[str, set[str]] = {}
         self._shape_successes: dict[str, list[TacticCandidate]] = {}
@@ -301,6 +304,7 @@ class TacticPatternCache:
             },
             "last_access": dict(self._last_access),
             "access_seq": self._access_seq,
+            "candidate_timeout_floors": dict(self._candidate_timeout_floors),
         }
 
     def restore_checkpoint_state(self, record: Mapping[str, Any]) -> None:
@@ -349,6 +353,11 @@ class TacticPatternCache:
             for key, value in dict(record.get("last_access") or {}).items()
         }
         self._access_seq = max(0, int(record.get("access_seq", 0) or 0))
+        self._candidate_timeout_floors = {
+            str(key): float(value)
+            for key, value in dict(record.get("candidate_timeout_floors") or {}).items()
+            if type(value) in {int, float} and math.isfinite(value) and value > 0
+        }
         self._trim()
 
     @staticmethod
@@ -405,6 +414,9 @@ class TacticPatternCache:
         )
         return ":".join(
             [
+                # Older failure sets mix semantic rejections and slice
+                # timeouts. They cannot suppress the new adaptive policy.
+                "semantic-rejections-v1",
                 scope,
                 mode,
                 text_hash(context_fingerprint),
@@ -470,7 +482,8 @@ class TacticPatternCache:
     def _trim(self) -> None:
         entries = [
             ("exact", key)
-            for key in (set(self._successes) | set(self._failures))
+            for key in (set(self._successes) | set(self._failures)
+                        | set(self._candidate_timeout_floors))
         ] + [
             ("shape", key)
             for key in (set(self._shape_successes) | set(self._shape_failures))
@@ -489,25 +502,46 @@ class TacticPatternCache:
             else:
                 self._successes.pop(key, None)
                 self._failures.pop(key, None)
+                self._candidate_timeout_floors.pop(key, None)
             self._last_access.pop(self._access_key(kind, key), None)
 
     def preferred_candidate(self, key: str) -> Optional[TacticCandidate]:
+        if not self._record_verdicts:
+            return None
         candidate = self._successes.get(key)
         if candidate is not None:
             self._touch(key)
         return candidate
 
     def preferred_shape_candidates(self, key: str) -> list[TacticCandidate]:
+        if not self._record_verdicts:
+            return []
         candidates = list(self._shape_successes.get(key, ()))
         if candidates:
             self._touch(key, kind="shape")
         return candidates
 
     def failed_proofs(self, key: str) -> set[str]:
+        if not self._record_verdicts:
+            return set()
         failures = set(self._failures.get(key, set()))
         if failures:
             self._touch(key)
         return failures
+
+    def candidate_timeout_floor(self, key: str) -> float:
+        value = self._candidate_timeout_floors.get(key, 0.0)
+        if value:
+            self._touch(key)
+        return value
+
+    def record_candidate_timeout_floor(self, key: str, value: float) -> None:
+        if not math.isfinite(value) or value <= 0:
+            return
+        self._candidate_timeout_floors[key] = max(
+            value, self._candidate_timeout_floors.get(key, 0.0),
+        )
+        self._touch(key)
 
     def failed_shape_proofs(self, key: str) -> set[str]:
         del key
@@ -549,9 +583,9 @@ class TacticPatternCache:
     ) -> bool:
         if bool(partial_stub_validated):
             return False
-        if str(error_type or "") == "timeout" and not bool(
-            candidate_timeout_fully_funded
-        ):
+        if str(error_type or "") == "timeout":
+            # A later quantum can grant a larger actual slice under the same
+            # nominal portfolio budget. A timeout is not a semantic rejection.
             return False
         return str(error_type or "") not in _NON_CACHEABLE_TACTIC_ERROR_TYPES
 
@@ -564,6 +598,8 @@ class TacticPatternCache:
         goal_statement: str = "",
         preamble: str = "",
     ) -> dict[str, int]:
+        if not self._record_verdicts:
+            return {}
         self._successes[key] = candidate
         self._failures.get(key, set()).discard(candidate.proof)
         self._touch(key)
@@ -600,7 +636,7 @@ class TacticPatternCache:
         preamble: str = "",
     ) -> dict[str, int]:
         clean_key = str(key or "").strip()
-        if not clean_key:
+        if not clean_key or not self._record_verdicts:
             return {}
         if ok:
             if defer_success:
@@ -1788,6 +1824,7 @@ def _candidate_intended_timeout_s(
     *,
     total_timeout_s: float,
     candidate_count: int,
+    minimum_timeout_s: float = 0.0,
 ) -> float:
     """Return one candidate's full slice before tail-budget truncation."""
 
@@ -1796,7 +1833,7 @@ def _candidate_intended_timeout_s(
     budget = total / divisor
     if total >= 5.0:
         budget = max(5.0, budget)
-    return budget
+    return max(budget, minimum_timeout_s)
 
 
 def _candidate_timeout_s(
@@ -1804,6 +1841,7 @@ def _candidate_timeout_s(
     total_timeout_s: float,
     remaining_s: float,
     candidate_count: int,
+    minimum_timeout_s: float = 0.0,
 ) -> float:
     """Allocate enough time for one Lean check to get past Mathlib startup."""
 
@@ -1811,8 +1849,60 @@ def _candidate_timeout_s(
     budget = _candidate_intended_timeout_s(
         total_timeout_s=total_timeout_s,
         candidate_count=candidate_count,
+        minimum_timeout_s=minimum_timeout_s,
     )
     return min(remaining, budget)
+
+
+def _observed_candidate_timeout_floor_s(lean: Any) -> float:
+    """Use runtime latency as a scheduling hint, never as proof evidence."""
+
+    try:
+        get_stats = getattr(lean, "get_stats", None)
+        if not callable(get_stats) or inspect.iscoroutinefunction(get_stats):
+            return 0.0
+        stats = get_stats()
+        if inspect.iscoroutine(stats):
+            stats.close()
+            return 0.0
+        if not isinstance(stats, Mapping):
+            return 0.0
+        observed = []
+        for name in ("avg_check_time_s", "repl_startup_time_s"):
+            value = stats.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if math.isfinite(value) and value > 0:
+                    observed.append(float(value))
+        # Leave modest execution headroom above observed wall time.  The
+        # portfolio deadline still caps every allocation, including outliers.
+        latency = max(observed, default=0.0)
+        with_headroom = latency * 1.25
+        return with_headroom if math.isfinite(with_headroom) else latency
+    except Exception:
+        return 0.0
+
+
+def _attempt_exhausted_check_budget(attempt: TacticAttempt) -> bool:
+    return attempt.error_type == "timeout" or (
+        attempt.error_type == "infra_failure"
+        and "Lean timeout while waiting for Lean backend execution"
+        in attempt.diagnostic
+    )
+
+
+def _candidate_maximum_opportunity_s(
+    timeout_s: float, pattern_context: Optional[Mapping[str, Any]],
+) -> float:
+    """Separate this operation's remaining lease from a fresh action budget."""
+
+    if isinstance(pattern_context, Mapping):
+        try:
+            configured = float(pattern_context.get("tactic_timeout_s", 0) or 0)
+            if math.isfinite(configured) and configured > 0:
+                return max(float(timeout_s), configured)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return float(timeout_s)
 
 
 def _candidate_timeout_was_fully_funded(
@@ -2042,6 +2132,9 @@ class DeterministicTacticBackend:
 
     def __init__(self, *, pattern_cache: Optional[TacticPatternCache] = None) -> None:
         self.pattern_cache = pattern_cache
+        self._timing_cache = pattern_cache or TacticPatternCache(
+            max_entries=64, record_verdicts=False,
+        )
 
     async def close(
         self,
@@ -2308,8 +2401,26 @@ class DeterministicTacticBackend:
             if attempt_limit > 0
             else len(candidates)
         )
+        # A one-candidate scheduler quantum must not divide its available
+        # check budget by the size of a portfolio it will not execute.
+        funded_candidate_count = max(1, candidate_stop - candidate_start)
+        timing_key = self._timing_cache.key_for(
+            goal_statement, preamble, helpers, pattern_context=pattern_context,
+            suppress_solution_placeholders=suppress_solution_placeholders,
+            opaque_mode=opaque_mode,
+            allow_official_answer_visibility=allow_official_answer_visibility,
+        )
+        minimum_timeout_s = max(
+            _observed_candidate_timeout_floor_s(lean),
+            self._timing_cache.candidate_timeout_floor(timing_key),
+        )
+        if minimum_timeout_s:
+            cache_metadata["candidate_timeout_floor_s"] = minimum_timeout_s
+        maximum_opportunity_s = _candidate_maximum_opportunity_s(timeout_s, pattern_context)
 
-        for index in range(candidate_start, candidate_stop):
+        index = candidate_start
+        timeout_retried = False
+        while index < candidate_stop and (not attempt_limit or len(attempts) < attempt_limit):
             candidate = candidates[index]
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
@@ -2330,11 +2441,13 @@ class DeterministicTacticBackend:
             candidate_timeout = _candidate_timeout_s(
                 total_timeout_s=float(timeout_s),
                 remaining_s=remaining,
-                candidate_count=len(candidates),
+                candidate_count=funded_candidate_count,
+                minimum_timeout_s=minimum_timeout_s,
             )
             candidate_intended_timeout = _candidate_intended_timeout_s(
                 total_timeout_s=float(timeout_s),
-                candidate_count=len(candidates),
+                candidate_count=funded_candidate_count,
+                minimum_timeout_s=minimum_timeout_s,
             )
             candidate_timeout_fully_funded = _candidate_timeout_was_fully_funded(
                 allocated_timeout_s=candidate_timeout,
@@ -2452,10 +2565,37 @@ class DeterministicTacticBackend:
                     candidate_portfolio=candidates,
                     next_candidate_index=index + 1,
                 )
-            if (
-                attempt.error_type == "timeout"
-                and not candidate_timeout_fully_funded
-            ):
+            check_timed_out = _attempt_exhausted_check_budget(attempt)
+            whole_quantum_timed_out = check_timed_out and _candidate_timeout_was_fully_funded(
+                allocated_timeout_s=candidate_timeout,
+                intended_timeout_s=maximum_opportunity_s,
+            )
+            if check_timed_out:
+                doubled_timeout = candidate_timeout * 2.0
+                learned_floor = max(
+                    minimum_timeout_s, doubled_timeout if math.isfinite(doubled_timeout)
+                    else candidate_timeout,
+                )
+                self._timing_cache.record_candidate_timeout_floor(
+                    timing_key, learned_floor,
+                )
+            if check_timed_out and not whole_quantum_timed_out and candidate_timeout_fully_funded:
+                # An expired check slice gives no semantic rejection. Fund
+                # one larger retry of THIS candidate before moving the cursor:
+                # it could be the portfolio's only successful proof.
+                minimum_timeout_s = learned_floor
+                cache_metadata["candidate_timeout_floor_s"] = minimum_timeout_s
+                if (
+                    not timeout_retried
+                    and deadline - time.monotonic() >= minimum_timeout_s
+                    and (not attempt_limit or len(attempts) < attempt_limit)
+                ):
+                    timeout_retried = True
+                    cache_metadata["candidate_timeout_adaptations"] = int(
+                        cache_metadata.get("candidate_timeout_adaptations", 0)
+                    ) + 1
+                    continue
+            if check_timed_out and not whole_quantum_timed_out:
                 # A continuation receives a fresh deadline.  Resume at this
                 # candidate: it has not yet received a meaningful verdict.
                 return TacticCloseResult(
@@ -2470,8 +2610,14 @@ class DeterministicTacticBackend:
                     candidate_portfolio=candidates,
                     next_candidate_index=index,
                 )
+            # Once this candidate has received the entire configured quantum,
+            # a fresh quantum cannot grant a larger check. Advance fairly to
+            # the next candidate without treating timeout as a proof rejection.
+            # Short slices and portfolio tails above retain their exact cursor.
+            index += 1
+            timeout_retried = False
 
-        if candidate_stop < len(candidates):
+        if index < len(candidates):
             return TacticCloseResult(
                 ok=False,
                 proof=None,
@@ -2482,7 +2628,7 @@ class DeterministicTacticBackend:
                 exit_reason="candidate_quantum_exhausted",
                 cache_metadata=dict(cache_metadata),
                 candidate_portfolio=candidates,
-                next_candidate_index=candidate_stop,
+                next_candidate_index=index,
             )
 
         return TacticCloseResult(

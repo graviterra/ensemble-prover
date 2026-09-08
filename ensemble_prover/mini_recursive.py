@@ -22,6 +22,7 @@ import secrets
 import sys
 import time
 from dataclasses import asdict, dataclass, field, fields, replace as dataclass_replace
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -86,6 +87,7 @@ from .mini_subgoal_planner import (
 from .mini_tactic_closer import (
     OUTPUT_PREVIEW_CHARS,
     TacticCloseResult,
+    TacticPatternCache,
     is_transient_tactic_close_failure,
     try_close_with_tactics,
 )
@@ -190,6 +192,8 @@ from .proof_state import (
 )
 from .mini_recursive_outcome import is_resumable_mini_recursive_yield
 from .mini_session.planner_jobs import (
+    PlannerJobEquivalentPending,
+    planner_equivalent_wait_allowed,
     PlannerJobBroker,
     PlannerJobIdentity,
     PlannerJobLaunch,
@@ -6265,6 +6269,10 @@ async def _await_planner_job_or_yield(
     result = broker.peek(identity.job_id, identity.request_fingerprint)
     launch = PlannerJobLaunch(identity=identity, run=run)
     if result is None:
+        for candidate in broker.unconsumed_request_identities():
+            if (planner_equivalent_wait_allowed(candidate)
+                    and _planner_requests_can_wait_for_same_owner(identity, candidate)):
+                raise PlannerJobEquivalentPending(candidate)
         if before_yield is not None:
             await before_yield(identity)
         raise PlannerJobYield(launch)
@@ -6283,6 +6291,41 @@ async def _await_planner_job_or_yield(
             replay_exception = result.exception
         raise replay_exception.with_traceback(None)
     return result.value
+
+
+def _planner_requests_can_wait_for_same_owner(
+    request: PlannerJobIdentity, candidate: PlannerJobIdentity,
+) -> bool:
+    """Defer identical public work while preserving separate owner receipts."""
+    context = request.request_context_fingerprint.split(":")
+    if (not request.owner_lane_id or not candidate.owner_lane_id
+            or request.owner_lane_id == candidate.owner_lane_id
+            or len(context) != 4
+            or context[:2] != ["planner-context-policy", "v1"]
+            or not all(context[2:])):
+        return False
+    fields = (
+        "stage", "stage_round", "pass_index", "root_statement_hash",
+        "route_environment_hash", "proof_idea_cognition_hash",
+        "provider_lane_fingerprint", "answer_visibility_policy_hash",
+        "active_target_statement_keys", "helper_evidence_fingerprints",
+        "request_context_fingerprint", "request_material_fingerprint",
+    )
+    if any(getattr(request, name) != getattr(candidate, name) for name in fields):
+        return False
+    # The outer frontier signature also hashes the action registry. Removing
+    # an owner changes it without changing this exact prepared public request;
+    # the material and mathematical/policy identities below remain mandatory.
+    left = _saved_planner_request_envelope(request, expected_stages={request.stage})
+    right = _saved_planner_request_envelope(candidate, expected_stages={candidate.stage})
+    if left is None or right is None or left[0] != right[0]:
+        return False
+    # This is a remaining operation lease, not configured policy. The latter
+    # is bound into the versioned context identity above. No result or timeout
+    # allowance is transferred: the waiter will prepare again after publication.
+    return {k: v for k, v in left[1].items() if k != "operation_timeout_s"} == {
+        k: v for k, v in right[1].items() if k != "operation_timeout_s"
+    }
 
 
 def _planner_provider_lane_fingerprint(client: Any) -> str:
@@ -7191,6 +7234,10 @@ _SELF_REFUTING_SANITY_RE = re.compile(
     r"\b(?:fails?|false|refuted|contradicted)\b",
     re.IGNORECASE,
 )
+_SANITY_BOOLEAN_VALUE_SUFFIX_RE = re.compile(
+    r"[`'\"]?\s+(?:Boolean\s+)?(?:cells?|entries|values?|bits?|flags?)\b",
+    re.IGNORECASE,
+)
 
 _SANITY_NUMERIC_BINDER_RE = re.compile(
     r"(?:∀|\bforall\b)[^,]{0,240}:\s*"
@@ -7198,7 +7245,9 @@ _SANITY_NUMERIC_BINDER_RE = re.compile(
     re.IGNORECASE,
 )
 _SANITY_NUMERIC_OPERATION_RE = re.compile(
-    r"(?:\+|-|\*|/|\^|<|>|≤|≥|≠|=\s*[-+]?\d)"
+    # Bare disequality also compares points and colors. An unrelated Fin
+    # vertex binder must not make that geometric proposition a numeric formula.
+    r"(?:\+|-|\*|/|\^|<|>|≤|≥|=\s*[-+]?\d)"
     r"|\.succ\b|\b(?:Nat\.choose|Nat\.sqrt|Real\.sqrt|Finset\.(?:range|card)|"
     r"card|floor|ceil|Tendsto|sum|prod)\b|[∑∏]",
     re.IGNORECASE,
@@ -7238,7 +7287,12 @@ def _claim_sanity_requirement(claim: MiniSubgoalClaim) -> _SanityRequirement:
     rejection authority.
     """
 
-    statement = str(getattr(claim, "statement", "") or "").strip()
+    # Syntax and commentary are not numeric operations. In particular the
+    # ASCII implication arrow must classify identically to its Unicode form.
+    statement = _strip_comments_and_strings_for_materialization(
+        str(getattr(claim, "statement", "") or "")
+    ).strip()
+    statement = statement.replace("<->", "↔").replace("->", "→").replace("=>", "⇒")
     triggers: list[str] = []
     evidence: list[str] = []
     counting_classification = str(
@@ -7275,10 +7329,20 @@ def _self_refuting_sanity_reason(claim: MiniSubgoalClaim) -> str:
     sanity = str(getattr(claim, "sanity_check", "") or "").strip()
     if not sanity:
         return ""
-    match = _SELF_REFUTING_SANITY_RE.search(sanity)
-    if not match:
-        return ""
-    return _compact_text(match.group(0), 220)
+    # Mask Boolean modifiers before matching: discarding an entire greedy
+    # match ending in "false cells" can also discard an earlier "claim is
+    # false" within the same sentence. Keep widths equal for source excerpts.
+    classified_sanity = re.sub(
+        r"\bfalse\b",
+        lambda match: (
+            "value" if _SANITY_BOOLEAN_VALUE_SUFFIX_RE.match(sanity, match.end())
+            else match.group(0)
+        ),
+        sanity,
+        flags=re.IGNORECASE,
+    )
+    match = _SELF_REFUTING_SANITY_RE.search(classified_sanity)
+    return _compact_text(sanity[match.start():match.end()], 220) if match else ""
 
 
 # This is deliberately narrower than ``_SELF_REFUTING_SANITY_RE``.  That
@@ -14910,13 +14974,40 @@ def _claim_has_controller_sanity_exemption(
     )
 
 
+_SANITY_DECIMAL_LITERAL = r"[-+]?\d+(?:\.\d+)?"
+_SANITY_COORDINATE_LITERAL = (
+    rf"\(\s*{_SANITY_DECIMAL_LITERAL}"
+    rf"(?:\s*,\s*{_SANITY_DECIMAL_LITERAL})+\s*\)"
+)
+
+
+def _sanity_numeric_assignment(
+    text: str, name: str
+) -> tuple[Decimal, ...] | None:
+    """Read one explicit scalar or flat coordinate literal, never an expression."""
+
+    match = re.search(
+        rf"(?<![\w']){re.escape(name)}(?![\w'])\s*(?::=|=)\s*"
+        rf"({_SANITY_COORDINATE_LITERAL}|{_SANITY_DECIMAL_LITERAL})"
+        r"(?![\w']|\.\d|\s*[+\-*/^])",
+        text,
+    )
+    if match is None:
+        return None
+    # Decimal compares 1 and +1.0 equally without float rounding, including
+    # signed zero. Arity remains part of the tuple comparison below.
+    return tuple(
+        Decimal(part.strip()) for part in match.group(1).strip("()").split(",")
+    )
+
+
 def _quantified_equality_sanity_is_adversarial(
     claim: MiniSubgoalClaim,
 ) -> bool:
     """Diagnose missing explicit distinct assignments for an equality.
 
-    This surface heuristic cannot interpret arbitrary mathematical prose or
-    notation (including tuple assignments), so a negative result is advisory
+    Scalar and flat coordinate literal assignments are recognized. Other
+    mathematical prose is not interpreted, so a negative result is advisory
     only. Lean and certified falsification retain all proof authority.
     """
 
@@ -14926,7 +15017,15 @@ def _quantified_equality_sanity_is_adversarial(
     if len(bound_names) < 2 or len(implication_parts) < 2:
         return True
     conclusion = str(implication_parts[-1] or "")
-    if not re.search(r"(?<![<>=!≠≤≥])=(?!=|>)", conclusion):
+    # An existence/conjunction claim can contain nested equalities without
+    # asserting equality of the quantified inputs (for example a distance grid).
+    if (
+        re.match(r"^(?:[∀∃]|\b(?:forall|exists)\b)", conclusion)
+        or len(_split_top_level_conjunctions(conclusion)) > 1
+        or len(_split_top_level_disjunctions(conclusion)) > 1
+        or len(_split_top_level_iffs(conclusion)) > 1
+        or _split_top_level_relation(conclusion)[1] != "="
+    ):
         return True
     conclusion_names = [
         name
@@ -14936,16 +15035,16 @@ def _quantified_equality_sanity_is_adversarial(
     if len(conclusion_names) < 2:
         return True
     sanity = str(getattr(claim, "sanity_check", "") or "")
-    assigned_values: list[str] = []
+    assigned_values: list[tuple[Decimal, ...]] = []
     for name in conclusion_names:
-        match = re.search(
-            rf"(?<![\w']){re.escape(name)}(?![\w'])\s*(?::=|=)\s*"
-            r"([-+]?\d+(?:\.\d+)?)",
-            sanity,
-        )
-        if match:
-            assigned_values.append(match.group(1))
-    return len(assigned_values) >= 2 and len(set(assigned_values)) >= 2
+        value = _sanity_numeric_assignment(sanity, name)
+        if value is not None:
+            assigned_values.append(value)
+    return (
+        len(assigned_values) >= 2
+        and len({len(value) for value in assigned_values}) == 1
+        and len(set(assigned_values)) >= 2
+    )
 
 
 def _claim_declared_sanity_contract_reason(
@@ -20716,7 +20815,22 @@ async def run_mini_recursive_driver(
         for item in list(resume_frame.get("root_tactic_attempted_context_keys") or [])
         if str(item or "")
     }
+    # Keep allocation learning through planner yields/checkpoints. Raw driver
+    # portfolios use absolute cursors, so this cache must not reorder/filter
+    # semantic candidates as the proof-state cache is allowed to do.
+    root_tactic_timing_cache = TacticPatternCache(max_entries=256, record_verdicts=False)
+    saved_tactic_timing = resume_frame.get("root_tactic_timing_cache")
+    if isinstance(saved_tactic_timing, Mapping):
+        root_tactic_timing_cache.restore_checkpoint_state(saved_tactic_timing)
     root_tactic_portfolio_continuations: dict[str, int] = {}
+    root_tactic_portfolio_phases: dict[str, str] = {}
+    raw_portfolio_phases = resume_frame.get("root_tactic_portfolio_phases")
+    if isinstance(raw_portfolio_phases, Mapping):
+        root_tactic_portfolio_phases = {
+            str(key): str(phase)
+            for key, phase in list(raw_portfolio_phases.items())[:256]
+            if len(str(key)) == 64 and isinstance(phase, str) and phase in {"active", "fallback"}
+        }
     raw_root_tactic_portfolio_continuations = resume_frame.get(
         "root_tactic_portfolio_continuations"
     )
@@ -20731,8 +20845,12 @@ async def run_mini_recursive_driver(
                 offset = int(raw_offset)
             except (TypeError, ValueError, OverflowError):
                 continue
-            if 0 < offset <= 4096:
+            if 0 < offset <= 4096 or (offset == 0 and key in root_tactic_portfolio_phases):
                 root_tactic_portfolio_continuations[key] = offset
+    root_tactic_portfolio_phases = {
+        key: phase for key, phase in root_tactic_portfolio_phases.items()
+        if key in root_tactic_portfolio_continuations
+    }
     root_tactic_direct_portfolio_exhausted_execution_keys: set[str] = {
         str(item or "").strip()
         for item in list(
@@ -21401,12 +21519,21 @@ async def run_mini_recursive_driver(
             "root_tactic_attempted_context_keys": sorted(
                 root_tactic_attempted_context_keys
             ),
+            "root_tactic_timing_cache": root_tactic_timing_cache.checkpoint_state(),
             "root_tactic_portfolio_continuations": {
                 key: int(offset)
                 for key, offset in sorted(root_tactic_portfolio_continuations.items())[
                     :256
                 ]
-                if len(str(key or "")) == 64 and 0 < int(offset or 0) <= 4096
+                if len(str(key or "")) == 64 and (
+                    0 < int(offset or 0) <= 4096
+                    or (int(offset or 0) == 0 and key in root_tactic_portfolio_phases)
+                )
+            },
+            "root_tactic_portfolio_phases": {
+                key: root_tactic_portfolio_phases[key]
+                for key in sorted(root_tactic_portfolio_continuations)[:256]
+                if key in root_tactic_portfolio_phases
             },
             "root_tactic_direct_portfolio_exhausted_execution_keys": sorted(
                 root_tactic_direct_portfolio_exhausted_execution_keys
@@ -22321,19 +22448,12 @@ async def run_mini_recursive_driver(
             allow_official_answer_visibility=allow_official_answer_visibility,
             official_answer_payload_present=official_answer_payload_present,
         )
-        candidate_portfolio_offset = (
-            max(
-                0,
-                int(
-                    root_tactic_portfolio_continuations.get(
-                        portfolio_execution_key,
-                        0,
-                    )
-                    or 0
-                ),
-            )
-            if not current_active_root_targets
-            else 0
+        candidate_portfolio_offset = max(
+            0, int(root_tactic_portfolio_continuations.get(portfolio_execution_key, 0) or 0),
+        )
+        candidate_portfolio_phase = (
+            root_tactic_portfolio_phases.get(portfolio_execution_key, "active")
+            if current_active_root_targets else "direct"
         )
         if context_key and context_key in root_tactic_attempted_context_keys:
             stats.root_tactic_duplicate_context_skips += 1
@@ -22385,6 +22505,7 @@ async def run_mini_recursive_driver(
             official_answer_payload_present=official_answer_payload_present,
             enforce_root_finalization_contract=enforce_root_finalization_contract,
             candidate_portfolio_offset=candidate_portfolio_offset,
+            candidate_portfolio_phase=candidate_portfolio_phase,
             direct_portfolio_already_exhausted=bool(
                 not current_active_root_targets
                 and portfolio_execution_key
@@ -22392,6 +22513,7 @@ async def run_mini_recursive_driver(
             ),
             root_tactic_timeout_s=root_tactic_timeout_s,
             root_tactic_max_candidates=root_tactic_max_candidates,
+            tactic_pattern_cache=root_tactic_timing_cache,
         )
         result_portfolio = tuple(getattr(result, "candidate_portfolio", ()) or ())
         next_candidate_index = max(
@@ -22399,6 +22521,9 @@ async def run_mini_recursive_driver(
             int(getattr(result, "next_candidate_index", 0) or 0),
         )
         result_cache_metadata = dict(getattr(result, "cache_metadata", {}) or {})
+        result_portfolio_phase = str(
+            result_cache_metadata.get("root_tactic_candidate_portfolio_phase") or "direct"
+        )
         invalid_offset_reset = bool(
             result_cache_metadata.get("invalid_candidate_portfolio_offset_reset")
         )
@@ -22416,13 +22541,24 @@ async def run_mini_recursive_driver(
                 or result_cache_metadata.get("root_tactic_contract_transient") is True
             )
         )
+        active_phase_pending = bool(
+            current_active_root_targets
+            and result_portfolio_phase in {"active", "fallback"}
+            and (
+                str(result.exit_reason) in {"timeout", "candidate_quantum_exhausted"}
+                or is_transient_tactic_close_failure(result)
+                or result_cache_metadata.get("direct_root_tactic_transient_failure") is True
+            )
+        )
         resumable_suffix = bool(
-            not current_active_root_targets
-            and not result.ok
+            not result.ok
             and result_portfolio
-            and next_candidate_index > 0
             and next_candidate_index < len(result_portfolio)
-            and (advanced_suffix or stalled_resumable_suffix)
+            and (
+                active_phase_pending
+                or (not current_active_root_targets and next_candidate_index > 0
+                    and (advanced_suffix or stalled_resumable_suffix))
+            )
         )
         if resumable_suffix:
             prior_offset = root_tactic_portfolio_continuations.get(
@@ -22431,6 +22567,9 @@ async def run_mini_recursive_driver(
             root_tactic_portfolio_continuations[portfolio_execution_key] = (
                 next_candidate_index
             )
+            prior_phase = root_tactic_portfolio_phases.get(portfolio_execution_key)
+            if active_phase_pending:
+                root_tactic_portfolio_phases[portfolio_execution_key] = result_portfolio_phase
             try:
                 if publish_checkpoint is not None:
                     await publish_checkpoint(
@@ -22447,6 +22586,10 @@ async def run_mini_recursive_driver(
                         pass_helpers_accepted_before=pass_helpers_before,
                     )
             except BaseException:
+                if prior_phase is None:
+                    root_tactic_portfolio_phases.pop(portfolio_execution_key, None)
+                else:
+                    root_tactic_portfolio_phases[portfolio_execution_key] = prior_phase
                 if prior_offset is None:
                     root_tactic_portfolio_continuations.pop(
                         portfolio_execution_key,
@@ -22469,6 +22612,7 @@ async def run_mini_recursive_driver(
                 },
             )
         else:
+            root_tactic_portfolio_phases.pop(portfolio_execution_key, None)
             root_tactic_portfolio_continuations.pop(
                 portfolio_execution_key,
                 None,
@@ -33355,10 +33499,14 @@ async def _request_plan(
     def planner_failure_projection(
         classification: Any,
         *,
+        error: BaseException,
         provider_calls_completed: int,
         stage: str,
     ) -> dict[str, Any]:
         failure_scope = llm_failure_scope(classification.failure_reason)
+        completed = max(0, int(provider_calls_completed or 0))
+        dispatched = getattr(error, "provider_dispatches_started", 0)
+        dispatched = dispatched if type(dispatched) is int and dispatched >= 0 else 0
         return {
             "llm_retryable": projected_scoped_llm_failure_is_retryable(
                 reason=classification.failure_reason,
@@ -33369,11 +33517,9 @@ async def _request_plan(
             "scoped_failure_reason": (
                 classification.failure_reason if failure_scope == "scoped" else ""
             ),
-            "provider_calls_completed": max(
-                0,
-                int(provider_calls_completed or 0),
-            ),
-            "zero_provider_failure": provider_calls_completed <= 0,
+            "provider_calls_completed": completed,
+            "provider_dispatches_started": completed + dispatched,
+            "zero_provider_failure": completed + dispatched == 0,
             "planner_failure_stage": str(stage or "planner"),
         }
 
@@ -33503,6 +33649,37 @@ async def _request_plan(
             **({"generic_preamble_hash": text_hash(generic_preamble)} if generic_preamble else {}),
         }
     )
+    if planner_job_identity is not None and (
+        not planner_job_identity.request_material_json
+        or planner_job_identity.request_context_fingerprint.startswith("planner-context-policy:v1:")
+    ):
+        # Bind configured policy separately from the decreasing operation
+        # remainder. Old durable identities retain their old context format and
+        # conservatively remain ineligible for cross-owner deferral.
+        policy_key = _planner_material_fingerprint({
+            name: getattr(config, name, None)
+            for name in (
+                "planner_deadlines_enabled", "planner_provider_max_attempts",
+                "planner_request_timeout_s", "planner_operation_timeout_s",
+                "planner_composite_timeout_s", "planner_fallback_reserve_s",
+                "planner_escalation_provider_max_attempts",
+                "planner_escalation_request_timeout_s", "planner_escalation_operation_timeout_s",
+            )
+        })
+        saved_context = planner_job_identity.request_context_fingerprint.split(":")
+        if (len(saved_context) == 4
+                and saved_context[:2] == ["planner-context-policy", "v1"]
+                and saved_context[3]
+                and _saved_planner_request_envelope(
+                    planner_job_identity, expected_stages={planner_job_identity.stage},
+                ) is not None):
+            # A durable request retains its already-authorized I/O policy
+            # across changed runtime defaults. Fresh requests use the current
+            # key and cannot join an older, differently configured request.
+            policy_key = saved_context[3]
+        planner_request_context_fingerprint = (
+            f"planner-context-policy:v1:{planner_request_context_fingerprint}:{policy_key}"
+        )
     try:
         proposed_section = _render_proposed_helpers_for_planner(
             proposed_helpers,
@@ -34491,6 +34668,7 @@ async def _request_plan(
             {
                 **planner_failure_projection(
                     classification,
+                    error=exc,
                     provider_calls_completed=prior_provider_calls,
                     stage=failure_stage,
                 ),
@@ -34901,6 +35079,7 @@ async def _request_plan(
             failure_scope = llm_failure_scope(classification.failure_reason)
             failure_metadata = planner_failure_projection(
                 classification,
+                error=reasoning_exc,
                 provider_calls_completed=1,
                 stage="reasoning_recovery",
             )
@@ -35143,6 +35322,7 @@ async def _request_plan(
                 failure_scope = llm_failure_scope(classification.failure_reason)
                 failure_metadata = planner_failure_projection(
                     classification,
+                    error=visibility_exc,
                     provider_calls_completed=2,
                     stage="visibility_recovery",
                 )
@@ -35326,6 +35506,7 @@ async def _request_plan(
                 failure_scope = llm_failure_scope(classification.failure_reason)
                 failure_metadata = planner_failure_projection(
                     classification,
+                    error=repair_exc,
                     provider_calls_completed=1,
                     stage="parse_repair",
                 )
@@ -36913,9 +37094,11 @@ async def _try_root_close(
     official_answer_payload_present: Optional[bool] = None,
     enforce_root_finalization_contract: bool = True,
     candidate_portfolio_offset: int = 0,
+    candidate_portfolio_phase: str = "direct",
     direct_portfolio_already_exhausted: bool = False,
     root_tactic_timeout_s: Optional[float] = None,
     root_tactic_max_candidates: Optional[int] = None,
+    tactic_pattern_cache: Optional[TacticPatternCache] = None,
 ) -> TacticCloseResult:
     # Honor suppression at the SOURCE: this internal durable short-circuit runs
     # for every caller, so guarding only the call sites would let a suppressed
@@ -37019,6 +37202,8 @@ async def _try_root_close(
             active_root_targets=framed_active_root_targets,
             timeout_s=direct_timeout_s,
             max_candidates=direct_max_candidates,
+            pattern_cache=tactic_pattern_cache,
+            candidate_portfolio_phase=candidate_portfolio_phase,
             candidate_portfolio_offset=max(
                 0,
                 int(candidate_portfolio_offset or 0),

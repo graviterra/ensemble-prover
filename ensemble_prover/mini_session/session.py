@@ -10332,7 +10332,23 @@ class MiniSession:
         return None
 
     def _owned_planner_job_status(self, expected: str) -> bool:
-        return self._owned_planner_job_action(expected) is not None
+        if self._owned_planner_job_action(expected) is not None:
+            return True
+        if expected != "pending":
+            return False
+        broker = self.planner_job_broker(create=False)
+        if broker is None:
+            return False
+        # A controller may await a still-executing equivalent request after
+        # its original owner was retired. Wait for that execution to terminate
+        # without treating its unpublishable receipt as the waiter's authority.
+        for action in self.actions:
+            wait = getattr(action, "_planner_equivalent_wait", None)
+            if isinstance(wait, dict) and wait and broker.status(
+                str(wait.get("job_id") or ""), str(wait.get("request_fingerprint") or ""),
+            ) == "pending":
+                return True
+        return False
 
     def _planner_terminal_authority_reason(self) -> str:
         """Return durable authority that forbids planner publication."""

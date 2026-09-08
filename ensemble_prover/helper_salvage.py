@@ -19,6 +19,7 @@ from .proof_dossier import (
     helper_decl_name,
     is_answer_unsafe_helper_source,
     verified_helper_bound_contract_identity,
+    verified_helper_has_typed_binder_evidence,
     verified_helper_semantic_statement_changed,
 )
 from .contract_identity import parse_lean_contract_identity
@@ -1750,6 +1751,26 @@ class HelperSalvager:
         safe = decode_theorem_target_context(self.answer_safe_preamble)[0].strip()
         return bool(safe and checker and safe != checker)
 
+    async def _analyze_helper_contract(
+        self, dossier: ProofDossier, source: str, context: Sequence[str],
+    ) -> Mapping[str, Any]:
+        from .verified_helper_contract import analyze_verified_helper_contract
+
+        preamble = self.answer_safe_preamble if self._answer_safe_preamble_differs() else self.preamble
+        environment = str(dossier.current_lean_environment_hash or "")
+        return await analyze_verified_helper_contract(
+            self.lean, helper_decl_statement(source),
+            preamble=preamble, context=context, environment_hash=environment,
+            timeout_s=float(self.timeout_s or 30.0),
+            context_is_current=lambda: (
+                environment == str(dossier.current_lean_environment_hash or "")
+                and preamble == (
+                    self.answer_safe_preamble
+                    if self._answer_safe_preamble_differs() else self.preamble
+                )
+            ),
+        )
+
     async def _serialized_true_check(
         self,
         check_lemmas: Sequence[str],
@@ -1958,6 +1979,27 @@ class HelperSalvager:
                 )
                 fresh_signature = _helper_statement_signature(src)
                 if existing_signature == fresh_signature:
+                    if (
+                        existing is not None
+                        and not verified_helper_has_typed_binder_evidence(existing)
+                        and existing.verification_environment_hash
+                        == dossier.current_lean_environment_hash
+                        and all(
+                            str(getattr(dossier.verified_helpers.get(support), "source_hash", "")) == source_hash
+                            for support, source_hash in {
+                                **existing.support_source_hashes,
+                                **existing.replay_context_source_hashes,
+                            }.items()
+                        )
+                    ):
+                        from .verified_helper_contract import refresh_verified_helper_contract
+
+                        contract_fields = await self._analyze_helper_contract(
+                            dossier, existing.source, validation_context,
+                        )
+                        refresh_verified_helper_contract(dossier, existing, contract_fields)
+                        context = list(dossier.verified_helper_blocks())
+                    # Evidence enrichment is not another accepted proof.
                     result.skipped.append(name)
                     continue
                 old_name = name
@@ -2119,6 +2161,9 @@ class HelperSalvager:
                         )
                         result.rejected.append(f"{name}:{rejection}")
                         continue
+                contract_fields = await self._analyze_helper_contract(
+                    dossier, src, validation_context,
+                )
                 recorded = dossier.record_verified_helper(
                     src,
                     phase=phase,
@@ -2128,6 +2173,7 @@ class HelperSalvager:
                         for block in validation_context
                         if helper_decl_name(block) and helper_decl_name(block) != name
                     ],
+                    **contract_fields,
                 )
                 if recorded is None:
                     result.rejected.append(f"{name}:record_rejected")

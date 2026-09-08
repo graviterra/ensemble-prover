@@ -3,10 +3,10 @@
 ## Supported versions
 
 Security fixes are maintained on the latest revision of `main`. The current
-public release series is **1.07**, covering Mini Prover, single-claim
+public release series is **1.08**, covering Mini Prover, single-claim
 natural-language input, and multi-file formalization campaigns.
 
-The `v1.07` tag is a fixed snapshot: subsequent fixes on `main` do not change
+The `v1.08` tag is a fixed snapshot: subsequent fixes on `main` do not change
 that tag or previously downloaded archives. Update to the latest `main`
 revision to receive those fixes, and include the exact commit when reporting
 a problem. Older releases are not separate security-maintenance branches.

@@ -120,6 +120,36 @@ def lean_contract_evidence_receipt_matches(
     return bool(expected and str(receipt or "").strip() == expected)
 
 
+def make_lean_contract_binder_evidence_receipt(
+    identity: str,
+    statement_key: str,
+    environment_hash: str,
+    binder_sorts: tuple[str, ...],
+    proof_binder_types: tuple[str, ...],
+) -> str:
+    """Bind helper binder metadata to the checked statement and environment.
+
+    A statement identity alone does not authenticate a persisted empty proof
+    list. As with the statement receipt, this detects stale/corrupt metadata;
+    fresh Lean analysis remains the source of authority.
+    """
+
+    if (
+        not has_lean_contract_identity(identity)
+        or not statement_key
+        or not binder_sorts
+        or any(sort not in {"data", "proof"} for sort in binder_sorts)
+        or binder_sorts.count("proof") != len(proof_binder_types)
+        or any(not value.strip() for value in proof_binder_types)
+    ):
+        return ""
+    payload = json.dumps(
+        [identity, statement_key, environment_hash, binder_sorts, proof_binder_types],
+        ensure_ascii=True, separators=(",", ":"),
+    )
+    return "lean-contract-binders-v1:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
 def make_lean_contract_telescope_evidence_receipt(
     identity: str,
     statement_key: str,

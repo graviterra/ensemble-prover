@@ -10,7 +10,7 @@ point is `ensemble_prover.mini_prover`.
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
 file and Lake project. PutnamBench files are supported through a compatibility
 adapter, and callers may attach a natural-language problem description as
-additional model context. Release 1.07 also includes
+additional model context. Release 1.08 also includes
 experimental natural-language entry points: `ensemble_prover.nl_input` for a
 single claim and `ensemble_prover.formalization` for resumable, multi-file
 projects. These translate text before proving; the resulting Lean statement
@@ -58,9 +58,10 @@ the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** 1.07 — research preview. Includes Mini Prover, experimental
+> **Release status:** 1.08 — research preview. Includes Mini Prover, experimental
 > single-claim NL input, and resumable multi-file formalization campaigns.
-> Preserves the recursive progress and checkpoint-recovery fixes from v1.0.6.
+> Includes Python 3.12 CLI compatibility fixes and improved helper retention,
+> planner recovery, and durable checkpoint continuation.
 
 ## Documentation
 
@@ -85,7 +86,7 @@ troubleshooting, and the public Mini CLI option map.
 ## Requirements
 
 - Linux
-- Standard CPython 3.11 or 3.12 (release audited on 3.11)
+- Standard CPython 3.11 or 3.12 (release audited on both)
 - Lean toolchain compatible with the target Lake project
 - An API key for the selected language-model provider
 

@@ -540,15 +540,16 @@ async def try_close_root_with_active_lift(
             active_next_offset = int(
                 getattr(active_result, "next_candidate_index", 0) or 0
             )
+            active_portfolio = tuple(
+                getattr(active_result, "candidate_portfolio", ()) or ()
+            )
             if (
-                attempt_limit > 0
-                and str(getattr(active_result, "exit_reason", "") or "")
-                == "timeout"
-                and active_next_offset <= active_start_offset
+                str(getattr(active_result, "exit_reason", "") or "") == "timeout"
+                and 0 <= active_next_offset < len(active_portfolio)
             ):
-                # The candidate began but never settled. Preserve its exact
-                # active-phase cursor; an attempt record alone cannot consume
-                # the allowance or advance ownership to the fallback phase.
+                # An unfinished active suffix keeps its exact cursor, whether
+                # the invocation stopped on a count cap or its time budget.
+                # Completed earlier candidates do not authorize fallback yet.
                 return TacticCloseResult(
                     ok=False,
                     proof=None,
@@ -565,10 +566,8 @@ async def try_close_root_with_active_lift(
                         metadata,
                         {"root_tactic_candidate_portfolio_phase": "active"},
                     ),
-                    candidate_portfolio=tuple(
-                        getattr(active_result, "candidate_portfolio", ()) or ()
-                    ),
-                    next_candidate_index=active_start_offset,
+                    candidate_portfolio=active_portfolio,
+                    next_candidate_index=active_next_offset,
                 )
             if (
                 str(getattr(active_result, "exit_reason", "") or "")
@@ -799,8 +798,7 @@ async def try_close_root_with_active_lift(
             ),
             exit_reason=(
                 str(getattr(fallback_result, "exit_reason", "") or "")
-                if attempt_limit > 0
-                and str(getattr(fallback_result, "exit_reason", "") or "")
+                if str(getattr(fallback_result, "exit_reason", "") or "")
                 in {"candidate_quantum_exhausted", "timeout"}
                 else (
                     f"{active_failure_reason};"

@@ -5634,6 +5634,16 @@ class ProofSearchState:
             ).strip()
         records: List[Dict[str, Any]] = []
         if restoring_execution_snapshot:
+            from .mini_tactic_closer import TacticPatternCache
+
+            # Allocation hints must survive the same execution snapshots as
+            # their portfolio cursors. This restores no semantic verdicts.
+            timing_cache = TacticPatternCache()
+            timing_cache.restore_checkpoint_state({
+                "schema_version": 2,
+                "candidate_timeout_floors": execution_snapshot.get("tactic_timeout_floors") or {},
+            })
+            state._tactic_pattern_cache = timing_cache
             records = [
                 copy.deepcopy(record)
                 for record in execution_nodes
@@ -15480,7 +15490,14 @@ class ProofSearchState:
         is :meth:`from_execution_record`.
         """
 
+        from .mini_tactic_closer import TacticPatternCache
+
         record = self.to_record()
+        tactic_cache = getattr(self, "_tactic_pattern_cache", None)
+        record["tactic_timeout_floors"] = (
+            tactic_cache.checkpoint_state()["candidate_timeout_floors"]
+            if isinstance(tactic_cache, TacticPatternCache) else {}
+        )
         record["execution_schema_version"] = PROOF_STATE_EXECUTION_SCHEMA_VERSION
         by_id = {
             str(item.get("node_id") or ""): item

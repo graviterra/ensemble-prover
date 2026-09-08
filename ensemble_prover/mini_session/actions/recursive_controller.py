@@ -40,8 +40,10 @@ from ensemble_prover.mini_recursive_outcome import (
     is_resumable_mini_recursive_yield,
 )
 from ensemble_prover.mini_session.planner_jobs import (
+    PlannerJobEquivalentPending,
     PlannerJobLaunch,
     PlannerJobYield,
+    bind_planner_equivalent_wait_guard,
 )
 
 from ..action import MiniOutcome
@@ -90,6 +92,7 @@ class RecursiveControllerAction:
             "_recursive_root_tactic_context_keys_seen",
             "_pending_planner_job_launch",
             "_planner_job_receipt_identities",
+            "_planner_equivalent_wait",
         }
     )
 
@@ -108,6 +111,7 @@ class RecursiveControllerAction:
             "recursive_fixed_point_reason": str(
                 self._recursive_fixed_point_reason or ""
             ),
+            "planner_equivalent_wait": dict(self._planner_equivalent_wait),
         }
 
     def apply_scheduler_runtime_state(self, state: Any) -> None:
@@ -123,6 +127,12 @@ class RecursiveControllerAction:
             raise StateSnapshotCompatibilityError(
                 "recursive controller driver cursor is malformed"
             )
+        wait = record.get("planner_equivalent_wait", {})
+        if type(wait) is not dict or (wait and (
+            set(wait) != {"job_id", "request_fingerprint", "frontier_signature"}
+            or any(type(value) is not str or not value for value in wait.values())
+        )):
+            raise StateSnapshotCompatibilityError("malformed equivalent planner wait")
         self._recursive_driver_state = copy.deepcopy(driver_state)
         self._recursive_root_tactic_context_keys_seen = {
             str(item or "")
@@ -137,6 +147,7 @@ class RecursiveControllerAction:
         self._recursive_fixed_point_reason = str(
             record.get("recursive_fixed_point_reason") or ""
         )
+        self._planner_equivalent_wait = dict(wait)
 
     async def restore_checkpoint_children(self, session: Any, frames: dict[str, Any]) -> None:
         from ..durable_recursive_child import restore_controller_children
@@ -203,6 +214,7 @@ class RecursiveControllerAction:
         self._recursive_fixed_point_environment_signature = ""
         self._recursive_fixed_point_reason = ""
         self._pending_planner_job_launch: Optional[PlannerJobLaunch] = None
+        self._planner_equivalent_wait: dict[str, str] = {}
         self._planner_job_receipt_identities: dict[
             tuple[str, str], Any
         ] = {}
@@ -246,7 +258,7 @@ class RecursiveControllerAction:
             if broker is not None:
                 broker.acknowledge(identity)
         self._planner_job_receipt_identities = retained
-        if planner_pending:
+        if planner_pending or outcome.metadata.get("planner_equivalent_request_deferred"):
             # The pass has reached provider I/O but has not completed.  Its
             # allocation and compact driver cursor remain authoritative until
             # the scheduler-owned raw receipt is consumed or invalidated.
@@ -536,8 +548,45 @@ class RecursiveControllerAction:
         if isinstance(reservations, dict):
             reservations.pop(self.id, None)
 
+    def _equivalent_planner_owner_is_live(
+        self, session: Any, job_id: str, request_fingerprint: str,
+    ) -> bool:
+        for action in getattr(session, "actions", ()):
+            if action is self or not isinstance(action, RecursiveControllerAction):
+                continue
+            driver = action._recursive_driver_state
+            identity = driver.get("planner_job_identity")
+            if (driver.get("phase") == "planner_job_pending"
+                    and isinstance(identity, dict)
+                    and identity.get("job_id") == job_id
+                    and identity.get("request_fingerprint") == request_fingerprint
+                    and action.run_conversation_fn is not None
+                    and not action._recursive_fixed_point_environment_signature):
+                return True
+        return False
+
+    def _can_wait_for_equivalent_planner(
+        self, session: Any, job_id: str, request_fingerprint: str,
+    ) -> bool:
+        broker_getter = getattr(session, "planner_job_broker", None)
+        broker = broker_getter(create=False) if callable(broker_getter) else None
+        status = broker.status(job_id, request_fingerprint) if broker is not None else "missing"
+        # An orphaned or quarantined provider can still be charging. Keep its
+        # execution fence until termination, but never wait for an abandoned
+        # ready receipt whose original owner cannot publish it.
+        return status == "pending" or (
+            status == "ready"
+            and self._equivalent_planner_owner_is_live(session, job_id, request_fingerprint)
+        )
+
     def is_applicable(self, session: Any) -> bool:
         if session.dossier is None or session.lean is None or session.prover_client is None:
+            return False
+        wait = self._planner_equivalent_wait
+        if (wait and wait["frontier_signature"] == self._session_progress_signature(session)
+                and self._can_wait_for_equivalent_planner(
+                    session, wait["job_id"], wait["request_fingerprint"],
+                )):
             return False
         if self._pending_planner_job_launch is not None:
             return False
@@ -595,6 +644,7 @@ class RecursiveControllerAction:
         from ensemble_prover.mini_prover import Conversation
 
         started = time.monotonic()
+        self._planner_equivalent_wait = {}
         if self._recursive_fixed_point_environment_signature:
             current_signature = self._session_progress_signature(session)
             if current_signature != self._recursive_fixed_point_environment_signature:
@@ -974,7 +1024,33 @@ class RecursiveControllerAction:
             planner_owner_lane_id=self.id,
         )
         try:
-            result = await attempt_coro
+            with bind_planner_equivalent_wait_guard(
+                lambda identity: self._can_wait_for_equivalent_planner(
+                    session, identity.job_id, identity.request_fingerprint,
+                ),
+            ):
+                result = await attempt_coro
+        except PlannerJobEquivalentPending as pending:
+            signature = self._session_progress_signature(session)
+            if signature:
+                self._planner_equivalent_wait = {
+                    "job_id": pending.owner_identity.job_id,
+                    "request_fingerprint": pending.owner_identity.request_fingerprint,
+                    "frontier_signature": signature,
+                }
+            return MiniOutcome(
+                action_id=self.id, solved=False, proof=None, helpers_added=(), progress=False,
+                cost_seconds=max(0.0, time.monotonic() - started),
+                metadata={
+                    "planner_equivalent_request_deferred": True,
+                    "equivalent_planner_owner_action": pending.owner_identity.owner_lane_id,
+                    "equivalent_planner_owner_job_id": pending.owner_identity.job_id,
+                    "preserve_action_budget": True, "preserve_frontier_work": True,
+                    "iteration_neutral": True, "scheduler_neutral": True,
+                    "stagnation_neutral": True, "hard_pivot_neutral": True,
+                    "recursive_pass_quantum_yield": True,
+                },
+            )
         except PlannerJobYield as pending:
             identity_record = asdict(pending.launch.identity)
             self._planner_job_receipt_identities[

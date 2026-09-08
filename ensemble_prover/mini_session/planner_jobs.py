@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
@@ -158,6 +160,34 @@ class PlannerJobYield(BaseException):
         self.launch = launch
 
 
+class PlannerJobEquivalentPending(BaseException):
+    """Wait for another lane to publish before preparing this request again."""
+
+    def __init__(self, owner_identity: PlannerJobIdentity) -> None:
+        super().__init__(owner_identity.job_id)
+        self.owner_identity = owner_identity
+
+
+_equivalent_wait_guard: ContextVar[Callable[[PlannerJobIdentity], bool] | None] = ContextVar(
+    "planner_equivalent_wait_guard", default=None,
+)
+
+
+@contextmanager
+def bind_planner_equivalent_wait_guard(guard: Callable[[PlannerJobIdentity], bool]):
+    """Opt a compatible controller into neutral waits for a live local owner."""
+    token = _equivalent_wait_guard.set(guard)
+    try:
+        yield
+    finally:
+        _equivalent_wait_guard.reset(token)
+
+
+def planner_equivalent_wait_allowed(identity: PlannerJobIdentity) -> bool:
+    guard = _equivalent_wait_guard.get()
+    return guard is not None and guard(identity)
+
+
 class PlannerJobExecutionCancelled(RuntimeError):
     """A provider operation ended itself before producing a receipt."""
 
@@ -215,6 +245,13 @@ class PlannerJobBroker:
     def acknowledged_receipts(self) -> tuple[PlannerJobIdentity, ...]:
         return tuple(self._acknowledged.values())
 
+    def unconsumed_request_identities(self) -> tuple[PlannerJobIdentity, ...]:
+        """Expose pending/ready request identities without receipt authority."""
+        self._check_durable_failure()
+        return tuple(entry.identity for entry in (
+            *self._jobs.values(), *self._quarantined.values(),
+        ))
+
     def confirm_receipts_committed(self, identities: tuple[PlannerJobIdentity, ...]) -> None:
         for identity in identities:
             key = self._key(identity.job_id, identity.request_fingerprint)
@@ -251,6 +288,7 @@ class PlannerJobBroker:
     ) -> None:
         owner_task = asyncio.current_task()
         exposure = ProviderDispatchExposureTracker()
+        result: PlannerJobResult | None = None
         try:
             with (
                 bind_llm_usage_context(launch.usage_context),
@@ -289,6 +327,18 @@ class PlannerJobBroker:
                 value=value,
             )
         finally:
+            if result is not None and result.exception is not None:
+                # The callback can finish after its action quantum, and a
+                # generic transport error need not carry dispatch metadata.
+                # Capture authenticated exposure before retiring this tracker.
+                prior = getattr(result.exception, "provider_dispatches_started", 0)
+                prior = prior if type(prior) is int and prior >= 0 else 0
+                try:
+                    result.exception.provider_dispatches_started = max(
+                        prior, exposure.provider_dispatches_started,
+                    )
+                except Exception:
+                    pass
             reconcile = launch.reconcile_provider_exposure
             if callable(reconcile):
                 try:

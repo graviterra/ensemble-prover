@@ -5647,6 +5647,34 @@ async def _call_llm_with_tools_one_round_impl(
                                     "try_lean accepted."
                                 )
                             ):
+                                from ...verified_helper_contract import (
+                                    analyze_verified_helper_contract,
+                                )
+                                from ...proof_graph import helper_decl_statement
+
+                                contract_preamble = str(conv.preamble or "")
+                                contract_environment = str(
+                                    getattr(dossier, "current_lean_environment_hash", "") or ""
+                                )
+                                contract_remaining = elapsed_budget_remaining_s()
+                                contract_fields = await analyze_verified_helper_contract(
+                                        lean,
+                                        helper_decl_statement(bridge_source),
+                                        preamble=contract_preamble,
+                                        context=context_lemmas,
+                                        environment_hash=contract_environment,
+                                        timeout_s=(
+                                            min(30.0, contract_remaining)
+                                            if contract_remaining is not None
+                                            else 30.0
+                                        ),
+                                        context_is_current=lambda: (
+                                            contract_preamble == str(conv.preamble or "")
+                                            and contract_environment == str(
+                                                getattr(dossier, "current_lean_environment_hash", "") or ""
+                                            )
+                                        ),
+                                )
                                 recorded_bridge = recorder(
                                     bridge_source,
                                     phase="try_lean_verified_bridge",
@@ -5657,6 +5685,7 @@ async def _call_llm_with_tools_one_round_impl(
                                     provenance_tags=(
                                         "try_lean_accepted_example",
                                     ),
+                                    **contract_fields,
                                 )
                                 visibility = getattr(
                                     dossier,

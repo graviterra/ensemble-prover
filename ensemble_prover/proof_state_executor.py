@@ -33,13 +33,11 @@ from .deadline_guard import (
     create_result_only_deadline_task,
     outer_guard_timeout_s,
 )
-from .contract_identity import has_lean_contract_identity
 from .lean_parser import canonical_error_type, fallback_error_type_from_text
 from .math_utils import _strip_lean_comments_and_strings
 from .lean_runner import (
     LEAN_RESIDUAL_VERIFIER_GENERATION,
     LeanRunner,
-    LeanStatementContractAnalysis,
     lean_residual_elaboration_context_hash,
 )
 from .theorem_project import (
@@ -5019,53 +5017,21 @@ async def _accept_proof_state_helper(
         if operation_timeout > 0.0:
             contract_preamble = _proof_state_check_preamble(conv)
             contract_environment = str(dossier.current_lean_environment_hash or "")
-            try:
-                analyses, _output, returncode = await await_acceptance_operation(
-                    analyzer(
-                        [helper_statement],
-                        preamble_override="\n\n".join(
-                            part for part in (contract_preamble, *context) if part
-                        ),
-                        timeout_s=operation_timeout,
-                    ),
-                    operation_timeout,
-                )
-                analysis = analyses[0] if len(analyses) == 1 else None
-                if (
-                    returncode == 0
-                    and isinstance(analysis, LeanStatementContractAnalysis)
-                    and has_lean_contract_identity(analysis.structural_identity)
-                    and analysis.binder_sorts
-                    and all(sort in {"proof", "data"} for sort in analysis.binder_sorts)
-                    and len(analysis.binder_types) == len(analysis.binder_sorts)
-                    and all(
-                        isinstance(value, str) and value.strip()
-                        for value in analysis.binder_types
-                    )
-                    and analysis.binder_sorts.count("proof")
-                    == len(analysis.proof_binder_types)
-                    and all(
-                        isinstance(value, str) and value.strip()
-                        for value in analysis.proof_binder_types
-                    )
-                    and contract_preamble == _proof_state_check_preamble(conv)
+            from .verified_helper_contract import analyze_verified_helper_contract
+
+            contract_fields = dict(await analyze_verified_helper_contract(
+                lean,
+                helper_statement,
+                preamble=contract_preamble,
+                context=context,
+                environment_hash=contract_environment,
+                timeout_s=operation_timeout,
+                context_is_current=lambda: (
+                    contract_preamble == _proof_state_check_preamble(conv)
                     and contract_environment
                     == str(dossier.current_lean_environment_hash or "")
-                ):
-                    contract_fields = {
-                        "contract_identity": analysis.structural_identity,
-                        "contract_display_statement": analysis.display_type,
-                        "contract_binder_sorts": analysis.binder_sorts,
-                        "contract_proof_binder_types": analysis.proof_binder_types,
-                        "_contract_identity_statement": helper_statement,
-                        "_verification_environment_hash": contract_environment,
-                    }
-            except Exception:
-                # Contract classification enriches a proved helper; it must
-                # not erase paid body verification on an adapter/Lean failure.
-                # Cancellation still propagates, and without complete evidence
-                # the existing conservative visibility rule remains in force.
-                pass
+                ),
+            ))
             if not contract_fields:
                 dossier.increment_tool_metric("mini_helper_contract_analysis_unavailable", 1)
     # The monotonic deadline is an admission boundary between atomic checks.
@@ -8791,13 +8757,12 @@ async def _try_proof_state_root_tactic_assembly(
         )
         or ("direct" if direct_root_tactic else resumed_phase)
     )
-    capped_phase_timeout = bool(
-        int(candidate_attempt_limit or 0) > 0
-        and root_tactic_exit_reason == "timeout"
+    portfolio_phase_timeout = bool(
+        root_tactic_exit_reason == "timeout"
         and continuation_result_phase in {"direct", "active", "fallback"}
         and tuple(getattr(root_tactic, "candidate_portfolio", ()) or ())
     )
-    if root_tactic_exit_reason == "candidate_quantum_exhausted" or capped_phase_timeout:
+    if root_tactic_exit_reason == "candidate_quantum_exhausted" or portfolio_phase_timeout:
         candidate_portfolio = tuple(
             getattr(root_tactic, "candidate_portfolio", ()) or ()
         )
@@ -8825,14 +8790,30 @@ async def _try_proof_state_root_tactic_assembly(
                 "next_candidate_index": next_candidate_index,
             })
             root_node.root_tactic_portfolio_continuation = saved_continuation
-        if capped_phase_timeout and saved_continuation:
+        if portfolio_phase_timeout and saved_continuation:
+            previous_floors = shared_root_tactic_pattern_cache.checkpoint_state().get(
+                "candidate_timeout_floors", {}
+            )
+            current_floors = root_tactic_pattern_cache.checkpoint_state().get(
+                "candidate_timeout_floors", {}
+            )
+            timeout_progress = bool(
+                next_candidate_index > resumed_offset
+                or (resumed_phase, continuation_result_phase) == ("active", "fallback")
+                or any(value > previous_floors.get(key, 0)
+                       for key, value in current_floors.items())
+            )
             if was_deferred and allow_deferred_retry:
-                _mark_root_tactic_context_continued(proof_state, context_key)
-                _mark_root_tactic_context_attempted(proof_state, context_key)
-                try:
-                    proof_state.root_tactic_terminal_after_continuation += 1
-                except Exception:
-                    pass
+                # A completed check can advance the cursor or fund a larger
+                # next attempt. Keep that exact continuation eligible. Repeated
+                # unchanged short leases still hit the existing stall bound.
+                if not timeout_progress:
+                    _mark_root_tactic_context_continued(proof_state, context_key)
+                    _mark_root_tactic_context_attempted(proof_state, context_key)
+                    try:
+                        proof_state.root_tactic_terminal_after_continuation += 1
+                    except Exception:
+                        pass
             elif not was_deferred:
                 _mark_root_tactic_context_deferred(proof_state, context_key)
         record = {
@@ -8849,13 +8830,13 @@ async def _try_proof_state_root_tactic_assembly(
             "tactic_pattern_cache": root_tactic_cache_metadata,
             "root_tactic_context_preserved": True,
             "root_tactic_context_deferred": bool(
-                capped_phase_timeout and saved_continuation and not was_deferred
+                portfolio_phase_timeout and saved_continuation and not was_deferred
             ),
             "root_tactic_context_retry_after_defer": bool(was_deferred),
             "verdict": (
                 (
                     "root_tactic_candidate_quantum_timeout_preserved"
-                    if capped_phase_timeout
+                    if portfolio_phase_timeout
                     else "root_tactic_candidate_quantum_exhausted"
                 )
                 if saved_continuation

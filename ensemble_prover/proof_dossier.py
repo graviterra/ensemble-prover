@@ -29,6 +29,7 @@ from .falsification_cursor_identity import (
     right_pi_recipe_repair_disposition_is_valid,
 )
 from .contract_identity import (
+    make_lean_contract_binder_evidence_receipt,
     has_lean_contract_identity,
     lean_contract_evidence_receipt_matches,
     make_lean_contract_evidence_receipt,
@@ -2816,6 +2817,12 @@ def _dossier_is_conditional_negative_auxiliary(
 
     def negated_body(statement: str) -> str:
         body = _dossier_strip_balanced_outer_parens(statement)
+        inequalities = _top_level_token_positions(body, ("≠",))
+        if len(inequalities) == 1 and not _top_level_token_positions(
+            body, ("∧", "∨", "→", "->", "↔", "<->")
+        ):
+            index, _token = inequalities[0]
+            return body[:index].strip() + " = " + body[index + 1 :].strip()
         match = re.match(r"^(?:¬\s*|Not\s+)(.+)$", body, flags=re.DOTALL)
         if match is None:
             return ""
@@ -6996,6 +7003,7 @@ class VerifiedHelper:
     contract_display_statement: str = ""
     contract_binder_sorts: List[str] = field(default_factory=list)
     contract_proof_binder_types: List[str] = field(default_factory=list)
+    contract_binder_evidence_receipt: str = ""
 
 
 def verified_helper_bound_contract_identity(helper: Any) -> str:
@@ -7030,6 +7038,19 @@ def verified_helper_bound_contract_identity(helper: Any) -> str:
     ):
         return ""
     return identity
+
+
+def verified_helper_has_typed_binder_evidence(helper: Any) -> bool:
+    """Require complete binder metadata bound to this verified declaration."""
+
+    expected = make_lean_contract_binder_evidence_receipt(
+        verified_helper_bound_contract_identity(helper),
+        str(getattr(helper, "contract_identity_statement_key", "") or ""),
+        str(getattr(helper, "contract_identity_environment_hash", "") or ""),
+        tuple(getattr(helper, "contract_binder_sorts", ()) or ()),
+        tuple(getattr(helper, "contract_proof_binder_types", ()) or ()),
+    )
+    return bool(expected and expected == getattr(helper, "contract_binder_evidence_receipt", ""))
 
 
 def verified_helper_surface_statement_changed(existing: Any, incoming: Any) -> bool:
@@ -12350,11 +12371,9 @@ class ProofDossier:
         premises, conclusion, bound_names = _dossier_statement_premises_and_conclusion(
             statement
         )
-        has_lean_contract_evidence = bool(
-            has_lean_contract_identity(
-                str(getattr(helper, "contract_identity", "") or "")
-            )
-        )
+        # An Expr identity alone does not describe its proof binders. Older
+        # support refreshes attached identities without any binder analysis.
+        has_lean_contract_evidence = verified_helper_has_typed_binder_evidence(helper)
         if has_lean_contract_evidence:
             premises = tuple(
                 str(item or "")
@@ -15672,7 +15691,7 @@ class ProofDossier:
             ),
             contract_binder_sorts=(
                 list(getattr(helper, "contract_binder_sorts", []) or [])
-                if contract_identity
+                if contract_identity and verified_helper_has_typed_binder_evidence(helper)
                 else ()
             ),
             contract_proof_binder_types=(
@@ -15684,7 +15703,7 @@ class ProofDossier:
                     )
                     or []
                 )
-                if contract_identity
+                if contract_identity and verified_helper_has_typed_binder_evidence(helper)
                 else ()
             ),
             _contract_identity_statement=(
@@ -15745,6 +15764,8 @@ class ProofDossier:
             existing_identity_valid
             and incoming_identity_valid
             and existing_identity == incoming_identity
+            and verified_helper_has_typed_binder_evidence(existing)
+            and verified_helper_has_typed_binder_evidence(incoming)
         ):
             existing_display = str(
                 existing.contract_display_statement or ""
@@ -15859,6 +15880,8 @@ class ProofDossier:
             existing.contract_display_statement or ""
         ).strip()
         incoming_contract_lists: Dict[str, List[str]] = {}
+        incoming_has_typed_binders = verified_helper_has_typed_binder_evidence(incoming)
+        existing_has_typed_binders = verified_helper_has_typed_binder_evidence(existing)
         for field_name in (
             "contract_binder_sorts",
             "contract_proof_binder_types",
@@ -15866,7 +15889,8 @@ class ProofDossier:
             incoming_values = [
                 str(value or "")
                 for value in list(
-                    getattr(incoming, field_name, []) or []
+                    (getattr(incoming, field_name, []) or [])
+                    if incoming_has_typed_binders else []
                 )
                 if str(value or "").strip()
             ]
@@ -15999,15 +16023,31 @@ class ProofDossier:
             and verified_helper_bound_contract_identity(existing)
             == incoming_identity
         ):
-            if incoming_display and not existing_display:
+            if incoming_display and (
+                not existing_display
+                or (incoming_has_typed_binders and not existing_has_typed_binders)
+            ):
                 existing.contract_display_statement = incoming_display
                 changed = True
             for field_name, incoming_values in incoming_contract_lists.items():
-                if incoming_values and not list(
-                    getattr(existing, field_name, []) or []
-                ):
+                if (
+                    incoming_has_typed_binders and not existing_has_typed_binders
+                ) or (incoming_values and not list(getattr(existing, field_name, []) or [])):
                     setattr(existing, field_name, incoming_values)
                     changed = True
+
+        if (
+            incoming_has_typed_binders
+            and verified_helper_bound_contract_identity(existing) == incoming_identity
+            and all(
+                list(getattr(existing, field_name, []) or []) == incoming_values
+                for field_name, incoming_values in incoming_contract_lists.items()
+            )
+            and existing.contract_binder_evidence_receipt
+            != incoming.contract_binder_evidence_receipt
+        ):
+            existing.contract_binder_evidence_receipt = incoming.contract_binder_evidence_receipt
+            changed = True
 
         existing_tags = [
             str(tag or "").strip()
@@ -16272,6 +16312,13 @@ class ProofDossier:
                 for item in list(contract_proof_binder_types or [])
                 if str(item or "").strip()
             ],
+        )
+        item.contract_binder_evidence_receipt = make_lean_contract_binder_evidence_receipt(
+            bound_contract_identity,
+            evidence_statement_key,
+            verification_environment_hash,
+            tuple(item.contract_binder_sorts),
+            tuple(item.contract_proof_binder_types),
         )
         self._classify_verified_helper_quality(item)
         if str(getattr(item, "render_policy", "") or "") == "advisory_root_equivalent":
@@ -20813,6 +20860,9 @@ class ProofDossier:
                 ),
                 contract_display_statement=str(
                     raw.get("contract_display_statement") or ""
+                ),
+                contract_binder_evidence_receipt=str(
+                    raw.get("contract_binder_evidence_receipt") or ""
                 ),
                 contract_binder_sorts=[
                     str(item or "")

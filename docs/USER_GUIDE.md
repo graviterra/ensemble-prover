@@ -6,7 +6,7 @@ The experimental NL frontends first translate the mathematics into Lean; the
 formalization campaign can build definitions and supporting theorems across
 multiple files before completing the root theorem.
 
-This guide covers release 1.07, including both experimental NL frontends.
+This guide covers release 1.08, including both experimental NL frontends.
 Older Mini-only releases do not include those modules.
 Run commands from the repository root containing `.venv/` and `ensemble_prover/`,
 not from inside the `ensemble_prover/` Python package. The live help is the
@@ -55,7 +55,7 @@ packages, or any theorem project. Supply those separately.
 - network access to the selected model provider
 - a working Lean/Lake toolchain for the target project
 
-The release audit is performed with CPython 3.11. The setup script accepts
+The release audit is performed with both CPython 3.11 and 3.12. The setup script accepts
 standard CPython 3.11 and 3.12 and rejects trace-reference builds because the
 runtime relies on the ordinary CPython object layout for exact rollback.
 
