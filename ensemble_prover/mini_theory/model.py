@@ -215,6 +215,12 @@ class TheoryNeed:
         )
         object.__setattr__(self, "evidence_payload", _freeze_json(evidence))
 
+    def __deepcopy__(self, memo: dict[int, Any]) -> "TheoryNeed":
+        # All fields, including nested JSON evidence, are immutable. Restore
+        # can safely share this value; mappingproxy itself is not pickleable.
+        memo[id(self)] = self
+        return self
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "need_id": self.need_id,

@@ -108,6 +108,8 @@ from .mini_temperature import (
     resolve_mini_temperature,
 )
 from .llm_error_policy import (
+    ProviderAccountUnavailable,
+    is_provider_account_failure,
     classify_llm_exception,
     is_terminal_llm_failure_reason,
     llm_failure_scope,
@@ -16993,6 +16995,7 @@ async def run_mini_recursive_attempt(
     planner_job_broker: Optional[PlannerJobBroker] = None,
     planner_frontier_signature: str = "",
     planner_owner_lane_id: str = "",
+    provider_account_pause_enabled: bool = False,
 ) -> MiniRecursiveResult:
     """Bridge ``mini_prover`` attempt context into the recursive controller.
 
@@ -19877,6 +19880,7 @@ async def run_mini_recursive_attempt(
             planner_job_broker=planner_job_broker,
             planner_frontier_signature=planner_frontier_signature,
             planner_owner_lane_id=planner_owner_lane_id,
+            provider_account_pause_enabled=provider_account_pause_enabled,
         )
     except BaseException as driver_error:
         try:
@@ -20357,6 +20361,7 @@ async def run_mini_recursive_driver(
     planner_job_broker: Optional[PlannerJobBroker] = None,
     planner_frontier_signature: str = "",
     planner_owner_lane_id: str = "",
+    provider_account_pause_enabled: bool = False,
 ) -> MiniRecursiveResult:
     """Run the recursive helper loop once or more.
 
@@ -30424,6 +30429,12 @@ async def run_mini_recursive_driver(
                                 "verdict": "same_variant_projection_refreshed",
                             },
                         )
+                    if (provider_account_pause_enabled
+                            and is_provider_account_failure(claim_proof_result.terminal_failure_reason)):
+                        # Keep the exact child_pending cursor and its reserved
+                        # allocation. Account unavailability is not a completed
+                        # child result or a reason to discard a paid plan.
+                        raise ProviderAccountUnavailable(claim_proof_result.terminal_failure_reason)
                     if not (
                         claim_proof_result.controller_projection_invalidated
                         or claim_proof_result.theory_imported_bundle_ids

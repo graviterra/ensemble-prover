@@ -47,6 +47,7 @@ from ..solved_export_policy import (
     solved_export_verified_payload as policy_solved_export_verified_payload,
 )
 from ..mini_recursive_outcome import is_resumable_mini_recursive_yield
+from ..cost_reporting import cost_report, select_cost_snapshot
 from ..state_data import mappingproxy_backing_dict
 from .action import ActionBudget, RepairTicket
 from .capability_policy import field_is_runtime_capability
@@ -625,6 +626,13 @@ class MiniRunClassification:
     last_elapsed_s: Optional[float]
     last_phase: str
     last_verdict: str
+    cost_available: bool = False
+    cost_accounting_incomplete: bool = True
+    llm_unpriced_provider_exposure_count: int = 0
+    cost_source: str = "unavailable"
+    cost_valuation_source: str = "unspecified"
+    cost_valuation_assumptions: List[str] = dataclasses.field(default_factory=list)
+    pricing_policy: JSONDict = dataclasses.field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -3721,6 +3729,11 @@ def classify_run(run_dir: str | Path) -> MiniRunClassification:
         status = "live_or_incomplete"
     else:
         status = "missing_trace"
+    cost_snapshot = select_cost_snapshot(
+        summary, events, terminal_records,
+        summary_current=not summary_terminal_superseded,
+    )
+    cost_fields = cost_report(cost_snapshot)
     return MiniRunClassification(
         run_dir=str(run_path),
         event_count=len(events),
@@ -3738,21 +3751,10 @@ def classify_run(run_dir: str | Path) -> MiniRunClassification:
         answer_unsafe_count=answer_unsafe_count,
         terminal_reason=terminal_reason,
         dominant_category=dominant_category,
-        cost_usd=_summary_or_terminal_float("cost_usd", summary, terminal_records),
-        max_cost_usd=_summary_or_terminal_float("max_cost_usd", summary, terminal_records),
-        estimated_unknown_cost_usd=(
-            _summary_or_terminal_float(
-                "estimated_unknown_cost_usd",
-                summary,
-                terminal_records,
-            )
-        ),
-        llm_budget_accounted_cost_usd=(
-            _summary_or_terminal_float(
-                "llm_budget_accounted_cost_usd",
-                summary,
-                terminal_records,
-            )
+        **cost_fields,
+        max_cost_usd=_summary_or_terminal_float("max_cost_usd", cost_snapshot, ()),
+        llm_budget_accounted_cost_usd=_summary_or_terminal_float(
+            "llm_budget_accounted_cost_usd", cost_snapshot, (),
         ),
         evidence=_evidence(
             events=events,

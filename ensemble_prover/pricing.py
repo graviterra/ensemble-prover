@@ -10,6 +10,7 @@ import os
 import threading
 import time
 from dataclasses import asdict, dataclass
+from datetime import date, datetime, timezone
 from typing import Optional, Tuple
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -36,6 +37,7 @@ class OpenRouterReasoningCapabilities:
 # Official per-million-token pricing used by the shipped API-backed profiles.
 # Tuple order: (input, cached_input, output).
 _OPENAI_MODEL_PRICING: tuple[tuple[str, PricingTuple], ...] = (
+    ("gpt-6-astra", (10.0, 1.0, 50.0)),
     ("gpt-5.6-sol", (5.0, 0.5, 30.0)),
     ("gpt-5.6-terra", (2.0, 0.20, 12.00)),
     ("gpt-5.6-luna", (0.2, 0.02, 1.20)),
@@ -49,12 +51,28 @@ _OPENAI_GPT56_LONG_CONTEXT_THRESHOLD = 272_000
 _OPENAI_GPT56_LONG_CONTEXT_INPUT_MULTIPLIER = 2.0
 _OPENAI_GPT56_LONG_CONTEXT_OUTPUT_MULTIPLIER = 1.5
 _OPENAI_LONG_CONTEXT_MODEL_PREFIXES = (
+    "gpt-6-astra",
     "gpt-5.4",
     "gpt-5.6",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
 )
+
+# Verified policy window, not a claim about when the promotion started or
+# will end. Beyond the guaranteed window valuation needs a refreshed policy;
+# reservations can still use the undiscounted conservative schedule above.
+_PRICING_POLICY_VERSION = "2026-09-08"
+_SOL_PROMOTION_VERIFIED_FROM = date(2026, 9, 8)
+_SOL_PROMOTION_GUARANTEED_THROUGH = date(2026, 11, 21)
+_SOL_PROMOTIONAL_PRICING: PricingTuple = (4.0, 0.4, 20.0)
+_OPENAI_CACHE_WRITE_MODELS = (
+    "gpt-6-astra", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+)
+
+
+def _valuation_date(at_date: Optional[date]) -> date:
+    return at_date if at_date is not None else datetime.now(timezone.utc).date()
 
 _DEEPSEEK_MODEL_PRICING: tuple[tuple[str, PricingTuple], ...] = (
     ("deepseek-v4-flash", (0.14, 0.0028, 0.28)),
@@ -528,7 +546,10 @@ async def _await_openrouter_refresh_future(
     return future.result()
 
 
-def lookup_known_token_pricing(base_url: str, model: str) -> Optional[PricingTuple]:
+def lookup_known_token_pricing(
+    base_url: str, model: str, *, at_date: Optional[date] = None,
+    conservative: bool = False,
+) -> Optional[PricingTuple]:
     """Return known pricing for shipped API models, or ``None`` when unknown."""
     name = str(model or "").strip().lower()
     provider = provider_for_base_url(base_url)
@@ -536,6 +557,13 @@ def lookup_known_token_pricing(base_url: str, model: str) -> Optional[PricingTup
         for prefix, pricing in _OPENAI_MODEL_PRICING:
             for alias in _direct_provider_model_aliases(name):
                 if _model_matches_known_prefix(alias, prefix):
+                    if prefix in {"gpt-5.6", "gpt-5.6-sol"} and not conservative:
+                        if (
+                            _SOL_PROMOTION_VERIFIED_FROM <= _valuation_date(at_date)
+                            <= _SOL_PROMOTION_GUARANTEED_THROUGH
+                        ):
+                            return _SOL_PROMOTIONAL_PRICING
+                        return None
                     return pricing
         return None
     if provider == "deepseek":
@@ -658,6 +686,8 @@ def effective_token_pricing(
     model: str,
     *,
     input_tokens: int,
+    at_date: Optional[date] = None,
+    conservative: bool = False,
 ) -> Optional[PricingTuple]:
     """Return request-size-aware pricing for one concrete model request.
 
@@ -666,7 +696,9 @@ def effective_token_pricing(
     prevents budget reservations and final usage settlement from silently
     using different price policies.
     """
-    pricing = lookup_known_token_pricing(base_url, model)
+    pricing = lookup_known_token_pricing(
+        base_url, model, at_date=at_date, conservative=conservative,
+    )
     if pricing is None:
         return None
     has_long_context_tier = _direct_openai_model_matches_any(
@@ -699,16 +731,27 @@ def conservative_reservation_token_pricing(
         base_url,
         model,
         input_tokens=input_tokens,
+        conservative=True,
     )
     if pricing is None:
         return None
     if _direct_openai_model_matches_any(
         base_url,
         model,
-        ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
+        _OPENAI_CACHE_WRITE_MODELS,
     ):
         input_per_m, cached_per_m, output_per_m = pricing
-        return (input_per_m * 1.25, cached_per_m, output_per_m)
+        # No explicit tier is sent by this client, so the project default can
+        # select Fast. Reserve Astra's highest documented tier; settlement
+        # still values the actual tier returned by the provider.
+        tier_ceiling = 2.0 if _direct_openai_model_matches_any(
+            base_url, model, ("gpt-6-astra",),
+        ) else 1.0
+        return (
+            input_per_m * 1.25 * tier_ceiling,
+            cached_per_m * tier_ceiling,
+            output_per_m * tier_ceiling,
+        )
     return pricing
 
 
@@ -720,15 +763,136 @@ def compute_model_cost_usd(
     output_tokens: int,
     cached_input_tokens: int,
     cache_write_tokens: int = 0,
+    service_tier: str = "",
+    at_date: Optional[date] = None,
 ) -> Optional[float]:
-    """Compute model-aware cost, including GPT-5.6 cache-write billing."""
-    pricing = effective_token_pricing(
-        base_url,
-        model,
-        input_tokens=input_tokens,
+    """Value tokens using published rates; this does not assert invoice cost."""
+    policy = quote_model_pricing(
+        base_url, model, input_tokens=input_tokens,
+        service_tier=service_tier, at_date=at_date,
     )
-    if pricing is None:
+    return compute_quoted_cost_usd(
+        policy, input_tokens=input_tokens, output_tokens=output_tokens,
+        cached_input_tokens=cached_input_tokens, cache_write_tokens=cache_write_tokens,
+    )
+
+
+def quote_model_pricing(
+    base_url: str,
+    model: str,
+    *,
+    input_tokens: int,
+    service_tier: str = "",
+    at_date: Optional[date] = None,
+    conservative: bool = False,
+) -> dict[str, object]:
+    """Return a serializable as-of rate policy without network access.
+
+    Passing ``at_date`` selects the dated static policy. Historical dynamic
+    catalog prices are unavailable unless already pinned in a receipt.
+    The quote must be pinned with a receipt; an unknown quote remains unknown
+    when a later software version adds prices. Missing OpenAI service tier is
+    an explicit Standard assumption, never an assertion about account settings.
+    """
+    provider = provider_for_base_url(base_url)
+    tier = str(service_tier or "").strip().lower()
+    assumptions: list[str] = []
+    if provider == "openai" and not tier:
+        assumptions.append("service_tier_missing_assumed_standard")
+    effective_tier = tier or "default"
+    multiplier = 1.0
+    if provider == "openai" and effective_tier not in {"default", "standard"}:
+        # Only Astra's alternate-tier schedule was verified in this policy.
+        # Other concrete tiers remain unpriced rather than inheriting Standard.
+        if _direct_openai_model_matches_any(base_url, model, ("gpt-6-astra",)):
+            multiplier = {"priority": 2.0, "fast": 2.0, "flex": 0.5, "batch": 0.5}.get(effective_tier, 0.0)
+        else:
+            multiplier = 0.0
+    pricing = effective_token_pricing(
+        base_url, model, input_tokens=input_tokens,
+        at_date=at_date, conservative=conservative,
+    )
+    policy_version = _PRICING_POLICY_VERSION
+    rates_observed_at = None
+    rate_source = "verified_static_policy"
+    if provider == "openrouter":
+        with _OPENROUTER_PRICING_LOCK:
+            fetched_at = _OPENROUTER_PRICING_FETCHED_AT
+            fresh = fetched_at > 0 and time.time() - fetched_at < _OPENROUTER_PRICING_CACHE_TTL_S
+            has_cached_model = str(model or "").lower().strip() in _OPENROUTER_PRICING_CACHE
+        rates_observed_at = fetched_at if has_cached_model and fetched_at > 0 else None
+        rate_source = "live_catalog" if fresh else "stale_catalog_or_undated_fallback"
+        policy_version = "openrouter_catalog" if fresh else "openrouter_undated_fallback"
+        if at_date is not None and (at_date != _valuation_date(None) or not fresh):
+            pricing = None
+            assumptions.append("historical_dynamic_catalog_unavailable")
+        elif not fresh:
+            assumptions.append("stale_catalog_or_undated_fallback_rates")
+    source_model = next((
+        prefix for prefix, _ in _OPENAI_MODEL_PRICING
+        if _direct_openai_model_matches_any(base_url, model, (prefix,))
+    ), "")
+    source_url = (
+        f"https://developers.openai.com/api/docs/models/{source_model}"
+        if source_model else
+        "https://api-docs.deepseek.com/quick_start/pricing"
+        if provider == "deepseek" else
+        _OPENROUTER_MODELS_URL if provider == "openrouter" else ""
+    )
+    known = pricing is not None and multiplier > 0
+    rates: dict[str, float] = {}
+    if known:
+        input_rate, cached_rate, output_rate = pricing
+        write_multiplier = 1.25 if _direct_openai_model_matches_any(
+            base_url, model, _OPENAI_CACHE_WRITE_MODELS,
+        ) else 1.0
+        rates = {
+            "input": input_rate * multiplier,
+            "cached_input": cached_rate * multiplier,
+            "cache_write": input_rate * write_multiplier * multiplier,
+            "output": output_rate * multiplier,
+        }
+    return {
+        "schema_version": 1,
+        "policy_version": policy_version,
+        "valuation_date": _valuation_date(at_date).isoformat(),
+        "source_url": source_url,
+        "rate_source": rate_source,
+        "rates_observed_at": rates_observed_at,
+        "model": str(model or ""),
+        "provider": provider or "",
+        "pricing_known": known,
+        "service_tier": effective_tier,
+        "service_tier_multiplier": multiplier,
+        "long_context": bool(_direct_openai_model_matches_any(
+            base_url, model, _OPENAI_LONG_CONTEXT_MODEL_PREFIXES,
+        ) and input_tokens > _OPENAI_GPT56_LONG_CONTEXT_THRESHOLD),
+        "long_context_threshold": (
+            _OPENAI_GPT56_LONG_CONTEXT_THRESHOLD if _direct_openai_model_matches_any(
+                base_url, model, _OPENAI_LONG_CONTEXT_MODEL_PREFIXES,
+            ) else 0
+        ),
+        "rates_per_million": rates,
+        "assumptions": assumptions,
+        "conservative_reservation": conservative,
+    }
+
+
+def compute_quoted_cost_usd(
+    policy: dict[str, object], *, input_tokens: int, output_tokens: int,
+    cached_input_tokens: int, cache_write_tokens: int = 0,
+) -> Optional[float]:
+    """Value categories with already-pinned rates; reject malformed quotes."""
+    try:
+        validate_pricing_policy(policy)
+    except ValueError:
         return None
+    if policy["pricing_known"] is not True:
+        return None
+    rates = policy.get("rates_per_million")
+    if not isinstance(rates, dict):
+        return None
+    values = [rates.get(key) for key in ("input", "cached_input", "cache_write", "output")]
     input_i, output_i, cached_i = _normalize_usage_counts(
         input_tokens,
         output_tokens,
@@ -738,23 +902,60 @@ def compute_model_cost_usd(
         max(0, int(cache_write_tokens or 0)),
         max(0, input_i - cached_i),
     )
-    input_per_m, cached_per_m, output_per_m = pricing
-    write_multiplier = (
-        1.25
-        if _direct_openai_model_matches_any(
-            base_url,
-            model,
-            ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
-        )
-        else 1.0
-    )
+    input_per_m, cached_per_m, write_per_m, output_per_m = values
     ordinary_input = max(0, input_i - cached_i - write_i)
-    return (
-        ordinary_input * input_per_m / 1_000_000
-        + cached_i * cached_per_m / 1_000_000
-        + write_i * input_per_m * write_multiplier / 1_000_000
-        + output_i * output_per_m / 1_000_000
-    )
+    try:
+        cost = (
+            ordinary_input * input_per_m / 1_000_000
+            + cached_i * cached_per_m / 1_000_000
+            + write_i * write_per_m / 1_000_000
+            + output_i * output_per_m / 1_000_000
+        )
+    except OverflowError:
+        return None
+    return cost if math.isfinite(cost) else None
+
+
+def validate_pricing_policy(policy: object) -> None:
+    """Reject malformed persisted pricing evidence instead of repricing it."""
+    if not isinstance(policy, dict):
+        raise ValueError("pricing_policy must be an object")
+    if isinstance(policy.get("schema_version"), bool) or not isinstance(policy.get("schema_version"), int) or policy["schema_version"] != 1:
+        raise ValueError("unsupported pricing_policy schema_version")
+    try:
+        json.dumps(policy, allow_nan=False)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError("pricing_policy must be finite JSON data") from exc
+    for key in ("policy_version", "valuation_date", "source_url", "model", "provider", "service_tier"):
+        if not isinstance(policy.get(key), str):
+            raise ValueError(f"pricing_policy.{key} must be a string")
+    try:
+        date.fromisoformat(policy["valuation_date"])
+    except ValueError as exc:
+        raise ValueError("pricing_policy.valuation_date must be an ISO date") from exc
+    if not isinstance(policy.get("pricing_known"), bool):
+        raise ValueError("pricing_policy.pricing_known must be boolean")
+    if not isinstance(policy.get("long_context"), bool):
+        raise ValueError("pricing_policy.long_context must be boolean")
+    threshold = policy.get("long_context_threshold")
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 0:
+        raise ValueError("pricing_policy.long_context_threshold must be nonnegative integral")
+    assumptions = policy.get("assumptions")
+    if not isinstance(assumptions, (list, tuple)) or any(not isinstance(value, str) for value in assumptions):
+        raise ValueError("pricing_policy.assumptions must be strings")
+    rates = policy.get("rates_per_million")
+    if not isinstance(rates, dict):
+        raise ValueError("pricing_policy.rates_per_million must be an object")
+    expected = {"input", "cached_input", "cache_write", "output"} if policy["pricing_known"] else set()
+    if set(rates) != expected:
+        raise ValueError("pricing_policy has incomplete or unexpected rate categories")
+    for key, value in rates.items():
+        try:
+            valid = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError(f"pricing_policy rate {key} must be finite and nonnegative")
 
 
 async def lookup_known_token_pricing_async(
@@ -813,11 +1014,8 @@ async def conservative_reservation_token_pricing_async(
     input_tokens: int,
 ) -> Optional[PricingTuple]:
     """Async catalog lookup plus conservative cache-write reservation rate."""
-    pricing = await lookup_known_token_pricing_async(base_url, model)
-    if pricing is None:
-        return None
     if provider_for_base_url(base_url) != "openai":
-        return pricing
+        return await lookup_known_token_pricing_async(base_url, model)
     return conservative_reservation_token_pricing(
         base_url,
         model,

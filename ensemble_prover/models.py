@@ -736,6 +736,8 @@ def _responses_payload_to_chat_completion(data: Any) -> Dict[str, Any]:
         "id": str(body.get("id") or ""),
         "object": "chat.completion",
         "model": str(body.get("model") or ""),
+        **({"service_tier": body["service_tier"]} if "service_tier" in body else {}),
+        **({"created": body["created_at"]} if "created_at" in body else {}),
         # Consumers of a completed artifact must not mistake an unknown
         # incomplete/failed Responses status for the synthetic `stop` below.
         "_responses_status": status,
@@ -753,7 +755,7 @@ def _responses_payload_to_chat_completion(data: Any) -> Dict[str, Any]:
                 usage.get("total_tokens") or (input_tokens + output_tokens)
             ),
             "prompt_tokens_details": {
-                "cached_tokens": int(input_details.get("cached_tokens") or 0),
+                **input_details,
             },
             "completion_tokens_details": {
                 "reasoning_tokens": int(
@@ -2728,6 +2730,9 @@ class OpenAICompatClient:
         self._usage_cached_input_tokens: int = 0
         self._usage_cache_write_tokens: int = 0
         self._usage_prompt_cache_miss_tokens: int = 0
+        self._usage_reasoning_output_tokens: int = 0
+        self._usage_cost_valuation_sources: set[str] = set()
+        self._usage_cost_valuation_assumptions: set[str] = set()
         self._usage_cost_usd: float = 0.0
         self._usage_cost_usd_authoritative: bool = True
         self._usage_unpriced_input_tokens: int = 0
@@ -3179,6 +3184,9 @@ class OpenAICompatClient:
         self._usage_cached_input_tokens += int(record.cached_input_tokens)
         self._usage_cache_write_tokens += int(record.cache_write_tokens)
         self._usage_prompt_cache_miss_tokens += int(record.prompt_cache_miss_tokens)
+        self._usage_reasoning_output_tokens += int(record.reasoning_output_tokens)
+        self._usage_cost_valuation_sources.add(record.cost_valuation_source)
+        self._usage_cost_valuation_assumptions.update(record.cost_valuation_assumptions)
         record_cost, pricing_known = cost_for_record(record)
         if pricing_known:
             self._usage_cost_usd += float(record_cost)
@@ -3253,6 +3261,13 @@ class OpenAICompatClient:
             "cached_input_tokens": self._usage_cached_input_tokens,
             "cache_write_tokens": self._usage_cache_write_tokens,
             "prompt_cache_miss_tokens": self._usage_prompt_cache_miss_tokens,
+            "reasoning_output_tokens": self._usage_reasoning_output_tokens,
+            "cost_valuation_source": (
+                next(iter(self._usage_cost_valuation_sources))
+                if len(self._usage_cost_valuation_sources) == 1
+                else "mixed" if self._usage_cost_valuation_sources else "unspecified"
+            ),
+            "cost_valuation_assumptions": sorted(self._usage_cost_valuation_assumptions),
             "cost_usd": self._usage_cost_usd,
             "cost_usd_authoritative": self._usage_cost_usd_authoritative,
             "unpriced_input_tokens": self._usage_unpriced_input_tokens,
@@ -3272,6 +3287,9 @@ class OpenAICompatClient:
         self._usage_cached_input_tokens = 0
         self._usage_cache_write_tokens = 0
         self._usage_prompt_cache_miss_tokens = 0
+        self._usage_reasoning_output_tokens = 0
+        self._usage_cost_valuation_sources.clear()
+        self._usage_cost_valuation_assumptions.clear()
         self._usage_cost_usd = 0.0
         self._usage_cost_usd_authoritative = True
         self._usage_unpriced_input_tokens = 0
@@ -5830,7 +5848,10 @@ class OpenAICompatClient:
                     )
                 current.pop(cached_drop, None)
             retry_with_envelope = False
-            for _parameter_attempt in range(2):
+            # Two optional parameters can each need removal, followed by a
+            # successful dispatch. Keep those repairs inside this context
+            # attempt so they cannot spend the separate envelope retry.
+            for _parameter_attempt in range(3):
                 try:
                     resp = await self._post_with_retry(
                         f"{self.base_url}/responses",

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
 import hashlib
 import inspect
 import json
@@ -19,6 +20,7 @@ import uuid
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from numbers import Integral
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -31,14 +33,15 @@ from .provider_dispatch_continuation import (
 )
 
 from .llm_deadline import llm_retry_deadline_record_from_exception
+from .cost_policy import require_cost_budget_usd
 from .proof_lineage import ProofLineageEnvelope
 from .pricing import (
-    compute_cost_usd,
-    compute_model_cost_usd,
+    compute_quoted_cost_usd,
     conservative_reservation_token_pricing,
     conservative_reservation_token_pricing_async,
-    lookup_known_token_pricing,
     provider_for_base_url,
+    quote_model_pricing,
+    validate_pricing_policy,
 )
 from .provider_tool_protocol import (
     MiniRequestEnvelopePolicy,
@@ -84,7 +87,23 @@ _COST_LEDGER_RESERVATION_MAP_FIELDS = (
 _COST_LEDGER_SET_FIELDS = (
     "_unpriced_provider_exposure_receipts",
     "_cancelled_provider_inflight_reservations", "_late_hold_reservations",
+    "_cost_valuation_sources", "_cost_valuation_assumptions",
 )
+
+
+def _restore_legacy_cost_valuation_fields(state: Dict[str, Any]) -> None:
+    fields = {"_cost_valuation_sources", "_cost_valuation_assumptions"}
+    present = fields.intersection(state)
+    if present and present != fields:
+        raise ValueError("cost valuation provenance fields are incomplete")
+    if not present:
+        # Old ledgers retain their numeric amounts. Their applied prices are
+        # unknown; a restore must not manufacture current-catalog authority.
+        has_valued_history = bool(state.get("_exact_cost_usd", 0))
+        state["_cost_valuation_sources"] = ["unspecified"] if has_valued_history else []
+        state["_cost_valuation_assumptions"] = (
+            ["legacy_pricing_provenance_unavailable"] if has_valued_history else []
+        )
 
 
 def _cost_record_mapping(value: Any, *, label: str) -> Dict[str, Any]:
@@ -212,8 +231,60 @@ class ProviderUsageRecord:
     temperature_provider_drop_reason: str = ""
     reservation_target_id: str = ""
     reservation_dispatch_ordinal: int = 0
+    service_tier: str = ""
+    provider_response_id: str = ""
+    provider_created_at: Optional[float] = None
+    pricing_policy: Dict[str, Any] = field(default_factory=dict)
+    cost_valuation_source: str = ""
+    cost_valuation_assumptions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "raw_usage", _cost_record_mapping(self.raw_usage, label="provider raw usage"))
+        for name in (
+            "input_tokens", "output_tokens", "cached_input_tokens", "cache_write_tokens",
+            "prompt_cache_miss_tokens", "reasoning_output_tokens", "reservation_dispatch_ordinal",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integral count")
+        if (self.cached_input_tokens + self.cache_write_tokens > self.input_tokens
+                or self.prompt_cache_miss_tokens > self.input_tokens
+                or self.reasoning_output_tokens > self.output_tokens):
+            raise ValueError("usage token partitions exceed their totals")
+        if self.reported_cost_usd is not None and _usage_float(self.reported_cost_usd) is None:
+            raise ValueError("reported_cost_usd must be finite and nonnegative")
+        for name in ("service_tier", "provider_response_id", "cost_valuation_source"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"{name} must be a string")
+        created_at = self.provider_created_at
+        if created_at is not None and (
+            isinstance(created_at, bool) or not isinstance(created_at, (int, float))
+            or _usage_float(created_at) is None
+        ):
+            raise ValueError("provider_created_at must be a finite nonnegative timestamp")
+        assumptions = self.cost_valuation_assumptions
+        if not isinstance(assumptions, (list, tuple)) or any(not isinstance(value, str) for value in assumptions):
+            raise ValueError("cost_valuation_assumptions must be a sequence of strings")
+        object.__setattr__(self, "cost_valuation_assumptions", tuple(assumptions))
+        if not isinstance(self.pricing_policy, dict):
+            raise ValueError("pricing_policy must be an object")
+        if self.pricing_policy:
+            validate_pricing_policy(self.pricing_policy)
+            if (self.pricing_policy["model"] != self.model
+                    or self.pricing_policy["provider"] != (provider_for_base_url(self.base_url) or "")):
+                raise ValueError("pricing_policy identity must match the receipt")
+            aliases = {"": "default", "standard": "default", "priority": "fast"}
+            actual_tier = self.service_tier.strip().lower()
+            quoted_tier = self.pricing_policy["service_tier"].strip().lower()
+            if aliases.get(actual_tier, actual_tier) != aliases.get(quoted_tier, quoted_tier):
+                raise ValueError("pricing_policy service tier must match the receipt")
+            threshold = self.pricing_policy["long_context_threshold"]
+            if self.pricing_policy["long_context"] != bool(threshold and self.input_tokens > threshold):
+                raise ValueError("pricing_policy context tier must match the receipt")
+            object.__setattr__(self, "pricing_policy", copy.deepcopy(self.pricing_policy))
 
     def as_dict(self) -> Dict[str, Any]:
+        policy, source, assumptions = valuation_metadata_for_record(self)
         return {
             "model": self.model,
             "base_url": self.base_url,
@@ -224,7 +295,7 @@ class ProviderUsageRecord:
             "prompt_cache_miss_tokens": int(self.prompt_cache_miss_tokens),
             "reasoning_output_tokens": int(self.reasoning_output_tokens),
             "usage_source": self.usage_source,
-            "raw_usage": dict(self.raw_usage),
+            "raw_usage": _cost_record_mapping(self.raw_usage, label="provider raw usage"),
             "reported_cost_usd": self.reported_cost_usd,
             "reported_cost_source": str(self.reported_cost_source or ""),
             "reported_cost_unit": str(self.reported_cost_unit or ""),
@@ -244,6 +315,12 @@ class ProviderUsageRecord:
                 0,
                 int(self.reservation_dispatch_ordinal or 0),
             ),
+            "service_tier": self.service_tier,
+            "provider_response_id": self.provider_response_id,
+            "provider_created_at": self.provider_created_at,
+            "pricing_policy": copy.deepcopy(policy),
+            "cost_valuation_source": source,
+            "cost_valuation_assumptions": list(assumptions),
         }
 
 
@@ -1039,7 +1116,7 @@ def _usage_int(value: Any) -> int:
 
 def _usage_float(value: Any) -> Optional[float]:
     try:
-        if value is None:
+        if value is None or isinstance(value, bool):
             return None
         out = float(value)
         if not math.isfinite(out) or out < 0:
@@ -1047,6 +1124,48 @@ def _usage_float(value: Any) -> Optional[float]:
         return out
     except Exception:
         return None
+
+
+def _valid_provider_token_totals(usage: Dict[str, Any]) -> bool:
+    """A token receipt needs both valid totals; explicit zero is valid."""
+    total_groups = (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"))
+    for names in total_groups:
+        values = [usage[name] for name in names if name in usage]
+        if not values or any(
+            isinstance(value, bool) or not isinstance(value, Integral) or value < 0
+            for value in values
+        ) or len(set(values)) != 1:
+            return False
+    optional_names = (
+        "prompt_cache_hit_tokens", "cache_read_input_tokens", "cached_prompt_tokens",
+        "cache_write_input_tokens", "prompt_cache_miss_tokens", "reasoning_tokens",
+    )
+    counts = [usage[name] for name in optional_names if name in usage]
+    for name in ("prompt_tokens_details", "input_tokens_details", "completion_tokens_details", "output_tokens_details"):
+        detail = usage.get(name)
+        if detail is None:
+            continue
+        if not isinstance(detail, dict):
+            return False
+        counts.extend(detail[key] for key in ("cached_tokens", "cache_write_tokens", "reasoning_tokens") if key in detail)
+    if not all(
+        not isinstance(value, bool) and isinstance(value, Integral) and value >= 0
+        for value in counts
+    ):
+        return False
+    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+    output_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
+    input_details = [usage.get(name) or {} for name in ("prompt_tokens_details", "input_tokens_details")]
+    cached = max([detail.get("cached_tokens", 0) for detail in input_details] + [
+        usage.get(name, 0) for name in ("prompt_cache_hit_tokens", "cache_read_input_tokens", "cached_prompt_tokens")
+    ])
+    writes = max([detail.get("cache_write_tokens", 0) for detail in input_details] + [usage.get("cache_write_input_tokens", 0)])
+    reasoning = max([usage.get("reasoning_tokens", 0)] + [
+        (usage.get(name) or {}).get("reasoning_tokens", 0)
+        for name in ("completion_tokens_details", "output_tokens_details")
+    ])
+    return (cached + writes <= input_tokens and reasoning <= output_tokens
+            and usage.get("prompt_cache_miss_tokens", 0) <= input_tokens)
 
 
 def provider_usage_from_payload(
@@ -1066,16 +1185,24 @@ def provider_usage_from_payload(
     usage = data.get("usage") if isinstance(data, dict) else None
     if not isinstance(usage, dict):
         return None
-    input_tokens = _usage_int(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
+    provider = provider_for_base_url(base_url)
+    reported_cost = _usage_float(usage.get("cost")) if provider == "openrouter" else None
+    valid_totals = _valid_provider_token_totals(usage)
+    if not valid_totals and reported_cost is None:
+        return None
+    # An authoritative provider charge can exist without token totals. Keep
+    # that monetary evidence while explicitly flagging unavailable counters.
+    token_usage = usage if valid_totals else {}
+    input_tokens = _usage_int(token_usage.get("prompt_tokens", token_usage.get("input_tokens", 0)))
     output_tokens = _usage_int(
-        usage.get("completion_tokens", usage.get("output_tokens", 0))
+        token_usage.get("completion_tokens", token_usage.get("output_tokens", 0))
     )
 
     detail_records = [
         detail
         for detail in (
-            usage.get("prompt_tokens_details"),
-            usage.get("input_tokens_details"),
+            token_usage.get("prompt_tokens_details"),
+            token_usage.get("input_tokens_details"),
         )
         if isinstance(detail, dict)
     ]
@@ -1084,11 +1211,11 @@ def provider_usage_from_payload(
         default=0,
     )
     if cached <= 0:
-        cached = _usage_int(usage.get("prompt_cache_hit_tokens", 0))
+        cached = _usage_int(token_usage.get("prompt_cache_hit_tokens", 0))
     if cached <= 0:
-        cached = _usage_int(usage.get("cache_read_input_tokens", 0))
+        cached = _usage_int(token_usage.get("cache_read_input_tokens", 0))
     if cached <= 0:
-        cached = _usage_int(usage.get("cached_prompt_tokens", 0))
+        cached = _usage_int(token_usage.get("cached_prompt_tokens", 0))
     cached = min(cached, input_tokens)
 
     cache_write_tokens = max(
@@ -1099,53 +1226,62 @@ def provider_usage_from_payload(
         default=0,
     )
     if cache_write_tokens <= 0:
-        cache_write_tokens = _usage_int(usage.get("cache_write_input_tokens", 0))
+        cache_write_tokens = _usage_int(token_usage.get("cache_write_input_tokens", 0))
     cache_write_tokens = min(
         cache_write_tokens,
         max(0, input_tokens - cached),
     )
 
-    miss_tokens = _usage_int(usage.get("prompt_cache_miss_tokens", 0))
+    miss_tokens = _usage_int(token_usage.get("prompt_cache_miss_tokens", 0))
     if miss_tokens <= 0:
         miss_tokens = max(0, input_tokens - cached)
 
-    reasoning_tokens = _usage_int(usage.get("reasoning_tokens", 0))
-    completion_details = usage.get("completion_tokens_details")
+    reasoning_tokens = _usage_int(token_usage.get("reasoning_tokens", 0))
+    completion_details = token_usage.get("completion_tokens_details")
     if isinstance(completion_details, dict):
         reasoning_tokens = max(
             reasoning_tokens,
             _usage_int(completion_details.get("reasoning_tokens", 0)),
         )
-    output_details = usage.get("output_tokens_details")
+    output_details = token_usage.get("output_tokens_details")
     if isinstance(output_details, dict):
         reasoning_tokens = max(
             reasoning_tokens,
             _usage_int(output_details.get("reasoning_tokens", 0)),
         )
-    provider = provider_for_base_url(base_url)
-    reported_cost = None
     reported_cost_source = ""
     reported_cost_unit = ""
     if provider == "openrouter":
-        reported_cost = _usage_float(usage.get("cost"))
         if reported_cost is not None:
             reported_cost_source = "openrouter_usage.cost"
             reported_cost_unit = "openrouter_credits"
-    has_token_totals = any(
-        key in usage
-        for key in (
-            "prompt_tokens",
-            "input_tokens",
-            "completion_tokens",
-            "output_tokens",
-        )
-    )
-    if not has_token_totals and reported_cost is None:
-        return None
     if isinstance(data, dict):
         response_model = str(data.get("model") or model or "")
     else:
         response_model = str(model or "")
+
+    raw_service_tier = data.get("service_tier")
+    if raw_service_tier is not None and not isinstance(raw_service_tier, str):
+        return None
+    service_tier = raw_service_tier or ""
+    provider_created_at = _usage_float(data.get("created_at", data.get("created")))
+    valuation_date = None
+    if provider_created_at is not None:
+        try:
+            valuation_date = datetime.fromtimestamp(provider_created_at, timezone.utc).date()
+        except (OverflowError, OSError, ValueError):
+            provider_created_at = None
+    policy = quote_model_pricing(
+        base_url, response_model, input_tokens=input_tokens,
+        service_tier=service_tier, at_date=valuation_date,
+    )
+    assumptions = list(policy["assumptions"])
+    if provider_created_at is None:
+        assumptions.append("valuation_date_from_observation")
+    source = "published_rates" if policy["pricing_known"] else "unknown"
+    if reported_cost is not None:
+        source = "provider_reported"
+        assumptions = [] if valid_totals else ["provider_token_totals_unavailable"]
 
     return ProviderUsageRecord(
         model=response_model,
@@ -1167,6 +1303,12 @@ def provider_usage_from_payload(
         temperature_source=str(temperature_source or ""),
         temperature_provider_dropped=bool(temperature_provider_dropped),
         temperature_provider_drop_reason=str(temperature_provider_drop_reason or ""),
+        service_tier=service_tier,
+        provider_response_id=str(data.get("id") or ""),
+        provider_created_at=provider_created_at,
+        pricing_policy=policy,
+        cost_valuation_source=source,
+        cost_valuation_assumptions=tuple(assumptions),
     )
 
 
@@ -1521,15 +1663,38 @@ def _reservation_attempt_multipliers(
     return [multiplier for _ in range(max(0, int(target_count or 0)))]
 
 
+def valuation_metadata_for_record(
+    record: ProviderUsageRecord,
+) -> tuple[Dict[str, Any], str, tuple[str, ...]]:
+    """Read pinned evidence, or explicitly label a legacy current-rate quote."""
+    if record.pricing_policy:
+        return record.pricing_policy, record.cost_valuation_source, tuple(record.cost_valuation_assumptions)
+    policy = quote_model_pricing(
+        record.base_url, record.model, input_tokens=record.input_tokens,
+        service_tier=record.service_tier,
+    )
+    if record.reported_cost_usd is not None and provider_for_base_url(record.base_url) == "openrouter":
+        return policy, "provider_reported", ()
+    return (
+        policy,
+        "published_rates" if policy["pricing_known"] else "unknown",
+        (*policy["assumptions"], "legacy_receipt_current_rate_quote"),
+    )
+
+
 def cost_for_record(record: ProviderUsageRecord) -> tuple[float, bool]:
     if (
         record.reported_cost_usd is not None
         and provider_for_base_url(record.base_url) == "openrouter"
     ):
-        return float(record.reported_cost_usd), True
-    cost = compute_model_cost_usd(
-        record.base_url,
-        record.model,
+        cost = _usage_float(record.reported_cost_usd)
+        return (cost, True) if cost is not None else (0.0, False)
+    policy, _, _ = valuation_metadata_for_record(record)
+    if (policy.get("model") != record.model
+            or policy.get("provider") != (provider_for_base_url(record.base_url) or "")):
+        return 0.0, False
+    cost = compute_quoted_cost_usd(
+        policy,
         input_tokens=record.input_tokens,
         output_tokens=record.output_tokens,
         cached_input_tokens=record.cached_input_tokens,
@@ -1560,7 +1725,7 @@ class CostBudgetController:
         event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
         durable_event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
-        self.max_cost_usd = max(0.0, float(max_cost_usd or 0.0))
+        self.max_cost_usd = require_cost_budget_usd(max_cost_usd)
         self.reserve_output_tokens = max(0, int(reserve_output_tokens or 0))
         self.event_sink = event_sink
         self.durable_event_sink = durable_event_sink
@@ -1570,6 +1735,7 @@ class CostBudgetController:
         self._durable_write_failed = False
         self._active_reservation_records: Dict[str, CostReservation] = {}
         self._inflight_dispatch_intents: Dict[str, Dict[str, Any]] = {}
+        self._pending_dispatch_retirements: Dict[tuple[str, str], Dict[str, Any]] = {}
         self._restored_request_ids: set[str] = set()
         self._replayed_journal_hashes: Dict[int, str] = {}
         self._generation_recovery_pending = False
@@ -1588,6 +1754,8 @@ class CostBudgetController:
         self._events = 0
         self._usage_missing_events = 0
         self._pricing_unknown_events = 0
+        self._cost_valuation_sources: set[str] = set()
+        self._cost_valuation_assumptions: set[str] = set()
         self._cancelled_provider_inflight_events = 0
         self._cancelled_provider_inflight_estimated_cost_usd = 0.0
         self._cancelled_provider_inflight_reservations: set[str] = set()
@@ -1643,6 +1811,7 @@ class CostBudgetController:
         """Capture the complete ledger under its shared accounting lock."""
 
         async with self._lock:
+            await self._flush_dispatch_retirements_locked()
             return self._execution_record_locked()
 
     @classmethod
@@ -1783,9 +1952,11 @@ class CostBudgetController:
         if set(patch) != {"values", "entries", "membership"}:
             raise ValueError("cost accounting patch fields do not match the schema")
         values = _cost_record_mapping(patch["values"], label="cost patch values")
+        _restore_legacy_cost_valuation_fields(values)
         expected_values = set(_COST_LEDGER_FLOAT_FIELDS + _COST_LEDGER_COUNT_FIELDS) | {
             "_terminal_reason", "_final_accounting_frozen", "_role_totals",
             "_unpriced_provider_exposure_receipts", "_unpriced_provider_exposure_opaque",
+            "_cost_valuation_sources", "_cost_valuation_assumptions",
         }
         if set(values) != expected_values:
             raise ValueError("cost patch value fields do not match the schema")
@@ -1820,6 +1991,7 @@ class CostBudgetController:
 
     def _restore_accounting_state(self, record: Any) -> None:
         state = _cost_record_mapping(record, label="cost ledger state")
+        _restore_legacy_cost_valuation_fields(state)
         fields = set(
             _COST_LEDGER_FLOAT_FIELDS + _COST_LEDGER_COUNT_FIELDS
             + _COST_LEDGER_RESERVATION_MAP_FIELDS + _COST_LEDGER_SET_FIELDS
@@ -1870,6 +2042,8 @@ class CostBudgetController:
         }
         values["_unpriced_provider_exposure_receipts"] = sorted(self._unpriced_provider_exposure_receipts)
         values["_unpriced_provider_exposure_opaque"] = dict(self._unpriced_provider_exposure_opaque)
+        values["_cost_valuation_sources"] = sorted(self._cost_valuation_sources)
+        values["_cost_valuation_assumptions"] = sorted(self._cost_valuation_assumptions)
         entries = {
             name: {reservation_id: getattr(self, name).get(reservation_id)}
             for name in _COST_LEDGER_RESERVATION_MAP_FIELDS
@@ -1921,6 +2095,7 @@ class CostBudgetController:
         self, reservation: CostReservation, details: Mapping[str, Any],
     ) -> None:
         async with self._lock:
+            await self._flush_dispatch_retirements_locked()
             if self._generation_recovery_active:
                 raise OSError("cost ledger generation recovery is incomplete")
             if self._durable_write_failed:
@@ -1931,6 +2106,54 @@ class CostBudgetController:
             await self._write_durable_event_locked(
                 "dispatch_intent", reservation_id=reservation.reservation_id, details=intent,
             )
+
+    def _queue_authenticated_dispatch_retirement(
+        self, reservation_id: str, receipt: Mapping[str, Any],
+    ) -> None:
+        """Stage an already authenticated synchronous no-generation receipt."""
+
+        authorization_id = str(receipt.get("dispatch_authorization_id") or "")
+        intent = self._inflight_dispatch_intents.get(reservation_id, {}).get(authorization_id)
+        if not authorization_id or intent is None:
+            return
+        for name in ("target_id", "dispatch_ordinal", "estimated_dispatch_cost_usd"):
+            if receipt.get(name) != intent.get(name):
+                raise ValueError("provider retirement does not match its authorized dispatch")
+        self._pending_dispatch_retirements[(reservation_id, authorization_id)] = (
+            _cost_record_mapping(receipt, label="authenticated provider rejection")
+        )
+
+    async def _flush_dispatch_retirements_locked(self) -> None:
+        """Persist terminal receipts before another dispatch or snapshot."""
+
+        while self._pending_dispatch_retirements:
+            if self._durable_write_failed:
+                raise OSError("cost durable journal is unavailable after a failed write")
+            key = next(iter(self._pending_dispatch_retirements))
+            reservation_id, authorization_id = key
+            receipt = self._pending_dispatch_retirements[key]
+            intents = self._inflight_dispatch_intents.get(reservation_id, {})
+            intent = intents.pop(authorization_id, None)
+            if intent is None:
+                self._pending_dispatch_retirements.pop(key, None)
+                continue
+            if not intents:
+                self._inflight_dispatch_intents.pop(reservation_id, None)
+            try:
+                await self._write_durable_event_locked(
+                    "accounting_transition", reservation_id=reservation_id,
+                    details={"status": "pre_generation_dispatch_retired", "receipt": receipt},
+                )
+            except BaseException:
+                # A lost acknowledgement may have committed the deletion.
+                # Retain the conservative intent in this fenced object; only
+                # validated recovery may apply the actual journal suffix.
+                self._inflight_dispatch_intents.setdefault(reservation_id, {})[
+                    authorization_id
+                ] = intent
+                self._pending_dispatch_retirements.pop(key, None)
+                raise
+            self._pending_dispatch_retirements.pop(key, None)
 
     async def recover_interrupted_requests(self) -> None:
         """Settle only restored unfinished calls, retaining unknown exposure."""
@@ -3772,6 +3995,7 @@ class CostBudgetController:
         )
 
         async with self._lock:
+            await self._flush_dispatch_retirements_locked()
             if self._final_accounting_frozen:
                 return
             if self._durable_write_failed:
@@ -4085,6 +4309,15 @@ class CostBudgetController:
             self._prompt_cache_miss_tokens += miss_tokens
             self._reasoning_output_tokens += reasoning_tokens
             self._exact_cost_usd += exact_cost
+            for detail in observation_details:
+                self._cost_valuation_sources.add(
+                    str(detail.get("cost_valuation_source") or "unspecified")
+                )
+                assumptions = detail.get("cost_valuation_assumptions", ())
+                if isinstance(assumptions, (list, tuple)):
+                    self._cost_valuation_assumptions.update(
+                        value for value in assumptions if isinstance(value, str) and value
+                    )
             self._unknown_cost_usd = max(
                 0.0,
                 self._unknown_cost_usd + unknown_cost - unknown_reversed,
@@ -4720,6 +4953,9 @@ class CostBudgetController:
                         "status_code": clean_details.get("status_code", 0),
                         "reason": clean_details.get("reason", ""),
                     }
+                    self._queue_authenticated_dispatch_retirement(
+                        reservation.reservation_id, rejection_details,
+                    )
                     counted_dispatch_authorization_ids.remove(authorization_id)
                     dispatch_authorization_lease_receipt_ids.pop(
                         authorization_id,
@@ -5307,6 +5543,7 @@ class CostBudgetController:
             )
             payload.update(
                 {
+                    **self._valuation_summary(),
                     "llm_observed_usage_cost_usd": float(self._exact_cost_usd),
                     "llm_conservative_unknown_exposure_usd": unknown_exposure,
                     "llm_unpriced_provider_exposure_count": (
@@ -5333,6 +5570,13 @@ class CostBudgetController:
             return False
         return True
 
+    def _valuation_summary(self) -> Dict[str, Any]:
+        sources = sorted(self._cost_valuation_sources)
+        return {
+            "cost_valuation_source": sources[0] if len(sources) == 1 else "mixed" if sources else "unknown",
+            "cost_valuation_assumptions": sorted(self._cost_valuation_assumptions),
+        }
+
     def summary(self) -> Dict[str, Any]:
         unknown_exposure = float(self._unknown_cost_usd)
         unpriced_exposure_count = self._unpriced_provider_exposure_count()
@@ -5341,6 +5585,7 @@ class CostBudgetController:
             quantified_unknown or unpriced_exposure_count > 0
         )
         summary: Dict[str, Any] = {
+            **self._valuation_summary(),
             "input_tokens": int(self._input_tokens),
             "output_tokens": int(self._output_tokens),
             "cached_input_tokens": int(self._cached_input_tokens),
@@ -5738,12 +5983,15 @@ def usage_totals_from_clients(
         "cached_input_tokens": 0,
         "cache_write_tokens": 0,
         "prompt_cache_miss_tokens": 0,
+        "reasoning_output_tokens": 0,
         "usage_missing_responses": 0,
         "unpriced_response_count": 0,
         "llm_unpriced_provider_exposure_count": 0,
         "cost_accounting_incomplete": False,
         "cost_usd": 0.0,
     }
+    valuation_sources: set[str] = set()
+    valuation_assumptions: set[str] = set()
     for role, client in role_clients:
         if client is None:
             continue
@@ -5755,6 +6003,10 @@ def usage_totals_from_clients(
         cached_tokens = int(usage.get("cached_input_tokens", 0) or 0)
         cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
         miss_tokens = int(usage.get("prompt_cache_miss_tokens", 0) or 0)
+        reasoning_tokens = int(usage.get("reasoning_output_tokens", 0) or 0)
+        valuation_source = str(usage.get("cost_valuation_source") or "unspecified")
+        assumptions = list(usage.get("cost_valuation_assumptions") or ())
+        valuation_incomplete = bool(usage.get("cost_accounting_incomplete", False))
         missing_responses = max(
             0,
             int(usage.get("usage_missing_responses", 0) or 0),
@@ -5800,9 +6052,10 @@ def usage_totals_from_clients(
             fallback_input_tokens = input_tokens
             fallback_output_tokens = output_tokens
             fallback_cached_tokens = cached_tokens
-            pricing = lookup_known_token_pricing(base_url, model)
+            policy = quote_model_pricing(base_url, model, input_tokens=0)
+            pricing = policy["pricing_known"]
             unpriced_activity_incomplete = bool(
-                pricing is None
+                not pricing
                 and (
                     fallback_input_tokens > 0
                     or fallback_output_tokens > 0
@@ -5810,19 +6063,30 @@ def usage_totals_from_clients(
                 )
             )
             cost = (
-                compute_cost_usd(
-                    fallback_input_tokens,
-                    fallback_output_tokens,
-                    fallback_cached_tokens,
-                    pricing,
+                compute_quoted_cost_usd(
+                    policy,
+                    input_tokens=fallback_input_tokens,
+                    output_tokens=fallback_output_tokens,
+                    cached_input_tokens=fallback_cached_tokens,
+                    cache_write_tokens=cache_write_tokens,
                 )
-                if pricing is not None
+                if pricing
                 else 0.0
             )
             cost = max(
                 float(cost or 0.0),
                 float(reported_aggregate_cost or 0.0),
             )
+            valuation_source = "legacy_aggregate"
+            assumptions.extend(policy["assumptions"])
+            assumptions.extend((
+                "legacy_aggregate_current_rate_quote",
+                "aggregate_request_boundaries_unavailable",
+            ))
+            # Aggregate totals cannot establish request-specific context tiers,
+            # routed response models, or actual service tier. The short-context
+            # quote is an estimate; it does not become invoice authority.
+            valuation_incomplete = bool(input_tokens or output_tokens)
         # Older clients exposed only token partitions. Preserve compatibility
         # while ensuring an unknown-cost provider occurrence remains explicit
         # even when its token counters happen to be zero.
@@ -5835,6 +6099,9 @@ def usage_totals_from_clients(
         totals[f"{prefix}_cached_input_tokens"] = cached_tokens
         totals[f"{prefix}_cache_write_tokens"] = cache_write_tokens
         totals[f"{prefix}_prompt_cache_miss_tokens"] = miss_tokens
+        totals[f"{prefix}_reasoning_output_tokens"] = reasoning_tokens
+        totals[f"{prefix}_cost_valuation_source"] = valuation_source
+        totals[f"{prefix}_cost_valuation_assumptions"] = sorted(set(assumptions))
         totals[f"{prefix}_usage_missing_responses"] = missing_responses
         totals[f"{prefix}_unpriced_response_count"] = unpriced_responses
         totals[f"{prefix}_unpriced_provider_exposure_count"] = (
@@ -5847,14 +6114,23 @@ def usage_totals_from_clients(
         totals["cached_input_tokens"] += cached_tokens
         totals["cache_write_tokens"] += cache_write_tokens
         totals["prompt_cache_miss_tokens"] += miss_tokens
+        totals["reasoning_output_tokens"] += reasoning_tokens
+        valuation_sources.add(valuation_source)
+        valuation_assumptions.update(assumptions)
         totals["usage_missing_responses"] += missing_responses
         totals["unpriced_response_count"] += unpriced_responses
         totals["llm_unpriced_provider_exposure_count"] += provider_exposure_count
         totals["cost_accounting_incomplete"] = bool(
             totals["cost_accounting_incomplete"]
             or provider_exposure_count > 0
+            or valuation_incomplete
         )
         totals["cost_usd"] += cost
+    totals["cost_valuation_source"] = (
+        next(iter(valuation_sources)) if len(valuation_sources) == 1
+        else "mixed" if valuation_sources else "unspecified"
+    )
+    totals["cost_valuation_assumptions"] = sorted(valuation_assumptions)
     # The fallback replaces a zero-event controller ledger at finalization.
     # Publish the whole authority bundle together so watchdog recovery and
     # downstream consumers never combine client totals with stale controller

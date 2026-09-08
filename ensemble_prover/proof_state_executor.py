@@ -6276,18 +6276,12 @@ async def _try_proof_state_decl_closure(
                         "proof_stub": "",
                         "error_kind": "enclosing_deadline_deferred",
                         "deferred_before_launch": True,
+                        "all_operations_deferred_before_launch": True,
                     }
                 )
             break
         is_context_replay = decl_name in context_replay_names
-        if is_context_replay:
-            node.decl_application_last_context_replay_turn = int(turn)
-        record_dossier_lean_attempt_event(
-            dossier,
-            lane="proof_state_decl_application",
-            event="started",
-            attempt={"decl_name": decl_name, "index": index},
-        )
+        declaration_operation_started = False
         full_portfolio_probe = _decl_application_already_retried(decl_name)
         decl_probe_events: List[Dict[str, Any]] = []
 
@@ -6391,6 +6385,16 @@ async def _try_proof_state_decl_closure(
             }
 
         async def run_decl_application() -> Any:
+            nonlocal declaration_operation_started
+            declaration_operation_started = True
+            if is_context_replay:
+                node.decl_application_last_context_replay_turn = int(turn)
+            record_dossier_lean_attempt_event(
+                dossier,
+                lane="proof_state_decl_application",
+                event="started",
+                attempt={"decl_name": decl_name, "index": index},
+            )
             apply_decl = lean.apply_decl_to_goal
             try:
                 apply_decl_parameters = inspect.signature(apply_decl).parameters
@@ -6437,22 +6441,43 @@ async def _try_proof_state_decl_closure(
             )
         except asyncio.CancelledError:
             telemetry = decl_probe_telemetry()
-            record_dossier_lean_attempt_event(
-                dossier,
-                lane="proof_state_decl_application",
-                event="finished",
-                attempt={
-                    "ok": False,
-                    "decl_name": decl_name,
-                    "index": index,
-                    "error_type": "cancelled",
-                    "exception": "CancelledError",
-                    "cancelled": True,
-                    **telemetry,
-                },
-            )
+            if declaration_operation_started:
+                record_dossier_lean_attempt_event(
+                    dossier,
+                    lane="proof_state_decl_application",
+                    event="finished",
+                    attempt={
+                        "ok": False,
+                        "decl_name": decl_name,
+                        "index": index,
+                        "error_type": "cancelled",
+                        "exception": "CancelledError",
+                        "cancelled": True,
+                        **telemetry,
+                    },
+                )
             raise
         except _LeanOperationDeadline as exc:
+            if not declaration_operation_started:
+                # Admission did not invoke the declaration adapter. Preserve
+                # both its retry and proof-attempt budgets; the legacy defer
+                # flag also describes later acceptance and is not authority
+                # for whether this whole declaration attempt began.
+                attempts.append({
+                    "decl_name": decl_name,
+                    "applicable": False,
+                    "closed": False,
+                    "remaining_goal_count": 0,
+                    "proof_stub": "",
+                    "error_kind": "lean_admission_deferred",
+                    "deferred_before_launch": True,
+                    "all_operations_deferred_before_launch": True,
+                    "retryable_failure": True,
+                    "retry_exhausted": False,
+                    "context_replay": is_context_replay,
+                    **decl_probe_telemetry(),
+                })
+                break
             result = {
                 "decl_name": decl_name,
                 "applicable": False,
@@ -6474,24 +6499,25 @@ async def _try_proof_state_decl_closure(
             }
         # A Lean adapter may ignore its timeout or suppress cancellation.
         telemetry = decl_probe_telemetry()
-        record_dossier_lean_attempt_event(
-            dossier,
-            lane="proof_state_decl_application",
-            event="finished",
-            attempt={
-                "ok": bool(result.get("applicable", False)),
-                "decl_name": decl_name,
-                "index": index,
-                "error_type": str(result.get("error_kind", "") or ""),
-                "diagnostic": str(result.get("error", "") or ""),
-                "exception": (
-                    str(result.get("error_kind", "") or "")
-                    if str(result.get("error_kind", "") or "").endswith("Error")
-                    else ""
-                ),
-                **telemetry,
-            },
-        )
+        if declaration_operation_started:
+            record_dossier_lean_attempt_event(
+                dossier,
+                lane="proof_state_decl_application",
+                event="finished",
+                attempt={
+                    "ok": bool(result.get("applicable", False)),
+                    "decl_name": decl_name,
+                    "index": index,
+                    "error_type": str(result.get("error_kind", "") or ""),
+                    "diagnostic": str(result.get("error", "") or ""),
+                    "exception": (
+                        str(result.get("error_kind", "") or "")
+                        if str(result.get("error_kind", "") or "").endswith("Error")
+                        else ""
+                    ),
+                    **telemetry,
+                },
+            )
 
         applicable = bool(result.get("applicable", False))
         proof_stub = str(result.get("proof_stub", "") or "").strip()
@@ -6561,6 +6587,7 @@ async def _try_proof_state_decl_closure(
             "retryable_failure": retryable_failure,
             "retry_exhausted": already_retried_decl_application,
             "context_replay": is_context_replay,
+            "all_operations_deferred_before_launch": False,
             **telemetry,
         }
         definitive_kind = str(ping_error_kind or error_kind).strip().lower()
@@ -6827,6 +6854,13 @@ async def _try_proof_state_decl_closure(
             _mark_decl_application_tried(decl_name)
 
     if attempts:
+        launched_attempt_count = sum(
+            attempt.get("all_operations_deferred_before_launch") is not True
+            for attempt in attempts
+        )
+        if not launched_attempt_count:
+            node.blocker = str(attempts[-1].get("error_kind") or "lean_admission_deferred")
+            return "", attempts
         spawned_child_nodes = [
             child_id
             for attempt in attempts
@@ -6837,7 +6871,7 @@ async def _try_proof_state_decl_closure(
             decl_application_signature = _decl_application_record_signature()
             if str(decl_application_signature or "").strip():
                 node.decl_application_signature = decl_application_signature
-            attempt_count = max(0, int(len(attempts) or 0))
+            attempt_count = launched_attempt_count
             node.decl_application_attempts += attempt_count
             node.close_attempts += attempt_count
             node.action = "assemble_from_children"
@@ -6865,7 +6899,7 @@ async def _try_proof_state_decl_closure(
         proof_state.record_decl_application_result(
             node_id=node.node_id,
             ok=False,
-            attempt_count=len(attempts),
+            attempt_count=launched_attempt_count,
             exit_reason=reason,
             decl_application_signature=_decl_application_record_signature(),
         )
@@ -11532,6 +11566,7 @@ async def _try_proof_state_one_child_closure(
                     else "tactic_budget_disabled"
                 ),
                 "deferred_before_launch": deadline_deferred,
+                "all_operations_deferred_before_launch": True,
                 "verdict": (
                     "child_operation_deferred"
                     if deadline_deferred
@@ -11654,6 +11689,11 @@ async def _try_proof_state_one_child_closure(
                     "target": node.target,
                     "helper_name": decl_helper_name,
                     "decl_attempts": decl_attempts[:10],
+                    "all_operations_deferred_before_launch": all(
+                        isinstance(attempt, Mapping)
+                        and attempt.get("all_operations_deferred_before_launch") is True
+                        for attempt in decl_attempts
+                    ),
                     "verdict": (
                         "helper_accepted" if decl_helper_name else "decl_rejected"
                     ),
@@ -11668,6 +11708,11 @@ async def _try_proof_state_one_child_closure(
         # Preserve this exact tactic item for one retry.  The recorded transient
         # context causes the next invocation to bypass the failed advisory gate
         # and proceed to Lean-validated tactic search.
+        falsification_record["all_operations_deferred_before_launch"] = not any(
+            record.get("phase") != "proof_state_child_falsification"
+            and record.get("all_operations_deferred_before_launch") is not True
+            for record in records
+        )
         return accepted_helpers, records
 
     if int(max_candidates or 0) <= 0 or _remaining_timeout(timeout_s) <= 0.0:
@@ -11699,6 +11744,11 @@ async def _try_proof_state_one_child_closure(
                     else "tactic_budget_disabled"
                 ),
                 "deferred_before_launch": deadline_deferred,
+                "all_operations_deferred_before_launch": not any(
+                    record.get("phase") != "proof_state_child_falsification"
+                    and record.get("all_operations_deferred_before_launch") is not True
+                    for record in records
+                ),
                 "verdict": (
                     "child_operation_deferred"
                     if deadline_deferred
@@ -11775,6 +11825,12 @@ async def _try_proof_state_one_child_closure(
         )
         return accepted_helpers, records
     tactic_started = time.monotonic()
+    prior_proving_records = any(
+        record.get("phase") != "proof_state_child_falsification"
+        and record.get("all_operations_deferred_before_launch") is not True
+        for record in records
+    )
+    tactic_operation_started = False
     suppressed_proofs: Set[str] = set()
     aggregate_attempts: List[Dict[str, Any]] = []
     aggregate_candidate_count = 0
@@ -11794,11 +11850,15 @@ async def _try_proof_state_one_child_closure(
     for _veto_loop in range(max(1, int(max_candidates or 1))):
         operation_timeout = _remaining_timeout(timeout_s)
         if operation_timeout <= 0.0:
-            final_exit_reason = "timeout"
+            final_exit_reason = (
+                "timeout" if tactic_operation_started else "lean_admission_deferred"
+            )
             break
         operation_pattern_cache = copy.deepcopy(tactic_pattern_cache)
 
         async def run_child_tactic() -> Any:
+            nonlocal tactic_operation_started
+            tactic_operation_started = True
             return await try_close_with_tactics(
                 lean,
                 node.target,
@@ -11842,7 +11902,9 @@ async def _try_proof_state_one_child_closure(
                 operation_label="proof_state_child_tactic",
             )
         except _LeanOperationDeadline:
-            final_exit_reason = "timeout"
+            final_exit_reason = (
+                "timeout" if tactic_operation_started else "lean_admission_deferred"
+            )
             break
         tactic_pattern_cache = operation_pattern_cache
         setattr(proof_state, "_tactic_pattern_cache", tactic_pattern_cache)
@@ -12069,6 +12131,7 @@ async def _try_proof_state_one_child_closure(
             normalized_formal_config = None
     if (
         not helper_name
+        and final_exit_reason != "lean_admission_deferred"
         and normalized_formal_config is not None
         and bool(getattr(normalized_formal_config, "enabled", False))
         and formal_search_client is not None
@@ -12456,6 +12519,7 @@ async def _try_proof_state_one_child_closure(
         and (
             final_exit_reason == "acceptance_retryable_error"
             or final_exit_reason == "pending_helper_acceptance_owned"
+            or final_exit_reason == "lean_admission_deferred"
             or tactic_residual_deferred
             or (timeout_outcome and not timeout_retry_exhausted)
         )
@@ -12524,13 +12588,22 @@ async def _try_proof_state_one_child_closure(
             "tactic_exit_reason": final_exit_reason,
             "tactic_pattern_cache": dict(getattr(result, "cache_metadata", {}) or {}),
             "retryable_timeout": retryable_tactic_outcome,
+            "retryable_infrastructure": final_exit_reason == "lean_admission_deferred",
+            "deferred_before_launch": final_exit_reason == "lean_admission_deferred",
+            "all_operations_deferred_before_launch": bool(
+                final_exit_reason == "lean_admission_deferred"
+                and not tactic_operation_started
+                and not prior_proving_records
+            ),
             "residual_attestation_deferred": tactic_residual_deferred,
             "retry_exhausted": timeout_retry_exhausted,
             "verdict": (
                 "helper_accepted"
                 if helper_name
                 else (
-                    "tactic_residual_attestation_deferred"
+                    "child_operation_deferred"
+                    if final_exit_reason == "lean_admission_deferred"
+                    else "tactic_residual_attestation_deferred"
                     if tactic_residual_deferred
                     else (
                         "tactic_retryable_timeout"
@@ -12595,6 +12668,21 @@ async def _try_proof_state_child_closures(
     def _update_status(records: Sequence[Mapping[str, Any]]) -> None:
         if status_out is None:
             return
+        if records:
+            # Advisory falsification is not a proving attempt. A batch is
+            # deferred only if every proving record says no operation began.
+            all_deferred = any(
+                record.get("all_operations_deferred_before_launch") is True
+                for record in records
+            ) and all(
+                record.get("phase") == "proof_state_child_falsification"
+                or record.get("all_operations_deferred_before_launch") is True
+                for record in records
+            )
+            status_out["all_operations_deferred_before_launch"] = bool(
+                status_out.get("all_operations_deferred_before_launch", True)
+                and all_deferred
+            )
         deferred = any(
             bool(record.get("deadline_deferred"))
             or bool(record.get("deferred_before_launch"))
@@ -12927,10 +13015,25 @@ async def _try_proof_state_child_closures(
             payload={"current_context_key": current_key},
         )
 
-    work_items = proof_state.work_frontier(
-        max_items=max(8, int(max_nodes or 0) * 4),
-        graph=getattr(dossier, "proof_graph", None),
-    )
+    frontier_limit = max(8, int(max_nodes or 0) * 4)
+    while True:
+        work_items = proof_state.work_frontier(
+            max_items=frontier_limit,
+            graph=getattr(dossier, "proof_graph", None),
+        )
+        if (
+            not targeted_child_work
+            or int(max_nodes or 0) <= 0
+            or len(work_items) < frontier_limit
+            or target_ids.issubset({
+                item.node_id for item in work_items
+                if not target_types or item.work_type in target_types
+            })
+        ):
+            break
+        # The scheduler's selected identity may be beyond the ordinary batch
+        # prefix. Widen lookup before filtering; max_nodes still caps dispatch.
+        frontier_limit *= 2
     decomposition_records: List[Dict[str, Any]] = []
     if not targeted_child_work:
         for item in work_items:
@@ -12968,6 +13071,8 @@ async def _try_proof_state_child_closures(
     node_ids: List[str] = []
     selected_work_type_by_node: Dict[str, str] = {}
     for item in work_items:
+        if len(node_ids) >= max(0, int(max_nodes or 0)):
+            break
         if item.work_type not in {
             "decl_probe",
             "tactic_swarm",
@@ -12998,6 +13103,13 @@ async def _try_proof_state_child_closures(
             state_ok, state_proof = await _run_root_exact_checkpoint()
             if state_ok and state_proof:
                 return True, state_proof, accepted_helpers
+        if targeted_child_work and not accepted_helpers and status_out is not None:
+            status_out["selected_work_not_executed"] = (
+                "child_node_capacity_disabled"
+                if int(max_nodes or 0) <= 0
+                else "selected_child_work_no_longer_eligible"
+            )
+            status_out.setdefault("all_operations_deferred_before_launch", True)
         return False, None, accepted_helpers
 
     requested_parallelism = max(1, int(batch_parallelism or 1))
@@ -13132,10 +13244,15 @@ async def _try_proof_state_child_closures(
             if status_out is not None:
                 status_out["deadline_deferred"] = True
                 status_out["deferred_node_id"] = node.node_id
+                if not results:
+                    status_out.setdefault("all_operations_deferred_before_launch", True)
             break
         results.append(await _run_safe(node))
 
     for helper_names, records in results:
+        if status_out is not None and not records:
+            # Missing operation receipts cannot establish that nothing ran.
+            status_out["all_operations_deferred_before_launch"] = False
         _update_status(records)
         _extend_accepted_helpers(helper_names)
         if recorder is not None:

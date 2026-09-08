@@ -22,6 +22,7 @@ from ensemble_prover.proof_dossier import (
 )
 from ensemble_prover.helper_quality import verified_helper_admission_quality
 from ensemble_prover.llm_error_policy import (
+    ProviderAccountUnavailable,
     is_terminal_llm_failure_reason,
     llm_failure_scope,
     planner_failure_is_transport_empty,
@@ -992,6 +993,7 @@ class RecursiveControllerAction:
             recursive_helper_budget=0,
             recursion_depth=int(getattr(session, "recursion_depth", 0) or 0),
             progress_callback=checkpoint_recursive_driver,
+            provider_account_pause_enabled=getattr(session, "checkpoint_registry", None) is not None,
             verified_helper_accept_callback=getattr(
                 session,
                 "theory_verified_helper_accept_callback",
@@ -1107,7 +1109,7 @@ class RecursiveControllerAction:
                     "recursive_pass_quantum_yield": True,
                 },
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, ProviderAccountUnavailable):
             # Cancellation is a pause/interruption, not a completed
             # allocation.  Preserve the live reservation so an in-process
             # resume has the same recovery semantics as a process restart.

@@ -14,9 +14,11 @@ import math
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ..state_data import clone_json_value
+from ..llm_error_policy import classify_llm_exception, is_provider_account_failure
+from ..tactic_attempt_telemetry import MONOTONIC_LEAN_ATTEMPT_METRICS
 
 _MANIFEST = "attempt_checkpoint.json"
 _SCHEMA = 1
@@ -43,6 +45,19 @@ def _write(path: Path, value: dict[str, Any]) -> None:
     write_checkpoint_record(path, value)
 
 
+def _validated_execution_audit(value: Any, sessions: dict[str, Any]) -> dict[str, dict[str, int]]:
+    """Observability only: no proof, budget, or scheduling keys are allowed."""
+    if type(value) is not dict:
+        raise ValueError("Invalid checkpoint execution audit")
+    for lane, metrics in value.items():
+        if type(lane) is not str or lane not in sessions or type(metrics) is not dict:
+            raise ValueError("Invalid checkpoint execution audit lane")
+        if any(key not in MONOTONIC_LEAN_ATTEMPT_METRICS
+               or type(amount) is not int or amount < 0 for key, amount in metrics.items()):
+            raise ValueError("Invalid checkpoint execution audit metric")
+    return _json(value)
+
+
 def _worker_clock_receipt(record: dict[str, Any]) -> tuple[float, float, bool]:
     elapsed = record.get("worker_active_elapsed_s")
     observed = record.get("worker_observed_epoch_s")
@@ -52,6 +67,28 @@ def _worker_clock_receipt(record: dict[str, Any]) -> tuple[float, float, bool]:
             or type(completed) is not bool):
         raise ValueError("Invalid cumulative worker clock receipt")
     return float(elapsed), float(observed), completed
+
+
+def _approved_source_transition(
+    saved: dict[str, Any], current: dict[str, Any], approval: str,
+) -> dict[str, str]:
+    """Approve only the exact predecessor source, never policy or input drift."""
+    if not approval:
+        if saved != current:
+            raise ValueError("Attempt checkpoint configuration identity mismatch")
+        return {}
+    old = saved.get("executor_source_hash") if type(saved) is dict else None
+    new = current.get("executor_source_hash")
+    for value in (approval, old, new):
+        if (type(value) is not str or len(value) != 64
+                or any(c not in "0123456789abcdef" for c in value)):
+            raise ValueError("Source approval requires exact SHA256 source fingerprints")
+    if approval != old:
+        raise ValueError("Source approval does not match the saved executor source hash")
+    expected = dict(saved, executor_source_hash=new)
+    if expected != current:
+        raise ValueError("Source approval cannot override checkpoint configuration identity")
+    return {"from": cast(str, old), "to": cast(str, new)} if old != new else {}
 
 
 def worker_elapsed_for_resume(record: dict[str, Any]) -> float:
@@ -78,6 +115,7 @@ class AttemptCheckpointRegistry:
     def __init__(
         self, directory: Path, *, identity: dict[str, Any],
         resume_from: Path | None = None, recorder: Any = None,
+        resume_accept_source_hash: str = "",
         cost_controller: Any = None,
         startup_artifacts: dict[str, str] | None = None,
         worker_started_monotonic: float | None = None,
@@ -112,6 +150,8 @@ class AttemptCheckpointRegistry:
         self._outer_state: dict[str, Any] = {}
         self._planner_receipts: dict[str, dict[str, Any]] = {}
         self._bound_sessions: dict[str, Any] = {}
+        self._audit_ready_lanes: set[str] = set()
+        self._execution_audit: dict[str, dict[str, int]] = {}
         self._sequence = 0
         self._closed = False
         self._lock_fp = None
@@ -119,14 +159,19 @@ class AttemptCheckpointRegistry:
         self._restored_recorder_record = None
         self._restored_journal_watermark = 0
         self._resuming = resume_from is not None
+        self.source_transition: dict[str, str] = {}
+        self._account_failure_planner_retries: dict[str, int] = {}
+        if resume_accept_source_hash and resume_from is None:
+            raise ValueError("Source approval requires resume_from")
         predecessor = None
         if resume_from is not None:
             predecessor = Path(resume_from).resolve()
             if predecessor == self.directory:
                 raise ValueError("Resume requires a new generation directory")
             manifest = self._load_manifest(predecessor)
-            if manifest["identity"] != self.identity:
-                raise ValueError("Attempt checkpoint configuration identity mismatch")
+            self.source_transition = _approved_source_transition(
+                manifest["identity"], self.identity, resume_accept_source_hash,
+            )
             self.attempt_id = manifest["attempt_id"]
             self.registry_root = Path(manifest["registry_root"])
         else:
@@ -143,6 +188,12 @@ class AttemptCheckpointRegistry:
                 # Reload under the shared lock: a former writer may have
                 # published a later generation while we were acquiring it.
                 manifest = self._load_manifest(predecessor)
+                if (manifest["attempt_id"] != self.attempt_id
+                        or Path(manifest["registry_root"]) != self.registry_root):
+                    raise ValueError("Attempt checkpoint owner identity changed under lock")
+                self.source_transition = _approved_source_transition(
+                    manifest["identity"], self.identity, resume_accept_source_hash,
+                )
                 head = _read(self.registry_root / "head.json")
                 # The candidate per-generation manifest may lead the sole
                 # committed shared head after an interrupted publication.
@@ -157,7 +208,33 @@ class AttemptCheckpointRegistry:
                 snapshot = _read(Path(head["snapshot_path"]))
                 if _digest(snapshot) != head["snapshot_hash"]:
                     raise ValueError("Attempt checkpoint snapshot hash mismatch")
-                self._restore_snapshot(snapshot)
+                self._restore_snapshot(snapshot, expected_identity=manifest["identity"])
+                # A globally account-stopped lane must not immediately replay
+                # its stale quota error as the result of a fresh recovery.
+                # Successful plans and every other error receipt remain exact.
+                from .planner_jobs import planner_result_from_record
+                for lane, receipts in self._planner_receipts.items():
+                    saved = self._sessions.get(lane, {}).get("scheduler", {}).get("session_state", {})
+                    if not is_provider_account_failure(saved.get("terminal_failure_reason", "")):
+                        continue
+                    for key, raw in tuple(receipts.items()):
+                        result = planner_result_from_record(raw)
+                        if (result.exception is not None and is_provider_account_failure(
+                                classify_llm_exception(result.exception).failure_reason)):
+                            receipts.pop(key)
+                            self._account_failure_planner_retries[lane] = self._account_failure_planner_retries.get(lane, 0) + 1
+                # A failed provider call is not a completed mathematical child
+                # result. Explicit resume authorizes another attempt under the
+                # SAME saved action and cost limits, after fresh Lean restore.
+                for lane, frame in self._children.items():
+                    saved = self._sessions.get(lane, {}).get("scheduler", {}).get("session_state", {})
+                    result = frame.get("result")
+                    if (is_provider_account_failure(saved.get("terminal_failure_reason", ""))
+                            and saved.get("root_finalized") is False
+                            and type(result) is dict and set(result) == {"ok", "proof", "timed_out"}
+                            and result["ok"] is False and result["proof"] is None
+                            and result["timed_out"] is False):
+                        frame["result"] = None
             if self.directory.exists() and any(self.directory.iterdir()):
                 from ..mini_generation_artifacts import validate_startup_artifact_receipts
                 # A recorder may already own this new directory; only its
@@ -196,15 +273,18 @@ class AttemptCheckpointRegistry:
             raise ValueError("Attempt checkpoint snapshot escaped its generation")
         return record
 
-    def _restore_snapshot(self, record: dict[str, Any]) -> None:
+    def _restore_snapshot(self, record: dict[str, Any], *,
+                          expected_identity: dict[str, Any] | None = None) -> None:
         required = {"schema_version", "attempt_id", "identity", "sessions", "children", "outer_state", "planner_receipts", "cost_ledger", "recorder", "journal_watermark", "predecessor", "worker_active_elapsed_s", "worker_observed_epoch_s", "worker_generation_completed"}
-        if type(record) is not dict or set(record) != required or type(record["schema_version"]) is not int or record["schema_version"] != _SCHEMA:
+        if type(record) is not dict or set(record) not in (required, required | {"execution_audit"}) or type(record["schema_version"]) is not int or record["schema_version"] != _SCHEMA:
             raise ValueError("Unsupported attempt checkpoint snapshot schema")
-        if record["identity"] != self.identity or record["attempt_id"] != self.attempt_id:
+        if (record["identity"] != (self.identity if expected_identity is None else expected_identity)
+                or record["attempt_id"] != self.attempt_id):
             raise ValueError("Attempt checkpoint snapshot identity mismatch")
         for name in ("sessions", "children", "outer_state", "planner_receipts"):
             if type(record[name]) is not dict:
                 raise ValueError("Invalid attempt checkpoint state map")
+        execution_audit = _validated_execution_audit(record.get("execution_audit", {}), record["sessions"])
         watermark = record["journal_watermark"]
         if type(watermark) is not int or watermark < 0:
             raise ValueError("Invalid attempt checkpoint journal watermark")
@@ -222,6 +302,7 @@ class AttemptCheckpointRegistry:
         self._children = _json(record["children"])
         self._outer_state = _json(record["outer_state"])
         self._planner_receipts = _json(record["planner_receipts"])
+        self._execution_audit = execution_audit
         self._restored_cost_record = _json(record["cost_ledger"])
         self._restored_recorder_record = _json(record["recorder"])
         self._restored_journal_watermark = watermark
@@ -233,6 +314,7 @@ class AttemptCheckpointRegistry:
             "identity": self.identity, "sessions": self._sessions,
             "children": self._children, "outer_state": self._outer_state,
             "planner_receipts": self._planner_receipts,
+            "execution_audit": self._execution_audit,
             "cost_ledger": self._restored_cost_record,
             "recorder": self._restored_recorder_record,
             "journal_watermark": self._restored_journal_watermark,
@@ -354,8 +436,37 @@ class AttemptCheckpointRegistry:
                     restored = restore_children(session, child_frames)
                     if inspect.isawaitable(restored):
                         await restored
+            # Child preparation may restore the parent a second time. Release
+            # only generation-local account latches after every such restore.
+            reason = getattr(session, "terminal_failure_reason", "")
+            if self.is_resume and record is not None and is_provider_account_failure(reason):
+                session.terminal_failure_reason = ""
+                session.terminal_failure_kind = ""
+                if getattr(session, "last_failure_reason", "") == reason:
+                    session.last_failure_reason = ""
+                for owner, reason_field, kind_field in (
+                    (session.conv, "_last_llm_failure_reason", "_last_llm_failure_kind"),
+                    (session.dossier, "session_failure_reason", "session_failure_kind"),
+                ):
+                    if is_provider_account_failure(getattr(owner, reason_field, "")):
+                        setattr(owner, reason_field, "")
+                        setattr(owner, kind_field, "")
+                session._record_event({
+                    "phase": "checkpoint_resume", "verdict": "provider_failure_retry_on_resume",
+                    "previous_failure_reason": reason, "lane": lane_key,
+                    "planner_account_failures_reopened": self._account_failure_planner_retries.get(lane_key, 0),
+                    "generation_id": self.generation_id,
+                })
+            # Prepared-child restore deliberately retains the pre-action parent
+            # record and its identity. Recover reporting separately, by same-lane
+            # maximum, never by summing inherited child totals or firing sinks.
+            for key, floor in self._execution_audit.get(lane_key, {}).items():
+                session.dossier.tool_metrics[key] = max(
+                    int(session.dossier.tool_metrics.get(key, 0) or 0), floor,
+                )
             if record is None:
                 await self.commit_session(lane_key, session)
+            self._audit_ready_lanes.add(lane_key)
         except BaseException:
             if self._bound_sessions.get(lane_key) is session:
                 self._bound_sessions.pop(lane_key)
@@ -439,6 +550,22 @@ class AttemptCheckpointRegistry:
             snapshot = self._snapshot_payload()
             session_updates = updates.pop("session_updates", {})
             snapshot["sessions"] = {**self._sessions, **session_updates}
+            execution_audit = _json(self._execution_audit)
+            for lane, session in self._bound_sessions.items():
+                # bind_session reserves ownership before asynchronous restore;
+                # a pending/failed new bind is not a committed reporting lane.
+                if (lane not in snapshot["sessions"]
+                        or (lane not in self._audit_ready_lanes and lane not in session_updates)):
+                    continue
+                metrics = dict(session.dossier.tool_metrics)
+                floor = execution_audit.setdefault(lane, {})
+                for key in MONOTONIC_LEAN_ATTEMPT_METRICS:
+                    amount = metrics.get(key, 0)
+                    if type(amount) is not int or amount < 0:
+                        raise ValueError("Invalid live execution audit metric")
+                    if amount:
+                        floor[key] = max(floor.get(key, 0), amount)
+            snapshot["execution_audit"] = execution_audit
             snapshot["children"] = {**self._children, **child_updates}
             snapshot["planner_receipts"] = planner_receipts
             snapshot.update(updates)
@@ -451,6 +578,7 @@ class AttemptCheckpointRegistry:
             self._children = snapshot["children"]
             self._outer_state = snapshot["outer_state"]
             self._planner_receipts = planner_receipts
+            self._execution_audit = execution_audit
             self._restored_cost_record = cost_record
             self._restored_recorder_record = recorder_record
             self._restored_journal_watermark = watermark

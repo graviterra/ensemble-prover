@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from .state_data import clone_json_value
+from .cost_policy import require_cost_budget_usd
 
 
 _GENERATION_OPTIONS = frozenset({
     "output_dir", "resume_from", "terminal_trace", "mini_theory_startup_overlay_nonce",
+    "resume_accept_source_hash",
 })
 
 
@@ -54,6 +56,8 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
     """Inherit saved policy while rejecting explicitly conflicting overrides."""
 
     resume_from = getattr(args, "resume_from", None)
+    if getattr(args, "resume_accept_source_hash", "") and not resume_from:
+        raise ValueError("Source approval requires --resume-from")
     if not resume_from or getattr(args, "_checkpoint_config_resolved", False):
         return args
     from .mini_session.attempt_checkpoint import AttemptCheckpointRegistry
@@ -155,13 +159,15 @@ async def checkpoint_cost_controller(registry: Any, recorder: Any, args: Any) ->
 
     from .llm_usage import CostBudgetController
 
+    max_cost_usd = require_cost_budget_usd(getattr(args, "cost_budget_usd", 0.0))
+
     saved = registry.cost_resume_state if registry is not None else None
     sink = registry.durable_cost_event if registry is not None else None
     if saved is None:
         if registry is not None and registry.is_resume:
             registry.validated_journal_records()
         controller = CostBudgetController(
-            max_cost_usd=max(0.0, float(getattr(args, "cost_budget_usd", 0.0) or 0.0)),
+            max_cost_usd=max_cost_usd,
             reserve_output_tokens=max(0, int(getattr(args, "cost_budget_reserve_output_tokens", 1024) or 0)),
             event_sink=recorder.record_turn,
             durable_event_sink=sink,

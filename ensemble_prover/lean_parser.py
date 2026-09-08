@@ -1316,7 +1316,11 @@ def primary_error_type(parsed: LeanParseResult) -> str:
         # Keep diagnostic boundaries: e.g. `simp` in one error followed by
         # `made no progress` in another is not a simp-no-progress failure.
         underlying_errors = {
-            fallback_error_type_from_text(d.message): True
+            (
+                "tactic_failed"
+                if d.message.strip() == "failed"
+                else fallback_error_type_from_text(d.message)
+            ): True
             for d in parsed.diagnostics
             if d.severity == "error"
         }
@@ -1738,7 +1742,12 @@ def parse_lean_output(
     result.parse_error = parse_error
     result.type_mismatch = type_mismatch
     result.unknown_identifier = unknown_identifier
-    result.tactic_failed = tactic_failed
+    # Some Lean tactics emit only `error: failed`. Require the entire
+    # structured error message; warning text or quoted identifiers are not
+    # proof failures. This changes diagnostics, never axiom-audit authority.
+    result.tactic_failed = tactic_failed or any(
+        message.strip() == "failed" for message in _err_msgs
+    )
     result.binder_arity_mismatch = binder_arity_mismatch
     result.simp_no_progress = simp_no_progress
     # Decision-procedure refutation: search per-error-message AND raw to

@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from ..config import LeanConfig, RetrievalConfig, RoleConfig  # noqa: F401  (parity with mini_prover imports)
 from ..lean_runner import LeanRunner
 from ..llm_error_policy import (
+    ProviderAccountUnavailable,
     is_terminal_llm_failure_reason,
     is_terminal_session_failure_reason,
     llm_failure_scope,
@@ -5146,11 +5147,6 @@ async def prove_problem_via_session(
             # The builder may clone the supplied dossier. Register the exact
             # object MiniSession will mutate before its first awaited action.
             parallel_live_sample_dossiers[sample_index] = session.dossier
-            if sample_count > 1:
-                _install_parallel_monotonic_metric_sink(
-                    session.dossier,
-                    attempt_dossier,
-                )
             effective_premise_block = str(premise_block or "").strip()
             effective_premise_names = list(premise_names or ())
             if effective_premise_block:
@@ -5173,6 +5169,13 @@ async def prove_problem_via_session(
                 # Restore overwrites this freshly constructed transcript;
                 # appending afterward would duplicate saved premise input.
                 await checkpoint_registry.bind_session(f"sample:{sample_index}", session)
+            if sample_count > 1:
+                # Fresh restore replaces dossier runtime hooks. Rebind only
+                # after it has restored this generation's reporting owner.
+                _install_parallel_monotonic_metric_sink(
+                    session.dossier,
+                    attempt_dossier,
+                )
             try:
                 if sample_count > 1:
                     from ..mini_formal_state_search import parallel_lean_admission_scope
@@ -5474,6 +5477,17 @@ async def prove_problem_via_session(
         terminal_sample_detected = False
         failed_sample_indices: Set[int] = set()
         sample_failures: List[Dict[str, Any]] = []
+        provider_account_pauses: Dict[int, ProviderAccountUnavailable] = {}
+
+        def _record_account_pause(task: asyncio.Task, exc: ProviderAccountUnavailable) -> None:
+            sample_index = task_index.get(task, -1)
+            if sample_index not in provider_account_pauses:
+                provider_account_pauses[sample_index] = exc
+                failed_sample_indices.add(sample_index)
+                sample_failures.append(record_parallel_sample_failure(
+                    attempt_dossier, sample_index=sample_index,
+                    error_kind=type(exc).__name__, error=exc.reason, stage="provider_account_pause",
+                ))
         late_sample_grace_s = max(
             0.0,
             float(kwargs.get("parallel_late_sample_grace_s", 0.0) or 0.0),
@@ -5534,6 +5548,14 @@ async def prove_problem_via_session(
                             _sample_recursive_prepass_owned,
                             _sample_adaptive_recursive_owned,
                         ) = task.result()
+                    except ProviderAccountUnavailable as exc:
+                        _record_account_pause(task, exc)
+                        _capture_inflight_disproofs(exclude_index=winning_index)
+                        # Leave through the normal drain/fan-in path so a
+                        # paused sample cannot eclipse a sibling's proof.
+                        terminal_sample_detected = True
+                        pending = set()
+                        continue
                     except Exception as exc:
                         sample_index = task_index.get(task, -1)
                         _capture_inflight_disproofs(exclude_index=winning_index)
@@ -5712,6 +5734,8 @@ async def prove_problem_via_session(
                             winning_index = sample_index
                             winning_proof = proof
                             winning_dossier = sample_dossier
+                except ProviderAccountUnavailable as exc:
+                    _record_account_pause(task, exc)
                 except asyncio.CancelledError:
                     if current is not None and current.cancelling():
                         _abandon_sample_tasks(tasks)
@@ -6141,6 +6165,8 @@ async def prove_problem_via_session(
                 "=== parallel sampling: recovered finalized root proof from failed sample ===",
             )
             return True, str(attempt_dossier.final_proof or "")
+        if provider_account_pauses:
+            raise provider_account_pauses[min(provider_account_pauses)]
         _trace(
             trace_prefix,
             f"=== parallel sampling: all {sample_count} samples failed ===",
@@ -7681,6 +7707,17 @@ async def _mini_session_run_conversation_callback(
     reporting_parent_dossier = kwargs.get("reporting_parent_dossier")
     if reporting_parent_dossier is None:
         reporting_parent_dossier = getattr(theory_parent_session, "dossier", None)
+    if (
+        reporting_parent_dossier is not None
+        and reporting_parent_dossier is not session.dossier
+        and not callable(getattr(session.dossier, "_monotonic_tool_metric_sink", None))
+    ):
+        # Mirror new execution-audit events while the child is running, including
+        # late cancellation callbacks. Restored/cloned totals are already history;
+        # this runtime-only sink forwards no historical counts or proof authority.
+        _install_parallel_monotonic_metric_sink(
+            session.dossier, reporting_parent_dossier,
+        )
     reporting_baseline = {
         key: int(getattr(session.dossier, "tool_metrics", {}).get(key, 0) or 0)
         for key in _RECURSIVE_CHILD_REPORTING_METRICS

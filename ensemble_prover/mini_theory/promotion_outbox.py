@@ -63,6 +63,43 @@ def _sha256(payload: str | bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _promotion_verification_diagnostics(result: Any) -> dict[str, Any]:
+    """Retain bounded failure evidence without publishing raw verifier output."""
+
+    verification = getattr(getattr(result, "publication", None), "verification", None)
+    diagnostics: dict[str, Any] = {}
+    for stage in ("compile", "audit"):
+        output = str(getattr(verification, f"{stage}_output", "") or "")
+        if not output:
+            continue
+        safe = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", output)
+        safe = "".join(char for char in safe if char.isprintable() or char in "\n\t")
+        safe = re.sub(r"/tmp/mini_theory_verify\.[^/\s:]+", "<verification-scratch>", safe)
+        safe = re.sub(r"/(?:home|Users)/[^/\s:]+", "<home>", safe)
+        safe = re.sub(r"\bsk-[A-Za-z0-9_-]{16,}\b", "<redacted>", safe)
+        safe = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*", "Bearer <redacted>", safe)
+        safe = re.sub(
+            r"(?i)(?<!\w)(?P<quote>[\"']?)"
+            r"(?P<key>api[_-]?key|access[_-]?token|password|secret)(?P=quote)"
+            r"(?P<separator>\s*[:=]\s*)"
+            r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)",
+            r"\g<quote>\g<key>\g<quote>\g<separator><redacted>",
+            safe,
+        ).strip()
+        limit = 2048
+        truncated = len(safe) > limit
+        if truncated:
+            marker = "\n... [truncated] ...\n"
+            head = (limit - len(marker)) // 2
+            safe = safe[:head] + marker + safe[-(limit - len(marker) - head):]
+        diagnostics[stage] = {
+            "excerpt": safe,
+            "sha256": _sha256(output.encode("utf-8", errors="replace")),
+            "truncated": truncated,
+        }
+    return diagnostics
+
+
 def helper_is_promotable(helper: Any) -> tuple[bool, str]:
     """Return whether a dossier helper is generic reusable theory material."""
 
@@ -228,6 +265,12 @@ class PromotionDrainReport:
     retryable: int = 0
     recovered_claims: int = 0
     remaining: int = 0
+    # A cancelled scan reports its last observed pending snapshot, not a fresh
+    # authoritative empty inbox. The scope includes other owners; theorem
+    # filtering is explicit and never implies a per-run count.
+    remaining_scan_incomplete: bool = False
+    remaining_scope: str = "current_environment_inbox"
+    source_theorems: tuple[str, ...] = ()
     events: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -1015,6 +1058,7 @@ class PromotionOutbox:
         report = PromotionDrainReport()
         if not _HEX_32_RE.fullmatch(str(current_owner_id or "")):
             report.failures += 1
+            report.remaining_scan_incomplete = True
             self._event(
                 report,
                 event_callback,
@@ -1035,7 +1079,9 @@ class PromotionOutbox:
             for item in source_theorems
             if str(item or "").strip()
         }
+        report.source_theorems = tuple(sorted(allowed_source_theorems))
         processed: set[str] = set()
+        pending_snapshot_ids: set[str] = set()
         limit = max(0, int(max_entries or 0))
         while True:
             if cancellation_event is not None and cancellation_event.is_set():
@@ -1049,14 +1095,19 @@ class PromotionOutbox:
                 known_entries,
                 cancellation_event=cancellation_event,
             )
+            pending_snapshot = self.pending_entries(
+                source_theorems=tuple(allowed_source_theorems),
+                cancellation_event=cancellation_event,
+                _context=validation_context,
+            )
+            if cancellation_event is None or not cancellation_event.is_set():
+                pending_snapshot_ids = {entry.entry_id for entry in pending_snapshot}
+            else:
+                pending_snapshot_ids.update(entry.entry_id for entry in pending_snapshot)
             candidates = sorted(
                 [
                 entry
-                for entry in self.pending_entries(
-                    source_theorems=tuple(allowed_source_theorems),
-                    cancellation_event=cancellation_event,
-                    _context=validation_context,
-                )
+                for entry in pending_snapshot
                 if entry.entry_id not in processed
                 ],
                 key=lambda entry: (
@@ -1313,6 +1364,13 @@ class PromotionOutbox:
                         helper_name=entry.helper_name,
                         diagnostic=str(getattr(result, "diagnostic", "") or ""),
                         published=bool(getattr(result, "published", False)),
+                        cancelled=cancelled,
+                        retryable=verdict.endswith("retryable"),
+                        verification_diagnostics=(
+                            _promotion_verification_diagnostics(result)
+                            if not bool(getattr(result, "published", False))
+                            else {}
+                        ),
                         verdict=verdict,
                     )
                 except BaseException as exc:
@@ -1329,6 +1387,8 @@ class PromotionOutbox:
                     else:
                         raise
                 finally:
+                    if settled:
+                        pending_snapshot_ids.discard(entry.entry_id)
                     if not settled:
                         self._release_claim(entry.entry_id, claim)
                 processed.add(entry.entry_id)
@@ -1341,12 +1401,20 @@ class PromotionOutbox:
                 processed.update(retryable)
             if not progressed:
                 break
-        report.remaining = len(
-            self.pending_entries(
+        if cancellation_event is not None and cancellation_event.is_set():
+            report.remaining_scan_incomplete = True
+            report.remaining = len(pending_snapshot_ids)
+        else:
+            remaining_entries = self.pending_entries(
                 source_theorems=tuple(allowed_source_theorems),
                 cancellation_event=cancellation_event,
             )
-        )
+            if cancellation_event is not None and cancellation_event.is_set():
+                pending_snapshot_ids.update(entry.entry_id for entry in remaining_entries)
+                report.remaining_scan_incomplete = True
+                report.remaining = len(pending_snapshot_ids)
+            else:
+                report.remaining = len(remaining_entries)
         return report
 
     @staticmethod

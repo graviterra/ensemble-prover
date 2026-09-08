@@ -27,6 +27,7 @@ from ensemble_prover.verified_helper_contract import (
 from ensemble_prover.proof_state import ProofSearchState, ProofStateWorkItem
 from ensemble_prover.root_finalization import RootFinalizationCandidate
 from ensemble_prover.state_data import clone_json_value
+from ensemble_prover.mini_theory.model import TheoryNeed
 
 from .action import ActionBudget, MiniOutcome, RepairTicket
 from .capability_policy import field_is_runtime_capability
@@ -38,7 +39,7 @@ from .turn.post_failure import PostFailureResult
 SCHEMA_VERSION = 1
 _VALUE_CLASSES = {value.__name__: value for value in (
     ActionBudget, MiniOutcome, RepairTicket, RootFinalizationCandidate,
-    ProofStateWorkItem, TurnExtraction, PostFailureResult,
+    ProofStateWorkItem, TurnExtraction, PostFailureResult, TheoryNeed,
 )}
 _RUNTIME_FIELDS = frozenset({
     "problem", "dossier", "proof_state", "conv", "actions", "budgets",
@@ -81,9 +82,14 @@ def _encode(value: Any, *, path: str = "value") -> Any:
             for key, item in value.items()
         ]}
     if kind.__name__ in _VALUE_CLASSES and _VALUE_CLASSES[kind.__name__] is kind:
+        # Thaw immutable theory evidence recursively: passing mapping proxies
+        # to its constructor would stringify nested evidence.
+        payload = value.to_dict() if kind is TheoryNeed else {
+            field.name: getattr(value, field.name) for field in fields(kind)
+        }
         return {"value_type": kind.__name__, "fields": {
-            field.name: _encode(getattr(value, field.name), path=f"{path}.{field.name}")
-            for field in fields(kind)
+            name: _encode(item, path=f"{path}.{name}")
+            for name, item in payload.items()
         }}
     if isinstance(value, BaseException):
         # The settled outcome already contains canonical diagnostic policy.
@@ -290,7 +296,7 @@ async def _verify(lean: Any, *, statement: str, proof: str, helpers: list[str], 
 
 async def _prepare_dossier(session: Any, data: dict[str, Any]) -> ProofDossier:
     """Cross conservative import and fresh Lean before restoring any authority."""
-    dossier = ProofDossier.from_execution_record(data)
+    dossier = ProofDossier._from_execution_record_for_reverification(data)
     originals = data.get("verified_helpers")
     if type(originals) is not list:
         raise ValueError("checkpoint helper list is malformed")
@@ -436,7 +442,7 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
     staged = copy.copy(verifier_view)
     staged.conv = copy.copy(session.conv)
     staged.conv.__dict__ = copy.deepcopy(conversation)
-    staged.dossier = ProofDossier.from_execution_record(data["dossier"])
+    staged.dossier = ProofDossier._from_execution_record_for_reverification(data["dossier"])
     graph = staged.dossier.proof_graph
     saved_state = data["proof_state"]
     if (saved_state is None) != (session.proof_state is None):

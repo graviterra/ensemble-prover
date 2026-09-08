@@ -716,7 +716,35 @@ the validated checkpoint prefix is retained in the predecessor file and
 excluded from restored trace metrics; corruption of committed evidence still
 rejects restart.
 
-Resume requires the same input, executor source, and material Lean environment.
+Resume requires the same input, executor source, and material Lean environment
+by default. After installing a checkpoint-compatible bug fix, explicitly approve
+the saved executor fingerprint to resume with updated code:
+
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover \
+  --resume-from runs/mini_prover/example_target_01 \
+  --resume-accept-source-hash <saved-executor-sha256>
+```
+
+Copy the exact `identity.executor_source_hash` from that generation's
+`attempt_checkpoint.json`. This approves only the code change, not changes to
+the target, configuration, material Lean environment, or checkpoint schema.
+The new generation records both source fingerprints. Proof rechecking and
+financial-ledger validation are still mandatory.
+
+An API quota, billing, or authentication rejection is reported as
+`INFRASTRUCTURE ABORTED`, not a mathematical failure. Correct the external
+account problem, then use `--resume-from`. Explicit resume releases those
+account-failure stop flags and permits unfinished children to continue; it does
+not reset spent actions, time, cost limits, or mathematical/safety stops. If
+account access is still unavailable, the new generation stops again.
+This preserves unfinished controller invocations in checkpoints written by the
+fixed runtime. Older checkpoints that already discarded a controller cursor
+cannot recover that exact invocation merely by clearing the account error;
+a fresh search using reverified helpers may be necessary.
+Runs started with `--no-checkpoint` cannot resume; after restoring account
+access, start a new run instead.
+
 An incompatible or incomplete checkpoint is rejected before search resumes.
 Only the latest generation can continue, with one active writer per attempt.
 Previous generation artifacts remain unchanged. Keep the generation directories

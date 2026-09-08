@@ -908,6 +908,29 @@ def is_terminal_llm_failure_reason(reason: str) -> bool:
     return bool(classification.terminal)
 
 
+def is_provider_account_failure(reason: str) -> bool:
+    """External account state may be repaired between explicit run generations.
+
+    Deliberately excludes local cost limits, unknown pricing, mathematical
+    results and trust-boundary stops. Never use prose matching for reopening.
+    """
+    return reason in {"llm_auth_error", "llm_billing_error", "llm_insufficient_quota"}
+
+
+class ProviderAccountUnavailable(BaseException):
+    """Pause an unfinished controller without committing a mathematical result.
+
+    Like cancellation, this bypasses local Exception recovery; unlike
+    CancelledError, parallel tasks retain a typed reason for their owner.
+    """
+
+    def __init__(self, reason: str):
+        if not is_provider_account_failure(reason):
+            raise ValueError("Not an external provider account failure")
+        self.reason = reason
+        super().__init__(reason)
+
+
 def is_terminal_session_failure_reason(reason: str) -> bool:
     """Return true for durable run-terminal LLM or controller verdicts."""
 

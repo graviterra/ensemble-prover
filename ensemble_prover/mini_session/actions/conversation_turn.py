@@ -8443,8 +8443,6 @@ class ConversationTurnAction:
     _ANSWER_SAFE_RECHECK_MAX_CONTENT_CHARS: ClassVar[int] = 250_000
     _ANSWER_SAFE_RECHECK_MAX_STATE_CHARS: ClassVar[int] = 2_000_000
     _PROVIDER_QUANTUM_CHECKPOINT_MAX_STATE_CHARS: ClassVar[int] = 500_000
-    _PROVIDER_QUANTUM_CHECKPOINT_MAX_HISTORY_CHARS: ClassVar[int] = 1_500_000
-    _PROVIDER_QUANTUM_CHECKPOINT_MAX_HISTORY_MESSAGES: ClassVar[int] = 128
     _PROVIDER_QUANTUM_CHECKPOINT_MAX_BINDING_CHARS: ClassVar[int] = 300_000
     _PROVIDER_QUANTUM_CHECKPOINT_MAX_TARGET_CHARS: ClassVar[int] = 1_000_000
     _PROVIDER_QUANTUM_CHECKPOINT_MAX_LEGACY_BINDING_CHARS: ClassVar[int] = (
@@ -9395,7 +9393,7 @@ class ConversationTurnAction:
     def _bounded_json_copy(
         value: Any,
         *,
-        max_chars: int,
+        max_chars: int | None,
         label: str,
     ) -> Any:
         """Return an immutable JSON-shaped copy or reject the checkpoint."""
@@ -9408,7 +9406,7 @@ class ConversationTurnAction:
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            if len(encoded) > max(1, int(max_chars or 0)):
+            if max_chars is not None and len(encoded) > max(1, int(max_chars or 0)):
                 raise StateSnapshotCompatibilityError(f"{label} is oversized")
             return json.loads(encoded)
         except StateSnapshotCompatibilityError:
@@ -9715,7 +9713,9 @@ class ConversationTurnAction:
         )
         history = self._bounded_json_copy(
             raw.get("history"),
-            max_chars=self._PROVIDER_QUANTUM_CHECKPOINT_MAX_HISTORY_CHARS,
+            # Retain the complete conversation. The durable record writer
+            # enforces the overall storage limit, not a small context cap.
+            max_chars=None,
             label="conversation provider quantum history",
         )
         raw_binding = raw.get("binding")
@@ -9997,7 +9997,6 @@ class ConversationTurnAction:
                 )
         if (
             not isinstance(history, list)
-            or len(history) > self._PROVIDER_QUANTUM_CHECKPOINT_MAX_HISTORY_MESSAGES
         ):
             raise StateSnapshotCompatibilityError(
                 "conversation provider quantum history is malformed"

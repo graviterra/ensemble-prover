@@ -31,6 +31,7 @@ from .mini_recursive_outcome import is_resumable_mini_recursive_yield
 from .graph_execution_projection import GRAPH_PROJECTION_METRICS
 from .tactic_attempt_telemetry import MONOTONIC_LEAN_ATTEMPT_METRICS
 from .state_data import clone_json_value
+from .cost_reporting import COST_REPORT_KEYS, cost_report, is_cumulative_cost_snapshot
 
 
 _MINI_GRAPH_RECURSIVE_DECOMPOSE_METRIC_KEYS = (
@@ -499,7 +500,7 @@ _LLM_USAGE_ROLE_SUFFIXES = {
 
 
 def _is_llm_usage_summary_key(key: str) -> bool:
-    if key in _LLM_USAGE_BASE_KEYS:
+    if key in _LLM_USAGE_BASE_KEYS or key in COST_REPORT_KEYS:
         return True
     return any(
         key.endswith(f"_{suffix}") for suffix in _LLM_USAGE_ROLE_SUFFIXES
@@ -2771,6 +2772,16 @@ class RunRecorder:
         self.metrics[key] = value
 
     def _record_llm_usage_metrics(self, record: Dict[str, Any]) -> None:
+        cumulative_cost = is_cumulative_cost_snapshot(record)
+        if cumulative_cost:
+            self.metrics.update(cost_report(record, source="ledger_snapshot"))
+        elif "cost_accounting_incomplete" in record:
+            # Older event formats lack cumulative amounts. Preserve uncertainty
+            # without treating a later per-call success as global reconciliation.
+            self.metrics["cost_accounting_incomplete"] = bool(
+                self.metrics.get("cost_accounting_incomplete")
+                or record["cost_accounting_incomplete"]
+            )
         verdict = str(record.get("verdict") or "")
         if verdict == "cost_budget_rejected":
             self._metric_add("llm_budget_rejections", 1)
@@ -2867,6 +2878,8 @@ class RunRecorder:
             "cost_usd",
             "estimated_unknown_cost_usd",
         ):
+            if cumulative_cost and key in {"cost_usd", "estimated_unknown_cost_usd"}:
+                continue
             self._metric_add(key, record.get(key))
         role = _canonical_llm_usage_role(str(record.get("role") or ""))
         if role:

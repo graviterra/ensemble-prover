@@ -107,7 +107,7 @@ from ensemble_prover.proof_lineage import (
     stable_identity,
     structural_statement_identity,
 )
-from ensemble_prover.llm_error_policy import llm_failure_scope
+from ensemble_prover.llm_error_policy import ProviderAccountUnavailable, llm_failure_scope
 from ensemble_prover.models import provider_serving_fingerprint
 from ensemble_prover.llm_usage import (
     ProviderDispatchExposureTracker,
@@ -23447,7 +23447,7 @@ class MiniSession:
                         ),
                         operation_label=(f"mini_session_run_governor_{action.id}"),
                     )
-            except asyncio.CancelledError as cancellation:
+            except (asyncio.CancelledError, ProviderAccountUnavailable) as cancellation:
                 # Settle provider exposure before propagating operator
                 # cancellation so late child work cannot publish mutation.
                 try:

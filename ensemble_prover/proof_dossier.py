@@ -2807,6 +2807,7 @@ def _dossier_is_conditional_negative_auxiliary(
     root_statement: str,
     active_target_statements: Sequence[str] = (),
     bound_names: Sequence[str] = (),
+    helper_statement: str = "",
 ) -> bool:
     """Distinguish a conditional negative lemma from a target refutation.
 
@@ -2815,8 +2816,41 @@ def _dossier_is_conditional_negative_auxiliary(
     contradictions and negations of the root/active conclusion advisory.
     """
 
+    # Bound the input before calling shared scoped normalizers, which may
+    # recurse themselves. This optional usefulness analysis must not crash a
+    # checkpoint refresh on a deeply nested, otherwise valid Lean statement.
+    max_input_work = 250_000
+    input_work = 0
+    for text in (conclusion, helper_statement, root_statement, *premises, *active_target_statements):
+        input_work += len(text)
+        if input_work > max_input_work:
+            return False
+        index = depth = scope_tokens = 0
+        while index < len(text):
+            skip_to = _lean_lexical_skip_end(text, index)
+            if skip_to is not None:
+                index = skip_to
+                continue
+            character = text[index]
+            if character in _DOSSIER_LEAN_GROUP_OPEN_TO_CLOSE:
+                depth += 1
+                if depth > 64:
+                    return False
+            elif character in _DOSSIER_LEAN_GROUP_OPEN_TO_CLOSE.values():
+                depth = max(0, depth - 1)
+            if (
+                _dossier_top_level_quantifier_token_len(text, index)
+                or character == "→"
+                or text.startswith("=>", index)
+            ):
+                scope_tokens += 1
+                if scope_tokens > 192:
+                    return False
+            index += 1
+
     def negated_body(statement: str) -> str:
         body = _dossier_strip_balanced_outer_parens(statement)
+        body, _names = _dossier_strip_leading_forall_binders_with_names(body)
         inequalities = _top_level_token_positions(body, ("≠",))
         if len(inequalities) == 1 and not _top_level_token_positions(
             body, ("∧", "∨", "→", "->", "↔", "<->")
@@ -2829,7 +2863,10 @@ def _dossier_is_conditional_negative_auxiliary(
         inner = match.group(1).strip()
         # Negation binds more tightly than these connectives: `¬ P ∧ Q`
         # must not be treated as `¬ (P ∧ Q)` by the auxiliary exception.
-        if _top_level_token_positions(inner, ("∧", "∨", "→", "->", "↔", "<->")):
+        if (
+            not _dossier_top_level_quantifier_token_len(inner, 0)
+            and _top_level_token_positions(inner, ("∧", "∨", "→", "->", "↔", "<->"))
+        ):
             return ""
         return _dossier_strip_balanced_outer_parens(inner)
 
@@ -2847,6 +2884,8 @@ def _dossier_is_conditional_negative_auxiliary(
     # coarse ingredients of every root conclusion. These ingredients deny
     # the exception; they never establish equality or refutation authority.
     from .proof_graph import (
+        _graph_application_arg_count,
+        _graph_application_first_argument,
         _graph_bridge_variant_rejection_tokens,
         _graph_leading_binder_analysis,
         _graph_type_returns_prop,
@@ -2873,28 +2912,145 @@ def _dossier_is_conditional_negative_auxiliary(
                 tokens.add("operator:" + operator)
         return tokens
 
+    scope_work = 0
+    scope_exhausted = False
+    max_scope_depth = 64
+    max_scope_work = 250_000
+
+    def proposition_atoms(text: str, depth: int = 0) -> Optional[List[str]]:
+        """Inspect logical scope, never propositions inside data arguments.
+
+        For example, a predicate occurring in a set comprehension passed to
+        ``Summable`` is not itself asserted by that summability statement.
+        Quantifier bodies own all following connectives until their enclosing
+        delimiter; peeling the binder before splitting preserves that scope.
+        """
+        nonlocal scope_work, scope_exhausted
+        scope_work += len(text)
+        if depth >= max_scope_depth or scope_work > max_scope_work:
+            scope_exhausted = True
+            return None
+        body = _dossier_strip_balanced_outer_parens(text)
+        if _dossier_top_level_quantifier_token_len(body, 0):
+            commas = _top_level_token_positions(body, (",",))
+            if not commas:
+                return [body]
+            return proposition_atoms(body[commas[0][0] + 1 :], depth + 1)
+        implications = _dossier_split_top_level_implications(body)
+        if len(implications) > 1:
+            return proposition_atoms(implications[-1], depth + 1)
+        conjunctions = _dossier_split_top_level_conjunctions(body)
+        if len(conjunctions) > 1:
+            atoms: List[str] = []
+            for part in conjunctions:
+                nested = proposition_atoms(part, depth + 1)
+                if nested is None:
+                    return None
+                atoms.extend(nested)
+            return atoms
+        return [body]
+
+    def atom_families(text: str, names: Sequence[str]) -> Set[str]:
+        families: Set[str] = set()
+        atoms = proposition_atoms(text)
+        if atoms is None:
+            return set()
+        for atom in atoms:
+            positions = _top_level_token_positions(
+                atom, ("↔", "→", "->", "∧", "∨", "≤", "≥", "≠", "∈", "∉", "⊆", "∣", "=", "<", ">")
+            )
+            if positions:
+                if any(token in {"↔", "→", "->", "∧", "∨"} for _index, token in positions):
+                    return set()
+                families.update("operator:" + token for _index, token in positions)
+                continue
+            head = first_identifier(atom)
+            if not head or head in {*names, "fun", "let", "if", "match"}:
+                return set()
+            if head in {"And", "Or", "Exists", "Iff"}:
+                # Preserve the conservative elaborated-syntax fallback.
+                families.update(rejection_tokens(atom))
+            else:
+                families.add(
+                    "operator:" + operator_heads[head]
+                    if head in operator_heads
+                    else "identifier:" + head.rsplit(".", 1)[-1]
+                )
+        return families
+
     positive_candidates = _dossier_root_conclusion_candidates(positive_conclusion)
     if len(positive_candidates) != 1:
         return False
     positive_body, positive_names = positive_candidates[0]
-    positive_body = _dossier_strip_balanced_outer_parens(positive_body)
-    positions = _top_level_token_positions(
-        positive_body, ("↔", "→", "->", "∧", "∨", "≤", "≥", "≠", "∈", "∉", "⊆", "∣", "=", "<", ">")
-    )
-    if positions:
-        if any(token in {"↔", "→", "->", "∧", "∨"} for _index, token in positions):
+    families = atom_families(positive_body, (*bound_names, *positive_names))
+    if not families:
+        return False
+
+    def has_live_structure(text: str) -> bool:
+        """Recognize a property of witnesses or a genuinely varying function."""
+        from .mini_falsification.generators import _right_pi_term_mentions_dependency
+
+        body = _dossier_strip_balanced_outer_parens(text)
+        prefix = _dossier_top_level_quantifier_token_len(body, 0)
+        if prefix:
+            separators = _top_level_token_positions(body, (",",))
+        else:
+            head = first_identifier(body)
+            body = _dossier_strip_balanced_outer_parens(
+                _graph_application_first_argument(body, head)
+            ) if head else ""
+            if not body.startswith("fun "):
+                return False
+            prefix = len("fun ")
+            separators = _top_level_token_positions(body, ("=>", "↦"))
+        if not separators:
             return False
-        families = {"operator:" + token for _index, token in positions}
-    else:
-        head = first_identifier(positive_body)
-        if not head or head in {*bound_names, *positive_names, "fun", "let", "if", "match"}:
-            return False
-        families = {"operator:" + operator_heads[head]} if head in operator_heads else {
-            "identifier:" + head.rsplit(".", 1)[-1]
-        }
+        position, token = separators[0]
+        names = _dossier_binder_names_from_chunk(body[prefix:position])
+        return any(
+            _right_pi_term_mentions_dependency(body[position + len(token) :], name)
+            for name in names
+        )
+
+    # Conditional transport is useful even when its property family occurs in
+    # the root. It still requires its own negative assumption on the same live
+    # data object. This is eligibility for named-fact use, not evidence that the
+    # root is false, that the extra assumption holds, or that a goal is solved.
+    # Keep the older scalar-instance guard: an unrelated closed ¬ Prime fact,
+    # or scalar disequality, is not such a structured data transport.
+    from .mini_falsification.generators import _right_pi_term_mentions_dependency
+
+    _helper_body, helper_binders = _graph_leading_binder_analysis(helper_statement)
+    transport_parameters = {
+        name
+        for _raw, names, type_text, is_proof, ambiguous in helper_binders
+        if not is_proof and not ambiguous
+        and (_graph_application_arg_count(type_text, first_identifier(type_text)) or 0) > 0
+        for name in names
+    }
+    transport_premises = [
+        positive
+        for premise in premises
+        if (positive := negated_body(premise))
+        and has_live_structure(positive)
+        and families & atom_families(positive, bound_names)
+        and any(
+            _right_pi_term_mentions_dependency(positive_conclusion, name)
+            and _right_pi_term_mentions_dependency(positive, name)
+            for name in transport_parameters
+        )
+    ] if has_live_structure(positive_conclusion) else []
     for target in (root_statement, *active_target_statements):
         predicate_names: Set[str] = set()
         target_tail = target
+        target_premises, _target_conclusion, _target_names = (
+            _dossier_statement_premises_and_conclusion(target)
+        )
+        transport_requires_extra_negative_assumption = bool(transport_premises) and not any(
+            families & atom_families(positive, _target_names)
+            for premise in target_premises
+            if (positive := negated_body(premise))
+        )
         while target_tail:
             target_body, target_binders = _graph_leading_binder_analysis(target_tail)
             predicate_names.update(
@@ -2922,10 +3078,56 @@ def _dossier_is_conditional_negative_auxiliary(
                 return False
             if head in {*target_names, "fun", "let", "if", "match"}:
                 return False
-            tokens = rejection_tokens(candidate)
-            if not tokens or families & tokens:
+            tokens = atom_families(candidate_body, target_names)
+            positive_atoms = proposition_atoms(positive_conclusion)
+            positive_witness_names = _dossier_quantifier_bound_names(positive_conclusion)
+            target_atoms = proposition_atoms(candidate_body)
+            target_witness_names = _dossier_quantifier_bound_names(candidate_body)
+            no_closed_target_atom = target_atoms is not None and all(
+                not (atom_families(atom, target_names) & families)
+                or has_live_structure(atom)
+                or any(
+                    _right_pi_term_mentions_dependency(atom, name)
+                    for name in target_witness_names
+                )
+                for atom in target_atoms
+            )
+            # A live witness used only in a harmless conjunct must not launder
+            # a separate scalar refutation: `∃ n, n = s.card ∧ Prime 4` still
+            # contradicts a root asserting Prime 4. Keep named scalar
+            # predicates conservative even when decorated arguments mention
+            # data/witnesses: cancellation or beta reduction can erase them.
+            # Witness relations such as `0 < d` in an AP property differ from
+            # these named scalar atoms; function properties retain their own
+            # live lambda structure.
+            no_scalar_refuting_atom = positive_atoms is not None and all(
+                not (atom_families(atom, bound_names) & tokens)
+                or has_live_structure(atom)
+                or (
+                    (
+                        first_identifier(atom) in operator_heads
+                        or _top_level_token_positions(
+                            atom, ("≤", "≥", "≠", "∈", "∉", "⊆", "∣", "=", "<", ">")
+                        )
+                    )
+                    and any(
+                        _right_pi_term_mentions_dependency(atom, name)
+                        for name in positive_witness_names
+                    )
+                )
+                for atom in positive_atoms
+            )
+            if not tokens or (
+                families & tokens
+                and not (
+                    transport_requires_extra_negative_assumption
+                    and has_live_structure(candidate_body)
+                    and no_closed_target_atom
+                    and no_scalar_refuting_atom
+                )
+            ):
                 return False
-    return not any(
+    return not scope_exhausted and not any(
         _dossier_statements_root_adjacent(
             positive_conclusion,
             target,
@@ -12568,6 +12770,7 @@ class ProofDossier:
                             root_statement=self.root_statement,
                             active_target_statements=active_target_statements,
                             bound_names=bound_names,
+                            helper_statement=statement,
                         )
                     )
                 )
@@ -20597,6 +20800,16 @@ class ProofDossier:
         return cls._from_execution_record(record, authority=None)
 
     @classmethod
+    def _from_execution_record_for_reverification(cls, record: Dict[str, Any]) -> "ProofDossier":
+        """Private staging only: retain complete tactic syntax for fresh Lean.
+
+        This is not authenticated proof authority. In particular, saved root
+        and disproof receipts retain the ordinary conservative import policy.
+        The caller must recheck every helper before publishing this dossier.
+        """
+        return cls._from_execution_record(record, authority=None, reverify_complete_helpers=True)
+
+    @classmethod
     def _from_authenticated_execution_record(
         cls,
         record: Dict[str, Any],
@@ -20614,6 +20827,7 @@ class ProofDossier:
         record: Dict[str, Any],
         *,
         authority: object | None,
+        reverify_complete_helpers: bool = False,
     ) -> "ProofDossier":
         trusted_execution_restore = authority is _AUTHENTICATED_EXECUTION_RESTORE
 
@@ -20626,6 +20840,7 @@ class ProofDossier:
         dossier = cls._from_record(
             data,
             trusted_execution_restore=trusted_execution_restore,
+            reverify_complete_helpers=reverify_complete_helpers,
         )
         dossier._root_proof_finalization_receipts = set()
         if trusted_execution_restore:
@@ -20723,6 +20938,7 @@ class ProofDossier:
         record: Dict[str, Any],
         *,
         trusted_execution_restore: bool,
+        reverify_complete_helpers: bool = False,
     ) -> "ProofDossier":
         """Rehydrate a dossier from ``to_record`` JSON-compatible data."""
 
@@ -20961,7 +21177,7 @@ class ProofDossier:
             # (sorry/admit and an unresolved ``exact ?_``) remain rejected by
             # the validated-complete placeholder check itself.
             trusted_execution_helper = bool(
-                trusted_execution_restore
+                (trusted_execution_restore or reverify_complete_helpers)
                 and item_has_graph_verification_receipt
             )
             if (

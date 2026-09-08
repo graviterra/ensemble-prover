@@ -104,6 +104,7 @@ from .mini_falsification import (
     require_falsification_search_bound,
     require_falsification_watchdog,
 )
+from .cost_policy import require_cost_budget_usd
 from .mini_recursive import (
     PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
     _probe_active_root_targets,
@@ -441,6 +442,8 @@ from .certify_counterexample_tool import (
 )
 from .utils import display_line_count, format_exception, parse_tool_arguments
 from .llm_error_policy import (
+    ProviderAccountUnavailable,
+    is_provider_account_failure,
     LLMErrorClassification,
     classify_llm_error_text,
     classify_llm_exception,
@@ -12849,6 +12852,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Resume an attempt checkpoint into a new output generation, retaining its saved configuration.",
     )
     p.add_argument(
+        "--resume-accept-source-hash", default="", metavar="SAVED_SHA256",
+        help=("Explicitly approve resuming after an executor update by supplying the saved "
+              "executor_source_hash. Input, policy, checkpoint integrity, budgets, and fresh "
+              "Lean verification remain enforced. Requires --resume-from."),
+    )
+    p.add_argument(
         "--no-checkpoint", dest="checkpoint_enabled", action="store_false", default=True,
         help="Disable durable execution checkpoints for this new run.",
     )
@@ -13042,7 +13051,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--cost-budget-usd",
-        type=float,
+        type=require_cost_budget_usd,
         default=0.0,
         help=(
             "Optional MiniSession LLM dollar budget. 0 disables budget stops "
@@ -14356,7 +14365,7 @@ async def _validate_cost_budget_pricing(
     role_clients: Sequence[tuple[str, Any]],
 ) -> tuple[Dict[str, Any], ...]:
     """Fail before proof work if an enabled dollar budget cannot be priced."""
-    if max(0.0, float(max_cost_usd or 0.0)) <= 0.0:
+    if require_cost_budget_usd(max_cost_usd) == 0.0:
         return ()
     checked: List[Dict[str, Any]] = []
     unknown: List[Dict[str, Any]] = []
@@ -14790,6 +14799,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     worker_started_monotonic = time.monotonic()
     worker_admitted_elapsed_s = None
     args = resolve_resume_args(args)
+    args.cost_budget_usd = require_cost_budget_usd(getattr(args, "cost_budget_usd", 0.0))
     # CLI namespaces can also be supplied programmatically.  Validate the
     # complete falsification numeric surface before installing handlers,
     # resolving theorem inputs, or initializing any runtime service.
@@ -14843,6 +14853,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             checkpoint_registry = AttemptCheckpointRegistry(
                 output_dir, identity=cli_attempt_identity(args, problem),
                 resume_from=(Path(args.resume_from) if getattr(args, "resume_from", None) else None),
+                resume_accept_source_hash=str(getattr(args, "resume_accept_source_hash", "") or ""),
                 startup_artifacts=startup_artifacts,
                 worker_started_monotonic=worker_started_monotonic,
                 worker_admitted_elapsed_s=worker_admitted_elapsed_s,
@@ -14906,6 +14917,13 @@ async def _main_async(args: argparse.Namespace) -> int:
 
     try:
         print("=== mini_prover run ===")
+        if checkpoint_registry is not None and checkpoint_registry.source_transition:
+            recorder.record_turn({
+                "action": "checkpoint_resume",
+                "verdict": "executor_source_change_accepted",
+                "source_transition": dict(checkpoint_registry.source_transition),
+                "predecessor": checkpoint_registry.predecessor,
+            })
         print(f"Output dir: {output_dir}")
         print(
             "Terminal trace: "
@@ -15704,6 +15722,10 @@ async def _main_async(args: argparse.Namespace) -> int:
             failure_reason = f"{type(exc).__name__}: {exc}"
             infrastructure_aborted = True
             print(f"\nUNCAUGHT EXCEPTION: {failure_reason}", flush=True)
+    except ProviderAccountUnavailable as exc:
+        failure_reason = exc.reason
+        infrastructure_aborted = True
+        print(f"\nPROVIDER ACCOUNT UNAVAILABLE: {failure_reason}", flush=True)
     except SystemExit as exc:
         # Setup-side SystemExit (most commonly missing API key from
         # ``_make_role_cfg``). Capture it so the finally block can finalize
@@ -16047,6 +16069,10 @@ async def _main_async(args: argparse.Namespace) -> int:
                     usage_summary=usage_summary,
                     recorder_metrics=dict(getattr(recorder, "metrics", {}) or {}),
                 )
+                infrastructure_aborted = bool(
+                    infrastructure_aborted
+                    or (not ok and is_provider_account_failure(effective_failure_reason))
+                )
                 failure_reason_detail = _mini_prover_unsolved_failure_detail(
                     ok=bool(ok),
                     effective_failure_reason=effective_failure_reason,
@@ -16198,6 +16224,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                     ),
                     "failure_reason_detail": failure_reason_detail,
                     "controller_failure_reason": controller_failure_reason,
+                    "infrastructure_aborted": infrastructure_aborted,
                     "prover": (
                         {"provider": args.prover, "model": prover_cfg.model}
                         if prover_cfg
@@ -16918,8 +16945,13 @@ async def _main_async(args: argparse.Namespace) -> int:
                         "The proof search did not reach a mathematical "
                         "solved/unsolved verdict."
                     )
-                    if failure_reason:
-                        print(f"Failure: {failure_reason}")
+                    if effective_failure_reason:
+                        print(f"Failure: {effective_failure_reason}")
+                    if is_provider_account_failure(effective_failure_reason):
+                        if checkpoint_registry is not None:
+                            print("Restore API account access or credits, then use --resume-from with this run directory.")
+                        else:
+                            print("Checkpointing was disabled. Restore API account access or credits, then start a new run.")
                     print("=" * 64)
                 else:
                     print(f"NOT SOLVED: {problem.theorem_name}")

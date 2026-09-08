@@ -1058,6 +1058,7 @@ class ChildClosureAction:
             execution_status.get("deadline_deferred")
             or execution_status.get("retryable_timeout")
             or execution_status.get("retryable_infrastructure")
+            or execution_status.get("all_operations_deferred_before_launch")
         )
         if not ok and not helpers and retryable_execution_defer:
             metadata["preserve_frontier_work"] = True
@@ -1110,7 +1111,13 @@ class ChildClosureAction:
             metadata["hard_pivot_neutral"] = True
         if root_candidate is not None:
             metadata["root_finalization_already_applied"] = True
-        if not metadata.get("preserve_action_budget"):
+        if execution_status.get("all_operations_deferred_before_launch"):
+            # The advisory falsifier may have run, but no selected proving
+            # operation started. Preserve its retry without spending a proof
+            # contract attempt or minting semantic iteration headroom. Elapsed
+            # time and ordinary scheduler iterations still bound deferrals.
+            metadata["semantic_budget_step_consumed"] = False
+        elif not metadata.get("preserve_action_budget"):
             # ``proof_work`` is a semantic budget scope. Durable frontier
             # identities prevent replay of the same work, while this marker
             # keeps the outer loop open for the next declaration/context item.
