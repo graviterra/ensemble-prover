@@ -10051,6 +10051,8 @@ def _plan_root_assembly_claim_names(
     satisfied_dependency_helpers: Sequence[Any] = (),
     active_target_statements: Sequence[str] = (),
     active_target_contract_identities: Sequence[str] = (),
+    require_dependency_closure: bool = True,
+    allow_surface_heuristics: bool = True,
 ) -> tuple[str, ...]:
     """Return claims that explicitly connect the plan back to its root.
 
@@ -10266,20 +10268,27 @@ def _plan_root_assembly_claim_names(
         else:
             root_connected = bool(
                 active_target_match
-                or graph_statement_root_equivalent(
-                    statement,
-                    root_statement,
-                    active_target_statements=(root_statement, *active_targets),
-                )
-                or _is_assembly_like_claim(
-                    claim,
-                    root_statement=root_statement,
+                or (
+                    allow_surface_heuristics
+                    and (
+                        graph_statement_root_equivalent(
+                            statement,
+                            root_statement,
+                            active_target_statements=(root_statement, *active_targets),
+                        )
+                        or _is_assembly_like_claim(
+                            claim,
+                            root_statement=root_statement,
+                        )
+                    )
                 )
             )
         if not root_connected:
             continue
         name = str(claim.name or "").strip()
-        if name and name not in names and selected_dependency_closure_present(claim):
+        if name and name not in names and (
+            not require_dependency_closure or selected_dependency_closure_present(claim)
+        ):
             names.append(name)
     return tuple(names)
 
@@ -14944,7 +14953,9 @@ _CONTROLLER_ROOT_ASSEMBLY_NAME_RE = re.compile(
 # treated lexical heuristics as vetoes and let `fails` bypass a missing check.
 # v3 makes prose advisory and requires missing-check migration regardless of
 # the declared status; existing valid selected work still needs no new model call.
-_PLAN_DIAGNOSTICS_RECEIPT_VERSION = 3
+# v4 re-audits role-labelled schemas after root-contract adjudication, including
+# already selected v3 queues that could retain a mislabelled prerequisite.
+_PLAN_DIAGNOSTICS_RECEIPT_VERSION = 4
 
 
 def _claim_has_controller_sanity_exemption(
@@ -15055,6 +15066,7 @@ def _claim_declared_sanity_contract_reason(
     require_complete: bool = False,
     root_statement: str = "",
     active_target_statements: Sequence[str] = (),
+    allow_root_schema_exemption: bool = True,
 ) -> str:
     """Return a diagnostic reason for one typed planner sanity receipt."""
 
@@ -15077,8 +15089,22 @@ def _claim_declared_sanity_contract_reason(
         root_statement=root_statement,
         active_target_statements=active_target_statements,
     )
+    # A declared root route must reach the separate Lean contract check even
+    # when its surface spelling differs from the elaborated root. Numerical
+    # prose cannot establish that equivalence, and requiring it here can erase
+    # the route before the authoritative check runs. This grants no contract
+    # identity or proof authority; new dependencies keep their own admission
+    # requirements, and a falsely labelled route still fails root validation.
+    root_schema = bool(
+        allow_root_schema_exemption
+        and str(root_statement or "").strip()
+        and str(getattr(claim, "role", "") or "").strip().lower()
+        == "root_assembly"
+    )
     sanity_required = (
-        _claim_sanity_requirement(claim).required and not controller_exempt
+        _claim_sanity_requirement(claim).required
+        and not controller_exempt
+        and not root_schema
     )
     if sanity_required and not check:
         return "sanity_check_required"
@@ -15112,6 +15138,9 @@ def _filter_plan_declared_sanity_contract(
     require_complete: bool = False,
     active_target_statements: Sequence[str] = (),
     withhold_missing_required_checks: bool = False,
+    confirm_root_schemas: bool = False,
+    active_target_contract_identities: Sequence[str] = (),
+    missing_checks_only: bool = False,
 ) -> MiniSubgoalPlan:
     """Audit receipts and optionally withhold protocol-incomplete fresh work.
 
@@ -15130,12 +15159,33 @@ def _filter_plan_declared_sanity_contract(
                 require_complete=require_complete,
                 root_statement=plan.root_statement,
                 active_target_statements=active_target_statements,
+                allow_root_schema_exemption=(
+                    not confirm_root_schemas
+                    or (
+                        str(claim.role or "").strip().lower() == "root_assembly"
+                        and bool(
+                            _plan_root_assembly_claim_names(
+                                plan,
+                                candidate_claims=(claim,),
+                                active_target_statements=(
+                                    plan.root_statement, *active_target_statements,
+                                ),
+                                active_target_contract_identities=(
+                                    active_target_contract_identities
+                                ),
+                                require_dependency_closure=False,
+                                allow_surface_heuristics=False,
+                            )
+                        )
+                    )
+                ),
             )
         )
+        and (not missing_checks_only or reason == "sanity_check_required")
     }
     if not diagnostics:
         return plan
-    withheld_names: set[str] = set()
+    withheld_by_name: dict[str, list[MiniSubgoalClaim]] = {}
     kept: list[MiniSubgoalClaim] = []
     for index, claim in enumerate(plan.claims):
         reason = diagnostics.get(index)
@@ -15192,7 +15242,7 @@ def _filter_plan_declared_sanity_contract(
         if withhold:
             claim_name = str(claim.name or "").strip()
             if claim_name:
-                withheld_names.add(claim_name)
+                withheld_by_name.setdefault(claim_name, []).append(claim)
             stats.plans_sanity_contract_withheld += 1
             _add_planner_feedback(
                 planner_feedback,
@@ -15217,23 +15267,48 @@ def _filter_plan_declared_sanity_contract(
                 "the statement classification requests one."
             ),
         )
-    if not withheld_names:
+    if not withheld_by_name:
         return plan
-    while withheld_names:
+
+    def dependency_was_withheld(claim: MiniSubgoalClaim, dependency: str) -> bool:
+        rejected = withheld_by_name.get(dependency, ())
+        if not rejected:
+            return False
+        bindings = {
+            str(identity or "").strip()
+            for name, identity in claim.dependency_semantic_identities
+            if str(name or "").strip() == dependency and str(identity or "").strip()
+        }
+        if len(bindings) != 1:
+            return True
+        binding = next(iter(bindings))
+        if binding.startswith(("unresolved:", "ambiguous-internal:")):
+            return True
+        # Two tranches may reuse a label for different frozen obligations.
+        # Only the rejected obligation's consumers are tainted. Legacy claims
+        # without frozen identity remain ambiguous and are withheld safely.
+        return any(
+            not candidate.origin_plan_fingerprint
+            or not candidate.obligation_id
+            or _claim_matches_dependency_route(candidate, binding)
+            for candidate in rejected
+        )
+
+    while withheld_by_name:
         next_kept: list[MiniSubgoalClaim] = []
-        newly_withheld: set[str] = set()
+        newly_withheld: dict[str, list[MiniSubgoalClaim]] = {}
         for claim in kept:
             tainted = [
                 str(dependency or "").strip()
                 for dependency in claim.dependencies
-                if str(dependency or "").strip() in withheld_names
+                if dependency_was_withheld(claim, str(dependency or "").strip())
             ]
             if not tainted:
                 next_kept.append(claim)
                 continue
             claim_name = str(claim.name or "").strip()
             if claim_name:
-                newly_withheld.add(claim_name)
+                newly_withheld.setdefault(claim_name, []).append(claim)
             stats.plans_sanity_contract_withheld += 1
             _record(
                 record_event,
@@ -15261,7 +15336,7 @@ def _filter_plan_declared_sanity_contract(
                 ),
             )
         kept = next_kept
-        withheld_names = newly_withheld
+        withheld_by_name = newly_withheld
     return dataclass_replace(plan, claims=tuple(kept))
 
 
@@ -26092,6 +26167,26 @@ async def run_mini_recursive_driver(
                         },
                     )
 
+            # Initial role-only admission lets equivalent spellings reach Lean.
+            # Source arbitration may retain a mismatched schema as another
+            # route's prerequisite; that does not excuse its missing receipt.
+            # Recheck each actual claim, not the union of recognized names.
+            plan = _filter_plan_declared_sanity_contract(
+                plan,
+                pass_index=pass_index,
+                record_event=contract_filter_event_sink,
+                stats=original_filter_stats,
+                planner_feedback=planner_feedback,
+                require_complete=bool(config.planner_sanity_contract_required),
+                active_target_statements=plan_active_target_statements,
+                withhold_missing_required_checks=bool(
+                    config.planner_sanity_contract_required
+                ),
+                confirm_root_schemas=True,
+                active_target_contract_identities=active_target_contract_identities,
+                missing_checks_only=True,
+            )
+
             elaborated_root_candidate_names = tuple(
                 str(claim.name or "")
                 for index, claim in enumerate(canonical_contract_plan.claims)
@@ -27332,6 +27427,23 @@ async def run_mini_recursive_driver(
                             original_plan=replan_original,
                             canonical_plan=replan_canonical,
                         )
+                    replan_filtered = _filter_plan_declared_sanity_contract(
+                        replan_filtered,
+                        pass_index=pass_index,
+                        record_event=record_event,
+                        stats=stats,
+                        planner_feedback=planner_feedback,
+                        require_complete=bool(config.planner_sanity_contract_required),
+                        active_target_statements=plan_active_target_statements,
+                        withhold_missing_required_checks=bool(
+                            config.planner_sanity_contract_required
+                        ),
+                        confirm_root_schemas=True,
+                        active_target_contract_identities=(
+                            replan_active_target_contract_identities
+                        ),
+                        missing_checks_only=True,
+                    )
                     replan_failed_root_indices = [
                         index
                         for index, ok in enumerate(replan_coverage.claim_elaborated)
@@ -27811,6 +27923,35 @@ async def run_mini_recursive_driver(
             plan,
             claims=tuple(candidate_source),
         )
+        if not restored_selected_plan and (
+            pending_unproved_plan_claims or deferred_priority_claims
+        ):
+            # Retained frontiers join after fresh-plan contract admission. A
+            # current receipt on that fresh tranche says nothing about the
+            # older obligations; audit their complete dependency union before
+            # selection, and retire exactly the withheld objects from both
+            # queues so they cannot reappear on the next continuation.
+            candidate_route_identity_plan = _filter_plan_declared_sanity_contract(
+                candidate_route_identity_plan,
+                pass_index=pass_index,
+                record_event=record_event,
+                stats=stats,
+                planner_feedback=planner_feedback,
+                require_complete=bool(config.planner_sanity_contract_required),
+                active_target_statements=plan_active_target_statements,
+                withhold_missing_required_checks=bool(
+                    config.planner_sanity_contract_required
+                ),
+                confirm_root_schemas=True,
+                active_target_contract_identities=active_target_contract_identities,
+                missing_checks_only=True,
+            )
+            admitted_ids = {id(claim) for claim in candidate_route_identity_plan.claims}
+            for retained_queue in (pending_unproved_plan_claims, deferred_priority_claims):
+                for key, claim in tuple(retained_queue.items()):
+                    if id(claim) not in admitted_ids:
+                        retained_queue.pop(key)
+            candidate_source = candidate_route_identity_plan.claims
         candidate_plan_dependency_identities = _plan_claim_route_identity_map(
             candidate_route_identity_plan,
             dependency_identities=contract_dependency_identities,
@@ -27969,7 +28110,8 @@ async def run_mini_recursive_driver(
         # Checkpoints predating the current admission receipt need one audit.
         # v1 meant diagnostic-only sanity handling; v2 could admit a missing
         # required check when its status was `fails`. Neither receipt alone
-        # authorizes the queue under current admission. Version-0 legacy
+        # authorizes the queue under current admission; v3 could exempt a
+        # wrong-root prerequisite on its role alone. Version-0 legacy
         # claims and controller claims retain their claim-level exemptions.
         if (
             restored_selected_plan
@@ -28020,6 +28162,8 @@ async def run_mini_recursive_driver(
                 withhold_missing_required_checks=bool(
                     config.planner_sanity_contract_required
                 ),
+                confirm_root_schemas=True,
+                active_target_contract_identities=active_target_contract_identities,
             )
             admitted_claim_ids = {id(claim) for claim in restored_claim_plan.claims}
             claims = [

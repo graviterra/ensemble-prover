@@ -2884,6 +2884,7 @@ def _dossier_is_conditional_negative_auxiliary(
     # coarse ingredients of every root conclusion. These ingredients deny
     # the exception; they never establish equality or refutation authority.
     from .proof_graph import (
+        _GRAPH_NON_PROP_CLASS_HEADS,
         _graph_application_arg_count,
         _graph_application_first_argument,
         _graph_bridge_variant_rejection_tokens,
@@ -2947,8 +2948,195 @@ def _dossier_is_conditional_negative_auxiliary(
     max_scope_work = 250_000
     local_definition_names: Set[str] = set()
     protected_families: Set[str] = set()
+    conditional_relational_data_transport = False
+    target_scalar_names: Set[str] = set()
+    target_bound_names: Set[str] = set()
+    target_instance_override = False
 
-    def proposition_atoms(text: str, depth: int = 0) -> Optional[List[str]]:
+    def aggregate_instance_override(
+        binders: Sequence[Tuple[str, Tuple[str, ...], str, bool, bool]],
+        names: Set[str],
+    ) -> bool:
+        # Instance synthesis also uses ordinary named class-valued locals.
+        # Unknown instances cannot establish standard aggregate semantics.
+        # These determined classes do not change the operations themselves.
+        determined = {"Decidable", "DecidableEq", "LocallyFiniteOrder"}
+        for raw, _names, typ, proof, ambiguous in binders:
+            head = first_identifier(_dossier_strip_balanced_outer_parens(typ))
+            if head in determined and head not in names:
+                continue
+            if not proof and (
+                ambiguous or raw.startswith("[")
+                or head in _GRAPH_NON_PROP_CLASS_HEADS | {"SupSet", "HasSubset"}
+            ):
+                return True
+        return False
+
+    def transport_aggregate_value(
+        binding: str, type_text: str, scope_names: Set[str], instance_override: bool,
+    ) -> bool:
+        """Narrow eligibility fallback, never a root/refutation certificate.
+
+        A structured negative transport can support an extremal data bound.
+        Its relational predicates inside an aggregate do not make it an
+        unconditional counterexample. Keep scalar predicates, decision
+        encodings, local aliases and unfamiliar control syntax conservative.
+        """
+        visible_names = target_bound_names | scope_names
+        if (
+            not conditional_relational_data_transport
+            or instance_override
+            or target_instance_override
+            or visible_names & {
+                "Nat", "ℕ", "Real", "ℝ", "Finset", "sSup",
+                "Finset.Ico", "Finset.Icc", "Finset.range",
+            }
+        ):
+            return False
+        value = binding.split(":=", 1)[1].strip()
+        # Recognize the complete cardinality-extremum expression, not an
+        # incidental sSup token: arbitrary aggregates can encode a refutation.
+        # Unrecognized notation remains advisory; this is not a Lean parser.
+        natural = {"Nat", "ℕ"}
+        scalar_types = natural | {"Real", "ℝ"}
+        reserved = scalar_types | {"Finset", "sSup", "fun"}
+
+        def numeric(text: str, names: Set[str]) -> bool:
+            tokens = set(_dossier_lean_identifier_tokens(text))
+            if not tokens <= names | scalar_types:
+                return False
+            rest = identifier_pattern.sub("", text)
+            return bool(text.strip()) and re.fullmatch(r"[\s\d()+*/^:↑-]*", rest) is not None
+
+        def peel_casts(text: str) -> str:
+            body = _dossier_strip_balanced_outer_parens(text)
+            while (colon := _dossier_top_level_colon_index(body)) >= 0:
+                if body[colon + 1:].strip() not in scalar_types:
+                    return ""
+                body = _dossier_strip_balanced_outer_parens(body[:colon])
+            return body
+
+        arrows = _dossier_split_top_level_implications(type_text)
+        if len(arrows) != 2 or arrows[0].strip() not in natural or arrows[1].strip() not in scalar_types:
+            return False
+        separators = _top_level_token_positions(value, ("=>", "↦"))
+        if not value.startswith("fun ") or len(separators) != 1:
+            return False
+        index, arrow = separators[0]
+        parameter = value[4:index].strip()
+        if not re.fullmatch(r"[^\W\d][\w']*", parameter) or parameter in reserved | target_bound_names:
+            return False
+        scalars = target_scalar_names | {parameter}
+        expression = peel_casts(value[index + len(arrow):])
+        divisions = _top_level_token_positions(expression, ("/",))
+        if divisions:
+            if len(divisions) != 1:
+                return False
+            split = divisions[0][0]
+            if not numeric(expression[split + 1:], scalars):
+                return False
+            expression = peel_casts(expression[:split])
+        if not expression.startswith("sSup "):
+            return False
+        builder = expression[len("sSup "):].strip()
+        if not builder.startswith("{") or _dossier_matching_group_index(builder, 0) != len(builder) - 1:
+            return False
+        inside = builder[1:-1]
+        bar = _dossier_top_level_binder_separator_index(inside, ("|",))
+        if bar < 0:
+            return False
+        declaration, predicate = inside[:bar].strip(), inside[bar + 1:].strip()
+        _tail, cardinal_binders = _graph_leading_binder_analysis(f"∀ ({declaration}), True")
+        if len(cardinal_binders) != 1:
+            return False
+        _raw, cardinal_names, cardinal_type, proof, ambiguous = cardinal_binders[0]
+        if len(cardinal_names) != 1 or cardinal_type.strip() not in natural or proof or ambiguous:
+            return False
+        cardinal = cardinal_names[0]
+        comma = _dossier_find_top_level_comma(predicate)
+        if not predicate.startswith("∃ ") or comma < 0:
+            return False
+        _tail, set_binders = _graph_leading_binder_analysis("∀ " + predicate[1:comma].strip() + ", True")
+        if len(set_binders) != 1:
+            return False
+        _raw, set_names, set_type, proof, ambiguous = set_binders[0]
+        if len(set_names) != 1 or set_type.strip() not in {"Finset Nat", "Finset ℕ"} or proof or ambiguous:
+            return False
+        local_set = set_names[0]
+        if cardinal == local_set or {cardinal, local_set} & (reserved | scalars | target_bound_names):
+            return False
+        if canonical_lean_identifier(f"{local_set}.card") in visible_names:
+            return False
+        atoms = _dossier_split_top_level_conjunctions(predicate[comma + 1:])
+        if len(atoms) != 3:
+            return False
+        equality = {f"{local_set}.card={cardinal}", f"{cardinal}={local_set}.card"}
+        if sum(re.sub(r"\s+", "", _dossier_strip_balanced_outer_parens(atom)) in equality for atom in atoms) != 1:
+            return False
+        bounds = patterns = membership_count = 0
+
+        def pattern(text: str, witnesses: Set[str], depth: int = 0) -> bool:
+            nonlocal membership_count
+            if depth > 32:
+                return False
+            body = _dossier_strip_balanced_outer_parens(text)
+            if body.startswith(("∃ ", "∀ ")):
+                comma = _dossier_find_top_level_comma(body)
+                if comma < 0:
+                    return False
+                _tail, binders = _graph_leading_binder_analysis("∀ " + body[1:comma].strip() + ", True")
+                added: Set[str] = set()
+                for _raw, names, typ, proof, ambiguous in binders:
+                    if not names or typ.strip() not in natural or proof or ambiguous:
+                        return False
+                    if set(names) & (reserved | scalars | witnesses | added | {cardinal, local_set}):
+                        return False
+                    added.update(names)
+                return bool(added) and pattern(body[comma + 1:], witnesses | added, depth + 1)
+            parts = _dossier_split_top_level_implications(body)
+            if len(parts) == 1:
+                parts = _dossier_split_top_level_conjunctions(body)
+            if len(parts) > 1:
+                return all(pattern(part, witnesses, depth + 1) for part in parts)
+            relations = _top_level_token_positions(body, ("∈", "≤", "<", "="))
+            if len(relations) != 1:
+                return False
+            index, relation = relations[0]
+            left, right = body[:index].strip(), body[index + len(relation):].strip()
+            if not numeric(left, scalars | witnesses):
+                return False
+            if relation == "∈":
+                membership_count += 1
+                return right == local_set
+            return numeric(right, scalars | witnesses) and bool(
+                witnesses.intersection(_dossier_lean_identifier_tokens(body))
+            )
+
+        for atom in atoms:
+            atom = _dossier_strip_balanced_outer_parens(atom)
+            if re.sub(r"\s+", "", atom) in equality:
+                continue
+            if cardinal in _dossier_lean_identifier_tokens(atom):
+                return False
+            subset = _top_level_token_positions(atom, ("⊆",))
+            if len(subset) == 1 and atom[:subset[0][0]].strip() == local_set:
+                bound = atom[subset[0][0] + 1:].strip()
+                head = first_identifier(bound)
+                arity = {"Finset.Ico": 2, "Finset.Icc": 2, "Finset.range": 1}.get(head)
+                if arity is None or _graph_application_arg_count(bound, head) != arity or not numeric(bound[len(head):], scalars):
+                    return False
+                bounds += 1
+            else:
+                positive = negated_body(atom)
+                if not positive or not pattern(positive, set()):
+                    return False
+                patterns += 1
+        return bounds == patterns == 1 and membership_count > 0
+
+    def proposition_atoms(
+        text: str, depth: int = 0, *,
+        scope_names: Optional[Set[str]] = None, instance_override: bool = False,
+    ) -> Optional[List[str]]:
         """Inspect logical scope, never propositions inside data arguments.
 
         For example, a predicate occurring in a set comprehension passed to
@@ -2957,6 +3145,7 @@ def _dossier_is_conditional_negative_auxiliary(
         delimiter; peeling the binder before splitting preserves that scope.
         """
         nonlocal scope_work, scope_exhausted
+        scope_names = set() if scope_names is None else scope_names
         scope_work += len(text)
         if depth >= max_scope_depth or scope_work > max_scope_work:
             scope_exhausted = True
@@ -2979,14 +3168,25 @@ def _dossier_is_conditional_negative_auxiliary(
                 or binders[0][3]
                 or binders[0][4]
                 or _graph_type_returns_prop(type_text)
-                or protected_families.intersection(rejection_tokens(annotation))
+                or (
+                    protected_families.intersection(rejection_tokens(annotation))
+                    and not transport_aggregate_value(
+                        binding, type_text, scope_names, instance_override,
+                    )
+                )
             ):
                 return None
             # A local data definition does not change the outer proposition
             # family. A local predicate alias does: retain its name so an
             # application of it fails closed instead of looking unrelated.
             local_definition_names.add(canonical_lean_identifier(name))
-            return proposition_atoms(remainder, depth + 1)
+            return proposition_atoms(
+                remainder, depth + 1,
+                scope_names=scope_names | {canonical_lean_identifier(name)},
+                instance_override=instance_override or aggregate_instance_override(
+                    binders, target_bound_names | scope_names,
+                ),
+            )
         if _dossier_top_level_quantifier_token_len(body, 0):
             commas = _top_level_token_positions(body, (",",))
             if not commas:
@@ -3002,15 +3202,31 @@ def _dossier_is_conditional_negative_auxiliary(
                 for _raw, _names, type_text, is_proof, ambiguous in binders
             ):
                 return None
-            return proposition_atoms(body[commas[0][0] + 1 :], depth + 1)
+            return proposition_atoms(
+                body[commas[0][0] + 1 :], depth + 1,
+                scope_names=scope_names | {
+                    canonical_lean_identifier(name)
+                    for _raw, names, _typ, _proof, _ambiguous in binders
+                    for name in names
+                },
+                instance_override=instance_override or aggregate_instance_override(
+                    binders, target_bound_names | scope_names,
+                ),
+            )
         implications = _dossier_split_top_level_implications(body)
         if len(implications) > 1:
-            return proposition_atoms(implications[-1], depth + 1)
+            return proposition_atoms(
+                implications[-1], depth + 1,
+                scope_names=scope_names, instance_override=instance_override,
+            )
         conjunctions = _dossier_split_top_level_conjunctions(body)
         if len(conjunctions) > 1:
             atoms: List[str] = []
             for part in conjunctions:
-                nested = proposition_atoms(part, depth + 1)
+                nested = proposition_atoms(
+                    part, depth + 1,
+                    scope_names=scope_names, instance_override=instance_override,
+                )
                 if nested is None:
                     return None
                 atoms.extend(nested)
@@ -3122,7 +3338,27 @@ def _dossier_is_conditional_negative_auxiliary(
             for name in transport_parameters
         )
     ] if has_live_structure(positive_conclusion) else []
+    transport_atoms = proposition_atoms(positive_conclusion)
+    transport_witness_names = _dossier_quantifier_bound_names(positive_conclusion)
+    relational_transport = bool(
+        transport_premises
+        and families
+        and all(family.startswith("operator:") for family in families)
+        and transport_atoms
+        and all(
+            has_live_structure(atom)
+            or any(
+                _right_pi_term_mentions_dependency(atom, name)
+                for name in transport_witness_names
+            )
+            for atom in transport_atoms
+        )
+    )
     for target in (root_statement, *active_target_statements):
+        conditional_relational_data_transport = False
+        target_scalar_names = set()
+        target_bound_names = set()
+        target_instance_override = False
         predicate_names: Set[str] = set()
         target_tail = target
         target_premises, _target_conclusion, _target_names = (
@@ -3133,8 +3369,18 @@ def _dossier_is_conditional_negative_auxiliary(
             for premise in target_premises
             if (positive := negated_body(premise))
         )
+        conditional_relational_data_transport = bool(
+            relational_transport and transport_requires_extra_negative_assumption
+        )
         while target_tail:
             target_body, target_binders = _graph_leading_binder_analysis(target_tail)
+            target_instance_override = target_instance_override or aggregate_instance_override(
+                target_binders, target_bound_names,
+            )
+            for _raw, names, typ, proof, ambiguous in target_binders:
+                target_bound_names.update(canonical_lean_identifier(name) for name in names)
+                if not proof and not ambiguous and typ.strip() in {"Nat", "ℕ", "Real", "ℝ"}:
+                    target_scalar_names.update(canonical_lean_identifier(name) for name in names)
             predicate_names.update(
                 canonical_lean_identifier(name)
                 for _raw, names, type_text, _is_proof, _ambiguous in target_binders

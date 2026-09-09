@@ -1163,11 +1163,12 @@ def _helper_lemma_blocks(
 
 
 def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[TacticCandidate]:
-    """Amortize Lean startup for adjacent, closing-only helper alternatives.
+    """Amortize Lean startup for adjacent, closing-only preflight alternatives.
 
     Every original script remains in order. ``solve`` requires a branch to
     close all goals, so a partial simpa cannot hide a later successful branch.
-    Other tactics (including residual-producing ones) keep separate checks.
+    The initial ``intros; omega`` probe can share the same check. Other tactics
+    (including residual-producing ones) keep separate checks.
     """
 
     direct_sources = {
@@ -1199,7 +1200,13 @@ def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[Ta
         pending.clear()
 
     for candidate in candidates:
-        if candidate.source in direct_sources and candidate.proof.startswith("by\n  "):
+        quick_intro = (
+            candidate.source == "intro_coercion"
+            and candidate.proof == _proof_from_lines(("intros", "omega"))
+        )
+        if (
+            candidate.source in direct_sources or quick_intro
+        ) and candidate.proof.startswith("by\n  "):
             pending.append(candidate)
             if len(pending) >= 8:
                 flush()
