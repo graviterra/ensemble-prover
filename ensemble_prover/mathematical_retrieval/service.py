@@ -1515,6 +1515,10 @@ class VerifiedHelperSource:
         self.environment_hash = str(environment_hash or "")
         self._active_source_hashes: frozenset[str] = frozenset()
         self._active_helper_names_by_source_hash: dict[str, str] = {}
+        self._helper_context_bindings: tuple[tuple[str, str, str], ...] = ()
+        self._helper_context_id = ""
+        self._last_helper_context: Optional[dict[str, tuple[str, str]]] = None
+        self._normalized_source_keys: dict[str, str] = {}
         self._indexed_snapshot = ""
         self._entries: tuple[Any, ...] = ()
         self._inverted: dict[str, set[int]] = {}
@@ -1599,15 +1603,61 @@ class VerifiedHelperSource:
     def record_generation(self) -> tuple[tuple[str, str], ...]:
         return tuple(sorted(self._record_generation.items()))
 
-    def set_rechecked(self, source_hashes: Sequence[str]) -> None:
+    def set_rechecked(
+        self,
+        source_hashes: Sequence[str],
+        *,
+        helper_names_by_source_hash: Optional[Mapping[str, str]] = None,
+    ) -> None:
         self._active_source_hashes = frozenset(
             str(item).strip() for item in source_hashes if str(item).strip()
         )
+        names = (
+            self._active_helper_names_by_source_hash
+            if helper_names_by_source_hash is None
+            else helper_names_by_source_hash
+        )
         self._active_helper_names_by_source_hash = {
             source_hash: helper_name
-            for source_hash, helper_name in self._active_helper_names_by_source_hash.items()
+            for source_hash, helper_name in names.items()
             if source_hash in self._active_source_hashes
         }
+        self._set_helper_context_bindings(())
+        self._last_helper_context = None
+
+    def _set_helper_context_bindings(
+        self, bindings: tuple[tuple[str, str, str], ...]
+    ) -> None:
+        self._helper_context_bindings = bindings
+        self._helper_context_id = stable_retrieval_hash(bindings) if bindings else ""
+
+    def set_helper_context(self, helpers: Mapping[str, tuple[str, str]]) -> None:
+        """Replace visibility without reading or normalizing the cache corpus.
+
+        Compact fingerprints describe only the rendered context. Renamed
+        cache identities are resolved later inside the bounded index/search
+        operation, without changing the source's snapshot identity.
+        """
+        from ensemble_prover.utils import rename_lean_identifier
+
+        names = {source_hash: name for name, (source_hash, _source) in helpers.items()}
+        if helpers == self._last_helper_context:
+            bindings = self._helper_context_bindings
+        else:
+            pending: list[tuple[str, str, str]] = []
+            for name, (_source_hash, helper_source) in helpers.items():
+                normalized = rename_lean_identifier(
+                    helper_source, name, "__retrieval_helper_identity"
+                )
+                pending.append((
+                    name,
+                    hashlib.sha256(helper_source.encode()).hexdigest(),
+                    hashlib.sha256(normalized.encode()).hexdigest(),
+                ))
+            bindings = tuple(sorted(pending))
+        self.set_rechecked(tuple(names), helper_names_by_source_hash=names)
+        self._set_helper_context_bindings(bindings)
+        self._last_helper_context = dict(helpers)
 
     def snapshot_id(self) -> str:
         if self.allowed_record_ids is not None:
@@ -1620,6 +1670,10 @@ class VerifiedHelperSource:
                     "rechecked_source_hashes": sorted(self._active_source_hashes),
                     "rechecked_helper_names": sorted(
                         self._active_helper_names_by_source_hash.items()
+                    ),
+                    **(
+                        {"helper_context_id": self._helper_context_id}
+                        if self._helper_context_id else {}
                     ),
                 }
             )
@@ -1642,6 +1696,10 @@ class VerifiedHelperSource:
                 "rechecked_helper_names": sorted(
                     self._active_helper_names_by_source_hash.items()
                 ),
+                **(
+                    {"helper_context_id": self._helper_context_id}
+                    if self._helper_context_id else {}
+                ),
             }
         )
 
@@ -1654,7 +1712,12 @@ class VerifiedHelperSource:
             }
         )
 
-    def _ensure_index(self) -> None:
+    def _ensure_index(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+        deadline_exhausted: Optional[Callable[[], bool]] = None,
+    ) -> None:
         snapshot = self.snapshot_id()
         if self._indexed_snapshot == snapshot:
             return
@@ -1662,13 +1725,21 @@ class VerifiedHelperSource:
         raw_records = list(records() or ()) if callable(records) else []
         entries: list[Any] = []
         inverted: dict[str, set[int]] = defaultdict(set)
+        bindings: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for landed_name, source_digest, normalized_digest in self._helper_context_bindings:
+            bindings[normalized_digest].append((landed_name, source_digest))
+        complete = True
         for record in raw_records:
+            if _retrieval_elapsed(deadline_monotonic, deadline_exhausted):
+                complete = False
+                break
             if (
                 self.allowed_record_ids is not None
                 and _helper_record_id(record) not in self.allowed_record_ids
             ):
                 continue
             name = str(record.get("name") or "").strip()
+            original_name = name
             statement = str(
                 record.get("statement_preview") or record.get("statement") or ""
             ).strip()
@@ -1677,6 +1748,12 @@ class VerifiedHelperSource:
             name = self._active_helper_names_by_source_hash.get(source_hash, name)
             if not name or not statement or not source or not source_hash:
                 continue
+            context_name = (
+                self._context_name_for_source(source, source_hash, bindings)
+                if bindings and source_hash not in self._active_source_hashes
+                else ""
+            )
+            name = context_name or name
             entry = SimpleNamespace(
                 name=name,
                 type=statement,
@@ -1687,16 +1764,46 @@ class VerifiedHelperSource:
                 _helper_source=source,
                 _source_hash=source_hash,
                 _owner_theorem=str(record.get("theorem_name") or ""),
+                _original_helper_name=original_name,
+                _helper_context_id=self._helper_context_id if context_name else "",
             )
             index = len(entries)
             entries.append(entry)
             for token in _normalized_analogy_tokens(
-                f"{name} {statement} {entry._owner_theorem}"
+                f"{name} {original_name} {statement} {entry._owner_theorem}"
             ):
                 inverted[token].add(index)
         self._entries = tuple(entries)
         self._inverted = dict(inverted)
-        self._indexed_snapshot = snapshot
+        self._indexed_snapshot = snapshot if complete else ""
+
+    def _context_name_for_source(
+        self,
+        source: str,
+        source_hash: str,
+        bindings: Mapping[str, Sequence[tuple[str, str]]],
+    ) -> str:
+        from ensemble_prover.proof_dossier import helper_decl_name, text_hash
+        from ensemble_prover.utils import rename_lean_identifier
+
+        name = helper_decl_name(source)
+        if not name or text_hash(source) != source_hash:
+            return ""
+        # Forked search views share this memo under the existing backend lock.
+        # Entries are pure source identities, never availability receipts.
+        with self.cache_lock:
+            normalized_digest = self._normalized_source_keys.get(source_hash)
+            if normalized_digest is None:
+                normalized = rename_lean_identifier(
+                    source, name, "__retrieval_helper_identity"
+                )
+                normalized_digest = hashlib.sha256(normalized.encode()).hexdigest()
+                self._normalized_source_keys[source_hash] = normalized_digest
+        for landed_name, landed_digest in bindings.get(normalized_digest, ()):
+            renamed = rename_lean_identifier(source, name, landed_name)
+            if hashlib.sha256(renamed.encode()).hexdigest() == landed_digest:
+                return landed_name
+        return ""
 
     def iter_entries(self) -> Sequence[Any]:
         self._ensure_index()
@@ -1713,7 +1820,14 @@ class VerifiedHelperSource:
             trust_kind="kernel_checked_foreign_environment",
             availability=(
                 "already_imported"
-                if source_hash in self._active_source_hashes
+                if (
+                    source_hash in self._active_source_hashes
+                    or (
+                        self._helper_context_id
+                        and _entry_value(entry, "_helper_context_id", "")
+                        == self._helper_context_id
+                    )
+                )
                 else "requires_helper_recheck"
             ),
             helper_source=str(_entry_value(entry, "_helper_source", "") or ""),
@@ -1739,7 +1853,10 @@ class VerifiedHelperSource:
                 ),
             )
         try:
-            self._ensure_index()
+            self._ensure_index(
+                deadline_monotonic=deadline_monotonic,
+                deadline_exhausted=deadline_exhausted,
+            )
             query_text = " ".join(
                 item
                 for item in (
@@ -1759,7 +1876,10 @@ class VerifiedHelperSource:
                 if _retrieval_elapsed(deadline_monotonic, deadline_exhausted):
                     break
                 entry = self._entries[index]
-                score = _analogy_score(query_text, f"{_entry_name(entry)} {_entry_type(entry)}")
+                score = _analogy_score(
+                    query_text,
+                    f"{_entry_name(entry)} {entry._original_helper_name} {_entry_type(entry)}",
+                )
                 if query.theorem_name and str(
                     _entry_value(entry, "_owner_theorem", "") or ""
                 ) == query.theorem_name:
@@ -2493,6 +2613,10 @@ class MathematicalRetrievalService:
                         if source_hash in rechecked_source_hashes
                     },
                 }
+                if source._helper_context_bindings:
+                    records[source.source_id]["helper_context_bindings"] = [
+                        list(binding) for binding in source._helper_context_bindings
+                    ]
             elif isinstance(source, PublishedTheorySource):
                 allowed_bundle_ids = (
                     set(source.allowed_bundle_ids)
@@ -2753,6 +2877,22 @@ class MathematicalRetrievalService:
                     if str(source_hash or "").strip()
                     and str(helper_name or "").strip()
                 }
+                context_bindings: list[tuple[str, str, str]] = []
+                raw_bindings = saved_record.get("helper_context_bindings", [])
+                if not isinstance(raw_bindings, (list, tuple)):
+                    raise ValueError(f"malformed checkpoint helper context: {source_id}")
+                for binding in raw_bindings:
+                    if (
+                        not isinstance(binding, (list, tuple))
+                        or len(binding) != 3
+                        or not all(isinstance(value, str) for value in binding)
+                        or not binding[0].strip()
+                        or any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in binding[1:])
+                    ):
+                        raise ValueError(f"malformed checkpoint helper context: {source_id}")
+                    context_bindings.append(tuple(binding))
+                if len({binding[0] for binding in context_bindings}) != len(context_bindings):
+                    raise ValueError(f"duplicate checkpoint helper context: {source_id}")
                 if not rechecked.issubset(allowed_source_hashes) or not set(
                     aliases
                 ).issubset(rechecked):
@@ -2768,6 +2908,7 @@ class MathematicalRetrievalService:
                             "allowed_source_hashes": allowed_source_hashes,
                             "rechecked": rechecked,
                             "aliases": aliases,
+                            "context_bindings": tuple(sorted(context_bindings)),
                         },
                     )
                 )
@@ -2851,6 +2992,8 @@ class MathematicalRetrievalService:
                 source.allowed_source_hashes = state["allowed_source_hashes"]
                 source._active_source_hashes = state["rechecked"]
                 source._active_helper_names_by_source_hash = dict(state["aliases"])
+                source._set_helper_context_bindings(state["context_bindings"])
+                source._last_helper_context = None
                 source._indexed_snapshot = ""
             elif isinstance(source, PublishedTheorySource):
                 source.allowed_bundle_ids = state["allowed_bundle_ids"]
@@ -2948,6 +3091,13 @@ class MathematicalRetrievalService:
                 forked._active_helper_names_by_source_hash = dict(
                     source._active_helper_names_by_source_hash
                 )
+                forked._set_helper_context_bindings(source._helper_context_bindings)
+                forked._last_helper_context = (
+                    dict(source._last_helper_context)
+                    if source._last_helper_context is not None
+                    else None
+                )
+                forked._normalized_source_keys = source._normalized_source_keys
                 forked.allowed_source_hashes = source.allowed_source_hashes
                 forked.allowed_record_ids = source.allowed_record_ids
                 forked_sources.append(forked)
@@ -3055,6 +3205,31 @@ class MathematicalRetrievalService:
         for source in self.sources:
             if isinstance(source, VerifiedHelperSource):
                 source.set_rechecked(source_hashes)
+
+    def set_verified_helper_context(
+        self, dossier: Any, helper_blocks: Sequence[str]
+    ) -> None:
+        """Replace discovery availability with the controller's Lean context.
+
+        Registry membership alone is insufficient: policy, dependency closure,
+        and route scope may withhold an otherwise checked helper. Use stored
+        source identities because rendered duplicate proofs can be aliases.
+        This changes discovery metadata only; it never admits a helper.
+        """
+        from ensemble_prover.proof_dossier import helper_decl_name, text_hash
+
+        registry = getattr(dossier, "verified_helpers", {}) or {}
+        helpers: dict[str, tuple[str, str]] = {}
+        for block in helper_blocks:
+            name = helper_decl_name(block)
+            helper = registry.get(name)
+            source_hash = str(getattr(helper, "source_hash", "") or "").strip()
+            helper_source = str(getattr(helper, "source", "") or "").strip()
+            if name and helper_source and text_hash(helper_source) == source_hash:
+                helpers[name] = (source_hash, helper_source)
+        for source in self.sources:
+            if isinstance(source, VerifiedHelperSource):
+                source.set_helper_context(helpers)
 
     def mark_project_module_imported(self, module_name: str) -> None:
         del module_name

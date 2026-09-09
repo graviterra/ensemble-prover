@@ -5372,6 +5372,11 @@ async def _call_llm_with_tools_one_round_impl(
                     elif name == "search_theorems" and hasattr(
                         searcher, "static_mathlib_searcher"
                     ):
+                        set_context = getattr(
+                            searcher, "set_verified_helper_context", None
+                        )
+                        if callable(set_context):
+                            set_context(dossier, tool_helper_blocks())
                         run_federated_search = primitives[
                             "run_search_theorems_tool"
                         ]

@@ -4007,7 +4007,8 @@ def _graph_is_binder_name_surface(text: str) -> bool:
         match = re.match(r"[^\W\d][\w']*", raw[index:], flags=re.UNICODE)
         if match is None:
             return False
-        if match.group(0).lower() in reserved:
+        # Lean keywords are case-sensitive; capitalized spellings are names.
+        if match.group(0) in reserved:
             return False
         index += len(match.group(0))
         found = True
@@ -4030,7 +4031,7 @@ def _graph_binder_names_from_chunk(chunk: str) -> Tuple[str, ...]:
             body = body[:separator]
         body = body.translate(str.maketrans({ch: " " for ch in "(){}[]⦃⦄⟨⟩"}))
         for name in _graph_lean_identifier_tokens(body):
-            if name.lower() in {"forall", "exists", "fun", "by", "let", "in"}:
+            if name in {"forall", "exists", "fun", "by", "let", "in"}:
                 continue
             if name not in names:
                 names.append(name)

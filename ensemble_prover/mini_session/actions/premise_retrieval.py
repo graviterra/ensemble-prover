@@ -86,6 +86,13 @@ class PremiseRetrievalAction:
             or getattr(session.problem, "statement_type", "")
         )
         try:
+            def sync_helper_availability() -> None:
+                set_context = getattr(session.searcher, "set_verified_helper_context", None)
+                dossier = getattr(session, "dossier", None)
+                if callable(set_context) and dossier is not None:
+                    set_context(dossier, dossier.verified_helper_blocks())
+
+            sync_helper_availability()
             retrieval_timeout_s = max(
                 0.01,
                 min(
@@ -202,6 +209,7 @@ class PremiseRetrievalAction:
                     increment = getattr(session, "_increment_dossier_metric", None)
                     if callable(increment):
                         increment("mini_mathematical_retrieval_helper_rechecks", 1)
+                    sync_helper_availability()
                     retrieval_record = await retrieve_premise_record_async(
                         session.searcher,
                         goal_statement=goal_statement,
@@ -215,7 +223,11 @@ class PremiseRetrievalAction:
                         deadline_exhausted=action_deadline_exhausted,
                     )
                     hits = list(getattr(retrieval_record, "hits", ()) or ())
-                    already_usable = True
+                    already_usable = bool(
+                        hits
+                        and str(getattr(hits[0], "availability", "") or "")
+                        == "already_imported"
+                    )
                     break
             if not already_usable:
                 attempted_imports: set[tuple[str, str]] = set()
@@ -404,6 +416,7 @@ class PremiseRetrievalAction:
                         increment("mini_mathematical_retrieval_module_imports", 1)
                         if imported_project_modules:
                             increment("mini_mathematical_retrieval_project_imports", 1)
+                    sync_helper_availability()
                     retrieval_record = await retrieve_premise_record_async(
                         session.searcher,
                         goal_statement=goal_statement,
@@ -518,6 +531,7 @@ class PremiseRetrievalAction:
                                 or ()
                             )
                         )
+                    sync_helper_availability()
                     retrieval_record = await retrieve_premise_record_async(
                         session.searcher,
                         goal_statement=goal_statement,

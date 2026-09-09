@@ -3789,6 +3789,9 @@ async def prove_problem_via_session(
         if not premise_retrieval_enabled or target_searcher is None:
             return "", [], {}
         try:
+            set_context = getattr(target_searcher, "set_verified_helper_context", None)
+            if callable(set_context):
+                set_context(target_dossier, target_dossier.verified_helper_blocks())
             from ensemble_prover.premise_retrieval import (
                 retrieve_premise_record_async,
             )

@@ -2182,7 +2182,7 @@ def _dossier_binder_names_from_chunk(chunk: str) -> Tuple[str, ...]:
     raw = raw.translate(str.maketrans({ch: " " for ch in "(){}[]⦃⦄⟨⟩"}))
     names: List[str] = []
     for name in _dossier_lean_identifier_tokens(raw):
-        if name.lower() in {"forall", "exists", "fun", "by", "let", "in"}:
+        if name in {"forall", "exists", "fun", "by", "let", "in"}:
             continue
         if name not in names:
             names.append(name)
@@ -2888,6 +2888,8 @@ def _dossier_is_conditional_negative_auxiliary(
         _graph_application_first_argument,
         _graph_bridge_variant_rejection_tokens,
         _graph_leading_binder_analysis,
+        _graph_let_binding_name_from_prefix,
+        _graph_top_level_let_parts,
         _graph_type_returns_prop,
     )
 
@@ -2896,26 +2898,55 @@ def _dossier_is_conditional_negative_auxiliary(
         "Membership.mem": "∈", "Dvd.dvd": "∣", "Set.Subset": "⊆",
     }
 
-    def first_identifier(text: str) -> str:
-        match = re.match(r"@?([^\W\d][\w']*(?:\.[^\W\d][\w']*)*)", text)
-        return match.group(1) if match else ""
+    identifier_segment = r"(?:«[^»]+»|[^\W\d][\w']*)"
+    identifier_pattern = re.compile(
+        rf"@?({identifier_segment}(?:\.{identifier_segment})*)"
+    )
+
+    def first_identifier(text: str, *, canonical: bool = True) -> str:
+        match = identifier_pattern.match(text)
+        if match is None:
+            return ""
+        raw = match.group(1)
+        return canonical_lean_identifier(raw).removeprefix("_root_.") if canonical else raw
 
     def rejection_tokens(text: str) -> Set[str]:
         tokens = set(_graph_bridge_variant_rejection_tokens(text))
+        names = tuple(
+            canonical_lean_identifier(name)
+            for name in _dossier_lean_identifier_tokens(text)
+        )
         # Retain qualified user predicate suffixes that the shared graph guard
         # strips as standard elaboration names (for example `Wrapped.Eq`).
-        tokens.update("identifier:" + name for name in _dossier_lean_identifier_tokens(text))
-        # The shared guard recognizes explicit applications. Include implicit
-        # applications as well, since checked source can use either spelling.
-        for name, operator in operator_heads.items():
-            if re.search(r"(?<![\w'.])@?" + re.escape(name) + r"(?![\w'])", text):
-                tokens.add("operator:" + operator)
+        tokens.update("identifier:" + name for name in names)
+        tokens.update(
+            "identifier:" + name.rsplit(".", 1)[-1]
+            for name in names
+        )
+        # Match complete qualified names, including escaped segments, without
+        # turning a user predicate such as Wrapped.Eq into the builtin Eq.
+        index = 0
+        while index < len(text):
+            skip_to = _lean_lexical_skip_end(text, index)
+            if skip_to is not None and not text.startswith("«", index):
+                index = skip_to
+                continue
+            match = identifier_pattern.match(text, index)
+            if match is None:
+                index += 1
+                continue
+            name = canonical_lean_identifier(match.group(1)).removeprefix("_root_.")
+            if name in operator_heads:
+                tokens.add("operator:" + operator_heads[name])
+            index = match.end()
         return tokens
 
     scope_work = 0
     scope_exhausted = False
     max_scope_depth = 64
     max_scope_work = 250_000
+    local_definition_names: Set[str] = set()
+    protected_families: Set[str] = set()
 
     def proposition_atoms(text: str, depth: int = 0) -> Optional[List[str]]:
         """Inspect logical scope, never propositions inside data arguments.
@@ -2931,10 +2962,46 @@ def _dossier_is_conditional_negative_auxiliary(
             scope_exhausted = True
             return None
         body = _dossier_strip_balanced_outer_parens(text)
+        if re.match(r"let\s", body):
+            binding, remainder = _graph_top_level_let_parts(body)
+            name = _graph_let_binding_name_from_prefix(binding)
+            if not name or not remainder:
+                return None
+            annotation = binding[len("let"):].strip()[len(name):].strip()
+            if not annotation.startswith(":") or ":=" not in annotation:
+                return None
+            type_text = annotation[1:].split(":=", 1)[0].strip()
+            _tail, binders = _graph_leading_binder_analysis(
+                f"∀ ({name} : {type_text}), True"
+            )
+            if (
+                len(binders) != 1
+                or binders[0][3]
+                or binders[0][4]
+                or _graph_type_returns_prop(type_text)
+                or protected_families.intersection(rejection_tokens(annotation))
+            ):
+                return None
+            # A local data definition does not change the outer proposition
+            # family. A local predicate alias does: retain its name so an
+            # application of it fails closed instead of looking unrelated.
+            local_definition_names.add(canonical_lean_identifier(name))
+            return proposition_atoms(remainder, depth + 1)
         if _dossier_top_level_quantifier_token_len(body, 0):
             commas = _top_level_token_positions(body, (",",))
             if not commas:
                 return [body]
+            prefix = _dossier_top_level_quantifier_token_len(body, 0)
+            _tail, binders = _graph_leading_binder_analysis(
+                "∀ " + body[prefix:commas[0][0]].strip() + ", True"
+            )
+            if any(
+                (bool(local_definition_names) and (not type_text.strip() or ambiguous))
+                or _graph_type_returns_prop(type_text)
+                or (body.startswith("∃") and (is_proof or ambiguous))
+                for _raw, _names, type_text, is_proof, ambiguous in binders
+            ):
+                return None
             return proposition_atoms(body[commas[0][0] + 1 :], depth + 1)
         implications = _dossier_split_top_level_implications(body)
         if len(implications) > 1:
@@ -2956,6 +3023,18 @@ def _dossier_is_conditional_negative_auxiliary(
         if atoms is None:
             return set()
         for atom in atoms:
+            head = first_identifier(atom)
+            if head in {"And", "Or", "Exists", "Iff"}:
+                if head in {
+                    *(canonical_lean_identifier(name) for name in names),
+                    *local_definition_names,
+                }:
+                    return set()
+                # In elaborated logical applications, lambda arrows are not
+                # equality/order operators. Preserve the conservative scan of
+                # the whole assertion, including existential proof witnesses.
+                families.update(rejection_tokens(atom))
+                continue
             positions = _top_level_token_positions(
                 atom, ("↔", "→", "->", "∧", "∨", "≤", "≥", "≠", "∈", "∉", "⊆", "∣", "=", "<", ">")
             )
@@ -2964,18 +3043,16 @@ def _dossier_is_conditional_negative_auxiliary(
                     return set()
                 families.update("operator:" + token for _index, token in positions)
                 continue
-            head = first_identifier(atom)
-            if not head or head in {*names, "fun", "let", "if", "match"}:
+            if not head or head in {
+                *(canonical_lean_identifier(name) for name in names),
+                *local_definition_names, "fun", "let", "if", "match"
+            }:
                 return set()
-            if head in {"And", "Or", "Exists", "Iff"}:
-                # Preserve the conservative elaborated-syntax fallback.
-                families.update(rejection_tokens(atom))
-            else:
-                families.add(
-                    "operator:" + operator_heads[head]
-                    if head in operator_heads
-                    else "identifier:" + head.rsplit(".", 1)[-1]
-                )
+            families.add(
+                "operator:" + operator_heads[head]
+                if head in operator_heads
+                else "identifier:" + head.rsplit(".", 1)[-1]
+            )
         return families
 
     positive_candidates = _dossier_root_conclusion_candidates(positive_conclusion)
@@ -2985,6 +3062,7 @@ def _dossier_is_conditional_negative_auxiliary(
     families = atom_families(positive_body, (*bound_names, *positive_names))
     if not families:
         return False
+    protected_families.update(families)
 
     def has_live_structure(text: str) -> bool:
         """Recognize a property of witnesses or a genuinely varying function."""
@@ -2995,7 +3073,7 @@ def _dossier_is_conditional_negative_auxiliary(
         if prefix:
             separators = _top_level_token_positions(body, (",",))
         else:
-            head = first_identifier(body)
+            head = first_identifier(body, canonical=False)
             body = _dossier_strip_balanced_outer_parens(
                 _graph_application_first_argument(body, head)
             ) if head else ""
@@ -3025,7 +3103,11 @@ def _dossier_is_conditional_negative_auxiliary(
         name
         for _raw, names, type_text, is_proof, ambiguous in helper_binders
         if not is_proof and not ambiguous
-        and (_graph_application_arg_count(type_text, first_identifier(type_text)) or 0) > 0
+        and (
+            _graph_application_arg_count(
+                type_text, first_identifier(type_text, canonical=False)
+            ) or 0
+        ) > 0
         for name in names
     }
     transport_premises = [
@@ -3054,7 +3136,7 @@ def _dossier_is_conditional_negative_auxiliary(
         while target_tail:
             target_body, target_binders = _graph_leading_binder_analysis(target_tail)
             predicate_names.update(
-                name
+                canonical_lean_identifier(name)
                 for _raw, names, type_text, _is_proof, _ambiguous in target_binders
                 if _graph_type_returns_prop(type_text)
                 for name in names
@@ -3069,14 +3151,20 @@ def _dossier_is_conditional_negative_auxiliary(
             candidate_body = _dossier_strip_balanced_outer_parens(candidate_parts[-1])
             # An outer predicate parameter can be instantiated by a constant
             # proposition even underneath an existential or conjunction.
-            if predicate_names.intersection(_dossier_lean_identifier_tokens(candidate_body)):
+            if predicate_names.intersection(
+                canonical_lean_identifier(name)
+                for name in _dossier_lean_identifier_tokens(candidate_body)
+            ):
                 return False
             head = first_identifier(candidate_body)
             # A parenthesized application can hide a bound predicate behind
             # beta reduction. Unknown prefixes cannot show a distinct family.
             if not head and not candidate_body.startswith(("∃", "∀")):
                 return False
-            if head in {*target_names, "fun", "let", "if", "match"}:
+            if head in {
+                *(canonical_lean_identifier(name) for name in target_names),
+                "fun", "if", "match"
+            }:
                 return False
             tokens = atom_families(candidate_body, target_names)
             positive_atoms = proposition_atoms(positive_conclusion)

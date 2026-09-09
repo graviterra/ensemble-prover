@@ -26529,16 +26529,28 @@ class MiniSession:
         )
 
     def _sync_retrieval_verified_helpers(self) -> None:
-        """Reflect current-dossier kernel checks into session-local retrieval."""
+        """Reflect usable Lean context into session-local retrieval."""
 
+        if self.dossier is None:
+            return
+        set_context = getattr(self.searcher, "set_verified_helper_context", None)
         mark_rechecked = getattr(
             self.searcher,
             "mark_verified_helper_rechecked",
             None,
         )
-        if not callable(mark_rechecked) or self.dossier is None:
+        if not callable(set_context) and not callable(mark_rechecked):
             return
-        for helper in tuple(getattr(self.dossier, "verified_helpers", {}).values()):
+        blocks = self.dossier.verified_helper_blocks()
+        if callable(set_context):
+            set_context(self.dossier, blocks)
+            return
+        from ensemble_prover.proof_dossier import helper_decl_name
+
+        visible_names = {helper_decl_name(block) for block in blocks}
+        for name, helper in tuple(getattr(self.dossier, "verified_helpers", {}).items()):
+            if name not in visible_names:
+                continue
             source = str(getattr(helper, "source", "") or "").strip()
             if source:
                 mark_rechecked(text_hash(source))

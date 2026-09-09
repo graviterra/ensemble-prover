@@ -6686,6 +6686,10 @@ async def run_conversation(
                         elif name == "search_theorems" and isinstance(
                             searcher, MathematicalRetrievalService
                         ):
+                            searcher.set_verified_helper_context(
+                                dossier,
+                                _current_verified_helper_blocks(),
+                            )
                             from .mathematical_retrieval.async_runtime import (
                                 RetrievalWorkerCapacityError,
                                 run_sync_abandonment_safe,
@@ -6700,7 +6704,7 @@ async def run_conversation(
                                         accepted_result_out=accepted_result_out,
                                         goal_state=_active_root_tool_goal_statement(
                                             dossier,
-                                            conv,
+                                            conv=conv,
                                         ),
                                     ),
                                     timeout_s=float(
