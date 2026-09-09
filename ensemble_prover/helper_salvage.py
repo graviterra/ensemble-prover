@@ -1536,6 +1536,43 @@ class HelperSalvageResult:
         return bool(self.accepted)
 
 
+def helper_salvage_telemetry_fields(
+    result: HelperSalvageResult,
+    *,
+    previously_accepted: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """Describe every salvage disposition without changing proof authority.
+
+    Keep acceptance/rejection verdicts compatible with existing consumers,
+    but do not label skipped duplicates or infrastructure deferrals rejected.
+    The category list and counts expose mixed outcomes without implying every
+    candidate shares the summary verdict. Skips need not be duplicates: the
+    salvager also skips declarations it cannot identify.
+    """
+    outcomes = {
+        "accepted": list(dict.fromkeys([*previously_accepted, *result.accepted])),
+        "rejected": list(result.rejected),
+        "skipped": list(result.skipped),
+        "deferred": list(getattr(result, "deferred", ()) or ()),
+    }
+    categories = [category for category, entries in outcomes.items() if entries]
+    primary_category = next(
+        (
+            category
+            for category in ("accepted", "rejected", "deferred", "skipped")
+            if outcomes[category]
+        ),
+        "no_change",
+    )
+    return {
+        **{f"{category}_helpers": entries for category, entries in outcomes.items()},
+        **{f"{category}_count": len(entries) for category, entries in outcomes.items()},
+        "helper_outcome_categories": categories,
+        "helper_outcomes_mixed": len(categories) > 1,
+        "verdict": f"helpers_{primary_category}",
+    }
+
+
 def merge_context_helpers(
     verified_helpers: Sequence[str],
     fresh_helpers: Sequence[str],

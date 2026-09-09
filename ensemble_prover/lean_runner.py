@@ -35,6 +35,7 @@ from .config import (
     _resolve_lean_scratch_root,
 )
 from .contract_identity import (
+    LEAN_CONTRACT_COMPONENT_HASH_VERSION,
     LEAN_CONTRACT_IDENTITY_VERSION,
     make_lean_contract_identity,
 )
@@ -2251,10 +2252,10 @@ class LeanStatementContractAnalysis:
     proof_binder_types: tuple[str, ...] = ()
     # Full Expr hashes for proof-binder domains after Lean head reduction.
     # Unlike ``proof_binder_types`` these remain authoritative across reducible
-    # aliases and pretty-printer notation.  Hashes containing local variables
-    # naturally fail to match standalone closed helpers and fall back to the
-    # existing contextual contract analysis.
+    # aliases and pretty-printer notation. Context-dependent domains have an
+    # empty slot: local variable IDs are not portable statement identities.
     proof_binder_structural_hashes: tuple[str, ...] = ()
+    component_hash_version: int = 0
     # Structural hash of the proposition remaining after independent leading
     # proof binders are erased. This supports Lean-authoritative forward
     # chaining (`H → C` plus `H` supplies `C`) without trusting display text.
@@ -3049,6 +3050,39 @@ def _contract_expr_has_open_universe(value: Any) -> bool:
     return False
 
 
+def _contract_expr_has_open_context(value: Any, *, depth: int = 0) -> bool:
+    """Reject local Expr IDs and loose indices in standalone components.
+
+    Free-variable names are allocation IDs, not mathematical identities.
+    Renumbering them independently would also erase correlations between
+    theorem parameters. Only variables bound inside the component are safe.
+    """
+
+    if not isinstance(value, list) or not value:
+        return False
+    tag = value[0]
+    if not isinstance(tag, str):
+        return any(_contract_expr_has_open_context(item, depth=depth) for item in value)
+    if tag in {"fvar", "mvar"}:
+        return True
+    if tag == "bvar":
+        return not (
+            len(value) == 2
+            and type(value[1]) is int
+            and 0 <= value[1] < depth
+        )
+    if tag in {"forall", "lam"} and len(value) == 4:
+        return _contract_expr_has_open_context(value[2], depth=depth) or (
+            _contract_expr_has_open_context(value[3], depth=depth + 1)
+        )
+    if tag == "let" and len(value) == 5:
+        return any(
+            _contract_expr_has_open_context(item, depth=depth)
+            for item in value[2:4]
+        ) or _contract_expr_has_open_context(value[4], depth=depth + 1)
+    return any(_contract_expr_has_open_context(item, depth=depth) for item in value[1:])
+
+
 def _shift_contract_bvars_after_removed_binder(
     expr: Any,
     *,
@@ -3211,6 +3245,7 @@ def _contract_analysis_from_payload(
                     if _contract_expr_has_open_universe(
                         canonical_binder_expr
                     )
+                    or _contract_expr_has_open_context(canonical_binder_expr)
                     else hash_text(
                         json.dumps(
                             {
@@ -3258,7 +3293,7 @@ def _contract_analysis_from_payload(
             )
             if not _contract_expr_has_open_universe(
                 canonical_conclusion_expr
-            ):
+            ) and not _contract_expr_has_open_context(canonical_conclusion_expr):
                 contract_conclusion_structural_hash = hash_text(
                     json.dumps(
                         {
@@ -3284,6 +3319,7 @@ def _contract_analysis_from_payload(
         proof_binder_structural_hashes=tuple(
             proof_binder_structural_hashes
         ),
+        component_hash_version=LEAN_CONTRACT_COMPONENT_HASH_VERSION,
         contract_conclusion_structural_hash=(
             contract_conclusion_structural_hash
         ),

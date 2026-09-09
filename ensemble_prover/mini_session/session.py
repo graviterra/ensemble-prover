@@ -16820,6 +16820,10 @@ class MiniSession:
             return False
         if self._has_funded_retryable_model_call_defer():
             return False
+        child_closure = self.registered_action("child_closure")
+        pending_tactics = getattr(child_closure, "has_funded_tactic_continuation", None)
+        if callable(pending_tactics) and pending_tactics(self):
+            return False
         eligible = self._eligible_no_progress_action_families()
         seen = (
             self._semantic_signature_action_families(
@@ -33449,6 +33453,13 @@ class MiniSession:
                     version_parts["obligation_proof_hash"] = str(
                         getattr(obligation, "proof_hash", "") or ""
                     )
+        tactic_portfolio_hash = str(
+            self._work_item_field(work_item, "tactic_portfolio_hash", "") or ""
+        )
+        if work_type == "tactic_swarm" and tactic_portfolio_hash:
+            # Do not invalidate unrelated historical consumed/deferred keys
+            # merely by adding an empty field to the work-item schema.
+            version_parts["tactic_portfolio_hash"] = tactic_portfolio_hash
         version = hashlib.sha256(
             repr(sorted(version_parts.items())).encode("utf-8", errors="replace")
         ).hexdigest()[:16]

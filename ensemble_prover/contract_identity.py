@@ -11,7 +11,9 @@ from typing import Optional, Tuple
 LEAN_CONTRACT_IDENTITY_VERSION = 3
 SUPPORTED_LEAN_CONTRACT_IDENTITY_VERSIONS = frozenset({2, 3})
 LEAN_CONTRACT_EVIDENCE_VERSION = 1
-LEAN_CONTRACT_TELESCOPE_EVIDENCE_VERSION = 1
+# Component evidence predating v2 could hash context-local Lean variables.
+LEAN_CONTRACT_TELESCOPE_EVIDENCE_VERSION = 2
+LEAN_CONTRACT_COMPONENT_HASH_VERSION = 1
 _LEAN_CONTRACT_IDENTITY_RE = re.compile(
     r"^lean-expr-v(?P<version>[23]):"
     r"(?P<full>[0-9a-f]{64}):"
@@ -199,7 +201,7 @@ def make_lean_contract_telescope_evidence_receipt(
         separators=(",", ":"),
         ensure_ascii=True,
     )
-    return "lean-contract-telescope-evidence-v1:" + hashlib.sha256(
+    return f"lean-contract-telescope-evidence-v{LEAN_CONTRACT_TELESCOPE_EVIDENCE_VERSION}:" + hashlib.sha256(
         payload.encode("utf-8", errors="replace")
     ).hexdigest()
 

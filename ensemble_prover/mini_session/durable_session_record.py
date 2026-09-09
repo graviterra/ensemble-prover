@@ -294,9 +294,17 @@ async def _verify(lean: Any, *, statement: str, proof: str, helpers: list[str], 
         raise ValueError("saved proof failed fresh Lean checkpoint verification")
 
 
-async def _prepare_dossier(session: Any, data: dict[str, Any]) -> ProofDossier:
-    """Cross conservative import and fresh Lean before restoring any authority."""
-    dossier = ProofDossier._from_execution_record_for_reverification(data)
+async def _prepare_dossier(
+    session: Any, data: dict[str, Any], *, staged_dossier: ProofDossier | None = None,
+) -> ProofDossier:
+    """Freshly verify an imported private dossier before publishing authority.
+
+    Full session restore supplies its already-imported staging object so fresh
+    helper evidence updates the graph bound to its validated scheduler/actions.
+    Other callers receive an independently imported dossier as before.
+    """
+    dossier = (staged_dossier if staged_dossier is not None
+               else ProofDossier._from_execution_record_for_reverification(data))
     originals = data.get("verified_helpers")
     if type(originals) is not list:
         raise ValueError("checkpoint helper list is malformed")
@@ -474,9 +482,11 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
         staged.actions.append(cloned_action)
     staged.recorder = staged.on_event = staged.checkpoint_registry = None
     apply_scheduler_snapshot(staged, data["scheduler"])
-    verified_dossier = await _prepare_dossier(verifier_view, data["dossier"])
-    staged.dossier._root_proof_finalization_receipts = (
-        verified_dossier._root_proof_finalization_receipts
+    # Enrich the same private dossier/graph that owns the validated cursors.
+    # Preparing a second dossier and copying only root receipts would discard
+    # fresh typed helper evidence and its corresponding visibility metadata.
+    await _prepare_dossier(
+        verifier_view, data["dossier"], staged_dossier=staged.dossier,
     )
     if not staged.dossier.final_proof:
         staged.dossier.clear_solved()

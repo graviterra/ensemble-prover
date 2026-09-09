@@ -7362,6 +7362,12 @@ async def _run_graph_native_formalization_helper_contract(
                                     )
                                     or ()
                                 ),
+                                component_hash_version=(
+                                    getattr(contract_analysis, "component_hash_version", 0)
+                                    if getattr(contract_analysis, "component_hash_version", 0)
+                                    == getattr(parent_contract_analysis, "component_hash_version", 0)
+                                    else 0
+                                ),
                             )
                         )
                 else:
@@ -20631,7 +20637,10 @@ async def _run_helpers_only_cascade(
             )
         return None
 
-    from ensemble_prover.helper_salvage import collect_open_child_targets
+    from ensemble_prover.helper_salvage import (
+        collect_open_child_targets,
+        helper_salvage_telemetry_fields,
+    )
 
     salvager = HelperSalvager(
         lean,
@@ -20674,15 +20683,9 @@ async def _run_helpers_only_cascade(
         "phase": "helper_only_salvage",
         "turn_in_phase": phase_turn,
         "candidate_count": len(lemma_dag_candidate_helpers),
-        "accepted_helpers": list(
-            dict.fromkeys([*lemma_dag_helpers, *salvage_result.accepted])
-        ),
-        "rejected_helpers": list(salvage_result.rejected),
-        "skipped_helpers": list(salvage_result.skipped),
-        "verdict": (
-            "helpers_accepted"
-            if lemma_dag_helpers or salvage_result.accepted
-            else "helpers_rejected"
+        **helper_salvage_telemetry_fields(
+            salvage_result,
+            previously_accepted=lemma_dag_helpers,
         ),
     })
 

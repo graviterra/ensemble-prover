@@ -79,7 +79,9 @@ from .proof_graph import (
 import hashlib
 
 from .proof_state import (
+    PROOF_STATE_CHILD_TACTIC_POLICY_VERSION,
     PROOF_STATE_ROOT_TACTIC_PORTFOLIO_SCHEMA_VERSION,
+    validated_child_tactic_portfolio_continuation,
     ProofSearchState,
     ProofStateNode,
     _LEAN_LOCAL_IDENT_RE,
@@ -2966,7 +2968,7 @@ async def _retry_pending_typed_residual_extractions(
                 node_id=parent.node_id,
                 ok=False,
                 attempt_count=max(
-                    1,
+                    0 if type(origin.get("attempt_count")) is int else 1,
                     _durable_nonnegative_int(origin.get("attempt_count")),
                 ),
                 exit_reason=str(receipt_status or "typed_residual_settled"),
@@ -10159,6 +10161,7 @@ def _proof_state_child_tactic_terminal_context_key(
     return text_hash(
         json.dumps(
             {
+                "execution_policy": PROOF_STATE_CHILD_TACTIC_POLICY_VERSION,
                 "target": node.target,
                 "preamble": preamble,
                 "helpers": helpers,
@@ -10609,6 +10612,7 @@ async def _try_proof_state_one_child_closure(
     formal_search_client: Optional[Any] = None,
     cost_controller: Optional[Any] = None,
     action_deadline_monotonic: float = 0.0,
+    candidate_attempt_limit: int = 0,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Run the declaration/tactic/assembler swarm for one proof-state node."""
 
@@ -11807,6 +11811,12 @@ async def _try_proof_state_one_child_closure(
         timeout_s=tactic_available_timeout,
         max_candidates=max_candidates,
     )
+    continuation = validated_child_tactic_portfolio_continuation(
+        node.child_tactic_portfolio_continuation
+    )
+    if continuation.get("context_key") != tactic_terminal_context_key:
+        continuation = {}
+    node.child_tactic_portfolio_continuation = continuation
     if tactic_terminal_context_key in set(
         getattr(node, "tactic_terminal_context_keys", []) or []
     ):
@@ -11843,11 +11853,50 @@ async def _try_proof_state_one_child_closure(
     candidate_portfolio: Optional[Tuple[Any, ...]] = None
     candidate_portfolio_offset = 0
     reusable_candidate_portfolio = False
+    residual_candidates = list(continuation.get("residual_candidates", []))
+    if continuation:
+        from .mini_tactic_closer import TacticCandidate
+
+        candidate_portfolio = tuple(
+            TacticCandidate(**candidate) for candidate in continuation["candidates"]
+        )
+        candidate_portfolio_offset = continuation["next_candidate_index"]
+        reusable_candidate_portfolio = True
+    resumed_offset = candidate_portfolio_offset
+    remaining_candidate_attempts = max(0, int(candidate_attempt_limit or 0))
+
+    def save_child_portfolio() -> Dict[str, Any]:
+        from .mini_tactic_closer import TacticCandidate
+
+        if not candidate_portfolio or not all(
+            isinstance(candidate, TacticCandidate) for candidate in candidate_portfolio
+        ):
+            return {}
+        saved = validated_child_tactic_portfolio_continuation({
+            "schema_version": PROOF_STATE_ROOT_TACTIC_PORTFOLIO_SCHEMA_VERSION,
+            "context_key": tactic_terminal_context_key,
+            "phase": "direct",
+            "candidates": [
+                {
+                    "proof": candidate.proof, "tactic": candidate.tactic,
+                    "source": candidate.source, "helper": candidate.helper,
+                }
+                for candidate in candidate_portfolio
+            ],
+            "next_candidate_index": candidate_portfolio_offset,
+            "residual_candidates": residual_candidates,
+        })
+        if saved:
+            node.child_tactic_portfolio_continuation = saved
+        return saved
 
     # Resume the unattempted suffix of one generated/ranked portfolio after
     # an acceptance veto. This preserves the configured candidate budget
     # without regenerating a full swarm for every Lean-successful proof.
     for _veto_loop in range(max(1, int(max_candidates or 1))):
+        if candidate_attempt_limit > 0 and remaining_candidate_attempts <= 0:
+            final_exit_reason = "candidate_quantum_exhausted"
+            break
         operation_timeout = _remaining_timeout(timeout_s)
         if operation_timeout <= 0.0:
             final_exit_reason = (
@@ -11871,6 +11920,7 @@ async def _try_proof_state_one_child_closure(
                 defer_success_cache=True,
                 candidate_portfolio=candidate_portfolio,
                 candidate_portfolio_offset=candidate_portfolio_offset,
+                candidate_attempt_limit=remaining_candidate_attempts,
                 # The offset already excludes the vetoed prefix on resumed
                 # portfolios. Avoid sorting and copying the growing veto set.
                 suppressed_proofs=(
@@ -11919,6 +11969,10 @@ async def _try_proof_state_one_child_closure(
             if isinstance(attempt, dict)
         ]
         aggregate_attempts.extend(result_attempts)
+        if candidate_attempt_limit > 0:
+            # A veto consumes the same dispatch quantum as a rejected check.
+            # Compatibility backends may omit optional attempt telemetry.
+            remaining_candidate_attempts -= max(1, len(result_attempts))
         if hasattr(result, "candidate_portfolio"):
             reusable_candidate_portfolio = True
             candidate_portfolio = tuple(
@@ -11946,6 +12000,21 @@ async def _try_proof_state_one_child_closure(
             getattr(result, "cache_metadata", {}),
         )
         final_exit_reason = str(getattr(result, "exit_reason", "") or "exhausted")
+        for attempt in result_attempts:
+            if (
+                attempt.get("partial_stub_validated")
+                and attempt.get("remaining_goals")
+                and attempt.get("partial_proof_stub")
+            ):
+                residual = {
+                    "proof": str(attempt["partial_proof_stub"]),
+                    "source": str(attempt.get("source") or ""),
+                }
+                if residual not in residual_candidates:
+                    residual_candidates.append(residual)
+        # Publish settled generation before transferring a successful proof
+        # to the verifier WAL. A deferred-then-vetoed proof must not replay.
+        save_child_portfolio()
         if not (getattr(result, "ok", False) and getattr(result, "proof", None)):
             break
         local_success_attempt = next(
@@ -12102,6 +12171,46 @@ async def _try_proof_state_one_child_closure(
     object.__setattr__(result, "elapsed_s", round(time.monotonic() - tactic_started, 3))
     object.__setattr__(result, "exit_reason", final_exit_reason)
     object.__setattr__(result, "cache_metadata", aggregate_cache_metadata)
+    if (
+        not helper_name
+        and final_exit_reason in {"candidate_quantum_exhausted", "timeout"}
+        and reusable_candidate_portfolio
+        and candidate_portfolio_offset < len(candidate_portfolio or ())
+    ):
+        # Keep the exact ranked suffix, including an underfunded timeout's
+        # candidate. Nothing here is proof authority; acceptance still goes
+        # through the existing helper verifier on a subsequent success.
+        saved_continuation = save_child_portfolio()
+        if saved_continuation:
+            node.child_tactic_portfolio_continuation = saved_continuation
+            node.tactic_attempts += len(aggregate_attempts)
+            node.close_attempts += len(aggregate_attempts)
+            node.blocker = final_exit_reason
+            proof_state.record_tactic_pattern_cache_metrics(aggregate_cache_metadata)
+            records.append({
+                "phase": "proof_state_child_tactic",
+                "turn_in_phase": turn, "node_id": node.node_id,
+                "target": node.target,
+                "tactic_candidate_count": result.candidate_count,
+                **tactic_attempt_telemetry_fields(result.attempts),
+                "tactic_attempts": result.attempts[:10],
+                "tactic_elapsed_s": result.elapsed_s,
+                "tactic_exit_reason": final_exit_reason,
+                "tactic_pattern_cache": aggregate_cache_metadata,
+                "next_candidate_index": candidate_portfolio_offset,
+                "child_tactic_continuation_pending": True,
+                "child_tactic_cursor_advanced": candidate_portfolio_offset > resumed_offset,
+                "retryable_timeout": final_exit_reason == "timeout",
+                "retry_exhausted": False,
+                "verdict": (
+                    "child_tactic_candidate_quantum_timeout_preserved"
+                    if final_exit_reason == "timeout"
+                    else "child_tactic_candidate_quantum_exhausted"
+                ),
+            })
+            # Formal search and residual fanout belong after portfolio
+            # settlement, never inside a yielded candidate quantum.
+            return accepted_helpers, records
     formal_search_run: Optional[Any] = None
     formal_search_attempt_count = 0
     normalized_formal_config: Optional[Any] = None
@@ -12131,7 +12240,11 @@ async def _try_proof_state_one_child_closure(
             normalized_formal_config = None
     if (
         not helper_name
-        and final_exit_reason != "lean_admission_deferred"
+        and final_exit_reason not in {
+            "lean_admission_deferred", "acceptance_retryable_error",
+            "pending_helper_acceptance_owned",
+        }
+        and not (continuation and resumed_offset == len(continuation["candidates"]))
         and normalized_formal_config is not None
         and bool(getattr(normalized_formal_config, "enabled", False))
         and formal_search_client is not None
@@ -12439,25 +12552,20 @@ async def _try_proof_state_one_child_closure(
                         )
     tactic_spawned: List[str] = []
     tactic_residual_deferred = False
-    if not helper_name:
-        for attempt in result.attempts[:8]:
-            if not isinstance(attempt, dict):
-                continue
-            remaining_goals = list(attempt.get("remaining_goals") or [])
-            partial_stub = str(
-                attempt.get("partial_proof_stub")
-                or attempt.get("proof_stub")
-                or ""
-            ).strip()
-            if (
-                not remaining_goals
-                or not partial_stub
-                or not bool(attempt.get("partial_stub_validated", False))
-            ):
-                continue
-            residual_source = (
-                f"tactic:{attempt.get('source') or attempt.get('tactic') or result.exit_reason}"
-            )
+    residual_producer_precharged = bool(
+        not helper_name and residual_candidates
+        and final_exit_reason not in {
+            "acceptance_retryable_error", "pending_helper_acceptance_owned",
+        }
+    )
+    if residual_producer_precharged:
+        # The completed checks belong to this producer, not to each residual
+        # verifier receipt. Charge them once before any verifier can yield.
+        node.tactic_attempts += len(result.attempts)
+        node.close_attempts += len(result.attempts)
+        for residual in list(residual_candidates):
+            partial_stub = residual["proof"]
+            residual_source = f"tactic:{residual['source']}"
             spawned, typed_goal_count, receipt_status = (
                 await _extract_and_spawn_typed_residual_goals(
                     lean=lean,
@@ -12477,9 +12585,9 @@ async def _try_proof_state_one_child_closure(
                         "kind": "tactic_residual",
                         "turn_index": turn,
                         "tactic_source": str(
-                            attempt.get("source") or attempt.get("tactic") or ""
+                            residual["source"]
                         ),
-                        "attempt_count": len(result.attempts),
+                        "attempt_count": 0,
                         "terminal_context_key": tactic_terminal_context_key,
                         "cache_metadata": dict(
                             getattr(result, "cache_metadata", {}) or {}
@@ -12488,8 +12596,18 @@ async def _try_proof_state_one_child_closure(
                 )
             )
             node = proof_state.nodes.get(node.node_id, node)
-            attempt["partial_stub_validation"] = receipt_status
-            attempt["typed_residual_goal_count"] = typed_goal_count
+            for attempt in result.attempts:
+                if attempt.get("partial_proof_stub") == partial_stub:
+                    attempt["partial_stub_validation"] = receipt_status
+                    attempt["typed_residual_goal_count"] = typed_goal_count
+            pending_stub = str(
+                (node.pending_residual_goal_extraction or {}).get("parent_proof_stub") or ""
+            )
+            if not receipt_status.endswith("_deferred") or pending_stub == partial_stub:
+                # Retire only this settled hint (or transfer it to the typed
+                # verifier WAL); cancellation cannot erase later siblings.
+                residual_candidates.remove(residual)
+                save_child_portfolio()
             if receipt_status.endswith("_deferred"):
                 tactic_residual_deferred = True
                 final_exit_reason = receipt_status
@@ -12503,6 +12621,14 @@ async def _try_proof_state_one_child_closure(
             node.action = "assemble_from_children"
             node.blocker = f"tactic residual spawned {len(set(tactic_spawned))} subgoal(s)"
             node.priority = proof_state._priority(node)
+    if helper_name or (
+        not residual_candidates
+        and final_exit_reason not in {
+            "lean_admission_deferred", "acceptance_retryable_error",
+            "pending_helper_acceptance_owned",
+        }
+    ):
+        node.child_tactic_portfolio_continuation = {}
     timeout_outcome = bool(
         not helper_name
         and not tactic_spawned
@@ -12549,7 +12675,9 @@ async def _try_proof_state_one_child_closure(
             node_id=node.node_id,
             ok=bool(helper_name),
             attempt_count=(
-                max(1, len(result.attempts))
+                formal_search_attempt_count
+                if residual_producer_precharged
+                else max(1, len(result.attempts))
                 if timeout_retry_exhausted
                 else len(result.attempts) + formal_search_attempt_count
             ),
@@ -12668,6 +12796,10 @@ async def _try_proof_state_child_closures(
     def _update_status(records: Sequence[Mapping[str, Any]]) -> None:
         if status_out is None:
             return
+        for key in ("child_tactic_continuation_pending", "child_tactic_cursor_advanced"):
+            status_out[key] = bool(
+                status_out.get(key) or any(record.get(key) for record in records)
+            )
         if records:
             # Advisory falsification is not a proving attempt. A batch is
             # deferred only if every proving record says no operation began.
@@ -13162,6 +13294,7 @@ async def _try_proof_state_child_closures(
                 max_residual_goals=max_residual_goals,
                 proof_cache=proof_cache,
                 allowed_work_types=target_types or None,
+                candidate_attempt_limit=candidate_attempt_limit,
                 formal_search_config=formal_search_config,
                 formal_search_client=formal_search_client,
                 cost_controller=cost_controller,

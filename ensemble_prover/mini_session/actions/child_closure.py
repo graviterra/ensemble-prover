@@ -751,6 +751,67 @@ class ChildClosureAction:
                 return True
         return False
 
+    def has_funded_tactic_continuation(self, session: Any) -> bool:
+        """An executable finite suffix is not an unchanged-search fixed point."""
+
+        from ensemble_prover.proof_state import validated_child_tactic_portfolio_continuation
+        from ensemble_prover.proof_state_executor import _proof_state_child_tactic_terminal_context_key
+
+        budget = session.budgets.get(self.id)
+        state = getattr(session, "proof_state", None)
+        if budget is None or budget.exhausted() or state is None:
+            return False
+        remaining = self._remaining_action_budget_s(session)
+        if remaining is not None and remaining < self.required_dispatch_budget_s(
+            "tactic_swarm",
+        ):
+            return False
+        for item in state.work_frontier(
+            max_items=max(8, len(state.nodes) * 8),
+            graph=getattr(session.dossier, "proof_graph", None),
+        ):
+            if item.work_type != "tactic_swarm":
+                continue
+            node = state.nodes.get(item.node_id)
+            if not self._work_item_targets_open_child(state, item, item.work_type):
+                continue
+            if node.pending_helper_acceptance or node.pending_residual_goal_extraction:
+                # This node's verifier owns admission until it settles. An
+                # unrelated previous selection must not price this suffix.
+                continue
+            saved = validated_child_tactic_portfolio_continuation(
+                node.child_tactic_portfolio_continuation
+            )
+            if not saved or (
+                saved["next_candidate_index"] >= len(saved["candidates"])
+                and not saved["residual_candidates"]
+            ):
+                continue
+            if self._frontier_work_already_consumed(session, item):
+                continue
+            if session._frontier_work_key(item, probe=True) in session.skipped_frontier_work_keys:
+                continue
+            action_key = session._frontier_action_key(item, self.id)
+            if (
+                action_key in session.consumed_frontier_action_keys
+                or action_key in session.skipped_frontier_action_keys
+                or action_key in session.model_call_deferred_frontier_action_keys
+                or session._model_call_deferred_static_action_blocks_work_item(
+                    self.id, item,
+                )
+            ):
+                continue
+            if session.proof_work_semantic_attempt_exhausted(
+                item, action_id=self.id, touch=False,
+            ) or self._tactic_context_is_terminal(session, node):
+                continue
+            if saved["context_key"] == _proof_state_child_tactic_terminal_context_key(
+                conv=session.conv, dossier=session.dossier, proof_state=state,
+                node=node, timeout_s=self.timeout_s, max_candidates=self.max_candidates,
+            ):
+                return True
+        return False
+
     def _tactic_context_is_terminal(self, session: Any, node: Any) -> bool:
         """Observe the executor's exact child-tactic terminal identity.
 
@@ -1051,6 +1112,17 @@ class ChildClosureAction:
             # while reserving one real scheduler iteration for its suffix.
             metadata["root_tactic_candidate_continuation_pending"] = True
             metadata["preserve_action_budget"] = True
+            metadata["semantic_budget_step_consumed"] = True
+            metadata["stagnation_neutral"] = True
+            metadata["hard_pivot_neutral"] = True
+        if execution_status.get("child_tactic_continuation_pending"):
+            # A settled candidate is not a settled child proof contract.
+            # The immutable work-item cursor admits its suffix. Charge all
+            # elapsed time and invocations; semantic headroom grants no time.
+            metadata["child_tactic_continuation_pending"] = True
+            metadata["child_tactic_cursor_advanced"] = bool(
+                execution_status.get("child_tactic_cursor_advanced")
+            )
             metadata["semantic_budget_step_consumed"] = True
             metadata["stagnation_neutral"] = True
             metadata["hard_pivot_neutral"] = True

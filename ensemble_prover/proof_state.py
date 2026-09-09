@@ -69,6 +69,7 @@ PROOF_STATE_VERIFIER_RETRY_MAX_STATES_PER_NODE = 64
 PROOF_STATE_EXECUTION_SCHEMA_VERSION = 2
 PROOF_STATE_ROOT_TACTIC_PORTFOLIO_SCHEMA_VERSION = 1
 PROOF_STATE_ROOT_TACTIC_PORTFOLIO_MAX_CANDIDATES = 256
+PROOF_STATE_CHILD_TACTIC_POLICY_VERSION = "child_tactic_portfolio_v1"
 _PROOF_STATE_KNOWN_RESIDUAL_SOURCE_PREFIXES = (
     "try_skeleton_tool",
     "decl_application",
@@ -281,9 +282,23 @@ def _proof_state_durable_sequence(value: Any) -> List[Any]:
 def validated_root_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
     """Return a bounded executable root-tactic cursor or fail closed."""
 
+    return _validated_tactic_portfolio_continuation(
+        value, max_candidates=PROOF_STATE_ROOT_TACTIC_PORTFOLIO_MAX_CANDIDATES
+    )
+
+
+def _validated_tactic_portfolio_continuation(
+    value: Any, *, max_candidates: Optional[int] = None, allow_completed: bool = False,
+    bounded_fields: bool = True,
+) -> Dict[str, Any]:
+    """Validate an exact portfolio without changing the configured search size."""
+
     if not isinstance(value, Mapping):
         return {}
-    if value.get("schema_version") != PROOF_STATE_ROOT_TACTIC_PORTFOLIO_SCHEMA_VERSION:
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != PROOF_STATE_ROOT_TACTIC_PORTFOLIO_SCHEMA_VERSION
+    ):
         return {}
     phase = str(value.get("phase") or "")
     if phase not in {"direct", "active", "fallback"}:
@@ -316,7 +331,7 @@ def validated_root_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
             "candidates": [],
             "next_candidate_index": 0,
         }
-    if len(raw_candidates) > PROOF_STATE_ROOT_TACTIC_PORTFOLIO_MAX_CANDIDATES:
+    if max_candidates is not None and len(raw_candidates) > max_candidates:
         return {}
     candidates: List[Dict[str, Any]] = []
     seen_proofs: Set[str] = set()
@@ -333,12 +348,14 @@ def validated_root_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
             not proof.strip()
             or not tactic.strip()
             or not source.strip()
-            or len(proof) > 16_384
-            or len(tactic) > 8_192
-            or len(source) > 256
             or (helper is not None and not isinstance(helper, str))
-            or (isinstance(helper, str) and len(helper) > 512)
             or proof in seen_proofs
+            or (bounded_fields and (
+                len(proof) > 16_384
+                or len(tactic) > 8_192
+                or len(source) > 256
+                or (isinstance(helper, str) and len(helper) > 512)
+            ))
         ):
             return {}
         seen_proofs.add(proof)
@@ -350,7 +367,9 @@ def validated_root_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
                 "helper": helper,
             }
         )
-    if next_candidate_index >= len(candidates):
+    if next_candidate_index > len(candidates) or (
+        next_candidate_index == len(candidates) and not allow_completed
+    ):
         return {}
     return {
         "schema_version": PROOF_STATE_ROOT_TACTIC_PORTFOLIO_SCHEMA_VERSION,
@@ -359,6 +378,42 @@ def validated_root_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
         "candidates": candidates,
         "next_candidate_index": next_candidate_index,
     }
+
+
+def validated_child_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
+    """Validate private child search work, never a proof-acceptance receipt."""
+
+    validated = _validated_tactic_portfolio_continuation(
+        value, allow_completed=True, bounded_fields=False
+    )
+    if validated.get("phase") != "direct":
+        return {}
+    # Residual hints request fresh typed verification; they never carry goal
+    # or proof authority. Bind them to the already executed exact prefix.
+    residuals = value.get("residual_candidates", [])
+    if not isinstance(residuals, (list, tuple)):
+        return {}
+    prefix = {
+        (candidate["proof"], candidate["source"])
+        for candidate in validated["candidates"][:validated["next_candidate_index"]]
+    }
+    if len(residuals) > len(prefix):
+        return {}
+    seen: Set[Tuple[str, str]] = set()
+    normalized = []
+    for residual in residuals:
+        if not isinstance(residual, Mapping):
+            return {}
+        proof, source = residual.get("proof"), residual.get("source")
+        if not isinstance(proof, str) or not isinstance(source, str):
+            return {}
+        key = (proof, source)
+        if key not in prefix or key in seen:
+            return {}
+        seen.add(key)
+        normalized.append({"proof": proof, "source": source})
+    validated["residual_candidates"] = normalized
+    return validated
 
 
 _RESIDUAL_ATTESTATION_QUARANTINE_SCHEMA_VERSION = 1
@@ -4617,6 +4672,7 @@ class ProofStateWorkItem:
     decl_application_pending_hash: str = ""
     helper_acceptance_request_hash: str = ""
     decl_application_signature: str = ""
+    tactic_portfolio_hash: str = ""
     residual_attestation_hash: str = ""
     proof_stub_hash: str = ""
     assembly_witness_hash: str = ""
@@ -4722,6 +4778,7 @@ class ProofStateWorkItem:
             "decl_application_pending_hash": self.decl_application_pending_hash,
             "helper_acceptance_request_hash": self.helper_acceptance_request_hash,
             "decl_application_signature": self.decl_application_signature,
+            "tactic_portfolio_hash": self.tactic_portfolio_hash,
             "residual_attestation_hash": self.residual_attestation_hash,
             "proof_stub_hash": self.proof_stub_hash,
             "assembly_witness_hash": self.assembly_witness_hash,
@@ -4959,6 +5016,7 @@ class ProofStateNode:
     # This private proof-bearing payload is emitted only by execution records;
     # generic/prompt-safe records omit it and therefore fail closed.
     root_tactic_portfolio_continuation: Dict[str, Any] = field(default_factory=dict)
+    child_tactic_portfolio_continuation: Dict[str, Any] = field(default_factory=dict)
     # Durable "this child goal is provably FALSE" marker. Set only from a
     # Lean-checked + axiom-audited negation certificate (never an LLM claim), so
     # proving-oriented work (decl_probe / child_llm_prove) can be permanently
@@ -6689,6 +6747,11 @@ class ProofSearchState:
             root_tactic_portfolio_continuation=(
                 validated_root_tactic_portfolio_continuation(
                     record.get("root_tactic_portfolio_continuation")
+                )
+            ),
+            child_tactic_portfolio_continuation=(
+                validated_child_tactic_portfolio_continuation(
+                    record.get("child_tactic_portfolio_continuation")
                 )
             ),
         )
@@ -12213,6 +12276,7 @@ class ProofSearchState:
         node.pending_residual_goal_extraction = {}
         node.pending_helper_acceptance = {}
         node.verifier_retry_states = {}
+        node.child_tactic_portfolio_continuation = {}
 
     def pending_residual_goal_extraction_status(
         self,
@@ -13784,6 +13848,16 @@ class ProofSearchState:
                     ),
                     decl_application_signature=str(
                         getattr(node, "decl_application_signature", "") or ""
+                    ),
+                    tactic_portfolio_hash=(
+                        text_hash(json.dumps({
+                            "policy": PROOF_STATE_CHILD_TACTIC_POLICY_VERSION,
+                            "continuation": validated_child_tactic_portfolio_continuation(
+                                node.child_tactic_portfolio_continuation
+                            ),
+                        }, sort_keys=True))
+                        if work_type == "tactic_swarm" and node.kind == "child_goal"
+                        else ""
                     ),
                     residual_attestation_hash=(
                         str(
@@ -15582,6 +15656,11 @@ class ProofSearchState:
                     "root_tactic_portfolio_continuation": (
                         validated_root_tactic_portfolio_continuation(
                             node.root_tactic_portfolio_continuation
+                        )
+                    ),
+                    "child_tactic_portfolio_continuation": (
+                        validated_child_tactic_portfolio_continuation(
+                            node.child_tactic_portfolio_continuation
                         )
                     ),
                     "proved_helper_name": node.proved_helper_name,

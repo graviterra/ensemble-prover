@@ -8931,7 +8931,10 @@ async def run_conversation(
                     trace_prefix,
                     "  attempting answer-safe helper salvage from helper-only reply...",
                 )
-                from ensemble_prover.helper_salvage import collect_open_child_targets
+                from ensemble_prover.helper_salvage import (
+                    collect_open_child_targets,
+                    helper_salvage_telemetry_fields,
+                )
 
                 salvager = HelperSalvager(
                     lean,
@@ -8970,14 +8973,7 @@ async def run_conversation(
                             "phase": "helper_only_salvage",
                             "turn_in_phase": turn,
                             "candidate_count": len(lemma_dag_candidate_helpers),
-                            "accepted_helpers": list(salvage_result.accepted),
-                            "rejected_helpers": list(salvage_result.rejected),
-                            "skipped_helpers": list(salvage_result.skipped),
-                            "verdict": (
-                                "helpers_accepted"
-                                if salvage_result.accepted
-                                else "helpers_rejected"
-                            ),
+                            **helper_salvage_telemetry_fields(salvage_result),
                         }
                     )
                 if salvage_result.accepted:

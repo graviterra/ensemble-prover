@@ -25,6 +25,7 @@ from .lean_syntax import (
     split_lean_top_level_implications,
 )
 from .contract_identity import (
+    LEAN_CONTRACT_COMPONENT_HASH_VERSION,
     has_lean_contract_identity,
     lean_contract_evidence_receipt_matches,
     make_lean_contract_evidence_receipt,
@@ -4417,6 +4418,8 @@ def _graph_binder_group_is_proof_premise(
 
 def _graph_leading_binder_analysis(
     statement: str,
+    *,
+    include_implications: bool = False,
 ) -> Tuple[str, Tuple[Tuple[str, Tuple[str, ...], str, bool, bool], ...]]:
     """Parse leading binders with local dependent-Prop propagation.
 
@@ -4435,6 +4438,15 @@ def _graph_leading_binder_analysis(
     while True:
         telescope_step = _graph_leading_telescope_step(body)
         if telescope_step is None:
+            if include_implications:
+                parts = _graph_split_top_level_implications(body)
+                if len(parts) >= 2:
+                    # An implication may introduce another universal telescope.
+                    # Keep its context while walking the right-hand side; never
+                    # descend into an existential conclusion or premise body.
+                    records.extend(("", (), part, True, False) for part in parts[:-1])
+                    body = parts[-1]
+                    continue
             break
         binder_groups, remaining_body = telescope_step
         for group in binder_groups:
@@ -5268,7 +5280,9 @@ def graph_statement_closed_premises(statement: str) -> Tuple[str, ...]:
     proof binders, yielding obligations such as ``∀ D, Target D``.
     """
 
-    body, binder_records = _graph_leading_binder_analysis(statement)
+    body, binder_records = _graph_leading_binder_analysis(
+        statement, include_implications=True
+    )
     binder_premises: List[Tuple[Tuple[str, ...], str]] = []
     for index, record in enumerate(binder_records):
         _raw, names, type_text, is_proof, _ambiguous = record
@@ -5430,7 +5444,9 @@ def graph_statement_closed_data_requirements(
 def graph_statement_closed_conclusion(statement: str) -> str:
     """Return the conclusion closed over all leading non-proof binders."""
 
-    body, binder_records = _graph_leading_binder_analysis(statement)
+    body, binder_records = _graph_leading_binder_analysis(
+        statement, include_implications=True
+    )
     implication_parts = _graph_split_top_level_implications(body)
     conclusion = _graph_strip_balanced_outer_parens(
         implication_parts[-1] if implication_parts else body
@@ -11828,6 +11844,7 @@ class ProofGraph:
         support_names: Optional[Iterable[str]] = None,
         parent_proof_binder_structural_hashes: Optional[Iterable[str]] = None,
         helper_proof_binder_structural_hashes: Optional[Iterable[str]] = None,
+        component_hash_version: int = 0,
     ) -> bool:
         """Record a verified helper as support for, not proof of, an obligation.
 
@@ -11946,8 +11963,8 @@ class ProofGraph:
                 for value in list(
                     helper_proof_binder_structural_hashes or []
                 )
-                if str(value or "").strip()
             ],
+            "component_hash_version": component_hash_version,
         }
         supports = [
             dict(item)
@@ -12194,9 +12211,9 @@ class ProofGraph:
         if route is None or route.kind != "strategy_route":
             return False
         route_metadata = route.metadata if isinstance(route.metadata, dict) else {}
-        if self._route_is_terminally_poisoned(route_id):
+        route_poisoned = self._route_is_terminally_poisoned(route_id)
+        if route_poisoned:
             metadata["formalization_bridge_parent_work_route_poisoned"] = True
-            return False
         target_statement = str(
             parent_statement
             or metadata.get("formalization_bridge_parent_statement")
@@ -12321,10 +12338,12 @@ class ProofGraph:
             str(item.get("helper_node_id") or "").strip(): item
             for item in supports
             if str(item.get("helper_node_id") or "").strip()
+            and item.get("component_hash_version") == LEAN_CONTRACT_COMPONENT_HASH_VERSION
         }
         parent_proof_binder_structural_hashes = {
             str(value or "").strip()
             for item in supports
+            if item.get("component_hash_version") == LEAN_CONTRACT_COMPONENT_HASH_VERSION
             for value in list(
                 item.get("parent_proof_binder_structural_hashes") or []
             )
@@ -12708,6 +12727,10 @@ class ProofGraph:
                 "formalization_bridge_parent_hypothesis_variant_premise"
             ] = sorted(set(variant_premise_statements))
             metadata["formalization_bridge_parent_work_missing"] = True
+            return False
+        # Retire invalid historical debts even when their route has already
+        # failed, but never materialize or revive work on that route.
+        if route_poisoned:
             return False
         available_premise_keys = {
             *parent_contract_premise_keys,
