@@ -19,6 +19,8 @@ _GENERATION_OPTIONS = frozenset({
     "resume_accept_source_hash",
 })
 
+_SUBSCRIPTION_BINARY_OPTIONS = {"codex": ("codex_bin", "codex"), "claude-code": ("claude_code_bin", "claude")}
+
 
 class CheckpointArgumentParser(argparse.ArgumentParser):
     """Remember explicit overrides, including values equal to parser defaults."""
@@ -50,11 +52,10 @@ def public_cli_config(args: argparse.Namespace) -> dict[str, Any]:
         key: value for key, value in vars(args).items()
         if not key.startswith("_") and key not in _GENERATION_OPTIONS
     }
-    if "codex" not in {config.get("prover"), config.get("refiner")}:
-        # This additive transport option does not affect API roles. Keep
-        # their existing checkpoint policy shape unchanged. Codex runs bind
-        # the executable choice and reject changes on resume as usual.
-        config.pop("codex_bin", None)
+    for provider, (option, _) in _SUBSCRIPTION_BINARY_OPTIONS.items():
+        if provider not in {config.get("prover"), config.get("refiner")}:
+            # Preserve old policy shapes unless this transport is selected.
+            config.pop(option, None)
     return clone_json_value(config, label="checkpoint CLI configuration")
 
 
@@ -75,11 +76,11 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("Checkpoint does not contain a compatible public CLI configuration")
     saved = clone_json_value(identity["cli_config"], label="saved CLI configuration")
     current = public_cli_config(args)
-    if "codex" in {saved.get("prover"), saved.get("refiner")}:
-        # Bare resume uses parser defaults until saved role policy is inherited.
-        # Compare against the saved transport's schema while retaining explicit
-        # binary/provider overrides for the compatibility checks below.
-        current["codex_bin"] = getattr(args, "codex_bin", "codex")
+    for provider, (option, default) in _SUBSCRIPTION_BINARY_OPTIONS.items():
+        if provider in {saved.get("prover"), saved.get("refiner")}:
+            # Bare resume inherits the saved transport schema, but explicit
+            # binary/provider overrides must still pass compatibility checks.
+            current[option] = getattr(args, option, default)
     if set(saved) != set(current):
         raise ValueError("Checkpoint CLI configuration schema has changed")
     explicit = getattr(args, "_explicit_cli_destinations", None)

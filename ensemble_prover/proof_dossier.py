@@ -3538,6 +3538,7 @@ def clone_verified_helper(item: "VerifiedHelper") -> "VerifiedHelper":
         replay_context_source_hashes=dict(
             getattr(item, "replay_context_source_hashes", {}) or {}
         ),
+        replay_context_repair_receipts=copy.deepcopy(item.replay_context_repair_receipts),
         quality_tags=list(getattr(item, "quality_tags", []) or []),
         open_premise_statement_keys=list(
             getattr(item, "open_premise_statement_keys", []) or []
@@ -7278,6 +7279,8 @@ class VerifiedHelper:
     support_source_hashes: Dict[str, str] = field(default_factory=dict)
     replay_context_names: List[str] = field(default_factory=list)
     replay_context_source_hashes: Dict[str, str] = field(default_factory=dict)
+    # Audit history only: checkpoint loading still replays the declaration.
+    replay_context_repair_receipts: List[Dict[str, Any]] = field(default_factory=list)
     provenance_tags: List[str] = field(default_factory=list)
     visibility_policy: str = ""
     quality_tags: List[str] = field(default_factory=list)
@@ -7483,6 +7486,7 @@ def _merge_verified_helper_progress_delta(
             if node_id and node_id not in target:
                 target.append(node_id)
     deltas[name] = delta
+    dossier._refresh_verified_helper_progress_alias_fields()
 
 
 @dataclass
@@ -13061,6 +13065,15 @@ class ProofDossier:
         self._refresh_verified_helper_progress_alias_fields()
 
     def _refresh_verified_helper_progress_alias_fields(self) -> None:
+        # Citation aliases retain proof-support compatibility. Mathematical
+        # novelty instead uses the existing semantic fact registry's identity.
+        first_by_fact: Dict[str, str] = {}
+        for helper in self.verified_helpers.values():
+            if _verified_helper_counts_for_theory_progress(self, helper):
+                first_by_fact.setdefault(
+                    self._verified_fact_identity(helper),
+                    self.verified_helper_statement_aliases.get(helper.name, helper.name),
+                )
         for name, delta in list(self.verified_helper_progress_deltas.items()):
             helper = self.verified_helpers.get(name)
             if helper is None:
@@ -13073,6 +13086,7 @@ class ProofDossier:
             delta.theory_progress = bool(
                 canonical_helper_name == name
                 and _verified_helper_counts_for_theory_progress(self, helper)
+                and first_by_fact.get(self._verified_fact_identity(helper)) == name
             )
 
     def record_active_root_targets(self, targets: Iterable[Dict[str, Any]]) -> None:
@@ -13462,6 +13476,7 @@ class ProofDossier:
                 )
             )
         _resolve_graph_native_obligations_against_verified_helpers(self)
+        self._refresh_verified_helper_progress_alias_fields()
         if removed_by_sync:
             # Unsafe-helper filtering is an authoritative removal path that
             # bypasses remove_verified_helper. Publish its fact view in one
@@ -16004,6 +16019,10 @@ class ProofDossier:
         )
         if recorded is None:
             return None
+        if recorded.source == helper.source:
+            for receipt in helper.replay_context_repair_receipts:
+                if receipt not in recorded.replay_context_repair_receipts:
+                    recorded.replay_context_repair_receipts.append(copy.deepcopy(receipt))
         landed_replaced_existing = bool(
             canonical_lean_identifier(str(getattr(recorded, "name", "") or ""))
             == canonical_lean_identifier(existing_helper_name)
@@ -16272,6 +16291,10 @@ class ProofDossier:
         merged_replay_hashes.update(incoming_replay_hashes)
 
         changed = False
+        for receipt in incoming.replay_context_repair_receipts:
+            if receipt not in existing.replay_context_repair_receipts:
+                existing.replay_context_repair_receipts.append(copy.deepcopy(receipt))
+                changed = True
         if list(existing.support_names or []) != merged_support_names:
             existing.support_names = merged_support_names
             changed = True
@@ -16622,6 +16645,10 @@ class ProofDossier:
         if "negative_evidence_helper" in item.quality_tags:
             self.increment_tool_metric("mini_negative_evidence_helpers_withheld", 1)
         existing = self.verified_helpers.get(name)
+        if existing is not None and existing.source == item.source:
+            item.replay_context_repair_receipts = copy.deepcopy(
+                existing.replay_context_repair_receipts
+            )
         if (
             existing is not None
             and not verified_helper_surface_statement_changed(existing, item)
@@ -20108,13 +20135,11 @@ class ProofDossier:
         authorized_context_names = (
             {helper_decl_name(block) for block in helper_context_override}
             if helper_context_override is not None
-            else None
+            else {helper_decl_name(block) for block in self.verified_helper_blocks(refresh_quality=False)}
         )
 
         def helper_is_available(helper: VerifiedHelper) -> bool:
-            if authorized_context_names is not None:
-                return helper.name in authorized_context_names
-            return self._verified_helper_context_visible(helper)
+            return helper.name in authorized_context_names
 
         redact_solution_refs = effective_solution_placeholder_suppression(
             suppress_solution_placeholders=self.suppress_solution_placeholders,
@@ -20222,9 +20247,29 @@ class ProofDossier:
             if str(getattr(helper, "render_policy", "") or "")
             == "advisory_requires_unproved_premise"
         ]
+        context_blocked_helpers = [
+            helper for helper in suppressed_helpers
+            if self._verified_helper_context_visible(helper)
+        ]
         non_constructive_suppressed_count = len(suppressed_helpers) - len(
             conditional_suppressed_helpers
-        )
+        ) - len(context_blocked_helpers)
+        if context_blocked_helpers:
+            lines.append("- verified helpers awaiting context repair (not supplied to Lean):")
+            for helper in context_blocked_helpers:
+                display_name = _prompt_safe_helper_name(
+                    helper.name, redact_solution_refs=redact_solution_refs,
+                )
+                missing = [
+                    _prompt_safe_helper_name(name, redact_solution_refs=redact_solution_refs)
+                    for name in self._verified_helper_generated_dependencies(helper)
+                    if name not in authorized_context_names
+                ]
+                reason = (
+                    "excluded replay dependencies: " + ", ".join(missing)
+                    if missing else "outside this dispatch's verified helper scope"
+                )
+                lines.append(f"  - `{display_name}`: {reason}; recheck the stored proof before reuse.")
         if conditional_suppressed_helpers:
             lines.append(
                 "- verified conditional reducers withheld from named-fact use: "
@@ -21120,6 +21165,9 @@ class ProofDossier:
                     if str(name or "").strip()
                     and str(source_hash or "").strip()
                 },
+                replay_context_repair_receipts=copy.deepcopy(
+                    list(raw.get("replay_context_repair_receipts") or [])
+                ),
                 provenance_tags=[
                     str(tag or "").strip()
                     for tag in list(raw.get("provenance_tags") or [])

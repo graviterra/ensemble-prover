@@ -88,8 +88,8 @@ troubleshooting, and the public Mini CLI option map.
 - Linux
 - Standard CPython 3.11 or 3.12 (release audited on both)
 - Lean toolchain compatible with the target Lake project
-- An API key for the selected provider, or a ChatGPT Codex sign-in for Mini's
-  optional subscription backend
+- An API key for the selected provider, or a ChatGPT Codex / Claude Code
+  subscription sign-in for Mini's prover and refiner
 
 The public runtime snapshot pins the complete dependency closure for four core
 Python packages in `requirements.txt`: HTTP transport, graph search,
@@ -160,6 +160,11 @@ To use a ChatGPT Codex subscription for the prover or refiner, select
 `--refiner codex --refiner-model <model>` after `codex login`.
 Set `--cost-budget-usd 0`; subscription usage is not priced as API usage.
 See [Codex subscription setup and transport limits](docs/CODEX_SUBSCRIPTION_BACKEND.md).
+
+Claude Code subscription roles are also available with `--prover claude-code`
+and/or `--refiner claude-code`, an explicit model such as `--prover-model opus`,
+and `--cost-budget-usd 0`. See
+[Claude Code setup and transport limits](docs/CLAUDE_CODE_SUBSCRIPTION_BACKEND.md).
 
 To sweep all locally unsolved PutnamBench problems in random order:
 

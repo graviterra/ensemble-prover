@@ -341,6 +341,9 @@ from .mini_tactic_closer import (
     try_close_with_tactics,
 )
 from .codex_subscription import CODEX_SUBSCRIPTION_BASE_URL, CodexSubscriptionClient
+from .claude_code_subscription import (
+    CLAUDE_CODE_SUBSCRIPTION_BASE_URL, ClaudeCodeSubscriptionClient,
+)
 from .models import (
     OpenAICompatClient,
     response_output_items,
@@ -12367,6 +12370,7 @@ _DEFAULT_MODELS = {
     "deepseek": "deepseek-v4-pro",
     "openrouter": "",
     "codex": "",
+    "claude-code": "",
 }
 
 _PROVIDER_BASE_URLS = {
@@ -12374,6 +12378,7 @@ _PROVIDER_BASE_URLS = {
     "deepseek": "https://api.deepseek.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "codex": CODEX_SUBSCRIPTION_BASE_URL,
+    "claude-code": CLAUDE_CODE_SUBSCRIPTION_BASE_URL,
 }
 
 _PROVIDER_ENV_VARS = {
@@ -12485,9 +12490,9 @@ def _make_role_cfg(
         raise SystemExit(f"Unknown provider: {provider}")
     api_key = (
         os.environ.get(_PROVIDER_ENV_VARS[provider], "").strip()
-        if provider != "codex" else None
+        if provider not in {"codex", "claude-code"} else None
     )
-    if provider != "codex" and not api_key:
+    if provider not in {"codex", "claude-code"} and not api_key:
         raise SystemExit(
             f"{_PROVIDER_ENV_VARS[provider]} is not set in the environment."
         )
@@ -12564,6 +12569,8 @@ def _make_mini_role_client(
 ) -> Any:
     if getattr(cfg, "base_url", "") == CODEX_SUBSCRIPTION_BASE_URL:
         return CodexSubscriptionClient(cfg)
+    if getattr(cfg, "base_url", "") == CLAUDE_CODE_SUBSCRIPTION_BASE_URL:
+        return ClaudeCodeSubscriptionClient(cfg)
     return OpenAICompatClient(
         cfg, provider_lane_health_registry=provider_lane_health_registry,
     )
@@ -12901,14 +12908,14 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--prover",
         default="deepseek",
-        choices=["openai", "deepseek", "openrouter", "codex"],
+        choices=["openai", "deepseek", "openrouter", "codex", "claude-code"],
         help="Provider for the prover role.",
     )
     p.add_argument("--prover-model", default=None)
     p.add_argument(
         "--refiner",
         default=None,
-        choices=["openai", "deepseek", "openrouter", "codex"],
+        choices=["openai", "deepseek", "openrouter", "codex", "claude-code"],
         help=(
             "Optional refiner provider. When set, the refiner role takes over "
             "the transcript after prover stalls; it may use the same provider "
@@ -12919,6 +12926,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--codex-bin", default="codex",
         help="Codex CLI executable for --prover/--refiner codex (ChatGPT subscription sign-in).",
+    )
+    p.add_argument(
+        "--claude-code-bin", default="claude",
+        help="Claude Code executable for --prover/--refiner claude-code (saved Claude.ai subscription).",
     )
     p.add_argument(
         "--planner-escalation",
@@ -14394,10 +14405,11 @@ async def _validate_cost_budget_pricing(
         if client is None:
             continue
         for model, base_url in reservation_pricing_targets(client):
-            if base_url == CODEX_SUBSCRIPTION_BASE_URL:
+            if base_url in {CODEX_SUBSCRIPTION_BASE_URL, CLAUDE_CODE_SUBSCRIPTION_BASE_URL}:
+                backend = "Codex" if base_url == CODEX_SUBSCRIPTION_BASE_URL else "Claude Code"
                 raise ValueError(
-                    "--cost-budget-usd cannot price Codex subscription allowance; "
-                    "use --cost-budget-usd 0. Codex usage is still recorded."
+                    f"--cost-budget-usd cannot price {backend} subscription allowance; "
+                    f"use --cost-budget-usd 0. {backend} usage is still recorded."
                 )
             identity = (str(role or "llm"), str(model or ""), str(base_url or ""))
             if identity in seen:
@@ -15018,6 +15030,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             effort=prover_reasoning_effort,
         )
         prover_cfg.codex_binary = getattr(args, "codex_bin", "codex")
+        prover_cfg.claude_code_binary = getattr(args, "claude_code_bin", "claude")
         prover_client = _make_mini_role_client(
             prover_cfg,
             provider_lane_health_registry=provider_lane_health_registry,
@@ -15044,15 +15057,16 @@ async def _main_async(args: argparse.Namespace) -> int:
                 effort=refiner_reasoning_effort,
             )
             refiner_cfg.codex_binary = getattr(args, "codex_bin", "codex")
+            refiner_cfg.claude_code_binary = getattr(args, "claude_code_bin", "claude")
             refiner_client = _make_mini_role_client(
                 refiner_cfg,
                 provider_lane_health_registry=provider_lane_health_registry,
             )
         for role_client in (prover_client, refiner_client):
-            if isinstance(role_client, CodexSubscriptionClient):
+            if isinstance(role_client, (CodexSubscriptionClient, ClaudeCodeSubscriptionClient)):
                 await role_client.preflight()
                 print(
-                    f"[mini_prover] {role_client.cfg.name}: Codex ChatGPT subscription "
+                    f"[mini_prover] {role_client.cfg.name}: {role_client.backend_name} subscription "
                     f"({role_client.cli_version}); output-token limits are prompt targets; "
                     "temperature/top_p are not sent.",
                     flush=True,
@@ -15070,7 +15084,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         planner_escalation_choice = str(
             getattr(args, "planner_escalation", "auto") or "auto"
         ).strip().lower()
-        if planner_escalation_choice == "auto" and "codex" in {args.prover, args.refiner}:
+        if planner_escalation_choice == "auto" and {"codex", "claude-code"} & {args.prover, args.refiner}:
             # Subscription selection must not silently activate an API-billed
             # escalation role because an unrelated API key is in the shell.
             planner_escalation_choice = ""

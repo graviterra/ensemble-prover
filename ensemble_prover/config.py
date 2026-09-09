@@ -301,6 +301,8 @@ class RoleConfig:
     thinking_enabled: bool = False
     # Executable used only by the codex://chatgpt subscription transport.
     codex_binary: str = "codex"
+    # Executable used only by the claude-code://subscription transport.
+    claude_code_binary: str = "claude"
 
 
 @dataclass

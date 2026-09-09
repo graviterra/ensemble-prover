@@ -261,6 +261,7 @@ def mini_bounded_visible_output_reasoning_effort(
     )
     if requested == "none" and (
         _strict_reasoning_on(cfg)
+        or getattr(client, "supports_reasoning_off", True) is False
         or (
             base_url_matches_provider(base_url, "openai")
             and (
@@ -270,7 +271,8 @@ def mini_bounded_visible_output_reasoning_effort(
         )
     ):
         # Compact serialization may reduce effort, but must not silently turn
-        # off an explicit on request. GPT-6 also rejects none at the provider.
+        # off an explicit on request or select an unsupported recovery control.
+        # Explicit operator off was preserved above for the adapter to enforce.
         return "low"
     return requested or "low"
 

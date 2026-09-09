@@ -129,6 +129,7 @@ that file.
 | DeepSeek | `deepseek` | `deepseek-v4-pro` | `DEEPSEEK_API_KEY` |
 | OpenRouter | `openrouter` | none; specify one | `OPENROUTER_API_KEY` |
 | Codex subscription (Mini prover/refiner) | `codex` | none; specify one | `codex login` using ChatGPT |
+| Claude Code subscription (Mini prover/refiner) | `claude-code` | none; specify one | `claude auth login` using Claude.ai |
 
 The default prover provider is DeepSeek. Select `--prover openai` explicitly
 if only `OPENAI_API_KEY` is configured. OpenRouter always requires an explicit
@@ -145,11 +146,13 @@ the OpenAI API with `gpt-5.6-terra`; otherwise it disables escalation with a
 warning. Use `--planner-escalation off` to disable it deliberately, or choose
 another provider and model explicitly.
 
-When either Mini role uses `codex`, automatic API planner escalation is disabled.
+When either Mini role uses `codex` or `claude-code`, automatic API planner escalation is disabled.
 Select a model explicitly and set `--cost-budget-usd 0`; subscription allowances
 are not API dollar budgets. See [Codex subscription setup and limitations](CODEX_SUBSCRIPTION_BACKEND.md)
 for the CLI requirements, launch example, context behavior, and accounting.
 An API key is not required for a subscription-only Mini run.
+Claude Code setup and controls are documented in the
+[Claude Code subscription guide](CLAUDE_CODE_SUBSCRIPTION_BACKEND.md).
 
 The NL frontends have their own formalizer settings. The campaign currently
 uses the OpenAI API for all three of its roles: `gpt-5.6-terra` for formalization
@@ -972,6 +975,7 @@ CLI.
 ### Providers, roles, and reasoning
 
 `--prover`, `--prover-model`, `--refiner`, `--refiner-model`,
+`--codex-bin`, `--claude-code-bin`,
 `--planner-escalation`, `--planner-escalation-model`, `--reasoning-mode`,
 `--enable-reasoning`, `--disable-reasoning`, `--reasoning-effort`,
 `--prover-reasoning-mode`, `--prover-reasoning-effort`,

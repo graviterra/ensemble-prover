@@ -8442,6 +8442,7 @@ class ConversationTurnAction:
             "_answer_safe_recheck_pending",
             "_answer_safe_recheck_parked",
             "_answer_safe_recheck_held_terminal_provider_failure",
+            "_helper_context_repair_key",
         }
     )
     _ANSWER_SAFE_RECHECK_RUNTIME_SCHEMA_VERSION: ClassVar[int] = 6
@@ -10771,6 +10772,9 @@ class ConversationTurnAction:
         self._provider_quantum_yield_consumed_generation = int(
             provider_quantum_yield_consumed_generation
         )
+        # A repair memo contains no proof authority and belongs only to the
+        # live dispatch history, never to a restored earlier checkpoint.
+        self._helper_context_repair_key = ""
 
     def synchronize_scheduler_runtime_state(self, session: Any) -> None:
         """Publish the restored action-owned cursor to the session mirror."""
@@ -12675,6 +12679,55 @@ class ConversationTurnAction:
                 assemble_route_helper_names,
                 assemble_route_helper_blocks,
             ) = _selected_assemble_route_contract_context(session)
+        if (
+            dossier is not None
+            and bool(getattr(dossier, "verified_helpers", {}))
+            and not assemble_route_goal_statement
+            and not graph_native_goal_statement
+            and not formalization_helper_contract
+            and not authenticated_provider_resume
+            and not answer_safe_pending_replay
+        ):
+            from ensemble_prover.helper_context_repair import (
+                helper_context_repair_key, repair_verified_helper_context,
+            )
+            from ensemble_prover.proof_state_executor import _proof_state_acceptance_preamble
+
+            repair_preamble = _proof_state_acceptance_preamble(conv)
+            repair_target = str(dossier.root_statement or conv.goal_statement or "")
+            repair_key = helper_context_repair_key(dossier, repair_preamble, repair_target)
+            if repair_key != getattr(self, "_helper_context_repair_key", ""):
+                repair = await repair_verified_helper_context(
+                    dossier=dossier, lean=session.lean, preamble=repair_preamble,
+                    target_statement=repair_target,
+                    turn_index=int(getattr(session, "iteration", 0)),
+                    publication_guard=publication_guard,
+                )
+                publication_guard()
+                self._helper_context_repair_key = (
+                    helper_context_repair_key(dossier, repair_preamble, repair_target)
+                    if not repair.retryable else ""
+                )
+                if repair.proof:
+                    helper_names = tuple(helper_decl_name(block) for block in repair.replay_helpers)
+                    phase = "helper_context_conditional_application"
+                    turn_index = int(getattr(session, "iteration", 0))
+                    return MiniOutcome(
+                        action_id=self.id, solved=True, proof=repair.proof,
+                        progress=True, cost_seconds=time.monotonic() - started,
+                        root_candidate=RootFinalizationCandidate(
+                            proof=repair.proof, replay_helpers=repair.replay_helpers,
+                            helper_names=helper_names, target_statement=repair_target,
+                            phase=phase, turn_index=turn_index, source_action_id=self.id,
+                            verification_certificate=root_verification_certificate(
+                                accepted=True, proof=repair.proof, phase=phase,
+                                turn_index=turn_index, target_statement=repair_target,
+                                replay_helpers=repair.replay_helpers, helper_names=helper_names,
+                                source=self.id,
+                            ),
+                        ),
+                        metadata={"repaired_helper_names": list(repair.repaired_names)},
+                    )
         llm_dossier = dossier
         if assemble_route_goal_statement and dossier is not None:
             # Tools need the same replay dependencies as the route verifier.
@@ -16123,8 +16176,13 @@ class ConversationTurnAction:
         context_helpers = (
             list(assemble_route_helper_blocks)
             if assemble_route_goal_statement
+            else list(loop_result.helper_context)
+            if getattr(loop_result, "helper_context", None) is not None
             else (dossier.verified_helper_blocks() if dossier is not None else [])
         )
+        validate_context = getattr(dossier, "validate_helper_context", None)
+        if callable(validate_context) and getattr(loop_result, "helper_context", None) is not None:
+            validate_context(context_helpers)
 
         # Common telemetry payload — every recorder.record_turn call in
         # the legacy run_conversation per-turn body (mini_prover.py:3535+)

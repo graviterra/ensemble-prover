@@ -3942,10 +3942,16 @@ class CostBudgetController:
                 if release_reservation
                 else {}
             )
-        usage_missing = bool(not records or missing_target_costs)
+        usage_receipts_missing = bool(not records or missing_target_costs)
+        partial_usage_observed = any(
+            record.usage_source == "claude_code_subscription_partial_usage"
+            and record.raw_usage.get("incomplete") is True
+            for record in records
+        )
+        usage_missing = usage_receipts_missing or partial_usage_observed
         missing_unknown_cost = 0.0
         charge_missing_usage = (
-            usage_missing and status not in _MISSING_USAGE_NO_CHARGE_STATUSES
+            usage_receipts_missing and status not in _MISSING_USAGE_NO_CHARGE_STATUSES
         )
         provider_inflight_cancelled = (
             status == "cancelled_provider_inflight"
@@ -5990,6 +5996,7 @@ def usage_totals_from_clients(
         "prompt_cache_miss_tokens": 0,
         "reasoning_output_tokens": 0,
         "usage_missing_responses": 0,
+        "partial_usage_responses": 0,
         "unpriced_response_count": 0,
         "llm_unpriced_provider_exposure_count": 0,
         "cost_accounting_incomplete": False,
@@ -6097,7 +6104,17 @@ def usage_totals_from_clients(
         # even when its token counters happen to be zero.
         if unpriced_responses <= 0 and unpriced_activity_incomplete:
             unpriced_responses = 1
-        provider_exposure_count = unpriced_responses + missing_responses
+        # A partial subscription receipt contributes observed tokens while
+        # retaining missing-usage authority for the same provider occurrence.
+        # Older clients report disjoint counters and default to zero overlap.
+        partial_responses = min(
+            max(0, int(usage.get("partial_usage_responses", 0) or 0)),
+            unpriced_responses,
+            missing_responses,
+        )
+        provider_exposure_count = (
+            unpriced_responses + missing_responses - partial_responses
+        )
         prefix = str(role or "llm").strip()
         totals[f"{prefix}_input_tokens"] = input_tokens
         totals[f"{prefix}_output_tokens"] = output_tokens
@@ -6108,6 +6125,7 @@ def usage_totals_from_clients(
         totals[f"{prefix}_cost_valuation_source"] = valuation_source
         totals[f"{prefix}_cost_valuation_assumptions"] = sorted(set(assumptions))
         totals[f"{prefix}_usage_missing_responses"] = missing_responses
+        totals[f"{prefix}_partial_usage_responses"] = partial_responses
         totals[f"{prefix}_unpriced_response_count"] = unpriced_responses
         totals[f"{prefix}_unpriced_provider_exposure_count"] = (
             provider_exposure_count
@@ -6123,6 +6141,7 @@ def usage_totals_from_clients(
         valuation_sources.add(valuation_source)
         valuation_assumptions.update(assumptions)
         totals["usage_missing_responses"] += missing_responses
+        totals["partial_usage_responses"] += partial_responses
         totals["unpriced_response_count"] += unpriced_responses
         totals["llm_unpriced_provider_exposure_count"] += provider_exposure_count
         totals["cost_accounting_incomplete"] = bool(

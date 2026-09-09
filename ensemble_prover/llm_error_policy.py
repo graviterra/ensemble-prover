@@ -18,19 +18,41 @@ from .llm_usage import CostBudgetExceeded, ProviderDispatchAttemptLimitExceeded
 _TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
-class CodexBackendError(RuntimeError):
+class SubscriptionBackendError(RuntimeError):
     """A classified failure from the subscription CLI, without credential logs."""
+
+    backend = "subscription"
 
     def __init__(self, message: str, *, kind: str = "protocol") -> None:
         if kind not in {"auth", "quota", "rate_limit", "transport", "protocol", "capability", "context"}:
-            raise ValueError(f"Unknown Codex error kind: {kind}")
-        self.codex_kind = kind
-        self.codex_message = message
+            raise ValueError(f"Unknown subscription error kind: {kind}")
+        self.backend_kind = kind
+        self.backend_message = message
         self.llm_required_prompt_context_overflow = kind == "context"
-        super().__init__(f"[codex:{kind}] {message}")
+        super().__init__(f"[{self.backend}:{kind}] {message}")
 
     def __reduce__(self):
-        return (_restore_codex_backend_error, (self.codex_message, self.codex_kind), self.__dict__)
+        return (_restore_subscription_backend_error, (type(self), self.backend_message, self.backend_kind), self.__dict__)
+
+
+def _restore_subscription_backend_error(error_type, message: str, kind: str) -> SubscriptionBackendError:
+    return error_type(message, kind=kind)
+
+
+class CodexBackendError(SubscriptionBackendError):
+    backend = "codex"
+
+    @property
+    def codex_kind(self) -> str:
+        return self.backend_kind
+
+    @property
+    def codex_message(self) -> str:
+        return self.backend_message
+
+
+class ClaudeCodeBackendError(SubscriptionBackendError):
+    backend = "claude-code"
 
 
 def _restore_codex_backend_error(message: str, kind: str) -> CodexBackendError:
@@ -540,21 +562,21 @@ def classify_llm_exception(
 ) -> LLMErrorClassification:
     """Classify one exception for mini-prover retry and termination policy."""
 
-    if isinstance(exc, CodexBackendError):
+    if isinstance(exc, SubscriptionBackendError):
         reason = {
             "auth": "llm_auth_error",
             "quota": "llm_insufficient_quota",
             "capability": "provider_capability_conflict",
             "context": "llm_required_prompt_context_overflow",
-        }.get(exc.codex_kind, "llm_network_error")
-        terminal = exc.codex_kind in {"auth", "quota", "capability", "context"}
+        }.get(exc.backend_kind, "llm_network_error")
+        terminal = exc.backend_kind in {"auth", "quota", "capability", "context"}
         return LLMErrorClassification(
             kind={
                 "auth": "auth", "quota": "insufficient_quota",
                 "capability": "provider_capability_conflict", "rate_limit": "rate_limit",
                 "transport": "transport", "protocol": "transient",
                 "context": "llm_required_prompt_context_overflow",
-            }[exc.codex_kind],
+            }[exc.backend_kind],
             retryable=not terminal,
             terminal=terminal,
             failure_reason=reason,
@@ -810,9 +832,10 @@ def classify_llm_error_text(error_text: str) -> LLMErrorClassification:
     """Classify a rendered LLM error after the original exception is gone."""
 
     text = _lower_text(error_text)
-    codex_error = re.search(r"(?:^|:\s*)\[codex:(auth|quota|rate_limit|capability|transport|protocol|context)\]", text)
+    codex_error = re.search(r"(?:^|:\s*)\[(codex|claude-code):(auth|quota|rate_limit|capability|transport|protocol|context)\]", text)
     if codex_error:
-        return classify_llm_exception(CodexBackendError(text, kind=codex_error.group(1)))
+        error_type = CodexBackendError if codex_error.group(1) == "codex" else ClaudeCodeBackendError
+        return classify_llm_exception(error_type(text, kind=codex_error.group(2)))
     if not text:
         return LLMErrorClassification(kind="empty", retryable=False, terminal=False)
     ownership_classification = _runtime_transport_ownership_classification(error_text)

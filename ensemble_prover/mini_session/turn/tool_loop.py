@@ -799,6 +799,7 @@ class ToolLoopResult:
     """Typed bundle returned by ``call_llm_with_tools_one_round``."""
 
     content: str = ""
+    helper_context: Optional[tuple[str, ...]] = None
     tool_calls_used: int = 0
     tool_call_log: List[dict] = field(default_factory=list)
     llm_error: Optional[str] = None
@@ -2168,15 +2169,29 @@ async def _call_llm_with_tools_one_round_impl(
     """
 
     primitives = _legacy_imports()
-    # This is a controller-authorized route closure, never provider input.
-    # Freeze it per dispatch; ordinary calls continue to use dossier policy.
+    explicit_helper_scope = helper_context_override is not None
+
+    def validate_tool_scope(blocks: Sequence[str]) -> tuple[str, ...]:
+        validator = getattr(dossier, "validate_helper_context", None)
+        if callable(validator):
+            return validator(blocks)
+        if blocks and explicit_helper_scope:
+            raise ValueError("helper context requires a verification dossier")
+        # Older trusted adapters define their ordinary scope through
+        # verified_helper_blocks(). They cannot authorize an explicit override.
+        return tuple(blocks)
+
+    # Freeze both ordinary and controller-authorized route availability. The
+    # same scope feeds prompts, retrieval, tools, and the final proof replay.
+    if helper_context_override is None and dossier is not None:
+        helper_context_override = tuple(dossier.verified_helper_blocks())
     if helper_context_override is not None:
         helper_context_override = tuple(helper_context_override)
         if dossier is None:
             if helper_context_override:
                 raise ValueError("helper context requires a verification dossier")
         else:
-            helper_context_override = dossier.validate_helper_context(helper_context_override)
+            helper_context_override = validate_tool_scope(helper_context_override)
     initial_helper_names = (
         set(getattr(dossier, "verified_helpers", {}) or {})
         | {
@@ -2200,6 +2215,8 @@ async def _call_llm_with_tools_one_round_impl(
             if name and name not in names and name not in initial_helper_names:
                 blocks.append(block)
                 names.add(name)
+        if dossier is not None:
+            validate_tool_scope(blocks)
         return blocks
 
     def helper_context_kwargs() -> dict[str, Any]:
@@ -7805,6 +7822,7 @@ async def _call_llm_with_tools_one_round_impl(
 
     return ToolLoopResult(
         content=content,
+        helper_context=tuple(tool_helper_blocks()),
         tool_calls_used=tool_calls_used,
         tool_call_log=tool_call_log,
         llm_error=llm_error,
