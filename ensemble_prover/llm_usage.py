@@ -1084,9 +1084,11 @@ def mark_provider_pre_generation_rejection(
 ) -> None:
     """Retire one dispatch known not to have generated a completion.
 
-    This is intentionally limited to authoritative provider receipts such as
-    unsupported-parameter 4xx responses.  Transport timeouts remain ambiguous
-    and therefore retain conservative missing-usage accounting.
+    This is limited to authoritative evidence of no generation: provider
+    receipts such as unsupported-parameter 4xx responses, or a local transport
+    that definitively never submitted its input (status_code=0, explicit local
+    reason). Timeouts after submission remain ambiguous and retain conservative
+    missing-usage accounting.
     """
 
     marker = _PROVIDER_DISPATCH_MARKER.get()
@@ -4791,37 +4793,40 @@ class CostBudgetController:
                 "estimated_dispatch_cost_usd": dispatch_cost,
             }
             dispatch_authorization_records[authorization_id] = dict(receipt)
-            await self._record_dispatch_intent(reservation, receipt)
-            # Preserve the caller's live pre-dispatch hook. Budget state is
-            # extended first so the live hold includes new authority.
-            if inherited_dispatch_observer is not None:
-                try:
+            try:
+                await self._record_dispatch_intent(reservation, receipt)
+                # Preserve the caller's live pre-dispatch hook. Budget state is
+                # extended first so the live hold includes new authority.
+                if inherited_dispatch_observer is not None:
                     observed = inherited_dispatch_observer()
                     if inspect.isawaitable(observed):
                         await observed
-                except BaseException:
-                    counted_dispatch_authorization_ids.discard(authorization_id)
-                    dispatch_authorization_lease_receipt_ids.pop(
-                        authorization_id,
-                        None,
+            except BaseException:
+                counted_dispatch_authorization_ids.discard(authorization_id)
+                dispatch_authorization_lease_receipt_ids.pop(authorization_id, None)
+                dispatch_authorization_records.pop(authorization_id, None)
+                if provider_dispatch_lease is not None:
+                    provider_dispatch_lease.retire(receipt)
+                dispatch_authority_remaining_usd[target_id] = (
+                    max(
+                        0.0,
+                        float(dispatch_authority_remaining_usd.get(target_id, 0.0) or 0.0),
                     )
-                    dispatch_authorization_records.pop(authorization_id, None)
-                    if provider_dispatch_lease is not None:
-                        provider_dispatch_lease.retire(receipt)
-                    dispatch_authority_remaining_usd[target_id] = (
-                        max(
-                            0.0,
-                            float(
-                                dispatch_authority_remaining_usd.get(
-                                    target_id,
-                                    0.0,
-                                )
-                                or 0.0
-                            ),
-                        )
-                        + dispatch_cost
+                    + dispatch_cost
+                )
+                # The transport has not received authority or submitted input.
+                # Retire any recorded intent through the existing durable path;
+                # an uncertain journal write keeps its normal failure fence.
+                if not self._durable_write_failed:
+                    self._queue_authenticated_dispatch_retirement(
+                        reservation.reservation_id,
+                        {
+                            **receipt,
+                            "status_code": 0,
+                            "reason": "local_dispatch_admission_cancelled",
+                        },
                     )
-                    raise
+                raise
             return receipt
 
         async def _authorize_concrete_dispatch(

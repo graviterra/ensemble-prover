@@ -2,7 +2,7 @@
 
 The `ensemble_prover.nl_input` module translates a text or LaTeX mathematical
 claim to Lean definitions and a proposition, checks them with Lean, and starts Mini Prover.
-It is included in release 1.08; older Mini-only releases do not include it.
+It is included in release 1.09; older Mini-only releases do not include it.
 Run the commands below from the repository
 root containing `.venv/`, not from inside the `ensemble_prover/` package.
 

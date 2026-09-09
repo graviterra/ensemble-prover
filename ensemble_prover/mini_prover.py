@@ -340,6 +340,7 @@ from .mini_tactic_closer import (
     is_transient_tactic_close_failure,
     try_close_with_tactics,
 )
+from .codex_subscription import CODEX_SUBSCRIPTION_BASE_URL, CodexSubscriptionClient
 from .models import (
     OpenAICompatClient,
     response_output_items,
@@ -12358,19 +12359,21 @@ def _mini_dossier_structural_metric_record(
 
 
 # ---------------------------------------------------------------------------
-# Provider config. Three providers wired by env vars.
+# Provider config. API transports and the locally authenticated Codex CLI.
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MODELS = {
     "openai": "gpt-5.2",
     "deepseek": "deepseek-v4-pro",
     "openrouter": "",
+    "codex": "",
 }
 
 _PROVIDER_BASE_URLS = {
     "openai": "https://api.openai.com/v1",
     "deepseek": "https://api.deepseek.com/v1",
     "openrouter": "https://openrouter.ai/api/v1",
+    "codex": CODEX_SUBSCRIPTION_BASE_URL,
 }
 
 _PROVIDER_ENV_VARS = {
@@ -12480,8 +12483,11 @@ def _make_role_cfg(
     provider = provider.lower()
     if provider not in _DEFAULT_MODELS:
         raise SystemExit(f"Unknown provider: {provider}")
-    api_key = os.environ.get(_PROVIDER_ENV_VARS[provider], "").strip()
-    if not api_key:
+    api_key = (
+        os.environ.get(_PROVIDER_ENV_VARS[provider], "").strip()
+        if provider != "codex" else None
+    )
+    if provider != "codex" and not api_key:
         raise SystemExit(
             f"{_PROVIDER_ENV_VARS[provider]} is not set in the environment."
         )
@@ -12489,7 +12495,7 @@ def _make_role_cfg(
     if not resolved_model:
         raise SystemExit(
             f"{provider} requires an explicit model for {role_name}; "
-            f"pass --{role_name}-model (for example, an OpenRouter model id)."
+            f"pass --{role_name}-model with a model supported by {provider}."
         )
     if provider == "openrouter":
         resolved_model = _canonical_openrouter_model_id(resolved_model)
@@ -12551,6 +12557,16 @@ def _make_role_cfg(
     setattr(cfg, "request_timeout_s", request_timeout_f)
     setattr(cfg, "request_timeout_disabled", bool(request_timeout_disabled))
     return cfg
+
+
+def _make_mini_role_client(
+    cfg: RoleConfig, *, provider_lane_health_registry: Any = None,
+) -> Any:
+    if getattr(cfg, "base_url", "") == CODEX_SUBSCRIPTION_BASE_URL:
+        return CodexSubscriptionClient(cfg)
+    return OpenAICompatClient(
+        cfg, provider_lane_health_registry=provider_lane_health_registry,
+    )
 
 
 def _normalize_reasoning_cli_mode(mode: Optional[str]) -> str:
@@ -12885,14 +12901,14 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--prover",
         default="deepseek",
-        choices=["openai", "deepseek", "openrouter"],
+        choices=["openai", "deepseek", "openrouter", "codex"],
         help="Provider for the prover role.",
     )
     p.add_argument("--prover-model", default=None)
     p.add_argument(
         "--refiner",
         default=None,
-        choices=["openai", "deepseek", "openrouter"],
+        choices=["openai", "deepseek", "openrouter", "codex"],
         help=(
             "Optional refiner provider. When set, the refiner role takes over "
             "the transcript after prover stalls; it may use the same provider "
@@ -12900,6 +12916,10 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--refiner-model", default=None)
+    p.add_argument(
+        "--codex-bin", default="codex",
+        help="Codex CLI executable for --prover/--refiner codex (ChatGPT subscription sign-in).",
+    )
     p.add_argument(
         "--planner-escalation",
         default="auto",
@@ -14374,6 +14394,11 @@ async def _validate_cost_budget_pricing(
         if client is None:
             continue
         for model, base_url in reservation_pricing_targets(client):
+            if base_url == CODEX_SUBSCRIPTION_BASE_URL:
+                raise ValueError(
+                    "--cost-budget-usd cannot price Codex subscription allowance; "
+                    "use --cost-budget-usd 0. Codex usage is still recorded."
+                )
             identity = (str(role or "llm"), str(model or ""), str(base_url or ""))
             if identity in seen:
                 continue
@@ -14992,7 +15017,8 @@ async def _main_async(args: argparse.Namespace) -> int:
             mode=prover_reasoning_mode,
             effort=prover_reasoning_effort,
         )
-        prover_client = OpenAICompatClient(
+        prover_cfg.codex_binary = getattr(args, "codex_bin", "codex")
+        prover_client = _make_mini_role_client(
             prover_cfg,
             provider_lane_health_registry=provider_lane_health_registry,
         )
@@ -15017,10 +15043,20 @@ async def _main_async(args: argparse.Namespace) -> int:
                 mode=refiner_reasoning_mode,
                 effort=refiner_reasoning_effort,
             )
-            refiner_client = OpenAICompatClient(
+            refiner_cfg.codex_binary = getattr(args, "codex_bin", "codex")
+            refiner_client = _make_mini_role_client(
                 refiner_cfg,
                 provider_lane_health_registry=provider_lane_health_registry,
             )
+        for role_client in (prover_client, refiner_client):
+            if isinstance(role_client, CodexSubscriptionClient):
+                await role_client.preflight()
+                print(
+                    f"[mini_prover] {role_client.cfg.name}: Codex ChatGPT subscription "
+                    f"({role_client.cli_version}); output-token limits are prompt targets; "
+                    "temperature/top_p are not sent.",
+                    flush=True,
+                )
         await _preflight_mini_reasoning_contract_or_defer(
             prover_client,
             role="prover",
@@ -15034,6 +15070,10 @@ async def _main_async(args: argparse.Namespace) -> int:
         planner_escalation_choice = str(
             getattr(args, "planner_escalation", "auto") or "auto"
         ).strip().lower()
+        if planner_escalation_choice == "auto" and "codex" in {args.prover, args.refiner}:
+            # Subscription selection must not silently activate an API-billed
+            # escalation role because an unrelated API key is in the shell.
+            planner_escalation_choice = ""
         if planner_escalation_choice == "auto":
             # On by default via the OpenAI API, but fail-soft: a run
             # configured without OPENAI_API_KEY must keep working (an

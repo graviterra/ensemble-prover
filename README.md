@@ -10,7 +10,7 @@ point is `ensemble_prover.mini_prover`.
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
 file and Lake project. PutnamBench files are supported through a compatibility
 adapter, and callers may attach a natural-language problem description as
-additional model context. Release 1.08 also includes
+additional model context. Release 1.09 also includes
 experimental natural-language entry points: `ensemble_prover.nl_input` for a
 single claim and `ensemble_prover.formalization` for resumable, multi-file
 projects. These translate text before proving; the resulting Lean statement
@@ -58,10 +58,10 @@ the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** 1.08 — research preview. Includes Mini Prover, experimental
+> **Release status:** 1.09 — research preview. Includes Mini Prover, experimental
 > single-claim NL input, and resumable multi-file formalization campaigns.
-> Includes Python 3.12 CLI compatibility fixes and improved helper retention,
-> planner recovery, and durable checkpoint continuation.
+> Adds an optional Codex subscription backend for Mini's prover and refiner,
+> alongside the existing API providers.
 
 ## Documentation
 
@@ -88,7 +88,8 @@ troubleshooting, and the public Mini CLI option map.
 - Linux
 - Standard CPython 3.11 or 3.12 (release audited on both)
 - Lean toolchain compatible with the target Lake project
-- An API key for the selected language-model provider
+- An API key for the selected provider, or a ChatGPT Codex sign-in for Mini's
+  optional subscription backend
 
 The public runtime snapshot pins the complete dependency closure for four core
 Python packages in `requirements.txt`: HTTP transport, graph search,
@@ -111,7 +112,7 @@ Install Lean and Lake separately using the official
 does not ship or provision Lean, Lake, Mathlib, PutnamBench, or downloaded
 package trees.
 
-Copy the environment template and add only the provider keys you use:
+For API providers, copy the environment template and add only the keys you use:
 
 ```bash
 cp .env.example .env
@@ -153,6 +154,12 @@ For a PutnamBench source file:
 
 The Putnam adapter expects a separately supplied compatible PutnamBench
 checkout; no benchmark data or setup environment is bundled.
+
+To use a ChatGPT Codex subscription for the prover or refiner, select
+`--prover codex --prover-model <model>` and/or
+`--refiner codex --refiner-model <model>` after `codex login`.
+Set `--cost-budget-usd 0`; subscription usage is not priced as API usage.
+See [Codex subscription setup and transport limits](docs/CODEX_SUBSCRIPTION_BACKEND.md).
 
 To sweep all locally unsolved PutnamBench problems in random order:
 

@@ -299,6 +299,8 @@ class RoleConfig:
     # operator opt-out. Thinking mode disables temperature/top_p and requires
     # reasoning_content replay for tool-call conversations.
     thinking_enabled: bool = False
+    # Executable used only by the codex://chatgpt subscription transport.
+    codex_binary: str = "codex"
 
 
 @dataclass

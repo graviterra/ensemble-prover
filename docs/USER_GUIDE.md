@@ -6,7 +6,8 @@ The experimental NL frontends first translate the mathematics into Lean; the
 formalization campaign can build definitions and supporting theorems across
 multiple files before completing the root theorem.
 
-This guide covers release 1.08, including both experimental NL frontends.
+This guide covers release 1.09, including both experimental NL frontends and
+the optional Codex subscription backend for Mini's prover and refiner.
 Older Mini-only releases do not include those modules.
 Run commands from the repository root containing `.venv/` and `ensemble_prover/`,
 not from inside the `ensemble_prover/` Python package. The live help is the
@@ -102,7 +103,7 @@ If that command fails, fix the theorem project before starting the prover.
 
 ## 3. Configure a provider
 
-For a new installation, copy the environment template. Keep your existing
+For API providers on a new installation, copy the environment template. Keep your existing
 `.env` if you have already configured credentials:
 
 ```bash
@@ -122,11 +123,12 @@ that file.
 
 ### Provider defaults
 
-| Provider | CLI value | Default model | Required key |
+| Provider | CLI value | Default model | Authentication |
 | --- | --- | --- | --- |
 | OpenAI | `openai` | `gpt-5.2` | `OPENAI_API_KEY` |
 | DeepSeek | `deepseek` | `deepseek-v4-pro` | `DEEPSEEK_API_KEY` |
 | OpenRouter | `openrouter` | none; specify one | `OPENROUTER_API_KEY` |
+| Codex subscription (Mini prover/refiner) | `codex` | none; specify one | `codex login` using ChatGPT |
 
 The default prover provider is DeepSeek. Select `--prover openai` explicitly
 if only `OPENAI_API_KEY` is configured. OpenRouter always requires an explicit
@@ -142,6 +144,12 @@ Planner escalation defaults to `auto`. If `OPENAI_API_KEY` exists, `auto` uses
 the OpenAI API with `gpt-5.6-terra`; otherwise it disables escalation with a
 warning. Use `--planner-escalation off` to disable it deliberately, or choose
 another provider and model explicitly.
+
+When either Mini role uses `codex`, automatic API planner escalation is disabled.
+Select a model explicitly and set `--cost-budget-usd 0`; subscription allowances
+are not API dollar budgets. See [Codex subscription setup and limitations](CODEX_SUBSCRIPTION_BACKEND.md)
+for the CLI requirements, launch example, context behavior, and accounting.
+An API key is not required for a subscription-only Mini run.
 
 The NL frontends have their own formalizer settings. The campaign currently
 uses the OpenAI API for all three of its roles: `gpt-5.6-terra` for formalization
