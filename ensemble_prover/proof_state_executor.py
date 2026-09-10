@@ -10075,6 +10075,54 @@ async def _try_proof_state_lemma_dag_helpers(
     return accepted_helpers
 
 
+_CHILD_FALSIFICATION_RETRY_GENERATION = "child-falsification-operational-retry-v1"
+
+
+def _child_falsification_preflight_operational_context(
+    *,
+    lean: Any,
+    node: ProofStateNode,
+    preamble: str,
+    policy: FalsificationPolicy,
+    dossier_environment_hash: str,
+) -> str:
+    """Identify infrastructure retries independently of helper accumulation.
+
+    This key only limits advisory probe frequency. Reports and certificates
+    continue to bind their full, exact helper and Lean environment context.
+    """
+
+    from .mini_falsification.service import falsification_environment_hash
+
+    cfg = getattr(lean, "cfg", None)
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "generation": _CHILD_FALSIFICATION_RETRY_GENERATION,
+                "target": str(node.target or ""),
+                "node_environment_hash": str(
+                    getattr(node, "statement_environment_hash", "") or ""
+                ),
+                "dossier_environment_hash": dossier_environment_hash,
+                "execution_policy": vars(policy),
+                "environment_hash": falsification_environment_hash(
+                    preamble=str(preamble or ""),
+                    helpers=(),
+                    policy=policy,
+                    lean=lean,
+                ),
+                "backend_mode": str(getattr(cfg, "backend_mode", "") or ""),
+                "use_repl": getattr(cfg, "use_repl", None),
+                "lean_runner_type": (
+                    f"{type(lean).__module__}.{type(lean).__qualname__}"
+                ),
+            },
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _child_falsification_preflight_seen(
     node: ProofStateNode,
     context_key: str,
@@ -10134,7 +10182,25 @@ def _proof_state_child_tactic_terminal_context_key(
     node: ProofStateNode,
     timeout_s: float,
     max_candidates: int,
+    refresh_quality: bool = True,
 ) -> str:
+    return _proof_state_child_tactic_context_keys(
+        conv=conv, dossier=dossier, proof_state=proof_state, node=node,
+        timeout_s=timeout_s, max_candidates=max_candidates,
+        refresh_quality=refresh_quality,
+    )[0]
+
+
+def _proof_state_child_tactic_context_keys(
+    *,
+    conv: Any,
+    dossier: ProofDossier,
+    proof_state: ProofSearchState,
+    node: ProofStateNode,
+    timeout_s: float,
+    max_candidates: int,
+    refresh_quality: bool = True,
+) -> Tuple[str, str, List[str]]:
     timeout_value = max(0.0, float(timeout_s or 0.0))
     timeout_class = (
         "adequate"
@@ -10144,7 +10210,7 @@ def _proof_state_child_tactic_terminal_context_key(
     preamble = _proof_state_residual_preamble(conv)
     helpers = _proof_state_residual_lemmas(
         conv,
-        _proof_state_verified_helper_blocks(dossier),
+        _proof_state_verified_helper_blocks(dossier, refresh_quality=refresh_quality),
     )
     pattern_context = _proof_state_tactic_pattern_context(
         proof_state,
@@ -10158,37 +10224,98 @@ def _proof_state_child_tactic_terminal_context_key(
             "max_candidates": str(max(0, int(max_candidates or 0))),
         }
     )
-    return text_hash(
-        json.dumps(
-            {
-                "execution_policy": PROOF_STATE_CHILD_TACTIC_POLICY_VERSION,
-                "target": node.target,
-                "preamble": preamble,
-                "helpers": helpers,
-                "pattern_context": pattern_context,
-                "tactic_timeout_class": timeout_class,
-                "suppress_solution_placeholders": bool(
-                    getattr(conv, "suppress_solution_placeholders", True)
-                ),
-                "opaque_mode": bool(
-                    getattr(conv, "opaque_mode", getattr(dossier, "opaque_mode", True))
-                ),
-                "allow_official_answer_visibility": bool(
-                    getattr(
-                        conv,
-                        "allow_official_answer_visibility",
-                        getattr(dossier, "allow_official_answer_visibility", False),
-                    )
-                ),
-                "official_answer_payload_present": getattr(
-                    conv,
-                    "official_answer_payload_present",
-                    getattr(dossier, "official_answer_payload_present", None),
-                ),
-            },
-            sort_keys=True,
-            default=str,
-        )
+    context = {
+        "execution_policy": PROOF_STATE_CHILD_TACTIC_POLICY_VERSION,
+        "target": node.target,
+        "preamble": preamble,
+        "node_environment_hash": str(node.statement_environment_hash or ""),
+        "dossier_environment_hash": str(
+            getattr(dossier, "current_lean_environment_hash", "") or ""
+        ),
+        "helpers": helpers,
+        "pattern_context": pattern_context,
+        "tactic_timeout_class": timeout_class,
+        "suppress_solution_placeholders": bool(
+            getattr(conv, "suppress_solution_placeholders", True)
+        ),
+        "opaque_mode": bool(
+            getattr(conv, "opaque_mode", getattr(dossier, "opaque_mode", True))
+        ),
+        "allow_official_answer_visibility": bool(
+            getattr(
+                conv,
+                "allow_official_answer_visibility",
+                getattr(dossier, "allow_official_answer_visibility", False),
+            )
+        ),
+        "official_answer_payload_present": getattr(
+            conv,
+            "official_answer_payload_present",
+            getattr(dossier, "official_answer_payload_present", None),
+        ),
+    }
+    exact_key = text_hash(json.dumps(context, sort_keys=True, default=str))
+    context.pop("helpers")
+    base_key = text_hash(json.dumps(context, sort_keys=True, default=str))
+    return exact_key, base_key, [text_hash(helper) for helper in helpers]
+
+
+def _proof_state_child_tactic_portfolio_continuation(
+    *,
+    conv: Any,
+    dossier: ProofDossier,
+    proof_state: ProofSearchState,
+    node: ProofStateNode,
+    timeout_s: float,
+    max_candidates: int,
+    refresh_quality: bool = False,
+) -> Dict[str, Any]:
+    """Admit scheduling state without granting any current proof authority."""
+
+    saved = validated_child_tactic_portfolio_continuation(
+        node.child_tactic_portfolio_continuation
+    )
+    if not saved:
+        return {}
+    exact_key, base_key, helper_hashes = _proof_state_child_tactic_context_keys(
+        conv=conv, dossier=dossier, proof_state=proof_state, node=node,
+        timeout_s=timeout_s, max_candidates=max_candidates,
+        refresh_quality=refresh_quality,
+    )
+    generation = saved.get("generation_context", {})
+    previous_helpers = saved.get("execution_helper_hashes", [])
+    if generation and generation.get("base_key") != base_key:
+        return {}
+    if saved["context_key"] == exact_key:
+        # Optional epoch metadata must agree with the exact execution receipt,
+        # even when no rebase is needed. A well-shaped corrupted checkpoint
+        # cannot retain broader scheduling authority for a later helper change.
+        if generation and previous_helpers != helper_hashes:
+            return {}
+        return saved
+    if (
+        generation.get("base_key") != base_key
+        or len(helper_hashes) < len(previous_helpers)
+        or helper_hashes[:len(previous_helpers)] != previous_helpers
+    ):
+        return {}
+    # The generated portfolio is immutable. Only its execution context moves
+    # forward; every resumed proof and residual still faces the fresh verifier.
+    saved["context_key"] = exact_key
+    saved["execution_helper_hashes"] = helper_hashes
+    return saved
+
+
+def child_tactic_portfolio_needs_refresh(saved: Mapping[str, Any]) -> bool:
+    """A settled older generation grants one newly generated finite epoch."""
+
+    generation = saved.get("generation_context", {})
+    return bool(
+        generation
+        and generation.get("context_key") != saved.get("context_key")
+        and saved.get("candidates")
+        and saved.get("next_candidate_index") == len(saved["candidates"])
+        and not saved.get("residual_candidates")
     )
 
 
@@ -10292,6 +10419,19 @@ async def _try_proof_state_child_falsification_preflight(
         engine_timeout_s=budget_s,
         aggregate_timeout_s=budget_s,
     )
+    operational_context = _child_falsification_preflight_operational_context(
+        lean=lean,
+        node=node,
+        preamble=preamble,
+        policy=policy,
+        dossier_environment_hash=dossier_environment_hash,
+    )
+    retry_key = _verifier_retry_key(
+        stage="child_falsification_preflight",
+        request_hash=operational_context,
+        context_hash=operational_context,
+        verifier_generation=_CHILD_FALSIFICATION_RETRY_GENERATION,
+    )
     context_key = text_hash(
         json.dumps(
             {
@@ -10301,6 +10441,7 @@ async def _try_proof_state_child_falsification_preflight(
                 "policy_hash": policy.policy_hash,
                 "node_environment_hash": node_environment_hash,
                 "dossier_environment_hash": dossier_environment_hash,
+                "operational_context": operational_context,
             },
             sort_keys=True,
             default=str,
@@ -10308,17 +10449,31 @@ async def _try_proof_state_child_falsification_preflight(
     )
     if _child_falsification_preflight_seen(node, context_key):
         return bool(getattr(node, "falsified", False)), {}
-    if _child_falsification_preflight_transient_seen(node, context_key):
+    transient_seen = _child_falsification_preflight_transient_seen(node, context_key)
+    cooling = proof_state.verifier_retry_status(node, retry_key) == "cooling"
+    if cooling:
         # A preflight infrastructure failure may defer tactic search once, but
         # must not permanently monopolize the exact tactic frontier.  Lean still
         # validates every tactic candidate, so bypassing a repeatedly unavailable
-        # advisory falsifier does not weaken proof soundness.
+        # advisory falsifier does not weaken proof soundness. Helper growth
+        # cannot rearm failed infrastructure during cooldown; after it expires,
+        # even the same failed exact context gets a bounded recovery probe.
+        # Historical transient markers have no permanent suppression authority:
+        # the shared cooldown may have cleared after another context recovered.
         return False, {
             "phase": "proof_state_child_falsification",
             "turn_in_phase": turn,
             "node_id": node.node_id,
             "target": node.target,
-            "verdict": "falsification_transient_bypassed",
+            "verdict": (
+                "falsification_transient_bypassed"
+                if transient_seen
+                else "falsification_operational_backoff"
+            ),
+            "verifier_retry_key": retry_key,
+            "retry_after_epoch_s": proof_state.verifier_retry_next_eligible_at(
+                node, retry_key
+            ),
             "retryable_infrastructure": False,
             "retryable_timeout": False,
         }
@@ -10332,24 +10487,55 @@ async def _try_proof_state_child_falsification_preflight(
     def remember_transient(error_kind: str, blocker: str, *, timeout: bool) -> None:
         if dispatch_replaced():
             return
-        # Deadline rollback may replace ``proof_state.nodes`` with a snapshot,
-        # so always resolve the live node instead of mutating a stale argument.
-        live_node = proof_state.nodes.get(node.node_id) or node
-        _remember_child_falsification_preflight_transient(live_node, context_key)
-        proof_state.record_transition(
-            node_id=live_node.node_id,
-            source="falsification_preflight",
-            error_type="child_goal_falsification_preflight_transient",
-            action=live_node.action,
-            blocker=str(blocker or "")[:500],
-            phase="proof_state_child_falsification",
-            turn_index=turn,
-            payload={
-                "context_key": context_key,
-                "completed": False,
-                "infrastructure_exception": str(error_kind or ""),
-                "retryable_timeout": bool(timeout),
-            },
+        # A local timeout may publish operational backoff, but a replaced
+        # dispatch cannot retain even part of the retry-frequency mutation.
+        with DeadlineMutationTransaction(
+            deadline_exhausted=dispatch_replaced,
+            dossier=dossier,
+            proof_state=proof_state,
+            label="proof_state_child_falsification_failure",
+        ) as failure_transaction:
+            if not failure_transaction.can_mutate():
+                return
+            # Rollback may replace nodes; never mutate a stale argument.
+            live_node = proof_state.nodes.get(node.node_id) or node
+            _remember_child_falsification_preflight_transient(live_node, context_key)
+            remember_operational_failure(live_node, error_kind)
+            proof_state.record_transition(
+                node_id=live_node.node_id,
+                source="falsification_preflight",
+                error_type="child_goal_falsification_preflight_transient",
+                action=live_node.action,
+                blocker=str(blocker or "")[:500],
+                phase="proof_state_child_falsification",
+                turn_index=turn,
+                payload={
+                    "context_key": context_key,
+                    "verifier_retry_key": retry_key,
+                    "completed": False,
+                    "infrastructure_exception": str(error_kind or ""),
+                    "retryable_timeout": bool(timeout),
+                },
+            )
+
+    def remember_operational_failure(
+        live_node: ProofStateNode,
+        error_kind: str,
+    ) -> None:
+        proof_state.record_verifier_retry_failure(
+            live_node,
+            retry_key=retry_key,
+            stage="child_falsification_preflight",
+            request_hash=operational_context,
+            context_hash=operational_context,
+            verifier_generation=_CHILD_FALSIFICATION_RETRY_GENERATION,
+            failure_kind=str(error_kind or "transient_failure"),
+            failure_fingerprint=hashlib.sha256(
+                str(error_kind or "transient_failure").encode("utf-8")
+            ).hexdigest(),
+            immediate_retry_count=0,
+            base_cooldown_s=30.0,
+            max_cooldown_s=1800.0,
         )
 
     try:
@@ -10507,6 +10693,13 @@ async def _try_proof_state_child_falsification_preflight(
             live_node.falsification_advisory_candidate_hash = (
                 "" if falsified else advisory_candidate_hash
             )
+            if retryable_infrastructure:
+                remember_operational_failure(
+                    live_node,
+                    ",".join(sorted(transient_error_kinds)) or "transient_failure",
+                )
+            else:
+                proof_state.clear_verifier_retry_state(live_node, retry_key)
             proof_state.record_transition(
                 node_id=node.node_id,
                 source="falsification_preflight",
@@ -10527,6 +10720,7 @@ async def _try_proof_state_child_falsification_preflight(
                 turn_index=turn,
                 payload={
                     "context_key": context_key,
+                    "verifier_retry_key": retry_key,
                     "completed": completed,
                     "promoted": promoted,
                     "certificate_hash": certificate_hash,
@@ -11803,7 +11997,7 @@ async def _try_proof_state_one_child_closure(
         }
     )
     tactic_available_timeout = _remaining_timeout(timeout_s)
-    tactic_terminal_context_key = _proof_state_child_tactic_terminal_context_key(
+    tactic_terminal_context_key, tactic_base_key, tactic_helper_hashes = _proof_state_child_tactic_context_keys(
         conv=conv,
         dossier=dossier,
         proof_state=proof_state,
@@ -11811,12 +12005,22 @@ async def _try_proof_state_one_child_closure(
         timeout_s=tactic_available_timeout,
         max_candidates=max_candidates,
     )
-    continuation = validated_child_tactic_portfolio_continuation(
-        node.child_tactic_portfolio_continuation
+    continuation = _proof_state_child_tactic_portfolio_continuation(
+        conv=conv, dossier=dossier, proof_state=proof_state, node=node,
+        timeout_s=tactic_available_timeout, max_candidates=max_candidates,
     )
-    if continuation.get("context_key") != tactic_terminal_context_key:
+    if child_tactic_portfolio_needs_refresh(continuation):
+        # The previous finite epoch settled. Generate against the latest
+        # helpers only now, so publication cannot keep extending its suffix.
         continuation = {}
     node.child_tactic_portfolio_continuation = continuation
+    generation_context = continuation.get("generation_context") or {
+        "schema_version": 1,
+        "base_key": tactic_base_key,
+        "context_key": tactic_terminal_context_key,
+        "helper_hashes": tactic_helper_hashes,
+    }
+    generation_context_changed = generation_context["context_key"] != tactic_terminal_context_key
     if tactic_terminal_context_key in set(
         getattr(node, "tactic_terminal_context_keys", []) or []
     ):
@@ -11864,6 +12068,7 @@ async def _try_proof_state_one_child_closure(
         reusable_candidate_portfolio = True
     resumed_offset = candidate_portfolio_offset
     remaining_candidate_attempts = max(0, int(candidate_attempt_limit or 0))
+    candidate_timeout_floor_s = float(continuation.get("candidate_timeout_floor_s", 0.0))
 
     def save_child_portfolio() -> Dict[str, Any]:
         from .mini_tactic_closer import TacticCandidate
@@ -11885,6 +12090,9 @@ async def _try_proof_state_one_child_closure(
             ],
             "next_candidate_index": candidate_portfolio_offset,
             "residual_candidates": residual_candidates,
+            "generation_context": generation_context,
+            "execution_helper_hashes": tactic_helper_hashes,
+            "candidate_timeout_floor_s": candidate_timeout_floor_s,
         })
         if saved:
             node.child_tactic_portfolio_continuation = saved
@@ -11921,6 +12129,7 @@ async def _try_proof_state_one_child_closure(
                 candidate_portfolio=candidate_portfolio,
                 candidate_portfolio_offset=candidate_portfolio_offset,
                 candidate_attempt_limit=remaining_candidate_attempts,
+                candidate_timeout_floor_s=candidate_timeout_floor_s,
                 # The offset already excludes the vetoed prefix on resumed
                 # portfolios. Avoid sorting and copying the growing veto set.
                 suppressed_proofs=(
@@ -11999,6 +12208,26 @@ async def _try_proof_state_one_child_closure(
             aggregate_cache_metadata,
             getattr(result, "cache_metadata", {}),
         )
+        # Keep learned time allocation with the finite generation rather
+        # than the exact helper-sensitive verdict cache. A helper addition
+        # or JSON restart must not continually shrink the same retry slice.
+        result_cache_metadata = getattr(result, "cache_metadata", None)
+        raw_timeout_floor = (
+            result_cache_metadata.get("candidate_timeout_floor_s", 0.0)
+            if isinstance(result_cache_metadata, Mapping) else 0.0
+        )
+        try:
+            learned_timeout_floor = (
+                float(raw_timeout_floor)
+                if type(raw_timeout_floor) in (int, float) else 0.0
+            )
+        except OverflowError:
+            learned_timeout_floor = 0.0
+        if math.isfinite(learned_timeout_floor) and learned_timeout_floor > 0:
+            candidate_timeout_floor_s = min(
+                max(candidate_timeout_floor_s, learned_timeout_floor),
+                max(0.0, float(timeout_s)),
+            )
         final_exit_reason = str(getattr(result, "exit_reason", "") or "exhausted")
         for attempt in result_attempts:
             if (
@@ -12245,6 +12474,7 @@ async def _try_proof_state_one_child_closure(
             "pending_helper_acceptance_owned",
         }
         and not (continuation and resumed_offset == len(continuation["candidates"]))
+        and not generation_context_changed
         and normalized_formal_config is not None
         and bool(getattr(normalized_formal_config, "enabled", False))
         and formal_search_client is not None
@@ -12621,6 +12851,40 @@ async def _try_proof_state_one_child_closure(
             node.action = "assemble_from_children"
             node.blocker = f"tactic residual spawned {len(set(tactic_spawned))} subgoal(s)"
             node.priority = proof_state._priority(node)
+    if (
+        not helper_name
+        and not tactic_spawned
+        and not tactic_residual_deferred
+        and final_exit_reason not in {
+            "lean_admission_deferred", "acceptance_retryable_error",
+            "pending_helper_acceptance_owned",
+        }
+        and child_tactic_portfolio_needs_refresh(save_child_portfolio())
+    ):
+        # Old-generation exhaustion is not current-context exhaustion. Keep
+        # one bounded refresh pending; no helper publication appends candidates
+        # or postpones the settlement of the immutable portfolio above.
+        if not residual_producer_precharged:
+            node.tactic_attempts += len(result.attempts)
+            node.close_attempts += len(result.attempts)
+        node.blocker = "child_tactic_portfolio_refresh_pending"
+        proof_state.record_tactic_pattern_cache_metrics(aggregate_cache_metadata)
+        records.append({
+            "phase": "proof_state_child_tactic",
+            "turn_in_phase": turn, "node_id": node.node_id,
+            "target": node.target,
+            "tactic_candidate_count": result.candidate_count,
+            **tactic_attempt_telemetry_fields(result.attempts),
+            "tactic_attempts": result.attempts[:10],
+            "tactic_elapsed_s": result.elapsed_s,
+            "tactic_exit_reason": final_exit_reason,
+            "tactic_pattern_cache": aggregate_cache_metadata,
+            "next_candidate_index": candidate_portfolio_offset,
+            "child_tactic_continuation_pending": True,
+            "child_tactic_cursor_advanced": candidate_portfolio_offset > resumed_offset,
+            "verdict": "child_tactic_portfolio_refresh_pending",
+        })
+        return accepted_helpers, records
     if helper_name or (
         not residual_candidates
         and final_exit_reason not in {

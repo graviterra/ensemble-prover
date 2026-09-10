@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import copy
+import re
+from collections.abc import Mapping
 from typing import Any
 
 from ...mini_falsification.model import content_hash
 from ...proof_dossier import canonical_dossier_statement_key
 from ..action import MiniOutcome
+from ..planner_jobs import PlannerJobLaunch
 from .recursive_controller import RecursiveControllerAction
 
 
@@ -53,15 +56,18 @@ class GraphRootReplanAction(RecursiveControllerAction):
 
     def observe_proof_outcome(
         self, session: Any, outcome: MiniOutcome, *, formal_progress: bool,
+        sustained_helper_progress: bool = False,
     ) -> None:
         if (
             self._pending_replan_request
             and not self._active_replan_identity
-            and self._pending_replan_request.get("context_identity")
-            != self._context_identity(session)
+            and not self.selected_replan_work(session)
         ):
             self._pending_replan_request = {}
-        if formal_progress or outcome.solved or outcome.exception is not None:
+        if (
+            (formal_progress and not sustained_helper_progress)
+            or outcome.solved or outcome.exception is not None
+        ):
             return
         if not outcome.action_id.startswith("conversation_turn"):
             return
@@ -82,19 +88,31 @@ class GraphRootReplanAction(RecursiveControllerAction):
             session._persistent_infrastructure_defer(metadata)
             or metadata.get("paid_tool_infrastructure_disposition")
             or int(metadata.get("provider_calls_completed", 0) or 0) <= 0
-            or int(metadata.get("semantic_diagnostic_best_phase", -1)) < 0
+            or (
+                not sustained_helper_progress
+                and int(metadata.get("semantic_diagnostic_best_phase", -1)) < 0
+            )
         ):
             return
         attempts = int(metadata.get("proof_tool_attempts", 0) or 0)
         stalled = int(metadata.get("consecutive_no_formal_progress", 0) or 0)
-        if stalled < self._STALL_TOOL_ATTEMPTS or attempts < self._STALL_TOOL_ATTEMPTS:
+        if not sustained_helper_progress and (
+            stalled < self._STALL_TOOL_ATTEMPTS or attempts < self._STALL_TOOL_ATTEMPTS
+        ):
             return
         context = self._context_identity(session)
-        identity = content_hash((
-            context, outcome.action_id,
-            int(metadata.get("conv_turn_index_absolute", 0) or 0),
-            attempts // self._STALL_TOOL_ATTEMPTS,
-        ))
+        identity = content_hash(
+            (
+                context, "sustained_helper_progress",
+                session.helper_only_progress_identity,
+                int(session.helper_only_provider_quanta),
+            )
+            if sustained_helper_progress else (
+                context, outcome.action_id,
+                int(metadata.get("conv_turn_index_absolute", 0) or 0),
+                attempts // self._STALL_TOOL_ATTEMPTS,
+            )
+        )
         if identity in self._served_replan_requests or self._pending_replan_request:
             return
         self._pending_replan_request = {
@@ -109,6 +127,10 @@ class GraphRootReplanAction(RecursiveControllerAction):
             "owner_action_id": outcome.action_id,
             "stalled_tool_attempts": stalled,
             "diagnostic_kind": str(metadata.get("semantic_diagnostic_best_error_kind") or ""),
+            "sustained_helper_progress": sustained_helper_progress,
+            "helper_only_progress_identity": (
+                session.helper_only_progress_identity if sustained_helper_progress else ""
+            ),
         }
         session._record_event({
             "phase": "session_root_replanning",
@@ -128,13 +150,40 @@ class GraphRootReplanAction(RecursiveControllerAction):
         )):
             return {}
         active = self._active_replan_identity == request.get("request_identity")
+        if not active and request.get("sustained_helper_progress"):
+            # This is a request to replan the unchanged obligation *after*
+            # earned work drains. Additional checked helpers enrich that
+            # planning context; only parent progress or a changed root can
+            # discharge the sustained-progress intervention itself.
+            if (
+                request.get("helper_only_progress_identity")
+                != session._helper_only_root_identity()
+                or int(session.max_helper_only_provider_quanta or 0) <= 0
+                or int(session.helper_only_provider_quanta or 0)
+                < int(session.max_helper_only_provider_quanta)
+            ):
+                return {}
+            selected = copy.deepcopy(request)
+            selected["context_identity"] = self._context_identity(session)
+            return selected
         if not active and request.get("context_identity") != self._context_identity(session):
             return {}
         return copy.deepcopy(request)
 
     def is_applicable(self, session: Any) -> bool:
+        request = self.selected_replan_work(session)
+        active = bool(self._active_replan_identity) and (
+            self._active_replan_identity == request.get("request_identity")
+        )
         return bool(
-            self.selected_replan_work(session)
+            request
+            and not (
+                request.get("sustained_helper_progress")
+                # Once active, an owned ready result must publish even if
+                # more child debt arrived while its provider was running.
+                and not active
+                and session._helper_only_progress_has_funded_continuation()
+            )
             and getattr(session.conv, "allow_helper_decomposition", True)
             and (
                 self._active_replan_identity
@@ -155,6 +204,46 @@ class GraphRootReplanAction(RecursiveControllerAction):
         self._active_replan_identity = str(self._pending_replan_request["request_identity"])
         return await super().run(session)
 
+    def has_owned_active_continuation(self, session: Any) -> bool:
+        """Keep paid planner work live without trusting an orphaned marker."""
+
+        if not self._active_replan_identity or not self.selected_replan_work(session):
+            return False
+        budget = session.budgets.get(self.id)
+        dispatch_funded = budget is None or not budget.exhausted()
+        driver = self._recursive_driver_state
+        identity = driver.get("planner_job_identity")
+        broker_status = "missing"
+        owned_launch = False
+        if driver.get("phase") == "planner_job_pending" and isinstance(identity, Mapping):
+            job_id = str(identity.get("job_id") or "").strip()
+            fingerprint = str(identity.get("request_fingerprint") or "").strip()
+            if job_id and fingerprint:
+                launch = self._pending_planner_job_launch
+                owned_launch = isinstance(launch, PlannerJobLaunch) and (
+                    launch.identity.job_id == job_id
+                    and launch.identity.request_fingerprint == fingerprint
+                )
+                broker = session.planner_job_broker(create=False)
+                if broker is not None:
+                    broker_status = broker.status(job_id, fingerprint)
+        # The scheduler publishes owned ready broker receipts independently
+        # of the ordinary action budget, but run() must still accept the work.
+        if (dispatch_funded or broker_status == "ready") and session._safe_is_applicable(
+            self, context="sustained_helper_progress_active",
+        ):
+            return True
+        if owned_launch or broker_status == "pending":
+            return True
+        wait = self._planner_equivalent_wait
+        return bool(
+            wait
+            and wait["frontier_signature"] == self._session_progress_signature(session)
+            and self._can_wait_for_equivalent_planner(
+                session, wait["job_id"], wait["request_fingerprint"],
+            )
+        )
+
     def on_outcome_applied(self, session: Any, outcome: MiniOutcome) -> None:
         invalidated = bool(outcome.metadata.get("root_replan_invalidated"))
         if outcome.metadata.get("verdict") == "root_replan_not_serviceable" and not invalidated:
@@ -170,6 +259,12 @@ class GraphRootReplanAction(RecursiveControllerAction):
         ):
             return
         identity = str(self._pending_replan_request.get("request_identity") or "")
+        if (
+            identity and not invalidated and outcome.exception is None
+            and int(outcome.metadata.get("passes_used", 0) or 0) > 0
+            and session._helper_only_progress_intervention_due()
+        ):
+            session._reset_helper_only_progress_window()
         if identity:
             self._served_replan_requests = [*self._served_replan_requests, identity][-256:]
         self._pending_replan_request = {}
@@ -194,6 +289,17 @@ class GraphRootReplanAction(RecursiveControllerAction):
             raise ValueError("invalid root replanning request history")
         if not isinstance(active, str) or (active and active != pending.get("request_identity")):
             raise ValueError("invalid active root replanning request")
+        # Legacy requests omit this optional pair. New intervention intent
+        # must not silently change meaning through truthiness or coercion.
+        if "sustained_helper_progress" in pending or "helper_only_progress_identity" in pending:
+            sustained = pending.get("sustained_helper_progress")
+            helper_identity = pending.get("helper_only_progress_identity")
+            if type(sustained) is not bool or not isinstance(helper_identity, str):
+                raise ValueError("invalid sustained helper replanning request")
+            if (sustained and re.fullmatch(r"[0-9a-f]{64}", helper_identity) is None) or (
+                not sustained and helper_identity
+            ):
+                raise ValueError("invalid sustained helper replanning identity")
         super().apply_scheduler_runtime_state(record)
         self._pending_replan_request = copy.deepcopy(pending)
         self._served_replan_requests = list(served)

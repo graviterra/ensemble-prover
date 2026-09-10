@@ -78,7 +78,9 @@ class ChildClosureAction:
         )
 
 
-    def _typed_residual_receipt_budget_s(self, session: Any = None) -> float:
+    def _typed_residual_receipt_budget_s(
+        self, session: Any = None, *, include_cooling_node_id: str = "",
+    ) -> float:
         configured_lean_timeout_s = 0.0
         if session is not None:
             try:
@@ -122,7 +124,12 @@ class ChildClosureAction:
                 # it cannot shorten or kill productive work.
                 answer_safe_recheck = True
             nodes = getattr(proof_state, "nodes", {}) or {}
-            for node_id in self._pending_typed_residual_node_ids(session):
+            pending_typed_ids = set(self._pending_typed_residual_node_ids(session))
+            if include_cooling_node_id and include_cooling_node_id in self._pending_typed_residual_node_ids(
+                session, include_cooling=True,
+            ):
+                pending_typed_ids.add(include_cooling_node_id)
+            for node_id in pending_typed_ids:
                 node = nodes.get(node_id)
                 pending = dict(
                     getattr(node, "pending_residual_goal_extraction", {}) or {}
@@ -142,7 +149,12 @@ class ChildClosureAction:
                 # assembly/tactic dispatch that uses the newly proved child.
                 required = 2 + int(answer_safe_recheck)
                 operation_count = max(operation_count, required)
-            if self._pending_helper_acceptance_node_ids(session):
+            if self._pending_helper_acceptance_node_ids(session) or (
+                include_cooling_node_id
+                and include_cooling_node_id in self._pending_helper_acceptance_node_ids(
+                    session, include_cooling=True,
+                )
+            ):
                 # These are paid helper candidates awaiting the same primary
                 # and optional answer-safe checks. Preserve a subsequent
                 # quantum for the assembly/tactic lane that consumes them.
@@ -160,7 +172,10 @@ class ChildClosureAction:
         work_type: str = "",
         *,
         session: Any = None,
+        include_cooling_node_id: str = "",
     ) -> float:
+        # A liveness quote may price one cooling receipt's eventual dispatch.
+        # Other cooling receipts must not inflate ready work's required budget.
         normalized_work_type = str(work_type or "").strip()
         reserve = (
             max(0.0, float(self.timeout_s))
@@ -199,7 +214,9 @@ class ChildClosureAction:
         if pending_receipt_selected or pending_helper_selected:
             reserve = max(
                 reserve,
-                self._typed_residual_receipt_budget_s(session),
+                self._typed_residual_receipt_budget_s(
+                    session, include_cooling_node_id=include_cooling_node_id,
+                ),
             )
         return reserve
 
@@ -754,21 +771,32 @@ class ChildClosureAction:
     def has_funded_tactic_continuation(self, session: Any) -> bool:
         """An executable finite suffix is not an unchanged-search fixed point."""
 
-        from ensemble_prover.proof_state import validated_child_tactic_portfolio_continuation
-        from ensemble_prover.proof_state_executor import _proof_state_child_tactic_terminal_context_key
+        return bool(self.funded_tactic_continuation_work_items(session))
 
+    def funded_tactic_continuation_work_items(self, session: Any) -> list[Any]:
+        """Quote exact admitted suffixes for both liveness and selection."""
+
+        from ensemble_prover.proof_state_executor import (
+            _proof_state_child_tactic_portfolio_continuation,
+            child_tactic_portfolio_needs_refresh,
+        )
+
+        if self.timeout_s <= 0.0 or self.max_nodes <= 0:
+            return []
         budget = session.budgets.get(self.id)
         state = getattr(session, "proof_state", None)
         if budget is None or budget.exhausted() or state is None:
-            return False
+            return []
         remaining = self._remaining_action_budget_s(session)
         if remaining is not None and remaining < self.required_dispatch_budget_s(
             "tactic_swarm",
         ):
-            return False
+            return []
+        funded = []
         for item in state.work_frontier(
             max_items=max(8, len(state.nodes) * 8),
             graph=getattr(session.dossier, "proof_graph", None),
+            mutate=False,
         ):
             if item.work_type != "tactic_swarm":
                 continue
@@ -779,17 +807,23 @@ class ChildClosureAction:
                 # This node's verifier owns admission until it settles. An
                 # unrelated previous selection must not price this suffix.
                 continue
-            saved = validated_child_tactic_portfolio_continuation(
-                node.child_tactic_portfolio_continuation
+            saved = _proof_state_child_tactic_portfolio_continuation(
+                conv=session.conv, dossier=session.dossier, proof_state=state,
+                node=node, timeout_s=self.timeout_s, max_candidates=self.max_candidates,
             )
             if not saved or (
                 saved["next_candidate_index"] >= len(saved["candidates"])
                 and not saved["residual_candidates"]
+                and not child_tactic_portfolio_needs_refresh(saved)
             ):
                 continue
             if self._frontier_work_already_consumed(session, item):
                 continue
             if session._frontier_work_key(item, probe=True) in session.skipped_frontier_work_keys:
+                continue
+            if session._selected_work_targets_terminal_graph_work_probe(
+                session._work_item_to_record(item)
+            ):
                 continue
             action_key = session._frontier_action_key(item, self.id)
             if (
@@ -805,12 +839,8 @@ class ChildClosureAction:
                 item, action_id=self.id, touch=False,
             ) or self._tactic_context_is_terminal(session, node):
                 continue
-            if saved["context_key"] == _proof_state_child_tactic_terminal_context_key(
-                conv=session.conv, dossier=session.dossier, proof_state=state,
-                node=node, timeout_s=self.timeout_s, max_candidates=self.max_candidates,
-            ):
-                return True
-        return False
+            funded.append(item)
+        return funded
 
     def _tactic_context_is_terminal(self, session: Any, node: Any) -> bool:
         """Observe the executor's exact child-tactic terminal identity.

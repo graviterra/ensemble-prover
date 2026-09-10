@@ -746,6 +746,7 @@ class TacticCloserBackend(Protocol):
         candidate_portfolio: Optional[Sequence[TacticCandidate]] = None,
         candidate_portfolio_offset: int = 0,
         candidate_attempt_limit: int = 0,
+        candidate_timeout_floor_s: float = 0.0,
         suppressed_proofs: Optional[Sequence[str]] = None,
         source_prefixes: Optional[Sequence[str]] = None,
         excluded_source_prefixes: Optional[Sequence[str]] = None,
@@ -2158,6 +2159,7 @@ class DeterministicTacticBackend:
         candidate_portfolio: Optional[Sequence[TacticCandidate]] = None,
         candidate_portfolio_offset: int = 0,
         candidate_attempt_limit: int = 0,
+        candidate_timeout_floor_s: float = 0.0,
         suppressed_proofs: Optional[Sequence[str]] = None,
         source_prefixes: Optional[Sequence[str]] = None,
         excluded_source_prefixes: Optional[Sequence[str]] = None,
@@ -2417,13 +2419,22 @@ class DeterministicTacticBackend:
             opaque_mode=opaque_mode,
             allow_official_answer_visibility=allow_official_answer_visibility,
         )
+        maximum_opportunity_s = _candidate_maximum_opportunity_s(timeout_s, pattern_context)
+        try:
+            resumed_timeout_floor = float(candidate_timeout_floor_s)
+        except (TypeError, ValueError, OverflowError):
+            resumed_timeout_floor = 0.0
+        if not math.isfinite(resumed_timeout_floor) or resumed_timeout_floor < 0:
+            resumed_timeout_floor = 0.0
         minimum_timeout_s = max(
             _observed_candidate_timeout_floor_s(lean),
             self._timing_cache.candidate_timeout_floor(timing_key),
+            # Scheduling history belongs to the admitted finite generation.
+            # It cannot enlarge this operation's deadline or prove anything.
+            min(resumed_timeout_floor, maximum_opportunity_s),
         )
         if minimum_timeout_s:
             cache_metadata["candidate_timeout_floor_s"] = minimum_timeout_s
-        maximum_opportunity_s = _candidate_maximum_opportunity_s(timeout_s, pattern_context)
 
         index = candidate_start
         timeout_retried = False
@@ -2586,6 +2597,7 @@ class DeterministicTacticBackend:
                 self._timing_cache.record_candidate_timeout_floor(
                     timing_key, learned_floor,
                 )
+                cache_metadata["candidate_timeout_floor_s"] = learned_floor
             if check_timed_out and not whole_quantum_timed_out and candidate_timeout_fully_funded:
                 # An expired check slice gives no semantic rejection. Fund
                 # one larger retry of THIS candidate before moving the cursor:
@@ -2668,6 +2680,7 @@ async def try_close_with_tactics(
     candidate_portfolio: Optional[Sequence[TacticCandidate]] = None,
     candidate_portfolio_offset: int = 0,
     candidate_attempt_limit: int = 0,
+    candidate_timeout_floor_s: float = 0.0,
     suppressed_proofs: Optional[Sequence[str]] = None,
     source_prefixes: Optional[Sequence[str]] = None,
     excluded_source_prefixes: Optional[Sequence[str]] = None,
@@ -2701,6 +2714,9 @@ async def try_close_with_tactics(
             acceptance path succeeds.
         candidate_attempt_limit: Maximum settled candidates to check from the
             portfolio cursor. Zero leaves the candidate loop unlimited.
+        candidate_timeout_floor_s: Scheduling-only timeout history from an
+            admitted portfolio continuation. The current deadline still caps
+            every check; this does not carry a cached verdict.
         suppressed_proofs: Per-call proof bodies to skip without writing them
             into the cache's terminal failure set.
         source_prefixes: Optional source prefixes used to restrict the generated
@@ -2733,6 +2749,7 @@ async def try_close_with_tactics(
             int(candidate_portfolio_offset or 0),
         ),
         "candidate_attempt_limit": max(0, int(candidate_attempt_limit or 0)),
+        "candidate_timeout_floor_s": candidate_timeout_floor_s,
         "suppressed_proofs": tuple(suppressed_proofs or ()),
         "source_prefixes": tuple(source_prefixes or ()),
         "excluded_source_prefixes": tuple(excluded_source_prefixes or ()),

@@ -2055,6 +2055,7 @@ def build_session_for_prove_problem(
     # contradiction-route helpers kept resetting stagnation.
     strict_progress_accounting: bool = False,
     soft_progress_streak_cap: int = 4,
+    max_helper_only_provider_quanta: int = 24,
     run_wall_clock_budget_s: float = 0.0,
     no_strong_progress_budget_s: float = 0.0,
     theory_library: Optional[Any] = None,
@@ -2549,6 +2550,9 @@ def build_session_for_prove_problem(
         ),
         strict_progress_accounting=bool(strict_progress_accounting),
         max_soft_progress_streak=max(0, int(soft_progress_streak_cap or 0)),
+        max_helper_only_provider_quanta=max(
+            0, int(max_helper_only_provider_quanta or 0)
+        ),
         run_wall_clock_budget_s=max(
             0.0,
             float(run_wall_clock_budget_s or 0.0),
@@ -6648,6 +6652,15 @@ def _register_child_graph_recursive_decompose_action(
         "graph_recursive_decompose",
         ActionBudget(max_invocations=max_invocations, max_total_seconds=0.0),
     )
+    from .actions.graph_root_replan import GraphRootReplanAction
+
+    graph_action = session.registered_action("graph_recursive_decompose")
+    graph_action._budget_remaining(session)
+    session.register(GraphRootReplanAction(source_action=graph_action))
+    session.set_budget(
+        "graph_root_replan",
+        ActionBudget(max_invocations=-1, max_total_seconds=0.0),
+    )
 
 
 class _DeferredTheoryPromotion:
@@ -6971,6 +6984,16 @@ async def _mini_session_run_conversation_callback(
         strict_progress_accounting=bool(kwargs.get("strict_progress_accounting", True)),
         max_soft_progress_streak=max(
             0, int(kwargs.get("soft_progress_streak_cap", 4) or 0)
+        ),
+        max_helper_only_provider_quanta=max(
+            0,
+            int(
+                kwargs.get(
+                    "max_helper_only_provider_quanta",
+                    getattr(theory_parent_session, "max_helper_only_provider_quanta", 24),
+                )
+                or 0
+            ),
         ),
         theory_library=theory_library,
         theory_candidate_builder=getattr(

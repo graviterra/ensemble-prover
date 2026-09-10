@@ -413,6 +413,48 @@ def validated_child_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
         seen.add(key)
         normalized.append({"proof": proof, "source": source})
     validated["residual_candidates"] = normalized
+    if "candidate_timeout_floor_s" in value:
+        floor = value["candidate_timeout_floor_s"]
+        if type(floor) not in (int, float):
+            return {}
+        try:
+            floor = float(floor)
+        except OverflowError:
+            return {}
+        if not math.isfinite(floor) or floor < 0:
+            return {}
+        validated["candidate_timeout_floor_s"] = floor
+    # Generation identity authorizes only search scheduling across helper
+    # additions. Legacy cursors omit it and remain exact-context-only.
+    if "generation_context" in value:
+        generation = value["generation_context"]
+        if not isinstance(generation, Mapping):
+            return {}
+        if type(generation.get("schema_version")) is not int or generation["schema_version"] != 1:
+            return {}
+        if any(
+            not isinstance(generation.get(key), str)
+            or re.fullmatch(r"[0-9a-f]{16}", generation[key]) is None
+            for key in ("base_key", "context_key")
+        ):
+            return {}
+        helper_hashes = generation.get("helper_hashes")
+        execution_helper_hashes = value.get("execution_helper_hashes")
+        for hashes in (helper_hashes, execution_helper_hashes):
+            if not isinstance(hashes, (list, tuple)) or any(
+                not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{16}", item) is None
+                for item in hashes
+            ):
+                return {}
+        if list(execution_helper_hashes[:len(helper_hashes)]) != list(helper_hashes):
+            return {}
+        validated["generation_context"] = {
+            "schema_version": 1,
+            "base_key": generation["base_key"],
+            "context_key": generation["context_key"],
+            "helper_hashes": list(helper_hashes),
+        }
+        validated["execution_helper_hashes"] = list(execution_helper_hashes)
     return validated
 
 
@@ -13647,12 +13689,16 @@ class ProofSearchState:
         retrieval_available: bool = False,
         decl_application_context_hashes: Optional[Mapping[str, str]] = None,
         mutate: bool = True,
+        include_cooling_verifier_work: bool = False,
     ) -> List[ProofStateWorkItem]:
         """Return executable work derived from the current graph frontier.
 
         This is a typed scheduler view over the graph state: parents ready for
         deterministic assembly are separate from child-goal retrieval/probing,
         and root failures remain explicit repair work instead of transcript text.
+        ``include_cooling_verifier_work`` also quotes retained verifier debt
+        using its canonical work identity; callers must still respect cooldown
+        before dispatch. It does not change the default executable frontier.
         """
 
         start = max(0, int(offset or 0))
@@ -14255,7 +14301,8 @@ class ProofSearchState:
                 and str(pending_helper.get("target_hash") or "")
                 == text_hash(str(pending_node.target or ""))
                 and (
-                    not helper_retry_key
+                    include_cooling_verifier_work
+                    or not helper_retry_key
                     or self.verifier_retry_status(
                         pending_node,
                         helper_retry_key,
@@ -14279,7 +14326,8 @@ class ProofSearchState:
                     pending_record.get("verifier_retry_key") or ""
                 ).strip()
                 if (
-                    pending_status == "rematerialize"
+                    include_cooling_verifier_work
+                    or pending_status == "rematerialize"
                     or not retry_key
                     or self.verifier_retry_status(pending_node, retry_key)
                     != "cooling"

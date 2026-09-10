@@ -135,6 +135,11 @@ _SESSION_SCALAR_STATE_KEYS: tuple[str, ...] = (
     "strict_progress_accounting",
     "soft_progress_streak",
     "max_soft_progress_streak",
+    "max_helper_only_provider_quanta",
+    "helper_only_provider_quanta",
+    "helper_only_progress_identity",
+    "max_scoped_frontier_quanta_before_root_authoring",
+    "scoped_frontier_quanta_since_root_authoring",
     "final_proof",
     "last_lean_verdict",
     "last_llm_content",
@@ -223,6 +228,10 @@ _SESSION_NONNEGATIVE_COUNTER_STATE_KEYS = frozenset(
         "max_stagnation",
         "soft_progress_streak",
         "max_soft_progress_streak",
+        "max_helper_only_provider_quanta",
+        "helper_only_provider_quanta",
+        "max_scoped_frontier_quanta_before_root_authoring",
+        "scoped_frontier_quanta_since_root_authoring",
         "repeated_wall_count",
         "hard_pivot_count",
         "provider_calls_completed_total",
@@ -279,6 +288,7 @@ _SESSION_STRING_STATE_KEYS = frozenset(
         "local_repair_quota_failure_signature",
         "policy_repair_redirect_selected_action_id",
         "identical_no_progress_search_signature",
+        "helper_only_progress_identity",
     }
 )
 _SESSION_OPTIONAL_STRING_STATE_KEYS = frozenset(

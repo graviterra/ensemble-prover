@@ -139,6 +139,9 @@ _SCOPED_LLM_FAILURE_REASONS = {
     "selected_proof_idea_context_invalidated",
 }
 _SCOPED_CONTROLLER_FAILURE_REASONS = {
+    # An unchanged obligation with sustained helper-only work remains open;
+    # its local search intervention is not a mathematical rejection.
+    "sustained_helper_progress_stalled",
     # A poisoned MiniSession remains terminal and non-reusable.  When that
     # session belongs to one isolated recursive child, however, its authority
     # does not extend to sibling claims or the parent controller.  Preserve

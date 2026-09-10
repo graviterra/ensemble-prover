@@ -10615,6 +10615,13 @@ class MiniSession:
     strict_progress_accounting: bool = False
     soft_progress_streak: int = 0
     max_soft_progress_streak: int = 4
+    # Helper growth can keep changing executable retry identities without
+    # discharging this session's root/obligation. Count accepted-helper
+    # provider quanta separately; checked helpers remain valid local progress.
+    # Zero disables this intervention, not ordinary semantic retry budgets.
+    max_helper_only_provider_quanta: int = 24
+    helper_only_provider_quanta: int = 0
+    helper_only_progress_identity: str = ""
     # H1 (2026-05-08): action ids treated as "fallback" — if stagnation
     # hits the cap, ``apply()`` flips ``fallback_actions_attempted`` once
     # any of these run, so the next ``should_continue`` call terminates
@@ -16858,6 +16865,302 @@ class MiniSession:
         )
         return True
 
+    def _helper_only_root_identity(self) -> str:
+        """Identify the obligation independently of its growing helper set."""
+
+        root = str(
+            getattr(self.problem, "statement_type", "")
+            or getattr(self.dossier, "root_statement", "")
+            or getattr(self.conv, "goal_statement", "")
+            or ""
+        ).strip()
+        if not root:
+            return ""
+        return hashlib.sha256(
+            json.dumps(
+                [canonical_dossier_statement_key(root), self.acceptance_preamble()],
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _reset_helper_only_progress_window(self) -> None:
+        self.helper_only_progress_identity = self._helper_only_root_identity()
+        self.helper_only_provider_quanta = 0
+
+    def resume_after_helper_progress_stall(self) -> bool:
+        """Explicitly authorize a fresh search window without granting budget.
+
+        Checkpoint restore alone retains the scoped stop. A caller may use
+        this after inspecting the retained facts or revising its search plan.
+        """
+
+        reason = "sustained_helper_progress_stalled"
+        if self.terminal_failure_reason != reason:
+            return False
+        self._reset_helper_only_progress_window()
+        self.terminal_failure_reason = ""
+        self.terminal_failure_kind = ""
+        if getattr(self, "last_failure_reason", "") == reason:
+            self.last_failure_reason = ""
+        for owner, reason_field, kind_field in (
+            (self.dossier, "session_failure_reason", "session_failure_kind"),
+            (self.conv, "_last_llm_failure_reason", "_last_llm_failure_kind"),
+        ):
+            if getattr(owner, reason_field, "") == reason:
+                setattr(owner, reason_field, "")
+                setattr(owner, kind_field, "")
+        if self.last_action_outcome_metadata.get("scoped_failure_reason") == reason:
+            for key in ("scoped_failure_reason", "llm_failure_scope", "restartable_from_checkpoint"):
+                self.last_action_outcome_metadata.pop(key, None)
+        self._record_event(
+            {
+                "phase": "session_sustained_helper_progress",
+                "iteration": self.iteration,
+                "helper_only_progress_identity": self.helper_only_progress_identity,
+                "verdict": "helper_progress_window_explicitly_reopened",
+            }
+        )
+        return True
+
+    def _helper_only_progress_intervention_due(self) -> bool:
+        identity = self._helper_only_root_identity()
+        if identity != self.helper_only_progress_identity:
+            self.helper_only_progress_identity = identity
+            self.helper_only_provider_quanta = 0
+        limit = max(0, int(self.max_helper_only_provider_quanta or 0))
+        return bool(
+            identity and limit > 0 and self.helper_only_provider_quanta >= limit
+        )
+
+    def _observe_helper_only_provider_progress(
+        self,
+        outcome: MiniOutcome,
+        *,
+        strong_progress: bool,
+        fresh_formal_evidence: Sequence[str],
+    ) -> bool:
+        """Count fresh checked helpers without calling them parent progress.
+
+        A provider continuation can preserve the conversation action budget
+        while completing a paid tool quantum. Its receipt, rather than that
+        budget's invocation count, determines eligibility here.
+        """
+
+        self._helper_only_progress_intervention_due()
+        if strong_progress:
+            self._reset_helper_only_progress_window()
+            return False
+        metadata = outcome.metadata
+        if (
+            not str(outcome.action_id or "").startswith("conversation_turn")
+            or outcome.exception is not None
+            or not self.helper_only_progress_identity
+            or _nonnegative_metadata_int(metadata, "provider_calls_completed") <= 0
+            or self._persistent_infrastructure_defer(metadata)
+            or metadata.get("paid_tool_infrastructure_disposition")
+        ):
+            return False
+        record = dict(self.selected_work_item_record or {})
+        if record and (
+            self.selected_work_item_action_id != outcome.action_id
+            or record.get("work_type") not in {"root_repair", "assemble_route"}
+        ):
+            return False
+        root = str(
+            getattr(self.problem, "statement_type", "")
+            or getattr(self.dossier, "root_statement", "")
+            or getattr(self.conv, "goal_statement", "")
+            or ""
+        ).strip()
+        target = str(
+            record.get("exact_target_statement")
+            or record.get("target_statement")
+            or getattr(self.conv, "goal_statement", "")
+            or root
+        ).strip()
+        if canonical_dossier_statement_key(target) != canonical_dossier_statement_key(root):
+            return False
+        fresh_helpers = [
+            str(name)
+            for name in tuple(outcome.helpers_added or ())
+            if any(
+                item.startswith(f"helper:{name}:")
+                for item in fresh_formal_evidence
+            )
+        ]
+        if not fresh_helpers:
+            return False
+        self.helper_only_provider_quanta += 1
+        due = self._helper_only_progress_intervention_due()
+        metadata.update(
+            {
+                "helper_only_provider_quanta": self.helper_only_provider_quanta,
+                "max_helper_only_provider_quanta": self.max_helper_only_provider_quanta,
+                "helper_only_progress_identity": self.helper_only_progress_identity,
+                "sustained_helper_progress_intervention_due": due,
+            }
+        )
+        self._record_event(
+            {
+                "phase": "session_sustained_helper_progress",
+                "iteration": self.iteration,
+                "action_id": outcome.action_id,
+                "helper_only_provider_quanta": self.helper_only_provider_quanta,
+                "max_helper_only_provider_quanta": self.max_helper_only_provider_quanta,
+                "helper_only_progress_identity": self.helper_only_progress_identity,
+                "accepted_helpers": fresh_helpers,
+                "verdict": (
+                    "helper_only_progress_intervention_due"
+                    if due else "helper_only_provider_quantum_recorded"
+                ),
+            }
+        )
+        return due
+
+    def _helper_only_progress_has_funded_continuation(self) -> bool:
+        return bool(
+            self._has_funded_durable_progress_tool_continuation()
+            or self._helper_only_progress_continuation_work_items(include_cooling=True)
+        )
+
+    def _helper_only_progress_continuation_work_items(
+        self, *, include_cooling: bool,
+    ) -> List[Any]:
+        """Use identical admission masks for continuation debt and dispatch."""
+
+        action = self.registered_action("child_closure")
+        budget = self.budgets.get("child_closure")
+        if action is None or budget is None or budget.exhausted():
+            return []
+        if action.timeout_s <= 0.0 or action.max_nodes <= 0:
+            return []
+        tactic_items = getattr(action, "funded_tactic_continuation_work_items", None)
+        tactic_suffixes = list(tactic_items(self)) if callable(tactic_items) else []
+        admitted: List[Any] = []
+        remaining_getter = getattr(action, "_remaining_action_budget_s", None)
+        required_getter = getattr(action, "required_dispatch_budget_s", None)
+        frontier = getattr(self.proof_state, "work_frontier", None)
+        if not all(callable(fn) for fn in (remaining_getter, required_getter, frontier)):
+            return tactic_suffixes
+        remaining = remaining_getter(self)
+        for item in frontier(
+            max_items=max(8, len(getattr(self.proof_state, "nodes", {})) * 8),
+            graph=getattr(self.dossier, "proof_graph", None),
+            mutate=False,
+            include_cooling_verifier_work=include_cooling,
+        ):
+            work_type = str(self._work_item_field(item, "work_type", "") or "")
+            if work_type not in {"helper_acceptance", "residual_goal_extraction"}:
+                continue
+            work_key = self._frontier_work_key(item, probe=True)
+            action_key = self._frontier_action_key(item, action.id)
+            if (
+                action._frontier_work_already_consumed(self, item)
+                or work_key in self.skipped_frontier_work_keys
+                or action_key in self.consumed_frontier_action_keys
+                or action_key in self.skipped_frontier_action_keys
+                or action_key in self.model_call_deferred_frontier_action_keys
+                or self._model_call_deferred_static_action_blocks_work_item(action.id, item)
+                or self.proof_work_semantic_attempt_exhausted(
+                    item, action_id=action.id, touch=False,
+                )
+                or self._selected_work_targets_terminal_graph_work_probe(
+                    self._work_item_to_record(item)
+                )
+            ):
+                continue
+            # Both lanes own a primary verification receipt, so reserve that
+            # floor independently of whichever node happened to be selected.
+            required = required_getter(
+                "residual_goal_extraction", session=self,
+                include_cooling_node_id=(
+                    str(self._work_item_field(item, "node_id", "") or "")
+                    if include_cooling else ""
+                ),
+            )
+            if remaining is None or remaining >= required:
+                admitted.append(item)
+        # Primary receipts can certify already-generated proofs. Do not let
+        # other finite suffixes consume the budget needed for those checks.
+        return [*admitted, *tactic_suffixes]
+
+    def _select_helper_only_progress_continuation(self) -> Optional[Action]:
+        """Drain earned child work before permitting further helper authoring."""
+
+        action = self.registered_action("child_closure")
+        if action is None:
+            return None
+        for item in self._helper_only_progress_continuation_work_items(include_cooling=False):
+            if not self._set_selected_work_item(item, action.id):
+                continue
+            self._activate_selected_graph_ready_work_item(item)
+            if not self._safe_is_applicable(
+                action, context="sustained_helper_progress_continuation"
+            ):
+                self._clear_selected_work_item()
+                continue
+            self.selected_frontier_action_key = self._frontier_action_key(item, action.id)
+            return action
+        return None
+
+    def _sustained_helper_progress_stalled(self) -> bool:
+        """Pause an unchanged obligation only when its earned work has drained."""
+
+        if not self._helper_only_progress_intervention_due():
+            return False
+        if self._helper_only_progress_has_funded_continuation():
+            return False
+        if self._active_repair_ticket() is not None or self.repair_policy_narrowing_required:
+            return False
+        planner = self.registered_action("graph_root_replan")
+        if planner is not None:
+            # A launched planner owns a paid continuation even when its
+            # provider is still pending or its last pass was reserved.
+            if planner.has_owned_active_continuation(self):
+                return False
+            budget = self.budgets.get(planner.id)
+            if (
+                (budget is None or not budget.exhausted())
+                and not self._model_call_deferred_static_action_effective(planner.id)
+                and self._safe_is_applicable(planner, context="sustained_helper_progress")
+            ):
+                return False
+        if self._has_funded_retryable_model_call_defer():
+            return False
+        reason = "sustained_helper_progress_stalled"
+        self.terminal_failure_reason = reason
+        self.terminal_failure_kind = "search_incomplete"
+        self.last_failure_reason = reason
+        if self.dossier is not None:
+            self.dossier.session_failure_reason = reason
+            self.dossier.session_failure_kind = "search_incomplete"
+        if self.conv is not None:
+            self.conv._last_llm_failure_reason = reason
+            self.conv._last_llm_failure_kind = "search_incomplete"
+        self.last_action_outcome_metadata.update(
+            {
+                "scoped_failure_reason": reason,
+                "llm_failure_scope": "scoped",
+                "restartable_from_checkpoint": True,
+            }
+        )
+        self._record_event(
+            {
+                "phase": "session_sustained_helper_progress",
+                "iteration": self.iteration,
+                "helper_only_provider_quanta": self.helper_only_provider_quanta,
+                "max_helper_only_provider_quanta": self.max_helper_only_provider_quanta,
+                "helper_only_progress_identity": self.helper_only_progress_identity,
+                "terminal_failure_reason": reason,
+                "terminal_failure_kind": "search_incomplete",
+                "failure_scope": "scoped",
+                "restartable_from_checkpoint": True,
+                "recovery_action": "resume_after_helper_progress_stall",
+                "verdict": "sustained_helper_progress_stalled",
+            }
+        )
+        return True
+
     def should_continue(self) -> bool:
         self._cleanup_settled_quarantined_lean_generations()
         if self._run_governor_exhausted():
@@ -16967,6 +17270,8 @@ class MiniSession:
             return False
         if self.root_finalized and self._durable_final_proof():
             self.pending_fallback_action_id = ""
+            return False
+        if self._sustained_helper_progress_stalled():
             return False
         if self._identical_no_progress_fixed_point_exhausted():
             return False
@@ -21009,6 +21314,16 @@ class MiniSession:
                 }
             )
             return None
+        if (
+            self._helper_only_progress_intervention_due()
+            and self._helper_only_progress_has_funded_continuation()
+        ):
+            continuation = self._select_helper_only_progress_continuation()
+            if continuation is not None:
+                record_repair_first_fairness_outcome(continuation)
+            # Preserve the debt while a paid suffix is waiting. A static
+            # conversation must not manufacture more helper-context epochs.
+            return continuation
         root_replan = self.registered_action("graph_root_replan")
         if root_replan is not None:
             replan_budget = self.budgets.get(root_replan.id)
@@ -21960,6 +22275,51 @@ class MiniSession:
         )
         self._clear_selected_work_item()
         return True
+
+    def _has_funded_durable_progress_tool_continuation(self) -> bool:
+        """Authenticate live or checkpointed closing work without restoring it."""
+
+        continuation = dict(self.durable_progress_tool_continuation or {})
+        identity = str(continuation.get("identity") or "").strip()
+        action_id = str(continuation.get("action_id") or "").strip()
+        action = self.registered_action(action_id)
+        budget = self.budgets.get(action_id)
+        if (
+            not identity or action is None or budget is None or budget.exhausted()
+            or not callable(getattr(action, "owns_durable_progress_tool_continuation", None))
+        ):
+            return False
+        selected_work = dict(continuation.get("selected_work_item_record") or {})
+        if selected_work and self._selected_work_targets_terminal_graph_work_probe(selected_work):
+            return False
+        from .turn.tool_loop import _validated_durable_progress_tool_continuation_state
+
+        for raw in (
+            getattr(self.conv, "_provider_call_quantum_state", None),
+            continuation.get("replay_payload"),
+        ):
+            if not isinstance(raw, Mapping):
+                continue
+            target = str(raw.get("durable_progress_tool_continuation_target") or "").strip()
+            selected_target = str(
+                selected_work.get("exact_target_statement")
+                or selected_work.get("target_statement") or ""
+            ).strip()
+            if selected_target and selected_target != target:
+                continue
+            try:
+                validated = _validated_durable_progress_tool_continuation_state(
+                    raw, conv=self.conv, dossier=self.dossier,
+                    goal_statement_override=target,
+                    max_tool_calls_per_turn=getattr(action, "max_tool_calls_per_turn", 0),
+                )
+            except Exception:
+                # Match selection's fail-closed authentication without
+                # mutating or rehydrating an invalid saved provider frame.
+                continue
+            if validated.get("durable_progress_tool_continuation_identity") == identity:
+                return True
+        return False
 
     def _select_durable_progress_tool_continuation_action(
         self,
@@ -27881,6 +28241,19 @@ class MiniSession:
             and selected_work_type
             and not selected_root_frontier_quantum
         )
+        # Reattesting a receipt after helper growth and deferring a proving
+        # operation do not advance the child search. Charging them as search
+        # quanta can spend the entire fairness window before its saved tactic
+        # suffix runs. Ordinary time and invocation accounting still applies.
+        scoped_frontier_preparation_only = bool(
+            selected_scoped_frontier_quantum
+            and (
+                selected_work_type in {"residual_goal_extraction", "helper_acceptance"}
+                or dict(metadata.get("child_closure_execution_status") or {}).get(
+                    "all_operations_deferred_before_launch"
+                )
+            )
+        )
         previous_scoped_fairness_streak = int(
             self.scoped_frontier_quanta_since_root_authoring or 0
         )
@@ -27902,6 +28275,7 @@ class MiniSession:
             self.scoped_frontier_quanta_since_root_authoring = 0
         elif (
             selected_scoped_frontier_quantum
+            and not scoped_frontier_preparation_only
             and outcome.exception is None
             and not preserve_action_budget
             and not bool(metadata.get("scheduler_neutral"))
@@ -28228,6 +28602,11 @@ class MiniSession:
                         ),
                     }
                 )
+        sustained_helper_progress = self._observe_helper_only_provider_progress(
+            outcome,
+            strong_progress=final_strong_progress,
+            fresh_formal_evidence=fresh_action_formal_evidence,
+        )
         root_replan = self.registered_action("graph_root_replan")
         if root_replan is not None:
             root_replan.observe_proof_outcome(
@@ -28236,6 +28615,7 @@ class MiniSession:
                     final_strong_progress or conversation_fresh_formal_evidence
                     or metadata.get("frontier_progress_retry_granted")
                 ),
+                sustained_helper_progress=sustained_helper_progress,
             )
         self._action_start_proof_work_semantic_identity = ""
         self._action_start_conversation_static_root_identity = ""
