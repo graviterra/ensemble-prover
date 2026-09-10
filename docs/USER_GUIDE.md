@@ -6,9 +6,17 @@ The experimental NL frontends first translate the mathematics into Lean; the
 formalization campaign can build definitions and supporting theorems across
 multiple files before completing the root theorem.
 
+For mathematics still being investigated, use the research ledger to coordinate
+claims, evidence, and reviews, or the autonomous research loop to explore
+approaches with model workers. These workflows can begin without Lean and may
+produce a proof argument, counterexample, construction, or precise remaining
+gap. A research assessment is not a Lean proof certificate.
+
 This guide covers release 1.09, including both experimental NL frontends and
-the optional Codex subscription backend for Mini's prover and refiner.
-Older Mini-only releases do not include those modules.
+the optional Codex subscription backend for Mini's prover and refiner, plus
+the experimental research workflows now on master. Older release snapshots
+may not include the research modules; Mini-only releases also lack the NL
+frontends. Check the help in your installed checkout.
 Run commands from the repository root containing `.venv/` and `ensemble_prover/`,
 not from inside the `ensemble_prover/` Python package. The live help is the
 authority for the options available in your checkout:
@@ -17,6 +25,8 @@ authority for the options available in your checkout:
 .venv/bin/python -m ensemble_prover.mini_prover --help
 .venv/bin/python -m ensemble_prover.nl_input --help
 .venv/bin/python -m ensemble_prover.formalization --help
+.venv/bin/python -m ensemble_prover.research_claims --help
+.venv/bin/python -m ensemble_prover.research_claims discovery --help
 ```
 
 ## 1. What you supply
@@ -29,6 +39,8 @@ Choose the entry point that matches your input:
 | A PutnamBench Lean file | `ensemble_prover.mini_prover --putnam-file ...` | [PutnamBench adapter](#5-use-the-putnambench-adapter) |
 | One claim in natural language or LaTeX text | `ensemble_prover.nl_input` | [Single-claim translation](#18-formalize-one-natural-language-claim) |
 | Longer mathematical notes needing definitions, lemmas, and resumable work | `ensemble_prover.formalization` | [Formalization campaigns](#19-run-a-multi-file-formalization-campaign) |
+| Claims and arguments being investigated by you or external workers | `ensemble_prover.research_claims` | [Coordinated research](#20-coordinate-mathematical-research) |
+| A natural-language problem to investigate autonomously, without choosing proof or disproof in advance | `ensemble_prover.research_claims discovery` | [Autonomous research](#21-run-autonomous-mathematical-research) |
 
 Every proof run needs a trusted, working Lean/Lake project and credentials for
 the selected model provider. For direct Mini Prover input, also supply:
@@ -41,7 +53,13 @@ The NL frontends do not require you to write the target Lean declaration first.
 They do still need an existing, built Lake project with Mathlib. Mini's
 `--description` and `--description-file` add context to an existing Lean target;
 they do **not** invoke translation. Lean remains the proof checker in every
-workflow, and a checked proof does not certify the accuracy of an NL translation.
+proof workflow, and a checked proof does not certify the accuracy of an NL
+translation.
+
+The manual research ledger requires neither Lean nor an API key. Autonomous
+research requires model access but not a Lean project until you hand results
+to the formalizer. Supply the exact mathematical question as UTF-8 text; do not
+assume that a reviewed natural-language argument has been formally verified.
 
 The release does not include Lean, Lake, Mathlib, PutnamBench, downloaded Lake
 packages, or any theorem project. Supply those separately.
@@ -55,6 +73,11 @@ packages, or any theorem project. Supply those separately.
 - `venv` support for that Python installation
 - network access to the selected model provider
 - a working Lean/Lake toolchain for the target project
+
+Lean/Lake is required for proof search and formalization, not for research-only
+work. Manual ledger commands run offline. The autonomous research CLI uses
+OpenAI API credentials; optional experiments additionally require unprivileged
+Linux namespace isolation as described in [section 21](#optional-research-experiments).
 
 The release audit is performed with both CPython 3.11 and 3.12. The setup script accepts
 standard CPython 3.11 and 3.12 and rejects trace-reference builds because the
@@ -159,6 +182,11 @@ uses the OpenAI API for all three of its roles: `gpt-5.6-terra` for formalizatio
 and independent review, and `gpt-5.6-luna` for proof search. See
 [campaign model and budget controls](#campaign-models-and-budgets); Mini's
 provider defaults above do not select the campaign's models.
+
+Autonomous research also uses the OpenAI API, but requires you to choose both
+`--model` and `--review-model` at initialization. The saved names are reused on
+resume; Mini's prover/refiner settings and subscription backends do not select
+research workers. See [section 21](#21-run-autonomous-mathematical-research).
 
 ### Provider examples
 
@@ -813,6 +841,11 @@ The formalization campaign has a separate durable project ledger. Repeating
 does not restore every internal Mini search state. See
 [the campaign workflow](#19-run-a-multi-file-formalization-campaign).
 
+Autonomous research has its own ledger and admission counters. Repeating its
+`discovery run` command resumes within the original limits;
+neither Mini resume flags nor campaign invocation budgets apply to it. See
+[research budgets and recovery](#research-budgets-and-recovery).
+
 For a graceful stop, send one interrupt and allow cleanup to finish. Repeated
 signals may escalate before all terminal artifacts are flushed.
 
@@ -936,6 +969,8 @@ Configured providers may receive:
 - the optional natural-language description;
 - original NL source passages, supporting definitions, proof plans, and reviewer
   evidence when using the NL frontends;
+- original problems, source documents, full research arguments, review feedback,
+  and experiment results when running autonomous research;
 - retrieved declarations;
 - generated proof attempts; and
 - structured Lean error feedback.
@@ -950,10 +985,19 @@ and `~/.cache/mini_prover/theory`. Protect, separate, and delete them according
 to the applicable data policy. Never commit `.env`, provider credentials, or
 generated run artifacts.
 
+Research directories likewise contain complete mathematics, prompts, responses,
+and reviews. Their optional Python experiment tool has a separate fail-closed
+sandbox; this does not sandbox the controller, the external provider, or a later
+Lean/formalization run.
+
 Only Lean-accepted and freshly exported artifacts should be described as
 proved. Plans, model output, retrieval hits, computed examples, speculative
 claims, and counterexample probes are search evidence until they cross the
 relevant verification gate.
+
+Research `supported`/`refuted` statuses describe reviewed arguments, not kernel
+certificates. Finite experiments do not establish infinite claims, and novelty
+within one ledger does not establish novelty in the mathematical literature.
 
 ## 16. Public CLI option map
 
@@ -1303,3 +1347,187 @@ real-Lean integration and live-example evidence; autonomous frontier success
 rates and FLT/million-line performance have not been established. See the
 [advanced campaign guide](formalization-campaign.md) for export replay,
 concurrent workers, and environment recovery.
+
+## 20. Coordinate mathematical research
+
+Use the ledger when you or external workers choose the investigations and submit
+their results. It records exact claims, immutable arguments, reviews, dependency
+obligations, and quantitative losses. Its assignment commands prepare bounded
+work packets; they do not run model workers. For execution, use section 21.
+
+Save a claim as `claim.json`, for example:
+
+```json
+{
+  "claim_id": "root",
+  "author": "user",
+  "contract": {
+    "statement": "For every integer n, n + 0 = n.",
+    "domain": "integers"
+  }
+}
+```
+
+Create a separate ledger and inspect the claim without a provider or Lean:
+
+```bash
+.venv/bin/python -m ensemble_prover.research_claims init runs/research/manual
+.venv/bin/python -m ensemble_prover.research_claims add-claim runs/research/manual --file claim.json
+.venv/bin/python -m ensemble_prover.research_claims show runs/research/manual root
+.venv/bin/python -m ensemble_prover.research_claims frontier runs/research/manual root
+```
+
+The ledger separates three questions: is the argument supported, what kind of
+verification was recorded, and does it actually advance the parent problem?
+A correct helper with unsuitable hypotheses or quantitative losses may not
+close the parent's obligation. Conflicting reviews remain active unless a new
+review explicitly supersedes them; identities supplied to the manual ledger
+are locally asserted, not authenticated.
+
+Use `add-artifact` to snapshot complete argument bytes, then `add-evidence`,
+`add-review`, and `assess-obligation` to record their roles. The [complete ledger
+walkthrough](../ensemble_prover/research_claims/README.md#run-a-complete-local-example)
+provides the submission formats, an example of a correct but unhelpful lemma,
+assignment commands, and review-resolution rules.
+
+## 21. Run autonomous mathematical research
+
+Use this loop to investigate a problem before you have a complete proof or Lean
+statement. Workers may pursue proofs, counterexamples, intermediate conjectures,
+new constructions, or gaps. They can start alternative programs, share complete
+arguments, request fresh reviews, and wait for child results without polling the
+model. Alternative approaches do not become extra assumptions of the root.
+
+### Initialize, execute, and inspect research
+
+Save the exact question in `problem.md`. State its domain, hypotheses, and
+quantifiers; a proof sketch is optional. Additional papers or notes must already
+be converted to UTF-8 text. Choose OpenAI API model names available to your
+account and configure `OPENAI_API_KEY` in the repository-root `.env`.
+
+```bash
+# Offline initialization: the run directory must be new.
+.venv/bin/python -m ensemble_prover.research_claims discovery init runs/research/example \
+  --problem problem.md \
+  --model gpt-5.6-sol --review-model gpt-6-astra \
+  --max-requests 32 --max-seconds 3600 --concurrency 4
+
+# Paid model execution; repeat to resume, not to reset the limits.
+.venv/bin/python -m ensemble_prover.research_claims discovery run runs/research/example
+
+.venv/bin/python -m ensemble_prover.research_claims discovery status runs/research/example
+.venv/bin/python -m ensemble_prover.research_claims history runs/research/example root
+```
+
+Add repeated `--source FILE` options at initialization for supporting documents.
+Original text is preserved; editing those files afterward does not change the
+saved input. Manual ledger initialization and `discovery init` are distinct:
+use a new directory for autonomous execution, not an existing manual ledger.
+
+Status is JSON; live execution events go to stderr. Inspect the mathematical
+assessment separately from the operational status:
+
+| Result | Meaning / next step |
+| --- | --- |
+| `idle` | No live research work remains. This does not mean the problem is solved. |
+| `budget_exhausted` / `deadline_exhausted` | The original authorization ended. Inspect saved work; resume does not grant more budget. |
+| `provider_failure` / `provider_timeout` | Resolve access or transport trouble, then explicitly resume if authorization remains. |
+| `context_overflow` | Required context cannot fit. It is not silently shortened; blindly retrying the same prompt will not help. |
+| `target_changed` / `blocked` | Inspect claim revisions and waiting work. Changing the original target stops the run. |
+| Mathematical `supported` / `refuted` | A written proof argument / counterexample passed independent review. Neither is a Lean certificate. |
+
+Exit code 0 can mean `idle` or an exhausted budget/deadline, not proof success.
+Research `root_proved` and `kernel_verified` remain false. Fresh reviewer
+conversations provide procedural separation, not guaranteed independent errors.
+
+### Research budgets and recovery
+
+- `--max-requests` counts durable HTTP dispatch intents across workers, reviews,
+  transport retries, and resumes. Rejected or interrupted requests are not
+  automatically refunded. It is not a dollar or token cap.
+- `--max-seconds` starts at first execution and includes downtime. No automatic
+  extension occurs. Stop with Ctrl-C and allow cleanup; repeat `discovery run`
+  to resume under the same limits.
+- `--concurrency` bounds active worker operations on one host. Reviews have
+  priority; research turns use durable FIFO ordering so delegation does not
+  continually jump ahead of waiting programs.
+- `--request-timeout-s` sets the model-operation timeout; default 300 seconds,
+  also bounded by the remaining run authorization.
+- Saved responses replay without another model request. An interrupted request
+  with an unknown outcome may require another reservation; exactly-once provider
+  execution is not promised.
+- Child findings and reviews are delivered durably, including during another
+  worker's request. A changed child claim retires its stale invocation and
+  notifies its unchanged parent without allocating a fresh budget.
+
+No proof plan or required context is silently truncated. Complete arguments,
+reviews, raw responses, and experiment results remain in hashed artifacts. To
+retrieve a named artifact, choose a new output file:
+
+```bash
+.venv/bin/python -m ensemble_prover.research_claims read-artifact runs/research/example SHA256 \
+  --output complete-artifact.txt
+```
+
+New ledgers use schema 4. Stop older clients and back up the directory before
+upgrading a version 1, 2, or 3 ledger:
+
+```bash
+.venv/bin/python -m ensemble_prover.research_claims upgrade DIRECTORY
+```
+
+The upgrade preserves records and budgets; it does not start model work. See
+the [ledger compatibility instructions](../ensemble_prover/research_claims/README.md)
+before upgrading.
+
+### Optional research experiments
+
+Add `--experiments` to `discovery init` to enable bounded Python standard-library
+computations. They require an unprivileged Linux caller, `/usr/bin/bwrap` with
+usable user namespaces, and `/usr/bin/python3`. Missing isolation reports
+`tool_unavailable`; generated code is never run unsandboxed as a fallback.
+
+Experiments have no host home/project mounts, inherited credentials, network,
+writable scratch filesystem, or subprocess permission. Defaults are 20 seconds,
+512 MiB per-process address space, and 1,000,000 combined raw output bytes.
+Exceeding the output quota marks the result incomplete; exact captured bytes
+are retained separately from potentially lossy UTF-8 display text. Finite
+observations are evidence only for their stated scope, not proofs of an infinite
+claim. Interrupted experiments are not automatically repeated.
+
+### Hand research to formalization
+
+A worker's `formalize` action saves a handoff artifact; its SHA-256 appears in
+`discovery status` under `handoffs`. Supply your built Lean/Lake project to
+initialize a formalization campaign, without model calls:
+
+```bash
+.venv/bin/python -m ensemble_prover.research_claims discovery formalize runs/research/example SHA256 \
+  --project-path /path/to/lake-project \
+  --output runs/formalization/from_research
+```
+
+The handoff includes the exact plan, original documents, and a frozen ledger
+with all shared artifacts present at that point, including child and sibling
+arguments. Later additions are excluded; changed claim revisions reject a stale
+handoff. Older incomplete handoff formats must be regenerated.
+
+To authorize separate, paid formalization work:
+
+```bash
+.venv/bin/python -m ensemble_prover.formalization run runs/formalization/from_research \
+  --max-steps 20 --max-model-calls 60
+```
+
+The research request cap does **not** cover these formalizer or nested Mini
+calls. The campaign's own cap also excludes nested Mini calls and transport
+retries; see [campaign budgets](#campaign-models-and-budgets). Review the generated
+Lean statements and use the campaign's checked export workflow before claiming
+a proved result.
+
+The research loop is experimental. Automatic bidirectional research/Lean
+execution, shared budgets across both systems, automatic literature search,
+and distributed fleets are not implemented. No autonomous mathematical discovery
+success rate or literature novelty claim has been established. The [full research
+execution contract](../ensemble_prover/research_claims/DISCOVERY.md) documents
+the current guarantees and limitations.

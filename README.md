@@ -5,7 +5,33 @@ combines language-model proof search with Lean verification. Given a formalized
 Lean target, it plans a proof, retrieves relevant declarations, decomposes hard
 goals into helper claims, tests and repairs candidate proofs, and finalizes a
 Lean-checked result without further user interaction. The maintained entry
-point is `ensemble_prover.mini_prover`.
+point for proof search is `ensemble_prover.mini_prover`.
+
+## Recent updates
+
+September 2026 — highlights from the current source checkout:
+
+- **Codex and Claude Code integration:** use subscription-backed CLI transports
+  for Mini's prover and refiner, alongside the existing API providers.
+  [Codex setup](docs/CODEX_SUBSCRIPTION_BACKEND.md) ·
+  [Claude Code setup](docs/CLAUDE_CODE_SUBSCRIPTION_BACKEND.md)
+- **Autonomous mathematical research — experimental:** explore proofs,
+  counterexamples, and alternative approaches with model workers, fresh reviews,
+  optional isolated experiments, and resumable request/time budgets.
+  [Start a research run](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research)
+- **Coordinated research:** track exact claims, full arguments, review objections,
+  remaining gaps, and whether a helper actually advances the target problem.
+  [Use the research ledger](docs/USER_GUIDE.md#20-coordinate-mathematical-research)
+- **Natural-language formalization:** start from a single claim or longer notes,
+  develop supporting Lean definitions and lemmas, and resume multi-file work.
+  [Single claims](docs/USER_GUIDE.md#18-formalize-one-natural-language-claim) ·
+  [Formalization campaigns](docs/USER_GUIDE.md#19-run-a-multi-file-formalization-campaign)
+
+Research reviews are not Lean proof certificates. The autonomous research and
+multi-file formalization CLIs use the OpenAI API; subscription integration applies to Mini's
+prover/refiner roles. Older release snapshots may not include every feature above.
+
+## Overview
 
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
 file and Lake project. PutnamBench files are supported through a compatibility
@@ -17,6 +43,15 @@ projects. These translate text before proving; the resulting Lean statement
 and its project environment remain the authoritative proof contract, not a
 certificate of translation fidelity. Programmatic callers can submit the same generic
 theorem-project request used by the CLI.
+
+The current source checkout also includes experimental **mathematical research**
+workflows. `ensemble_prover.research_claims` records exact claims, complete
+arguments, independent reviews, remaining gaps, and whether a helper actually
+advances its parent problem. Its `discovery` command runs autonomous
+investigations: workers explore alternative approaches, seek proofs or
+counterexamples, share findings, and request fresh reviews within a durable
+request and time budget. Research can begin with a natural-language problem,
+without a Lean project; formalization and proof verification come later.
 
 As of August 2026, across research and evaluation runs, the system has produced
 Lean-verified proofs for **65 distinct Putnam problems**, counting repeated
@@ -34,8 +69,10 @@ Ensemble Prover is an actively developed research-grade tool. It continues to
 solve Putnam problems and is now attempting frontier-mathematics problems.
 The 65 accepted proofs are a snapshot of this ongoing work.
 
-Every accepted result is checked by Lean. Model responses, plans, retrieved
-material, speculative helper claims, and falsification results are treated as
+Every result reported as a solved proof by Mini Prover is checked by Lean.
+Research-ledger support is a separate assessment, not a proved theorem.
+Model responses, plans, retrieved material, speculative helper claims, and
+falsification results are treated as
 search evidence rather than proofs until they pass the relevant verification
 gates. Each run records a structured, replayable dossier containing the proof
 search and verification history.
@@ -60,14 +97,18 @@ the proof files and answers are not.
 
 > **Release status:** 1.09 — research preview. Includes Mini Prover, experimental
 > single-claim NL input, and resumable multi-file formalization campaigns.
-> Adds an optional Codex subscription backend for Mini's prover and refiner,
+> Optional Codex and Claude Code subscription backends serve Mini's prover and refiner,
 > alongside the existing API providers.
+> The current source also includes experimental coordinated and autonomous
+> research; older release snapshots may not contain these entry points.
 
 ## Documentation
 
 Start with the **[User Guide](docs/USER_GUIDE.md)** for installation, theorem
 project preparation, [single-claim NL input](docs/USER_GUIDE.md#18-formalize-one-natural-language-claim),
 [long formalization projects](docs/USER_GUIDE.md#19-run-a-multi-file-formalization-campaign),
+[coordinated research](docs/USER_GUIDE.md#20-coordinate-mathematical-research),
+[autonomous research](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research),
 provider configuration, budgets, outputs, proof graphs, diagnostic replay,
 troubleshooting, and the public Mini CLI option map.
 
@@ -82,6 +123,9 @@ troubleshooting, and the public Mini CLI option map.
 - Natural-language/LaTeX-text translation with explicit Lean proof contracts
 - Resumable multi-file development with independent model review and checked exports
 - Complete required plan/context delivery, with explicit errors when model limits are exceeded
+- Research claims with separate correctness, verification, and contribution assessments
+- Autonomous research programs with fresh reviews, durable feedback, and fair research scheduling
+- Optional isolated Python experiments and complete research-to-formalization handoffs
 
 ## Requirements
 
@@ -90,6 +134,11 @@ troubleshooting, and the public Mini CLI option map.
 - Lean toolchain compatible with the target Lake project
 - An API key for the selected provider, or a ChatGPT Codex / Claude Code
   subscription sign-in for Mini's prover and refiner
+
+The manual research ledger needs neither Lean nor provider credentials.
+Autonomous research uses the OpenAI API and does not need Lean until the
+formalization handoff. Optional Python experiments require Linux bubblewrap
+with usable unprivileged user namespaces; there is no unsandboxed fallback.
 
 The public runtime snapshot pins the complete dependency closure for four core
 Python packages in `requirements.txt`: HTTP transport, graph search,
@@ -228,6 +277,52 @@ success rates and FLT/million-line performance have not been established.
 Lean verification certifies the formal proof, not the accuracy of translation
 from natural language. Review the generated definitions and statements.
 
+## Investigate a mathematical problem
+
+For human- or externally coordinated work, the [research ledger
+guide](ensemble_prover/research_claims/README.md) walks through recording claims,
+arguments, reviews, quantitative requirements, and bounded assignments. The
+ledger organizes work; its manual commands do not launch model workers.
+
+For autonomous investigations, supply a complete UTF-8 problem file. No proof
+sketch or choice of an affirmative conclusion is required. Choose OpenAI API
+model names available to your account:
+
+```bash
+# Offline: save the problem and the limits for this research run.
+.venv/bin/python -m ensemble_prover.research_claims discovery init runs/research/example \
+  --problem problem.md \
+  --model gpt-5.6-sol --review-model gpt-6-astra \
+  --max-requests 32 --max-seconds 3600 --concurrency 4
+
+# Paid: requires OPENAI_API_KEY; repeat this command to resume.
+.venv/bin/python -m ensemble_prover.research_claims discovery run runs/research/example
+
+.venv/bin/python -m ensemble_prover.research_claims discovery status runs/research/example
+```
+
+The request budget includes transport retries, reviews, and resumed requests.
+The wall-clock limit starts at first execution and includes downtime; resuming
+does not reset either limit. These are not dollar caps. Add `--source notes.md`
+at initialization for supporting text, or `--experiments` to allow isolated,
+bounded Python computations. The research CLI uses API routing, not the Mini
+subscription backends.
+
+Workers can wait without model calls and resume when child findings arrive.
+Full arguments, feedback, raw responses, and proof plans remain available as
+artifacts; required context is not silently shortened. `supported` means a
+written argument passed model review, not Lean verification. An `idle` run or
+exit code 0 is not a mathematical success verdict.
+
+A saved handoff can initialize the existing formalizer with the exact plan,
+original sources, and a frozen snapshot of shared research arguments. Running
+formalization requires separate authorization; its model requests and nested
+Mini calls are not covered by the research cap. An automatic round trip
+between research and Lean is not implemented. There is no automatic literature
+search or established autonomous discovery success rate. See the [research
+walkthrough](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research) and
+[full execution contract](ensemble_prover/research_claims/DISCOVERY.md).
+
 ## Verify a checkout
 
 Verify the installed Python environment and CLI:
@@ -237,6 +332,8 @@ Verify the installed Python environment and CLI:
 .venv/bin/python -m ensemble_prover.mini_prover --help
 .venv/bin/python -m ensemble_prover.nl_input --help
 .venv/bin/python -m ensemble_prover.formalization --help
+.venv/bin/python -m ensemble_prover.research_claims --help
+.venv/bin/python -m ensemble_prover.research_claims discovery --help
 ```
 
 Verify that the user-supplied target project can resolve its own toolchain:
@@ -251,6 +348,11 @@ By default, runs are written beneath `runs/mini_prover/`. A run may contain a
 human-readable log, structured turn records, activation telemetry, proof
 artifacts, and a final summary. Generated runs, caches, local environments, and
 secrets are excluded by `.gitignore`.
+
+Research state lives in the directory supplied to the research CLI, including
+`ledger.sqlite3` and content-addressed artifacts. Keep these records private
+when the underlying mathematics is private; they include complete source text
+and model conversations.
 
 Persistent Mini theory defaults to `~/.cache/mini_prover/theory`. Use
 `--mini-theory-root` to isolate experiments, `--mini-theory-mode read` for
