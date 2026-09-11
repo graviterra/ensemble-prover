@@ -2121,6 +2121,26 @@ def _legacy_imports():
     }
 
 
+_ATTEMPT_TOOL_DIRECTIVE_KEY = "_tool_loop_attempt_directive"
+
+
+def _attempt_tool_directive(
+    content: str, *, repair_semantics: Optional[str] = _REPAIR_CONTINUATION
+) -> dict[str, Any]:
+    """Controller-only guidance whose authority ends with this tool attempt.
+
+    Keep the tag in history/checkpoints, not provider messages. Never infer
+    ownership from prose: a user's similarly worded instruction must survive.
+    """
+    message = (
+        _user_history_message(content, repair_semantics=repair_semantics)
+        if repair_semantics is not None
+        else {"role": "user", "content": content}
+    )
+    message[_ATTEMPT_TOOL_DIRECTIVE_KEY] = True
+    return message
+
+
 async def _call_llm_with_tools_one_round_impl(
     *,
     conv: Any,
@@ -2642,6 +2662,19 @@ async def _call_llm_with_tools_one_round_impl(
         max_tool_calls_per_turn=max_tool_calls_per_turn,
     )
     resumed_provider_continuation = bool(quantum_state)
+    if not resumed_provider_continuation:
+        # Budgets/governors below start afresh only without a live validated
+        # continuation. Retire their prior instructions at that same boundary;
+        # a provider-quantum yield must retain both restrictions and counters.
+        # Remove only controller-tagged user notes, never mathematical evidence
+        # or assistant/tool protocol messages. Prior requests remain in traces.
+        conv.history[:] = [
+            message for message in conv.history
+            if not (
+                message.get("role") == "user"
+                and message.get(_ATTEMPT_TOOL_DIRECTIVE_KEY) is True
+            )
+        ]
     provider_chain_resume_target_id = str(
         quantum_state.get("provider_chain_resume_target_id") or ""
     ).strip()
@@ -4539,7 +4572,9 @@ async def _call_llm_with_tools_one_round_impl(
                             # the problem from every later LLM call.
                             conv.ensure_bootstrap()
                             conv.history.append(
-                                {"role": "user", "content": handling.feedback}
+                                _attempt_tool_directive(
+                                    handling.feedback, repair_semantics=None
+                                )
                             )
                             deepseek_dsml_reprompted_after_budget = True
                             content = ""
@@ -4559,21 +4594,17 @@ async def _call_llm_with_tools_one_round_impl(
                     if not final_no_tools_policy_reprompted:
                         conv.ensure_bootstrap()
                         conv.history.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "The previous final response used a top-level "
-                                    f"Lean `{forbidden_final_command}` command, which "
-                                    "is not an executable artifact for this turn. Do "
-                                    "not inspect the environment or leave placeholders. "
-                                    + _final_submission_shape_instruction(
-                                        allow_helper_only=bool(getattr(conv, "allow_helper_decomposition", True)),
-                                        require_declaration=(
-                                            try_lean_require_declaration
-                                        )
-                                    )
+                            _attempt_tool_directive(
+                                "The previous final response used a top-level "
+                                f"Lean `{forbidden_final_command}` command, which "
+                                "is not an executable artifact for this turn. Do "
+                                "not inspect the environment or leave placeholders. "
+                                + _final_submission_shape_instruction(
+                                    allow_helper_only=bool(getattr(conv, "allow_helper_decomposition", True)),
+                                    require_declaration=try_lean_require_declaration,
                                 ),
-                            }
+                                repair_semantics=None,
+                            )
                         )
                         final_no_tools_policy_reprompted = True
                         final_no_tools_event = (
@@ -4777,7 +4808,7 @@ async def _call_llm_with_tools_one_round_impl(
                     _increment_tool_metric("tool_repeat_forced_finalize", 1)
                     conv.ensure_bootstrap()
                     conv.history.append(
-                        _user_history_message(
+                        _attempt_tool_directive(
                             (
                                 "You repeated a tool call after correction. Tools are "
                                 "now disabled for this attempt. Use the results already "
@@ -4787,7 +4818,6 @@ async def _call_llm_with_tools_one_round_impl(
                                     require_declaration=try_lean_require_declaration
                                 )
                             ),
-                            repair_semantics=_REPAIR_CONTINUATION,
                         )
                     )
                     primitives["trace"](
@@ -4925,7 +4955,7 @@ async def _call_llm_with_tools_one_round_impl(
                         lambda **_kw: "Repair self-check required.",
                     )
                     if repair_self_check_reminder_sent:
-                        reminder_message = _user_history_message(
+                        reminder_message = _attempt_tool_directive(
                             (
                                 "The remaining repair tool slot is reserved for "
                                 "`try_lean`. Do not call other tools now; call "
@@ -4936,7 +4966,6 @@ async def _call_llm_with_tools_one_round_impl(
                                     else "proof."
                                 )
                             ),
-                            repair_semantics=_REPAIR_CONTINUATION,
                         )
                     else:
                         reminder = message_fn(
@@ -7093,7 +7122,7 @@ async def _call_llm_with_tools_one_round_impl(
                 if search_cadence_stall_detected:
                     force_finalize_without_tools = True
                     conv.history.append(
-                        _user_history_message(
+                        _attempt_tool_directive(
                             "Search requests repeatedly ignored the required "
                             "formal-attempt guidance. Tools are disabled for "
                             "this attempt. Use the retrieved evidence to "
@@ -7102,7 +7131,6 @@ async def _call_llm_with_tools_one_round_impl(
                                 allow_helper_only=bool(getattr(conv, "allow_helper_decomposition", True)),
                                 require_declaration=try_lean_require_declaration
                             ),
-                            repair_semantics=_REPAIR_CONTINUATION,
                         )
                     )
                     primitives["trace"](
@@ -7115,7 +7143,7 @@ async def _call_llm_with_tools_one_round_impl(
             if semantic_no_progress_detected:
                 force_finalize_without_tools = True
                 conv.history.append(
-                    _user_history_message(
+                    _attempt_tool_directive(
                         (
                             "Tool work has produced no bankable formal progress "
                             "across several completed proof-tool "
@@ -7131,7 +7159,6 @@ async def _call_llm_with_tools_one_round_impl(
                                 require_declaration=try_lean_require_declaration
                             )
                         ),
-                        repair_semantics=_REPAIR_CONTINUATION,
                     )
                 )
                 primitives["trace"](
@@ -7206,7 +7233,7 @@ async def _call_llm_with_tools_one_round_impl(
                 tool_repeat_action = "force_finalize_after_guided_retry"
                 _increment_tool_metric("tool_repeat_forced_finalize", 1)
                 conv.history.append(
-                    _user_history_message(
+                    _attempt_tool_directive(
                         (
                             "You used the final corrective tool step. Tools are "
                             "now disabled for this attempt. Use the results already "
@@ -7216,7 +7243,6 @@ async def _call_llm_with_tools_one_round_impl(
                                 require_declaration=try_lean_require_declaration
                             )
                         ),
-                        repair_semantics=_REPAIR_CONTINUATION,
                     )
                 )
                 primitives["trace"](
@@ -7257,10 +7283,7 @@ async def _call_llm_with_tools_one_round_impl(
                     )
                 )
                 conv.history.append(
-                    _user_history_message(
-                        msg,
-                        repair_semantics=_REPAIR_CONTINUATION,
-                    )
+                    _attempt_tool_directive(msg)
                 )
                 if dropped > 0:
                     primitives["trace"](
