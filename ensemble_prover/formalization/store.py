@@ -18,7 +18,7 @@ import tempfile
 import time
 import uuid
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -494,8 +494,15 @@ class ProjectStore:
         lease_s: float = 300,
         now: float | None = None,
         kinds: Sequence[str] | None = None,
+        *,
+        ready_filter: Callable[[Task], bool] | None = None,
     ) -> Claim | None:
-        """Recover expired leases and atomically reserve one ready task."""
+        """Recover expired leases and atomically reserve one ready task.
+
+        A pure ready_filter can restrict admission without reserving or spending
+        attempts on other tasks. It runs after lease recovery, under the same
+        transaction as selection; callers must not perform I/O or mutate here.
+        """
         _lease_end(_clock(now), lease_s)
         if not isinstance(owner, str) or not owner.strip():
             raise ValueError("lease owner must be nonempty")
@@ -509,9 +516,20 @@ class ProjectStore:
             if kinds is not None:
                 query += " AND kind IN (" + ",".join("?" for _ in kinds) + ")"
                 values.extend(kinds)
-            row = self._connection.execute(
-                query + " ORDER BY priority DESC,id LIMIT 1", values
-            ).fetchone()
+            if ready_filter is None:
+                row = self._connection.execute(
+                    query + " ORDER BY priority DESC,id LIMIT 1", values
+                ).fetchone()
+            else:
+                candidates = self._connection.execute(
+                    query + " ORDER BY priority DESC,id", values
+                )
+                try:
+                    row = next(
+                        (row for row in candidates if ready_filter(_task(row))), None
+                    )
+                finally:
+                    candidates.close()
             if row is None:
                 return None
             timestamp = _clock(now)

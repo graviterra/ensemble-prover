@@ -7,15 +7,20 @@ assignments for coordinated mathematical research.
 It records which necessary implication a result supplies and whether its
 quantitative losses are acceptable. An experimental executable loop adds
 model-backed investigations, fresh reviews, isolated experiments, durable shared
-request admission, and exact formalization handoffs. See
+request admission, and an optional research-to-proof loop. With
+`discovery init --project-path /path/to/built-lake-project`, one `discovery run`
+drives formalization, independent statement review, Mini proof search, checked
+export, and feedback. Research without a project retains manual handoffs. See
 [Autonomous mathematical research](DISCOVERY.md) for use and limitations.
 
 The maintained prover enters through `mini_prover` and `mini_session.factory`
 into `MiniSession`; its formal search state and Lean acceptance remain separate.
 The existing `formalization` campaign handles source-grounded decomposition,
 semantic review, and compiler admission. This ledger adds written research
-provenance alongside those systems. Formalization execution remains separately
-authorized; the research loop does not grant proof-acceptance authority.
+provenance alongside those systems. Configured discovery runs share their request
+and deadline limits across all roles, including nested Mini dispatches. Manually
+launched standalone campaigns retain separate authorization and limits. Only the
+independently checked export path grants discovery proof authority.
 
 | Module | Responsibility |
 | --- | --- |
@@ -23,8 +28,9 @@ authorized; the research loop does not grant proof-acceptance authority.
 | [store.py](store.py) | SQLite persistence, revisions, artifact bytes, evidence, reviews, contributions, operations, assignments |
 | [scheduler.py](scheduler.py) | Explainable priorities and bounded assignment context |
 | [cli.py](cli.py) | JSON submissions and reports through `python -m` |
-| [discovery.py](discovery.py) | Executable research programs, reviews, and exact handoffs |
+| [discovery.py](discovery.py) | Research programs, reviews, proof scheduling, exact handoffs, and feedback |
 | [discovery_store.py](discovery_store.py) | Durable admission, response recovery, atomic application |
+| [proof_bridge.py](proof_bridge.py) | Bound campaigns, full proof context, Mini execution, export verification, and receipts |
 | [experiments.py](experiments.py) | Optional isolated, bounded Python computations |
 
 ## Three separate assessments
@@ -52,9 +58,13 @@ proof that two different people or model instances performed the work.
 
 Imported `kernel_report` evidence is historical metadata. It does not rerun
 Lean, authenticate a report, or establish that its theorem matches this claim.
-`verification.kernel_verified` is always `false`; scheduler `root_proved` is also
-always `false`. Finite computations and source records alone do not establish a
-general claim.
+The manual assessment's `verification.kernel_verified` is always `false`;
+scheduler `root_proved` is also always `false`. Discovery has separate
+`root_proved`, `root_refuted`, and `verified_proofs` fields. Only its independently
+rechecked exports can set a root result, with a checked proof of the original
+claim's negation required for refutation. Natural-language alignment remains
+`machine_reviewed_not_certified`; manual records cannot bypass export checks.
+Finite computations and source records alone do not establish a general claim.
 
 Each dependency contains an `obligation_id`, a `supplier_id`, the exact required
 `contract`, and optional `quantitative_requirements`. Closure requires all of:
@@ -376,23 +386,29 @@ reported experiment; the ledger does not execute or independently verify it.
 Use artifacts for complete source and output bytes. A `primary_source` submission
 can record bibliographic details and exact source locations in `details`.
 
-The ledger uses schema version **4**, stored in `DIRECTORY/ledger.sqlite3`.
+The ledger uses schema version **6**, stored in `DIRECTORY/ledger.sqlite3`.
 Use a dedicated directory. Existing prover or campaign databases are not migrated.
-Version 1, 2, and 3 research ledgers require an explicit upgrade:
+Version 1, 2, 3, 4, and 5 research ledgers require an explicit upgrade:
 
 ```bash
 .venv/bin/python -m ensemble_prover.research_claims upgrade DIRECTORY
 ```
 
 Back up the ledger before upgrading, and stop older ledger clients first.
-The upgrade validates the known legacy schema, retains all records and
-artifact bytes, and adds discovery runtime tables where absent. Version 4 adds
-durable child-result continuation semantics without reallocating existing run
-budgets. Version 1 upgrades also enable
+The upgrade validates the known legacy schema, retains mathematical records,
+artifact bytes, providers, and budgets, and adds discovery runtime tables where
+absent. Version 4 adds durable child-result continuation semantics without reallocating existing run
+budgets. Version 5 adds a provider-routing compatibility fence: old API-only
+clients cannot reopen subscription-backed discovery runs. Upgrading adds explicit
+`openai` worker/reviewer routing to legacy API-only run metadata; existing Codex
+routing is retained. Version 6 adds explicit closed-loop authorization and
+leaves automatic proving disabled on upgraded runs. Initialize a new discovery
+directory with `--project-path` to authorize it. New-format runs with missing
+routing or closed-loop fields are rejected. Version 1 upgrades also enable
 conflict-aware interpretation. Previously hidden
 contribution disagreements or changed assessment tokens may therefore reopen
 obligations; re-review affected contributions. Older code rejects
-version 4 when opening a ledger; the upgrade cannot revoke already-open legacy
+version 6 when opening a ledger; the upgrade cannot revoke already-open legacy
 connections, so mixed-version operation is unsupported. Unknown schemas and versions are
 rejected without alteration; no downgrade is provided.
 Mutations use transactions, revision checks occur while holding the write lock,

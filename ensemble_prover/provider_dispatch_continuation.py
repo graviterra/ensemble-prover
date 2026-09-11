@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextvars
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 # These variables form one request-local transport authority boundary.  Both
@@ -24,6 +24,9 @@ PROVIDER_PENDING_DISPATCH_RECEIPT: contextvars.ContextVar[dict[str, Any]] = (
 PROVIDER_DISPATCH_OBSERVER: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "provider_dispatch_observer",
     default=None,
+)
+PROVIDER_DISPATCH_GUARDS: contextvars.ContextVar[tuple[Callable[..., Any], ...]] = (
+    contextvars.ContextVar("provider_dispatch_guards", default=())
 )
 PROVIDER_DISPATCH_EXPOSURE_TRACKER: contextvars.ContextVar[Any] = (
     contextvars.ContextVar("provider_dispatch_exposure_tracker", default=None)

@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import json
 import sys
-from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
@@ -38,15 +37,37 @@ def register(commands: Any) -> None:
         help="Additional complete source document",
     )
     init.add_argument("--domain", default="As specified in the original problem")
-    init.add_argument("--model", required=True, help="OpenAI API research model name")
     init.add_argument(
-        "--review-model", required=True, help="OpenAI API reviewer model name"
+        "--provider",
+        choices=("openai", "codex"),
+        default="openai",
+        help="Research transport: OpenAI API or Codex ChatGPT subscription",
+    )
+    init.add_argument(
+        "--review-provider",
+        choices=("openai", "codex"),
+        help="Review transport (defaults to --provider; no automatic API fallback)",
+    )
+    init.add_argument(
+        "--model",
+        required=True,
+        help="Research/formalizer/prover/refiner model name for the selected provider",
+    )
+    init.add_argument(
+        "--review-model",
+        required=True,
+        help="Argument and semantic statement reviewer model name for its provider",
+    )
+    init.add_argument(
+        "--codex-bin",
+        default="codex",
+        help="Codex CLI executable; saved at initialization for resume",
     )
     init.add_argument(
         "--max-requests",
         type=int,
         required=True,
-        help="Total HTTP dispatch intents, including retries and resumes",
+        help="Total dispatch intents across roles and resumes: API requests or codex exec invocations",
     )
     init.add_argument(
         "--max-seconds",
@@ -61,6 +82,31 @@ def register(commands: Any) -> None:
         help="Maximum active worker operations; not a model-count limit",
     )
     init.add_argument("--request-timeout-s", type=float, default=300)
+    init.add_argument(
+        "--project-path",
+        type=Path,
+        help="Enable automatic formalization, Mini proof search and feedback in this existing Lake project",
+    )
+    init.add_argument(
+        "--import",
+        dest="imports",
+        action="append",
+        default=[],
+        help="Trusted Lean project import (repeatable; requires --project-path)",
+    )
+    init.add_argument(
+        "--proof-quantum-s",
+        type=float,
+        default=600,
+        help="Seconds before proof work returns feedback to research; shares the overall deadline",
+    )
+    init.add_argument(
+        "--formalization-steps",
+        type=int,
+        default=8,
+        help="Campaign controller steps per proof quantum",
+    )
+    init.add_argument("--lean-timeout-s", type=float, default=300)
     init.add_argument(
         "--experiments",
         action="store_true",
@@ -85,51 +131,71 @@ def register(commands: Any) -> None:
 
 
 async def _run(directory: Path) -> dict[str, Any]:
+    from ..codex_subscription import CodexSubscriptionClient
     from ..mini_prover import _make_role_cfg
     from ..models import OpenAICompatClient
     from .discovery import DiscoveryLoop
-    from .discovery_store import DiscoveryStore
+    from .discovery_store import DiscoveryStore, provider_routes
+    from .proof_bridge import ProofBridge, configuration
 
     from dotenv import load_dotenv
 
     load_dotenv()
     with DiscoveryStore(directory) as store:
         run = store.run_record()
+        research_provider, review_provider = provider_routes(run)
+        closed_loop = configuration(run)
         # Construct distinct clients per worker: provider response metadata is
         # mutable, and concurrent operations must not share that state.
-        async with AsyncExitStack() as cleanup:
-
-            def factory(role: str):
-                def make(_worker: str):
-                    try:
-                        cfg = _make_role_cfg(
-                            "openai",
-                            run["review_model"] if role == "review" else run["model"],
-                            role_name=role,
-                            llm_deadline_policy="hard",
-                            timeout_s=run["request_timeout_s"],
-                        )
-                    except SystemExit as exc:
-                        # The legacy config helper is CLI-oriented. Never let
-                        # its SystemExit escape an asynchronous worker task.
-                        raise ValueError(str(exc)) from exc
-                    # This optional shared-client setting predates a declared
-                    # RoleConfig field and is read dynamically by the transport.
-                    setattr(cfg, "operation_timeout_s", run["request_timeout_s"])
+        def factory(role: str):
+            def make(_worker: str):
+                try:
+                    cfg = _make_role_cfg(
+                        review_provider if role == "review" else research_provider,
+                        run["review_model"] if role == "review" else run["model"],
+                        role_name=role,
+                        llm_deadline_policy="hard",
+                        timeout_s=run["request_timeout_s"],
+                    )
+                except SystemExit as exc:
+                    # The legacy config helper is CLI-oriented. Never let
+                    # its SystemExit escape an asynchronous worker task.
+                    raise ValueError(str(exc)) from exc
+                # This optional shared-client setting predates a declared
+                # RoleConfig field and is read dynamically by the transport.
+                setattr(cfg, "operation_timeout_s", run["request_timeout_s"])
+                client: Any
+                if (
+                    review_provider if role == "review" else research_provider
+                ) == "codex":
+                    cfg.codex_binary = run.get("codex_binary", "codex")
+                    client = CodexSubscriptionClient(cfg)
+                else:
                     client = OpenAICompatClient(cfg)
-                    cleanup.push_async_callback(client.close)
-                    return client
+                return client
 
-                return make
+            return make
 
-            def progress(event: dict[str, Any]) -> None:
-                print(
-                    json.dumps(event, ensure_ascii=False), file=sys.stderr, flush=True
-                )
+        def progress(event: dict[str, Any]) -> None:
+            print(
+                json.dumps(event, ensure_ascii=False), file=sys.stderr, flush=True
+            )
 
-            return await DiscoveryLoop(
-                store, factory("research"), factory("review"), on_event=progress
-            ).run()
+        def proof_client(role: str, worker: str):
+            return factory(
+                "review" if role == "semantic_reviewer" else "research"
+            )(worker)
+
+        return await DiscoveryLoop(
+            store,
+            factory("research"),
+            factory("review"),
+            on_event=progress,
+            owns_clients=True,
+            proof_runner=ProofBridge(store, proof_client, owns_clients=True)
+            if closed_loop is not None
+            else None,
+        ).run()
 
 
 def dispatch(args: argparse.Namespace) -> Any:
@@ -161,6 +227,14 @@ def dispatch(args: argparse.Namespace) -> Any:
             concurrency=args.concurrency,
             request_timeout_s=args.request_timeout_s,
             experiments=args.experiments,
+            provider=args.provider,
+            review_provider=args.review_provider,
+            codex_binary=args.codex_bin,
+            project_path=args.project_path,
+            imports=tuple(args.imports),
+            proof_quantum_s=args.proof_quantum_s,
+            formalization_steps=args.formalization_steps,
+            lean_timeout_s=args.lean_timeout_s,
         )
         return {
             "status": "ready",

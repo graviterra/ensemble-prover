@@ -20,6 +20,8 @@ from typing import Any, Mapping, Sequence
 
 import httpx
 
+from ..codex_subscription import CodexSubscriptionClient
+from ..llm_error_policy import SubscriptionBackendError
 from ..models import (
     REQUIRED_PROMPT_CONTEXT_KEY,
     RequiredPromptContextOverflow,
@@ -32,7 +34,7 @@ from ..utils import strip_lean_comments_and_string_literals
 from .documents import SourceLibrary
 from .environment import EnvironmentSnapshot
 from .lean import ModuleArtifact
-from .prover import MiniProverFailure
+from .prover import MiniProverFailure, ProofAttemptFeedbackError
 from .store import Claim, LeaseLostError, ProjectStore, Task
 
 
@@ -139,6 +141,10 @@ class _ModelBudgetReached(Exception):
     """The caller's model-call quantum ended, without rejecting the task."""
 
 
+class _LocalRecoveryUnavailable(Exception):
+    """The next operation requires work outside local recovery authorization."""
+
+
 class _ProviderRequestFailed(RuntimeError):
     """A client request failed after its own retry policy was exhausted."""
 
@@ -239,9 +245,17 @@ class Campaign:
         compiler: Any,
         prover: Any,
         lease_s: float = 300,
+        required_context: dict[str, Any] | None = None,
     ):
         if not math.isfinite(lease_s) or lease_s <= 0:
             raise ValueError("lease_s must be finite and positive")
+        if required_context is not None and not isinstance(required_context, dict):
+            raise ValueError("required_context must be a mathematical data object")
+        # Copy and validate before opening resources. Caller mutation must not
+        # replace a research contract/plan between independent role calls.
+        self.required_context = (
+            json.loads(_json(required_context)) if required_context is not None else None
+        )
         self.directory = Path(directory).expanduser().resolve(strict=True)
         self.store = ProjectStore(self.directory)
         if self.store.get_metadata(
@@ -269,6 +283,7 @@ class Campaign:
         self.owner = uuid.uuid4().hex
         self._model_calls_remaining: int | None = None
         self._running = False
+        self._local_only = False
 
     def close(self) -> None:
         self.sources.close()
@@ -330,6 +345,10 @@ class Campaign:
 
     def _context(self, task: Task) -> dict[str, Any]:
         return {
+            **(
+                {"required_context": self.required_context}
+                if self.required_context is not None else {}
+            ),
             "task": {
                 "id": task.id,
                 "kind": task.kind,
@@ -394,6 +413,8 @@ class Campaign:
     async def _ask(
         self, claim: Claim, client: Any, system: str, context: Any, role: str
     ) -> dict[str, Any]:
+        if self._local_only:
+            raise _LocalRecoveryUnavailable
         if self._model_calls_remaining == 0:
             raise _ModelBudgetReached
         messages = [
@@ -411,8 +432,16 @@ class Campaign:
         if self._model_calls_remaining is not None:
             self._model_calls_remaining -= 1
         try:
-            _, response = await client.chat_raw(messages, response_format="json")
-        except RequiredPromptContextOverflow:
+            # Keep the strict subscription envelope/tool boundary, but let this
+            # controller persist and repair a completed malformed inner action.
+            # Other transports retain their existing JSON-mode behavior.
+            _, response = await client.chat_raw(
+                messages,
+                response_format=(
+                    None if isinstance(client, CodexSubscriptionClient) else "json"
+                ),
+            )
+        except (RequiredPromptContextOverflow, SubscriptionBackendError):
             raise
         except (RuntimeError, OSError) as exc:
             # The shared transport wraps exhausted retries in RuntimeError.
@@ -669,6 +698,10 @@ class Campaign:
                 observation["source"] = self.store.read_blob(
                     observation["payload"]["source_blob"]
                 ).decode("utf-8")
+            if "feedback_blob" in observation["payload"]:
+                observation["feedback"] = json.loads(
+                    self.store.read_blob(observation["payload"]["feedback_blob"])
+                )
             return observation
         raise ValueError("reviewer may retrieve evidence or return a decision")
 
@@ -750,6 +783,8 @@ class Campaign:
                 )
             source = self.store.read_blob(pending["source_blob"]).decode("utf-8")
         else:
+            if self._local_only:
+                raise _LocalRecoveryUnavailable
             context = self._context(task)
             context["original_source"] = self._refs(
                 frozen["source_refs"], required=True
@@ -758,15 +793,51 @@ class Campaign:
                 frozen.get("review_evidence", {})
             )
             context["review_verdict"] = frozen.get("review_verdict")
-            source = await self.prover.prove(
-                task=task,
-                name=frozen["name"],
-                statement=frozen["kernel_target"],
-                proof_plan=frozen["proof_plan"],
-                preamble=self._preamble(artifacts),
-                context=context,
-                run_dir=self.directory / "proof_runs" / claim.token,
-            )
+            primary_failure = False
+            try:
+                source = await self.prover.prove(
+                    task=task,
+                    name=frozen["name"],
+                    statement=frozen["kernel_target"],
+                    proof_plan=frozen["proof_plan"],
+                    preamble=self._preamble(artifacts),
+                    context=context,
+                    run_dir=self.directory / "proof_runs" / claim.token,
+                )
+            except BaseException:
+                primary_failure = True
+                raise
+            finally:
+                try:
+                    read_feedback = getattr(self.prover, "read_attempt_feedback", None)
+                    if callable(read_feedback):
+                        feedback = read_feedback()
+                        if feedback is not None:
+                            # Private evidence, never proof-admission authority.
+                            self.store.append_event(
+                                claim,
+                                "proof_attempt_feedback",
+                                {
+                                    "feedback_blob": self.store.write_blob(
+                                        _json(feedback).encode()
+                                    )
+                                },
+                            )
+                except BaseException as exc:
+                    # Secondary storage/serialization failures must not change
+                    # terminal-provider, admission-guard, or cancellation control
+                    # flow. Record only structural diagnostics where possible.
+                    with contextlib.suppress(BaseException):
+                        self.store.append_event(
+                            claim, "proof_attempt_feedback_failed",
+                            {"stage": "archive", "error_type": type(exc).__name__},
+                        )
+                    if not primary_failure:
+                        if not isinstance(exc, Exception) or isinstance(exc, LeaseLostError):
+                            raise
+                        raise ProofAttemptFeedbackError(
+                            stage="archive", error_type=type(exc).__name__
+                        ) from exc
         if source is None:
             self._observe(
                 claim,
@@ -816,8 +887,23 @@ class Campaign:
         session.pop("pending_proof", None)
         self.store.checkpoint(claim, session)
 
+    @staticmethod
+    def _local_recovery_ready(task: Task) -> bool:
+        """Only saved proof source or an accepted definition can finish locally."""
+        if task.session.get("pending_proof"):
+            return True
+        pending = task.session.get("pending_review")
+        return bool(
+            task.kind == "definition"
+            and pending
+            and pending.get("accepted") is True
+            and pending.get("candidate", {}).get("action") == "submit_definition"
+        )
+
     async def _step(self, claim: Claim) -> None:
         task = self.store.get_task(claim.task.id)
+        if self._local_only and not self._local_recovery_ready(task):
+            raise _LocalRecoveryUnavailable
         if task.session.get("pending_proof"):
             await self._prove(claim)
             return
@@ -1013,9 +1099,20 @@ class Campaign:
         }
 
     async def run(
-        self, *, max_steps: int | None = None, max_model_calls: int | None = None
+        self,
+        *,
+        max_steps: int | None = None,
+        max_model_calls: int | None = None,
+        local_only: bool = False,
     ) -> dict[str, Any]:
-        """Execute until the root is proved, work blocks, or an explicit quantum ends."""
+        """Execute a quantum, optionally admitting only already-produced work.
+
+        local_only needs no role clients or prover: it never requests a model
+        response or starts Mini, and skips tasks requiring either operation.
+        The caller retains responsibility for the overall wall-clock bound.
+        """
+        if type(local_only) is not bool:
+            raise ValueError("local_only must be boolean")
         if max_steps is not None and (type(max_steps) is not int or max_steps < 1):
             raise ValueError("max_steps must be a positive integer or None")
         if max_model_calls is not None and (
@@ -1026,18 +1123,24 @@ class Campaign:
             raise RuntimeError("this Campaign already has an active run")
         self._running = True
         self._model_calls_remaining = max_model_calls
+        self._local_only = local_only
         try:
             return await self._run_steps(max_steps)
         finally:
             self._running = False
             self._model_calls_remaining = None
+            self._local_only = False
 
     async def _run_steps(self, max_steps: int | None) -> dict[str, Any]:
         steps = 0
         while max_steps is None or steps < max_steps:
             if self.status()["status"] in {"proved", "needs_clarification", "invalid"}:
                 break
-            claim = self.store.claim(self.owner, lease_s=self.lease_s)
+            claim = self.store.claim(
+                self.owner,
+                lease_s=self.lease_s,
+                ready_filter=self._local_recovery_ready if self._local_only else None,
+            )
             if claim is None:
                 break
             heartbeat = asyncio.create_task(self._heartbeat(claim))
@@ -1055,6 +1158,30 @@ class Campaign:
             except LeaseLostError:
                 # Another worker/revision is authoritative; do not publish.
                 pass
+            except _LocalRecoveryUnavailable:
+                with contextlib.suppress(LeaseLostError):
+                    self.store.fail(
+                        claim, "saved local work changed; model work remains paused",
+                        retry=True,
+                    )
+                result = self.status()
+                result["stop_reason"] = "local_recovery_only"
+                return result
+            except ProofAttemptFeedbackError as exc:
+                diagnostic: dict[str, Any] = {
+                    "error_type": exc.error_type,
+                    "stage": exc.stage,
+                    "error": "proof attempt feedback unavailable",
+                }
+                with contextlib.suppress(BaseException):
+                    self._observe(claim, diagnostic)
+                # Releasing authority is independent of diagnostic storage:
+                # a blob outage must not strand a healthy SQLite lease.
+                with contextlib.suppress(BaseException):
+                    self.store.fail(claim, diagnostic["error"], retry=True)
+                result = self.status()
+                result.update(stop_reason="feedback_error", feedback_error=diagnostic)
+                return result
             except RequiredPromptContextOverflow as exc:
                 diagnostic = {
                     "error_type": type(exc).__name__,
@@ -1062,20 +1189,37 @@ class Campaign:
                     "required_tokens": exc.required_tokens,
                     "available_tokens": exc.available_tokens,
                 }
-                with contextlib.suppress(LeaseLostError):
+                with contextlib.suppress(BaseException):
                     self._observe(claim, diagnostic)
+                with contextlib.suppress(BaseException):
                     self.store.fail(claim, str(exc), retry=True)
                 result = self.status()
                 result.update(
                     stop_reason="context_overflow", context_overflow=diagnostic
                 )
                 return result
-            except (httpx.HTTPError, _ProviderRequestFailed, MiniProverFailure) as exc:
+            except (
+                httpx.HTTPError,
+                _ProviderRequestFailed,
+                MiniProverFailure,
+                SubscriptionBackendError,
+            ) as exc:
                 # The shared client has already applied its transport retry
                 # policy. Stop this quantum, retain the complete diagnostic,
                 # and release authority immediately for a deliberate resume.
                 diagnostic = {"error_type": type(exc).__name__, "error": str(exc)}
                 stop_reason = "provider_error"
+                if isinstance(exc, SubscriptionBackendError):
+                    # Never expose raw backend exception bodies. Structural
+                    # fields retain operational routing without credential logs.
+                    diagnostic = {
+                        "error_type": type(exc).__name__,
+                        "error": "subscription request failed",
+                        "backend": exc.backend,
+                        "backend_kind": exc.backend_kind,
+                    }
+                    if exc.backend_kind == "context":
+                        stop_reason = "context_overflow"
                 if isinstance(exc, MiniProverFailure):
                     # Mini returns a typed terminal outcome after its own
                     # cleanup. Its dossier preserves reason/kind, not the
@@ -1085,9 +1229,10 @@ class Campaign:
                 if isinstance(exc, httpx.HTTPStatusError):
                     diagnostic["status_code"] = exc.response.status_code
                     diagnostic["response_body"] = exc.response.text
-                with contextlib.suppress(LeaseLostError):
+                with contextlib.suppress(BaseException):
                     self._observe(claim, diagnostic)
-                    self.store.fail(claim, str(exc), retry=True)
+                with contextlib.suppress(BaseException):
+                    self.store.fail(claim, str(diagnostic["error"]), retry=True)
                 result = self.status()
                 result.update(stop_reason=stop_reason, **{stop_reason: diagnostic})
                 return result
@@ -1102,12 +1247,21 @@ class Campaign:
                 result["stop_reason"] = "max_model_calls"
                 return result
             except asyncio.CancelledError:
-                with contextlib.suppress(LeaseLostError):
-                    self.store.fail(
-                        claim,
-                        "worker cancelled; ready for immediate resume",
-                        retry=True,
-                    )
+                # Mini's cancellation cleanup captures its exact attempt, and
+                # _prove archives that feedback under this claim. Keep the
+                # heartbeat and lease alive until that work has joined.
+                work.cancel()
+                try:
+                    await asyncio.gather(work, return_exceptions=True)
+                finally:
+                    # A second cancellation can interrupt the join. Releasing
+                    # this lease must remain independent of that interruption.
+                    with contextlib.suppress(BaseException):
+                        self.store.fail(
+                            claim,
+                            "worker cancelled; ready for immediate resume",
+                            retry=True,
+                        )
                 raise
             except (ValueError, KeyError, TypeError, OSError, RuntimeError) as exc:
                 with contextlib.suppress(LeaseLostError):

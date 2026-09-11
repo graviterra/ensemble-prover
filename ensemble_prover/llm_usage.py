@@ -22,10 +22,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from numbers import Integral
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
 
 from .provider_dispatch_continuation import (
     PROVIDER_DISPATCH_EXPOSURE_TRACKER as _PROVIDER_DISPATCH_EXPOSURE_TRACKER,
+    PROVIDER_DISPATCH_GUARDS as _PROVIDER_DISPATCH_GUARDS,
     PROVIDER_DISPATCH_MARKER as _PROVIDER_DISPATCH_MARKER,
     PROVIDER_DISPATCH_OBSERVER as _PROVIDER_DISPATCH_OBSERVER,
     PROVIDER_DISPATCH_TARGET as _PROVIDER_DISPATCH_TARGET,
@@ -990,6 +991,29 @@ def provider_dispatch_child_target_id(wrapper: Any, child_index: int) -> str:
 
 
 @contextmanager
+def provider_dispatch_guard(callback: Callable[..., Any]) -> Iterator[None]:
+    """Add run-wide admission that nested operation observers cannot replace.
+
+    Every concrete transport intent invokes the scoped guards, outermost first,
+    before its operation observer. A guard may raise to deny dispatch; its return
+    value cannot change transport receipts. Callback inputs are private copies.
+    An earlier admission is not refunded if a later guard or observer denies the
+    operation: callers own conservative durable accounting and any reconciliation.
+
+    Scopes propagate to asyncio child tasks, not new processes. This boundary
+    requires a transport that calls ``notify_provider_dispatch_observer``.
+    """
+
+    token = _PROVIDER_DISPATCH_GUARDS.set(
+        (*_PROVIDER_DISPATCH_GUARDS.get(), callback)
+    )
+    try:
+        yield
+    finally:
+        _PROVIDER_DISPATCH_GUARDS.reset(token)
+
+
+@contextmanager
 def provider_dispatch_observer(callback: Callable[..., Any]):
     """Observe the concrete transport boundary for one logical operation.
 
@@ -1041,6 +1065,20 @@ async def notify_provider_dispatch_observer(
     require_hard_timeout_capability_active(
         "provider transport dispatch authorization"
     )
+    for guard in _PROVIDER_DISPATCH_GUARDS.get():
+        guard_details = copy.deepcopy(details)
+        try:
+            inspect.signature(guard).bind(guard_details)
+        except (TypeError, ValueError):
+            guarded = guard()
+        else:
+            guarded = guard(guard_details)
+        if inspect.isawaitable(guarded):
+            await guarded
+        # Awaited durable admission must not revive a fenced Mini task.
+        require_hard_timeout_capability_active(
+            "provider transport dispatch after run admission"
+        )
     observer = _PROVIDER_DISPATCH_OBSERVER.get()
     if observer is None:
         receipt = dict(details)

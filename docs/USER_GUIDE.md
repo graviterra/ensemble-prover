@@ -1,5 +1,7 @@
 # Ensemble Prover User Guide
 
+Last updated: 2026-09-10.
+
 Start with a Lean theorem, a natural-language claim, or mathematical notes for
 a longer project. Mini Prover searches for proofs and checks them with Lean.
 The experimental NL frontends first translate the mathematics into Lean; the
@@ -10,12 +12,14 @@ For mathematics still being investigated, use the research ledger to coordinate
 claims, evidence, and reviews, or the autonomous research loop to explore
 approaches with model workers. These workflows can begin without Lean and may
 produce a proof argument, counterexample, construction, or precise remaining
-gap. A research assessment is not a Lean proof certificate.
+gap. Supply a built Lake project to let the same discovery run formalize candidate
+arguments, search for proofs with Mini, independently check exports, and return
+feedback to research. A research assessment is not a Lean proof certificate.
 
 This guide covers release 1.09, including both experimental NL frontends and
-the optional Codex subscription backend for Mini's prover and refiner, plus
-the experimental research workflows now on master. Older release snapshots
-may not include the research modules; Mini-only releases also lack the NL
+the optional Codex subscription backend for Mini and autonomous research, plus
+the experimental research-to-proof workflow in this source checkout. Older
+release snapshots may not include the research modules; Mini-only releases also lack the NL
 frontends. Check the help in your installed checkout.
 Run commands from the repository root containing `.venv/` and `ensemble_prover/`,
 not from inside the `ensemble_prover/` Python package. The live help is the
@@ -57,9 +61,10 @@ proof workflow, and a checked proof does not certify the accuracy of an NL
 translation.
 
 The manual research ledger requires neither Lean nor an API key. Autonomous
-research requires model access but not a Lean project until you hand results
-to the formalizer. Supply the exact mathematical question as UTF-8 text; do not
-assume that a reviewed natural-language argument has been formally verified.
+research requires model access. A project is optional for research-only work;
+`discovery init --project-path /path/to/built-lake-project` enables automatic
+formalization and proof verification. Supply the exact mathematical question as
+UTF-8 text; a reviewed natural-language argument alone is not formally verified.
 
 The release does not include Lean, Lake, Mathlib, PutnamBench, downloaded Lake
 packages, or any theorem project. Supply those separately.
@@ -76,7 +81,7 @@ packages, or any theorem project. Supply those separately.
 
 Lean/Lake is required for proof search and formalization, not for research-only
 work. Manual ledger commands run offline. The autonomous research CLI uses
-OpenAI API credentials; optional experiments additionally require unprivileged
+OpenAI API credentials or Codex ChatGPT subscription sign-in; optional experiments additionally require unprivileged
 Linux namespace isolation as described in [section 21](#optional-research-experiments).
 
 The release audit is performed with both CPython 3.11 and 3.12. The setup script accepts
@@ -177,16 +182,21 @@ An API key is not required for a subscription-only Mini run.
 Claude Code setup and controls are documented in the
 [Claude Code subscription guide](CLAUDE_CODE_SUBSCRIPTION_BACKEND.md).
 
-The NL frontends have their own formalizer settings. The campaign currently
-uses the OpenAI API for all three of its roles: `gpt-5.6-terra` for formalization
-and independent review, and `gpt-5.6-luna` for proof search. See
+The standalone NL frontends have their own API-backed formalizer settings. The
+standalone campaign CLI uses the OpenAI API for all three of its roles:
+`gpt-5.6-terra` for formalization and independent review, and `gpt-5.6-luna` for
+proof search. See
 [campaign model and budget controls](#campaign-models-and-budgets); Mini's
 provider defaults above do not select the campaign's models.
 
-Autonomous research also uses the OpenAI API, but requires you to choose both
-`--model` and `--review-model` at initialization. The saved names are reused on
-resume; Mini's prover/refiner settings and subscription backends do not select
-research workers. See [section 21](#21-run-autonomous-mathematical-research).
+Autonomous research defaults to the OpenAI API; `--provider codex` selects the
+Codex subscription backend. `--review-provider` defaults to `--provider` and can
+explicitly select a different transport. Choose both `--model` and
+`--review-model` at initialization. When a project is configured, the formalizer,
+Mini prover, and refiner inherit `--provider`/`--model`; argument and semantic
+reviewers inherit `--review-provider`/`--review-model`. Saved providers and names
+are reused on resume; Mini's standalone flags do not select discovery roles. See
+[section 21](#21-run-autonomous-mathematical-research).
 
 ### Provider examples
 
@@ -842,8 +852,11 @@ does not restore every internal Mini search state. See
 [the campaign workflow](#19-run-a-multi-file-formalization-campaign).
 
 Autonomous research has its own ledger and admission counters. Repeating its
-`discovery run` command resumes within the original limits;
-neither Mini resume flags nor campaign invocation budgets apply to it. See
+`discovery run` command resumes within the original limits, including integrated
+formalization and Mini work when a project was configured. Saved campaign
+contracts, completed modules, and pending source persist; an interrupted inner
+Mini invocation may restart within the same global budget. Neither Mini resume
+flags nor standalone campaign invocation budgets apply to discovery. See
 [research budgets and recovery](#research-budgets-and-recovery).
 
 For a graceful stop, send one interrupt and allow cleanup to finish. Repeated
@@ -996,8 +1009,11 @@ claims, and counterexample probes are search evidence until they cross the
 relevant verification gate.
 
 Research `supported`/`refuted` statuses describe reviewed arguments, not kernel
-certificates. Finite experiments do not establish infinite claims, and novelty
-within one ledger does not establish novelty in the mathematical literature.
+certificates. Discovery `root_proved`/`root_refuted` require an independently
+rechecked export of the reviewed formal target; natural-language alignment remains
+`machine_reviewed_not_certified`. Manually supplied `kernel_report` records grant
+no proof authority. Finite experiments do not establish infinite claims, and
+novelty within one ledger does not establish novelty in the mathematical literature.
 
 ## 16. Public CLI option map
 
@@ -1396,7 +1412,9 @@ Use this loop to investigate a problem before you have a complete proof or Lean
 statement. Workers may pursue proofs, counterexamples, intermediate conjectures,
 new constructions, or gaps. They can start alternative programs, share complete
 arguments, request fresh reviews, and wait for child results without polling the
-model. Alternative approaches do not become extra assumptions of the root.
+model. With a built Lake project, the same command also drives formalization,
+semantic review, Mini proof search, independently checked export, and research
+feedback. Alternative approaches do not become extra assumptions of the root.
 
 ### Initialize, execute, and inspect research
 
@@ -1424,6 +1442,38 @@ Original text is preserved; editing those files afterward does not change the
 saved input. Manual ledger initialization and `discovery init` are distinct:
 use a new directory for autonomous execution, not an existing manual ledger.
 
+For a complete subscription-backed research-to-proof run, first run `codex login`
+and select ChatGPT. Supply a built Lean/Lake project and Codex model names
+available to your account:
+
+```bash
+.venv/bin/python -m ensemble_prover.research_claims discovery init runs/research/codex_example \
+  --problem problem.md --provider codex \
+  --project-path /path/to/built-lake-project \
+  --model YOUR_CODEX_MODEL --review-model YOUR_CODEX_REVIEW_MODEL \
+  --max-requests 32 --max-seconds 3600 --concurrency 4
+
+.venv/bin/python -m ensemble_prover.research_claims discovery run runs/research/codex_example
+.venv/bin/python -m ensemble_prover.research_claims discovery status runs/research/codex_example
+```
+
+One `discovery run` drives the full loop and uses subscription allowance.
+Omit `--project-path` to keep research-only execution, as in the API example above;
+add it to the API example to enable the same loop there.
+
+| Saved options | Roles selected |
+| --- | --- |
+| `--provider` and `--model` | Research worker, formalizer, Mini prover and refiner |
+| `--review-provider` and `--review-model` | Argument reviewer and semantic statement reviewer |
+
+Every role uses Codex in this example unless you add `--review-provider openai`.
+Conversely, `--provider openai --review-provider codex` selects API research/proof
+roles and Codex reviewers. Only API roles need `OPENAI_API_KEY`; there is no
+automatic API fallback. `--codex-bin /path/to/codex` saves a custom executable
+for resume.
+See [Codex setup and limits](CODEX_SUBSCRIPTION_BACKEND.md#autonomous-research).
+Claude Code is not currently a discovery provider.
+
 Status is JSON; live execution events go to stderr. Inspect the mathematical
 assessment separately from the operational status:
 
@@ -1434,28 +1484,85 @@ assessment separately from the operational status:
 | `provider_failure` / `provider_timeout` | Resolve access or transport trouble, then explicitly resume if authorization remains. |
 | `context_overflow` | Required context cannot fit. It is not silently shortened; blindly retrying the same prompt will not help. |
 | `target_changed` / `blocked` | Inspect claim revisions and waiting work. Changing the original target stops the run. |
+| `stale_proof` / entries in `stale_proofs` | A revised claim invalidated a saved proof's research binding. Status stays readable; the old receipt no longer establishes a root result. |
 | Mathematical `supported` / `refuted` | A written proof argument / counterexample passed independent review. Neither is a Lean certificate. |
+| `root_proved: true` | An independently rechecked export proves the formalized root claim. Inspect `verified_proofs` for the binding and export receipt. |
+| `root_refuted: true` | An independently rechecked export proves the original root claim's logical negation, with its domain, hypotheses, and quantifier scope retained. |
 
 Exit code 0 can mean `idle` or an exhausted budget/deadline, not proof success.
-Research `root_proved` and `kernel_verified` remain false. Fresh reviewer
-conversations provide procedural separation, not guaranteed independent errors.
+Only the export verification path can set discovery `root_proved` or
+`root_refuted`. Research-only runs leave both false. The manual ledger's
+`assessment.verification.kernel_verified` remains false even when discovery
+reports a checked export separately. Natural-language alignment remains
+`machine_reviewed_not_certified`; a Lean proof checks the reviewed formal
+statement. Fresh reviewer conversations provide procedural separation, not
+guaranteed independent errors.
+
+### Automatic formalization and proof feedback
+
+Configure the built project at initialization with `--project-path`; use repeated
+`--import MODULE` options for trusted imports from that project. Imports require
+a project. Initialization captures the environment and makes no model calls.
+There are no separate formalizer or Mini run commands for this workflow.
+
+A written proof that receives a `supported` review, or a counterexample that
+receives a `refuted` review, automatically queues formalization. Research workers
+can also emit `formalize` with a complete `proof_plan`; optional
+`"polarity": "refute"` requests the original claim's logical negation.
+The formalizer and independent semantic reviewer receive the exact original
+contract, original documents, complete proof plan, and saved shared artifacts.
+The plan remains required context during downstream proof work, not merely an
+initial summary.
+
+| Initialization option | Default | Meaning |
+| --- | --- | --- |
+| `--proof-quantum-s` | 600 seconds | Time before proof work returns control and feedback to research, bounded by the overall deadline. |
+| `--formalization-steps` | 8 | Campaign controller steps per proof quantum. |
+| `--lean-timeout-s` | 300 seconds | Lean operation timeout. |
+
+The investigator receives campaign results, complete task state, and artifact
+references for full diagnostics. A `continue_formalization` action resumes that
+worker's paused campaign with its frozen target and saved state. A revised plan
+or response to `needs_clarification` uses a new `formalize` action containing the
+complete replacement plan, which starts a fresh campaign and statement review.
+It does not edit the previously reviewed target in place. Earlier attempts and
+their diagnostics remain recorded.
+
+Campaigns are stored under `runs/research/codex_example/campaigns/JOB_ID/`.
+Successful exports have unique `verified-…` subdirectories. Discovery binds each
+receipt to the claim revision, prove/refute polarity, reviewed statement, saved
+environment, and export file hashes. Status revalidates that binding and saved
+artifacts. A model answer, reviewer vote, or manual `kernel_report` cannot replace
+this verification path. Proving a helper does not set either root result field.
+Revising a claim withdraws affected receipts from `verified_proofs` and records
+them under `stale_proofs`; the historical artifacts remain available. Status
+stays readable, and resume retires obsolete proof jobs without new budget.
 
 ### Research budgets and recovery
 
-- `--max-requests` counts durable HTTP dispatch intents across workers, reviews,
-  transport retries, and resumes. Rejected or interrupted requests are not
+- `--max-requests` counts durable dispatch intents across research workers, both
+  reviewers, formalizers, nested Mini prover/refiner calls, transport retries,
+  and resumes: one HTTP request for API transport, or one
+  `codex exec` invocation for Codex. Codex's internal HTTP retries are not
+  separately observable or counted. Rejected or interrupted requests are not
   automatically refunded. It is not a dollar or token cap.
 - `--max-seconds` starts at first execution and includes downtime. No automatic
   extension occurs. Stop with Ctrl-C and allow cleanup; repeat `discovery run`
   to resume under the same limits.
 - `--concurrency` bounds active worker operations on one host. Reviews have
-  priority; research turns use durable FIFO ordering so delegation does not
-  continually jump ahead of waiting programs.
+  priority, followed by formalization; research turns use durable FIFO ordering
+  so delegation does not continually jump ahead of waiting programs.
 - `--request-timeout-s` sets the model-operation timeout; default 300 seconds,
   also bounded by the remaining run authorization.
 - Saved responses replay without another model request. An interrupted request
   with an unknown outcome may require another reservation; exactly-once provider
   execution is not promised.
+- Saved formalization campaigns preserve reviewed contracts, completed modules,
+  and pending source. An interrupted inner Mini invocation may restart and uses
+  the same global request/deadline authorization. Bounded local finalization can
+  recover an already saved proof when no provider budget remains; it cannot
+  authorize another model dispatch. After the deadline, this recovery is bounded
+  by the saved Lean timeout.
 - Child findings and reviews are delivered durably, including during another
   worker's request. A changed child claim retires its stale invocation and
   notifies its unchanged parent without allocating a fresh budget.
@@ -1469,14 +1576,28 @@ retrieve a named artifact, choose a new output file:
   --output complete-artifact.txt
 ```
 
-New ledgers use schema 4. Stop older clients and back up the directory before
-upgrading a version 1, 2, or 3 ledger:
+Codex receives the complete serialized conversation in a fresh ephemeral
+invocation, including fresh reviewer assignments. Its runtime may manage or
+compact context internally; the adapter cannot attest exact delivery to the
+underlying model. Authentication and quota failures pause without changing the
+mathematical verdict; `last_error.backend_kind` identifies the subscription
+failure without copying raw credential-bearing diagnostics. If a different
+concurrent failure stopped the run first, inspect each job's `last_error_details`
+for its own cause.
+
+New ledgers use schema 6. Stop older clients and back up the directory before
+upgrading a version 1, 2, 3, 4, or 5 ledger:
 
 ```bash
 .venv/bin/python -m ensemble_prover.research_claims upgrade DIRECTORY
 ```
 
-The upgrade preserves records and budgets; it does not start model work. See
+The upgrade preserves records, providers, and budgets; it does not start model
+work or enable automatic proving. Older API-only runs receive explicit API
+routing metadata; existing Codex routing is retained. Schema 6 records explicit
+closed-loop authorization and rejects missing routing/authorization fields in a
+new-format run. To enable the integrated workflow, initialize a new discovery
+directory with `--project-path`. See
 the [ledger compatibility instructions](../ensemble_prover/research_claims/README.md)
 before upgrading.
 
@@ -1497,7 +1618,8 @@ claim. Interrupted experiments are not automatically repeated.
 
 ### Hand research to formalization
 
-A worker's `formalize` action saves a handoff artifact; its SHA-256 appears in
+For a research-only run initialized without `--project-path`, a worker's
+`formalize` action saves a handoff artifact; its SHA-256 appears in
 `discovery status` under `handoffs`. Supply your built Lean/Lake project to
 initialize a formalization campaign, without model calls:
 
@@ -1519,14 +1641,17 @@ To authorize separate, paid formalization work:
   --max-steps 20 --max-model-calls 60
 ```
 
-The research request cap does **not** cover these formalizer or nested Mini
-calls. The campaign's own cap also excludes nested Mini calls and transport
-retries; see [campaign budgets](#campaign-models-and-budgets). Review the generated
+The research request cap does **not** cover this separately launched campaign's
+formalizer or nested Mini calls. This differs from automatic proof work inside
+`discovery run`, where all roles share the research cap. The standalone campaign's
+own cap also excludes nested Mini calls and transport retries; see
+[campaign budgets](#campaign-models-and-budgets). Review the generated
 Lean statements and use the campaign's checked export workflow before claiming
 a proved result.
 
-The research loop is experimental. Automatic bidirectional research/Lean
-execution, shared budgets across both systems, automatic literature search,
+The research loop is experimental. Three offline scripted/fake-Codex trajectories
+exercise real Lean verification, including proof feedback; this is integration
+validation, not a discovery-performance benchmark. Automatic literature search
 and distributed fleets are not implemented. No autonomous mathematical discovery
 success rate or literature novelty claim has been established. The [full research
 execution contract](../ensemble_prover/research_claims/DISCOVERY.md) documents

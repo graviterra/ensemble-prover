@@ -37,7 +37,11 @@ from .model import (
 # Version 4 adds waiting jobs and durable child-result notification semantics.
 # Version 3 adds executable research state in the same transactional database.
 # Version 2 introduced conflict-aware review interpretation.
-SCHEMA_VERSION = 4
+# Older discovery clients hardcode the API transport. Reject new provider-aware
+# ledgers there instead of allowing subscription work to become API-billed work.
+# Version 6 adds explicitly authorized, closed-loop formalization jobs. Older
+# schedulers must not silently ignore that authorization or its proof state.
+SCHEMA_VERSION = 6
 APPLICATION_ID = 0x52534348
 
 
@@ -191,15 +195,49 @@ class ResearchStore:
                     )
                     self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-                if upgrade and version in (1, 2, 3):
+                if upgrade and version in (1, 2, 3, 4, 5):
                     # Validate the entire known legacy schema before changing
-                    # anything. Records/artifacts stay byte-for-byte intact.
+                    # anything. Mathematical records/artifacts stay intact;
+                    # legacy API routing becomes explicit in run metadata.
                     self._validate_schema(expected_version=version)
                     if version < 3:
                         for name in ("discovery_runs", "discovery_jobs"):
                             self._connection.execute(
                                 f"CREATE TABLE {name} ({_SCHEMA[name]})"
                             )
+                    for row in self._connection.execute(
+                        "SELECT run_id, record FROM discovery_runs"
+                    ).fetchall():
+                        record = json.loads(row["record"])
+                        if not isinstance(record, dict) or (
+                            version < 5
+                            and any(
+                                record.get(key, "openai") != "openai"
+                                for key in ("provider", "review_provider")
+                            )
+                        ):
+                            raise UnknownSchema(
+                                "legacy discovery routing is not API-only; upgrade refused"
+                            )
+                        if version < 5:
+                            record.update(provider="openai", review_provider="openai")
+                        elif any(
+                            not isinstance(record.get(key), str)
+                            or record[key] not in {"openai", "codex"}
+                            for key in ("provider", "review_provider")
+                        ):
+                            raise UnknownSchema(
+                                "invalid saved provider routing; upgrade refused"
+                            )
+                        if record.get("closed_loop") is not None:
+                            raise UnknownSchema(
+                                "legacy ledger cannot authorize closed-loop proving"
+                            )
+                        record["closed_loop"] = None
+                        self._connection.execute(
+                            "UPDATE discovery_runs SET record = ? WHERE run_id = ?",
+                            (json_text(record), row["run_id"]),
+                        )
                     self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 self._validate_schema()
             self._connection.execute("PRAGMA journal_mode = WAL")
@@ -278,7 +316,7 @@ class ResearchStore:
         ):
             raise UnknownSchema(
                 "unrecognized research ledger schema; no migration was attempted. "
-                "For a version 1, 2, or 3 ledger, explicitly run research_claims upgrade DIRECTORY."
+                "For a version 1 through 5 ledger, explicitly run research_claims upgrade DIRECTORY."
             )
         for name, expected in _COLUMNS.items():
             if name not in schema:

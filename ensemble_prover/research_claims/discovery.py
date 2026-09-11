@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import math
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .discovery_store import AdmissionStopped, DiscoveryStore
+from .discovery_store import AdmissionStopped, DiscoveryStore, provider_routes
 from .experiments import PythonSandbox
 from .model import (
     INTERNAL_JSON_NESTING,
@@ -60,7 +61,18 @@ Return exactly one JSON action per response, with no additional fields:
 {"action":"read_claim","claim_id":"id"}
   Returns full ledger history, including review objections and artifact IDs.
 {"action":"formalize","proof_plan":"complete proposed formalization/proof plan"}
-  Saves an exact handoff bundle, not a proof or a paid formalization attempt.
+  With closed_loop enabled, automatically formalizes, reviews the statement,
+  invokes Ensemble Prover and independently verifies the export. Otherwise it
+  saves a handoff for the operator. An optional "polarity":"refute" requests
+  a proof of the original claim's logical negation, never a weakened target.
+  You wait without model calls until exact results or failure feedback arrive.
+{"action":"continue_formalization","program_id":"assigned proof program ID"}
+  Continue your paused formalization with its frozen target and saved state.
+  To change a failed plan or answer a clarification, send a new formalize action
+  with the complete revised plan; this gets a fresh independent statement review.
+  Use actual Lean failure feedback to repair arguments or pursue another route.
+  Reviewed written proofs/counterexamples automatically enter formalization when
+  closed_loop is enabled. A reviewer vote alone is never kernel verification.
 {"action":"request_review","evidence_id":"id","question":"what changed / what to reconsider",
  "supersedes_review_ids":["explicit active review IDs to reconsider"]}
   Requests a fresh review of existing evidence, including dismissal of a filled
@@ -94,6 +106,7 @@ _FIELDS = {
     "read_artifact": {"artifact_id"},
     "read_claim": {"claim_id"},
     "formalize": {"proof_plan"},
+    "continue_formalization": {"program_id"},
     "finish": {"reason"},
     "wait": {"reason"},
     "review": {"verdict", "rationale"},
@@ -113,6 +126,14 @@ def initialize(
     concurrency: int = 4,
     experiments: bool = False,
     request_timeout_s: float = 300,
+    provider: str = "openai",
+    review_provider: str | None = None,
+    codex_binary: str = "codex",
+    project_path: Path | None = None,
+    imports: tuple[str, ...] = (),
+    proof_quantum_s: float = 600,
+    formalization_steps: int = 8,
+    lean_timeout_s: float = 300,
 ) -> None:
     """Create an immutable objective and explicit authorization; spend nothing."""
     if not isinstance(target, ClaimSpec) or target.dependencies:
@@ -121,6 +142,19 @@ def initialize(
         )
     for name, model_name in (("model", model), ("review model", review_model)):
         text(model_name, name)
+    provider, review_provider = provider_routes(
+        {
+            "provider": provider,
+            "review_provider": provider if review_provider is None else review_provider,
+        }
+    )
+    text(codex_binary, "codex_binary")
+    if "\x00" in codex_binary:
+        raise ValueError("codex_binary must not contain NUL")
+    # A relative executable path must not change meaning on resume from a
+    # different working directory. Bare command names still use the user's PATH.
+    if "/" in codex_binary:
+        codex_binary = str(Path(codex_binary).absolute())
     positive_int(max_requests, "max_requests")
     positive_int(concurrency, "concurrency")
     for name, value in (
@@ -141,6 +175,15 @@ def initialize(
         for name, content in sources.items()
     ):
         raise ValueError("supply complete named UTF-8 source documents")
+    from .proof_bridge import configure
+
+    closed_loop = configure(
+        project_path,
+        imports=imports,
+        proof_quantum_s=proof_quantum_s,
+        formalization_steps=formalization_steps,
+        lean_timeout_s=lean_timeout_s,
+    )
     with DiscoveryStore(directory, create=True) as store, store.atomic():
         store.create_claim(target)
         source_ids = {
@@ -155,6 +198,9 @@ def initialize(
                 "sources": source_ids,
                 "model": model,
                 "review_model": review_model,
+                "provider": provider,
+                "review_provider": review_provider,
+                "codex_binary": codex_binary,
                 "max_requests": max_requests,
                 "requests_used": 0,
                 "max_seconds": max_seconds,
@@ -166,6 +212,7 @@ def initialize(
                 "status": "ready",
                 "handoffs": [],
                 "last_error": None,
+                "closed_loop": closed_loop,
             }
         )
         store.add_job(
@@ -176,6 +223,14 @@ def initialize(
 
 
 class DiscoveryLoop:
+    """Run durable workers, optionally owning the clients they acquire.
+
+    With owns_clients=True, ownership begins when a worker first acquires a
+    client. Unused supplied instances remain caller-owned. Fixed instances are
+    pinned until run exit; factories must return fresh or still-live clients
+    when a retired worker reopens. The default leaves borrowed clients alone.
+    """
+
     def __init__(
         self,
         store: DiscoveryStore,
@@ -184,13 +239,18 @@ class DiscoveryLoop:
         *,
         sandbox: PythonSandbox | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        proof_runner: Any = None,
+        owns_clients: bool = False,
     ):
         self.store = store
         self.providers = {"research": researcher, "review": reviewer}
         self.sandbox = sandbox or PythonSandbox()
         self.on_event = on_event
+        self.proof_runner = proof_runner
+        self.owns_clients = owns_clients
         self._clients: dict[str, Any] = {}
         self._client_locks: dict[int, asyncio.Lock] = {}
+        self._owned_clients: dict[int, Any] = {}
         for provider in self.providers.values():
             if hasattr(provider, "chat_raw"):
                 self._check_client(provider)
@@ -208,9 +268,65 @@ class DiscoveryLoop:
             client = (
                 provider if hasattr(provider, "chat_raw") else provider(job["worker"])
             )
+            if self.owns_clients:
+                # Register before validation so a rejected factory result is
+                # still closed when its operation fails.
+                self._owned_clients[id(client)] = client
             self._check_client(client)
             self._clients[job["worker"]] = client
         return self._clients[job["worker"]]
+
+    async def _retire_clients(
+        self,
+        active_jobs: set[str],
+        *,
+        closing: bool = False,
+        preserve_failure: bool = False,
+    ) -> None:
+        """Release unused owned pools only after their worker operations join."""
+        if not self.owns_clients:
+            return
+        if closing:
+            self._clients.clear()
+        else:
+            for job in self.store.jobs():
+                if job["job_id"] not in active_jobs and job["status"] in {
+                    "finished", "stale", "superseded",
+                }:
+                    self._clients.pop(job["worker"], None)
+        retained = {id(client) for client in self._clients.values()}
+        if not closing:
+            # Fixed instances can be reused by future workers. Factories own
+            # recreation; their retired workers retain all messages on disk.
+            retained.update(
+                id(provider) for provider in self.providers.values()
+                if hasattr(provider, "chat_raw")
+            )
+        for identity in list(self._client_locks):
+            if identity not in retained:
+                self._client_locks.pop(identity)
+        failure: BaseException | None = None
+        for identity in list(self._owned_clients):
+            if identity in retained:
+                continue
+            client = self._owned_clients.pop(identity)
+            try:
+                await client.close()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+                # Cleanup diagnostics are structural: exception bodies may
+                # contain provider URLs or credentials.
+                try:
+                    logging.getLogger(__name__).warning(
+                        "Research client cleanup failed (%s)", type(exc).__name__
+                    )
+                except BaseException:
+                    # A user logging handler cannot stop remaining cleanup
+                    # or replace the original operation/cleanup exception.
+                    pass
+        if failure is not None and not preserve_failure:
+            raise failure
 
     def _context(self, job: dict[str, Any]) -> dict[str, Any]:
         with self.store.read_snapshot():
@@ -235,6 +351,7 @@ class DiscoveryLoop:
                 },
                 "claim": self.store.get_claim(job["claim_id"]),
                 "experiments_enabled": run["experiments"],
+                "closed_loop_enabled": run["closed_loop"] is not None,
                 "requests_remaining": run["max_requests"] - run["requests_used"],
                 # Explicit inventory, not replacement summaries of arguments.
                 # Complete artifacts remain addressable across every program.
@@ -297,6 +414,8 @@ class DiscoveryLoop:
         )
 
     async def _request(self, job: dict[str, Any]) -> dict[str, Any]:
+        from ..codex_subscription import CodexSubscriptionClient
+        from ..llm_error_policy import SubscriptionBackendError
         from ..llm_usage import provider_dispatch_observer
         from ..models import REQUIRED_PROMPT_CONTEXT_KEY, RequiredPromptContextOverflow
         from ..nl_input import _completion_error
@@ -332,6 +451,7 @@ class DiscoveryLoop:
                     request=self._blob(messages, "research-request.json"),
                     response=None,
                     tool_result=None,
+                    last_error_details=None,
                 )
                 self.store.save_job(job)
 
@@ -346,8 +466,14 @@ class DiscoveryLoop:
             )
             try:
                 with provider_dispatch_observer(authorize):
+                    # The Codex envelope must be complete and valid, but the
+                    # discovery parser owns the inner action. Persist malformed
+                    # action text/refusals before giving correction feedback.
+                    response_format = (
+                        None if isinstance(client, CodexSubscriptionClient) else "json"
+                    )
                     _, response = await asyncio.wait_for(
-                        client.chat_raw(messages, response_format="json"),
+                        client.chat_raw(messages, response_format=response_format),
                         timeout=timeout,
                     )
                 # Save the entire raw provider output before interpretation.
@@ -382,7 +508,10 @@ class DiscoveryLoop:
             except Exception as exc:
                 if isinstance(exc, AdmissionStopped):
                     reason = str(exc)
-                elif isinstance(exc, RequiredPromptContextOverflow):
+                elif isinstance(exc, RequiredPromptContextOverflow) or (
+                    isinstance(exc, SubscriptionBackendError)
+                    and exc.backend_kind == "context"
+                ):
                     reason = "context_overflow"
                 elif isinstance(exc, asyncio.TimeoutError):
                     reason = (
@@ -396,26 +525,36 @@ class DiscoveryLoop:
                 # public status structural; provider responses above stay exact.
                 with self.store.atomic():
                     job = self.store.job(job["job_id"])
+                    error = {
+                        "kind": reason,
+                        "exception_type": type(exc).__name__,
+                    }
+                    if isinstance(exc, SubscriptionBackendError):
+                        error.update(backend=exc.backend, backend_kind=exc.backend_kind)
+                    job["last_error_details"] = error
                     if (
                         self.store.get_claim(job["claim_id"])["revision"]
                         != job["revision"]
                     ):
                         self._mark_stale(job)
-                        return job
-                    job.update(
-                        status="pending",
-                        last_error=reason,
-                    )
-                    self.store.save_job(job)
+                        # A revision rejection before dispatch is normal
+                        # liveness recovery. Independent provider failures
+                        # still close admission, even for obsolete work.
+                        if isinstance(exc, AdmissionStopped) and reason in {
+                            "claim_changed",
+                            "stale_job",
+                        }:
+                            return job
+                    else:
+                        job.update(status="pending", last_error=reason)
+                        self.store.save_job(job)
                     run = self.store.run_record()
-                    run.update(
-                        status=reason,
-                        last_error={
-                            "kind": reason,
-                            "exception_type": type(exc).__name__,
-                        },
-                    )
-                    self.store.save_run(run)
+                    # The first failure closes admission. A concurrent worker
+                    # observing that stop (or failing later) must not replace
+                    # its causal diagnostic with AdmissionStopped/TimeoutError.
+                    if run["status"] == "running":
+                        run.update(status=reason, last_error=error)
+                        self.store.save_run(run)
                 return job
 
     def _action(self, job: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -435,7 +574,13 @@ class DiscoveryLoop:
         kind = action.get("action") if isinstance(action, dict) else None
         if not isinstance(kind, str) or kind not in _FIELDS:
             raise ValueError("unknown research action")
-        optional = {"supersedes_review_ids"} if kind == "review" else set()
+        optional = (
+            {"supersedes_review_ids"}
+            if kind == "review"
+            else {"polarity"}
+            if kind == "formalize"
+            else set()
+        )
         object_fields(
             action,
             {"action"} | _FIELDS[kind] | optional,
@@ -710,6 +855,23 @@ class DiscoveryLoop:
                 },
                 requires_response=True,
             )
+            if self.store.run_record()["closed_loop"] is not None and (
+                evidence["kind"] == "written_proof"
+                and action["verdict"] == "supported"
+                or evidence["kind"] == "counterexample"
+                and action["verdict"] == "refuted"
+            ):
+                # Review is a reason to attempt a proof, never proof authority.
+                plan = "\n\n".join(
+                    self.store.read_artifact(aid).decode()
+                    for aid in evidence["artifact_ids"]
+                )
+                self._queue_formalization(
+                    self.store.job(parent["job_id"]),
+                    plan,
+                    "refute" if evidence["kind"] == "counterexample" else "prove",
+                    preserve_active_parent=True,
+                )
             return {"review": record, "kernel_verified": False}
         if kind == "request_review":
             text(action["question"], "review question")
@@ -762,28 +924,40 @@ class DiscoveryLoop:
             }
         if kind == "formalize":
             plan = text(action["proof_plan"], "complete proof plan")
-            run = self.store.run_record()
-            handoff = {
-                "schema": 2,
-                "claim": self.store.get_claim(claim_id),
-                "proof_plan": plan,
-                "original_target": run["target_spec"],
-                "sources": run["sources"],
-                "history": self.store.history(claim_id),
-                # Prose can reference any shared argument by ID; guessing a
-                # dependency closure from its spelling would silently lose data.
-                # Freeze the complete ledger/artifact inventory at this cutpoint.
-                "ledger": self.store.export(),
-                "kernel_verified": False,
-            }
-            artifact = self._blob(handoff, "formalization-handoff.json")
-            run["handoffs"].append(artifact)
-            self.store.save_run(run)
+            polarity = action.get("polarity", "prove")
+            if not isinstance(polarity, str) or polarity not in {"prove", "refute"}:
+                raise ValueError("formalization polarity must be prove or refute")
+            if self.store.run_record()["closed_loop"] is not None:
+                return self._queue_formalization(job, plan, polarity)
+            if polarity != "prove":
+                raise ValueError("automatic refutation requires closed-loop proving")
+            artifact = self._save_handoff(job, plan)
             return {
                 "handoff_artifact": artifact,
                 "status": "awaiting_operator_formalization",
                 "kernel_verified": False,
             }
+        if kind == "continue_formalization":
+            from .proof_bridge import handoff_bundle
+
+            child = self.store.job(text(action["program_id"], "program_id"))
+            if (
+                child["role"] != "formalization"
+                or child["parent_job"] != job["job_id"]
+                or child["status"] != "waiting"
+            ):
+                raise ValueError(
+                    "only this program's paused formalization may be continued"
+                )
+            if child.get("feedback_status") == "needs_clarification":
+                raise ValueError(
+                    "clarification requires a new complete formalize plan; the reviewed target cannot be silently edited"
+                )
+            handoff_bundle(self.store, child)
+            child.update(status="pending", recovery_pending=True)
+            self.store.save_job(child)
+            job["status"] = "waiting"
+            return {"status": "formalization_queued", "program_id": child["job_id"]}
         if kind == "finish":
             text(action["reason"], "conclusion")
             job["status"] = "finished"
@@ -829,7 +1003,239 @@ class DiscoveryLoop:
             }
         raise ValueError("unsupported action")
 
+    def _save_handoff(self, job: dict[str, Any], plan: str) -> str:
+        run = self.store.run_record()
+        handoff = {
+            "schema": 2,
+            "claim": self.store.get_claim(job["claim_id"]),
+            "proof_plan": plan,
+            "original_target": run["target_spec"],
+            "sources": run["sources"],
+            "history": self.store.history(job["claim_id"]),
+            "ledger": self.store.export(),
+            "kernel_verified": False,
+        }
+        artifact = self._blob(handoff, "formalization-handoff.json")
+        run["handoffs"].append(artifact)
+        self.store.save_run(run)
+        return artifact
+
+    def _queue_formalization(
+        self,
+        job: dict[str, Any],
+        plan: str,
+        polarity: str,
+        *,
+        preserve_active_parent: bool = False,
+    ) -> dict[str, Any]:
+        for older in self.store.jobs():
+            if (
+                older["role"] == "formalization"
+                and older["parent_job"] == job["job_id"]
+                and older["status"] == "waiting"
+            ):
+                older["status"] = "superseded"
+                self.store.save_job(older)
+        artifact = self._save_handoff(job, plan)
+        child = self.store.add_job(
+            job["claim_id"],
+            "Formalize, independently review, prove and verify the exact research claim",
+            role="formalization",
+            parent_job=job["job_id"],
+        )
+        child.update(
+            handoff_artifact=artifact, polarity=polarity, recovery_pending=True
+        )
+        self.store.save_job(child)
+        if not preserve_active_parent or job["status"] not in {
+            "running",
+            "responded",
+            "tool_running",
+        }:
+            job["status"] = "waiting"
+        self.store.save_job(job)
+        return {
+            "status": "formalization_queued",
+            "program_id": child["job_id"],
+            "handoff_artifact": artifact,
+            "kernel_verified": False,
+        }
+
+    async def _advance_formalization(self, job: dict[str, Any]) -> None:
+        from ..llm_error_policy import SubscriptionBackendError
+        from ..llm_usage import provider_dispatch_guard
+        from .proof_bridge import handoff_bundle, validate_receipt
+
+        with self.store.atomic():
+            job = self.store.job(job["job_id"])
+            try:
+                handoff_bundle(self.store, job)
+            except RevisionConflict:
+                self._mark_stale(job)
+                return
+            job.update(
+                status="running",
+                turn=job["turn"] + 1,
+                recovery_pending=False,
+                last_error_details=None,
+                request=job["handoff_artifact"],
+            )
+            self.store.save_job(job)
+
+        def authorize(details: Any = None) -> None:
+            self.store.authorize(job["job_id"], job["turn"])
+            self._emit("provider_dispatch", job)
+
+        result = None
+        try:
+            config = self.store.run_record()["closed_loop"]
+            remaining = self.store.run_record()["deadline"] - time.time()
+            # A bounded local finalization can recover already-produced proof
+            # material even when no new provider work is authorized.
+            timeout = (
+                min(config["proof_quantum_s"], remaining)
+                if remaining > 0
+                else config["lean_timeout_s"]
+            )
+            with provider_dispatch_guard(authorize):
+                result = await asyncio.wait_for(
+                    self.proof_runner.advance(job), timeout=timeout
+                )
+            if result["status"] == "proved":
+                validate_receipt(self.store, job, result.get("receipt"))
+            with self.store.atomic():
+                job = self.store.job(job["job_id"])
+                job["proof_feedback"] = self._blob(
+                    result, "formalization-feedback.json"
+                )
+                try:
+                    handoff_bundle(self.store, job)
+                except RevisionConflict:
+                    self._mark_stale(job)
+                    return
+                stop = result.get("stop_reason")
+                job.update(
+                    status="verified"
+                    if result["status"] == "proved"
+                    else "pending"
+                    if stop
+                    else "waiting",
+                    proof_receipt=result.get("receipt"),
+                    feedback_status=result.get("feedback", {})
+                    .get("campaign_status", {})
+                    .get("status"),
+                )
+                self.store.save_job(job)
+                self._notify(
+                    job["parent_job"],
+                    {
+                        "formalization_result": {
+                            "program_id": job["job_id"],
+                            "artifact_id": job["proof_feedback"],
+                            **result,
+                        }
+                    },
+                    requires_response=True,
+                )
+                run = self.store.run_record()
+                if result["status"] == "proved" and job["claim_id"] == run["target_id"]:
+                    run["status"] = (
+                        "proved" if job["polarity"] == "prove" else "refuted"
+                    )
+                    self.store.save_run(run)
+                elif stop and run["status"] == "running":
+                    reason = self.store.stop_reason(run) or (
+                        "context_overflow"
+                        if stop == "context_overflow"
+                        else "provider_failure"
+                    )
+                    run.update(
+                        status=reason,
+                        last_error={"kind": reason, "phase": "formalization"},
+                    )
+                    self.store.save_run(run)
+            self._emit("formalization_result", job)
+        except RevisionConflict:
+            with self.store.atomic():
+                job = self.store.job(job["job_id"])
+                if result is not None:
+                    job["proof_feedback"] = self._blob(
+                        result, "stale-formalization-feedback.json"
+                    )
+                self._mark_stale(job)
+        except asyncio.CancelledError:
+            with self.store.atomic():
+                job = self.store.job(job["job_id"])
+                job.update(
+                    status="pending",
+                    recovery_pending=True,
+                    last_error="interrupted_formalization",
+                )
+                self.store.save_job(job)
+            raise
+        except (AdmissionStopped, TimeoutError, SubscriptionBackendError) as exc:
+            feedback = None
+            feedback_error = None
+            if isinstance(exc, TimeoutError) and callable(
+                getattr(self.proof_runner, "feedback", None)
+            ):
+                try:
+                    feedback = self.proof_runner.feedback(job)
+                except RevisionConflict:
+                    with self.store.atomic():
+                        self._mark_stale(self.store.job(job["job_id"]))
+                    return
+                except Exception as secondary:
+                    feedback_error = type(secondary).__name__
+            with self.store.atomic():
+                job = self.store.job(job["job_id"])
+                run = self.store.run_record()
+                reason = self.store.stop_reason(run) or (
+                    str(exc)
+                    if isinstance(exc, AdmissionStopped)
+                    else "provider_failure"
+                    if isinstance(exc, SubscriptionBackendError)
+                    else "formalization_quantum_expired"
+                )
+                error = {"kind": reason, "exception_type": type(exc).__name__}
+                if feedback_error is not None:
+                    error["feedback_error_type"] = feedback_error
+                    reason = "feedback_error"
+                if isinstance(exc, SubscriptionBackendError):
+                    error.update(backend=exc.backend, backend_kind=exc.backend_kind)
+                job.update(
+                    status="waiting"
+                    if reason == "formalization_quantum_expired"
+                    else "pending",
+                    last_error=reason,
+                    last_error_details=error,
+                )
+                if feedback is not None:
+                    job["proof_feedback"] = self._blob(
+                        feedback, "formalization-feedback.json"
+                    )
+                self.store.save_job(job)
+                if reason == "formalization_quantum_expired":
+                    self._notify(
+                        job["parent_job"],
+                        {
+                            "formalization_result": {
+                                "program_id": job["job_id"],
+                                "status": reason,
+                                "feedback": feedback,
+                                "next_action": "Continue this program or supply a revised complete formalize plan.",
+                            }
+                        },
+                        requires_response=True,
+                    )
+                elif run["status"] == "running":
+                    run.update(status=reason, last_error=error)
+                    self.store.save_run(run)
+
     async def _advance(self, job: dict[str, Any]) -> None:
+        if job["role"] == "formalization":
+            await self._advance_formalization(job)
+            return
         if job["status"] == "pending":
             job = await self._request(job)
         if job["status"] != "responded":
@@ -885,8 +1291,16 @@ class DiscoveryLoop:
         self.apply_response(job)
 
     async def run(self) -> dict[str, Any]:
+        from .proof_bridge import configuration, handoff_bundle
+
+        config = configuration(self.store.run_record())
+        if config is not None and self.proof_runner is None:
+            raise ValueError("closed-loop proving requires an authorized proof runner")
         tasks: dict[asyncio.Task[None], str] = {}
         with self.store.execution_lock():
+            initial_status = self.store.status()
+            if initial_status["root_proved"] or initial_status.get("root_refuted"):
+                return initial_status
             with self.store.atomic():
                 run = self.store.run_record()
                 if run["started_at"] is None:
@@ -895,6 +1309,15 @@ class DiscoveryLoop:
                 run.update(status="running", last_error=None)
                 self.store.save_run(run)
                 for job in self.store.jobs():
+                    if job["role"] == "formalization" and job["status"] not in {
+                        "stale",
+                        "superseded",
+                    }:
+                        try:
+                            handoff_bundle(self.store, job)
+                        except RevisionConflict:
+                            self._mark_stale(job)
+                            continue
                     if (
                         self.store.get_claim(job["claim_id"])["revision"]
                         != job["revision"]
@@ -905,6 +1328,11 @@ class DiscoveryLoop:
                             status="pending",
                             last_error="interrupted_request_outcome_unknown",
                         )
+                        if job["role"] == "formalization":
+                            job["recovery_pending"] = True
+                        self.store.save_job(job)
+                    elif job["role"] == "formalization" and job["status"] == "pending":
+                        job["recovery_pending"] = True
                         self.store.save_job(job)
                     elif job["status"] == "pending" and "queue_order" not in job:
                         self.store.save_job(job)
@@ -920,8 +1348,10 @@ class DiscoveryLoop:
                             ),
                         )
                         self.store.save_job(job)
+            primary_failure = False
             try:
                 while True:
+                    await self._retire_clients(set(tasks.values()))
                     run = self.store.run_record()
                     reason = self.store.stop_reason(run)
                     active = set(tasks.values())
@@ -935,13 +1365,26 @@ class DiscoveryLoop:
                                 job["status"] == "responded"
                                 or (
                                     job["status"] == "pending"
-                                    and not reason
-                                    and run["status"] == "running"
+                                    and (
+                                        run["status"] == "running"
+                                        and not reason
+                                        or job["role"] == "formalization"
+                                        and job.get("recovery_pending")
+                                        and reason != "target_changed"
+                                        and run["status"]
+                                        in {
+                                            "running",
+                                            "budget_exhausted",
+                                            "deadline_exhausted",
+                                        }
+                                    )
                                 )
                             )
                         ),
                         key=lambda job: (
-                            job["role"] != "review",
+                            {"review": 0, "formalization": 1, "research": 2}[
+                                job["role"]
+                            ],
                             job.get("queue_order", 0),
                         ),
                     )
@@ -957,10 +1400,7 @@ class DiscoveryLoop:
                                 reason
                                 if reason == "target_changed" or pending and reason
                                 else "blocked"
-                                if any(
-                                    job["status"] == "waiting"
-                                    for job in jobs
-                                )
+                                if any(job["status"] == "waiting" for job in jobs)
                                 else "idle"
                             )
                             self.store.save_run(run)
@@ -968,10 +1408,31 @@ class DiscoveryLoop:
                     done, _ = await asyncio.wait(
                         tasks, return_when=asyncio.FIRST_COMPLETED
                     )
+                    # Committed, revalidated root authority takes precedence
+                    # over failures in now-unneeded siblings, even when both
+                    # tasks finish in the same scheduling turn. The finally
+                    # block cancels and joins every remaining operation.
+                    if self.store.run_record()["status"] in {"proved", "refuted"}:
+                        status = self.store.status()
+                        if status["root_proved"] or status["root_refuted"]:
+                            return status
                     for task in done:
                         tasks.pop(task)
                         task.result()
             except BaseException as exc:
+                primary_failure = True
+                # A client retirement awaits external cleanup. During that
+                # await another worker may commit the exact root proof; its
+                # revalidated authority still outranks a sibling's failure.
+                try:
+                    if self.store.run_record()["status"] in {"proved", "refuted"}:
+                        status = self.store.status()
+                        if status["root_proved"] or status["root_refuted"]:
+                            return status
+                except Exception:
+                    # Never substitute unverifiable terminal metadata for a
+                    # result, or replace the original exception on DB failure.
+                    pass
                 try:
                     record = self.store.run_record()
                     record.update(
@@ -989,7 +1450,29 @@ class DiscoveryLoop:
             finally:
                 for task in tasks:
                     task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                except BaseException:
+                    primary_failure = True
+                    raise
+                finally:
+                    try:
+                        await self._retire_clients(
+                            set(), closing=True, preserve_failure=primary_failure
+                        )
+                    except BaseException:
+                        # Cleanup after a successful return must not mask a
+                        # committed root either. Recheck its actual receipt,
+                        # including any changes during asynchronous close.
+                        verified = False
+                        try:
+                            if self.store.run_record()["status"] in {"proved", "refuted"}:
+                                status = self.store.status()
+                                verified = status["root_proved"] or status["root_refuted"]
+                        except Exception:
+                            pass
+                        if not verified:
+                            raise
 
 
 def create_formalization_handoff(

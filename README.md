@@ -1,5 +1,7 @@
 # Ensemble Prover
 
+Last updated: 2026-09-10.
+
 This repository contains a research-grade autonomous theorem prover that
 combines language-model proof search with Lean verification. Given a formalized
 Lean target, it plans a proof, retrieves relevant declarations, decomposes hard
@@ -12,12 +14,15 @@ point for proof search is `ensemble_prover.mini_prover`.
 September 2026 — highlights from the current source checkout:
 
 - **Codex and Claude Code integration:** use subscription-backed CLI transports
-  for Mini's prover and refiner, alongside the existing API providers.
+  for Mini's prover and refiner, alongside the existing API providers. Codex
+  also supports every model role in the research-to-proof loop.
   [Codex setup](docs/CODEX_SUBSCRIPTION_BACKEND.md) ·
   [Claude Code setup](docs/CLAUDE_CODE_SUBSCRIPTION_BACKEND.md)
 - **Autonomous mathematical research — experimental:** explore proofs,
   counterexamples, and alternative approaches with model workers, fresh reviews,
-  optional isolated experiments, and resumable request/time budgets.
+  optional isolated experiments, and resumable request/time budgets. Supply a
+  built Lake project to include formalization, Mini proof search, checked export,
+  and feedback to research in the same run.
   [Start a research run](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research)
 - **Coordinated research:** track exact claims, full arguments, review objections,
   remaining gaps, and whether a helper actually advances the target problem.
@@ -27,9 +32,11 @@ September 2026 — highlights from the current source checkout:
   [Single claims](docs/USER_GUIDE.md#18-formalize-one-natural-language-claim) ·
   [Formalization campaigns](docs/USER_GUIDE.md#19-run-a-multi-file-formalization-campaign)
 
-Research reviews are not Lean proof certificates. The autonomous research and
-multi-file formalization CLIs use the OpenAI API; subscription integration applies to Mini's
-prover/refiner roles. Older release snapshots may not include every feature above.
+Research reviews are not Lean proof certificates. Autonomous research and its
+integrated formalization/proof roles support the OpenAI API and Codex subscriptions.
+The standalone NL and formalization CLIs remain API-backed. Claude Code integration
+applies to Mini's prover/refiner roles. Older release snapshots may not include
+every feature above.
 
 ## Overview
 
@@ -50,8 +57,10 @@ arguments, independent reviews, remaining gaps, and whether a helper actually
 advances its parent problem. Its `discovery` command runs autonomous
 investigations: workers explore alternative approaches, seek proofs or
 counterexamples, share findings, and request fresh reviews within a durable
-request and time budget. Research can begin with a natural-language problem,
-without a Lean project; formalization and proof verification come later.
+request and time budget. Research can begin with a natural-language problem.
+With a built Lake project, the same run formalizes candidate arguments, searches
+for proofs, independently checks exports, and returns failures or results to
+research. Omitting the project keeps a standalone research-only run.
 
 As of August 2026, across research and evaluation runs, the system has produced
 Lean-verified proofs for **65 distinct Putnam problems**, counting repeated
@@ -98,7 +107,7 @@ the proof files and answers are not.
 > **Release status:** 1.09 — research preview. Includes Mini Prover, experimental
 > single-claim NL input, and resumable multi-file formalization campaigns.
 > Optional Codex and Claude Code subscription backends serve Mini's prover and refiner,
-> alongside the existing API providers.
+> alongside the existing API providers. Codex also serves autonomous research.
 > The current source also includes experimental coordinated and autonomous
 > research; older release snapshots may not contain these entry points.
 
@@ -136,7 +145,7 @@ troubleshooting, and the public Mini CLI option map.
   subscription sign-in for Mini's prover and refiner
 
 The manual research ledger needs neither Lean nor provider credentials.
-Autonomous research uses the OpenAI API and does not need Lean until the
+Autonomous research uses the OpenAI API or Codex subscription sign-in and does not need Lean until the
 formalization handoff. Optional Python experiments require Linux bubblewrap
 with usable unprivileged user namespaces; there is no unsandboxed fallback.
 
@@ -285,13 +294,15 @@ arguments, reviews, quantitative requirements, and bounded assignments. The
 ledger organizes work; its manual commands do not launch model workers.
 
 For autonomous investigations, supply a complete UTF-8 problem file. No proof
-sketch or choice of an affirmative conclusion is required. Choose OpenAI API
-model names available to your account:
+sketch or choice of an affirmative conclusion is required. Add your existing,
+built Lean/Lake project to enable the full research-to-proof loop. The default
+transport is the OpenAI API; choose model names available to your account:
 
 ```bash
 # Offline: save the problem and the limits for this research run.
 .venv/bin/python -m ensemble_prover.research_claims discovery init runs/research/example \
   --problem problem.md \
+  --project-path /path/to/built-lake-project \
   --model gpt-5.6-sol --review-model gpt-6-astra \
   --max-requests 32 --max-seconds 3600 --concurrency 4
 
@@ -301,25 +312,49 @@ model names available to your account:
 .venv/bin/python -m ensemble_prover.research_claims discovery status runs/research/example
 ```
 
-The request budget includes transport retries, reviews, and resumed requests.
+One `discovery run` drives research, formalization, independent statement review,
+Mini proof search, checked export, and feedback. The request budget includes all
+those roles, nested Mini dispatches, transport retries, and resumed requests.
 The wall-clock limit starts at first execution and includes downtime; resuming
-does not reset either limit. These are not dollar caps. Add `--source notes.md`
-at initialization for supporting text, or `--experiments` to allow isolated,
-bounded Python computations. The research CLI uses API routing, not the Mini
-subscription backends.
+does not reset either limit. These are not dollar caps. Omit `--project-path` for
+research-only execution. Add `--source notes.md` for supporting text,
+`--import Mathlib` for a trusted project import, or `--experiments` for isolated,
+bounded Python computations; `--import` requires a project.
+
+For Codex subscription research, run `codex login` using ChatGPT, then add
+`--provider codex` at initialization and choose Codex model names. This selects
+Codex for research, formalization, proof search, refinement, and both argument
+and semantic review, without an API key or API fallback. `--model` selects the
+research/formalizer/prover/refiner model; `--review-model` selects both reviewers.
+`--review-provider openai` explicitly selects API reviewers instead; the
+reverse combination is also supported. One budgeted Codex dispatch is one
+`codex exec` invocation, not each internal HTTP request. See
+[Codex research setup](docs/CODEX_SUBSCRIPTION_BACKEND.md#autonomous-research).
 
 Workers can wait without model calls and resume when child findings arrive.
 Full arguments, feedback, raw responses, and proof plans remain available as
-artifacts; required context is not silently shortened. `supported` means a
-written argument passed model review, not Lean verification. An `idle` run or
-exit code 0 is not a mathematical success verdict.
+artifacts; the harness does not silently shorten required context. The Codex
+runtime may manage context internally; exact underlying-model delivery cannot
+be attested by this adapter. A reviewed proof or counterexample automatically
+queues formalization when a project was configured. Proof work returns feedback
+after at most `--proof-quantum-s 600` seconds or `--formalization-steps 8` controller
+steps by default; `--lean-timeout-s` defaults to 300 seconds. A worker can continue
+the same campaign or submit a revised complete plan for a fresh reviewed campaign.
 
-A saved handoff can initialize the existing formalizer with the exact plan,
-original sources, and a frozen snapshot of shared research arguments. Running
-formalization requires separate authorization; its model requests and nested
-Mini calls are not covered by the research cap. An automatic round trip
-between research and Lean is not implemented. There is no automatic literature
-search or established autonomous discovery success rate. See the [research
+`supported` means a written argument passed model review. Only an independently
+rechecked export can set discovery `root_proved` or `root_refuted`; the latter
+requires a formal proof of the original proposition's negation. Natural-language
+alignment remains `machine_reviewed_not_certified`. An `idle` run or exit code 0
+is not a mathematical success verdict.
+
+Research-only runs can still save an exact handoff for separately authorized
+standalone formalization; that separate command's requests are outside the
+research cap. Schema 6 requires an explicit upgrade for version 1–5 ledgers and
+preserves providers and budgets without enabling automatic proving on old runs.
+Three offline scripted/fake-Codex trajectories have exercised real Lean checks;
+they are integration tests, not a discovery-performance benchmark. There is no
+automatic literature search or established autonomous discovery success rate.
+See the [research
 walkthrough](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research) and
 [full execution contract](ensemble_prover/research_claims/DISCOVERY.md).
 

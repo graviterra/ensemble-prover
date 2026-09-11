@@ -57,6 +57,7 @@ _END_RE = re.compile(
     flags=re.UNICODE,
 )
 _MUTUAL_RE = re.compile(r"(?<!\S)mutual\b")
+_RAW_STRING_START_RE = re.compile(r'r(?P<hashes>#+)?"')
 _TARGET_CONTEXT_MARKER = "-- ensemble-theorem-target-context: "
 
 
@@ -108,11 +109,11 @@ def _mask_noncode(text: str) -> str:
             mask(i, end)
             i = end
             continue
-        raw_match = re.match(r"r(?P<hashes>#+)?\"", src[i:])
+        raw_match = _RAW_STRING_START_RE.match(src, i) if src[i] == "r" else None
         if raw_match is not None and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] in "_")):
             hashes = raw_match.group("hashes") or ""
             close = '"' + hashes
-            body_start = i + raw_match.end()
+            body_start = raw_match.end()
             close_at = src.find(close, body_start)
             end = n if close_at < 0 else close_at + len(close)
             mask(i, end)
@@ -145,14 +146,14 @@ def _mask_noncode(text: str) -> str:
                     newline = src.find("\n", end + 2)
                     end = n if newline < 0 else newline
                     continue
-                raw_match = re.match(r"r(?P<hashes>#+)?\"", src[end:])
+                raw_match = _RAW_STRING_START_RE.match(src, end) if src[end] == "r" else None
                 if raw_match is not None and (
                     end == 0
                     or not (src[end - 1].isalnum() or src[end - 1] == "_")
                 ):
                     hashes = raw_match.group("hashes") or ""
                     close = '"' + hashes
-                    body_start = end + raw_match.end()
+                    body_start = raw_match.end()
                     close_at = src.find(close, body_start)
                     end = n if close_at < 0 else close_at + len(close)
                     continue

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +42,15 @@ class MiniProverFailure(RuntimeError):
         super().__init__(f"Mini proof search stopped: {reason} ({kind})")
 
 
+class ProofAttemptFeedbackError(RuntimeError):
+    """Attempt evidence could not be preserved; not a mathematical failure."""
+
+    def __init__(self, *, stage: str, error_type: str) -> None:
+        self.stage = stage
+        self.error_type = error_type
+        super().__init__(f"Proof attempt feedback unavailable: {stage} ({error_type})")
+
+
 def _description(task: Any, proof_plan: str, context: dict[str, Any]) -> str:
     """Keep mathematical prose verbatim, with the structured citations alongside."""
 
@@ -46,6 +58,11 @@ def _description(task: Any, proof_plan: str, context: dict[str, Any]) -> str:
         "Campaign task:\n" + str(task.description),
         "Full proof plan:\n" + proof_plan,
     ]
+    required_context = context.get("required_context")
+    if isinstance(required_context, dict):
+        research_plan = required_context.get("proof_plan")
+        if isinstance(research_plan, str):
+            parts.append("Original research proof plan (verbatim):\n" + research_plan)
     seen: set[tuple[str, Any, Any, str]] = set()
     for key in ("original_source", "task_source"):
         for source in context.get(key, ()):
@@ -94,6 +111,73 @@ class MiniProver:
         self.options = dict(options or {})
         self._lock = asyncio.Lock()
         self._closed = False
+        self._attempt_run_dir: Path | None = None
+        self._last_attempt: dict[str, Any] | None = None
+        self._capture_errors: list[dict[str, str]] = []
+
+    def read_attempt_feedback(self) -> dict[str, Any] | None:
+        """Return exact private attempt evidence, never proof-admission authority.
+
+        Text is decoded from the original bytes without newline normalization.
+        The snapshot is taken after recorder/Lean cleanup, including unsuccessful
+        and interrupted attempts. Missing/unreadable artifacts are explicit;
+        symlinks are never followed. No mathematical text is shortened.
+        """
+        return copy.deepcopy(self._last_attempt)
+
+    def _capture_attempt_feedback(self, *, task_id: str, status: str) -> None:
+        directory = self._attempt_run_dir
+        if directory is None:
+            return
+        artifacts: list[dict[str, Any]] = []
+        unavailable: list[dict[str, str]] = []
+
+        def walk_error(exc: OSError) -> None:
+            unavailable.append({"path": ".", "error_type": type(exc).__name__})
+
+        for parent, directories, names in os.walk(
+            directory, followlinks=False, onerror=walk_error
+        ):
+            for name in list(directories):
+                path = Path(parent) / name
+                if path.is_symlink():
+                    directories.remove(name)
+                    unavailable.append(
+                        {"path": str(path.relative_to(directory)),
+                         "error_type": "symlink_not_followed"}
+                    )
+            for name in sorted(names):
+                path = Path(parent) / name
+                if path.suffix not in {".json", ".jsonl", ".lean"}:
+                    continue
+                relative = str(path.relative_to(directory))
+                if path.is_symlink():
+                    unavailable.append(
+                        {"path": relative, "error_type": "symlink_not_followed"}
+                    )
+                    continue
+                try:
+                    content = path.read_bytes()
+                    text = content.decode("utf-8")
+                except (OSError, UnicodeError) as exc:
+                    unavailable.append(
+                        {"path": relative, "error_type": type(exc).__name__}
+                    )
+                    continue
+                artifacts.append(
+                    {"path": relative, "sha256": hashlib.sha256(content).hexdigest(),
+                     "text": text}
+                )
+        self._last_attempt = {
+            "schema": 1,
+            "task_id": task_id,
+            "run_dir": str(directory),
+            "status": status,
+            "complete": not unavailable and not self._capture_errors,
+            "artifacts": artifacts,
+            "unavailable": unavailable,
+            "capture_errors": list(self._capture_errors),
+        }
 
     async def close(self) -> None:
         """Wait for the current attempt's cleanup, without closing shared clients."""
@@ -115,15 +199,49 @@ class MiniProver:
         async with self._lock:
             if self._closed:
                 raise RuntimeError("MiniProver is closed")
-            return await self._prove(
-                task=task,
-                name=name,
-                statement=statement,
-                proof_plan=proof_plan,
-                preamble=preamble,
-                context=context,
-                run_dir=run_dir,
-            )
+            self._attempt_run_dir = None
+            self._last_attempt = None
+            self._capture_errors = []
+            status = "error"
+            primary_failure = False
+            try:
+                source = await self._prove(
+                    task=task,
+                    name=name,
+                    statement=statement,
+                    proof_plan=proof_plan,
+                    preamble=preamble,
+                    context=context,
+                    run_dir=run_dir,
+                )
+                status = "solved" if source is not None else "unsolved"
+                return source
+            except BaseException as exc:
+                primary_failure = True
+                if isinstance(exc, MiniProverFailure):
+                    status = "terminal"
+                elif isinstance(exc, asyncio.CancelledError):
+                    status = "cancelled"
+                raise
+            finally:
+                try:
+                    self._capture_attempt_feedback(task_id=task.id, status=status)
+                except BaseException as exc:
+                    self._capture_errors.append(
+                        {"stage": "snapshot", "error_type": type(exc).__name__}
+                    )
+                    self._last_attempt = {
+                        "schema": 1, "task_id": task.id,
+                        "run_dir": str(self._attempt_run_dir or run_dir),
+                        "status": status, "complete": False, "artifacts": [],
+                        "unavailable": [], "capture_errors": list(self._capture_errors),
+                    }
+                    if not primary_failure:
+                        if not isinstance(exc, Exception):
+                            raise
+                        raise ProofAttemptFeedbackError(
+                            stage="snapshot", error_type=type(exc).__name__
+                        ) from exc
 
     async def _prove(
         self,
@@ -145,6 +263,7 @@ class MiniProver:
         # Every claim token owns a new directory. Reusing one would truncate
         # its recorder and replace the previous attempt's immutable evidence.
         run_dir.mkdir(parents=True, exist_ok=False)
+        self._attempt_run_dir = run_dir
         self.module_root.mkdir(parents=True, exist_ok=True)
         if _CONTEXT_MARKER not in {line.strip() for line in preamble.splitlines()}:
             preamble = preamble.rstrip() + "\n" + _CONTEXT_MARKER + "\n"
@@ -186,6 +305,7 @@ class MiniProver:
         recorder: RunRecorder | None = None
         finalized = False
         terminal_failure: MiniProverFailure | None = None
+        primary_failure = False
 
         def make_dossier(prepared: TheoremProblem) -> ProofDossier:
             nonlocal dossier, problem
@@ -199,7 +319,7 @@ class MiniProver:
             return dossier
 
         try:
-            recorder = RunRecorder(run_dir)
+            recorder = RunRecorder(run_dir, task_local_console=True)
             ok, _reply = await prove_theorem_project(
                 request=request,
                 prover_client=self.prover_client,
@@ -242,7 +362,20 @@ class MiniProver:
             ) + "\n"
             (run_dir / "Proof.lean").write_text(source, encoding="utf-8")
             return source
+        except BaseException:
+            primary_failure = True
+            raise
         finally:
+            secondary_failure: BaseException | None = None
+
+            def record_secondary(stage: str, exc: BaseException) -> None:
+                nonlocal secondary_failure
+                if secondary_failure is None:
+                    secondary_failure = exc
+                self._capture_errors.append(
+                    {"stage": stage, "error_type": type(exc).__name__}
+                )
+
             try:
                 if dossier is not None:
                     (run_dir / "dossier.json").write_text(
@@ -272,9 +405,21 @@ class MiniProver:
                             ),
                         }
                     )
-            finally:
-                try:
-                    if recorder is not None:
-                        recorder.close()
-                finally:
-                    await runner.aclose()
+            except BaseException as exc:
+                record_secondary("attempt_records", exc)
+            try:
+                if recorder is not None:
+                    recorder.close()
+            except BaseException as exc:
+                record_secondary("recorder_close", exc)
+            try:
+                await runner.aclose()
+            except BaseException as exc:
+                record_secondary("lean_close", exc)
+            if secondary_failure is not None and not primary_failure:
+                if not isinstance(secondary_failure, Exception):
+                    raise secondary_failure
+                raise ProofAttemptFeedbackError(
+                    stage=self._capture_errors[0]["stage"],
+                    error_type=type(secondary_failure).__name__,
+                ) from secondary_failure

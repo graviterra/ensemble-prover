@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+import contextvars
 import hashlib
 import json
 import math
 import os
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -561,6 +563,95 @@ class _TeeStream:
             raise first_error
 
 
+_TASK_CONSOLE_CAPTURE: contextvars.ContextVar[Optional["_TaskConsoleCapture"]] = (
+    contextvars.ContextVar("mini_task_console_capture", default=None)
+)
+_TASK_CONSOLE_LOCK = threading.RLock()
+_TASK_CONSOLE_ROUTER: Optional["_TaskConsoleRouter"] = None
+
+
+class _TaskConsoleStream:
+    """Route console output through the active task's recorder, when present."""
+
+    def __init__(self, original: Any, name: str) -> None:
+        self.original = original
+        self.name = name
+
+    def _stream(self) -> Any:
+        capture = _TASK_CONSOLE_CAPTURE.get()
+        if capture is not None:
+            stream = capture.streams.get(self.name)
+            if stream is not None:
+                return stream
+        return self.original
+
+    def write(self, data: str) -> int:
+        return self._stream().write(data)
+
+    def flush(self) -> None:
+        self._stream().flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.original, name)
+
+
+class _TaskConsoleRouter:
+    """One shared pair of proxies, removed when the last scoped capture closes."""
+
+    def __init__(self) -> None:
+        self.stdout = _TaskConsoleStream(sys.stdout, "stdout")
+        self.stderr = _TaskConsoleStream(sys.stderr, "stderr")
+        self.users = 0
+        sys.stdout, sys.stderr = self.stdout, self.stderr
+
+    def unregister(self) -> None:
+        global _TASK_CONSOLE_ROUTER
+        self.users -= 1
+        if self.users == 0:
+            # Respect an unrelated caller's later redirection of either stream.
+            if sys.stdout is self.stdout:
+                sys.stdout = self.stdout.original
+            if sys.stderr is self.stderr:
+                sys.stderr = self.stderr.original
+            if _TASK_CONSOLE_ROUTER is self:
+                _TASK_CONSOLE_ROUTER = None
+
+
+class _TaskConsoleCapture:
+    """Own a task-local sink without retaining closed files in child contexts."""
+
+    def __init__(self, log: Any) -> None:
+        global _TASK_CONSOLE_ROUTER
+        with _TASK_CONSOLE_LOCK:
+            if _TASK_CONSOLE_ROUTER is None:
+                _TASK_CONSOLE_ROUTER = _TaskConsoleRouter()
+            self.router: Optional[_TaskConsoleRouter] = _TASK_CONSOLE_ROUTER
+            self.router.users += 1
+            self.streams = {
+                "stdout": _TeeStream(self.router.stdout.original, log),
+                "stderr": _TeeStream(self.router.stderr.original, log),
+            }
+            self.parent = _TASK_CONSOLE_CAPTURE.get()
+            _TASK_CONSOLE_CAPTURE.set(self)
+
+    def close(self) -> None:
+        with _TASK_CONSOLE_LOCK:
+            if self.router is None:
+                return
+            if _TASK_CONSOLE_CAPTURE.get() is self:
+                parent = self.parent
+                while parent is not None and not parent.streams:
+                    parent = parent.parent
+                _TASK_CONSOLE_CAPTURE.set(parent)
+            # A child task can retain a copied ContextVar after its parent has
+            # closed. Clearing these references makes its late output console
+            # only, without writes to a closed file or a stale proxy chain.
+            self.streams.clear()
+            self.parent = None
+            self.router.unregister()
+            self.router = None
+
+
 _LIVE_TRACE_MODES = {"compact", "full", "jsonl", "off"}
 
 
@@ -607,10 +698,11 @@ def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
 class RunRecorder:
     """Owns ``run.log`` (tee'd console) and ``turns.jsonl`` (structured trace).
 
-    The recorder is process-global because the conversational loop calls
+    The default recorder is process-global because the conversational loop calls
     ``print()`` everywhere; we redirect ``sys.stdout``/``sys.stderr`` at
     construction so existing prints automatically tee to the log file
-    without any further plumbing.
+    without any further plumbing. Concurrent campaign attempts opt into
+    ``task_local_console`` so their task trees retain separate console logs.
     """
 
     _POLICY_METRIC_ERROR_TYPES: Set[str] = {
@@ -671,6 +763,7 @@ class RunRecorder:
     def __init__(
         self, output_dir: Path, *, resume_state: Optional[Dict[str, Any]] = None,
         startup_artifacts: Optional[Dict[str, str]] = None,
+        task_local_console: bool = False,
     ) -> None:
         prepared_resume = (
             self._prepare_generation_resume(Path(output_dir), resume_state, startup_artifacts=startup_artifacts)
@@ -683,10 +776,14 @@ class RunRecorder:
         self._log_fp = log_path.open("w", encoding="utf-8")
         self._turns_fp = turns_path.open("w", encoding="utf-8")
         self._turns_hasher = hashlib.sha256()
-        self._orig_stdout = sys.stdout
-        self._orig_stderr = sys.stderr
-        sys.stdout = _TeeStream(self._orig_stdout, self._log_fp)
-        sys.stderr = _TeeStream(self._orig_stderr, self._log_fp)
+        self._orig_stdout = None if task_local_console else sys.stdout
+        self._orig_stderr = None if task_local_console else sys.stderr
+        self._task_console_capture = (
+            _TaskConsoleCapture(self._log_fp) if task_local_console else None
+        )
+        if not task_local_console:
+            sys.stdout = _TeeStream(self._orig_stdout, self._log_fp)
+            sys.stderr = _TeeStream(self._orig_stderr, self._log_fp)
         self.live_trace_mode = "compact"
         self.live_trace_response_chars: Optional[int] = 1600
         self.start_ts = time.time()
@@ -3280,8 +3377,11 @@ class RunRecorder:
             _write_json_atomic(summary_path, final_summary)
 
     def close(self) -> None:
-        sys.stdout = self._orig_stdout
-        sys.stderr = self._orig_stderr
+        if self._task_console_capture is not None:
+            self._task_console_capture.close()
+        else:
+            sys.stdout = self._orig_stdout
+            sys.stderr = self._orig_stderr
         try:
             self._log_fp.close()
         except Exception:

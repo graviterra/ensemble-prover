@@ -15,11 +15,27 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 from .model import json_text
-from .store import ResearchStore, ResearchStoreError
+from .store import ResearchStore, ResearchStoreError, RevisionConflict
 
 
 class AdmissionStopped(RuntimeError):
     """No more external work may be started under the saved authorization."""
+
+
+def provider_routes(record: dict[str, Any]) -> tuple[str, str]:
+    """Schema-5 routing is explicit, including in upgraded API-only ledgers."""
+    provider = record.get("provider")
+    review_provider = record.get("review_provider")
+    if (
+        not isinstance(provider, str)
+        or provider not in ("openai", "codex")
+        or not isinstance(review_provider, str)
+        or review_provider not in ("openai", "codex")
+    ):
+        raise ValueError(
+            "research provider and review_provider must be openai or codex"
+        )
+    return provider, review_provider
 
 
 class DiscoveryStore(ResearchStore):
@@ -148,6 +164,7 @@ class DiscoveryStore(ResearchStore):
             "messages": [],
             "response": None,
             "last_error": None,
+            "last_error_details": None,
             "tool_result": None,
             "request": None,
             "inbox": [],
@@ -198,23 +215,75 @@ class DiscoveryStore(ResearchStore):
     def status(self) -> dict[str, Any]:
         with self.read_snapshot():
             run = self.run_record()
+            from .proof_bridge import configuration, handoff_bundle, validate_receipt
+
+            configuration(run)
+            proofs = []
+            stale_proofs = []
+            for job in self.jobs():
+                if job["role"] == "formalization" and job["status"] == "verified":
+                    # A normal ledger revision retires this proof's authority;
+                    # it does not corrupt its historical Lean artifacts. Check
+                    # the handoff before opening the old campaign or receipt.
+                    try:
+                        handoff_bundle(self, job)
+                    except RevisionConflict:
+                        stale_proofs.append(
+                            {
+                                "program_id": job["job_id"],
+                                "claim_id": job["claim_id"],
+                                "reason": "claim_changed",
+                            }
+                        )
+                        continue
+                    receipt = validate_receipt(self, job, job.get("proof_receipt"))
+                    proofs.append(
+                        {
+                            "program_id": job["job_id"],
+                            "claim_id": job["claim_id"],
+                            "polarity": job["polarity"],
+                            "receipt": receipt,
+                        }
+                    )
             return {
                 **run,
+                "status": (
+                    "target_changed"
+                    if self.stop_reason(run) == "target_changed"
+                    else "stale_proof"
+                )
+                if stale_proofs
+                and run["status"] in {"proved", "refuted"}
+                and not any(item["claim_id"] == run["target_id"] for item in proofs)
+                else run["status"],
                 "jobs": [
                     {
-                        key: job[key]
-                        for key in (
-                            "job_id",
-                            "claim_id",
-                            "role",
-                            "status",
-                            "turn",
-                            "last_error",
-                        )
+                        **{
+                            key: job[key]
+                            for key in (
+                                "job_id",
+                                "claim_id",
+                                "role",
+                                "status",
+                                "turn",
+                                "last_error",
+                            )
+                        },
+                        "last_error_details": job.get("last_error_details"),
                     }
                     for job in self.jobs()
                 ],
                 "assessment": self.assessment(run["target_id"]),
-                "root_proved": False,
+                "root_proved": any(
+                    item["claim_id"] == run["target_id"] and item["polarity"] == "prove"
+                    for item in proofs
+                ),
+                "root_refuted": any(
+                    item["claim_id"] == run["target_id"]
+                    and item["polarity"] == "refute"
+                    for item in proofs
+                ),
+                "verified_proofs": proofs,
+                "stale_proofs": stale_proofs,
                 "novelty": "not_established_by_literature_review",
             }

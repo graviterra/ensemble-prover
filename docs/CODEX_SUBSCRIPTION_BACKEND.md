@@ -1,7 +1,9 @@
 # Codex subscription backend
 
-Mini can use your saved **ChatGPT Codex subscription sign-in** for its prover
-and refiner roles. Select `codex` as the provider and explicitly select a model
+Last updated: 2026-09-10.
+
+Mini and autonomous discovery can use your saved **ChatGPT Codex subscription
+sign-in** for their model roles. Select `codex` as the provider and explicitly select a model
 available to your Codex account. API providers remain available independently.
 
 ## Setup and launch
@@ -43,8 +45,81 @@ role uses Codex, automatic planner escalation is disabled so an API key elsewher
 in the environment cannot silently activate an API-billed planner. Explicit
 planner provider selections retain their usual behavior.
 
-This backend applies to Mini's prover and refiner roles. The natural-language
-frontends' formalizer and campaign model settings remain API-backed.
+This backend applies to Mini's prover/refiner and every model role in discovery's
+integrated research-to-proof loop. The standalone `nl_input` and `formalization`
+CLIs retain their API-backed model settings; the discovery loop injects its saved
+clients into the formalization core. Claude Code is supported by Mini only.
+
+## Autonomous research
+
+After signing in with ChatGPT, supply a complete UTF-8 problem and an existing,
+built Lean/Lake project. Replace the project path and model placeholders:
+
+```bash
+.venv/bin/python -m ensemble_prover.research_claims discovery init runs/research/codex_example \
+  --problem problem.md --provider codex \
+  --project-path /path/to/built-lake-project \
+  --model YOUR_CODEX_MODEL --review-model YOUR_CODEX_REVIEW_MODEL \
+  --max-requests 32 --max-seconds 3600 --concurrency 4
+
+.venv/bin/python -m ensemble_prover.research_claims discovery run runs/research/codex_example
+.venv/bin/python -m ensemble_prover.research_claims discovery status runs/research/codex_example
+```
+
+Initialization makes no model calls; `run` consumes subscription allowance and
+drives research, formalization, Mini proof search, verified export, and feedback.
+Omit `--project-path` for standalone research without automatic proof work.
+Optional `--import Mathlib` selects a trusted project import and requires a project.
+
+| Saved options | Roles selected |
+| --- | --- |
+| `--provider` and `--model` | Research worker, formalizer, Mini prover and refiner |
+| `--review-provider` and `--review-model` | Argument reviewer and semantic statement reviewer |
+
+`--review-provider` inherits `--provider`, so every role uses Codex in this
+example. `--review-provider openai` explicitly selects API reviewers;
+`--provider openai --review-provider codex` selects the reverse. API credentials
+are needed only for API roles. There is no automatic API fallback. A custom
+`--codex-bin` is saved with the run; relative
+executable paths are anchored at initialization so a changed working directory
+does not change their meaning on resume.
+
+The request cap counts one `codex exec` invocation per subscription dispatch;
+internal CLI HTTP retries are not individually observable. Research, both kinds
+of review, formalization, and nested Mini dispatches share this cap and the
+original wall-clock deadline, including downtime and resumes.
+Neither cap is a dollar limit. Sign-in, usage-limit, and transport failures
+preserve research state. Correct the problem, then repeat `discovery run` if
+authorization remains. No allowance is automatically refunded or extended.
+
+Workers and reviewers use separate clients and fresh ephemeral invocations.
+Complete arguments pass through the same ledger and review gates as API-backed
+research. The exact source and original proof plan remain required downstream
+context; full diagnostics return to the investigator. The host does not trim
+required content, but Codex can manage context internally as described below.
+Reviewed proofs/counterexamples automatically queue proof work when the project
+is configured. Defaults are `--proof-quantum-s 600`, `--formalization-steps 8`, and
+`--lean-timeout-s 300`. A paused campaign retains its reviewed contracts, completed
+modules, and pending source; an interrupted inner Mini invocation may restart
+under the same global budget. Bounded local finalization can recover an already
+saved proof after provider authorization is exhausted, without new model calls.
+
+Research support/refutation is a review assessment. Only an independently
+rechecked export sets discovery `root_proved` or `root_refuted`; a refutation
+proves the original claim's logical negation. Natural-language alignment remains
+`machine_reviewed_not_certified`. Manual `kernel_report` evidence cannot create
+that authority. A research-only run can still save a handoff for separately
+authorized standalone API formalization outside its research cap. Full instructions
+are in
+[User Guide section 21](USER_GUIDE.md#21-run-autonomous-mathematical-research).
+
+New ledgers use schema 6. Stop older clients, back up version 1–5 ledgers, and run
+`python -m ensemble_prover.research_claims upgrade DIRECTORY` explicitly before
+opening them with this version. The upgrade preserves providers and budgets,
+adds explicit API routing where required by old API-only formats, and leaves
+automatic proving disabled. Missing routing or closed-loop authorization fields
+in new-format runs are errors. Create a new discovery run with `--project-path`
+to authorize the integrated workflow.
 
 ## Request and tool behavior
 
@@ -72,7 +147,7 @@ utilities, including an apply-patch capability on some models; the read-only
 sandbox is the write boundary. Event rejection is detection, not proof that no
 native action ran. Prover tool requests are executed by Mini.
 
-Mini verifies that its serialized request retains required context. Codex may
+The host verifies that its serialized request retains required context. Codex may
 manage or compact context internally; this adapter cannot attest that every
 serialized token reaches the underlying model unchanged. Each invocation uses
 the CLI's saved authentication store. Concurrent roles can refresh that store;
