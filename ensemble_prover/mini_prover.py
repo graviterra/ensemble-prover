@@ -1991,7 +1991,7 @@ class Conversation:
                 "a tool has shown that exact declaration exists. Use this mode only "
                 "for with-answer controls, not no-answer benchmark runs."
             )
-        preserve_context = self._preserves_nl_context()
+        preserve_context = self._preserves_required_context()
         parts = [
             f"Problem (natural language):\n{self.problem_text if preserve_context else self.problem_text.strip()}",
             f"Lean signature:\n{self.lean_signature if preserve_context else self.lean_signature.strip()}",
@@ -2039,6 +2039,16 @@ class Conversation:
             for line in str(source or "").splitlines()
         )
 
+    def _preserves_required_context(self) -> bool:
+        # An answer-discovery plan belongs in the description, not in the
+        # frozen Lean source. This opts into transport preservation only:
+        # NL campaign-specific provider failure policy remains separate.
+        from .answer_input import ANSWER_CONTEXT_MARKER
+
+        return self._preserves_nl_context() or (
+            str(self.problem_text or "").lstrip().startswith(ANSWER_CONTEXT_MARKER + "\n")
+        )
+
     def messages_for_llm(self) -> List[Dict[str, Any]]:
         msgs: List[Dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt()},
@@ -2053,7 +2063,7 @@ class Conversation:
                     redact_solution_refs=redact_solution_refs,
                 )
             )
-        if self._preserves_nl_context():
+        if self._preserves_required_context():
             # History may have been compacted, restored, or switched to a
             # refiner. Rebuild from the full conversation fields, never from
             # a possibly shortened historic message. Transport must reject
@@ -14183,6 +14193,15 @@ def _build_argparser() -> argparse.ArgumentParser:
         default="",
         help=argparse.SUPPRESS,
     )
+    p.add_argument(
+        "--answer-attempts",
+        type=int,
+        default=3,
+        help=(
+            "Proposal/review attempts for answer(sorry) questions before ordinary "
+            "proof search; uses the prover model and shares cost/time limits (default: %(default)s)."
+        ),
+    )
     return p
 
 
@@ -17728,6 +17747,10 @@ def main() -> int:
         int(getattr(args, "parallel_samples", 1) or 1),
     )
     if not is_watchdog_worker():
+        from .answer_input_cli import run_cli as run_answer_input, should_discover
+
+        if should_discover(args):
+            return run_answer_input(args, sys.argv[1:])
         try:
             worker_timeout_s = remaining_worker_timeout_s(args)
         except WorkerBudgetExhausted as error:

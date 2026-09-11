@@ -17,6 +17,9 @@ from .cost_policy import require_cost_budget_usd
 _GENERATION_OPTIONS = frozenset({
     "output_dir", "resume_from", "terminal_trace", "mini_theory_startup_overlay_nonce",
     "resume_accept_source_hash",
+    # Consumed upstream before a frozen theorem's Mini attempt begins. It
+    # must not change the policy schema of existing ordinary checkpoints.
+    "answer_attempts",
 })
 
 _SUBSCRIPTION_BINARY_OPTIONS = {"codex": ("codex_bin", "codex"), "claude-code": ("claude_code_bin", "claude")}

@@ -1139,7 +1139,20 @@ async def prove_helper_in_subsession(
         suppress_solution_placeholders=effective_placeholder_suppression,
     )
     child_problem_text = child_dossier.problem_text
-    if any(
+    from ensemble_prover.answer_input import ANSWER_CONTEXT_MARKER
+
+    parent_descriptions = (
+        str(getattr(parent_dossier, "problem_text", "") or ""),
+        str(getattr(parent_conv, "problem_text", "") or ""),
+    )
+    answer_context = next(
+        (
+            text for text in parent_descriptions
+            if text.lstrip().startswith(ANSWER_CONTEXT_MARKER + "\n")
+        ),
+        "",
+    )
+    if answer_context or any(
         line.strip() == "-- ensemble-nl-input: preserve-context"
         for preamble in (
             getattr(parent_conv, "preamble", ""),
@@ -1147,11 +1160,7 @@ async def prove_helper_in_subsession(
         )
         for line in str(preamble or "").splitlines()
     ):
-        campaign_context = str(
-            getattr(parent_dossier, "problem_text", "")
-            or getattr(parent_conv, "problem_text", "")
-            or ""
-        )
+        campaign_context = answer_context or next(filter(None, parent_descriptions), "")
         if campaign_context:
             # Keep one durable, unwrapped source for further descendants.
             # Copying the already-wrapped parent conversation would repeatedly
@@ -1162,6 +1171,12 @@ async def prove_helper_in_subsession(
                 "context only; prove this child's displayed Lean target):\n"
                 + campaign_context
             )
+            if answer_context:
+                # Child orientation precedes the source, so explicitly keep
+                # the transport opt-in at the front. This is description
+                # metadata only; it neither changes Lean nor enables the
+                # separate NL-campaign provider-failure policy.
+                child_problem_text = ANSWER_CONTEXT_MARKER + "\n" + child_problem_text
     if parent_target_graph_node is None:
         parent_graph = getattr(parent_dossier, "proof_graph", None)
         if parent_graph is not None and nested_node_id:

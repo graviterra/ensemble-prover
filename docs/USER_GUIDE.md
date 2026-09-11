@@ -274,10 +274,65 @@ evidence. The following inputs are rejected before search:
 - a project with no Lake file;
 - an empty or unknown theorem name;
 - a private theorem target;
-- `sorry` or `admit` in the target's type; or
+- `sorry` or `admit` in the target's type, except supported `answer(sorry)`
+  slots handled by the answer-discovery frontend below; or
 - unsound `sorry` or `admit` dependencies in the reusable prefix.
 
 Use a public wrapper theorem when the desired declaration is private.
+
+### Questions with an unknown answer
+
+The current source includes experimental answer discovery for generic Lean
+questions containing `answer(sorry)` in the selected theorem's statement.
+Use the ordinary command; no separate discovery command is required:
+
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover \
+  --lean-file /path/to/Question.lean \
+  --theorem-name Question.classification \
+  --project-path /path/to/built-lake-project \
+  --prover openai \
+  --answer-attempts 3 \
+  --output-dir runs/question-answer
+```
+
+The project's imports must define its `answer(...)` notation. This is different
+from a missing proof (`:= by sorry`), which already goes straight to proof search.
+The PutnamBench adapter continues to use its existing answer handling.
+
+Mini first checks the project, asks the configured prover model for explicit
+answers and a complete argument, checks the terms in Lean, and requests a
+fresh-context review of whether they meaningfully answer the question. It does
+not prescribe an affirmative answer. Only the inner placeholders are filled:
+the wrapper, hypotheses, surrounding statement, and original file are preserved.
+The full answer and proof plan are saved and handed to ordinary Mini proof search.
+Source and model text are not silently truncated; oversized or incomplete
+responses stop rather than becoming partial candidates.
+
+`--answer-attempts` bounds proposal/interpretation/type repairs (default 3).
+In this first frontend, **one admitted candidate enters proof search**; a failed
+proof does not automatically start a search for a different answer. Failure to
+prove it is not evidence that the answer is false. The model review assesses
+answer form, not mathematical truth or novelty; only Lean verification can
+establish the instantiated theorem.
+
+Proposal and review use your prover/provider/reasoning settings. Their usage is
+recorded, and their time and cost are deducted from enabled global run limits
+before proof search. Subscription backends retain their normal limitation:
+dollar budgets cannot price subscription allowance. The process watchdog also
+covers preparation and shutdown.
+
+The outer output directory contains `answers/` (original, proposals, reviews,
+candidate Lean files, and full plan), `answer_usage.json`, and `proof/` (the normal
+Mini run). After a proof checkpoint exists, resume it with:
+
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover \
+  --resume-from runs/question-answer/proof
+```
+
+Interrupted answer preparation is recorded but is not itself resumable; restart
+with a new output directory. Disabling checkpointing also disables proof resume.
 
 ### Imports and supporting source trees
 

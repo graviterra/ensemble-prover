@@ -1,6 +1,6 @@
 # Ensemble Prover
 
-Last updated: 2026-09-10.
+Last updated: 2026-09-11.
 
 This repository contains a research-grade autonomous theorem prover that
 combines language-model proof search with Lean verification. Given a formalized
@@ -13,6 +13,10 @@ point for proof search is `ensemble_prover.mini_prover`.
 
 September 2026 — highlights from the current source checkout:
 
+- **Unknown-answer questions — experimental:** Mini can propose and review
+  explicit terms for `answer(sorry)` slots, then try to prove the exact filled
+  theorem. The original question is preserved; a proposed answer is not a proof.
+  [Answer discovery](docs/USER_GUIDE.md#questions-with-an-unknown-answer)
 - **Codex and Claude Code integration:** use subscription-backed CLI transports
   for Mini's prover and refiner, alongside the existing API providers. Codex
   also supports every model role in the research-to-proof loop.

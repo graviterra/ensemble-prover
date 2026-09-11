@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -958,6 +959,43 @@ def theorem_reusable_preamble(
     return merge_imports(preamble, imports), target_scoped_prefix
 
 
+def theorem_type_probe_source(
+    source: str,
+    declaration: LeanTheoremDeclaration,
+    imports: Sequence[str] = (),
+) -> str:
+    """Render the existing non-evidentiary, exact-context declaration probe."""
+    preamble, target_scoped_prefix = theorem_reusable_preamble(
+        source, declaration, imports
+    )
+    # Keep the theorem/lemma command: an axiom would lose include-bound
+    # variables. Neither its old proof nor downstream commands are checked.
+    local_header = (
+        declaration.command_prefix
+        + source[declaration.keyword_start : declaration.header_end]
+    ).strip()
+    isolated_header = "\n".join(
+        part
+        for part in (
+            preamble.rstrip(),
+            theorem_probe_scoped_prefix(target_scoped_prefix),
+            "set_option warningAsError false in",
+            local_header,
+        )
+        if part
+    ).rstrip()
+    # An equation-style header stops before its first clause, not after :=.
+    if not isolated_header.endswith(":="):
+        isolated_header += " :="
+    closers = _active_command_scope_closers(source, declaration.declaration_start)
+    return merge_imports(
+        isolated_header
+        + " by\n  set_option warningAsError false in\n  sorry\n"
+        + ("\n".join(closers) + "\n" if closers else ""),
+        imports,
+    )
+
+
 def active_include_variables(text: str, end: int) -> tuple[str, ...]:
     """Return section variables persistently included at the target boundary."""
 
@@ -1186,9 +1224,24 @@ def _find_project_module_source_anywhere(
     if not components:
         return None
     suffix = Path(*components[:-1], components[-1] + ".lean").parts
+    root = Path(project).resolve()
+    if ".lake" in root.parts:
+        return None
+
+    def scan_error(error: OSError) -> None:
+        if not isinstance(error, PermissionError):
+            raise error
+
     matches: list[Path] = []
-    for candidate in Path(project).resolve().rglob(components[-1] + ".lean"):
-        if ".lake" in candidate.parts or not candidate.is_file():
+    # Package/build sources were never eligible, but filtering rglob results
+    # traversed their entire trees for every missing dependency. Prune before
+    # descent; retain fresh local discovery and ambiguity detection.
+    for directory, children, files in os.walk(root, onerror=scan_error, followlinks=False):
+        children[:] = [child for child in children if child != ".lake"]
+        if suffix[-1] not in files:
+            continue
+        candidate = Path(directory) / suffix[-1]
+        if not candidate.is_file():
             continue
         if tuple(candidate.parts[-len(suffix) :]) == suffix:
             matches.append(candidate.resolve())
@@ -1642,39 +1695,7 @@ def _resolve_theorem_project(
             "dependency or use a benchmark adapter with an explicit assumption policy"
         )
 
-    # Elaborate the selected declaration in its exact command context without
-    # compiling its existing proof body or any unrelated downstream command.
-    # Keep the theorem/lemma command itself: changing it to an axiom loses
-    # `include x in` auto-bound variables. The placeholder is isolated to this
-    # non-evidentiary type probe and locally suppresses its expected warning.
-    local_header = (
-        declaration.command_prefix
-        + source[declaration.keyword_start : declaration.header_end]
-    ).strip()
-    probe_scoped_prefix = theorem_probe_scoped_prefix(target_scoped_prefix)
-    isolated_header = "\n".join(
-        part
-        for part in (
-            preamble.rstrip(),
-            probe_scoped_prefix,
-            "set_option warningAsError false in",
-            local_header,
-        )
-        if part
-    ).rstrip()
-    # find_decl_header_end includes a genuine top-level assignment opener but
-    # stops before an equation clause. Looking for any earlier `:=` confuses
-    # let-bindings/named arguments inside an equation-style theorem type with
-    # the declaration terminator.
-    if not isolated_header.endswith(":="):
-        isolated_header += " :="
-    closers = _active_command_scope_closers(source, declaration.declaration_start)
-    elaboration_source = (
-        isolated_header
-        + " by\n  set_option warningAsError false in\n  sorry\n"
-        + ("\n".join(closers) + "\n" if closers else "")
-    )
-    elaboration_source = merge_imports(elaboration_source, req.imports)
+    elaboration_source = theorem_type_probe_source(source, declaration, req.imports)
     lean_preamble = encode_theorem_target_context(
         preamble,
         proof_scoped_prefix=theorem_proof_scoped_prefix(target_scoped_prefix),
