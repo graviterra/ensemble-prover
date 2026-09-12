@@ -37,6 +37,7 @@ from .lean_parser import (
     _diagnostic_compact_lines,
     canonical_error_type,
     fallback_error_type_from_text,
+    has_unification_failure,
 )
 from .math_utils import _strip_lean_comments_and_strings
 from .lean_runner import (
@@ -6195,14 +6196,18 @@ def _decl_application_failure_is_context_sensitive(
 
     normalized = str(error_kind or "").strip().lower()
     diagnostic = str(error_text or "").strip().lower()
-    return normalized == "unknown_identifier" or any(
-        token in normalized or token in diagnostic
-        for token in (
-            "instance",
-            "synthes",
-            "typeclass",
-            "unification",
-            "metavariable",
+    return (
+        normalized == "unknown_identifier"
+        or has_unification_failure(diagnostic)
+        or any(
+            token in normalized or token in diagnostic
+            for token in (
+                "instance",
+                "synthes",
+                "typeclass",
+                "unification",
+                "metavariable",
+            )
         )
     )
 
@@ -6556,6 +6561,8 @@ async def _try_proof_state_decl_closure(
                 ),
                 "timeout_s": operation_timeout,
                 "ping_only": not full_portfolio_probe,
+                # Per compilation: the runner reserves a separate allowance
+                # for baseline elaboration and for the first application.
                 "ping_timeout_s": (
                     min(8.0, operation_timeout)
                     if not full_portfolio_probe
@@ -6684,6 +6691,17 @@ async def _try_proof_state_decl_closure(
             error_text,
         )
         retryable_failure = _decl_application_failure_is_retryable(error_kind)
+        if (
+            error_kind == "decl_application_ping_deferred"
+            and not _decl_application_failure_is_retryable(ping_error_kind)
+            and _decl_application_failure_is_context_sensitive(
+                ping_error_kind, error_text
+            )
+        ):
+            # Legacy adapters may still label a completed unification miss as
+            # a deferred tactic failure. Keep context repair, not an immediate
+            # full portfolio in the unchanged environment.
+            retryable_failure = False
         if (
             str(ping_error_kind or "").strip().lower()
             in {

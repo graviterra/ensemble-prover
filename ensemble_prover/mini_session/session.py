@@ -28177,17 +28177,72 @@ class MiniSession:
         fresh_action_formal_evidence = sorted(
             action_end_formal_evidence - action_start_formal_evidence
         )
+        # A helper can repeat known mathematics while closing genuinely open
+        # work. Require an action-start observation and a new proved node;
+        # changing the receipt on an already-proved node is not fresh work.
+        newly_proved_children = []
+        newly_proved_graph_targets = []
+        if (
+            self._action_start_frontier_formal_signature
+            and self.proof_state is not None
+        ):
+            for node_id, child in dict(self.proof_state.nodes or {}).items():
+                if (
+                    node_id == getattr(self.proof_state, "root_node_id", "")
+                    or getattr(child, "kind", "") != "child_goal"
+                    or getattr(child, "status", "") != "proved"
+                ):
+                    continue
+                prefix = f"proof_state:{node_id}:"
+                if (
+                    any(
+                        item.startswith(prefix)
+                        for item in fresh_action_formal_evidence
+                    )
+                    and not any(
+                        item.startswith(prefix)
+                        for item in action_start_formal_evidence
+                    )
+                ):
+                    newly_proved_children.append(node_id)
+        graph = getattr(self.dossier, "proof_graph", None)
+        graph_certificate = getattr(
+            graph, "_proved_node_has_durable_certificate", None
+        )
+        if self._action_start_frontier_formal_signature and callable(graph_certificate):
+            for node_id, target in dict(getattr(graph, "nodes", {}) or {}).items():
+                if (
+                    getattr(target, "kind", "")
+                    not in {"proposed_claim", "formal_variant", "missing_obligation"}
+                    or getattr(target, "status", "") != "proved"
+                ):
+                    continue
+                prefix = f"proof_graph:{node_id}:"
+                if (
+                    any(
+                        item.startswith(prefix)
+                        for item in fresh_action_formal_evidence
+                    )
+                    and not any(
+                        item.startswith(prefix)
+                        for item in action_start_formal_evidence
+                    )
+                    and graph_certificate(target)
+                ):
+                    newly_proved_graph_targets.append(node_id)
         non_helper_parent_progress = bool(
             preexisting_strong_progress
-            and not outcome.helpers_added
+            and (not outcome.helpers_added or newly_proved_graph_targets)
             and action_parent_progress
             and fresh_action_formal_evidence
         )
         non_helper_structural_strong = bool(
             preexisting_strong_progress
-            and not outcome.helpers_added
+            and (not outcome.helpers_added or newly_proved_graph_targets)
             and fresh_action_formal_evidence
         )
+        if non_helper_parent_progress:
+            metadata["parent_progress"] = True
         ledger_parent_progress = bool(
             helper_progress_metadata.get("parent_progress")
             or helper_progress_metadata.get("strong_progress")
@@ -28197,6 +28252,25 @@ class MiniSession:
             or non_helper_structural_strong
             or ledger_parent_progress
         )
+        duplicate_helper_names = set(
+            helper_progress_metadata.get("duplicate_helper_names", ())
+        )
+        helper_alias_only = bool(
+            outcome.helpers_added
+            and set(outcome.helpers_added) <= duplicate_helper_names
+            and not helper_progress_metadata.get("theory_progress")
+            and not final_strong_progress
+            and not newly_proved_children
+            and not newly_proved_graph_targets
+            and not metadata.get("tool_residual_progress")
+            and not metadata.get("schedulable_decomposition_created")
+        )
+        if helper_alias_only:
+            # Keep checked declarations and provenance, but do not credit a
+            # renamed fact as either soft or strong mathematical progress.
+            # Enforce this even for legacy actions that still report progress.
+            metadata["helper_alias_only"] = True
+            outcome = replace(outcome, progress=False, metadata=metadata)
         if preexisting_strong_progress and not final_strong_progress:
             self._increment_dossier_metric(
                 "mini_session_unverified_strong_progress_rejected",
@@ -29603,7 +29677,11 @@ class MiniSession:
                     "verdict": "non_stagnating_repair_redirect",
                 }
             )
-        elif unverified_decomposition_only or quarantined_residual_diagnostics_only:
+        elif (
+            helper_alias_only
+            or unverified_decomposition_only
+            or quarantined_residual_diagnostics_only
+        ):
             # Explicit decomposition evidence may add durable open work, but
             # zero-accepted proposals are not proof progress. This must win
             # even for fast frontier-selected work, otherwise the cheap
@@ -29612,6 +29690,7 @@ class MiniSession:
             # drift, not schedulable decomposition, and should not reset root
             # repair stagnation either.
             self.stagnation_counter += 1
+            self.soft_progress_streak = 0
             self.last_proof_state_signature = new_signature
         elif is_noop_consumption:
             # Frontier-consumed no-op (cost < 1s): not stagnation.

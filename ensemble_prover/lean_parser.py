@@ -15,6 +15,21 @@ from typing import List, Optional
 _log = logging.getLogger(__name__)
 
 
+class LeanOutput(str):
+    """String-compatible native output with separately recorded runner status.
+
+    Empty status means the compiler completed; warning text cannot override it.
+    Plain strings remain supported for legacy adapters and saved raw output.
+    """
+
+    runtime_status: str
+
+    def __new__(cls, text: str, *, runtime_status: str = "") -> "LeanOutput":
+        output = super().__new__(cls, text)
+        output.runtime_status = runtime_status
+        return output
+
+
 @dataclass
 class LeanGoalState:
     """A single remaining proof goal extracted from Lean output."""
@@ -404,7 +419,9 @@ _NO_GOALS_TO_BE_SOLVED_RE = re.compile(
     r"\bno goals to be solved\b",
     re.IGNORECASE,
 )
-_UNIFICATION_FAILED_RE = re.compile(r"failed to unify|cannot unify", re.IGNORECASE)
+_UNIFICATION_FAILED_RE = re.compile(
+    r"failed to unify|cannot unify|could not unify", re.IGNORECASE
+)
 _TIMEOUT_RE = re.compile(
     r"maximum heartbeats exceeded|maximum number of heartbeats .* has been reached|"
     r"time limit exceeded|lean timeout|fast[- ]fail timeout|timeout at `|"
@@ -1580,8 +1597,13 @@ def canonical_error_type(parsed: Optional[LeanParseResult]) -> str:
         for d in getattr(parsed, "diagnostics", [])
         if getattr(d, "severity", "") == "error"
     )
-    raw = str(getattr(parsed, "raw", "") or "")
-    text = err_msgs if err_msgs.strip() else raw
+    raw_output = getattr(parsed, "raw", "")
+    raw = str(raw_output or "")
+    text = (
+        err_msgs
+        if getattr(parsed, "diagnostics", []) or isinstance(raw_output, LeanOutput)
+        else raw
+    )
     return fallback_error_type_from_text(
         text,
         unsolved_goal_count=int(getattr(parsed, "unsolved_goal_count", 0) or 0),
@@ -1650,10 +1672,19 @@ def parse_lean_output(
             ):
                 result.sorry_count += 1
 
-    # Prefer structured error diagnostics to avoid false positives from echoed
-    # source code, but recover any *missing* families from the raw output so
-    # wrapped diagnostics do not disappear behind a different first-line match.
+    # Semantic failures belong to error diagnostics. Warning/info bodies can
+    # quote complete Lean errors and goal states without reporting a failure.
+    # Keep raw fallback for adapters that supply unstructured diagnostics.
     _err_msgs = [d.message for d in result.diagnostics if d.severity == "error"]
+    semantic_output = (
+        "\n".join(
+            match.group(0)
+            for match in _DIAG_RE.finditer(raw)
+            if match.group(4) == "error"
+        )
+        if result.diagnostics
+        else "" if ok and isinstance(raw, LeanOutput) and not raw.runtime_status else raw
+    )
 
     def _classify_texts(
         texts: List[str],
@@ -1693,7 +1724,7 @@ def parse_lean_output(
             simp_no_progress,
         )
 
-    _classification_texts = _err_msgs if _err_msgs else [raw]
+    _classification_texts = _err_msgs if result.diagnostics else [semantic_output]
     (
         termination_failed,
         parse_error,
@@ -1705,39 +1736,6 @@ def parse_lean_output(
         unification_failure_like,
         simp_no_progress,
     ) = _classify_texts(_classification_texts)
-    if _err_msgs:
-        (
-            raw_termination_failed,
-            raw_parse_error,
-            raw_type_mismatch,
-            raw_unknown_identifier,
-            raw_tactic_failed,
-            raw_binder_arity_mismatch,
-            raw_missing_instance_like,
-            raw_unification_failure_like,
-            raw_simp_no_progress,
-        ) = _classify_texts([raw])
-        termination_failed = termination_failed or raw_termination_failed
-        parse_error = parse_error or raw_parse_error
-        type_mismatch = type_mismatch or raw_type_mismatch
-        unknown_identifier = unknown_identifier or raw_unknown_identifier
-        # Do not OR tactic-failure phrases from the entire raw stream when
-        # structured errors exist. Warning text may legitimately quote names
-        # such as ``«tactic 'foo' failed»`` and otherwise contaminate a valid
-        # residual state. Real tactic failures are classified from their error
-        # diagnostics above; raw fallback remains available when no structured
-        # error was parsed.
-        binder_arity_mismatch = binder_arity_mismatch or raw_binder_arity_mismatch
-        missing_instance_like = missing_instance_like or raw_missing_instance_like
-        unification_failure_like = (
-            unification_failure_like or raw_unification_failure_like
-        )
-        # Skip raw_simp_no_progress in the OR-merge: the simp_no_progress regex
-        # uses a 240-char gap that can false-positive across diagnostic boundaries
-        # when run on the full concatenated raw text (e.g. matching "simp" from one
-        # diagnostic and "made no progress" from another).  The per-message
-        # classification above is sufficient and boundary-safe.
-
     result.termination_failed = termination_failed
     result.parse_error = parse_error
     result.type_mismatch = type_mismatch
@@ -1750,8 +1748,8 @@ def parse_lean_output(
     )
     result.binder_arity_mismatch = binder_arity_mismatch
     result.simp_no_progress = simp_no_progress
-    # Decision-procedure refutation: search per-error-message AND raw to
-    # catch wrapped diagnostics. The first-line phrasing is uniquely
+    # Decision-procedure refutation: inspect each complete error body,
+    # including wrapped diagnostics. The first-line phrasing is uniquely
     # diagnostic — see ``has_proposition_falsified`` for rationale.
     # ``tactic_failed`` remains True alongside (the tactic also failed
     # in the structural sense) but the canonical priority routes to
@@ -1759,36 +1757,56 @@ def parse_lean_output(
     # the planner the strong "your claim is mathematically false" verdict
     # rather than the generic "try a different tactic" advice.
     result.proposition_falsified = any(
-        has_proposition_falsified(text) for text in (_err_msgs or [raw])
-    ) or has_proposition_falsified(raw)
+        has_proposition_falsified(text) for text in _classification_texts
+    )
     # Unknown universe (e.g. `Type u_2` referenced without a matching
-    # `universe u_2` declaration). Detected over both per-error-message
-    # and raw text so we don't miss it whether Lean reports it as a
+    # `universe u_2` declaration). Inspect each error body so it is found as a
     # standalone error or wrapped in a multi-error diagnostic. Treated
     # as a structural top-priority error because every downstream
     # tactic emits cascading errors when this is unresolved.
     result.unknown_universe = any(
-        has_unknown_universe(text) for text in (_err_msgs or [raw])
-    ) or has_unknown_universe(raw)
+        has_unknown_universe(text) for text in _classification_texts
+    )
     if result.unknown_universe:
-        result.unknown_universe_name = _extract_unknown_universe_name(raw)
-    # Timeout can originate from the runner (not a Lean diagnostic), keep raw search.
-    result.timeout = has_timeout(raw)
-    # Infrastructure failures (persistent verifier / subprocess / transport)
-    # always originate from the runner layer and never appear as Lean
-    # diagnostics. Detect from raw text so downstream routing can treat
-    # them as retryable instead of authoritative compile failures.
-    result.infra_failure = has_infra_failure(raw)
-    # Detail extraction uses raw text but is gated on flags (confirmed real).
+        result.unknown_universe_name = _extract_unknown_universe_name(semantic_output)
+    # Runtime failures can appear outside Lean diagnostics. Do not scan warning
+    # bodies: an unused simp argument can itself be named «Lean timeout».
+    runtime_status = raw.runtime_status if isinstance(raw, LeanOutput) else None
+    runtime_output = (
+        runtime_status
+        if runtime_status is not None
+        else _DIAG_RE.sub("", raw) if result.diagnostics else raw
+    )
+    if runtime_status is None and result.diagnostics and returncode != 0:
+        # The final diagnostic regex also consumes trailing unstructured output.
+        # Recover the runner's standalone status lines on failed executions,
+        # without treating indented terms or quoted diagnostic text as statuses.
+        runtime_output += "\n" + "\n".join(
+            line
+            for line in raw.splitlines()
+            if line and not line[0].isspace()
+            and (
+                _INFRA_FAILURE_RE.match(line)
+                or _TIMEOUT_RE.match(line.removeprefix("Lean "))
+            )
+        )
+    failure_output = "\n".join(
+        [*(_err_msgs if result.diagnostics or runtime_status is not None else [raw]),
+         runtime_output]
+    )
+    result.timeout = has_timeout(failure_output)
+    result.infra_failure = has_infra_failure(failure_output)
+    # Details use the same diagnostic scope as flags, so a warning cannot
+    # supply a different identifier, type, or missing instance.
     if result.type_mismatch:
         result.expected_type, result.actual_type = _extract_type_mismatch_details(
-            raw,
+            semantic_output,
             diagnostics=result.diagnostics,
         )
     if result.unknown_identifier:
-        result.unknown_identifier_name = _extract_unknown_identifier(raw)
+        result.unknown_identifier_name = _extract_unknown_identifier(semantic_output)
     result.missing_instance = (
-        _extract_missing_instance(raw) if missing_instance_like else None
+        _extract_missing_instance(semantic_output) if missing_instance_like else None
     )
     # Use the same diagnostic scope as the failure flag. Quoted warning text
     # must not supply the name of a different tactic from the actual error.
@@ -1804,12 +1822,12 @@ def parse_lean_output(
         if result.tactic_failed
         else None
     )
-    result.unification_failure = (
-        _extract_unification_failure(raw) if unification_failure_like else None
-    )
+    # A warning may quote a unification diagnostic. Only errors can establish
+    # this semantic failure; retain raw fallback for unstructured Lean output.
+    result.unification_failure = _extract_unification_failure(semantic_output)
 
     # Parse unsolved goals
-    result.remaining_goals = _parse_unsolved_goals(raw)
+    result.remaining_goals = _parse_unsolved_goals(semantic_output)
     result.unsolved_goal_count = len(result.remaining_goals)
 
     # Extract tactic suggestions from info diagnostics AND raw output.

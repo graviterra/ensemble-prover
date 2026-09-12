@@ -7058,6 +7058,7 @@ def helper_progress_metadata_for_accepted_helpers(
             "strong_progress": False,
             "strong_progress_reason": "none",
             "theory_progress_helper_names": [],
+            "duplicate_helper_names": [],
             "parent_progress_helper_names": [],
             "parent_progress_resolved_claim_node_ids": [],
             "parent_progress_resolved_variant_node_ids": [],
@@ -7065,15 +7066,44 @@ def helper_progress_metadata_for_accepted_helpers(
             "parent_progress_edge_count": 0,
         }
 
+    helpers = getattr(dossier, "verified_helpers", {}) or {}
+    names_by_statement_key: Dict[str, Set[str]] = {}
+    names_by_fact_identity: Dict[str, Set[str]] = {}
+    fact_identity_by_name: Dict[str, str] = {}
+    fact_identity_fn = getattr(dossier, "_verified_fact_identity", None)
+    for name, raw_delta in deltas_raw.items():
+        delta = _coerce_verified_helper_progress_delta(raw_delta)
+        if delta is not None and delta.statement_key and name in helpers:
+            names_by_statement_key.setdefault(delta.statement_key, set()).add(name)
+            helper = helpers[name]
+            if callable(fact_identity_fn) and isinstance(helper, VerifiedHelper):
+                fact_identity = fact_identity_fn(helper)
+                fact_identity_by_name[name] = fact_identity
+                names_by_fact_identity.setdefault(fact_identity, set()).add(name)
     theory_names: List[str] = []
+    duplicate_names: List[str] = []
     parent_names: List[str] = []
     claim_ids: List[str] = []
     variant_ids: List[str] = []
     obligation_ids: List[str] = []
     for name in names:
         delta = _coerce_verified_helper_progress_delta(deltas_raw.get(name))
-        helpers = getattr(dossier, "verified_helpers", {}) or {}
         helper = helpers.get(name) if isinstance(helpers, dict) else None
+        if (
+            delta is not None
+            and not delta.theory_progress
+            and (
+                names_by_statement_key.get(delta.statement_key, set()) - {name}
+                or names_by_fact_identity.get(
+                    fact_identity_by_name.get(name, ""), set()
+                ) - {name}
+            )
+        ):
+            # Source aliases may have distinct execution environments and no
+            # name-alias mapping. Their recorded proposition identity still
+            # establishes that the acceptance added no new mathematics. Bound
+            # Lean fact identities also recognize differently spelled aliases.
+            duplicate_names.append(name)
         helper_is_generic = bool(
             helper is not None
             and verified_helper_admission_quality(helper).generic_novelty
@@ -7117,6 +7147,7 @@ def helper_progress_metadata_for_accepted_helpers(
         "strong_progress": parent_progress,
         "strong_progress_reason": reason,
         "theory_progress_helper_names": theory_names,
+        "duplicate_helper_names": duplicate_names,
         "parent_progress_helper_names": parent_names,
         "parent_progress_resolved_claim_node_ids": claim_ids,
         "parent_progress_resolved_variant_node_ids": variant_ids,

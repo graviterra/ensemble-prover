@@ -65,6 +65,7 @@ from ensemble_prover.proof_dossier import (
     active_root_target_statement,
     active_root_targets_for_frame,
     helper_decl_name,
+    helper_progress_metadata_for_accepted_helpers,
     is_answer_unsafe_statement_text,
     selected_work_has_explicit_cognition,
     text_hash,
@@ -14709,6 +14710,9 @@ class ConversationTurnAction:
                 ]
             )
         )
+        # A fresh attested residual split is executable work independently of
+        # whether helpers emitted alongside it are novel mathematical facts.
+        skeleton_route_metadata["tool_residual_progress"] = skeleton_route_banked
         if route_scoped_tool_helpers and assemble_route_goal_statement:
             selected_record = getattr(session, "selected_work_item_record", {}) or {}
             if not isinstance(selected_record, dict):
@@ -18236,6 +18240,17 @@ class ConversationTurnAction:
         # subsequent outer-loop dispatch would re-run the same salvage
         # work on stale data when conv_turn budget runs low.
         if proof is None:
+            # Read after route publication so newly resolved parent obligations
+            # count even if the tool's declaration is a mathematical alias.
+            checked_tool_helper_progress = helper_progress_metadata_for_accepted_helpers(
+                dossier, durable_checked_tool_helpers
+            )
+            checked_bridge_metadata.update(checked_tool_helper_progress)
+            durable_tool_progress = bool(
+                skeleton_route_banked
+                or checked_tool_helper_progress["theory_progress"]
+                or checked_tool_helper_progress["parent_progress"]
+            )
             if (
                 not content.strip()
                 and not helpers
@@ -18285,7 +18300,7 @@ class ConversationTurnAction:
                     solved=False,
                     proof=None,
                     helpers_added=durable_checked_tool_helpers,
-                    progress=True,
+                    progress=durable_tool_progress,
                     cost_seconds=time.monotonic() - started,
                     metadata=handoff_metadata,
                 )
@@ -18772,9 +18787,7 @@ class ConversationTurnAction:
                     solved=False,
                     proof=None,
                     helpers_added=durable_checked_tool_helpers,
-                    progress=bool(
-                        skeleton_route_banked or durable_checked_tool_helpers
-                    ),
+                    progress=durable_tool_progress,
                     cost_seconds=cost,
                     metadata={
                         "role": self.role,
@@ -18898,9 +18911,7 @@ class ConversationTurnAction:
                 solved=False,
                 proof=None,
                 helpers_added=durable_checked_tool_helpers,
-                progress=bool(
-                    skeleton_route_banked or durable_checked_tool_helpers
-                ),
+                progress=durable_tool_progress,
                 cost_seconds=cost,
                 metadata={
                     "role": self.role,

@@ -78,6 +78,9 @@ class VerifierResponse:
     service_time_s: float
     queue_wait_s: float = 0.0
     failure_kind: str = ""
+    # None preserves legacy adapter behavior; native completion carries an
+    # explicit empty status, distinct from any words quoted by diagnostics.
+    runtime_status: Optional[str] = None
 
 
 class PersistentVerifierError(RuntimeError):
@@ -572,6 +575,7 @@ class PersistentVerifierWorker:
                         msg.get("service_time_s", time.monotonic() - started) or 0.0
                     ),
                     queue_wait_s=float(queue_wait_s),
+                    runtime_status="",
                 )
                 self.state = str(msg.get("worker_state_after", "idle") or "idle")
                 self._transport_completions += 1

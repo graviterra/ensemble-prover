@@ -13,6 +13,7 @@ import math
 import types
 from typing import Any
 
+from .lean_parser import LeanOutput
 
 class StateDataError(TypeError):
     """A value is outside the hook-free execution-record data model."""
@@ -42,6 +43,10 @@ def clone_json_value(value: Any, *, label: str = "state value") -> Any:
 
     def clone(item: Any, path: str) -> Any:
         item_type = type(item)
+        if item_type is LeanOutput:
+            # Runtime provenance is process-local, not a JSON capability.
+            # Preserve exact diagnostic text without invoking subclass hooks.
+            return str.__str__(item)
         if item is None or item_type in {str, bool, int}:
             return item
         if item_type is float:

@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable, ClassVar, Dict, Optional, Tuple
 
+from .lean_parser import LeanOutput
 from .subprocess_cleanup import (
     communicate_with_hard_timeout,
     terminate_and_reap_process,
@@ -39,9 +40,9 @@ def _status_with_captured_output(
     status: str, stdout_chunks: list[bytes], stderr_chunks: list[bytes]
 ) -> str:
     detail = _captured_output_text(stdout_chunks, stderr_chunks).strip()
-    if not detail:
-        return status
-    return f"{detail}\n{status}"
+    return LeanOutput(
+        f"{detail}\n{status}" if detail else status, runtime_status=status
+    )
 
 
 class LeanREPL:
@@ -922,7 +923,7 @@ class LeanREPL:
             )
 
         out = _captured_output_text(stdout_chunks, stderr_chunks)
-        return (proc.returncode if proc.returncode is not None else 1, out)
+        return (proc.returncode if proc.returncode is not None else 1, LeanOutput(out))
 
     async def restart(self) -> bool:
         """Reset and re-resolve the environment."""

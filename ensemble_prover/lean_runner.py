@@ -48,11 +48,13 @@ from .domain import (
 )
 from .lean_parser import (
     LeanDiagnostic,
+    LeanOutput,
     LeanGoalState,
     LeanParseResult,
     canonical_error_type,
     diagnostic_preview,
     has_infra_failure,
+    has_unification_failure,
     is_oracle_silent_success,
     parse_lean_output,
 )
@@ -1450,9 +1452,9 @@ def _status_with_captured_output(
     stderr_chunks: Sequence[bytes],
 ) -> str:
     detail = _captured_output_text(stdout_chunks, stderr_chunks).strip()
-    if not detail:
-        return status
-    return f"{detail}\n{status}"
+    return LeanOutput(
+        f"{detail}\n{status}" if detail else status, runtime_status=status
+    )
 
 
 _LEAN_DIAGNOSTIC_HEADER_RE = re.compile(
@@ -5083,9 +5085,17 @@ class LeanRunner:
             self._persistent_fallback_count += 1
             return None
         output = str(response.output or "")
+        runtime_status = getattr(response, "runtime_status", None)
+        if runtime_status is not None:
+            output = LeanOutput(output, runtime_status=runtime_status)
         failure_kind = str(getattr(response, "failure_kind", "") or "").strip()
         if int(response.returncode) != 0 and (
-            bool(failure_kind) or has_infra_failure(output)
+            bool(failure_kind)
+            or (
+                parse_lean_output(output, int(response.returncode)).infra_failure
+                if runtime_status is not None
+                else has_infra_failure(output)
+            )
         ):
             logger.warning(
                 "Persistent verifier returned infrastructure failure, falling back: %s",
@@ -5093,7 +5103,7 @@ class LeanRunner:
             )
             self._persistent_fallback_count += 1
             return None
-        return (int(response.returncode), str(response.output or ""))
+        return (int(response.returncode), output)
 
     async def _run_via_repl(
         self,
@@ -5538,7 +5548,7 @@ class LeanRunner:
         if returncode is None:
             logger.warning("Lean process returncode missing; treating as failure.")
             returncode = 1
-        return (returncode, out)
+        return (returncode, LeanOutput(out))
 
     async def _execute_generated_file(
         self,
@@ -5575,7 +5585,7 @@ class LeanRunner:
             file_path,
             _BackendExecutionResult(
                 returncode=int(returncode),
-                output=str(out),
+                output=out if isinstance(out, LeanOutput) else str(out),
                 backend=str(backend_key or "lake"),
             ),
             None,
@@ -7052,7 +7062,7 @@ class LeanRunner:
         )
         if execution is None:
             return False, "", str(write_error or "source type probe unavailable")
-        output = str(execution.output or "")
+        output = execution.output
         if int(execution.returncode) != 0:
             return False, "", output
         rendered_types = self._checked_declaration_types_from_output(
@@ -7153,7 +7163,7 @@ class LeanRunner:
         if execution is None:
             output = str(write_error or "source type equivalence probe unavailable")
             return parse_lean_output(output, 1), output, 1
-        output = str(execution.output or "")
+        output = execution.output
         returncode = int(execution.returncode)
         parsed = parse_lean_output(output, returncode)
         if returncode == 0 and parsed.ok:
@@ -7481,6 +7491,10 @@ run_cmd Lean.Elab.Command.liftTermElabM do
             for line in output_lines
             if not line.lstrip().startswith("MINI_CONTRACT_ANALYSIS_")
         )
+        if isinstance(output, LeanOutput):
+            diagnostic_output = LeanOutput(
+                diagnostic_output, runtime_status=output.runtime_status
+            )
         parsed = parse_lean_output(diagnostic_output, int(returncode or 0))
         for diagnostic in list(getattr(parsed, "diagnostics", ()) or ()):
             if str(getattr(diagnostic, "severity", "") or "") != "info":
@@ -7876,7 +7890,7 @@ private def {serializer_prefix}_elabType
                 file_path=str(file_path or ""),
                 attempted=True,
             )
-        output = str(execution.output or "")
+        output = execution.output
         returncode = int(execution.returncode or 0)
         marker_family_re = re.compile(
             r"MINI_RESIDUAL_(?:PROOF_REJECTION|POSTPROCESS_FAILURE)_"
@@ -8408,7 +8422,7 @@ private def {serializer_prefix}_contractDefeq
                 error,
                 1,
             )
-        output = str(execution.output or "")
+        output = execution.output
         if termination_signal_from_returncode(execution.returncode):
             active_indices = tuple(
                 index for index, statement in enumerate(raw_statements) if statement
@@ -8885,7 +8899,7 @@ private def {serializer_prefix}_contractDefeq
         if execution is None:
             output = str(write_error or "statement type probe unavailable")
             return parse_lean_output(output, 1), output, 1
-        output = str(execution.output or "")
+        output = execution.output
         return (
             parse_lean_output(output, int(execution.returncode)),
             output,
@@ -8954,10 +8968,11 @@ private def {serializer_prefix}_contractDefeq
     ) -> Dict[str, Any]:
         """Probe whether a declaration can be applied to the current goal.
 
-        ``ping_only`` runs only the baseline plus the first, most robust probe
-        stub under a short deadline.  A negative ping is explicitly deferred
-        to the full portfolio: it is latency evidence, not a proof that later
-        ``exact``/``refine`` variants are impossible.
+        ``ping_only`` runs the baseline and first application stub, each with
+        up to ``ping_timeout_s`` seconds, within the overall ``timeout_s``
+        deadline. Semantic misses retire the ping in this context; ambiguous
+        failures defer to the full portfolio. Callers can explicitly select a
+        full probe to try alternate ``exact``/``refine`` strategies.
         """
         goal_statement = str(statement or "").strip()
         sanitized_decl, error = self._normalize_check_term_name(decl_name)
@@ -8982,7 +8997,7 @@ private def {serializer_prefix}_contractDefeq
         if ping_only:
             operation_timeout_s = min(
                 operation_timeout_s,
-                max(0.0, float(ping_timeout_s or 0.0)),
+                2 * max(0.0, float(ping_timeout_s or 0.0)),
             )
         # One absolute deadline bounds the baseline, the complete stub
         # portfolio, and failure enrichment together. In particular, a
@@ -8995,6 +9010,12 @@ private def {serializer_prefix}_contractDefeq
 
         def probe_timeouts() -> Tuple[float, float]:
             hard_timeout_s = portfolio_time_remaining()
+            if ping_only:
+                # Baseline elaboration compiles the same context as the
+                # application. It must not spend the application's allowance.
+                hard_timeout_s = min(
+                    hard_timeout_s, max(0.0, float(ping_timeout_s or 0.0))
+                )
             fast_fail_timeout_s = (
                 hard_timeout_s if ping_only else min(8.0, hard_timeout_s)
             )
@@ -9060,14 +9081,18 @@ private def {serializer_prefix}_contractDefeq
         ) -> Dict[str, Any]:
             normalized = str(error_kind or "unknown_error").strip().lower()
             diagnostic = str(error_text or "").strip().lower()
-            context_sensitive = normalized == "unknown_identifier" or any(
-                token in normalized or token in diagnostic
-                for token in (
-                    "instance",
-                    "synthes",
-                    "typeclass",
-                    "unification",
-                    "metavariable",
+            context_sensitive = (
+                normalized == "unknown_identifier"
+                or has_unification_failure(diagnostic)
+                or any(
+                    token in normalized or token in diagnostic
+                    for token in (
+                        "instance",
+                        "synthes",
+                        "typeclass",
+                        "unification",
+                        "metavariable",
+                    )
                 )
             )
             definitive = normalized in {
@@ -9082,7 +9107,13 @@ private def {serializer_prefix}_contractDefeq
             # either permanently structural or retriable after a real Lean
             # context change; neither should burn the 120-second portfolio in
             # this unchanged context.
-            requires_full = not definitive and not context_sensitive
+            infrastructure_failure = (
+                "timeout" in normalized
+                or normalized in {"infra_failure", "runner_exception"}
+            )
+            requires_full = infrastructure_failure or (
+                not definitive and not context_sensitive
+            )
             base_result["requires_full_probe"] = requires_full
             base_result["ping_error_kind"] = normalized
             base_result["error_kind"] = (
@@ -9280,7 +9311,18 @@ private def {serializer_prefix}_contractDefeq
                 base_result["remaining_goals"] = remaining_goals
                 return base_result
 
-            if returncode == 0 and not getattr(parsed, "diagnostics", None):
+            if (
+                returncode == 0
+                and not remaining_goals
+                and not parsed_error_kind
+                and not getattr(parsed, "sorry_count", 0)
+                and getattr(parsed, "axiom_audit_ok", None) is not False
+                and not getattr(parsed, "unexpected_axioms", [])
+                and not any(
+                    getattr(diag, "severity", "") == "error"
+                    for diag in (getattr(parsed, "diagnostics", []) or [])
+                )
+            ):
                 probe_event(
                     event="finished",
                     probe_stage="stub",

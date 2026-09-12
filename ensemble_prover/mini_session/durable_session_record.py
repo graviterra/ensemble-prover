@@ -62,7 +62,11 @@ _IDENTITY_CONV_FIELDS = (
 
 def _encode(value: Any, *, path: str = "value") -> Any:
     """Encode an allowlisted value union, never application reduction hooks."""
+    from ensemble_prover.lean_parser import LeanOutput
+
     kind = type(value)
+    if kind is LeanOutput:
+        return str.__str__(value)
     if value is None or kind in {str, bool, int}:
         return value
     if kind is float:
