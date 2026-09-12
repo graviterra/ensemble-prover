@@ -8,6 +8,7 @@ returns ok if root certifies. Consults internal frontiers
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, ClassVar, FrozenSet, Optional
 
@@ -109,6 +110,7 @@ class ChildClosureAction:
             configured_lean_timeout_s,
         )
         operation_count = 1
+        cache_acceptance_budget_s = 0.0
         if session is not None:
             proof_state = getattr(session, "proof_state", None)
             try:
@@ -149,12 +151,12 @@ class ChildClosureAction:
                 # assembly/tactic dispatch that uses the newly proved child.
                 required = 2 + int(answer_safe_recheck)
                 operation_count = max(operation_count, required)
-            if self._pending_helper_acceptance_node_ids(session) or (
-                include_cooling_node_id
-                and include_cooling_node_id in self._pending_helper_acceptance_node_ids(
-                    session, include_cooling=True,
-                )
+            pending_helper_ids = set(self._pending_helper_acceptance_node_ids(session))
+            if include_cooling_node_id and include_cooling_node_id in (
+                self._pending_helper_acceptance_node_ids(session, include_cooling=True)
             ):
+                pending_helper_ids.add(include_cooling_node_id)
+            if pending_helper_ids:
                 # These are paid helper candidates awaiting the same primary
                 # and optional answer-safe checks. Preserve a subsequent
                 # quantum for the assembly/tactic lane that consumes them.
@@ -162,8 +164,42 @@ class ChildClosureAction:
                     operation_count,
                     2 + int(answer_safe_recheck),
                 )
+                selected_record = dict(
+                    getattr(session, "selected_work_item_record", {}) or {}
+                )
+                selected_node_id = str(selected_record.get("node_id") or "")
+                selected_action_id = str(
+                    getattr(session, "selected_work_item_action_id", "") or ""
+                )
+                quoted_node_id = include_cooling_node_id or (
+                    selected_node_id
+                    if selected_action_id == self.id
+                    and selected_node_id in pending_helper_ids | pending_typed_ids
+                    else ""
+                )
+                if quoted_node_id:
+                    pending_helper_ids.intersection_update({quoted_node_id})
+                for node_id in pending_helper_ids:
+                    pending = dict(getattr(nodes[node_id], "pending_helper_acceptance", {}) or {})
+                    continuation = dict(pending.get("continuation") or {})
+                    if continuation.get("kind") != "cache_seed_batch":
+                        continue
+                    saved_timeout = continuation.get("timeout_s")
+                    try:
+                        saved_timeout_s = 0.0 if isinstance(saved_timeout, bool) else float(saved_timeout)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if not math.isfinite(saved_timeout_s) or saved_timeout_s <= 0.0:
+                        continue
+                    # The cache verifier resumes its saved allowance. Keep the
+                    # generic follow-on quantum for subsequent assembly work.
+                    cache_acceptance_budget_s = max(
+                        cache_acceptance_budget_s,
+                        (1 + int(answer_safe_recheck)) * saved_timeout_s
+                        + operation_timeout_s,
+                    )
         return (
-            float(operation_count) * operation_timeout_s
+            max(float(operation_count) * operation_timeout_s, cache_acceptance_budget_s)
             + self.DEADLINE_ADMISSION_SLACK_S
         )
 

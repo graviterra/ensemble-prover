@@ -2612,24 +2612,56 @@ def _dossier_contract_alpha_replace_scoped(
                 binder = raw[tail_start : tail_start + comma]
                 body = raw[tail_start + comma + 1 :]
                 local_mapping = dict(mapping)
-                next_index = len(local_mapping)
+                next_index = 1 + max(
+                    (int(value[len("__bound"):-2]) for value in mapping.values()
+                     if _DOSSIER_ALPHA_BOUND_PLACEHOLDER_RE.fullmatch(value)),
+                    default=-1,
+                )
+                normalized_groups: List[str] = []
                 for binder_group in _dossier_binder_group_chunks(binder):
-                    for name in _dossier_binder_names_from_chunk(binder_group):
+                    group = binder_group.strip()
+                    unwrapped = _dossier_unwrap_binder_group(group)
+                    colon = _dossier_top_level_colon_index(unwrapped)
+                    names = _dossier_binder_names_from_chunk(binder_group)
+                    # A binder's annotation is outside its own scope. This is
+                    # material for ∃ n : Nat, ∃ n : Fin n, ...: the Fin argument
+                    # refers to the outer n, not the newly introduced witness.
+                    annotation = (
+                        _dossier_contract_alpha_replace_scoped(
+                            unwrapped[colon + 1:], local_mapping,
+                        ) if colon >= 0 else ""
+                    )
+                    for name in names:
                         local_mapping[name] = f"__bound{next_index}__"
                         next_index += 1
+                    if colon >= 0 and names:
+                        opener = group[0] if group[0] in "[{⦃" else "("
+                        closer = _DOSSIER_LEAN_GROUP_OPEN_TO_CLOSE[opener]
+                        normalized_groups.append(
+                            opener + " ".join(local_mapping[name] for name in names)
+                            + ":" + annotation + closer
+                        )
+                    else:
+                        normalized_groups.append(
+                            _dossier_contract_alpha_replace_scoped(group, local_mapping)
+                        )
                 out.append(raw[index : index + quantifier_len])
-                out.append(
-                    _dossier_contract_alpha_replace_scoped(binder, local_mapping)
-                )
+                out.append(" ".join(normalized_groups))
                 out.append(",")
                 out.append(
                     _dossier_contract_alpha_replace_scoped(body, local_mapping)
                 )
                 return "".join(out)
-        match = re.match(r"[A-Za-z_][A-Za-z0-9_']*", raw[index:])
+        match = re.match(r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*", raw[index:])
         if match is not None:
             token = match.group(0)
-            out.append(_dossier_contract_alpha_identifier_token(token, mapping))
+            head, separator, tail = token.partition(".")
+            # Namespace-qualified suffixes are constants, not occurrences of
+            # same-spelled local binders. Preserve a genuinely local projection
+            # head (n.val), without rewriting constants such as Namespace.n.
+            out.append(_dossier_contract_alpha_identifier_token(head, mapping))
+            if separator:
+                out.append(separator + tail)
             index += len(token)
             continue
         out.append(raw[index])

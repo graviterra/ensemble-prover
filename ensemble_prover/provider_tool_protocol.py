@@ -858,14 +858,16 @@ def _resolve_mini_leaf_output_cap(
         cap_source = f"{cap_source}+{request_kind}_visible_floor"
     capacity = _positive_int(getattr(cfg, "max_tokens", None))
     if capacity > 0:
-        if (
+        if str(request_kind or "") == "final_no_tools" or (
             (leaf_name.startswith("gpt-5.6") or mini_gpt6_model(model))
             and planner_visible_floor
         ):
-            # These planner stages receive the role's configured output
-            # allowance. This is independent of the reasoning setting:
-            # disabling reasoning must not quietly reinstate an 8K/16K
-            # harness-side truncation boundary on the visible plan.
+            # Serialization receives the configured output allowance, not a
+            # graph-search heuristic. Low reasoning effort is not a token
+            # bound: providers can consume a smaller shared envelope entirely
+            # on reasoning, leaving no final proof. Preserve explicit reasoning
+            # intent and let cost admission reserve this same concrete limit.
+            # Explicit request overrides have already returned above.
             automatic_cap = capacity
             cap_source = "model_output_capacity"
         else:

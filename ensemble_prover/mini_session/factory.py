@@ -831,9 +831,10 @@ def _stage_session_verified_helper(
             or {}
         )
         reuse_equivalent = getattr(outbox, "reuse_equivalent_work", None)
-        if str(
-            getattr(helper, "phase", "") or ""
-        ) == "proof_state_cache_seed" and callable(reuse_equivalent):
+        # Both live acceptance and cache replay may encounter exact work that
+        # is already pending or published. Reuse durably adds this workspace's
+        # authority; a policy/source miss still follows normal enqueue/revoke.
+        if callable(reuse_equivalent):
             result = reuse_equivalent(
                 helper,
                 **metadata,

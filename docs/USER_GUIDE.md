@@ -1,6 +1,6 @@
 # Ensemble Prover User Guide
 
-Last updated: 2026-09-10.
+Last updated: 2026-09-11.
 
 Start with a Lean theorem, a natural-language claim, or mathematical notes for
 a longer project. Mini Prover searches for proofs and checks them with Lean.
@@ -16,7 +16,7 @@ gap. Supply a built Lake project to let the same discovery run formalize candida
 arguments, search for proofs with Mini, independently check exports, and return
 feedback to research. A research assessment is not a Lean proof certificate.
 
-This guide covers release 1.09, including both experimental NL frontends and
+This guide covers release 1.10, including both experimental NL frontends and
 the optional Codex subscription backend for Mini and autonomous research, plus
 the experimental research-to-proof workflow in this source checkout. Older
 release snapshots may not include the research modules; Mini-only releases also lack the NL

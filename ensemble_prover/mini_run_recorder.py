@@ -497,6 +497,7 @@ _LLM_USAGE_ROLE_SUFFIXES = {
     "usage_missing_responses",
     "cost_usd",
     "estimated_unknown_cost_usd",
+    "usage_events",
     "model",
 }
 
@@ -2980,6 +2981,10 @@ class RunRecorder:
             self._metric_add(key, record.get(key))
         role = _canonical_llm_usage_role(str(record.get("role") or ""))
         if role:
+            # A generic "llm" role shares the aggregate's key; it was counted
+            # above and must not increment that same metric a second time.
+            if role != "llm":
+                self._metric_add(f"{role}_usage_events", 1)
             for key in (
                 "input_tokens",
                 "output_tokens",

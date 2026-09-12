@@ -192,15 +192,28 @@ def _validate_cost_financial_state(state: Dict[str, Any]) -> None:
     if any(type(value) is not str for value in roles.values()):
         raise ValueError("unknown cost roles must be strings")
     token_fields = {name.removeprefix("_") for name in _COST_LEDGER_COUNT_FIELDS[:6]}
-    role_fields = token_fields | {"cost_usd", "estimated_unknown_cost_usd", "model"}
+    required_role_fields = token_fields | {"cost_usd", "estimated_unknown_cost_usd", "model"}
+    optional_role_fields = {"usage_events"}
+    restored_role_totals: Dict[str, Dict[str, Any]] = {}
     for role, value in _cost_record_mapping(state["_role_totals"], label="role totals").items():
         totals = _cost_record_mapping(value, label=f"role totals.{role}")
-        if set(totals) != role_fields or type(totals["model"]) is not str:
+        extra = set(totals) - required_role_fields - optional_role_fields
+        missing = required_role_fields - set(totals)
+        if extra or missing or type(totals["model"]) is not str:
             raise ValueError("role total fields do not match the schema")
         for name in token_fields:
             _cost_record_count(totals[name], label=f"role totals.{role}.{name}")
+        if "usage_events" in totals:
+            _cost_record_count(
+                totals["usage_events"],
+                label=f"role totals.{role}.usage_events",
+            )
+        else:
+            totals["usage_events"] = 0
         for name in ("cost_usd", "estimated_unknown_cost_usd"):
             _cost_record_number(totals[name], label=f"role totals.{role}.{name}")
+        restored_role_totals[role] = totals
+    state["_role_totals"] = restored_role_totals
     for name in ("_late_usage_receipts", "_inflight_dispatch_intents"):
         for key, value in _cost_record_mapping(state[name], label=name).items():
             _validate_cost_financial_record(value, label=f"{name}.{key}")
@@ -1754,6 +1767,21 @@ def _canonical_usage_role(role: str) -> str:
     return mapping.get(text, text or "llm")
 
 
+def _empty_role_totals() -> Dict[str, Any]:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_tokens": 0,
+        "prompt_cache_miss_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "usage_events": 0,
+        "cost_usd": 0.0,
+        "estimated_unknown_cost_usd": 0.0,
+        "model": "",
+    }
+
+
 class CostBudgetController:
     """Shared MiniSession cost meter and optional dollar-budget guard."""
 
@@ -1822,6 +1850,15 @@ class CostBudgetController:
         self._role_totals: Dict[str, Dict[str, Any]] = {}
         self._pending_late_usage_tasks: set[asyncio.Task] = set()
         self._final_accounting_frozen = False
+
+    def _role_totals_locked(self, role_key: str) -> Dict[str, Any]:
+        totals = self._role_totals.setdefault(role_key, _empty_role_totals())
+        totals.setdefault("usage_events", 0)
+        return totals
+
+    def _note_role_usage_event_locked(self, role_key: str) -> None:
+        totals = self._role_totals_locked(role_key)
+        totals["usage_events"] = int(totals.get("usage_events", 0) or 0) + 1
 
     def _execution_record_locked(self) -> Dict[str, Any]:
         fields = (
@@ -3103,6 +3140,7 @@ class CostBudgetController:
             if self._durable_write_failed:
                 raise OSError("cost durable journal is unavailable after a failed write")
             self._events += 1
+            self._note_role_usage_event_locked(role_key)
             self._usage_missing_events += 1
             if self._reservation_target_is_unpriced(reservation, clean_target):
                 if dispatch_ordinal > 0:
@@ -3142,20 +3180,7 @@ class CostBudgetController:
                 self._reservation_unknown_role[reservation.reservation_id] = role_key
                 delta = max(0.0, aggregate - prior_aggregate)
                 self._unknown_cost_usd += delta
-                role_totals = self._role_totals.setdefault(
-                    role_key,
-                    {
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cached_input_tokens": 0,
-                        "cache_write_tokens": 0,
-                        "prompt_cache_miss_tokens": 0,
-                        "reasoning_output_tokens": 0,
-                        "cost_usd": 0.0,
-                        "estimated_unknown_cost_usd": 0.0,
-                        "model": "",
-                    },
-                )
+                role_totals = self._role_totals_locked(role_key)
                 role_totals["estimated_unknown_cost_usd"] = float(
                     role_totals.get("estimated_unknown_cost_usd", 0.0) or 0.0
                 ) + delta
@@ -3578,6 +3603,7 @@ class CostBudgetController:
                         )
                 self._refresh_terminal_reason_locked()
             self._events += 1
+            self._note_role_usage_event_locked(role_key)
             event = {
                     "phase": "llm_usage",
                     "verdict": "llm_late_pre_generation_rejection_recorded",
@@ -4395,20 +4421,8 @@ class CostBudgetController:
                         cancelled_exposure_reversed
                     ),
                 )
-            role_totals = self._role_totals.setdefault(
-                role_key,
-                {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cached_input_tokens": 0,
-                    "cache_write_tokens": 0,
-                    "prompt_cache_miss_tokens": 0,
-                    "reasoning_output_tokens": 0,
-                    "cost_usd": 0.0,
-                    "estimated_unknown_cost_usd": 0.0,
-                    "model": "",
-                },
-            )
+            role_totals = self._role_totals_locked(role_key)
+            self._note_role_usage_event_locked(role_key)
             role_totals["input_tokens"] += input_tokens
             role_totals["output_tokens"] += output_tokens
             role_totals["cached_input_tokens"] += cached_tokens
@@ -5700,6 +5714,12 @@ class CostBudgetController:
             summary[f"{prefix}_reasoning_output_tokens"] = int(
                 totals["reasoning_output_tokens"]
             )
+            # "llm_usage_events" already denotes all roles, including generic
+            # receipts; publishing that role's subtotal would erase the total.
+            if prefix != "llm":
+                summary[f"{prefix}_usage_events"] = int(
+                    totals.get("usage_events", 0) or 0
+                )
             summary[f"{prefix}_cost_usd"] = float(totals["cost_usd"])
             summary[f"{prefix}_estimated_unknown_cost_usd"] = float(
                 totals["estimated_unknown_cost_usd"]

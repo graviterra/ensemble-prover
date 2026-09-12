@@ -13,6 +13,11 @@ point for proof search is `ensemble_prover.mini_prover`.
 
 September 2026 — highlights from the current source checkout:
 
+- **1.10 — proof-search reliability:** resumed helper verification preserves its
+  saved time allowance; planner admission recognizes restated verified helpers;
+  proof finalization retains the configured output capacity. Recovered usage
+  reports keep planner and prover counts separate, and equivalent helper
+  promotion work is reused without repeatedly scanning earlier receipts.
 - **Unknown-answer questions — experimental:** Mini can propose and review
   explicit terms for `answer(sorry)` slots, then try to prove the exact filled
   theorem. The original question is preserved; a proposed answer is not a proof.
@@ -47,7 +52,7 @@ every feature above.
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
 file and Lake project. PutnamBench files are supported through a compatibility
 adapter, and callers may attach a natural-language problem description as
-additional model context. Release 1.09 also includes
+additional model context. Release 1.10 also includes
 experimental natural-language entry points: `ensemble_prover.nl_input` for a
 single claim and `ensemble_prover.formalization` for resumable, multi-file
 projects. These translate text before proving; the resulting Lean statement
@@ -108,7 +113,7 @@ the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** 1.09 — research preview. Includes Mini Prover, experimental
+> **Release status:** 1.10 — research preview. Includes Mini Prover, experimental
 > single-claim NL input, and resumable multi-file formalization campaigns.
 > Optional Codex and Claude Code subscription backends serve Mini's prover and refiner,
 > alongside the existing API providers. Codex also serves autonomous research.

@@ -33,7 +33,11 @@ from .deadline_guard import (
     create_result_only_deadline_task,
     outer_guard_timeout_s,
 )
-from .lean_parser import canonical_error_type, fallback_error_type_from_text
+from .lean_parser import (
+    _diagnostic_compact_lines,
+    canonical_error_type,
+    fallback_error_type_from_text,
+)
 from .math_utils import _strip_lean_comments_and_strings
 from .lean_runner import (
     LEAN_RESIDUAL_VERIFIER_GENERATION,
@@ -65,6 +69,7 @@ from .mini_deadline_transaction import DeadlineMutationTransaction
 from .proof_dossier import (
     ProofDossier,
     _decl_application_error_is_lean_diagnostic,
+    _prompt_safe_lean_diagnostic_text,
     active_root_target_statement,
     dossier_root_equivalence_placeholder,
     helper_decl_name,
@@ -5310,6 +5315,8 @@ async def _validate_same_problem_cache_batch(
     dossier: ProofDossier,
     records: Sequence[Mapping[str, Any]],
     timeout_s: float,
+    deadline_monotonic: float = 0.0,
+    _stage_before_check: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Optional[_CacheSeedBatchReceipt], Dict[str, Any]]:
     """Certify one valid cache closure in one Lean compilation.
 
@@ -5332,20 +5339,58 @@ async def _validate_same_problem_cache_batch(
     }
     if not helper_blocks:
         return None, telemetry
-    batch_timeout_s = max(
-        float(timeout_s or 0.0),
-        min(
-            60.0,
-            max(
-                2.0 * float(timeout_s or 0.0),
-                float(timeout_s or 0.0) + 0.5 * len(helper_blocks),
-            ),
-        ),
-    )
+    if _stage_before_check is not None and not _stage_before_check():
+        telemetry["batch_validation_verdict"] = "batch_validation_pending_owner_busy"
+        return None, telemetry
+    # A batch is one Lean compilation, so it receives the configured full
+    # verifier allowance. The old helper-count heuristic both undersized cold
+    # imports (12s -> 27s for 30 helpers) and exceeded explicit small limits.
+    batch_timeout_s = float(timeout_s or 0.0)
+    telemetry["batch_validation_timeout_s"] = batch_timeout_s
     if batch_timeout_s <= 0.0:
+        return None, telemetry
+    if _fully_funded_operation_timeout(batch_timeout_s, deadline_monotonic) <= 0.0:
+        telemetry["batch_validation_verdict"] = "batch_validation_deadline_deferred"
         return None, telemetry
     telemetry["batch_validation_attempted"] = True
     started = time.monotonic()
+
+    def record_failure(result: Any, *, check_kind: str, candidate_size: int) -> None:
+        raw = str(getattr(result, "output", "") or "")
+        parsed = getattr(result, "parsed", None)
+        if not raw:
+            raw = str(getattr(parsed, "raw", "") or "")
+        # Lean feedback is untrusted; retain the actual diagnostic but not
+        # terminal escapes, string payloads, or prompt/answer-reference bait.
+        error_messages = [
+            str(getattr(item, "message", "") or "")
+            for item in list(getattr(parsed, "diagnostics", ()) or ())
+            if str(getattr(item, "severity", "") or "").lower() == "error"
+        ]
+        # Put parsed errors ahead of verbose build/context chatter so a
+        # bounded preview preserves the failure, even when it appears late.
+        diagnostic_source = "\n".join([*error_messages, raw])
+        normalized = "\n".join(_diagnostic_compact_lines(diagnostic_source))
+        safe = _prompt_safe_lean_diagnostic_text(
+            normalized,
+            limit=max(4096, 2 * len(normalized)),
+            preserve_line_breaks=True,
+            strip_comments=False,
+        )
+        truncated = len(safe) > 4096
+        diagnostic = (
+            safe if not truncated else safe[:4050] + "\n... (Lean output truncated)"
+        )
+        fields = {
+            "batch_validation_diagnostic": diagnostic,
+            "batch_validation_diagnostic_length": len(raw),
+            "batch_validation_diagnostic_truncated": truncated,
+            "batch_validation_returncode": getattr(result, "returncode", None),
+            "batch_validation_failed_check_kind": check_kind,
+            "batch_validation_failed_candidate_count": candidate_size,
+        }
+        telemetry.update(fields)
+        telemetry.setdefault("batch_validation_failures", []).append(fields)
 
     def signature_rejects_keyword(exc: TypeError, keyword: str) -> bool:
         message = str(exc or "").lower()
@@ -5357,6 +5402,10 @@ async def _validate_same_problem_cache_batch(
         lemmas: Sequence[str],
     ) -> Any:
         async def operation() -> Any:
+            if _fully_funded_operation_timeout(
+                batch_timeout_s, deadline_monotonic,
+            ) <= 0.0:
+                raise _LeanOperationDeadline("cache seed batch deadline deferred")
             optional_kwargs: Dict[str, Any] = {
                 "timeout_s": batch_timeout_s,
                 "check_kind": check_kind,
@@ -5394,6 +5443,7 @@ async def _validate_same_problem_cache_batch(
             lean,
             operation,
             timeout_s=batch_timeout_s,
+            deadline_monotonic=deadline_monotonic,
             operation_label=check_kind,
         )
 
@@ -5421,6 +5471,11 @@ async def _validate_same_problem_cache_batch(
                 lemmas,
             )
             if not bool(getattr(primary_result, "ok", False)):
+                record_failure(
+                    primary_result,
+                    check_kind="proof_state_cache_seed_batch",
+                    candidate_size=candidate_size,
+                )
                 last_failure_kind = (
                     canonical_error_type(getattr(primary_result, "parsed", None))
                     or "proof_state_cache_seed_batch_check_failed"
@@ -5438,6 +5493,11 @@ async def _validate_same_problem_cache_batch(
                     lemmas,
                 )
                 if not bool(getattr(answer_safe_result, "ok", False)):
+                    record_failure(
+                        answer_safe_result,
+                        check_kind="proof_state_cache_seed_batch_answer_safe",
+                        candidate_size=candidate_size,
+                    )
                     last_failure_kind = (
                         canonical_error_type(
                             getattr(answer_safe_result, "parsed", None)
@@ -5485,8 +5545,15 @@ async def _validate_same_problem_cache_batch(
         raise
     except Exception as exc:
         batch_exception = True
+        record_failure(
+            SimpleNamespace(output=str(exc), returncode=None),
+            check_kind="proof_state_cache_seed_batch_exception",
+            candidate_size=candidate_size,
+        )
         telemetry["batch_validation_failure_kind"] = type(exc).__name__
-        telemetry["batch_validation_failure"] = str(exc)[:240]
+        telemetry["batch_validation_failure"] = (
+            telemetry["batch_validation_diagnostic"][:240]
+        )
         telemetry["batch_validation_verdict"] = "batch_validation_exception"
     finally:
         telemetry["batch_validation_elapsed_s"] = round(
@@ -5507,7 +5574,8 @@ async def seed_verified_helpers_from_same_problem_cache(
     proof_state: Optional[ProofSearchState],
     proof_cache: Optional[MiniVerifiedLemmaCache],
     theorem_name: str,
-    timeout_s: float = 12.0,
+    timeout_s: Optional[float] = None,
+    deadline_monotonic: float = 0.0,
     max_helpers: int = 64,
     max_passes: int = 3,
     _candidate_records: Optional[Sequence[Mapping[str, Any]]] = None,
@@ -5515,6 +5583,16 @@ async def seed_verified_helpers_from_same_problem_cache(
 ) -> Dict[str, Any]:
     """Seed cached helpers and finalize every certified admission tranche."""
 
+    # Real runners expose cfg.timeout_s; retain the historical fallback only
+    # for older/configuration-less adapters. An explicit zero still disables
+    # seeding, and old checkpoints' explicit 12s values remain authoritative.
+    timeout = float(
+        getattr(getattr(lean, "cfg", None), "timeout_s", 12.0)
+        if timeout_s is None
+        else timeout_s
+    )
+    if not math.isfinite(timeout):
+        raise ValueError("cache seed timeout must be finite")
     derived_refresh = _CacheSeedDerivedRefresh(
         dossier=dossier,
         proof_state=proof_state,
@@ -5527,7 +5605,8 @@ async def seed_verified_helpers_from_same_problem_cache(
             proof_state=proof_state,
             proof_cache=proof_cache,
             theorem_name=theorem_name,
-            timeout_s=timeout_s,
+            timeout_s=timeout,
+            deadline_monotonic=deadline_monotonic,
             max_helpers=max_helpers,
             max_passes=max_passes,
             _candidate_records=_candidate_records,
@@ -5547,6 +5626,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
     proof_cache: Optional[MiniVerifiedLemmaCache],
     theorem_name: str,
     timeout_s: float = 12.0,
+    deadline_monotonic: float = 0.0,
     max_helpers: int = 64,
     max_passes: int = 3,
     _candidate_records: Optional[Sequence[Mapping[str, Any]]] = None,
@@ -5627,6 +5707,12 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
 
     inc("mini_proof_state_cache_seed_candidates", len(candidates))
     pending = _dependency_order_cache_seed_records(candidates)
+    root_node = (
+        proof_state.nodes.get(proof_state.root_node_id)
+        if proof_state is not None
+        else None
+    )
+    initial_batch_pending: Optional[Dict[str, Any]] = None
     batch_receipt = _cached_seed_batch_receipt(
         proof_state,
         _batch_receipt_key,
@@ -5647,6 +5733,36 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
             # batch/per-helper verifier path; never treat a stale receipt as
             # rejection evidence.
             batch_receipt = None
+
+    def stage_batch_inputs() -> bool:
+        nonlocal initial_batch_pending
+        if root_node is not None:
+            # The first await may be a long cold batch compile. Persist its
+            # inputs before launch: attempted=True alone cannot resume after
+            # interruption, and a cache entry is never a proof certificate.
+            first_record = pending[0]
+            first_source = str(first_record.get("source") or "").strip()
+            if not stage_pending_helper_acceptance(
+                conv=conv,
+                dossier=dossier,
+                node=root_node,
+                helper_block=first_source,
+                source=f"cache_seed:{text_hash(first_source)}",
+                continuation={
+                    "kind": "cache_seed_batch",
+                    "theorem_name": summary["theorem_name"],
+                    "remaining_cache_records": [
+                        dict(record) for record in pending[1:]
+                    ],
+                    "timeout_s": timeout_s,
+                    "batch_receipt_key": "",
+                },
+                refresh_quality=False,
+            ):
+                return False
+            initial_batch_pending = root_node.pending_helper_acceptance
+        return True
+
     if batch_receipt is None:
         batch_receipt, batch_validation_telemetry = (
             await _validate_same_problem_cache_batch(
@@ -5655,6 +5771,8 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 dossier=dossier,
                 records=pending,
                 timeout_s=float(timeout_s or 0.0),
+                deadline_monotonic=deadline_monotonic,
+                _stage_before_check=stage_batch_inputs,
             )
         )
     else:
@@ -5672,6 +5790,12 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
     )
     summary["batch_candidate_count"] = len(pending)
     summary.update(batch_validation_telemetry)
+    if batch_validation_telemetry.get("batch_validation_verdict") == (
+        "batch_validation_pending_owner_busy"
+    ):
+        summary["retryable_error_count"] = 1
+        summary["verdict"] = "cache_seed_pending_owner_busy"
+        return summary
     batch_validation_attempted = bool(
         batch_validation_telemetry.get("batch_validation_attempted")
     )
@@ -5835,21 +5959,33 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 )
             ]
             if root_node is not None:
-                staged = stage_pending_helper_acceptance(
-                    conv=conv,
-                    dossier=dossier,
-                    node=root_node,
-                    helper_block=helper_block,
-                    source=f"cache_seed:{source_hash}",
-                    continuation={
-                        "kind": "cache_seed_batch",
-                        "theorem_name": summary["theorem_name"],
-                        "remaining_cache_records": remaining_cache_records,
-                        "timeout_s": float(timeout_s or 0.0),
-                        "batch_receipt_key": batch_receipt_key,
-                    },
-                    refresh_quality=batch_admission is None,
-                )
+                if (
+                    initial_batch_pending is not None
+                    and root_node.pending_helper_acceptance is initial_batch_pending
+                ):
+                    # This producer owns only the exact WAL entry it staged
+                    # above, not any preexisting/replaced pending candidate.
+                    initial_batch_pending["continuation"]["batch_receipt_key"] = (
+                        batch_receipt_key
+                    )
+                    staged = True
+                    initial_batch_pending = None
+                else:
+                    staged = stage_pending_helper_acceptance(
+                        conv=conv,
+                        dossier=dossier,
+                        node=root_node,
+                        helper_block=helper_block,
+                        source=f"cache_seed:{source_hash}",
+                        continuation={
+                            "kind": "cache_seed_batch",
+                            "theorem_name": summary["theorem_name"],
+                            "remaining_cache_records": remaining_cache_records,
+                            "timeout_s": float(timeout_s or 0.0),
+                            "batch_receipt_key": batch_receipt_key,
+                        },
+                        refresh_quality=batch_admission is None,
+                    )
                 if not staged:
                     summary["retryable_error_count"] = (
                         int(summary["retryable_error_count"]) + 1
@@ -5872,6 +6008,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 phase="proof_state_cache_seed",
                 turn_index=0,
                 timeout_s=float(timeout_s or 0.0),
+                deadline_monotonic=deadline_monotonic,
                 proof_cache=None,
                 proof_state=proof_state,
                 status_out=status,
@@ -11100,6 +11237,20 @@ async def _try_proof_state_one_child_closure(
         )
         continuation = dict(pending.get("continuation") or {})
         continuation_kind = str(continuation.get("kind") or "")
+        if continuation_kind == "cache_seed_batch":
+            # The first pending helper and its suffix share the same explicit
+            # verifier policy. Do not replace a saved 12s override with the
+            # generic residual verifier's 300s allowance on resume. Missing or
+            # malformed saved budgets defer without allocating fresh work.
+            saved_timeout = continuation.get("timeout_s")
+            try:
+                pending_acceptance_timeout_s = (
+                    0.0 if isinstance(saved_timeout, bool) else float(saved_timeout)
+                )
+            except (TypeError, ValueError, OverflowError):
+                pending_acceptance_timeout_s = 0.0
+            if not math.isfinite(pending_acceptance_timeout_s):
+                pending_acceptance_timeout_s = 0.0
         cache_seed_batch_receipt = (
             _cached_seed_batch_receipt(
                 proof_state,
@@ -11227,9 +11378,8 @@ async def _try_proof_state_one_child_closure(
                             continuation.get("theorem_name")
                             or getattr(dossier, "theorem_name", "")
                         ),
-                        timeout_s=_remaining_timeout(
-                            float(continuation.get("timeout_s") or timeout_s)
-                        ),
+                        timeout_s=float(continuation.get("timeout_s") or timeout_s),
+                        deadline_monotonic=action_deadline_monotonic,
                         max_helpers=len(remaining_cache_records),
                         _candidate_records=remaining_cache_records,
                         _batch_receipt_key=str(
@@ -11673,9 +11823,8 @@ async def _try_proof_state_one_child_closure(
                         continuation.get("theorem_name")
                         or getattr(dossier, "theorem_name", "")
                     ),
-                    timeout_s=_remaining_timeout(
-                        float(continuation.get("timeout_s") or timeout_s)
-                    ),
+                    timeout_s=float(continuation.get("timeout_s") or timeout_s),
+                    deadline_monotonic=action_deadline_monotonic,
                     max_helpers=len(remaining_cache_records),
                     _candidate_records=remaining_cache_records,
                     _batch_receipt_key=str(

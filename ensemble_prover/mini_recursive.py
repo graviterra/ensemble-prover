@@ -15060,6 +15060,209 @@ def _quantified_equality_sanity_is_adversarial(
     )
 
 
+def _sanity_helper_contract_key(statement: str) -> tuple[Any, ...]:
+    """Conservative, admission-only key for typed quantifiers and implication.
+
+    Preserve parameter domains and lexical scope. The only logical reshape is
+    ``(∃ x, P x) → Q`` to ``∀ x, P x → Q`` when moving the binder cannot capture
+    a free name in Q; unused explicit Pi binders become ordinary arrows. This
+    is not a Lean identity and must never authorize proof reuse or acceptance.
+    Unsupported binder/term syntax fails closed instead of guessing its scope.
+    """
+
+    def parse(text: str) -> tuple[Any, ...]:
+        raw = _strip_balanced_outer_parens(text.strip())
+        quantifier = re.match(r"^(∀|∃|forall\b|exists\b)\s*", raw)
+        if quantifier:
+            comma = _find_top_level_comma(raw[quantifier.end():])
+            if comma < 0:
+                raise ValueError("unterminated quantifier")
+            comma += quantifier.end()
+            groups = _binder_group_chunks(raw[quantifier.end():comma])
+            binders: list[tuple[str, tuple[Any, ...]]] = []
+            for group in groups:
+                if group.startswith(("{", "[", "⦃")):
+                    raise ValueError("implicit binder")
+                body = _strip_balanced_outer_parens(group)
+                colon = _top_level_colon_index(body)
+                if colon < 0:
+                    raise ValueError("untyped binder")
+                names = body[:colon].split()
+                if not names or any(
+                    _LEAN_IDENTIFIER_PATTERN.fullmatch(name) is None
+                    or name == "_" for name in names
+                ) or len(set(names)) != len(names):
+                    raise ValueError("unsupported binder name")
+                annotation = parse(body[colon + 1:])
+                # Same-group types are evaluated before any group name enters
+                # scope. Refuse a name reused in that annotation; splitting
+                # such a group could otherwise capture a previously free name.
+                if len(names) > 1 and set(names) & free_names(annotation):
+                    raise ValueError("dependent multi-name group")
+                binders.extend((name, annotation) for name in names)
+            if not binders:
+                raise ValueError("empty binder")
+            result = parse(raw[comma + 1:])
+            kind = "forall" if quantifier[1] in {"∀", "forall"} else "exists"
+            for name, annotation in reversed(binders):
+                result = (kind, name, annotation, result)
+            return result
+        parts = _split_top_level_implications(raw)
+        if len(parts) > 1:
+            result = parse(parts[-1])
+            for part in reversed(parts[:-1]):
+                result = ("arrow", parse(part), result)
+            return result
+        tokens: list[tuple[Any, ...]] = []
+        index = 0
+        while index < len(raw):
+            if raw[index].isspace():
+                index += 1
+                continue
+            skip = _lean_surface_lexical_skip_end(raw, index)
+            if skip is not None:
+                token = raw[index:skip]
+                tokens.append(("name" if token.startswith("«") else "literal", token))
+                index = skip
+                continue
+            if raw[index] in _LEAN_SURFACE_GROUP_OPEN_TO_CLOSE:
+                end = _matching_surface_group_index(raw, index)
+                if end < 0:
+                    raise ValueError("unbalanced group")
+                tokens.append(("group", raw[index], parse(raw[index + 1:end])))
+                index = end + 1
+                continue
+            match = _LEAN_IDENTIFIER_PATTERN.match(raw, index)
+            if match:
+                token = match[0]
+                if token in {"fun", "let", "match", "by", "do", "if", "forall", "exists"}:
+                    raise ValueError("unsupported scope")
+                end = match.end()
+                while end < len(raw) and raw[end] == ".":
+                    component = _LEAN_IDENTIFIER_PATTERN.match(raw, end + 1)
+                    if component is None:
+                        # Quoted components and projection syntax need Lean's
+                        # name resolution; do not reinterpret their scopes.
+                        raise ValueError("unsupported qualified identifier")
+                    end = component.end()
+                if end != match.end():
+                    tokens.append(("qualified", raw[index:end]))
+                    index = end
+                    continue
+                tokens.append(("name", token))
+                index = match.end()
+                continue
+            # Quantifiers embedded in an unparenthesized operator expression
+            # need a full Lean precedence parser; do not normalize those here.
+            if raw[index] in "∀∃":
+                raise ValueError("embedded quantifier")
+            tokens.append(("literal", raw[index]))
+            index += 1
+        if not tokens:
+            raise ValueError("empty expression")
+        return ("atom", tuple(tokens))
+
+    def free_names(node: tuple[Any, ...]) -> set[str]:
+        kind = node[0]
+        if kind in {"forall", "exists"}:
+            return free_names(node[2]) | (free_names(node[3]) - {node[1]})
+        if kind == "arrow":
+            return free_names(node[1]) | free_names(node[2])
+        if kind == "atom":
+            return set().union(*(free_names(token) for token in node[1]))
+        if kind == "group":
+            return free_names(node[2])
+        if kind == "qualified":
+            return {node[1].split(".", 1)[0]}
+        return {node[1]} if kind == "name" else set()
+
+    def reshape(node: tuple[Any, ...]) -> tuple[Any, ...]:
+        kind = node[0]
+        if kind in {"forall", "exists"}:
+            annotation, body = reshape(node[2]), reshape(node[3])
+            if kind == "forall" and node[1] not in free_names(body):
+                return reshape(("arrow", annotation, body))
+            return (kind, node[1], annotation, body)
+        if kind == "arrow":
+            left, right = reshape(node[1]), reshape(node[2])
+            if left[0] == "exists" and left[1] not in free_names(right):
+                return reshape(("forall", left[1], left[2], ("arrow", left[3], right)))
+            return (kind, left, right)
+        if kind == "group":
+            return (kind, node[1], reshape(node[2]))
+        if kind == "atom":
+            return (kind, tuple(reshape(token) for token in node[1]))
+        return node
+
+    def scoped(node: tuple[Any, ...], names: tuple[str, ...] = ()) -> tuple[Any, ...]:
+        kind = node[0]
+        if kind in {"forall", "exists"}:
+            return (kind, scoped(node[2], names), scoped(node[3], (*names, node[1])))
+        if kind == "name":
+            return ("bound", names[::-1].index(node[1])) if node[1] in names else node
+        if kind == "qualified":
+            if node[1].split(".", 1)[0] in names:
+                raise ValueError("local field notation requires elaboration")
+            return node
+        if kind == "arrow":
+            return (kind, scoped(node[1], names), scoped(node[2], names))
+        if kind == "group":
+            return (kind, node[1], scoped(node[2], names))
+        if kind == "atom":
+            return (kind, tuple(scoped(token, names) for token in node[1]))
+        return node
+
+    try:
+        return scoped(reshape(parse(_strip_contract_comments(statement))))
+    except (ValueError, RecursionError):
+        return ()
+
+
+def _claim_reuses_rendered_verified_helper(
+    claim: MiniSubgoalClaim,
+    rendered_helper_blocks: Sequence[str],
+    *,
+    rendered_helper_identities: Sequence[str] = (),
+) -> str:
+    """Name of a rendered helper that already proves ``claim``, else ``""``.
+
+    Admission may treat that Lean receipt as the missing sanity check. Match
+    only the rendered/citable set: a store-only helper is not yet usable at
+    assembly. Identities are used when the claim already carries one. Distinct
+    Expr identities do not rule out the admission-only propositional reshapes
+    below, so an unmatched identity still reaches that conservative matcher.
+    """
+
+    if not rendered_helper_blocks:
+        return ""
+    statements = [str(getattr(claim, "statement", "") or "")]
+    identities = [_bound_claim_contract_identity(claim)]
+    use_identities = any(
+        has_lean_contract_identity(identity) for identity in identities
+    )
+    helper_name, _matched = _reusable_verified_helper_match(
+        rendered_helper_blocks,
+        statements,
+        rendered_helper_identities=(
+            rendered_helper_identities if use_identities else ()
+        ),
+        candidate_identities=identities if use_identities else (),
+    )
+    if helper_name:
+        return helper_name
+    # This fallback excuses missing numerical prose only. In particular, keep
+    # the stricter authoritative helper-reuse matcher unchanged: the compiled
+    # claim still needs Lean validation and an accepted proof before discharge.
+    key = _sanity_helper_contract_key(statements[0])
+    if key:
+        for block in rendered_helper_blocks:
+            source = str(block or "")
+            name = str(helper_decl_name(source) or "").strip()
+            if name and _sanity_helper_contract_key(helper_decl_statement(source)) == key:
+                return name
+    return ""
+
+
 def _claim_declared_sanity_contract_reason(
     claim: MiniSubgoalClaim,
     *,
@@ -15067,6 +15270,8 @@ def _claim_declared_sanity_contract_reason(
     root_statement: str = "",
     active_target_statements: Sequence[str] = (),
     allow_root_schema_exemption: bool = True,
+    rendered_helper_blocks: Sequence[str] = (),
+    rendered_helper_identities: Sequence[str] = (),
 ) -> str:
     """Return a diagnostic reason for one typed planner sanity receipt."""
 
@@ -15107,6 +15312,12 @@ def _claim_declared_sanity_contract_reason(
         and not root_schema
     )
     if sanity_required and not check:
+        if _claim_reuses_rendered_verified_helper(
+            claim,
+            rendered_helper_blocks,
+            rendered_helper_identities=rendered_helper_identities,
+        ):
+            return ""
         return "sanity_check_required"
     if status == "fails":
         return "declared_failed"
@@ -15141,6 +15352,8 @@ def _filter_plan_declared_sanity_contract(
     confirm_root_schemas: bool = False,
     active_target_contract_identities: Sequence[str] = (),
     missing_checks_only: bool = False,
+    rendered_helper_blocks: Sequence[str] = (),
+    rendered_helper_identities: Sequence[str] = (),
 ) -> MiniSubgoalPlan:
     """Audit receipts and optionally withhold protocol-incomplete fresh work.
 
@@ -15179,6 +15392,8 @@ def _filter_plan_declared_sanity_contract(
                         )
                     )
                 ),
+                rendered_helper_blocks=rendered_helper_blocks,
+                rendered_helper_identities=rendered_helper_identities,
             )
         )
         and (not missing_checks_only or reason == "sanity_check_required")
@@ -24984,6 +25199,19 @@ async def run_mini_recursive_driver(
             None if replaying_committed_contract_filter_prefix else record_event
         )
 
+        def current_sanity_admission_helpers() -> tuple[
+            tuple[str, ...], tuple[str, ...]
+        ]:
+            """Rendered helpers that may already satisfy a restated claim."""
+
+            blocks = tuple(get_helpers() or ())
+            return blocks, tuple(
+                _rendered_helper_bound_identities(
+                    blocks,
+                    current_helper_evidence_records(),
+                )
+            )
+
         def apply_surface_plan_filters(
             candidate_plan: MiniSubgoalPlan,
             *,
@@ -25004,6 +25232,7 @@ async def run_mini_recursive_driver(
                 stats=filter_stats,
                 planner_feedback=planner_feedback,
             )
+            helper_blocks, helper_identities = current_sanity_admission_helpers()
             filtered = _filter_plan_declared_sanity_contract(
                 filtered,
                 pass_index=pass_index,
@@ -25015,6 +25244,8 @@ async def run_mini_recursive_driver(
                 withhold_missing_required_checks=bool(
                     config.planner_sanity_contract_required
                 ),
+                rendered_helper_blocks=helper_blocks,
+                rendered_helper_identities=helper_identities,
             )
             filtered = _filter_plan_structurally_vacuous_auxiliary_claims(
                 filtered,
@@ -26171,6 +26402,7 @@ async def run_mini_recursive_driver(
             # Source arbitration may retain a mismatched schema as another
             # route's prerequisite; that does not excuse its missing receipt.
             # Recheck each actual claim, not the union of recognized names.
+            helper_blocks, helper_identities = current_sanity_admission_helpers()
             plan = _filter_plan_declared_sanity_contract(
                 plan,
                 pass_index=pass_index,
@@ -26185,6 +26417,8 @@ async def run_mini_recursive_driver(
                 confirm_root_schemas=True,
                 active_target_contract_identities=active_target_contract_identities,
                 missing_checks_only=True,
+                rendered_helper_blocks=helper_blocks,
+                rendered_helper_identities=helper_identities,
             )
 
             elaborated_root_candidate_names = tuple(
@@ -27427,6 +27661,9 @@ async def run_mini_recursive_driver(
                             original_plan=replan_original,
                             canonical_plan=replan_canonical,
                         )
+                    helper_blocks, helper_identities = (
+                        current_sanity_admission_helpers()
+                    )
                     replan_filtered = _filter_plan_declared_sanity_contract(
                         replan_filtered,
                         pass_index=pass_index,
@@ -27443,6 +27680,8 @@ async def run_mini_recursive_driver(
                             replan_active_target_contract_identities
                         ),
                         missing_checks_only=True,
+                        rendered_helper_blocks=helper_blocks,
+                        rendered_helper_identities=helper_identities,
                     )
                     replan_failed_root_indices = [
                         index
@@ -27931,6 +28170,7 @@ async def run_mini_recursive_driver(
             # older obligations; audit their complete dependency union before
             # selection, and retire exactly the withheld objects from both
             # queues so they cannot reappear on the next continuation.
+            helper_blocks, helper_identities = current_sanity_admission_helpers()
             candidate_route_identity_plan = _filter_plan_declared_sanity_contract(
                 candidate_route_identity_plan,
                 pass_index=pass_index,
@@ -27945,6 +28185,8 @@ async def run_mini_recursive_driver(
                 confirm_root_schemas=True,
                 active_target_contract_identities=active_target_contract_identities,
                 missing_checks_only=True,
+                rendered_helper_blocks=helper_blocks,
+                rendered_helper_identities=helper_identities,
             )
             admitted_ids = {id(claim) for claim in candidate_route_identity_plan.claims}
             for retained_queue in (pending_unproved_plan_claims, deferred_priority_claims):
@@ -28151,6 +28393,7 @@ async def run_mini_recursive_driver(
                 stats=stats,
                 planner_feedback=planner_feedback,
             )
+            helper_blocks, helper_identities = current_sanity_admission_helpers()
             restored_claim_plan = _filter_plan_declared_sanity_contract(
                 restored_claim_plan,
                 pass_index=pass_index,
@@ -28164,6 +28407,8 @@ async def run_mini_recursive_driver(
                 ),
                 confirm_root_schemas=True,
                 active_target_contract_identities=active_target_contract_identities,
+                rendered_helper_blocks=helper_blocks,
+                rendered_helper_identities=helper_identities,
             )
             admitted_claim_ids = {id(claim) for claim in restored_claim_plan.claims}
             claims = [

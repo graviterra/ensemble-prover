@@ -930,6 +930,14 @@ def _argv_option(argv: Sequence[str], option: str, default: str = "") -> str:
     return default
 
 
+def _safe_watchdog_usage_role(value: Any) -> str:
+    role = str(value or "").strip()
+    role = {"prove": "prover", "refine": "refiner"}.get(role, role)
+    return role if role and len(role) <= 64 and all(
+        char.isalnum() or char == "_" for char in role
+    ) else ""
+
+
 def _recover_watchdog_turn_metadata(
     output_dir: Path,
     *,
@@ -959,6 +967,7 @@ def _recover_watchdog_turn_metadata(
     )
     recovered_token_totals = {key: 0 for key in token_keys}
     recovered_role_token_totals: Dict[str, Dict[str, int]] = {}
+    recovered_role_usage_events: Dict[str, int] = {}
     recovered_usage_events = 0
     recovered_usage_missing_events = 0
     recovered_usage_counter_contributions: list[Dict[str, int]] = []
@@ -1060,8 +1069,10 @@ def _recover_watchdog_turn_metadata(
                 else 0
             )
             usage_contribution: Optional[Dict[str, int]] = None
+            safe_role = ""
             if usage_counter_event:
                 recovered_usage_events += 1
+                safe_role = _safe_watchdog_usage_role(record.get("role"))
                 if event_turn_index > 0:
                     usage_contribution = {
                         "turn_index": event_turn_index,
@@ -1071,6 +1082,16 @@ def _recover_watchdog_turn_metadata(
                     recovered_usage_counter_contributions.append(
                         usage_contribution
                     )
+                # Late provider receipts count just like ordinary usage rows.
+                # Generic "llm" already names the aggregate; never add its
+                # subtotal into that same key a second time.
+                if safe_role and safe_role != "llm":
+                    role_key = f"{safe_role}_usage_events"
+                    recovered_role_usage_events[role_key] = (
+                        recovered_role_usage_events.get(role_key, 0) + 1
+                    )
+                    if usage_contribution is not None:
+                        usage_contribution[role_key] = 1
                 if bool(record.get("usage_missing")) or verdict in {
                     "llm_usage_missing",
                     "llm_late_dispatch_missing_usage",
@@ -1082,18 +1103,6 @@ def _recover_watchdog_turn_metadata(
                 recovered_token_turn_index = max(
                     recovered_token_turn_index,
                     event_turn_index,
-                )
-                role = str(record.get("role") or "").strip()
-                role = {"prove": "prover", "refine": "refiner"}.get(
-                    role,
-                    role,
-                )
-                safe_role = (
-                    role
-                    if role
-                    and len(role) <= 64
-                    and all(char.isalnum() or char == "_" for char in role)
-                    else ""
                 )
                 role_totals = (
                     recovered_role_token_totals.setdefault(
@@ -1354,6 +1363,7 @@ def _recover_watchdog_turn_metadata(
         recovered.update(recovered_token_totals)
         recovered["llm_usage_events"] = recovered_usage_events
         recovered["llm_usage_missing_events"] = recovered_usage_missing_events
+        recovered.update(recovered_role_usage_events)
         for role, totals in recovered_role_token_totals.items():
             for key, value in totals.items():
                 recovered[f"{role}_{key}"] = value
@@ -1842,6 +1852,7 @@ def _write_failure_summary(
             for key, value in recovered.items()
             if (
                 key in {"llm_usage_events", "llm_usage_missing_events"}
+                or key.endswith("_usage_events")
                 or any(key == suffix or key.endswith(f"_{suffix}") for suffix in (
                     "input_tokens",
                     "output_tokens",
@@ -1860,6 +1871,20 @@ def _write_failure_summary(
         )
         recovered_counters_are_authoritative = not existing_has_accounting_authority
         if recovered_counters_are_authoritative:
+            if (
+                recovered.get("watchdog_recovery_usage_complete", False)
+                and recovered.get("llm_usage_events", 0) > 0
+            ):
+                # The complete trace replaces a legacy/non-authoritative
+                # summary. Remove stale role counts even for roles absent from
+                # that trace; otherwise role totals can exceed the aggregate.
+                for key in tuple(payload):
+                    if (
+                        key != "llm_usage_events"
+                        and key.endswith("_usage_events")
+                        and _safe_watchdog_usage_role(key.removesuffix("_usage_events"))
+                    ):
+                        payload.pop(key, None)
             for key in recovered_counter_keys:
                 # A complete append-only trace replaces legacy/partial
                 # counters. A coherent modern controller summary still wins

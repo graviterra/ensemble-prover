@@ -516,6 +516,18 @@ class PromotionOutbox:
                             workspace_id=workspace_id,
                             supersedes_entry_id=active.entry_id,
                         )
+                # A foreign producer may have committed since our reuse miss.
+                # Only an already-current index can acknowledge this write
+                # incrementally; otherwise the next lookup must refresh it.
+                index_was_current = False
+                try:
+                    index_was_current = (
+                        self._equivalent_work_index is not None
+                        and self._equivalent_work_entries_generation
+                        == self._entries_generation()
+                    )
+                except Exception:
+                    pass
                 path = self._write_entry_locked(entry)
                 exact_active_idempotent = bool(
                     active is not None
@@ -535,6 +547,21 @@ class PromotionOutbox:
                         promotable=True,
                         reason="generic_verified_helper",
                     )
+                # Cache maintenance must share the commit's lock so it cannot
+                # acknowledge unseen concurrent entries. It is best-effort:
+                # failure here must not reverse a durable receipt's success.
+                try:
+                    if index_was_current:
+                        self._index_equivalent_work(entry)
+                        self._equivalent_work_entries_generation = (
+                            self._entries_generation()
+                        )
+                    else:
+                        self._equivalent_work_index = None
+                        self._equivalent_work_entries_generation = None
+                except Exception:
+                    self._equivalent_work_index = None
+                    self._equivalent_work_entries_generation = None
         except Exception as exc:
             return PromotionEnqueueResult(
                 False,
@@ -542,14 +569,6 @@ class PromotionOutbox:
                 error_kind=type(exc).__name__,
                 error=str(exc),
             )
-        # This cache is only an acceleration structure. Receipt persistence
-        # already committed successfully and must never be reported as failed
-        # because best-effort in-memory maintenance raced or ran out of room.
-        try:
-            self._index_equivalent_work(entry)
-        except Exception:
-            self._equivalent_work_index = None
-            self._equivalent_work_entries_generation = None
         return PromotionEnqueueResult(
             True,
             entry_id=entry.entry_id,

@@ -10960,7 +10960,9 @@ class MiniSession:
     last_giveup_cluster: Optional[str] = None
     proof_cache_seed_same_problem: bool = True
     proof_cache_seed_max_helpers: int = 64
-    proof_cache_seed_timeout_s: float = 12.0
+    # None follows the configured Lean allowance; explicit values (including
+    # older checkpoints' 12s override) retain their original authority.
+    proof_cache_seed_timeout_s: Optional[float] = None
     _proof_cache_seed_attempted: bool = False
     last_giveup_match: str = ""
     hard_pivot_threshold: int = 2
@@ -24199,6 +24201,10 @@ class MiniSession:
                 seed_verified_helpers_from_same_problem_cache,
             )
 
+            remaining = self._run_governor_remaining_s()
+            seed_deadline = (
+                time.monotonic() + remaining if remaining is not None else 0.0
+            )
             summary = await seed_verified_helpers_from_same_problem_cache(
                 lean=self.lean,
                 conv=self.conv,
@@ -24206,7 +24212,8 @@ class MiniSession:
                 proof_state=self.proof_state,
                 proof_cache=self.proof_cache,
                 theorem_name=theorem_name,
-                timeout_s=float(self.proof_cache_seed_timeout_s or 0.0),
+                timeout_s=self.proof_cache_seed_timeout_s,
+                deadline_monotonic=seed_deadline,
                 max_helpers=int(self.proof_cache_seed_max_helpers or 0),
             )
         except Exception as exc:
