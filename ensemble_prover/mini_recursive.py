@@ -8519,7 +8519,21 @@ def _contract_compact_surface(text: str) -> str:
     return "".join(out)
 
 
+_CONTRACT_NORMALIZATION_CACHE_SIZE = 2048
+_CONTRACT_NORMALIZATION_CACHE_MAX_CHARS = 16384
+
+
 def _contract_norm(text: str) -> str:
+    # Only immutable textual normalization is reusable. Whether the resulting
+    # contract has proved support still depends on the current closure/context.
+    raw = str(text or "")
+    if len(raw) > _CONTRACT_NORMALIZATION_CACHE_MAX_CHARS:
+        return _cached_contract_norm.__wrapped__(raw)
+    return _cached_contract_norm(raw)
+
+
+@lru_cache(maxsize=_CONTRACT_NORMALIZATION_CACHE_SIZE)
+def _cached_contract_norm(text: str) -> str:
     stripped = _strip_leading_forall_binders(_strip_contract_comments(text))
     return _normalize_not_mem_contract_surface(_contract_compact_surface(stripped))
 
@@ -9068,19 +9082,27 @@ def _contract_alpha_norm(
     *,
     context_bound_names: Sequence[str] = (),
 ) -> str:
+    raw = str(text or "")
+    # Preserve binder order and take a fresh snapshot of mutable sequences.
+    # Apply the same name cleaning as the normalizer before making a hash key.
+    names = tuple(
+        str(name or "").strip()
+        for name in context_bound_names
+        if str(name or "").strip()
+    )
+    if len(raw) + sum(map(len, names)) > _CONTRACT_NORMALIZATION_CACHE_MAX_CHARS:
+        return _cached_contract_alpha_norm.__wrapped__(raw, names)
+    return _cached_contract_alpha_norm(raw, names)
+
+
+@lru_cache(maxsize=_CONTRACT_NORMALIZATION_CACHE_SIZE)
+def _cached_contract_alpha_norm(
+    text: str, context_bound_names: tuple[str, ...],
+) -> str:
     stripped, leading_names = _strip_leading_forall_binders_with_names(
         _strip_contract_comments(text)
     )
-    bound_names = tuple(
-        dict.fromkeys(
-            tuple(
-                str(name or "").strip()
-                for name in context_bound_names
-                if str(name or "").strip()
-            )
-            + leading_names
-        )
-    )
+    bound_names = tuple(dict.fromkeys(context_bound_names + leading_names))
 
     def proof_like_bound_name(name: str) -> bool:
         lowered = str(name or "").strip().lower()
