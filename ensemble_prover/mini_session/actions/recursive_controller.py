@@ -40,6 +40,10 @@ from ensemble_prover.mini_recursive_identity import (
 from ensemble_prover.mini_recursive_outcome import (
     is_resumable_mini_recursive_yield,
 )
+from ensemble_prover.mini_recursive_root_portfolio import (
+    merge_legacy_root_portfolios,
+    root_portfolio_state,
+)
 from ensemble_prover.mini_session.planner_jobs import (
     PlannerJobEquivalentPending,
     PlannerJobLaunch,
@@ -84,12 +88,14 @@ class RecursiveControllerAction:
     FAILED_DISPATCH_DURABLE_STATE_FIELDS: ClassVar[FrozenSet[str]] = frozenset(
         {
             "_recursive_driver_state",
+            "_recursive_root_portfolio_ledger",
             "_recursive_root_tactic_context_keys_seen",
         }
     )
     FAILED_DISPATCH_ROLLBACK_STATE_FIELDS: ClassVar[FrozenSet[str]] = frozenset(
         {
             "_recursive_driver_state",
+            "_recursive_root_portfolio_ledger",
             "_recursive_root_tactic_context_keys_seen",
             "_pending_planner_job_launch",
             "_planner_job_receipt_identities",
@@ -97,12 +103,28 @@ class RecursiveControllerAction:
         }
     )
 
+    def failed_dispatch_durable_state(self) -> dict[str, Any]:
+        """Keep completed tactic receipts when an interrupted planner rolls back."""
+
+        return copy.deepcopy(self._recursive_root_portfolio_ledger)
+
+    def merge_failed_dispatch_durable_state(self, state: Any) -> None:
+        """Restore root-only receipts; never restore a detached provider frame."""
+
+        if isinstance(state, dict) and state.get("revision", 0) > (
+            self._recursive_root_portfolio_ledger.get("revision", 0)
+        ):
+            self._recursive_root_portfolio_ledger = copy.deepcopy(state)
+
     def scheduler_runtime_state(self) -> dict[str, Any]:
         """Return versioned provider-free cursor state for exact replay."""
 
         return {
             "schema_version": 1,
             "recursive_driver_state": copy.deepcopy(self._recursive_driver_state),
+            "recursive_root_portfolio_ledger": copy.deepcopy(
+                self._recursive_root_portfolio_ledger
+            ),
             "recursive_root_tactic_context_keys_seen": sorted(
                 self._recursive_root_tactic_context_keys_seen
             ),
@@ -134,7 +156,18 @@ class RecursiveControllerAction:
             or any(type(value) is not str or not value for value in wait.values())
         )):
             raise StateSnapshotCompatibilityError("malformed equivalent planner wait")
+        ledger = record.get("recursive_root_portfolio_ledger", {})
+        if not isinstance(ledger, dict) or (ledger and (
+            type(ledger.get("revision")) is not int
+            or ledger["revision"] < 1
+            or not isinstance(ledger.get("state"), dict)
+        )):
+            raise StateSnapshotCompatibilityError("malformed root portfolio ledger")
         self._recursive_driver_state = copy.deepcopy(driver_state)
+        self._recursive_root_portfolio_ledger = (
+            {"revision": ledger["revision"], "state": root_portfolio_state(ledger["state"])}
+            if ledger else {}
+        )
         self._recursive_root_tactic_context_keys_seen = {
             str(item or "")
             for item in list(
@@ -211,6 +244,7 @@ class RecursiveControllerAction:
         self.budget_attr = str(budget_attr or "recursive_pass_budget_remaining")
         self._nested_execution_frame: dict[str, Any] = {}
         self._recursive_driver_state: dict[str, Any] = {}
+        self._recursive_root_portfolio_ledger: dict[str, Any] = {}
         self._recursive_root_tactic_context_keys_seen: set[str] = set()
         self._recursive_fixed_point_environment_signature = ""
         self._recursive_fixed_point_reason = ""
@@ -219,6 +253,37 @@ class RecursiveControllerAction:
         self._planner_job_receipt_identities: dict[
             tuple[str, str], Any
         ] = {}
+
+    def _shared_root_portfolio(self, session: Any) -> tuple[int, dict[str, Any]]:
+        """Read the latest root receipt without importing another lane's plan.
+
+        A session dispatches controller actions serially. Its next publication
+        advances the family revision, so a corrected or completed cursor wins
+        over an older sibling copy, including after checkpoint restoration.
+        """
+
+        actions = [self, *(
+            action for action in getattr(session, "actions", ())
+            if action is not self and isinstance(action, RecursiveControllerAction)
+        )]
+        latest = max(
+            (action._recursive_root_portfolio_ledger for action in actions),
+            key=lambda ledger: ledger.get("revision", 0),
+        )
+        if latest:
+            return latest["revision"], root_portfolio_state(latest["state"])
+        return 0, merge_legacy_root_portfolios([
+            {
+                **root_portfolio_state(action._recursive_driver_state),
+                "root_tactic_attempted_context_keys": sorted(
+                    action._recursive_root_tactic_context_keys_seen
+                    | set(root_portfolio_state(action._recursive_driver_state)[
+                        "root_tactic_attempted_context_keys"
+                    ])
+                ),
+            }
+            for action in actions
+        ])
 
     @staticmethod
     def _session_progress_signature(session: Any) -> str:
@@ -645,6 +710,9 @@ class RecursiveControllerAction:
         from ensemble_prover.mini_prover import Conversation
 
         started = time.monotonic()
+        # Capture legacy root receipts before a stale terminal planner frame
+        # is cleared. The root execution keys remain independently scoped.
+        root_portfolio_for_attempt = self._shared_root_portfolio(session)[1]
         self._planner_equivalent_wait = {}
         if self._recursive_fixed_point_environment_signature:
             current_signature = self._session_progress_signature(session)
@@ -880,6 +948,11 @@ class RecursiveControllerAction:
                         self._session_progress_signature(session)
                     )
                 self._recursive_driver_state = published_state
+                revision, _ = self._shared_root_portfolio(session)
+                self._recursive_root_portfolio_ledger = {
+                    "revision": revision + 1,
+                    "state": root_portfolio_state(published_state),
+                }
 
             def rollback_driver_state(exc: BaseException) -> None:
                 # A completed pass remains consumed in the live process when
@@ -1011,6 +1084,7 @@ class RecursiveControllerAction:
             prior_root_tactic_context_keys=tuple(
                 sorted(self._recursive_root_tactic_context_keys_seen)
             ),
+            root_tactic_portfolio_state=root_portfolio_for_attempt,
             planner_job_broker=(
                 session.planner_job_broker()
                 if callable(getattr(session, "planner_job_broker", None))

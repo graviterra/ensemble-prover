@@ -3389,6 +3389,7 @@ class LeanRunner:
             "check_with_sorry_raw",
             "suggest_tactics",
             "check_term_type",
+            "print_declaration",
             "check_source_declaration_type",
             "check_source_declaration_type_equivalence",
             "extract_typed_residual_batch",
@@ -7009,6 +7010,101 @@ class LeanRunner:
                     parts.append(summary[:240])
             return " ".join(parts)
         return out.strip()[:500] if out.strip() else "Error: no output"
+
+    @staticmethod
+    def _normalize_print_declaration_name(
+        name: str, *, allow_solution_refs: bool = False,
+    ) -> tuple[str, str]:
+        """Accept one identifier, never a #print subcommand or Lean script."""
+        candidate = str(name or "").strip()
+        if (
+            not candidate
+            or len(candidate) > 2000
+            or not _SAFE_CHECK_NAME_RE.fullmatch(candidate)
+        ):
+            return "", "Error: #print requires exactly one declaration name"
+        if not allow_solution_refs and _contains_solution_ref_for_prompt(candidate):
+            return "", "Error: that declaration is not available for inspection"
+        return candidate, ""
+
+    async def print_declaration(
+        self,
+        name: str,
+        *,
+        preamble_override: str | None = None,
+        lemmas: Optional[List[str]] = None,
+        timeout_s: float = 10.0,
+        allow_solution_refs: bool = False,
+    ) -> str:
+        """Inspect one declaration body in the model's read-only environment.
+
+        Only a validated identifier is interpolated. Static string #print
+        markers isolate the requested output from preamble/helper messages
+        across both plain subprocess and structured diagnostic transports.
+        This operation produces no proof receipt or proof-state mutation.
+        """
+        sanitized, error = self._normalize_print_declaration_name(
+            name, allow_solution_refs=allow_solution_refs,
+        )
+        if error:
+            return error
+        preamble = self._resolve_preamble(preamble_override)
+        lemma_block = "\n".join(list(lemmas or []))
+        context = f"{preamble}\n{lemma_block}"
+        if not allow_solution_refs:
+            if _observation_preamble_materializes_solution_ref(context):
+                return "Error: definition inspection unavailable in this answer-restricted context"
+            aliases = _observation_preamble_solution_ref_aliases(context)
+            if _observation_expression_references_proof_alias(sanitized, aliases):
+                return "Error: that declaration is not available for inspection"
+        universe_decl = _free_universe_decl(lemma_block)
+        marker_id = uuid.uuid4().hex
+        begin, end = f"ensemble_print_begin_{marker_id}", f"ensemble_print_end_{marker_id}"
+        content = (
+            f"{preamble}\n\n"
+            f"{universe_decl}\n\n"
+            f"{lemma_block}\n\n"
+            f'#print "{begin}"\n'
+            "set_option maxHeartbeats 200000 in\n"
+            f"#print {sanitized}\n"
+            f'#print "{end}"\n'
+        )
+        _file_path, execution, _write_error = await self._execute_generated_file(
+            goal_name=f"print_{short_id(sanitized)}",
+            content=content,
+            timeout_s=timeout_s,
+            fast_fail_timeout_s=timeout_s,
+            semaphore=self.suggest_sem,
+        )
+        if execution is None:
+            return "Note: definition information unavailable (verifier busy)"
+        parsed = parse_lean_output(execution.output, execution.returncode)
+        if bool(getattr(parsed, "infra_failure", False)):
+            return "Note: definition information unavailable (verifier busy)"
+        if int(execution.returncode or 0) != 0 or any(
+            str(getattr(diagnostic, "severity", "")).lower() == "error"
+            for diagnostic in parsed.diagnostics
+        ):
+            error_type = canonical_error_type(parsed) or "lean_error"
+            return (
+                f"Error: #print failed ({error_type}). "
+                "The declaration could not be inspected in this environment."
+            )
+        header_re = re.compile(r"^.+?:\d+:\d+:\s*info(?:\([^)]+\))?:\s*(.*)$")
+        payloads: list[str] = []
+        for line in str(execution.output or "").splitlines():
+            header = header_re.match(line)
+            payloads.append(header.group(1) if header else line)
+        starts = [index for index, line in enumerate(payloads) if line.strip() == begin]
+        ends = [index for index, line in enumerate(payloads) if line.strip() == end]
+        if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+            return "Note: definition inspection unavailable (no complete output)"
+        result = "\n".join(payloads[starts[0] + 1:ends[0]]).strip()
+        if not result:
+            return "Note: definition inspection unavailable (no complete output)"
+        if not allow_solution_refs and _contains_solution_ref_for_prompt(result):
+            return "Error: that declaration is not available for inspection"
+        return result[:2000]
 
     async def check_source_declaration_type(
         self,

@@ -526,6 +526,9 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     "status",
                     "compact_boundary",
                     "api_retry",
+                    # Claude Code 2.1.269 streams reasoning-token estimates.
+                    # They are telemetry, not actions or usage receipts.
+                    "thinking_tokens",
                 ):
                     raise ClaudeCodeBackendError(
                         "Claude Code emitted an unsupported system action",

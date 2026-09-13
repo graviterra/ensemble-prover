@@ -17282,6 +17282,7 @@ async def run_mini_recursive_attempt(
     verified_helper_accept_callback: Optional[Callable[[Any, Any], Any]] = None,
     continuation_state: Optional[Mapping[str, Any]] = None,
     prior_root_tactic_context_keys: Sequence[str] = (),
+    root_tactic_portfolio_state: Optional[Mapping[str, Any]] = None,
     planner_job_broker: Optional[PlannerJobBroker] = None,
     planner_frontier_signature: str = "",
     planner_owner_lane_id: str = "",
@@ -20157,6 +20158,7 @@ async def run_mini_recursive_attempt(
             progress_callback=progress_callback,
             continuation_state=continuation_state,
             prior_root_tactic_context_keys=prior_root_tactic_context_keys,
+            root_tactic_portfolio_state=root_tactic_portfolio_state,
             proof_environment_fingerprint=proof_environment_fingerprint,
             get_proof_environment_fingerprint=(
                 current_attempt_proof_environment_fingerprint
@@ -20644,6 +20646,7 @@ async def run_mini_recursive_driver(
     progress_callback: Optional[ProgressCallback] = None,
     continuation_state: Optional[Mapping[str, Any]] = None,
     prior_root_tactic_context_keys: Sequence[str] = (),
+    root_tactic_portfolio_state: Optional[Mapping[str, Any]] = None,
     proof_environment_fingerprint: str = "",
     get_proof_environment_fingerprint: Optional[GetPreambleFn] = None,
     root_tactic_environment_fingerprint: str = "",
@@ -21101,13 +21104,21 @@ async def run_mini_recursive_driver(
         for item in list(resume_frame.get("llm_root_close_pending_keys") or [])
         if isinstance(item, (list, tuple, set, frozenset))
     }
+    # Root tactic receipts have their own exact execution identities. They can
+    # survive a planner-lane handoff even when that lane's full continuation
+    # frame is inadmissible; no planner or pass state crosses this boundary.
+    root_portfolio_frame = (
+        root_tactic_portfolio_state
+        if isinstance(root_tactic_portfolio_state, Mapping)
+        else resume_frame
+    )
     root_tactic_attempted_context_keys: set[str] = {
         str(item or "")
         for item in tuple(prior_root_tactic_context_keys or ())
         if str(item or "")
     } | {
         str(item or "")
-        for item in list(resume_frame.get("root_tactic_attempted_context_keys") or [])
+        for item in list(root_portfolio_frame.get("root_tactic_attempted_context_keys") or [])
         if str(item or "")
     }
     # Keep allocation learning through planner yields/checkpoints. Raw driver
@@ -21119,14 +21130,14 @@ async def run_mini_recursive_driver(
         root_tactic_timing_cache.restore_checkpoint_state(saved_tactic_timing)
     root_tactic_portfolio_continuations: dict[str, int] = {}
     root_tactic_portfolio_phases: dict[str, str] = {}
-    raw_portfolio_phases = resume_frame.get("root_tactic_portfolio_phases")
+    raw_portfolio_phases = root_portfolio_frame.get("root_tactic_portfolio_phases")
     if isinstance(raw_portfolio_phases, Mapping):
         root_tactic_portfolio_phases = {
             str(key): str(phase)
             for key, phase in list(raw_portfolio_phases.items())[:256]
             if len(str(key)) == 64 and isinstance(phase, str) and phase in {"active", "fallback"}
         }
-    raw_root_tactic_portfolio_continuations = resume_frame.get(
+    raw_root_tactic_portfolio_continuations = root_portfolio_frame.get(
         "root_tactic_portfolio_continuations"
     )
     if isinstance(raw_root_tactic_portfolio_continuations, Mapping):
@@ -21149,7 +21160,7 @@ async def run_mini_recursive_driver(
     root_tactic_direct_portfolio_exhausted_execution_keys: set[str] = {
         str(item or "").strip()
         for item in list(
-            resume_frame.get("root_tactic_direct_portfolio_exhausted_execution_keys")
+            root_portfolio_frame.get("root_tactic_direct_portfolio_exhausted_execution_keys")
             or ()
         )[:256]
         if len(str(item or "").strip()) == 64

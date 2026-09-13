@@ -281,7 +281,7 @@ class FailureAnalyzer:
         )
         if check_enabled:
             lines.append(
-                "- If `try_lean` is available in the next turn, call it on the revised proof body before submitting. Use `check_lean` only for declaration names/signatures; it does not check proof bodies."
+                "- If `try_lean` is available in the next turn, call it on the revised proof body before submitting. Use `check_lean` for declaration names/signatures and #print definition lookup; it does not check proof bodies."
             )
         lines.append(
             "- If the repair direction says a goal is already a hypothesis, close that subgoal with `exact <hyp>` before adding new rewrites or searches."

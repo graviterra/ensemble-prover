@@ -195,7 +195,7 @@ _MINI_TEXT_TOOL_PROPERTIES = {
     "search_mathlib": frozenset({"query", "max_results"}),
     "search_theorems": frozenset({"query", "max_results"}),
     "try_lean": frozenset({"code", "purpose"}),
-    "try_skeleton": frozenset({"code", "purpose"}),
+    "try_skeleton": frozenset({"code", "purpose", "mode"}),
 }
 _MINI_TEXT_TOOL_REQUIRED = {
     "apply_decl_to_goal": "decl_name",
@@ -212,6 +212,10 @@ _MINI_TEXT_TOOL_ALIASES = {
     "compute_examples": frozenset({"query"}),
     "search_mathlib": frozenset({"limit"}),
     "search_theorems": frozenset({"limit"}),
+}
+_MINI_TEXT_TOOL_MODES = {
+    "compute_examples": frozenset({"eval", "reduce", "check"}),
+    "try_skeleton": frozenset({"bank", "observe"}),
 }
 
 
@@ -1620,11 +1624,9 @@ def _normalize_simple_xml_tool_arguments(
         max_results = normalized["max_results"]
         if isinstance(max_results, bool) or not isinstance(max_results, int):
             return None
-    if "mode" in normalized and normalized["mode"] not in {
-        "eval",
-        "reduce",
-        "check",
-    }:
+    if "mode" in normalized and normalized["mode"] not in _MINI_TEXT_TOOL_MODES.get(
+        name, frozenset(),
+    ):
         return None
     return normalized
 

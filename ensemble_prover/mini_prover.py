@@ -3283,7 +3283,9 @@ CHECK_LEAN_TOOL: Dict[str, Any] = {
             "a Mathlib lemma whose exact name and type you are not 100% sure "
             "of. Runs `#check <declaration>` in the same answer-safe Lean "
             "environment shown in the prompt and returns the declaration's "
-            "type signature. Confirms (a) the name actually exists, and (b) "
+            "type signature. Use `#print declaration.name` to inspect a "
+            "definition's body without changing the proof state. Confirms "
+            "(a) the name actually exists, and (b) "
             "the signature matches what your proof expects. Provide one or "
             "more declaration names or `#check declaration.name` lines — e.g. "
             "`tsum_subtype`, `Equiv.tsum_eq`, "
@@ -3299,8 +3301,10 @@ CHECK_LEAN_TOOL: Dict[str, Any] = {
                     "type": "string",
                     "description": (
                         "Scratch Lean text containing declaration names or "
-                        "`#check declaration.name` lines. `import` lines are "
-                        "ignored. Multiple checks are allowed and capped."
+                        "`#check declaration.name` or `#print declaration.name` "
+                        "lines. #check accepts term expressions; #print accepts "
+                        "one declaration name only. `import` lines are ignored. "
+                        "Mixed requests share a cap of 8 inspections."
                     ),
                 }
             },
@@ -3939,19 +3943,32 @@ def _normalize_check_query(term: str) -> Optional[str]:
     return bare_name if _CHECK_TERM_RE.fullmatch(bare_name) else f"({s})"
 
 
-def _extract_check_queries(args: Dict[str, Any], *, limit: int = 8) -> List[str]:
-    """Extract complete ``#check`` expressions from a tool call."""
+def _extract_lean_inspection_queries(
+    args: Dict[str, Any], *, limit: int = 8, include_print: bool = True,
+) -> List[Tuple[str, str]]:
+    """Extract bounded, ordered type and definition inspection requests."""
     cap = max(0, int(limit or 0))
     if cap <= 0:
         return []
-    out: List[str] = []
-    seen: set[str] = set()
+    out: List[Tuple[str, str]] = []
+    seen: set[Tuple[str, str]] = set()
 
-    def add_query(value: Any) -> bool:
-        normalized = _normalize_check_query(str(value or ""))
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            out.append(normalized)
+    def add_query(value: Any, kind: str = "check") -> bool:
+        raw = str(value or "").strip()
+        if include_print and raw.startswith("#print") and kind == "check":
+            kind, raw = "print", raw[len("#print"):].strip()
+        if kind == "print":
+            if not include_print:
+                return False
+            # Retain invalid #print requests so the tool reports a concrete
+            # rejection instead of silently dropping half of a mixed call.
+            normalized = raw[:2001]
+        else:
+            normalized = _normalize_check_query(raw)
+        key = (kind, normalized or "")
+        if (normalized or kind == "print") and key not in seen:
+            seen.add(key)
+            out.append(key)
         return len(out) >= cap
 
     raw_terms = args.get("terms")
@@ -3985,15 +4002,17 @@ def _extract_check_queries(args: Dict[str, Any], *, limit: int = 8) -> List[str]
             stripped = marker_line.strip()
             if not stripped:
                 continue
-            if "#check" in stripped:
-                matches = list(re.finditer(r"#check\b", marker_line))
+            if "#check" in stripped or "#print" in stripped:
+                matches = list(re.finditer(r"#(check|print)\b", marker_line))
                 for match_index, match in enumerate(matches):
                     end = (
                         matches[match_index + 1].start()
                         if match_index + 1 < len(matches)
                         else len(marker_line)
                     )
-                    if add_query(query_line[match.end() : end].strip()):
+                    if add_query(
+                        query_line[match.end() : end].strip(), match.group(1),
+                    ):
                         return out
             else:
                 query_text = query_line.strip()
@@ -4002,6 +4021,13 @@ def _extract_check_queries(args: Dict[str, Any], *, limit: int = 8) -> List[str]
                 ):
                     return out
     return out
+
+
+def _extract_check_queries(args: Dict[str, Any], *, limit: int = 8) -> List[str]:
+    """Compatibility extractor for callers requesting only type checks."""
+    return [query for _kind, query in _extract_lean_inspection_queries(
+        args, limit=limit, include_print=False,
+    )]
 
 
 def _proof_state_node_for_tool_statement(
@@ -5317,14 +5343,15 @@ async def _run_check_lean_tool(
     redact_solution_refs: bool = True,
     timeout_s: float = 10.0,
 ) -> str:
-    """Run answer-safe #check queries for the LLM tool loop."""
+    """Run answer-safe #check/#print queries without proof-state effects."""
     from .deadline_guard import await_with_strict_deadline
 
-    queries = _extract_check_queries(args)
+    queries = _extract_lean_inspection_queries(args)
     if not queries:
         return (
-            "Error: no supported #check terms. Provide bare declaration names "
-            "or lines like `#check tsum_subtype`. Arbitrary Lean scripts are "
+            "Error: no supported #check terms or #print declarations. Provide "
+            "bare declaration names or lines like `#check tsum_subtype` / "
+            "`#print Set.IsAPOfLengthWith`. Arbitrary Lean scripts are "
             "not supported by this tool."
         )
 
@@ -5353,22 +5380,42 @@ async def _run_check_lean_tool(
     if configured_timeout_s is not None:
         controller_timeout_s = max(adapter_timeout_s, configured_timeout_s)
 
-    lines: List[str] = [f"{len(queries)} check(s):"]
-    for i, query in enumerate(queries, 1):
+    label = "inspection(s)" if any(kind == "print" for kind, _ in queries) else "check(s)"
+    lines: List[str] = [f"{len(queries)} {label}:"]
+    for i, (kind, query) in enumerate(queries, 1):
         try:
-            result = await await_with_strict_deadline(
-                lean.check_term_type(
-                    query,
-                    preamble_override=preamble,
-                    lemmas=list(context_lemmas or []),
-                    timeout_s=adapter_timeout_s,
-                ),
-                timeout_s=controller_timeout_s,
-                operation_label="mini_tool_check_lean",
-                operation_ownership="result_only",
+            error = ""
+            inspector = (
+                getattr(lean, "print_declaration", None)
+                if kind == "print" else lean.check_term_type
             )
+            if kind == "print":
+                _name, error = LeanRunner._normalize_print_declaration_name(
+                    query, allow_solution_refs=not redact_solution_refs,
+                )
+                if not error and not callable(inspector):
+                    error = "Note: definition inspection unavailable (adapter does not support #print)"
+            if error:
+                result = error
+            else:
+                kwargs: Dict[str, Any] = {
+                    "preamble_override": preamble,
+                    "lemmas": list(context_lemmas or []),
+                    "timeout_s": adapter_timeout_s,
+                }
+                if kind == "print":
+                    kwargs["allow_solution_refs"] = not redact_solution_refs
+                result = await await_with_strict_deadline(
+                    inspector(
+                        query,
+                        **kwargs,
+                    ),
+                    timeout_s=controller_timeout_s,
+                    operation_label="mini_tool_check_lean",
+                    operation_ownership="result_only",
+                )
         except asyncio.TimeoutError:
-            result = "Note: type information unavailable (verifier busy)"
+            result = f"Note: {'definition' if kind == 'print' else 'type'} information unavailable (verifier busy)"
         except Exception as exc:
             safe_exc_type = _prompt_safe_inline_text(
                 type(exc).__name__,
@@ -5387,7 +5434,7 @@ async def _run_check_lean_tool(
         result = str(result or "").strip() or "Error: no output"
         result = _prompt_safe_lean_diagnostic_text(
             result,
-            limit=700,
+            limit=2000 if kind == "print" else 700,
             redact_solution_refs=redact_solution_refs,
         )
         safe_query = _prompt_safe_inline_text(
@@ -5395,7 +5442,7 @@ async def _run_check_lean_tool(
             limit=180,
             redact_solution_refs=redact_solution_refs,
         )
-        lines.append(f"{i}. #check {safe_query}")
+        lines.append(f"{i}. #{kind} {safe_query}")
         lines.append(f"   {result}")
     return "\n".join(lines)
 
@@ -9568,7 +9615,7 @@ async def run_conversation(
                     "verdict": "proof_policy_rejected",
                 })
             check_hint = (
-                "Use the `check_lean` tool for #check queries."
+                "Use the `check_lean` tool for #check and #print queries."
                 if lean_check_tool_enabled
                 else "Do not include #check queries in proof submissions."
             )
@@ -13311,7 +13358,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_false",
         default=True,
         help=(
-            "Disable the answer-safe Lean #check tool. By default the prover can "
+            "Disable the answer-safe Lean #check/#print tool. By default the prover can "
             "call check_lean to verify declaration names instead of asking the "
             "user to run #check."
         ),
@@ -13696,7 +13743,7 @@ def _build_argparser() -> argparse.ArgumentParser:
             "Disable the `apply_decl_to_goal` LLM tool. The tool asks Lean "
             "whether a Mathlib declaration actually fits the current goal "
             "before the model commits it to a proof. Disabling it leaves the "
-            "model to verify candidates only via `check_lean` (type only) and "
+            "model to inspect candidates via `check_lean` (types/definitions) and "
             "`try_lean` (whole-proof attempts)."
         ),
     )

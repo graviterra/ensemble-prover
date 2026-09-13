@@ -90,7 +90,11 @@ TRY_SKELETON_TOOL: Dict[str, Any] = {
             "as proof-state structure: they create open obligations and an "
             "assembly route, never proof evidence. Do not use `sorry` or "
             "`admit`; leave holes as `?_` or stop after the reducing tactic so "
-            "Lean exposes the residual goals."
+            "Lean exposes the residual goals. For inspection without creating "
+            "proof-search work, use mode `observe`; use check_lean #print for "
+            "a declaration's definition. A purpose starting with inspection "
+            "of a definition defaults to observe; explicit mode `bank` adopts "
+            "the route."
         ),
         "parameters": {
             "type": "object",
@@ -107,11 +111,27 @@ TRY_SKELETON_TOOL: Dict[str, Any] = {
                     "type": "string",
                     "description": "Short description of the intended reduction.",
                 },
+                "mode": {
+                    "type": "string",
+                    "enum": ["bank", "observe"],
+                    "description": (
+                        "bank creates open obligations; observe only returns "
+                        "remaining goals and never schedules a route or retry. "
+                        "Defaults to bank except for definition-inspection purposes."
+                    ),
+                },
             },
             "required": ["code"],
         },
     },
 }
+
+
+_DEFINITION_INSPECTION_PURPOSE_RE = re.compile(
+    r"^(?:inspect|expose|view|show|observe)\s+"
+    r"(?:(?:the|an?|unfolded|underlying|full)\s+){0,3}definition\b",
+    re.IGNORECASE,
+)
 
 
 _PROOF_BODY_PREFIXES = (
@@ -771,7 +791,7 @@ async def _run_try_skeleton_tool_impl(
     deadline_exhausted: Optional[Callable[[], bool]] = None,
     deadline_monotonic: float = 0.0,
 ) -> str:
-    """Validate and bank a partial proof skeleton as route structure only."""
+    """Inspect a partial proof or bank it as route structure only."""
 
     del preamble  # the proof-state residual preamble is derived from conv.
     _dossier_metric(dossier, "mini_try_skeleton_calls", 1)
@@ -781,6 +801,25 @@ async def _run_try_skeleton_tool_impl(
         160,
         redact_solution_refs=redact_solution_refs,
     )
+    mode = args.get("mode", "bank")
+    if not isinstance(mode, str) or mode not in ("bank", "observe"):
+        return _reject(
+            dossier=dossier,
+            reason="invalid_skeleton_mode",
+            message="try_skeleton error: mode must be `bank` or `observe`.",
+            redact_solution_refs=redact_solution_refs,
+        )
+    # Older callers have only a purpose field. A clear definition-inspection
+    # request should not silently adopt witnesses chosen just to expose a goal.
+    # This is an interaction default, never mathematical evidence; an explicit
+    # bank request always wins, including for the identical proof body.
+    inferred_observation = bool(
+        "mode" not in args
+        and _DEFINITION_INSPECTION_PURPOSE_RE.match(
+            str(args.get("purpose", "") or "").strip()[:500]
+        )
+    )
+    observe_only = mode == "observe" or inferred_observation
     if not code:
         return _reject(
             dossier=dossier,
@@ -979,6 +1018,8 @@ async def _run_try_skeleton_tool_impl(
     def bank_pending_residual_retry(candidate_stub: str) -> bool:
         """Persist the exact paid stub for verifier-only replay."""
 
+        if observe_only:
+            return False
         exact_stub = str(candidate_stub or "").strip()
         recorder = getattr(
             proof_state,
@@ -1194,7 +1235,7 @@ async def _run_try_skeleton_tool_impl(
             extra=({"diagnostics": diagnostic} if diagnostic else None),
         )
     typed_goals = tuple(getattr(receipt, "goals", ()) or ())
-    if not typed_goals:
+    if not typed_goals and not observe_only:
         return _reject(
             dossier=dossier,
             reason="skeleton_closed_goal",
@@ -1246,6 +1287,37 @@ async def _run_try_skeleton_tool_impl(
             redact_solution_refs=redact_solution_refs,
             extra={"residual_goal_count": len(goals), "residual_goal_limit": limit},
         )
+    if observe_only:
+        if deadline_elapsed():
+            return deadline_rejection()
+        # The typed receipt is only an observation here. In particular, do not
+        # attach an assembly group, record pending extraction, or publish a
+        # proof_state_update that the tool loop would count as durable progress.
+        _dossier_metric(dossier, "mini_try_skeleton_observed", 1)
+        return _json_result({
+            "status": "observed",
+            "mode": "observe",
+            "reason": (
+                "definition_inspection_purpose"
+                if inferred_observation else "explicit_observation_mode"
+            ),
+            "evidence": False,
+            "route_banked": False,
+            "remaining_goals": [
+                _compact(
+                    goal["target"], 2400,
+                    redact_solution_refs=redact_solution_refs,
+                    lean_diagnostic=True,
+                )
+                for goal in goals
+            ],
+            "residual_goal_count": len(goals),
+            "summary": (
+                "Observed Lean's remaining goals. No route or proof was "
+                "accepted. To adopt this skeleton as a proof-search route, "
+                "resubmit with mode `bank`."
+            ),
+        })
     if any(_closed_false_residual_goal(goal) for goal in goals):
         return _reject(
             dossier=dossier,
