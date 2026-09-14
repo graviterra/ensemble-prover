@@ -1,6 +1,6 @@
 # Ensemble Prover
 
-Last updated: 2026-09-11.
+Last updated: 2026-09-13.
 
 This repository contains a research-grade autonomous theorem prover that
 combines language-model proof search with Lean verification. Given a formalized
@@ -8,6 +8,18 @@ Lean target, it plans a proof, retrieves relevant declarations, decomposes hard
 goals into helper claims, tests and repairs candidate proofs, and finalizes a
 Lean-checked result without further user interaction. The maintained entry
 point for proof search is `ensemble_prover.mini_prover`.
+
+## Ensemble Prover in action
+
+An excerpt from a Putnam 2025 A4 run: declaration checks, a candidate proof,
+a yield to the scheduler at a completed tool boundary, and a Lean-accepted
+helper proof recorded for reuse.
+
+[![Terminal trace showing Lean tool calls, a scheduler yield, the proof, and helper acceptance](docs/assets/proof-search-mechanics.png)](docs/assets/proof-search-mechanics.png)
+
+Click the image to view it at full resolution. This excerpt shows a helper
+subgoal being accepted, not final verification of the entire problem. The
+screenshot is losslessly cropped; its retained code and logs are unchanged.
 
 ## Recent updates
 
