@@ -465,7 +465,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             )
         )
         completed = False
-        answer: str | None = None
+        structured_answer: dict[str, Any] | None = None
         failure = ""
         failed_turn = False
         thread_id = ""
@@ -526,7 +526,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             emit_usage_callback(usage_callback, record)
 
         def on_event(event: dict[str, Any]) -> None:
-            nonlocal completed, answer, failure, failed_turn, thread_id, initialized
+            nonlocal completed, structured_answer, failure, failed_turn, thread_id, initialized
             kind = event.get("type")
             if initialized and event.get("session_id", thread_id) != thread_id:
                 raise ClaudeCodeBackendError("Claude Code changed session identity")
@@ -691,12 +691,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     )
                 structured = event.get("structured_output")
                 if isinstance(structured, dict):
-                    try:
-                        answer = json.dumps(structured, allow_nan=False)
-                    except (ValueError, RecursionError):
-                        raise ClaudeCodeBackendError(
-                            "Claude Code returned invalid structured output"
-                        ) from None
+                    structured_answer = structured
 
         def on_started() -> None:
             nonlocal dispatched
@@ -775,10 +770,14 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             raise _cli_failure(
                 failure + "\n" + stderr.decode("utf-8", errors="replace")
             )
-        if not isinstance(answer, str):
-            raise ClaudeCodeBackendError(
-                "Claude Code completed without an assistant response"
-            )
+        if structured_answer is None:
+            raise self._response_validation_error("missing_response") from None
+        # Completion includes the full wire stream and a successful process exit.
+        # Keep native actions and transport failures authoritative until then.
+        try:
+            answer = json.dumps(structured_answer, allow_nan=False)
+        except (ValueError, RecursionError):
+            raise self._response_validation_error("envelope_json") from None
         content, calls = self._decode_answer(
             answer, allowed, bool(selected or tool_choice == "required")
         )
@@ -786,13 +785,9 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             try:
                 inner = json.loads(content, parse_constant=_reject_json_constant)
             except (ValueError, RecursionError):
-                raise ClaudeCodeBackendError(
-                    "Claude Code returned invalid JSON content"
-                ) from None
+                raise self._response_validation_error("json_content") from None
             if not isinstance(inner, dict):
-                raise ClaudeCodeBackendError(
-                    "Claude Code JSON content must be an object"
-                )
+                raise self._response_validation_error("json_content_object") from None
         raw = {
             "id": thread_id,
             "model": self.cfg.model,

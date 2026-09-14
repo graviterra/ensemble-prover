@@ -2955,8 +2955,9 @@ _ROLLBACK_DEEPCOPY_MEMO_MUTATION_CODES = frozenset(
 )
 
 
-_RETRYABLE_FINAL_NO_TOOLS_FAILURE_KINDS = frozenset(
+_RETRYABLE_COMPLETED_RESPONSE_FAILURE_KINDS = frozenset(
     {
+        "provider_response_invalid",
         "final_no_tools_empty_output",
         "final_no_tools_forbidden_command",
         "final_no_tools_provider_ignored_tool_choice_none_budget_exhausted",
@@ -28921,6 +28922,7 @@ class MiniSession:
                     "llm_transport_failure_type",
                     "llm_transport_failure_attempt",
                     "llm_transport_failure_request_timeout_s",
+                    "llm_response_validation",
                     "llm_failure_tool_history_compacted_messages",
                     "llm_failure_tool_history_compacted_tool_rounds",
                     "llm_failure_tool_history_compacted_chars",
@@ -29931,6 +29933,7 @@ class MiniSession:
             "llm_transport_failure_type",
             "llm_transport_failure_attempt",
             "llm_transport_failure_request_timeout_s",
+            "llm_response_validation",
             "llm_failure_tool_history_compacted_messages",
             "llm_failure_tool_history_compacted_tool_rounds",
             "llm_failure_tool_history_compacted_chars",
@@ -36138,7 +36141,7 @@ class MiniSession:
             return True
         if kind == "llm_provider_quantum_exhausted" and retryable:
             return True
-        if kind in _RETRYABLE_FINAL_NO_TOOLS_FAILURE_KINDS and retryable:
+        if kind in _RETRYABLE_COMPLETED_RESPONSE_FAILURE_KINDS and retryable:
             # The provider completed a paid turn but returned no usable proof
             # artifact. The producer explicitly classifies these protocol
             # outcomes as retryable; release only through the existing bounded
@@ -36436,7 +36439,10 @@ class MiniSession:
             max_retries = max(max_retries, 2)
         if self._recovered_provider_receipt_retry_floor(metadata):
             max_retries = max(max_retries, 1)
-        if bool(metadata.get("provider_call_quantum_exhausted")) and (
+        if (
+            str(metadata.get("llm_failure_kind") or "").strip()
+            != "provider_response_invalid"
+        ) and bool(metadata.get("provider_call_quantum_exhausted")) and (
             _nonnegative_metadata_int(metadata, "provider_calls_completed") > 0
             or bool(metadata.get("provider_finalizer_continuation_exhausted"))
         ):
@@ -36502,7 +36508,10 @@ class MiniSession:
             max_retries = max(max_retries, 1)
         if self._active_repair_lane_capacity_retryable(action_id, metadata):
             max_retries = max(max_retries, 2)
-        if bool(metadata.get("provider_call_quantum_exhausted")) and (
+        if (
+            str(metadata.get("llm_failure_kind") or "").strip()
+            != "provider_response_invalid"
+        ) and bool(metadata.get("provider_call_quantum_exhausted")) and (
             _nonnegative_metadata_int(metadata, "provider_calls_completed") > 0
             or bool(metadata.get("provider_finalizer_continuation_exhausted"))
         ):
@@ -37080,7 +37089,7 @@ class MiniSession:
             self.model_call_deferred_static_action_metadata.get(clean) or {}
         )
         if str(metadata.get("llm_failure_kind") or "").strip() not in (
-            _RETRYABLE_FINAL_NO_TOOLS_FAILURE_KINDS
+            _RETRYABLE_COMPLETED_RESPONSE_FAILURE_KINDS
         ):
             return True
         stored_record = dict(metadata.get("selected_work_item_record") or {})
@@ -37615,7 +37624,10 @@ class MiniSession:
             max_retries = max(max_retries, 1)
         if self._active_repair_lane_capacity_retryable(clean, metadata):
             max_retries = max(max_retries, 2)
-        if bool(metadata.get("provider_call_quantum_exhausted")) and (
+        if (
+            str(metadata.get("llm_failure_kind") or "").strip()
+            != "provider_response_invalid"
+        ) and bool(metadata.get("provider_call_quantum_exhausted")) and (
             _nonnegative_metadata_int(metadata, "provider_calls_completed") > 0
             or bool(metadata.get("provider_finalizer_continuation_exhausted"))
         ):

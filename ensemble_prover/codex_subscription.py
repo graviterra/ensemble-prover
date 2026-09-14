@@ -539,7 +539,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
                 failure + "\n" + stderr.decode("utf-8", errors="replace")
             )
         if not isinstance(answer, str):
-            raise CodexBackendError("Codex completed without an assistant response")
+            raise self._response_validation_error("missing_response") from None
         content, calls = self._decode_answer(
             answer, allowed, bool(selected or tool_choice == "required")
         )
@@ -547,9 +547,9 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
             try:
                 inner = json.loads(content, parse_constant=_reject_json_constant)
             except (ValueError, RecursionError):
-                raise CodexBackendError("Codex returned invalid JSON content") from None
+                raise self._response_validation_error("json_content") from None
             if not isinstance(inner, dict):
-                raise CodexBackendError("Codex JSON content must be an object")
+                raise self._response_validation_error("json_content_object") from None
         raw = {
             "id": thread_id,
             "model": self.cfg.model,

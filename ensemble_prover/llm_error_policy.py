@@ -18,18 +18,56 @@ from .llm_usage import CostBudgetExceeded, ProviderDispatchAttemptLimitExceeded
 _TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
+_SUBSCRIPTION_RESPONSE_VALIDATION_STAGES = frozenset({
+    "envelope_json", "envelope_shape", "content_type", "tool_calls_type",
+    "tool_request_shape", "tool_name", "arguments_type", "arguments_json",
+    "arguments_object", "required_tool", "missing_response", "json_content",
+    "json_content_object",
+})
+
+
+def subscription_response_validation_record(value: Any) -> dict[str, Any]:
+    """Project inert, bounded diagnostics without granting response authority."""
+
+    getter = value.get if isinstance(value, Mapping) else lambda key: getattr(value, key, None)
+    stage = getter("validation_stage")
+    if type(stage) is not str or stage not in _SUBSCRIPTION_RESPONSE_VALIDATION_STAGES:
+        return {}
+    record: dict[str, Any] = {"validation_stage": stage}
+    index = getter("tool_index")
+    if type(index) is int and 0 <= index <= 9999:
+        record["tool_index"] = index
+    return record
+
+
 class SubscriptionBackendError(RuntimeError):
     """A classified failure from the subscription CLI, without credential logs."""
 
     backend = "subscription"
 
-    def __init__(self, message: str, *, kind: str = "protocol") -> None:
-        if kind not in {"auth", "quota", "rate_limit", "transport", "protocol", "capability", "context"}:
+    def __init__(
+        self, message: str, *, kind: str = "protocol",
+        validation_stage: str = "", tool_index: int | None = None,
+    ) -> None:
+        if kind not in {"auth", "quota", "rate_limit", "transport", "protocol", "response", "capability", "context"}:
             raise ValueError(f"Unknown subscription error kind: {kind}")
+        diagnostic = subscription_response_validation_record({
+            "validation_stage": validation_stage, "tool_index": tool_index,
+        })
+        if validation_stage and (kind != "response" or not diagnostic):
+            raise ValueError("Invalid subscription response validation stage")
+        self.validation_stage = diagnostic.get("validation_stage", "")
+        self.tool_index = diagnostic.get("tool_index")
+        if diagnostic:
+            message += " (" + "; ".join(f"{key}={value}" for key, value in diagnostic.items()) + ")"
         self.backend_kind = kind
         self.backend_message = message
         self.llm_required_prompt_context_overflow = kind == "context"
         super().__init__(f"[{self.backend}:{kind}] {message}")
+
+    @property
+    def provider_response_completed(self) -> bool:
+        return self.backend_kind == "response"
 
     def __reduce__(self):
         return (_restore_subscription_backend_error, (type(self), self.backend_message, self.backend_kind), self.__dict__)
@@ -133,6 +171,7 @@ _TERMINAL_LLM_FAILURE_REASONS = {
 }
 _SCOPED_LLM_FAILURE_REASONS = {
     "llm_network_error",
+    "provider_response_invalid",
     "llm_retry_deadline_exhausted",
     "provider_dispatch_attempt_limit_exhausted",
     "provider_lane_run_closed",
@@ -571,6 +610,7 @@ def classify_llm_exception(
             "quota": "llm_insufficient_quota",
             "capability": "provider_capability_conflict",
             "context": "llm_required_prompt_context_overflow",
+            "response": "provider_response_invalid",
         }.get(exc.backend_kind, "llm_network_error")
         terminal = exc.backend_kind in {"auth", "quota", "capability", "context"}
         return LLMErrorClassification(
@@ -578,6 +618,7 @@ def classify_llm_exception(
                 "auth": "auth", "quota": "insufficient_quota",
                 "capability": "provider_capability_conflict", "rate_limit": "rate_limit",
                 "transport": "transport", "protocol": "transient",
+                "response": "provider_response_invalid",
                 "context": "llm_required_prompt_context_overflow",
             }[exc.backend_kind],
             retryable=not terminal,
@@ -835,7 +876,7 @@ def classify_llm_error_text(error_text: str) -> LLMErrorClassification:
     """Classify a rendered LLM error after the original exception is gone."""
 
     text = _lower_text(error_text)
-    codex_error = re.search(r"(?:^|:\s*)\[(codex|claude-code):(auth|quota|rate_limit|capability|transport|protocol|context)\]", text)
+    codex_error = re.search(r"(?:^|:\s*)\[(codex|claude-code):(auth|quota|rate_limit|capability|transport|protocol|response|context)\]", text)
     if codex_error:
         error_type = CodexBackendError if codex_error.group(1) == "codex" else ClaudeCodeBackendError
         return classify_llm_exception(error_type(text, kind=codex_error.group(2)))
@@ -1102,6 +1143,8 @@ def projected_scoped_llm_failure_is_retryable(
         if isinstance(explicit, bool):
             return explicit
     normalized_kind = str(kind or "").strip().lower()
+    if normalized_reason == "provider_response_invalid":
+        return normalized_kind == "provider_response_invalid"
     if normalized_reason != "llm_network_error":
         return False
     return bool(

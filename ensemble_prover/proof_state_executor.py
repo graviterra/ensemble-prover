@@ -12,6 +12,7 @@ import textwrap
 import time
 import weakref
 from dataclasses import dataclass, replace
+from functools import wraps
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -62,6 +63,7 @@ from .mini_falsification import (
     TargetKind,
 )
 from .mini_falsification.generators import binder_domain, leading_forall_binders
+from .mini_falsification.lean_check import _select_generated_probe_check
 from .mini_root_tactic import (
     root_tactic_success_contract_status,
     try_close_root_with_active_lift,
@@ -201,6 +203,7 @@ class _SerializedFalsificationLeanProxy:
     _OPERATION_NAMES = frozenset(
         {
             "check",
+            "_check_generated_falsification_probe",
             "audit_proof_axioms",
             "analyze_statement_contracts",
             "_execute_content",
@@ -222,10 +225,14 @@ class _SerializedFalsificationLeanProxy:
         )
 
     def __getattr__(self, name: str) -> Any:
-        attribute = getattr(self._lean, name)
+        if name == "_check_generated_falsification_probe":
+            attribute = _select_generated_probe_check(self._lean)
+        else:
+            attribute = getattr(self._lean, name)
         if name not in self._OPERATION_NAMES or not callable(attribute):
             return attribute
 
+        @wraps(attribute)
         async def serialized_operation(*args: Any, **kwargs: Any) -> Any:
             try:
                 requested_timeout = max(

@@ -24,6 +24,7 @@ from ...llm_deadline import llm_retry_deadline_record_from_exception
 from ...llm_error_policy import (
     classify_llm_exception,
     transport_failure_record_from_exception,
+    subscription_response_validation_record,
 )
 from ...llm_usage import (
     ProviderDispatchAttemptLease,
@@ -822,6 +823,7 @@ class ToolLoopResult:
     llm_retry_count: int = 0
     llm_retry_deadline: dict = field(default_factory=dict)
     llm_transport_failure: dict = field(default_factory=dict)
+    llm_response_validation: dict = field(default_factory=dict)
     provider_attempts: List[dict] = field(default_factory=list)
     provider_protocol_event: str = ""
     provider_protocol_original_content: str = ""
@@ -2452,6 +2454,7 @@ async def _call_llm_with_tools_one_round_impl(
     llm_failure_reason = ""
     llm_retry_deadline: dict = {}
     llm_transport_failure: dict = {}
+    llm_response_validation: dict = {}
     provider_attempts: List[dict] = []
     tool_state_updates = 0
     tool_state_closures = 0
@@ -7372,6 +7375,8 @@ async def _call_llm_with_tools_one_round_impl(
             llm_retryable = bool(classification.retryable)
             llm_terminal = bool(classification.terminal)
             llm_failure_reason = str(classification.failure_reason or "")
+            if llm_failure_kind == "provider_response_invalid":
+                llm_response_validation = subscription_response_validation_record(exc)
         failed_provider_pre_generation_rejection = bool(
             provider_defer
             and llm_retryable
@@ -7401,7 +7406,10 @@ async def _call_llm_with_tools_one_round_impl(
             and provider_quantum_authenticated_dispatches_started > 0
         ):
             provider_call_quantum_exhausted = True
-            if llm_failure_kind != "provider_dispatch_attempt_limit_exhausted":
+            if llm_failure_kind not in {
+                "provider_dispatch_attempt_limit_exhausted",
+                "provider_response_invalid",
+            }:
                 # The admitted physical attempt consumed this scheduler
                 # quantum. Preserve its concrete error in ``llm_error`` and
                 # provider attempts, but classify the action outcome as a
@@ -7409,6 +7417,11 @@ async def _call_llm_with_tools_one_round_impl(
                 llm_failure_kind = "llm_provider_quantum_exhausted"
                 llm_retryable = True
                 llm_terminal = False
+            # A completed but unusable response spent this quantum too, but
+            # must retain its bounded output-retry policy. Replacing its kind
+            # with a generic yield makes zero parsed successes look like an
+            # unanswered transport request to the scheduler. The quantum flag
+            # still preserves the continuation and cumulative wall allowance.
             if provider_finalizer_continuation_active:
                 provider_finalizer_continuation_exhausted = True
                 provider_call_quantum_max_retries = max(
@@ -7874,6 +7887,7 @@ async def _call_llm_with_tools_one_round_impl(
         llm_retry_count=int(llm_retry_count),
         llm_retry_deadline=dict(llm_retry_deadline or {}),
         llm_transport_failure=dict(llm_transport_failure or {}),
+        llm_response_validation=dict(llm_response_validation or {}),
         provider_defer=dict(provider_defer or {}),
         provider_attempts=list(provider_attempts or []),
         recovered_finalizer_error=str(recovered_finalizer_error or ""),

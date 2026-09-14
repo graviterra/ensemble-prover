@@ -309,48 +309,54 @@ class SubscriptionCLIClient:
         return min(limits) if limits else None
 
     @classmethod
+    def _response_validation_error(
+        cls, stage: str, tool_index: int | None = None,
+    ) -> SubscriptionBackendError:
+        return cls.backend_error(
+            f"{cls.backend_name} returned an invalid response envelope or tool request",
+            kind="response", validation_stage=stage, tool_index=tool_index,
+        )
+
+    @classmethod
     def _decode_answer(
         cls, answer: str, allowed: list[str], required: bool
     ) -> tuple[str, list[dict[str, Any]]]:
+        """Validate a completed provider answer; wire failures remain protocol errors."""
         try:
             result = json.loads(answer, parse_constant=_reject_json_constant)
-            if not isinstance(result, dict) or set(result) != {"content", "tool_calls"}:
-                raise ValueError
-            content, requests = result["content"], result["tool_calls"]
-            if not isinstance(content, str) or not isinstance(requests, list):
-                raise ValueError
-            calls = []
-            for request in requests:
-                if not isinstance(request, dict) or set(request) != {
-                    "name",
-                    "arguments",
-                }:
-                    raise ValueError
-                if request["name"] not in allowed or not isinstance(
-                    request["arguments"], str
-                ):
-                    raise ValueError
-                if not isinstance(
-                    json.loads(
-                        request["arguments"], parse_constant=_reject_json_constant
-                    ),
-                    dict,
-                ):
-                    raise ValueError
-                calls.append(
-                    {
-                        "id": f"call_{uuid.uuid4().hex}",
-                        "type": "function",
-                        "function": dict(request),
-                    }
+        except (ValueError, TypeError, RecursionError):
+            raise cls._response_validation_error("envelope_json") from None
+        if not isinstance(result, dict) or set(result) != {"content", "tool_calls"}:
+            raise cls._response_validation_error("envelope_shape") from None
+        content, requests = result["content"], result["tool_calls"]
+        if not isinstance(content, str):
+            raise cls._response_validation_error("content_type") from None
+        if not isinstance(requests, list):
+            raise cls._response_validation_error("tool_calls_type") from None
+        calls = []
+        for index, request in enumerate(requests):
+            if not isinstance(request, dict) or set(request) != {"name", "arguments"}:
+                raise cls._response_validation_error("tool_request_shape", index) from None
+            if not isinstance(request["name"], str) or request["name"] not in allowed:
+                raise cls._response_validation_error("tool_name", index) from None
+            if not isinstance(request["arguments"], str):
+                raise cls._response_validation_error("arguments_type", index) from None
+            try:
+                arguments = json.loads(
+                    request["arguments"], parse_constant=_reject_json_constant
                 )
-            if required and not calls:
-                raise ValueError
-            return content, calls
-        except (ValueError, TypeError, KeyError, RecursionError):
-            raise cls.backend_error(
-                f"{cls.backend_name} returned an invalid response envelope or tool request"
-            ) from None
+            except (ValueError, TypeError, RecursionError):
+                raise cls._response_validation_error("arguments_json", index) from None
+            if not isinstance(arguments, dict):
+                raise cls._response_validation_error("arguments_object", index) from None
+            calls.append({
+                "id": f"call_{uuid.uuid4().hex}",
+                "type": "function",
+                "function": dict(request),
+            })
+        if required and not calls:
+            raise cls._response_validation_error("required_tool") from None
+        return content, calls
 
     async def chat(
         self,

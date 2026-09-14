@@ -45,7 +45,11 @@ from ensemble_prover.formalization_guardrails import (
     tool_log_has_api_grounding,
     unknown_identifier_name,
 )
-from ensemble_prover.llm_error_policy import classify_llm_error_text, llm_failure_scope
+from ensemble_prover.llm_error_policy import (
+    classify_llm_error_text,
+    llm_failure_scope,
+    subscription_response_validation_record,
+)
 from ensemble_prover.mini_policy import (
     _GRAPH_SELECTED_WORK_SCOPE_KEY,
     _REPAIR_FEEDBACK,
@@ -15526,6 +15530,13 @@ class ConversationTurnAction:
             llm_transport_failure = dict(
                 getattr(loop_result, "llm_transport_failure", {}) or {}
             )
+            response_validation_metadata = {}
+            if llm_failure_kind == "provider_response_invalid":
+                validation = subscription_response_validation_record(
+                    getattr(loop_result, "llm_response_validation", {}) or {}
+                )
+                if validation:
+                    response_validation_metadata["llm_response_validation"] = validation
             provider_defer = dict(
                 getattr(loop_result, "provider_defer", {}) or {}
             )
@@ -15769,6 +15780,7 @@ class ConversationTurnAction:
                 ),
                 **llm_retry_deadline,
                 **llm_transport_failure,
+                **response_validation_metadata,
                 **provider_defer,
                 "provider_attempts": provider_attempts,
                 "retry_count": int(getattr(loop_result, "llm_retry_count", 0) or 0),
@@ -15852,6 +15864,7 @@ class ConversationTurnAction:
                     ),
                     **llm_retry_deadline,
                     **llm_transport_failure,
+                    **response_validation_metadata,
                     **provider_defer,
                     "provider_attempts": provider_attempts,
                     "retry_count": int(

@@ -6,7 +6,7 @@ one known value exception, never an SDK exception, response, or traceback.
 
 from __future__ import annotations
 
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 import math
 from typing import Any, Mapping
 
@@ -17,6 +17,7 @@ from ensemble_prover.llm_deadline import (
 from ensemble_prover.llm_error_policy import (
     LLMErrorClassification,
     classify_llm_exception,
+    subscription_response_validation_record,
     transport_failure_record_from_exception,
 )
 from ensemble_prover.state_data import clone_json_value
@@ -111,7 +112,7 @@ def _deadline_context(value: Any) -> LLMRetryDeadlineContext | None:
 
 
 def encode_planner_error(error: BaseException) -> dict[str, Any]:
-    """Project only policy, transport diagnostics and logical dispatch counts."""
+    """Project policy, safe diagnostics and logical dispatch counts."""
 
     policy = asdict(classify_llm_exception(error))
     policy.pop("message")
@@ -134,6 +135,10 @@ def encode_planner_error(error: BaseException) -> dict[str, Any]:
             name: getattr(error, name) for name in _DISPATCH_COUNTS if hasattr(error, name)
         },
     }
+    if policy["kind"] == "provider_response_invalid":
+        validation = subscription_response_validation_record(error)
+        if validation:
+            record["response_validation"] = validation
     clean = clone_json_value(record, label="planner failure receipt")
     decode_planner_error(clean)
     return clean
@@ -143,10 +148,26 @@ def decode_planner_error(record: Mapping[str, Any]) -> RestoredPlannerJobError:
     """Validate inert receipt data and restore its original policy decision."""
 
     data = _object(clone_json_value(record, label="planner failure receipt"), label="planner failure receipt")
-    if (set(data) != {"schema_version", "classification", "transport", "deadline_context", "dispatch_counts"}
+    required_fields = {"schema_version", "classification", "transport", "deadline_context", "dispatch_counts"}
+    if (not required_fields <= set(data) <= required_fields | {"response_validation"}
             or type(data["schema_version"]) is not int or data["schema_version"] != 1):
         raise ValueError("unsupported planner failure receipt schema")
-    error = RestoredPlannerJobError(_classification(data["classification"]))
+    classification = _classification(data["classification"])
+    validation = _object(data.get("response_validation", {}), label="planner response validation")
+    if validation:
+        if (classification.kind != "provider_response_invalid"
+                or subscription_response_validation_record(validation) != validation):
+            raise ValueError("planner response validation fields do not match the schema")
+        diagnostic = f"validation_stage={validation['validation_stage']}"
+        if "tool_index" in validation:
+            diagnostic += f"; tool_index={validation['tool_index']}"
+        classification = replace(
+            classification,
+            message=f"{classification.message} [{diagnostic}]",
+        )
+    error = RestoredPlannerJobError(classification)
+    for name, value in validation.items():
+        setattr(error, name, value)
     transport = _object(data["transport"], label="planner transport diagnostics")
     if transport:
         if not {"llm_transport_failure_type", "llm_transport_failure_attempt"} <= set(transport) <= _TRANSPORT_FIELDS:
