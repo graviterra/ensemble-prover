@@ -1,6 +1,6 @@
 # Ensemble Prover
 
-Last updated: 2026-09-13.
+Last updated: 2026-09-15.
 
 This repository contains a research-grade autonomous theorem prover that
 combines language-model proof search with Lean verification. Given a formalized
@@ -25,6 +25,11 @@ screenshot is losslessly cropped; its retained code and logs are unchanged.
 
 September 2026 — highlights from the current source checkout:
 
+- **1.11 — strategy recovery:** discovery tracks ancestor obligations, reviews
+  contrary evidence, and returns stalled proof routes to research within the
+  existing budget. Adopt stopped Mini work, inspect primary sources, and explore
+  alternative methods while preserving the exact original Lean target.
+  [Strategy recovery](ensemble_prover/research_claims/STRATEGY_RECOVERY.md)
 - **1.10 — proof-search reliability:** resumed helper verification preserves its
   saved time allowance; planner admission recognizes restated verified helpers;
   proof finalization retains the configured output capacity. Recovered usage
@@ -64,7 +69,7 @@ every feature above.
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
 file and Lake project. PutnamBench files are supported through a compatibility
 adapter, and callers may attach a natural-language problem description as
-additional model context. Release 1.10 also includes
+additional model context. Release 1.11 also includes
 experimental natural-language entry points: `ensemble_prover.nl_input` for a
 single claim and `ensemble_prover.formalization` for resumable, multi-file
 projects. These translate text before proving; the resulting Lean statement
@@ -125,7 +130,7 @@ the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** 1.10 — research preview. Includes Mini Prover, experimental
+> **Release status:** 1.11 — research preview. Includes Mini Prover, experimental
 > single-claim NL input, and resumable multi-file formalization campaigns.
 > Optional Codex and Claude Code subscription backends serve Mini's prover and refiner,
 > alongside the existing API providers. Codex also serves autonomous research.
@@ -354,9 +359,10 @@ reverse combination is also supported. One budgeted Codex dispatch is one
 
 Workers can wait without model calls and resume when child findings arrive.
 Full arguments, feedback, raw responses, and proof plans remain available as
-artifacts; the harness does not silently shorten required context. The Codex
-runtime may manage context internally; exact underlying-model delivery cannot
-be attested by this adapter. A reviewed proof or counterexample automatically
+artifacts. Recovery uses bounded working context with exact artifact and page
+retrieval; workers must retrieve omitted content before judging it. The Codex
+runtime may also manage context internally; exact underlying-model delivery
+cannot be attested by this adapter. A reviewed proof or counterexample automatically
 queues formalization when a project was configured. Proof work returns feedback
 after at most `--proof-quantum-s 600` seconds or `--formalization-steps 8` controller
 steps by default; `--lean-timeout-s` defaults to 300 seconds. A worker can continue
@@ -370,11 +376,14 @@ is not a mathematical success verdict.
 
 Research-only runs can still save an exact handoff for separately authorized
 standalone formalization; that separate command's requests are outside the
-research cap. Schema 6 requires an explicit upgrade for version 1–5 ledgers and
-preserves providers and budgets without enabling automatic proving on old runs.
+research cap. New ledgers use schema 7; schemas 1–6 require an explicit upgrade.
+Migration preserves providers, budgets, and saved schema-6 closed-loop settings;
+it does not authorize strategy recovery on existing ledgers.
 Three offline scripted/fake-Codex trajectories have exercised real Lean checks;
 they are integration tests, not a discovery-performance benchmark. There is no
-automatic literature search or established autonomous discovery success rate.
+established autonomous discovery success rate. Recovery workers can search
+Crossref metadata, fetch public primary sources, and inspect original PDF pages;
+these tools do not provide comprehensive literature coverage.
 See the [research
 walkthrough](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research) and
 [full execution contract](ensemble_prover/research_claims/DISCOVERY.md).

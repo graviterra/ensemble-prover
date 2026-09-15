@@ -246,6 +246,7 @@ class Campaign:
         prover: Any,
         lease_s: float = 300,
         required_context: dict[str, Any] | None = None,
+        required_artifacts: Sequence[ModuleArtifact] = (),
     ):
         if not math.isfinite(lease_s) or lease_s <= 0:
             raise ValueError("lease_s must be finite and positive")
@@ -279,6 +280,19 @@ class Campaign:
             raise
         self.formalizer, self.reviewer = formalizer, reviewer
         self.compiler, self.prover = compiler, prover
+        self.required_artifacts = tuple(required_artifacts)
+        try:
+            if self.required_artifacts:
+                compiler.validate_closure(self.required_artifacts)
+            identities = [artifact.to_dict() for artifact in self.required_artifacts]
+            existing = self.store.get_metadata("required_artifacts")
+            if existing is not None and existing != identities:
+                raise ValueError("required ambient dependencies changed")
+            if existing is None and identities:
+                self.store.set_metadata("required_artifacts", identities)
+        except BaseException:
+            self.close()
+            raise
         self.lease_s = lease_s
         self.owner = uuid.uuid4().hex
         self._model_calls_remaining: int | None = None
@@ -312,12 +326,13 @@ class Campaign:
 
     def _dependencies(self, task: Task) -> tuple[list[Task], list[ModuleArtifact]]:
         tasks = self.store.dependencies(task.id)
-        artifacts = []
+        artifacts = list(self.required_artifacts)
         for dependency in tasks:
             if dependency.state != "verified" or not dependency.result:
                 raise ValueError(f"dependency {dependency.id} is not verified")
             artifact = ModuleArtifact.from_dict(dependency.result["artifact"])
-            artifacts.append(artifact)
+            if artifact not in artifacts:
+                artifacts.append(artifact)
         if callable(getattr(self.compiler, "validate_many", None)):
             self.compiler.validate_many(artifacts)
         else:
@@ -753,6 +768,9 @@ class Campaign:
             raise
 
     async def _prove(self, claim: Claim) -> None:
+        from .prover import ProofAttemptResult
+        from ..research_claims.strategy import StrategyYield
+
         task = self.store.get_task(claim.task.id)
         frozen = task.session.get("frozen_statement")
         if not frozen:
@@ -786,6 +804,9 @@ class Campaign:
             if self._local_only:
                 raise _LocalRecoveryUnavailable
             context = self._context(task)
+            if task.session.get("previous_proof_attempt_blob"):
+                context["previous_proof_attempt"] = json.loads(self.store.read_blob(task.session["previous_proof_attempt_blob"]))
+                context["previous_attempt_policy"] = "Retained candidate artifacts are not new assumptions or current proof authority. Revalidate any reused helper in the current frozen environment. Preserve useful mathematics while changing an obstructed route."
             context["original_source"] = self._refs(
                 frozen["source_refs"], required=True
             )
@@ -795,7 +816,8 @@ class Campaign:
             context["review_verdict"] = frozen.get("review_verdict")
             primary_failure = False
             try:
-                source = await self.prover.prove(
+                prove = getattr(self.prover, "prove_attempt", None) or self.prover.prove
+                attempt = await prove(
                     task=task,
                     name=frozen["name"],
                     statement=frozen["kernel_target"],
@@ -804,6 +826,15 @@ class Campaign:
                     context=context,
                     run_dir=self.directory / "proof_runs" / claim.token,
                 )
+                if isinstance(attempt, ProofAttemptResult):
+                    if attempt.status == "yielded_for_review":
+                        raise StrategyYield(attempt.details.get("reason", "strategy_review"),
+                            subject_id=attempt.details.get("subject_id", ""), allocation_id=attempt.details.get("allocation_id", ""))
+                    if attempt.status not in {"proved", "inconclusive"}:
+                        raise ValueError(f"unexpected proof adapter outcome: {attempt.status}")
+                    source = attempt.source
+                else:
+                    source = attempt
             except BaseException:
                 primary_failure = True
                 raise
@@ -813,16 +844,17 @@ class Campaign:
                     if callable(read_feedback):
                         feedback = read_feedback()
                         if feedback is not None:
+                            feedback_blob = self.store.write_blob(_json(feedback).encode())
                             # Private evidence, never proof-admission authority.
                             self.store.append_event(
                                 claim,
                                 "proof_attempt_feedback",
                                 {
-                                    "feedback_blob": self.store.write_blob(
-                                        _json(feedback).encode()
-                                    )
+                                    "feedback_blob": feedback_blob
                                 },
                             )
+                            self.store.checkpoint(claim, {**self.store.get_task(task.id).session,
+                                                          "previous_proof_attempt_blob": feedback_blob})
                 except BaseException as exc:
                     # Secondary storage/serialization failures must not change
                     # terminal-provider, admission-guard, or cancellation control
@@ -905,6 +937,10 @@ class Campaign:
         if self._local_only and not self._local_recovery_ready(task):
             raise _LocalRecoveryUnavailable
         if task.session.get("pending_proof"):
+            await self._prove(claim)
+            return
+        if task.session.get("strategy_continuation_pending") and task.session.get("frozen_statement"):
+            self.store.checkpoint(claim, {**task.session, "strategy_continuation_pending": False})
             await self._prove(claim)
             return
         pending = task.session.get("pending_review")
@@ -1132,6 +1168,8 @@ class Campaign:
             self._local_only = False
 
     async def _run_steps(self, max_steps: int | None) -> dict[str, Any]:
+        from ..research_claims.strategy import StrategyYield
+
         steps = 0
         while max_steps is None or steps < max_steps:
             if self.status()["status"] in {"proved", "needs_clarification", "invalid"}:
@@ -1155,6 +1193,14 @@ class Campaign:
                     # Lease renewal errors end this worker's authority. Stop
                     # its model/Lean operation before allowing another quantum.
                     await heartbeat
+            except StrategyYield as exc:
+                with contextlib.suppress(LeaseLostError):
+                    self.store.checkpoint(claim, {**self.store.get_task(claim.task.id).session,
+                                                  "strategy_continuation_pending": True})
+                    self.store.fail(claim, "Research strategy review: " + exc.reason, retry=True)
+                result = self.status()
+                result.update(status="yielded_for_review", strategy_outcome=exc.to_dict())
+                return result
             except LeaseLostError:
                 # Another worker/revision is authoritative; do not publish.
                 pass

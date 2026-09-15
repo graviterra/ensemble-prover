@@ -1078,6 +1078,15 @@ async def notify_provider_dispatch_observer(
     require_hard_timeout_capability_active(
         "provider transport dispatch authorization"
     )
+    # A completion receipt is too late to fence transport exposure. Every
+    # concrete retry gets its own identity before any admission callback.
+    attempt_id = f"provider-attempt:{uuid.uuid4().hex}"
+    details["provider_dispatch_attempt_id"] = attempt_id
+    from .research_claims.strategy_runtime import current_strategy
+
+    strategy = current_strategy()
+    if strategy is not None:
+        strategy.authorize(attempt_id)
     for guard in _PROVIDER_DISPATCH_GUARDS.get():
         guard_details = copy.deepcopy(details)
         try:
@@ -1092,6 +1101,8 @@ async def notify_provider_dispatch_observer(
         require_hard_timeout_capability_active(
             "provider transport dispatch after run admission"
         )
+        if strategy is not None:
+            strategy.check()
     observer = _PROVIDER_DISPATCH_OBSERVER.get()
     if observer is None:
         receipt = dict(details)
@@ -1110,9 +1121,17 @@ async def notify_provider_dispatch_observer(
         if inspect.isawaitable(result):
             result = await result
         receipt = dict(result or details)
+    # Admission callbacks can yield or synchronously revoke their owner. Keep
+    # the original debit, but never publish transport authority after fencing.
+    require_hard_timeout_capability_active(
+        "provider transport dispatch after operation admission"
+    )
+    if strategy is not None:
+        strategy.check()
     receipt["provider_dispatch_notification_receipt_id"] = (
         f"provider-dispatch:{uuid.uuid4().hex}"
     )
+    receipt["provider_dispatch_attempt_id"] = attempt_id
     _PROVIDER_PENDING_DISPATCH_RECEIPT.set(receipt)
     return receipt
 

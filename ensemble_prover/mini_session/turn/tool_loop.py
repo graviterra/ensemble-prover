@@ -17,6 +17,7 @@ import math
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Mapping, Optional, Sequence
 
@@ -1310,81 +1311,18 @@ def _validated_provider_call_quantum_state(
 
 
 def _tool_loop_process_deadline_monotonic(kwargs: Mapping[str, Any]) -> float:
-    """Return the earliest hard turn/provider deadline before dispatch."""
+    """Start only the explicit turn lease before local preparation.
+
+    Provider operation leases start at the provider boundary. Charging prompt
+    rendering against either their cumulative cap or configured operation
+    timeout can expire an unused provider lane before its first request.
+    """
 
     now = time.monotonic()
     max_turn_elapsed_s = _nonnegative_finite_float(
         kwargs.get("max_turn_elapsed_s", 0.0)
     )
-    provider_quantum_s = _nonnegative_finite_float(
-        kwargs.get(
-            "provider_call_quantum_s",
-            _CONVERSATION_PROVIDER_WALL_QUANTUM_S,
-        ),
-        default=_CONVERSATION_PROVIDER_WALL_QUANTUM_S,
-    )
-    provider_cap_s = (
-        max(
-            _CONVERSATION_PROVIDER_CUMULATIVE_WALL_FLOOR_S,
-            provider_quantum_s * _CONVERSATION_PROVIDER_CUMULATIVE_WALL_QUANTA,
-        )
-        if provider_quantum_s > 0.0
-        else 0.0
-    )
-    if max_turn_elapsed_s > 0.0:
-        provider_cap_s = (
-            min(provider_cap_s, max_turn_elapsed_s)
-            if provider_cap_s > 0.0
-            else max_turn_elapsed_s
-        )
-
-    provider_elapsed_s = 0.0
-    stored_deadline = 0.0
-    stored_exhausted = False
-    conv = kwargs.get("conv")
-    raw_state = _validated_provider_call_quantum_state(
-        conv,
-        goal_statement_override=kwargs.get("goal_statement_override"),
-        preserve_recognized_legacy_v1=True,
-    )
-    if raw_state:
-        stored_cap_s = _nonnegative_finite_float(
-            raw_state.get("provider_call_cumulative_wall_cap_s", 0.0)
-        )
-        if stored_cap_s > 0.0:
-            provider_cap_s = (
-                min(provider_cap_s, stored_cap_s)
-                if provider_cap_s > 0.0
-                else stored_cap_s
-            )
-        provider_elapsed_s = _nonnegative_finite_float(
-            raw_state.get("provider_call_cumulative_elapsed_s", 0.0)
-        )
-        stored_deadline = _nonnegative_finite_float(
-            raw_state.get("provider_call_cumulative_deadline_monotonic", 0.0)
-        )
-        stored_exhausted = bool(
-            raw_state.get("provider_call_cumulative_wall_exhausted", False)
-        )
-    if provider_quantum_s <= 0.0:
-        stored_exhausted = False
-        provider_cap_s = max_turn_elapsed_s if max_turn_elapsed_s > 0.0 else 0.0
-
-    deadlines: list[float] = []
-    if max_turn_elapsed_s > 0.0:
-        deadlines.append(now + max_turn_elapsed_s)
-    client = kwargs.get("client")
-    operation_timeout_s = _nonnegative_finite_float(
-        getattr(getattr(client, "cfg", None), "operation_timeout_s", 0.0)
-    )
-    if operation_timeout_s > 0.0:
-        deadlines.append(now + operation_timeout_s)
-    if provider_cap_s > 0.0 and not stored_exhausted:
-        provider_deadline = now + max(0.0, provider_cap_s - provider_elapsed_s)
-        if stored_deadline > 0.0:
-            provider_deadline = min(provider_deadline, stored_deadline)
-        deadlines.append(provider_deadline)
-    return min(deadlines) if deadlines else 0.0
+    return now + max_turn_elapsed_s if max_turn_elapsed_s > 0.0 else 0.0
 
 # Keep a substantial contiguous mathematical exploration verbatim while
 # bounding genuinely long tool transcripts.  A four-round proof search is a
@@ -2190,6 +2128,9 @@ async def _call_llm_with_tools_one_round_impl(
     by appending the assistant tool-call message and per-call tool messages.
     """
 
+    started = time.monotonic()
+    from ...research_claims.strategy import StrategyYield
+
     primitives = _legacy_imports()
     explicit_helper_scope = helper_context_override is not None
 
@@ -2248,7 +2189,6 @@ async def _call_llm_with_tools_one_round_impl(
             else {}
         )
 
-    started = time.monotonic()
     supports_tool_calls = getattr(client, "supports_tool_calls", None)
     if use_tools and callable(supports_tool_calls):
         try:
@@ -2628,6 +2568,7 @@ async def _call_llm_with_tools_one_round_impl(
         if provider_call_cumulative_wall_cap_s > 0.0
         else 0.0
     )
+    provider_clock_paused_at: Optional[float] = started
     provider_call_quantum_max_retries = max(
         2,
         (
@@ -3300,7 +3241,23 @@ async def _call_llm_with_tools_one_round_impl(
         llm_terminal = False
         llm_failure_reason = "llm_turn_elapsed_budget_exhausted"
 
+    def exclude_local_time_from_provider_deadline() -> None:
+        nonlocal provider_call_cumulative_deadline_monotonic
+        nonlocal provider_clock_paused_at
+        if provider_clock_paused_at is None:
+            return
+        now = time.monotonic()
+        if provider_call_cumulative_deadline_monotonic > 0.0:
+            provider_call_cumulative_deadline_monotonic += max(
+                0.0, now - provider_clock_paused_at
+            )
+        provider_clock_paused_at = now
+
     def provider_cumulative_wall_exhausted() -> bool:
+        # Preserve the stored lease at entry, including an already expired
+        # continuation, while excluding local rendering/tool time in this
+        # invocation. Scheduler gaps still retain their existing wall policy.
+        exclude_local_time_from_provider_deadline()
         return bool(
             provider_call_cumulative_wall_exhausted
             or (
@@ -3330,6 +3287,58 @@ async def _call_llm_with_tools_one_round_impl(
         # alternate frontier work runnable.
         llm_terminal = False
         llm_failure_reason = "llm_provider_cumulative_wall_exhausted"
+
+    @contextmanager
+    def provider_operation_budget():
+        nonlocal provider_clock_paused_at
+        nonlocal provider_call_elapsed_s, provider_call_cumulative_elapsed_s
+        if elapsed_budget_exhausted():
+            raise _TurnElapsedBudgetExhausted()
+        if provider_cumulative_wall_exhausted():
+            raise _ProviderCumulativeWallExhausted()
+        operation_started = time.monotonic()
+        provider_clock_paused_at = None
+        operation_timeout_s = _nonnegative_finite_float(
+            effective_operation_timeout_s
+            or getattr(getattr(client, "cfg", None), "operation_timeout_s", 0.0)
+        )
+        deadlines = [
+            deadline
+            for deadline in (
+                provider_call_cumulative_deadline_monotonic,
+                operation_started + operation_timeout_s
+                if operation_timeout_s > 0.0 else 0.0,
+            )
+            if deadline > 0.0
+        ]
+        lease = begin_process_deadline(
+            deadline_monotonic=min(deadlines) if deadlines else 0.0,
+            label="mini_session_provider_operation",
+        )
+        try:
+            yield
+        except asyncio.CancelledError:
+            lease.abandon("provider_operation_external_cancellation")
+            raise
+        except BaseException:
+            if llm_turn_elapsed_task_unsettled:
+                lease.abandon("provider_operation_task_unsettled")
+            elif elapsed_budget_exhausted() or (
+                lease.deadline_monotonic > 0.0
+                and time.monotonic() >= lease.deadline_monotonic
+            ):
+                lease.settle_timeout()
+            else:
+                lease.close()
+            raise
+        else:
+            lease.close()
+        finally:
+            now = time.monotonic()
+            provider_elapsed = max(0.0, now - operation_started)
+            provider_call_elapsed_s += provider_elapsed
+            provider_call_cumulative_elapsed_s += provider_elapsed
+            provider_clock_paused_at = now
 
     def observe_tool_state_update(tool_name: str, result_text: str) -> Optional[str]:
         nonlocal tool_state_updates, tool_state_closures
@@ -3919,28 +3928,34 @@ async def _call_llm_with_tools_one_round_impl(
                 except Exception:
                     return False
 
-            with provider_dispatch_resume_target(
+            # Final validation can itself project a large residual. Arm and
+            # measure only the provider operation, after that local work, on
+            # every invocation including invalid-prompt rescue. Keep elapsed
+            # cancellation settlement inside the owning operation lease.
+            with provider_operation_budget(), provider_dispatch_resume_target(
                 provider_chain_resume_target_id
             ):
-                return await _metered_or_plain_call_compat(
-                    cost_controller=cost_controller,
-                    client=client,
-                    messages=list(request_messages or ()),
-                    role=cost_role or str(getattr(conv, "role", "") or ""),
-                    scope=cost_scope,
-                    action_id=cost_action_id,
-                    call_kind=call_kind,
-                    tools=list(tools_for_cost or ()),
-                    max_tokens_override=request_max_tokens_override,
-                    metadata=provider_call_metadata,
-                    retryable_exception_no_charge=(
-                        _retryable_exception_will_be_retried
-                    ),
-                    provider_dispatch_lease=provider_dispatch_lease,
-                    invoke=lambda usage_callback: invoke(
-                        list(request_messages or ()),
-                        usage_callback,
-                        request_max_tokens_override,
+                return await await_with_elapsed_budget(
+                    _metered_or_plain_call_compat(
+                        cost_controller=cost_controller,
+                        client=client,
+                        messages=list(request_messages or ()),
+                        role=cost_role or str(getattr(conv, "role", "") or ""),
+                        scope=cost_scope,
+                        action_id=cost_action_id,
+                        call_kind=call_kind,
+                        tools=list(tools_for_cost or ()),
+                        max_tokens_override=request_max_tokens_override,
+                        metadata=provider_call_metadata,
+                        retryable_exception_no_charge=(
+                            _retryable_exception_will_be_retried
+                        ),
+                        provider_dispatch_lease=provider_dispatch_lease,
+                        invoke=lambda usage_callback: invoke(
+                            list(request_messages or ()),
+                            usage_callback,
+                            request_max_tokens_override,
+                        ),
                     ),
                 )
 
@@ -3976,18 +3991,12 @@ async def _call_llm_with_tools_one_round_impl(
 
         try:
             try:
-                result = await await_with_elapsed_budget(
-                    _call_with_invalid_prompt_rescue(
-                        invoke=_invoke_with_meter,
-                        messages=request_messages,
-                        trace=primitives["trace"],
-                        trace_prefix=trace_prefix,
-                        on_rescue=_persist_invalid_prompt_rescue,
-                    ),
-                    additional_deadline_monotonic=0.0,
-                    additional_deadline_exception=(
-                        _ProviderCumulativeWallExhausted
-                    ),
+                result = await _call_with_invalid_prompt_rescue(
+                    invoke=_invoke_with_meter,
+                    messages=request_messages,
+                    trace=primitives["trace"],
+                    trace_prefix=trace_prefix,
+                    on_rescue=_persist_invalid_prompt_rescue,
                 )
             except BaseException as retry_exc:
                 _capture_chain_resume_target(retry_exc)
@@ -4063,18 +4072,12 @@ async def _call_llm_with_tools_one_round_impl(
                 f"once ({safe_exc_type}: {safe_exc})",
             )
             try:
-                result = await await_with_elapsed_budget(
-                    _call_with_invalid_prompt_rescue(
-                        invoke=_invoke_with_meter,
-                        messages=request_messages,
-                        trace=primitives["trace"],
-                        trace_prefix=trace_prefix,
-                        on_rescue=_persist_invalid_prompt_rescue,
-                    ),
-                    additional_deadline_monotonic=0.0,
-                    additional_deadline_exception=(
-                        _ProviderCumulativeWallExhausted
-                    ),
+                result = await _call_with_invalid_prompt_rescue(
+                    invoke=_invoke_with_meter,
+                    messages=request_messages,
+                    trace=primitives["trace"],
+                    trace_prefix=trace_prefix,
+                    on_rescue=_persist_invalid_prompt_rescue,
                 )
             except BaseException as retry_exc:
                 _capture_chain_resume_target(retry_exc)
@@ -4094,7 +4097,6 @@ async def _call_llm_with_tools_one_round_impl(
         invalid_prompt_neutralization_pending = False
         return result
 
-    provider_call_started = 0.0
     repeat_recovery_active = False
     repeat_recovery_provider_calls_before = 0
 
@@ -4135,9 +4137,6 @@ async def _call_llm_with_tools_one_round_impl(
             replaying_durable_progress_tool = bool(
                 replaying_persisted_tool
                 and durable_progress_tool_replay_pending
-            )
-            provider_call_started = (
-                0.0 if replaying_persisted_tool else time.monotonic()
             )
             can_call_tools = (
                 replaying_persisted_tool
@@ -4409,13 +4408,6 @@ async def _call_llm_with_tools_one_round_impl(
             sent_messages = list(actual_messages or [])
             if not replaying_persisted_tool:
                 provider_calls_completed += 1
-                settled_provider_elapsed_s = max(
-                    0.0,
-                    time.monotonic() - provider_call_started,
-                )
-                provider_call_elapsed_s += settled_provider_elapsed_s
-                provider_call_cumulative_elapsed_s += settled_provider_elapsed_s
-                provider_call_started = 0.0
             if finalizer_ignored_none_budget_exhausted:
                 # Settle telemetry before terminating this bounded finalizer.
                 # The recursive lane ledger must see every provider call that
@@ -5270,6 +5262,11 @@ async def _call_llm_with_tools_one_round_impl(
                     return await runner(*runner_args, **runner_kwargs)
 
                 try:
+                    from ...research_claims.strategy_runtime import current_strategy
+
+                    strategy_runtime = current_strategy()
+                    if strategy_runtime is not None:
+                        strategy_runtime.check()
                     if args_parse_error:
                         if name == "try_lean" and try_lean_tool_enabled:
                             _set_repair_self_check_non_verdict_status(
@@ -5280,6 +5277,10 @@ async def _call_llm_with_tools_one_round_impl(
                             "JSON arguments; pass a JSON object matching the tool "
                             f"schema. Parse error: {args_parse_error}"
                         )
+                    elif name == "read_strategy_artifact" and strategy_runtime is not None:
+                        result_text = json.dumps(strategy_runtime.read_artifact(args), ensure_ascii=False)
+                    elif name == "request_strategy_review" and strategy_runtime is not None:
+                        result_text = json.dumps(strategy_runtime.challenge(args), ensure_ascii=False)
                     elif (
                         name in _SEARCH_CADENCE_TOOL_NAMES
                         and formal_cadence_available
@@ -6033,6 +6034,22 @@ async def _call_llm_with_tools_one_round_impl(
                     else:
                         safe_name = prompt_safe_tool_name_token(name)
                         result_text = f"Unknown tool: {safe_name}"
+                except StrategyYield:
+                    # An expired or revoked interval is a control transfer,
+                    # but every advertised call still needs a transcript
+                    # response before a later attempt can reuse this history.
+                    for remaining_index in range(index, len(calls_to_run)):
+                        conv.history.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": safe_tool_call_ids[remaining_index],
+                                "content": (
+                                    "Deferred: this proof interval returned "
+                                    "to strategy review."
+                                ),
+                            }
+                        )
+                    raise
                 except _TurnElapsedBudgetExhausted:
                     record_elapsed_budget_exhausted()
                     if formal_runner_invoked:
@@ -6381,6 +6398,11 @@ async def _call_llm_with_tools_one_round_impl(
                         "content": result_text,
                     }
                 )
+                if strategy_runtime is not None and strategy_runtime.pending_review:
+                    for remaining_index in range(index + 1, len(calls_to_run)):
+                        conv.history.append({"role": "tool", "tool_call_id": safe_tool_call_ids[remaining_index],
+                                             "content": "Deferred: this proof interval returned to strategy review."})
+                    strategy_runtime.yield_requested()
                 execution_disposition = _tool_execution_disposition(
                     name,
                     result_text,
@@ -7309,14 +7331,6 @@ async def _call_llm_with_tools_one_round_impl(
             provider_dispatches_started,
             _exception_nonnegative_int(exc, "provider_dispatches_started"),
         )
-        if provider_call_started > 0.0:
-            exhausted_provider_elapsed_s = max(
-                0.0,
-                time.monotonic() - provider_call_started,
-            )
-            provider_call_elapsed_s += exhausted_provider_elapsed_s
-            provider_call_cumulative_elapsed_s += exhausted_provider_elapsed_s
-            provider_call_started = 0.0
         record_elapsed_budget_exhausted()
     except _ProviderCumulativeWallExhausted as exc:
         _restore_unsettled_repeat_recovery()
@@ -7324,14 +7338,6 @@ async def _call_llm_with_tools_one_round_impl(
             provider_dispatches_started,
             _exception_nonnegative_int(exc, "provider_dispatches_started"),
         )
-        if provider_call_started > 0.0:
-            exhausted_provider_elapsed_s = max(
-                0.0,
-                time.monotonic() - provider_call_started,
-            )
-            provider_call_elapsed_s += exhausted_provider_elapsed_s
-            provider_call_cumulative_elapsed_s += exhausted_provider_elapsed_s
-            provider_call_started = 0.0
         record_provider_cumulative_wall_exhausted()
     except RuntimeCapabilityRevokedError:
         raise
@@ -7382,14 +7388,6 @@ async def _call_llm_with_tools_one_round_impl(
             and llm_retryable
             and llm_failure_kind in {"rate_limit", "http_429"}
         )
-        if provider_call_started > 0.0:
-            failed_provider_elapsed_s = max(
-                0.0,
-                time.monotonic() - provider_call_started,
-            )
-            provider_call_elapsed_s += failed_provider_elapsed_s
-            provider_call_cumulative_elapsed_s += failed_provider_elapsed_s
-            provider_call_started = 0.0
         if (
             (
                 llm_failure_kind == "provider_dispatch_attempt_limit_exhausted"
@@ -7663,6 +7661,7 @@ async def _call_llm_with_tools_one_round_impl(
             durable_progress_tool_continuation_identity
         )
     if persist_provider_continuation:
+        exclude_local_time_from_provider_deadline()
         setattr(
             conv,
             "_provider_call_quantum_state",
@@ -8055,6 +8054,18 @@ async def call_llm_with_tools_one_round(*args: Any, **kwargs: Any) -> ToolLoopRe
     or block ``asyncio.run`` shutdown.  Outside a supervised CLI worker the
     lease is a no-op and the long-standing cooperative API remains available.
     """
+
+    from ...research_claims.strategy_runtime import current_strategy, REQUEST_STRATEGY_REVIEW_TOOL, READ_STRATEGY_ARTIFACT_TOOL
+
+    strategy_runtime = current_strategy()
+    if strategy_runtime is not None:
+        strategy_runtime.check()
+        strategy_runtime.prepare_conversation(kwargs["conv"], kwargs.get("dossier"))
+        tool_list = list(kwargs.get("tools_list") or ())
+        for strategy_tool in (REQUEST_STRATEGY_REVIEW_TOOL, READ_STRATEGY_ARTIFACT_TOOL):
+            if not any(tool.get("function", {}).get("name") == strategy_tool["function"]["name"] for tool in tool_list):
+                tool_list.append(strategy_tool)
+        kwargs.update(tools_list=tool_list, use_tools=True)
 
     lease = begin_process_deadline(
         deadline_monotonic=_tool_loop_process_deadline_monotonic(kwargs),

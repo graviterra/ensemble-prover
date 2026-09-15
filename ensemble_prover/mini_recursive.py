@@ -4286,8 +4286,19 @@ def _render_recursive_child_obligation_contract(
     statement: str,
     helper_name: str,
 ) -> str:
+    from .research_claims.strategy_runtime import current_strategy
+
+    strategy_context = (
+        "Research allocation review is available through request_strategy_review. "
+        "If this target or an ancestor bottleneck is contradicted, unsupported, or blocked by a method limitation, "
+        "use its issued subject handle and complete applicability argument to return work to the parent research controller. "
+        "This scheduling transition needs no formal negation certificate, does not alter the original theorem, "
+        "and does not stop the overall run. The Checked defect rules below apply only to mathematical refutation. "
+        if current_strategy() is not None else ""
+    )
     safe_helper = _prompt_safe_helper_name(helper_name)
     return (
+        strategy_context +
         "Typed recursive proof obligation. Prove the formal target currently "
         "shown in the Lean signature; use the original theorem only as "
         "orientation for why this obligation matters. The controller has "

@@ -41,7 +41,7 @@ from .model import (
 # ledgers there instead of allowing subscription work to become API-billed work.
 # Version 6 adds explicitly authorized, closed-loop formalization jobs. Older
 # schedulers must not silently ignore that authorization or its proof state.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 APPLICATION_ID = 0x52534348
 
 
@@ -195,7 +195,7 @@ class ResearchStore:
                     )
                     self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-                if upgrade and version in (1, 2, 3, 4, 5):
+                if upgrade and version in (1, 2, 3, 4, 5, 6):
                     # Validate the entire known legacy schema before changing
                     # anything. Mathematical records/artifacts stay intact;
                     # legacy API routing becomes explicit in run metadata.
@@ -205,8 +205,13 @@ class ResearchStore:
                             self._connection.execute(
                                 f"CREATE TABLE {name} ({_SCHEMA[name]})"
                             )
+                    # Schema 7 may archive immutable configurations as config:*
+                    # rows. Older schemas cannot contain them; reject downgrade
+                    # tricks. A future migration must handle archives separately.
+                    if self._connection.execute("SELECT 1 FROM discovery_runs WHERE run_id != 'main' LIMIT 1").fetchone():
+                        raise UnknownSchema("legacy ledger contains unsupported configuration archives")
                     for row in self._connection.execute(
-                        "SELECT run_id, record FROM discovery_runs"
+                        "SELECT run_id, record FROM discovery_runs WHERE run_id = 'main'"
                     ).fetchall():
                         record = json.loads(row["record"])
                         if not isinstance(record, dict) or (
@@ -229,11 +234,15 @@ class ResearchStore:
                             raise UnknownSchema(
                                 "invalid saved provider routing; upgrade refused"
                             )
-                        if record.get("closed_loop") is not None:
+                        if version < 6 and record.get("closed_loop") is not None:
                             raise UnknownSchema(
                                 "legacy ledger cannot authorize closed-loop proving"
                             )
-                        record["closed_loop"] = None
+                        if version < 6:
+                            record["closed_loop"] = None
+                        if record.get("strategy_review") is not None:
+                            raise UnknownSchema("legacy ledger cannot authorize strategy recovery")
+                        record["strategy_review"] = None
                         self._connection.execute(
                             "UPDATE discovery_runs SET record = ? WHERE run_id = ?",
                             (json_text(record), row["run_id"]),
@@ -316,7 +325,7 @@ class ResearchStore:
         ):
             raise UnknownSchema(
                 "unrecognized research ledger schema; no migration was attempted. "
-                "For a version 1 through 5 ledger, explicitly run research_claims upgrade DIRECTORY."
+                "For a version 1 through 6 ledger, explicitly run research_claims upgrade DIRECTORY."
             )
         for name, expected in _COLUMNS.items():
             if name not in schema:

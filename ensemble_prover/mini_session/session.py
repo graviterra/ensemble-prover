@@ -23385,6 +23385,17 @@ class MiniSession:
             self.proof_state.statement_environment_hash = environment_hash
 
     async def run(self) -> Tuple[bool, Optional[str]]:
+        from ..research_claims.strategy_runtime import current_strategy
+
+        strategy = current_strategy()
+        statement = str(getattr(self.dossier, "root_statement", "") or "").strip()
+        if strategy is not None and statement:
+            subject = strategy.register(statement)
+            with strategy.subject_scope(subject["subject_id"]):
+                return await self._run_with_planner_owner()
+        return await self._run_with_planner_owner()
+
+    async def _run_with_planner_owner(self) -> Tuple[bool, Optional[str]]:
         planner_broker = self.planner_job_broker()
         if planner_broker is not None:
             planner_broker.bind_session_owner(self, asyncio.current_task())
@@ -23449,6 +23460,9 @@ class MiniSession:
             )
             or self._owned_missing_planner_recovery_action() is not None
         ):
+            from ..research_claims.strategy_runtime import check_strategy
+
+            check_strategy()
             self._retire_terminal_ready_planner_jobs()
             if self._planner_terminal_authority_reason():
                 break
@@ -27015,6 +27029,19 @@ class MiniSession:
         returned object — the input's ``solved`` bit is not rewritten in place.
         """
 
+        from ..research_claims.strategy_runtime import current_strategy
+        from ..research_claims.strategy import StrategyYield
+
+        strategy = current_strategy()
+        if strategy is not None:
+            try:
+                strategy.check()
+            except StrategyYield:
+                try:
+                    strategy.retain_dossier(self.dossier)
+                except (ValueError, OSError):
+                    pass  # Bounded artifact ingress cannot replace the control transfer.
+                raise
         metadata = dict(outcome.metadata or {})
         action_dispatch_id = str(metadata.get("action_dispatch_id") or "").strip()
         if self._apply_transition_active:

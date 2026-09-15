@@ -94,9 +94,10 @@ authorization remains. No allowance is automatically refunded or extended.
 
 Workers and reviewers use separate clients and fresh ephemeral invocations.
 Complete arguments pass through the same ledger and review gates as API-backed
-research. The exact source and original proof plan remain required downstream
-context; full diagnostics return to the investigator. The host does not trim
-required content, but Codex can manage context internally as described below.
+research. Exact source, proof plans, and diagnostics remain archived. Recovery
+uses bounded working context with exact artifact/page retrieval; omitted content
+must be retrieved before judging it. Codex can also manage context internally
+as described below.
 Reviewed proofs/counterexamples automatically queue proof work when the project
 is configured. Defaults are `--proof-quantum-s 600`, `--formalization-steps 8`, and
 `--lean-timeout-s 300`. A paused campaign retains its reviewed contracts, completed
@@ -113,13 +114,17 @@ authorized standalone API formalization outside its research cap. Full instructi
 are in
 [User Guide section 21](USER_GUIDE.md#21-run-autonomous-mathematical-research).
 
-New ledgers use schema 6. Stop older clients, back up version 1–5 ledgers, and run
+New ledgers use schema 7. Back up a schema 1–6 ledger that is no longer open in
+an older client, and run
 `python -m ensemble_prover.research_claims upgrade DIRECTORY` explicitly before
 opening them with this version. The upgrade preserves providers and budgets,
-adds explicit API routing where required by old API-only formats, and leaves
-automatic proving disabled. Missing routing or closed-loop authorization fields
-in new-format runs are errors. Create a new discovery run with `--project-path`
-to authorize the integrated workflow.
+adds explicit API routing where required by old API-only formats, and preserves
+schema-6 closed-loop settings. Migration does not authorize strategy recovery
+on existing ledgers; automatic proving remains disabled on schemas 1–5 upgrades.
+Missing routing or closed-loop authorization fields in new-format runs are
+errors. New discovery CLI runs enable recovery by default. See the
+[recovery guide](../ensemble_prover/research_claims/STRATEGY_RECOVERY.md) for
+original-target pinning, adoption, outside evidence, and research tools.
 
 ## Request and tool behavior
 

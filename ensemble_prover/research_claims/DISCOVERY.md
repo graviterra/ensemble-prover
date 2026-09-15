@@ -1,6 +1,6 @@
 # Autonomous mathematical research — experimental
 
-Last updated: 2026-09-10.
+Last updated: 2026-09-15.
 
 This executable loop investigates a mathematical problem, starts alternative
 research programs, shares complete arguments, commissions fresh reviews, and
@@ -10,6 +10,11 @@ approaches do not become extra hypotheses of the original target.
 With a built Lake project, one `discovery run` also drives formalization,
 independent statement review, Mini proof search, checked export, and feedback
 to the investigator. Without a project, research remains standalone.
+
+New CLI runs enable [strategy recovery](STRATEGY_RECOVERY.md): bounded proof
+intervals, independent ancestor/method objections, source research, and continued
+alternative investigations. Stalled routes return to research within the original
+limits. The guide covers pinned Lean targets and adoption of stopped Mini runs.
 
 ## Start and inspect a run
 
@@ -105,6 +110,10 @@ withdraws affected receipt authority and lists it under `stale_proofs`, while st
 remains readable and historical artifacts remain available. Resume retires stale
 proof jobs without new budget; changing the original target still stops the run.
 
+For original Lean targets supplied with `--lean-file`/`--theorem` or stopped-run
+adoption, final acceptance additionally checks an immutable original proposition
+captured before candidate imports and instances. See [target pinning](STRATEGY_RECOVERY.md#start-with-an-immutable-original-lean-target).
+
 Natural-language alignment remains `machine_reviewed_not_certified`. Lean checks
 the formal statement; the correspondence to the prose is independently model
 reviewed, not mathematically certified. The manual ledger's `kernel_report`
@@ -135,8 +144,9 @@ from this path; verified discovery exports are reported separately.
   proof after provider authorization ends, without issuing another model request;
   after the deadline, this recovery is bounded by the saved Lean timeout.
 - One controller process owns the run. Workers operate asynchronously up to the
-  configured concurrency. Reviews have priority, then formalization; research
-  turns use a durable FIFO queue, with new programs and continuing turns joining its tail. Repeated
+  configured concurrency. Strategy recovery uses a durable FIFO queue for ready
+  work across roles; compatibility mode retains review/formalization priority.
+  New programs and continuing turns join the queue tail. Repeated
   delegation cannot continually jump ahead of older waiting research turns.
   This is single-host, not a distributed fleet runtime.
 - Provider failures are operational pauses, not mathematical verdicts. Changing
@@ -148,16 +158,17 @@ There is no automatic budget extension. Exhausted runs remain inspectable;
 additional model work requires a newly authorized discovery run or separately
 authorized standalone campaign.
 
-New ledgers use schema 6, with explicit closed-loop authorization. Stop older
-clients, back up version 1–5 ledgers, and explicitly upgrade them:
+New ledgers use schema 7, with explicit closed-loop and strategy-recovery fields.
+For an inactive version 1–6 ledger, back it up and explicitly upgrade it:
 
 ```bash
 python -m ensemble_prover.research_claims upgrade DIRECTORY
 ```
 
 Upgrading preserves records, budgets, and existing providers. Older API-only runs
-receive explicit API routing metadata. Existing runs remain research-only;
-upgrading does not authorize automatic proving. Initialize a new directory with
+receive explicit API routing metadata. Existing schema-6 closed-loop authorization
+is preserved. Earlier research-only runs remain research-only, and recovery is not
+automatically enabled on migrated runs; upgrading grants no new authorization. Initialize a new directory with
 `--project-path` for that workflow. Missing routing or closed-loop authorization
 fields in new-format runs fail closed.
 
@@ -179,8 +190,10 @@ filled gap or supersede named earlier assessments; unlisted dissent remains acti
 Original documents, requests, raw responses, full arguments, experiment results,
 and proof plans are retained as hashed artifacts. Reviewers receive complete
 assigned arguments. Other arguments have exact artifact IDs and can be retrieved
-in full. Required conversation content is not silently truncated. A context-window
-overflow is explicit; automatic context compaction is not implemented here.
+in full. Recovery uses bounded working windows with lossless artifact/page retrieval;
+exact short control outcomes remain visible. Assigned arguments may require explicit
+page retrieval before assessment. Context overflow reduces the working window and
+returns to research. Compatibility mode retains the older explicit overflow behavior.
 The Codex adapter preserves the complete serialized request, but Codex may
 manage or compact its own context internally. Exact underlying-model delivery
 cannot be attested by the host. Subscription failures expose only classified
@@ -247,9 +260,11 @@ the research request cap. This separate campaign uses the standalone CLI's API
 model settings. Automatic proof work inside `discovery run` uses the saved
 discovery providers and shares its global cap instead.
 
-Other current limits: no automatic literature search, learned portfolio allocator,
-cross-run method library, distributed execution, or empirical discovery-performance
-claim. Three offline scripted/fake-Codex trajectories exercise real Lean
+Recovery workers and reviewers can search Crossref metadata, fetch public sources,
+and inspect original PDF pages. Coverage is not comprehensive; unavailable or
+uninspected sources remain unknown. Other current limits include no learned
+portfolio allocator, cross-run method library, distributed execution, or empirical
+discovery-performance claim. Three offline scripted/fake-Codex trajectories exercise real Lean
 verification and feedback; these are integration tests, not discovery-performance
 benchmarks. Optional computation has separate isolation tests. Paid model
 benchmarks require separate authorization.

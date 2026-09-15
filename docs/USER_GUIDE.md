@@ -16,7 +16,7 @@ gap. Supply a built Lake project to let the same discovery run formalize candida
 arguments, search for proofs with Mini, independently check exports, and return
 feedback to research. A research assessment is not a Lean proof certificate.
 
-This guide covers release 1.10, including both experimental NL frontends and
+This guide covers release 1.11, including both experimental NL frontends and
 the optional Codex subscription backend for Mini and autonomous research, plus
 the experimental research-to-proof workflow in this source checkout. Older
 release snapshots may not include the research modules; Mini-only releases also lack the NL
@@ -474,6 +474,13 @@ Options supplied after the launcher override its preset limits, including
 `0` to disable a limit. The ordinary CLI keeps its existing defaults. The
 Putnam sweep uses its separate first-acceptance and second-acceptance deadlines;
 this launcher does not change those milestones.
+
+Both launchers resolve relative paths from the repository root and run Python
+workers unbuffered, so redirected output is written promptly. The Putnam sweep
+also displays each attempt's normal progress lines in the terminal while saving
+them beside the attempt directory in `attempt_NNN.sweep_console.log`; see
+[the sweep guide](../ensemble_prover/PUTNAM_SWEEP.md)
+for its preview, resume, and deadline controls.
 
 ### Which timeout does what?
 
@@ -1622,17 +1629,18 @@ stays readable, and resume retires obsolete proof jobs without new budget.
   worker's request. A changed child claim retires its stale invocation and
   notifies its unchanged parent without allocating a fresh budget.
 
-No proof plan or required context is silently truncated. Complete arguments,
-reviews, raw responses, and experiment results remain in hashed artifacts. To
-retrieve a named artifact, choose a new output file:
+Complete proof plans, arguments, reviews, raw responses, and experiment results
+remain in hashed artifacts. Recovery uses bounded working context with exact
+artifact/page retrieval; workers must retrieve omitted content before judging it.
+To retrieve a named artifact, choose a new output file:
 
 ```bash
 .venv/bin/python -m ensemble_prover.research_claims read-artifact runs/research/example SHA256 \
   --output complete-artifact.txt
 ```
 
-Codex receives the complete serialized conversation in a fresh ephemeral
-invocation, including fresh reviewer assignments. Its runtime may manage or
+Codex receives the assigned working context in a fresh ephemeral invocation,
+including fresh reviewer assignments and exact retrieval handles. Its runtime may manage or
 compact context internally; the adapter cannot attest exact delivery to the
 underlying model. Authentication and quota failures pause without changing the
 mathematical verdict; `last_error.backend_kind` identifies the subscription
@@ -1640,21 +1648,29 @@ failure without copying raw credential-bearing diagnostics. If a different
 concurrent failure stopped the run first, inspect each job's `last_error_details`
 for its own cause.
 
-New ledgers use schema 6. Stop older clients and back up the directory before
-upgrading a version 1, 2, 3, 4, or 5 ledger:
+New ledgers use schema 7. Back up a ledger that is no longer open in an older
+client before explicitly upgrading schema 1, 2, 3, 4, 5, or 6:
 
 ```bash
 .venv/bin/python -m ensemble_prover.research_claims upgrade DIRECTORY
 ```
 
 The upgrade preserves records, providers, and budgets; it does not start model
-work or enable automatic proving. Older API-only runs receive explicit API
-routing metadata; existing Codex routing is retained. Schema 6 records explicit
-closed-loop authorization and rejects missing routing/authorization fields in a
-new-format run. To enable the integrated workflow, initialize a new discovery
-directory with `--project-path`. See
+work or authorize strategy recovery. Older API-only runs receive explicit API
+routing metadata; existing Codex routing and schema-6 closed-loop settings are
+retained. Automatic proving remains disabled on schemas 1–5 upgrades. New-format
+runs reject missing routing/authorization fields. To enable recovery and the
+integrated proof workflow, initialize a new discovery directory with
+`--project-path`. See
 the [ledger compatibility instructions](../ensemble_prover/research_claims/README.md)
 before upgrading.
+
+Recovery is enabled by default for new discovery CLI runs. It tracks ancestor
+obligations, reviews outside findings, and allocates further research when a
+proof route stalls. Researchers can search Crossref metadata, fetch public
+sources, and inspect original PDF pages. See the
+[strategy recovery guide](../ensemble_prover/research_claims/STRATEGY_RECOVERY.md)
+for exact-target Lean pinning, adopting stopped Mini work, and supplying evidence.
 
 ### Optional research experiments
 
@@ -1706,8 +1722,8 @@ a proved result.
 
 The research loop is experimental. Three offline scripted/fake-Codex trajectories
 exercise real Lean verification, including proof feedback; this is integration
-validation, not a discovery-performance benchmark. Automatic literature search
-and distributed fleets are not implemented. No autonomous mathematical discovery
+validation, not a discovery-performance benchmark. Literature coverage is not
+comprehensive, and distributed fleets are not implemented. No autonomous mathematical discovery
 success rate or literature novelty claim has been established. The [full research
 execution contract](../ensemble_prover/research_claims/DISCOVERY.md) documents
 the current guarantees and limitations.

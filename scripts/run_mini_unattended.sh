@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Bound unattended single-problem runs; explicit CLI arguments below win.
+# Usage: scripts/run_mini_unattended.sh [MiniProver options; --help lists them]
 set -euo pipefail
 
 MINI_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "${MINI_REPO_ROOT}"
+# Keep progress timely in redirected logs, including descendant Python workers.
+export PYTHONUNBUFFERED=1
 exec "${MINI_REPO_ROOT}/.venv/bin/python" -m ensemble_prover.mini_prover \
   --mini-worker-timeout-s 7200 \
   --mini-run-wall-clock-budget-s 6900 \

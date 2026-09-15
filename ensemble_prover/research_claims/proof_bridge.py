@@ -164,6 +164,10 @@ def binding(store: Any, job: dict[str, Any]) -> dict[str, Any]:
             }
         )
     )
+    original_binding = None
+    if store.run_record().get("strategy_review") or store.run_record().get("original_target_anchor"):
+        from .strategy import StrategyController
+        original_binding = StrategyController(store).snapshot().get("original_anchor")
     return {
         "schema": 1,
         "handoff_artifact": job["handoff_artifact"],
@@ -171,6 +175,7 @@ def binding(store: Any, job: dict[str, Any]) -> dict[str, Any]:
         "polarity": job["polarity"],
         "environment_id": config["environment"]["id"],
         "goal": goal,
+        **({"original_anchor": original_binding} if original_binding else {}),
     }
 
 
@@ -198,12 +203,19 @@ def validate_receipt(store: Any, job: dict[str, Any], receipt: Any) -> dict[str,
     from ..formalization.environment import EnvironmentSnapshot
     from ..formalization.store import ProjectStore
 
+    run = store.run_record()
+    if run.get("original_target_anchor") or run.get("strategy_review"):
+        from .strategy import StrategyController
+        StrategyController(store).snapshot()
+    pin = (run.get("strategy_review") or {}).get("original_lean") if job["claim_id"] == run["target_id"] else None
+    if pin and (not isinstance(receipt, dict) or "original_target" not in receipt):
+        raise ValueError("missing original target acceptance receipt")
     if not isinstance(receipt, dict) or set(receipt) != {
         "binding",
         "export_name",
         "files",
         "root_result",
-    }:
+    } | ({"original_target"} if pin else set()):
         raise ValueError("missing or invalid verified export receipt")
     directory = _campaign_path(store, job)
     with ProjectStore(directory) as campaign:
@@ -259,6 +271,16 @@ def validate_receipt(store: Any, job: dict[str, Any], receipt: Any) -> dict[str,
             environment=environment,
         )
         compiler.validate_closure([ModuleArtifact.from_dict(root.result["artifact"])])
+        if pin:
+            from .pinned_target import validate_acceptance
+
+            closure = validate_acceptance(pin, compiler, receipt["original_target"],
+                ModuleArtifact.from_dict(root.result["artifact"]), root.result["name"], job["polarity"], capture_root=store.directory / "original-modules")
+            for module in closure:
+                stem = "/".join(module.module_name.split("."))
+                if any(receipt["files"].get(stem + suffix) != digest for suffix, digest in
+                       ((".lean", module.source_sha256), (".olean", module.olean_sha256))):
+                    raise ValueError("original target export closure is incomplete")
     return receipt
 
 
@@ -360,7 +382,7 @@ class ProofBridge:
         from ..formalization.campaign import Campaign
         from ..formalization.environment import EnvironmentSnapshot
         from ..formalization.export import export_project
-        from ..formalization.lean import ModuleCompiler
+        from ..formalization.lean import ModuleArtifact, ModuleCompiler
         from ..formalization.prover import MiniProver
 
         config = configuration(self.store.run_record())
@@ -381,6 +403,10 @@ class ProofBridge:
             "artifact_inventory": bundle["ledger"]["artifacts"],
             "polarity_policy": "Translate the exact claim for prove. For refute, independently check that the formal target is the logical negation of the original claim, including domain, hypotheses and quantifier scope. Neither research text nor proof plan may change that target.",
         }
+        pin = (self.store.run_record().get("strategy_review") or {}).get("original_lean") if job["claim_id"] == self.store.run_record()["target_id"] else None
+        if pin:
+            required["pinned_original_target"] = {"statement": pin["statement"], "binding": pin["binding"],
+                "policy": "Final acceptance must prove this original compiled proposition, independently of semantic review."}
         async with _ProofExitStack() as cleanup:
             compiler = ModuleCompiler(
                 environment.project_path,
@@ -390,6 +416,17 @@ class ProofBridge:
                 environment=environment,
             )
             cleanup.push_async_callback(compiler.close)
+            # The definition of the original proposition and its local types
+            # are available before candidate development, without asserting it.
+            ambient_pin = (self.store.run_record().get("strategy_review") or {}).get("original_lean")
+            required_artifacts = []
+            if ambient_pin:
+                from .pinned_target import validate_pin
+                validate_pin(ambient_pin, compiler, capture_root=self.store.directory / "original-modules")
+                original_module = await compiler.compile(ambient_pin["pin_source"], expected_name=ambient_pin["pin_name"])
+                required_artifacts.append(original_module)
+                required["original_definitions"] = {"module": original_module.to_dict(), "source": ambient_pin["pin_source"],
+                    "policy": "Use these already admitted declarations. Do not redeclare their types or instances."}
             run = self.store.run_record()
             remaining = max(0, run["deadline"] - time.time())
             stop_reason = self.store.stop_reason(run)
@@ -431,6 +468,7 @@ class ProofBridge:
                     compiler=compiler,
                     prover=prover,
                     required_context=required,
+                    required_artifacts=required_artifacts,
                 )
             )
             _check_campaign(self.store, job, campaign.store)
@@ -447,7 +485,8 @@ class ProofBridge:
             feedback = self._feedback(campaign.store, result)
             if result["status"] != "proved":
                 return {
-                    "status": "incomplete",
+                    "status": "yielded_for_review" if result["status"] == "yielded_for_review" else "incomplete",
+                    "strategy_outcome": result.get("strategy_outcome"),
                     "stop_reason": result.get("stop_reason"),
                     "feedback": feedback,
                 }
@@ -457,7 +496,23 @@ class ProofBridge:
             import uuid
 
             output = directory / ("verified-" + uuid.uuid4().hex)
-            await export_project(directory, output)
+            original_acceptance = None
+            root_override = None
+            if pin:
+                from .pinned_target import check_candidate
+
+                candidate_result = campaign.store.get_task(campaign.store.get_metadata("root_id")).result
+                try:
+                    original_acceptance = await check_candidate(pin, compiler,
+                        ModuleArtifact.from_dict(candidate_result["artifact"]), candidate_result["name"], polarity=job["polarity"], capture_root=self.store.directory / "original-modules")
+                except ValueError as exc:
+                    return {"status": "incomplete", "feedback": {**feedback, "status": "target_mismatch",
+                        "original_target": pin["statement"], "candidate_result": candidate_result,
+                        "diagnostic": str(exc), "next_action": "Retain this checked candidate and find a route proving the original target."}}
+                root_override = {"kind": "theorem", "name": original_acceptance["wrapper_name"],
+                    "statement": original_acceptance["wrapper_statement"], "artifact": original_acceptance["wrapper"],
+                    "original_target_binding": pin["binding"]}
+            await export_project(directory, output, **({"root_override": root_override} if root_override is not None else {}))
             _check_campaign(self.store, job, campaign.store)
             receipt = {
                 "binding": binding(self.store, job),
@@ -473,5 +528,7 @@ class ProofBridge:
                     campaign.store.get_metadata("root_id")
                 ).result,
             }
+            if original_acceptance is not None:
+                receipt["original_target"] = original_acceptance
             validate_receipt(self.store, job, receipt)
             return {"status": "proved", "receipt": receipt, "feedback": feedback}

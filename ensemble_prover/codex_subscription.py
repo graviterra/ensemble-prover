@@ -8,6 +8,9 @@ No private endpoints, extracted login tokens, or API-key fallback are used.
 
 from __future__ import annotations
 
+import base64
+from copy import deepcopy
+
 import asyncio
 import json
 import shutil
@@ -41,6 +44,31 @@ from .subscription_cli import (
 from .subprocess_environment import sanitized_subprocess_environment
 
 CODEX_SUBSCRIPTION_BASE_URL = "codex://chatgpt"
+
+
+def _materialize_page_images(messages: list[dict[str, Any]], directory: Path) -> tuple[list[dict[str, Any]], list[Path]]:
+    """Translate bounded inline PNG source pages to explicit CLI attachments."""
+    copied = deepcopy(messages)
+    files: list[Path] = []
+    for message in copied:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for index, item in enumerate(content):
+            if not isinstance(item, dict) or item.get("type") != "image_url":
+                continue
+            url = item.get("image_url", {}).get("url", "")
+            prefix = "data:image/png;base64,"
+            if not isinstance(url, str) or not url.startswith(prefix) or len(url) > 24 * 1024 * 1024 or len(files) >= 8:
+                raise ValueError("Codex page attachments require at most eight bounded inline PNG images")
+            data = base64.b64decode(url[len(prefix):], validate=True)
+            if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) > 16 * 1024 * 1024:
+                raise ValueError("invalid PNG source page")
+            path = directory / f"source-page-{len(files) + 1}.png"
+            path.write_bytes(data)
+            files.append(path)
+            content[index] = {"type": "text", "text": "Inspect attached original source image " + path.name}
+    return copied, files
 
 
 def _subscription_environment() -> dict[str, str]:
@@ -490,6 +518,13 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
             )
             Path(cwd, "instructions.txt").write_text(_INSTRUCTIONS, encoding="utf-8")
             argv = self._command(cwd, effort)
+            image_messages, image_files = _materialize_page_images(request_messages, Path(cwd))
+            if image_files:
+                # Attach actual images using the CLI protocol; putting base64
+                # in the text prompt would not provide visual source access.
+                for image_file in image_files:
+                    argv[-1:-1] = ["--image", str(image_file)]
+                payload = json.dumps({**request, "messages": image_messages}, ensure_ascii=False, allow_nan=False).encode("utf-8")
             remaining = (
                 None if timeout is None else timeout - (time.monotonic() - started)
             )

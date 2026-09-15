@@ -29,6 +29,10 @@ from .model import (
     text,
 )
 from .store import RevisionConflict
+from .strategy_discovery import ACTION_FIELDS as STRATEGY_ACTION_FIELDS
+from .strategy_discovery import SYSTEM as STRATEGY_SYSTEM
+from .strategy import StrategyYield
+from .literature import FIELDS as LITERATURE_FIELDS, INSTRUCTIONS as LITERATURE_INSTRUCTIONS, LiteratureTools, source_context
 
 
 SYSTEM = """You are a mathematical research worker in Ensemble Prover.
@@ -111,6 +115,8 @@ _FIELDS = {
     "wait": {"reason"},
     "review": {"verdict", "rationale"},
     "request_review": {"evidence_id", "question", "supersedes_review_ids"},
+    **STRATEGY_ACTION_FIELDS,
+    **LITERATURE_FIELDS,
 }
 
 
@@ -134,6 +140,9 @@ def initialize(
     proof_quantum_s: float = 600,
     formalization_steps: int = 8,
     lean_timeout_s: float = 300,
+    strategy_recovery: bool = False,
+    strategy_policy: Mapping[str, Any] | None = None,
+    original_lean: dict[str, Any] | None = None,
 ) -> None:
     """Create an immutable objective and explicit authorization; spend nothing."""
     if not isinstance(target, ClaimSpec) or target.dependencies:
@@ -213,6 +222,7 @@ def initialize(
                 "handoffs": [],
                 "last_error": None,
                 "closed_loop": closed_loop,
+                "strategy_review": None,
             }
         )
         store.add_job(
@@ -220,6 +230,10 @@ def initialize(
             "Investigate the entire problem. Choose and execute promising research "
             "programs; delegate when useful, test alternatives, and retain exact gaps.",
         )
+        if strategy_recovery:
+            from .strategy import StrategyController
+
+            StrategyController.enable(store, original_lean=original_lean, **dict(strategy_policy or {}))
 
 
 class DiscoveryLoop:
@@ -248,9 +262,16 @@ class DiscoveryLoop:
         self.on_event = on_event
         self.proof_runner = proof_runner
         self.owns_clients = owns_clients
+        from .strategy_discovery import StrategyIntegration
+
+        self.strategy = StrategyIntegration(self) if store.run_record().get("strategy_review") is not None else None
+        self.literature = LiteratureTools(store)
         self._clients: dict[str, Any] = {}
         self._client_locks: dict[int, asyncio.Lock] = {}
         self._owned_clients: dict[int, Any] = {}
+        self._retiring_transports: dict[int, asyncio.Task[Any]] = {}
+        self._retiring_closures: dict[int, asyncio.Task[None]] = {}
+        self._closing_clients = False
         for provider in self.providers.values():
             if hasattr(provider, "chat_raw"):
                 self._check_client(provider)
@@ -264,6 +285,16 @@ class DiscoveryLoop:
 
     def _client(self, job: dict[str, Any]) -> Any:
         provider = self.providers[job["role"]]
+        previous = self._clients.get(job["worker"])
+        if (
+            self.strategy is not None
+            and previous is not None
+            and not hasattr(provider, "chat_raw")
+            and (id(previous) in self._retiring_transports or id(previous) in self._retiring_closures)
+        ):
+            # Factory ownership permits a fresh transport while the old one
+            # remains retained and fenced. Fixed shared clients cannot be cloned.
+            self._clients.pop(job["worker"])
         if job["worker"] not in self._clients:
             client = (
                 provider if hasattr(provider, "chat_raw") else provider(job["worker"])
@@ -287,6 +318,7 @@ class DiscoveryLoop:
         if not self.owns_clients:
             return
         if closing:
+            self._closing_clients = True
             self._clients.clear()
         else:
             for job in self.store.jobs():
@@ -305,9 +337,23 @@ class DiscoveryLoop:
         for identity in list(self._client_locks):
             if identity not in retained:
                 self._client_locks.pop(identity)
+        if self.strategy is not None:
+            # Pool disposal is independent of mathematical work. Keep strong
+            # ownership of slow disposals, and bound the whole cleanup batch.
+            for identity in list(self._owned_clients):
+                if identity in retained or identity in self._retiring_transports:
+                    continue
+                client = self._owned_clients.pop(identity)
+                if identity not in self._retiring_closures:
+                    self._retiring_closures[identity] = asyncio.create_task(
+                        self._close_retired_client(identity, client)
+                    )
+            if self._retiring_closures:
+                await asyncio.wait(set(self._retiring_closures.values()), timeout=.05)
+            return
         failure: BaseException | None = None
         for identity in list(self._owned_clients):
-            if identity in retained:
+            if identity in retained or identity in self._retiring_transports:
                 continue
             client = self._owned_clients.pop(identity)
             try:
@@ -328,13 +374,28 @@ class DiscoveryLoop:
         if failure is not None and not preserve_failure:
             raise failure
 
+    async def _close_retired_client(self, identity: int, client: Any) -> None:
+        try:
+            await client.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                logging.getLogger(__name__).warning(
+                    "Research client cleanup failed (%s)", type(exc).__name__
+                )
+            except Exception:
+                pass
+        finally:
+            self._retiring_closures.pop(identity, None)
+
     def _context(self, job: dict[str, Any]) -> dict[str, Any]:
         with self.store.read_snapshot():
             run = self.store.run_record()
             context = {
                 "target": run["target_spec"],
                 "sources": {
-                    name: self.store.read_artifact(aid).decode("utf-8")
+                    name: source_context(self.store, aid)
                     for name, aid in run["sources"].items()
                 },
                 "assignment": {
@@ -367,12 +428,15 @@ class DiscoveryLoop:
                 "programs": [
                     {
                         key: item[key]
-                        for key in ("job_id", "claim_id", "question", "status")
+                        for key in ("job_id", "claim_id", "question", "status", "late_research_candidates")
+                        if key in item
                     }
                     for item in self.store.jobs()
                 ],
             }
-            if job["role"] == "review":
+            if self.strategy is not None:
+                context.update(self.strategy.context(job))
+            if job["role"] == "review" and not job.get("strategy_review_id"):
                 evidence = next(
                     item
                     for item in self.store.history(job["claim_id"])["evidence"]
@@ -425,26 +489,49 @@ class DiscoveryLoop:
         # instance is serialized; CLI factories give each worker its own one.
         lock = self._client_locks.setdefault(id(client), asyncio.Lock())
         async with lock:
+            if self.strategy is not None and (
+                id(client) in self._retiring_transports
+                or id(client) in self._retiring_closures
+            ):
+                with self.store.atomic():
+                    job = self.store.job(job["job_id"])
+                    job.update(status="pending", retry_after=time.time() + .2, last_error="transport_retiring")
+                    self.store.save_job(job)
+                return job
             with self.store.atomic():
                 job = self.store.job(job["job_id"])
                 job["messages"].extend(job["inbox"])
                 job["inbox"] = []
+                context = self._context(job)
+                history = job["messages"]
+                if self.strategy is not None:
+                    from .context_window import window
+                    context = window(self.store, context, limit=self.store.run_record().get("context_char_limit", 20000))
+                    history = [{**item, "content": json_text(window(self.store, {"message": item["content"]}, limit=2500))}
+                               if len(json_text(item["content"])) > 2500 and not item.get("_retrieval_page") else item for item in history[-4:]]
                 messages = [
                     {
                         "role": "system",
-                        "content": SYSTEM,
+                        "content": SYSTEM + (STRATEGY_SYSTEM + LITERATURE_INSTRUCTIONS if self.strategy is not None else ""),
                         REQUIRED_PROMPT_CONTEXT_KEY: True,
                     },
                     {
                         "role": "user",
-                        "content": json_text(self._context(job)),
+                        "content": json_text(context),
                         REQUIRED_PROMPT_CONTEXT_KEY: True,
                     },
                     *[
                         {**message, REQUIRED_PROMPT_CONTEXT_KEY: True}
-                        for message in job["messages"]
+                        for message in history
                     ],
                 ]
+                if job.get("source_pages"):
+                    import base64
+
+                    for page in job["source_pages"]:
+                        messages.append({"role": "user", REQUIRED_PROMPT_CONTEXT_KEY: True,
+                            "content": [{"type": "text", "text": "Original source page: " + json_text(page)},
+                                        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(self.store.read_artifact(page["image_artifact"])).decode(), "detail": "high"}}]})
                 job.update(
                     status="running",
                     turn=job["turn"] + 1,
@@ -455,8 +542,21 @@ class DiscoveryLoop:
                 )
                 self.store.save_job(job)
 
+            admission_open = True
             async def authorize(details: Any = None) -> Any:
-                self.store.authorize(job["job_id"], job["turn"])
+                if self.strategy is not None:
+                    if not admission_open:
+                        raise StrategyYield("retired_transport")
+                    try:
+                        self.strategy.controller.admit_control(details["provider_dispatch_attempt_id"], job["job_id"], job["turn"])
+                    except StrategyYield as exc:
+                        # Only existing global limits end a run. Reservation
+                        # contention defers this worker until proof work yields.
+                        if self.store.stop_reason():
+                            raise AdmissionStopped(self.store.stop_reason()) from exc
+                        raise
+                else:
+                    self.store.authorize(job["job_id"], job["turn"])
                 self._emit("provider_dispatch", job)
                 return details
 
@@ -472,10 +572,54 @@ class DiscoveryLoop:
                     response_format = (
                         None if isinstance(client, CodexSubscriptionClient) else "json"
                     )
-                    _, response = await asyncio.wait_for(
-                        client.chat_raw(messages, response_format=response_format),
-                        timeout=timeout,
-                    )
+                    operation = client.chat_raw(messages, response_format=response_format)
+                    if self.strategy is None:
+                        _, response = await asyncio.wait_for(operation, timeout=timeout)
+                    else:
+                        task = asyncio.create_task(operation)
+                        try:
+                            done, _ = await asyncio.wait({task}, timeout=timeout)
+                            if not done:
+                                raise TimeoutError("research request expired")
+                            _, response = task.result()
+                        except BaseException:
+                            admission_open = False
+                            task.cancel()
+                            done, _ = await asyncio.wait({task}, timeout=.05)
+                            if not done:
+                                self._retiring_transports[id(client)] = task
+                            def retired(completed: asyncio.Task[Any]) -> None:
+                                self._retiring_transports.pop(id(client), None)
+                                try:
+                                    result = completed.result()
+                                    if time.time() <= run["deadline"] and len(json_text(result).encode()) <= 4 * 1024 * 1024:
+                                        with self.store.atomic():
+                                            artifact_id = self._blob(
+                                                {"candidate_only": True, "late_research_response": result,
+                                                 "job_id": job["job_id"], "turn": job["turn"]},
+                                                "late-research-response.json",
+                                            )
+                                            producer = self.store.job(job["job_id"])
+                                            candidates = producer.setdefault("late_research_candidates", [])
+                                            candidates.append({"artifact_id": artifact_id, "turn": job["turn"], "candidate_only": True})
+                                            self.store.save_job(producer)
+                                except BaseException:
+                                    pass  # Closed ledger/cancelled tail has no authority.
+                                finally:
+                                    identity = id(client)
+                                    if self._closing_clients and identity in self._owned_clients:
+                                        # The scheduler may already have returned and
+                                        # its ledger closed. Resource ownership still
+                                        # lasts until this transport finishes.
+                                        owned = self._owned_clients.pop(identity)
+                                        if identity not in self._retiring_closures:
+                                            self._retiring_closures[identity] = asyncio.create_task(
+                                                self._close_retired_client(identity, owned)
+                                            )
+                            task.add_done_callback(retired)
+                            raise
+                        finally:
+                            admission_open = False
                 # Save the entire raw provider output before interpretation.
                 with self.store.atomic():
                     job = self.store.job(job["job_id"])
@@ -490,6 +634,23 @@ class DiscoveryLoop:
                     self.store.save_job(job)
                 self._emit("response_saved", job)
                 return job
+            except StrategyYield as exc:
+                with self.store.atomic():
+                    current = self.store.job(job["job_id"])
+                    # An old transport cannot revive or overwrite a newer turn.
+                    if current["turn"] != job["turn"] or current["status"] != "running":
+                        return current
+                    if self.store.get_claim(current["claim_id"])["revision"] != current["revision"]:
+                        current.pop("strategy_capacity_wait", None)
+                        self._mark_stale(current)
+                    elif exc.reason == "global_limit":
+                        current.update(status="waiting", strategy_capacity_wait=True)
+                        self.store.save_job(current)
+                    else:
+                        current.update(status="pending", retry_after=time.time() + .2,
+                                       last_error=exc.reason)
+                        self.store.save_job(current)
+                return current
             except asyncio.CancelledError:
                 with self.store.atomic():
                     job = self.store.job(job["job_id"])
@@ -549,6 +710,17 @@ class DiscoveryLoop:
                         job.update(status="pending", last_error=reason)
                         self.store.save_job(job)
                     run = self.store.run_record()
+                    if self.strategy is not None and reason in {"context_overflow", "provider_timeout"} and not self.store.stop_reason(run):
+                        if reason == "context_overflow":
+                            run["context_char_limit"] = max(1200, int(run.get("context_char_limit", 20000) / 2))
+                            job["messages_archive"] = self._blob(job["messages"], "worker-context-history.json")
+                            job["messages"] = []
+                            job["source_pages"] = []
+                        job["retry_after"] = time.time() + min(30, 2 ** min(job.get("recovery_failures", 0), 5))
+                        job["recovery_failures"] = job.get("recovery_failures", 0) + 1
+                        self.store.save_job(job)
+                        self.store.save_run(run)
+                        return job
                     # The first failure closes admission. A concurrent worker
                     # observing that stop (or failing later) must not replace
                     # its causal diagnostic with AdmissionStopped/TimeoutError.
@@ -575,10 +747,14 @@ class DiscoveryLoop:
         if not isinstance(kind, str) or kind not in _FIELDS:
             raise ValueError("unknown research action")
         optional = (
+            {"method", "supersedes"}
+            if kind == "request_strategy_review"
+            else
             {"supersedes_review_ids"}
             if kind == "review"
             else {"polarity"}
             if kind == "formalize"
+            else {"path", "offset", "length"} if kind == "read_artifact"
             else set()
         )
         object_fields(
@@ -592,18 +768,27 @@ class DiscoveryLoop:
             "read_artifact",
             "read_claim",
             "experiment",
+            "strategy_review",
+            "progress_review",
+            "implication_review",
+            "alternative_review",
+            "lookup_strategy_subject",
+            *LITERATURE_FIELDS,
         }:
             raise ValueError(
                 "review workers may only inspect, experiment, or review their assigned evidence"
             )
-        if job["role"] != "review" and kind == "review":
+        if job["role"] != "review" and kind in {"review", "strategy_review", "progress_review", "implication_review", "alternative_review"}:
             raise ValueError("an investigator cannot act as its own reviewer")
+        if job.get("strategy_review_id") and kind == "review":
+            raise ValueError("this assignment requires a strategy_review allocation decision")
         return content, action
 
     def _reply(self, job: dict[str, Any], content: str, result: Any) -> None:
         job["messages"] += [
             {"role": "assistant", "content": content},
-            {"role": "user", "content": json_text(result)},
+            {"role": "user", "content": json_text(result),
+             **({"_retrieval_page": True} if isinstance(result, dict) and "offset" in result and "text" in result else {})},
         ]
         if job["status"] == "responded":
             job["status"] = "pending"
@@ -753,12 +938,27 @@ class DiscoveryLoop:
     def _apply_action(self, job: dict[str, Any], action: dict[str, Any]) -> Any:
         kind = action["action"]
         claim_id, revision = job["claim_id"], job["revision"]
+        if kind in STRATEGY_ACTION_FIELDS:
+            if self.strategy is None:
+                raise ValueError("strategy recovery is not enabled for this run")
+            return self.strategy.apply_action(job, action)
+        if kind in LITERATURE_FIELDS:
+            if not job.get("tool_result"):
+                raise ValueError("literature action was not executed")
+            result = load_json(self.store.read_artifact(job["tool_result"]).decode())
+            if result.get("image_artifact"):
+                pages = job.setdefault("source_pages", [])
+                pages.append({key: result[key] for key in ("original_artifact", "page", "image_artifact")})
+                job["source_pages"] = pages[-3:]
+            return result
         if kind == "read_artifact":
+            if self.strategy is not None:
+                from .context_window import read_page
+                return read_page(self.store, action["artifact_id"], path=action.get("path"),
+                    offset=action.get("offset", 0), length=action.get("length", 6000))
             return {
                 "artifact_id": action["artifact_id"],
-                "complete_text": self.store.read_artifact(action["artifact_id"]).decode(
-                    "utf-8"
-                ),
+                "complete_text": source_context(self.store, action["artifact_id"]),
             }
         if kind == "read_claim":
             return self.store.history(action["claim_id"])
@@ -961,6 +1161,8 @@ class DiscoveryLoop:
         if kind == "finish":
             text(action["reason"], "conclusion")
             job["status"] = "finished"
+            if self.strategy is not None:
+                self.strategy.record_finished_alternative(job)
             self._notify(
                 job["parent_job"],
                 {
@@ -1068,6 +1270,9 @@ class DiscoveryLoop:
 
         with self.store.atomic():
             job = self.store.job(job["job_id"])
+            if job["status"] == "verified":
+                validate_receipt(self.store, job, job.get("proof_receipt"))
+                return
             try:
                 handoff_bundle(self.store, job)
             except RevisionConflict:
@@ -1087,7 +1292,9 @@ class DiscoveryLoop:
             self._emit("provider_dispatch", job)
 
         result = None
+        lease = None
         try:
+            lease = self.strategy.prepare_proof(job) if self.strategy is not None else None
             config = self.store.run_record()["closed_loop"]
             remaining = self.store.run_record()["deadline"] - time.time()
             # A bounded local finalization can recover already-produced proof
@@ -1097,12 +1304,28 @@ class DiscoveryLoop:
                 if remaining > 0
                 else config["lean_timeout_s"]
             )
-            with provider_dispatch_guard(authorize):
-                result = await asyncio.wait_for(
-                    self.proof_runner.advance(job), timeout=timeout
-                )
+            from .strategy_runtime import bind_strategy
+
+            if lease is not None:
+                timeout = min(timeout, max(0.001, lease["expires_at"] - time.time()))
+            admission = bind_strategy(self.strategy.controller, lease) if lease is not None else provider_dispatch_guard(authorize)
+            with admission as runtime:
+                result = await runtime.run_operation(self.proof_runner.advance(job), timeout=timeout,
+                    on_late_result=lambda value: self._accept_late_proof(job["job_id"], value)) if lease is not None else await asyncio.wait_for(self.proof_runner.advance(job), timeout=timeout)
+            if not self._formalization_turn_current(job):
+                return
+            if self.strategy is not None and result["status"] == "yielded_for_review":
+                self.strategy.yield_job(job, result.get("strategy_outcome") or {"reason": "strategy_review"}, feedback=result)
+                return
+            if self.strategy is not None:
+                self.strategy.retain_feedback(job, result)
+                if result["status"] != "proved" and result.get("stop_reason") == "context_overflow" and not self.store.stop_reason():
+                    self.strategy.yield_job(job, {"status": "yielded_for_review", "reason": "proof_context_overflow"}, feedback=result)
+                    return
             if result["status"] == "proved":
                 validate_receipt(self.store, job, result.get("receipt"))
+            if lease is not None:
+                self.strategy.controller.finish_interval(lease)
             with self.store.atomic():
                 job = self.store.job(job["job_id"])
                 job["proof_feedback"] = self._blob(
@@ -1155,8 +1378,16 @@ class DiscoveryLoop:
                     )
                     self.store.save_run(run)
             self._emit("formalization_result", job)
+        except StrategyYield as exc:
+            if self.strategy is None:
+                raise
+            if not self._formalization_turn_current(job):
+                return
+            self.strategy.yield_job(job, exc.to_dict(), feedback=self._strategy_feedback(job))
         except RevisionConflict:
             with self.store.atomic():
+                if not self._formalization_turn_current(job):
+                    return
                 job = self.store.job(job["job_id"])
                 if result is not None:
                     job["proof_feedback"] = self._blob(
@@ -1165,15 +1396,24 @@ class DiscoveryLoop:
                 self._mark_stale(job)
         except asyncio.CancelledError:
             with self.store.atomic():
-                job = self.store.job(job["job_id"])
-                job.update(
-                    status="pending",
-                    recovery_pending=True,
-                    last_error="interrupted_formalization",
-                )
-                self.store.save_job(job)
+                if self._formalization_turn_current(job):
+                    job = self.store.job(job["job_id"])
+                    job.update(
+                        status="pending",
+                        recovery_pending=True,
+                        last_error="interrupted_formalization",
+                    )
+                    self.store.save_job(job)
             raise
         except (AdmissionStopped, TimeoutError, SubscriptionBackendError) as exc:
+            if not self._formalization_turn_current(job):
+                return
+            if self.strategy is not None and isinstance(exc, SubscriptionBackendError) and exc.backend_kind == "context" and not self.store.stop_reason():
+                self.strategy.yield_job(job, {"status": "yielded_for_review", "reason": "proof_context_overflow"}, feedback=self._strategy_feedback(job))
+                return
+            if self.strategy is not None and isinstance(exc, TimeoutError) and not self.store.stop_reason():
+                self.strategy.yield_job(job, {"status": "yielded_for_review", "reason": "interval_exhausted"}, feedback=self._strategy_feedback(job))
+                return
             feedback = None
             feedback_error = None
             if isinstance(exc, TimeoutError) and callable(
@@ -1231,6 +1471,50 @@ class DiscoveryLoop:
                 elif run["status"] == "running":
                     run.update(status=reason, last_error=error)
                     self.store.save_run(run)
+        finally:
+            if lease is not None:
+                self.strategy.controller.finish_interval(lease)
+
+    def _formalization_turn_current(self, attempted: dict[str, Any]) -> bool:
+        """Bookkeeping cannot displace a fresh accepted proof or another turn."""
+        from .proof_bridge import validate_receipt
+
+        current = self.store.job(attempted["job_id"])
+        if current["status"] == "verified":
+            validate_receipt(self.store, current, current.get("proof_receipt"))
+            return False
+        return current["turn"] == attempted["turn"] and current["status"] == "running"
+
+    def _strategy_feedback(self, job: dict[str, Any]) -> Any:
+        reader = getattr(self.proof_runner, "feedback", None)
+        if callable(reader):
+            try:
+                return reader(job)
+            except (ValueError, OSError, RevisionConflict) as exc:
+                return {"feedback_unavailable": type(exc).__name__}
+        return None
+
+    def _accept_late_proof(self, job_id: str, result: Any) -> None:
+        """Owner admission of a retained result; scheduling epochs grant no trust."""
+        from .proof_bridge import validate_receipt
+
+        if not isinstance(result, dict) or result.get("status") != "proved":
+            return
+        with self.store.atomic():
+            job = self.store.job(job_id)
+            run = self.store.run_record()
+            if run["status"] not in {"running", "budget_exhausted", "deadline_exhausted"}:
+                return
+            # Recheck the current handoff, exact root, environment and compiled
+            # closure. A review or expired search lease cannot supply authority.
+            validate_receipt(self.store, job, result.get("receipt"))
+            job.update(status="verified", proof_receipt=result["receipt"],
+                proof_feedback=self._blob(result, "verified-late-proof.json"), last_error=None)
+            self.store.save_job(job)
+            if job["claim_id"] == run["target_id"]:
+                run["status"] = "proved" if job["polarity"] == "prove" else "refuted"
+                self.store.save_run(run)
+            self._notify(job["parent_job"], {"verified_late_proof": result, "program_id": job_id}, requires_response=True)
 
     async def _advance(self, job: dict[str, Any]) -> None:
         if job["role"] == "formalization":
@@ -1245,6 +1529,28 @@ class DiscoveryLoop:
         except (ValueError, KeyError):
             self.apply_response(job)
             return
+        if action["action"] in LITERATURE_FIELDS and job["tool_result"] is None:
+            with self.store.atomic():
+                run = self.store.run_record()
+                current = self.store.job(job["job_id"])
+                if (current["status"] != "responded" or current["turn"] != job["turn"]
+                        or self.store.get_claim(job["claim_id"])["revision"] != job["revision"]
+                        or self.store.get_claim(run["target_id"])["revision"] != run["target_revision"]):
+                    self._mark_stale(current)
+                    return
+                job["status"] = "tool_running"
+                self.store.save_job(job)
+            result = await self.literature.run(action, remaining_s=self.store.run_record()["deadline"] - time.time()) if self.strategy is not None else {"status": "unavailable", "coverage": "none", "reason": "strategy research disabled", "kernel_verified": False}
+            with self.store.atomic():
+                job = self.store.job(job["job_id"])
+                artifact = self._blob(result, "literature-result.json")
+                if (self.store.get_claim(job["claim_id"])["revision"] != job["revision"]
+                        or self.store.get_claim(run["target_id"])["revision"] != run["target_revision"]):
+                    job["tool_result"] = artifact
+                    self._mark_stale(job)
+                    return
+                job.update(status="responded", tool_result=artifact)
+                self.store.save_job(job)
         if action["action"] == "experiment" and job["tool_result"] is None:
             run = self.store.run_record()
             code = action["code"]
@@ -1308,6 +1614,8 @@ class DiscoveryLoop:
                     run["deadline"] = run["started_at"] + run["max_seconds"]
                 run.update(status="running", last_error=None)
                 self.store.save_run(run)
+                if self.strategy is not None:
+                    self.strategy.controller.recover()
                 for job in self.store.jobs():
                     if job["role"] == "formalization" and job["status"] not in {
                         "stale",
@@ -1350,9 +1658,12 @@ class DiscoveryLoop:
                         self.store.save_job(job)
             primary_failure = False
             try:
+                self._closing_clients = False
                 while True:
                     await self._retire_clients(set(tasks.values()))
-                    run = self.store.run_record()
+                    if self.strategy is not None:
+                        self.strategy.synchronize()
+                    run = self.store.run_record(scheduling=True)
                     reason = self.store.stop_reason(run)
                     active = set(tasks.values())
                     jobs = self.store.jobs()
@@ -1382,15 +1693,22 @@ class DiscoveryLoop:
                             )
                         ),
                         key=lambda job: (
+                            job.get("queue_order", 0) if self.strategy is not None else 0,
                             {"review": 0, "formalization": 1, "research": 2}[
                                 job["role"]
                             ],
                             job.get("queue_order", 0),
                         ),
                     )
-                    for job in ready[: max(0, run["concurrency"] - len(tasks))]:
+                    due = [job for job in ready if job.get("retry_after", 0) <= time.time()]
+                    for job in due[: max(0, run["concurrency"] - len(tasks))]:
                         tasks[asyncio.create_task(self._advance(job))] = job["job_id"]
                     if not tasks:
+                        if self.strategy is not None and not reason and any(job.get("retry_after", 0) > time.time() for job in ready):
+                            await asyncio.sleep(.1)
+                            continue
+                        if self.strategy is not None and self.strategy.ensure_work():
+                            continue
                         pending = any(
                             job["status"] in {"pending", "responded", "waiting"}
                             for job in jobs
@@ -1398,7 +1716,7 @@ class DiscoveryLoop:
                         if run["status"] == "running":
                             run["status"] = (
                                 reason
-                                if reason == "target_changed" or pending and reason
+                                if reason == "target_changed" or (pending or self.strategy is not None) and reason
                                 else "blocked"
                                 if any(job["status"] == "waiting" for job in jobs)
                                 else "idle"
@@ -1406,13 +1724,14 @@ class DiscoveryLoop:
                             self.store.save_run(run)
                         return self.store.status()
                     done, _ = await asyncio.wait(
-                        tasks, return_when=asyncio.FIRST_COMPLETED
+                        tasks, return_when=asyncio.FIRST_COMPLETED,
+                        timeout=.1 if self.strategy is not None else None,
                     )
                     # Committed, revalidated root authority takes precedence
                     # over failures in now-unneeded siblings, even when both
                     # tasks finish in the same scheduling turn. The finally
                     # block cancels and joins every remaining operation.
-                    if self.store.run_record()["status"] in {"proved", "refuted"}:
+                    if self.store.run_record(scheduling=True)["status"] in {"proved", "refuted"}:
                         status = self.store.status()
                         if status["root_proved"] or status["root_refuted"]:
                             return status

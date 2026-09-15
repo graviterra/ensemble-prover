@@ -366,25 +366,42 @@ run_cmd do
   unless campaignImportsSafe (← Lean.getEnv) do
     Lean.throwError "base import crosses the generated module namespace"
   let module ← Lean.Parser.testParseModule (← Lean.getEnv) "candidate.lean" {_lean_string(source)}
-  let header : Lean.Elab.HeaderSyntax := ⟨module.raw[0]⟩
+  -- Normalize TSyntax (Lean 4.28) and Syntax (Lean 4.33) before inspecting it.
+  let module : Lean.Syntax := module
+  let header : Lean.Elab.HeaderSyntax := ⟨module[0]⟩
   let actual := (header.imports (includeInit := false)).map (·.module)
   unless actual == #[{import_names}] do
     Lean.throwError "parsed imports differ from admitted dependency imports"
-  for command in module.raw[1].getArgs do
+  let mut commands := module[1].getArgs
+  while !commands.isEmpty do
+    let command := commands.back!
+    commands := commands.pop
     unless campaignSyntaxSafe command do
       Lean.throwError "prohibited executable source syntax"
-    if command.isOfKind ``Lean.Parser.Command.declaration then
+    if command.isOfKind ``Lean.Parser.Command.moduleDoc then
+      -- Plain Markdown only adds documentation; structured Verso may elaborate code.
+      match command[1] with
+      | .atom _ _ => pure ()
+      | _ => Lean.throwError "structured module documentation is not admitted"
+    else if command.isOfKind ``Lean.Parser.Command.in then
+      unless [``Lean.Parser.Command.open, ``Lean.Parser.Command.set_option,
+          ``Lean.Parser.Command.include, ``Lean.Parser.Command.omit].contains command[0].getKind do
+        Lean.throwError "unsupported generated scope command"
+      commands := commands.push command[0] |>.push command[2]
+    else if command.isOfKind ``Lean.Parser.Command.declaration then
       unless [``Lean.Parser.Command.definition, ``Lean.Parser.Command.abbrev,
           ``Lean.Parser.Command.theorem, ``Lean.Parser.Command.structure,
           ``Lean.Parser.Command.inductive, ``Lean.Parser.Command.classInductive,
           ``Lean.Parser.Command.instance].contains command[1].getKind do
         Lean.throwError "unsupported declaration kind"
     else
-      unless [``Lean.Parser.Command.namespace, ``Lean.Parser.Command.end,
+      unless [``Lean.Parser.Command.eoi,
+          ``Lean.Parser.Command.namespace, ``Lean.Parser.Command.end,
           ``Lean.Parser.Command.section,
           ``Lean.Parser.Command.open, ``Lean.Parser.Command.variable,
+          ``Lean.Parser.Command.include, ``Lean.Parser.Command.omit,
           ``Lean.Parser.Command.universe, ``Lean.Parser.Command.set_option].contains command.getKind do
-        Lean.throwError "unsupported generated command: {{command.getKind}}"
+        Lean.throwError m!"unsupported generated command: {{command.getKind}}"
 """
         )
 

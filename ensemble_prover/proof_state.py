@@ -3751,7 +3751,21 @@ def _split_binder_groups(binder_text: str) -> List[str]:
 
 
 def _starts_right_scoped_identity_construct(text: str, index: int) -> bool:
-    tail = str(text or "")[index:].lstrip()
+    source = str(text or "")
+    # Operator scans call this at every top-level character. Reject ordinary
+    # terms before copying the suffix or repeatedly checking all of its nested
+    # parentheses. Stripping balanced outer parentheses can only expose a
+    # keyword after an initial run of whitespace and opening parentheses.
+    # This is just a prefilter: candidate constructs still undergo the complete
+    # grouping and binder/body checks below.
+    candidate_index = index
+    while candidate_index < len(source) and (
+        source[candidate_index].isspace() or source[candidate_index] == "("
+    ):
+        candidate_index += 1
+    if not source.startswith(("∀", "∃", "forall", "exists", "let"), candidate_index):
+        return False
+    tail = source[index:].lstrip()
     if not tail:
         return False
     candidate = (

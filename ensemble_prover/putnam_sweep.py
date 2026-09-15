@@ -7,6 +7,7 @@ Each problem retains MiniProver's own parallel samples and process supervisor.
 from __future__ import annotations
 
 import argparse
+import codecs
 import fcntl
 import hashlib
 import json
@@ -15,6 +16,7 @@ import os
 import random
 import re
 import secrets
+import select
 import signal
 import subprocess
 import sys
@@ -24,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
 
 from .solved_export_policy import effective_solved, export_boundary_present
 from .subprocess_environment import trusted_provider_worker_environment
@@ -149,11 +151,17 @@ class AcceptanceEventTail:
         return records
 
 
-def _scan_solved(paths: Sequence[Path]) -> set[str]:
-    # Reuse the existing manifest + export-source trust policy, not arbitrary
-    # solved=True pre-export run summaries or names of old run directories.
-    from .putnam_solved_exports import scan_solved_artifacts
+def _solved_policy(value: Any) -> str:
+    if not isinstance(value, str) or value not in {"exported", "verified"}:
+        raise ValueError("invalid solved selection policy; use exported or verified")
+    return value
 
+
+def _scan_solved(paths: Sequence[Path], *, policy: str) -> set[str]:
+    from .putnam_solved_exports import scan_exported_problems, scan_solved_artifacts
+
+    if _solved_policy(policy) == "exported":
+        return scan_exported_problems(paths)
     return scan_solved_artifacts(paths)
 
 
@@ -191,6 +199,7 @@ def build_manifest(
     solved_dirs: Sequence[Path],
     seed: int,
     mini_args: Sequence[str],
+    solved_policy: str = "exported",
     first_accepted_by_s: float = 600,
     second_accepted_by_s: float = 1800,
 ) -> dict[str, Any]:
@@ -200,7 +209,8 @@ def build_manifest(
         raise ValueError("seed must be an integer")
     gate = AcceptanceGate(0, first_accepted_by_s, second_accepted_by_s)
     build_command(source_dir / "putnam_2000_a1.lean", Path("unused"), mini_args)
-    solved = _scan_solved(solved_dirs)
+    solved_policy = _solved_policy(solved_policy)
+    solved = _scan_solved(solved_dirs, policy=solved_policy)
     sources = sorted(
         path
         for path in source_dir.glob("putnam_*.lean")
@@ -226,6 +236,7 @@ def build_manifest(
         "seed": seed,
         "source_dir": str(source_dir),
         "solved_dirs": [str(path) for path in solved_dirs],
+        "solved_policy": solved_policy,
         "mini_args": list(mini_args),
         "first_accepted_by_s": gate.first_accepted_by_s,
         "second_accepted_by_s": gate.second_accepted_by_s,
@@ -273,6 +284,8 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ValueError("malformed sweep manifest")
     if any(not isinstance(argument, str) for argument in data["mini_args"]):
         raise ValueError("malformed MiniProver arguments")
+    # Schema-1 manifests written before inventory selection used verified mode.
+    _solved_policy(data.get("solved_policy", "verified"))
     if type(data.get("seed")) is not int:
         raise ValueError("sweep seed must be an integer")
     if not isinstance(data.get("source_dir"), str) or not data["source_dir"]:
@@ -350,16 +363,96 @@ def _process_group_alive(pgid: int) -> bool:
         return True
 
 
+class _ConsoleRelay:
+    """Echo the durable log without making the child depend on a drained pipe."""
+
+    def __init__(self, reader: BinaryIO):
+        self.reader = reader
+        self.output = sys.stdout
+        try:
+            self.output_fd = self.output.fileno()
+        except (AttributeError, OSError, ValueError):
+            self.output_fd = None
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.pending = b""
+        self.error = ""
+
+    def _write(self, data: bytes) -> int:
+        if self.output_fd is None:
+            # In-memory output streams (e.g. embedded callers/test capture).
+            self.output.write(self.decoder.decode(data))
+            self.output.flush()
+            return len(data)
+        # A terminal or pipe can stop accepting output. Preserve its original
+        # mode for the caller, and leave any unwritten bytes for the next tick.
+        blocking = os.get_blocking(self.output_fd)
+        try:
+            os.set_blocking(self.output_fd, False)
+            return os.write(self.output_fd, data)
+        except BlockingIOError:
+            return 0
+        finally:
+            os.set_blocking(self.output_fd, blocking)
+
+    def copy_available(self, *, final: bool = False) -> None:
+        if self.error:
+            return
+        try:
+            # Bound each monitoring tick, including output without a newline.
+            # At shutdown, drain only the bytes already present: an unconfirmed
+            # child must not keep us following an ever-growing file forever.
+            remaining = (
+                max(0, os.fstat(self.reader.fileno()).st_size - self.reader.tell())
+                if final else 64 * 1024 - len(self.pending)
+            )
+            # Cleanup has already finished before the final drain. Give a
+            # healthy pipe reader a brief scheduling grace, with a separate
+            # hard bound so a stopped consumer cannot hold the sweep open.
+            drain_deadline = time.monotonic() + .25 if final else 0
+            while self.pending or remaining:
+                if final and time.monotonic() >= drain_deadline:
+                    return
+                if not self.pending:
+                    self.pending = self.reader.read(min(remaining, 64 * 1024))
+                    if not self.pending:
+                        break
+                    remaining -= len(self.pending)
+                written = self._write(self.pending)
+                if not written:
+                    patience = drain_deadline - time.monotonic()
+                    if not final or self.output_fd is None or patience <= 0:
+                        return
+                    poller = select.poll()
+                    poller.register(self.output_fd, select.POLLOUT)
+                    poller.poll(max(1, math.ceil(patience * 1000)))
+                    continue
+                self.pending = self.pending[written:]
+            if final and self.output_fd is None:
+                self.output.write(self.decoder.decode(b"", final=True))
+                self.output.flush()
+        except (OSError, ValueError) as exc:
+            # Let the owner stop and reap the process even if its console fails.
+            self.error = f"console relay failed: {type(exc).__name__}: {exc}"
+
+
 def _wait_for_cleanup(
-    proc: subprocess.Popen, *, timeout_s: float, poll_interval_s: float
+    proc: subprocess.Popen, *, timeout_s: float, poll_interval_s: float,
+    on_poll: Callable[[], None] = lambda: None,
 ) -> bool:
     deadline = time.monotonic() + timeout_s
     while True:
+        on_poll()
         if proc.poll() is not None and not _process_group_alive(proc.pid):
             return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(min(poll_interval_s, max(0, deadline - time.monotonic())))
+
+
+def console_log_path(output_dir: Path) -> Path:
+    """Keep sweep-owned output outside MiniProver's fresh generation directory."""
+    directory = Path(output_dir).resolve()
+    return directory.with_name(directory.name + ".sweep_console.log")
 
 
 def run_attempt(
@@ -391,7 +484,12 @@ def run_attempt(
     cutoff = ""
     interrupted = False
     monitor_error = ""
-    with (output_dir / "sweep_console.log").open("wb") as console:
+    console_path = console_log_path(output_dir)
+    worker_env = trusted_provider_worker_environment()
+    worker_env["PYTHONUNBUFFERED"] = "1"
+    # Exclusive creation also rejects existing or dangling symlink destinations.
+    with console_path.open("xb") as console, console_path.open("rb") as reader:
+        relay = _ConsoleRelay(reader)
         proc = subprocess.Popen(
             list(command),
             cwd=ROOT,
@@ -399,11 +497,15 @@ def run_attempt(
             stdout=console,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            env=trusted_provider_worker_environment(),
+            env=worker_env,
         )
         try:
             on_started(proc.pid)
             while proc.poll() is None:
+                relay.copy_available()
+                if relay.error:
+                    monitor_error = relay.error
+                    break
                 records = tail.read()
                 now = time.monotonic()
                 for record in records:
@@ -428,7 +530,8 @@ def run_attempt(
             except OSError as exc:
                 monitor_error = f"could not signal CLI supervisor: {exc}"
         cleaned = _wait_for_cleanup(
-            proc, timeout_s=cleanup_timeout_s, poll_interval_s=poll_interval_s
+            proc, timeout_s=cleanup_timeout_s, poll_interval_s=poll_interval_s,
+            on_poll=relay.copy_available,
         )
         if proc.returncode is not None and (
             proc.returncode < 0
@@ -447,6 +550,8 @@ def run_attempt(
                     gate.observe(record, now=now)
             except (OSError, ValueError) as exc:
                 monitor_error = f"{type(exc).__name__}: {exc}"
+        relay.copy_available(final=True)
+        monitor_error = monitor_error or relay.error
     if not cleaned:
         status = "cleanup_unconfirmed"
     elif _summary_solved(output_dir, proc.returncode):
@@ -459,6 +564,7 @@ def run_attempt(
         status = "cutoff" if cutoff else "failed"
     return {
         "status": status,
+        "console_log": str(console_path),
         "exit_code": proc.returncode,
         "cutoff_reason": cutoff,
         "accepted_identities": sorted(gate.accepted),
@@ -506,7 +612,8 @@ def run_sweep(
             if row["status"] in _TERMINAL:
                 continue
             if row["problem_id"] in _scan_solved(
-                [Path(path) for path in manifest["solved_dirs"]]
+                [Path(path) for path in manifest["solved_dirs"]],
+                policy=manifest.get("solved_policy", "verified"),
             ):
                 row["status"] = "skipped_solved"
                 save_manifest(manifest_path, manifest)
@@ -528,6 +635,7 @@ def run_sweep(
             command = build_command(source, output_dir, manifest["mini_args"])
             attempt = {
                 "output_dir": str(output_dir),
+                "console_log": str(console_log_path(output_dir)),
                 "command": command,
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "status": "running",
@@ -576,6 +684,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--putnam-dir", type=Path)
     parser.add_argument("--solved-dir", type=Path, action="append")
+    parser.add_argument(
+        "--solved-policy", choices=("exported", "verified"),
+        help="Skip existing exported filenames (default), or only verified manifest entries",
+    )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--first-accepted-by-s", type=float)
     parser.add_argument("--second-accepted-by-s", type=float)
@@ -602,6 +714,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.sweep_dir,
                         args.putnam_dir,
                         args.solved_dir,
+                        args.solved_policy,
                         args.seed,
                         args.first_accepted_by_s,
                         args.second_accepted_by_s,
@@ -633,6 +746,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     or [ROOT / "runs/mini_prover/solved", ROOT / "runs/solved"],
                     seed=args.seed if args.seed is not None else secrets.randbits(64),
                     mini_args=mini_args,
+                    solved_policy=args.solved_policy or "exported",
                     first_accepted_by_s=args.first_accepted_by_s
                     if args.first_accepted_by_s is not None
                     else 600,
@@ -642,7 +756,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 save_manifest(manifest_path, manifest)
         print(
-            f"Sweep: {manifest_path.resolve()}\nSeed: {manifest['seed']}\nUnsolved queue: {len(manifest['queue'])}"
+            f"Sweep: {manifest_path.resolve()}\nSeed: {manifest['seed']}\n"
+            f"Corpus: {manifest['corpus_count']}; excluded: {manifest['excluded_solved_count']}; "
+            f"selection policy: {manifest.get('solved_policy', 'verified')}\n"
+            f"Unsolved queue: {len(manifest['queue'])}"
         )
         if args.dry_run:
             for row in manifest["queue"]:

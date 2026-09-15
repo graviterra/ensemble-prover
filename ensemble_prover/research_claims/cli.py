@@ -224,7 +224,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = _dispatch(args)
         print(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2))
         if args.command == "discovery" and args.discovery_command == "run":
-            if result["status"] not in {"idle", "budget_exhausted", "deadline_exhausted"}:
+            if result["status"] not in {"idle", "budget_exhausted", "deadline_exhausted", "proved", "refuted"}:
                 return 2
         return 0
     except (ValueError, OSError, KeyError, sqlite3.Error) as exc:

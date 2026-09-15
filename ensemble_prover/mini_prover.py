@@ -5665,6 +5665,12 @@ async def run_conversation(
     the model sees them on subsequent calls within the same turn.
     """
     model_id = f"{getattr(client.cfg, 'name', '?')}/{getattr(client.cfg, 'model', '?')}"
+    from .research_claims.strategy_runtime import current_strategy, REQUEST_STRATEGY_REVIEW_TOOL, READ_STRATEGY_ARTIFACT_TOOL
+
+    strategy_runtime = current_strategy()
+    if strategy_runtime is not None:
+        strategy_runtime.check()
+        strategy_runtime.prepare_conversation(conv, dossier)
     compute_examples_tool_enabled = _effective_compute_examples_tool_enabled(
         compute_examples_tool_enabled,
         searcher=searcher,
@@ -5694,6 +5700,9 @@ async def run_conversation(
         base_tools_list.append(COMPUTE_EXAMPLES_TOOL)
     if apply_decl_to_goal_tool_enabled:
         base_tools_list.append(APPLY_DECL_TO_GOAL_TOOL)
+    if strategy_runtime is not None:
+        base_tools_list.extend((REQUEST_STRATEGY_REVIEW_TOOL, READ_STRATEGY_ARTIFACT_TOOL))
+        base_use_tools = True
 
     def _current_feedback_lemmas() -> List[str]:
         if dossier is None:
@@ -6718,6 +6727,8 @@ async def run_conversation(
                     compute_runner_invoked = False
                     runner_raised = False
                     try:
+                        if strategy_runtime is not None:
+                            strategy_runtime.check()
                         if args_parse_error:
                             if name == "try_lean" and effective_try_lean_tool_enabled:
                                 _set_repair_self_check_non_verdict_status(
@@ -6729,6 +6740,15 @@ async def run_conversation(
                                 "matching the tool schema. Parse error: "
                                 f"{args_parse_error}"
                             )
+                        elif name == "read_strategy_artifact" and strategy_runtime is not None:
+                            result_text = json.dumps(strategy_runtime.read_artifact(args), ensure_ascii=False)
+                        elif name == "request_strategy_review" and strategy_runtime is not None:
+                            result_text = json.dumps(strategy_runtime.challenge(args), ensure_ascii=False)
+                            conv.history.append({"role": "tool", "tool_call_id": safe_tcid, "content": result_text})
+                            for remaining_index in range(index + 1, len(calls_to_run)):
+                                conv.history.append({"role": "tool", "tool_call_id": safe_tool_call_ids[remaining_index],
+                                                     "content": "Deferred: this proof interval returned to strategy review."})
+                            strategy_runtime.yield_requested()
                         elif name == "search_mathlib" and searcher is not None:
                             result_text = _run_search_tool(
                                 searcher,

@@ -15,6 +15,7 @@ import re
 import secrets
 import unicodedata
 from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .state_data import clone_json_value
@@ -2557,6 +2558,18 @@ def _dossier_contract_alpha_norm(
     *,
     context_bound_names: Sequence[str] = (),
 ) -> str:
+    return _cached_dossier_contract_alpha_norm(
+        text,
+        context_bound_names=tuple(context_bound_names),
+    )
+
+
+@lru_cache(maxsize=64)
+def _cached_dossier_contract_alpha_norm(
+    text: str,
+    *,
+    context_bound_names: Tuple[str, ...],
+) -> str:
     stripped, leading_names = _dossier_strip_leading_forall_binders_with_names(text)
     bound_names = tuple(
         dict.fromkeys(
@@ -2750,6 +2763,15 @@ def _dossier_split_top_level_equality(text: str) -> Tuple[str, str]:
 def _dossier_root_conclusion_candidates(
     root_statement: str,
 ) -> List[Tuple[str, Tuple[str, ...]]]:
+    # Callers historically receive a mutable list. Cache only immutable values
+    # so one consumer cannot change another dossier's statement analysis.
+    return list(_cached_dossier_root_conclusion_candidates(root_statement))
+
+
+@lru_cache(maxsize=64)
+def _cached_dossier_root_conclusion_candidates(
+    root_statement: str,
+) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
     candidates: List[Tuple[str, Tuple[str, ...]]] = []
     seen: Set[str] = set()
 
@@ -2777,7 +2799,7 @@ def _dossier_root_conclusion_candidates(
         candidate_implications = _dossier_split_top_level_implications(candidate)
         if len(candidate_implications) >= 2:
             add_candidate(candidate_implications[-1], all_names)
-    return candidates
+    return tuple(candidates)
 
 
 def _dossier_statements_root_adjacent(

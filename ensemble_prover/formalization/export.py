@@ -37,7 +37,7 @@ def _sync_bundle(directory: Path) -> None:
         _sync_directory(parent)
 
 
-async def export_project(campaign_dir: Path, output_dir: Path) -> dict[str, Any]:
+async def export_project(campaign_dir: Path, output_dir: Path, *, root_override: dict[str, Any] | None = None) -> dict[str, Any]:
     """Check the complete compiled closure and re-import it from a fresh bundle.
 
     Trusted Mathlib/project dependencies are deliberately not vendored. Their
@@ -60,7 +60,8 @@ async def export_project(campaign_dir: Path, output_dir: Path) -> dict[str, Any]
             or task.result.get("kind") != "theorem"
         ):
             raise ValueError("only a verified, proved root can be exported")
-        result = task.result
+        campaign_result = task.result
+        result = root_override if root_override is not None else campaign_result
         generation = task.generation
         environment = EnvironmentSnapshot.from_dict(metadata["environment"])
         name = result.get("name")
@@ -86,7 +87,7 @@ async def export_project(campaign_dir: Path, output_dir: Path) -> dict[str, Any]
             statement = result.get("statement")
             if not isinstance(statement, str) or not statement.strip():
                 raise ValueError("exported root requires its exact theorem statement")
-            frozen = task.session.get("frozen_statement")
+            frozen = task.session.get("frozen_statement") if root_override is None else None
             if frozen is not None:
                 if (
                     not isinstance(frozen, dict)
@@ -192,7 +193,7 @@ async def export_project(campaign_dir: Path, output_dir: Path) -> dict[str, Any]
                 if (
                     current.state != "verified"
                     or current.generation != generation
-                    or current.result != result
+                    or current.result != campaign_result
                 ):
                     raise ValueError(
                         "campaign root changed while exporting; retry from current generation"
@@ -246,7 +247,7 @@ async def export_project(campaign_dir: Path, output_dir: Path) -> dict[str, Any]
                         if (
                             current.state != "verified"
                             or current.generation != generation
-                            or current.result != result
+                            or current.result != campaign_result
                         ):
                             raise ValueError(
                                 "campaign root changed while exporting; retry from current generation"

@@ -4417,6 +4417,9 @@ def _graph_binder_group_is_proof_premise(
     )
 
 
+# These caches contain lexical analyses only, never environment-dependent proof
+# authority. Keep their capacity small: an explicit residual can be very large.
+@lru_cache(maxsize=64)
 def _graph_leading_binder_analysis(
     statement: str,
     *,
@@ -4808,6 +4811,7 @@ def _graph_statement_root_adjacent(
     return False
 
 
+@lru_cache(maxsize=64)
 def _graph_contract_profile(statement: str) -> Tuple[Tuple[str, ...], str]:
     premises, conclusion, bound_names = _graph_statement_premises_and_conclusion(
         graph_formal_statement_text(statement)
@@ -5461,6 +5465,7 @@ def graph_statement_closed_conclusion(statement: str) -> str:
     return f"∀ {binder_prefix}, {conclusion}" if binder_prefix else conclusion
 
 
+@lru_cache(maxsize=64)
 def _graph_nonproof_parameter_profile(statement: str) -> Tuple[str, ...]:
     """Return normalized non-proof binder types in the leading theorem frame."""
 
@@ -5796,6 +5801,20 @@ def _graph_contract_alpha_norm(
     *,
     context_bound_names: Sequence[str] = (),
     preserve_type_ascriptions: bool = False,
+) -> str:
+    return _cached_graph_contract_alpha_norm(
+        text,
+        context_bound_names=tuple(context_bound_names),
+        preserve_type_ascriptions=preserve_type_ascriptions,
+    )
+
+
+@lru_cache(maxsize=64)
+def _cached_graph_contract_alpha_norm(
+    text: str,
+    *,
+    context_bound_names: Tuple[str, ...],
+    preserve_type_ascriptions: bool,
 ) -> str:
     stripped, leading_names = _graph_strip_leading_forall_binders_with_names(text)
     bound_names = tuple(

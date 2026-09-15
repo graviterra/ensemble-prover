@@ -8,6 +8,8 @@ are conservative intents, not claims that the provider billed those requests.
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import re
 import json
 import time
 import uuid
@@ -81,21 +83,76 @@ class DiscoveryStore(ResearchStore):
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
-    def run_record(self) -> dict[str, Any]:
+    @staticmethod
+    def _configuration_reference(config: Any) -> str | None:
+        if not isinstance(config, dict) or "_archived_config" not in config:
+            return None
+        if (
+            set(config) != {"_archived_config"}
+            or not isinstance(config["_archived_config"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", config["_archived_config"])
+        ):
+            raise ValueError("invalid archived configuration reference")
+        return "config:" + config["_archived_config"]
+
+    def run_record(self, *, scheduling: bool = False) -> dict[str, Any]:
+        """Read one consistent run snapshot; proof boundaries always hydrate.
+
+        Scheduling reads omit the immutable, potentially very large Lean
+        configuration. They confer no mathematical or environment authority.
+        """
         with self._transaction():
             row = self._connection.execute(
                 "SELECT record FROM discovery_runs WHERE run_id = 'main'"
             ).fetchone()
             if row is None:
                 raise ResearchStoreError("no autonomous discovery run initialized")
-            return json.loads(row[0])
+            record = json.loads(row[0])
+            key = self._configuration_reference(record.get("closed_loop"))
+            if key is not None and not scheduling:
+                archived = self._connection.execute(
+                    "SELECT record FROM discovery_runs WHERE run_id = ?", (key,)
+                ).fetchone()
+                if archived is None or hashlib.sha256(
+                    archived[0].encode()
+                ).hexdigest() != key.removeprefix("config:"):
+                    raise ValueError("archived configuration missing or hash changed")
+                record["closed_loop"] = json.loads(archived[0])
+            return record
 
     def save_run(self, record: dict[str, Any]) -> None:
         with self._transaction(write=True):
+            stored = dict(record)
+            config = record.get("closed_loop")
+            reference = self._configuration_reference(config)
+            if reference is not None:
+                if (
+                    self._connection.execute(
+                        "SELECT 1 FROM discovery_runs WHERE run_id = ?", (reference,)
+                    ).fetchone()
+                    is None
+                ):
+                    raise ValueError("archived configuration missing")
+            elif config is not None and record.get("strategy_review") is not None:
+                encoded = json_text(config)
+                digest = hashlib.sha256(encoded.encode()).hexdigest()
+                key = "config:" + digest
+                existing = self._connection.execute(
+                    "SELECT record FROM discovery_runs WHERE run_id = ?", (key,)
+                ).fetchone()
+                if existing is not None and existing[0] != encoded:
+                    raise ValueError(
+                        "archived configuration hash collision or corruption"
+                    )
+                if existing is None:
+                    self._connection.execute(
+                        "INSERT INTO discovery_runs VALUES (?, ?)", (key, encoded)
+                    )
+                stored["closed_loop"] = {"_archived_config": digest}
             self._connection.execute(
                 "INSERT INTO discovery_runs VALUES ('main', ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET record = excluded.record",
-                (json_text(record),),
+                (json_text(stored),),
             )
 
     def jobs(self) -> list[dict[str, Any]]:
@@ -174,7 +231,7 @@ class DiscoveryStore(ResearchStore):
         return record
 
     def stop_reason(self, record: dict[str, Any] | None = None) -> str | None:
-        run = record or self.run_record()
+        run = record or self.run_record(scheduling=True)
         root = self.get_claim(run["target_id"])
         if (
             root["revision"] != run["target_revision"]

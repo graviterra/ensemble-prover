@@ -1,8 +1,10 @@
-"""Read verified Putnam export manifests for local queue selection.
+"""Read Putnam export inventories and verified manifests for local selection.
 
 This lightweight scanner preserves the probe selector's artifact checks. It
 consumes existing verification receipts; it does not re-run Lean or certify
 untrusted artifacts. Both the public sweep and development selector use it.
+The separate inventory reader records filenames only, without granting proof
+verification status.
 """
 
 from __future__ import annotations
@@ -36,6 +38,17 @@ def _problem_from_name(name: str) -> str | None:
     if not match:
         return None
     return match.group(1)
+
+
+def scan_exported_problems(paths: Iterable[Path]) -> set[str]:
+    """List existing exported identities for scheduling, regardless of audit status."""
+    exported: set[str] = set()
+    for root in paths:
+        for artifact in Path(root).glob("putnam_*.lean"):
+            problem = _problem_from_name(artifact.name)
+            if problem and artifact.is_file():
+                exported.add(problem)
+    return exported
 
 
 def _safe_manifest_output_stem(output_stem: str, problem: str) -> bool:

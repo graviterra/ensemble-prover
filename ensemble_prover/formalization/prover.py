@@ -8,8 +8,9 @@ import hashlib
 import json
 import math
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..config import LeanConfig
 from ..lean_runner import LeanRunner
@@ -17,6 +18,7 @@ from ..llm_error_policy import is_terminal_llm_failure_reason
 from ..mini_prover import prove_theorem_project
 from ..mini_run_recorder import RunRecorder
 from ..proof_dossier import ProofDossier
+from ..research_claims.strategy import StrategyYield
 from ..theorem_project import (
     TheoremProblem,
     TheoremProjectRequest,
@@ -26,6 +28,24 @@ from ..theorem_project import (
 
 
 _CONTEXT_MARKER = "-- ensemble-nl-input: preserve-context"
+
+
+@dataclass(frozen=True)
+class ProofAttemptResult:
+    """A proof attempt's outcome; source still needs independent admission."""
+
+    status: Literal["proved", "yielded_for_review", "inconclusive", "operational_failure", "cancelled"]
+    source: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+    continuation: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.status not in {"proved", "yielded_for_review", "inconclusive", "operational_failure", "cancelled"}:
+            raise ValueError("unknown proof attempt outcome")
+        if self.status == "proved" and (not isinstance(self.source, str) or not self.source.strip()):
+            raise ValueError("proved attempt requires candidate source")
+        if self.status != "proved" and self.source is not None:
+            raise ValueError("non-proof outcome cannot carry accepted proof source")
 
 
 class MiniProverFailure(RuntimeError):
@@ -185,6 +205,25 @@ class MiniProver:
         async with self._lock:
             self._closed = True
 
+    async def prove_attempt(self, **kwargs: Any) -> ProofAttemptResult:
+        """Typed interface used by campaigns; legacy prove retains its API.
+
+        Prior artifacts are research context, never silently admitted helpers.
+        The compiler and Mini checks revalidate any material reused as proof.
+        """
+        try:
+            source = await self.prove(**kwargs)
+        except StrategyYield as exc:
+            feedback = self.read_attempt_feedback()
+            return ProofAttemptResult(
+                "yielded_for_review", details=exc.to_dict(),
+                continuation={"mode": "fresh_with_revalidated_artifacts", "run_dir": (feedback or {}).get("run_dir"),
+                              "artifact_reuse": "candidate context only; recheck before proof admission"},
+            )
+        return ProofAttemptResult("proved", source=source) if source is not None else ProofAttemptResult(
+            "inconclusive", continuation={"mode": "fresh_with_revalidated_artifacts", "run_dir": str(self._attempt_run_dir)}
+        )
+
     async def prove(
         self,
         *,
@@ -218,7 +257,9 @@ class MiniProver:
                 return source
             except BaseException as exc:
                 primary_failure = True
-                if isinstance(exc, MiniProverFailure):
+                if isinstance(exc, StrategyYield):
+                    status = "yielded_for_review"
+                elif isinstance(exc, MiniProverFailure):
                     status = "terminal"
                 elif isinstance(exc, asyncio.CancelledError):
                     status = "cancelled"
