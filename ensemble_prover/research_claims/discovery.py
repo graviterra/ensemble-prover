@@ -357,8 +357,11 @@ class DiscoveryLoop:
             # Pool disposal is independent of mathematical work. Keep strong
             # ownership of slow disposals, and bound the whole cleanup batch.
             for identity in list(self._owned_clients):
-                if identity in retained or identity in self._retiring_transports:
+                if identity in retained or (not closing and identity in self._retiring_transports):
                     continue
+                # Final owner shutdown must reach the client's quiescence
+                # barrier even when an HTTP request resists cancellation.
+                # Ordinary quanta retain those tails for late candidate ingress.
                 client = self._owned_clients.pop(identity)
                 if identity not in self._retiring_closures:
                     self._retiring_closures[identity] = asyncio.create_task(

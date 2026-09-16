@@ -1,6 +1,6 @@
 # Ensemble Prover User Guide
 
-Last updated: 2026-09-11.
+Last updated: 2026-09-15.
 
 Start with a Lean theorem, a natural-language claim, or mathematical notes for
 a longer project. Mini Prover searches for proofs and checks them with Lean.
@@ -563,6 +563,12 @@ same provider settings and cost budget, with at most six provider dispatches
 and 120 seconds per phase, further limited by the parent's remaining time and
 applicable hard deadlines. Research notes do not count as verified progress;
 Lean still decides whether the original theorem is proved.
+
+The original proof context takes priority when a model's prompt is crowded.
+Complete research arguments remain archived and available through the prover's
+research reading tool, including when the prompt omits the research summary.
+An unavailable research service leaves ordinary proof search able to continue
+within its existing limits.
 
 To disable automatic research, add this flag to your existing command:
 

@@ -93,6 +93,29 @@ async def _checkpoint(session: Any) -> None:
         await registry.commit_session(session.checkpoint_lane_key, session)
 
 
+def _grant_usage(run: dict[str, Any], grant: dict[str, Any]) -> tuple[int, bool]:
+    """Bound an unfinished grant by subsequent funding, without guessed refunds."""
+    if "used" in grant:
+        return grant["used"], bool(grant.get("accounting_ambiguous", False))
+    start = grant["start_requests"]
+    end = run["requests_used"]
+    ambiguous = False
+    for other in run["native_grants"].values():
+        if other["id"] == grant["id"]:
+            continue
+        if other["start_requests"] > start:
+            end = min(end, other["start_requests"])
+        elif other["start_requests"] == start:
+            if "ordinal" in grant and "ordinal" in other:
+                if other["ordinal"] > grant["ordinal"]:
+                    end = start
+            elif other.get("used") != 0:
+                # Old JSON sorts UUID keys; neither that order nor wall time
+                # proves which equal-start grant owns the remaining exposure.
+                ambiguous = True
+    return max(0, end - start), ambiguous and end > start
+
+
 def _allowed(session: Any) -> bool:
     if getattr(session, "scope", "problem") not in {"problem", "attempt", "sample", "parallel_fanin_recursive"}:
         return False
@@ -300,6 +323,14 @@ class NativeResearchCoordinator:
             return False
         self._open(session, donor.client)
         await self._ensure_loop(session, donor.client, donor.role)
+        assert self.store is not None
+        run = self.store.run_record()
+        if any("used" not in previous and _grant_usage(run, previous)[1]
+               for previous in run["native_grants"].values()):
+            # The old owner must first reconcile its conservative exposure.
+            # Optional recovery cannot fund work by guessing a legacy refund.
+            _event(session, "research_deferred", reason="ambiguous_legacy_grant_accounting")
+            return False
         timeout = min(120.0, donor.remaining_seconds if donor.remaining_seconds is not None else 120.0)
         checkpoint = self._capture(session, reason)
         grant = {"id": uuid.uuid4().hex, "action_id": donor.action_id,
@@ -318,12 +349,22 @@ class NativeResearchCoordinator:
             grants = run["native_grants"]
             if grant["id"] in grants:
                 raise ValueError("native grant was already funded")
+            # A different restored lane can reach this boundary before the
+            # owner of an interrupted grant. Freeze the old usage while this
+            # ledger still ends at its last request, so later reconciliation
+            # cannot charge this lane's new dispatches to the old donor.
+            for previous in grants.values():
+                if "used" not in previous:
+                    previous["used"], ambiguous = _grant_usage(run, previous)
+                    if ambiguous:
+                        previous["accounting_ambiguous"] = True
             # Revoke unused capacity of past quanta. Grant new calls solely from
             # the current precommitted donor; no run-limit reset is involved.
             run.update(max_requests=run["requests_used"] + grant["requests"],
                        started_at=run.get("started_at") or time.time(), deadline=grant["expires_at"],
                        max_seconds=timeout, status="running")
-            grants[grant["id"]] = {**grant, "start_requests": run["requests_used"], "closed": False}
+            grants[grant["id"]] = {**grant, "start_requests": run["requests_used"],
+                                  "ordinal": len(grants), "closed": False}
             self.store.save_run(run)
             for job in self.store.jobs():
                 if job["role"] in {"research", "review"} and job["status"] in {"pending", "waiting", "responded"}:
@@ -384,7 +425,10 @@ class NativeResearchCoordinator:
             run = self.store.run_record()
             saved = run["native_grants"].get(grant["id"])
             if saved is not None:
-                used = saved.get("used", run["requests_used"] - saved["start_requests"])
+                used, ambiguous = _grant_usage(run, saved)
+                if ambiguous:
+                    saved["accounting_ambiguous"] = True
+                    _event(session, "research_grant_accounting_ambiguous", grant_id=grant["id"])
                 missing = max(0, used - grant.get("accounted", 0))
                 session.provider_dispatches_started_total = int(getattr(session, "provider_dispatches_started_total", 0)) + missing
                 grant["accounted"] = used
@@ -466,8 +510,10 @@ class NativeResearchCoordinator:
         from .research_claims.context_window import window
         if hasattr(conv, "ensure_bootstrap"):
             conv.ensure_bootstrap()
-        context = {"original_target": self.pin["statement"], "guidance": self.guidance,
+        context = {"guidance": self.guidance,
                    "policy": "You may request_native_research when an ancestor claim, counting bound, or method is unsupported. Supply the exact bottleneck and source evidence. The run investigates at a committed action boundary and resumes under its existing budget. Use read_native_research_artifact for full archived arguments."}
+        if getattr(conv, "goal_statement", None) != self.pin["statement"]:
+            context["original_target"] = self.pin["statement"]
         if self.store is not None:
             context = window(self.store, context, limit=14000)
         content = "Native research recovery (advisory, not proof authority):\n" + _json(context)
@@ -475,7 +521,7 @@ class NativeResearchCoordinator:
         if isinstance(history, list):
             history[:] = [item for item in history if not item.get("_native_research_context")]
             history.append({"role": "user", "content": content,
-                            "_native_research_context": True, "_required_prompt_context": True})
+                            "_native_research_context": True})
         return NATIVE_TOOLS
 
     async def close(self) -> None:
@@ -511,9 +557,18 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
     if owner is None:
         raise ValueError("native research is not active")
     if name == "read_native_research_artifact":
-        object_fields(payload, {"artifact_id", "offset", "length", "path"}, {"artifact_id"}, name)
+        object_fields(payload, {"artifact_id", "offset", "length", "path"}, set(), name)
         if owner.store is None:
             raise ValueError("no native research artifacts yet")
+        if "artifact_id" not in payload:
+            if owner.guidance is None:
+                raise ValueError("no native research advice yet")
+            # Optional prompt advice may be dropped to preserve the original
+            # source. Keep its entire argument/handoff index discoverable even
+            # when the provider never saw an artifact hash.
+            payload = {**payload, "artifact_id": owner.store.put_artifact(
+                _json(owner.guidance).encode(), name="current-native-research-guidance.json",
+            )}
         return read_page(owner.store, **payload)
     if name != "request_native_research":
         raise ValueError("unknown native research tool")
@@ -541,6 +596,6 @@ NATIVE_TOOLS = [
      "description": "Request independent investigation of an unsupported ancestor or stalled method; never refutes or stops the run.",
      "parameters": {"type": "object", "properties": {"statement": {"type": "string"}, "reason": {"type": "string"}, "evidence_artifact_ids": {"type": "array", "items": {"type": "string"}}}, "required": ["statement", "reason"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "read_native_research_artifact",
-     "description": "Read a complete archived research argument or source, using exact pages.",
-     "parameters": {"type": "object", "properties": {"artifact_id": {"type": "string"}, "offset": {"type": "integer"}, "length": {"type": "integer"}, "path": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}}, "required": ["artifact_id"], "additionalProperties": False}}},
+     "description": "Read exact pages of archived research arguments or sources. Omit artifact_id for the complete current advice envelope, including argument and handoff links.",
+     "parameters": {"type": "object", "properties": {"artifact_id": {"type": "string"}, "offset": {"type": "integer"}, "length": {"type": "integer"}, "path": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}}, "required": [], "additionalProperties": False}}},
 ]
