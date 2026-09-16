@@ -25,6 +25,11 @@ screenshot is losslessly cropped; its retained code and logs are unchanged.
 
 September 2026 — highlights from the current source checkout:
 
+- **1.12 — automatic research during ordinary proof runs:** new Mini and Putnam runs
+  investigate stalled approaches and feed alternative strategies back into
+  proof search, using the existing run budget. Keep using your usual command;
+  add `--no-autonomous-research` to disable this behavior.
+  [How automatic recovery works](docs/USER_GUIDE.md#automatic-research-when-proof-search-stalls)
 - **1.11 — strategy recovery:** discovery tracks ancestor obligations, reviews
   contrary evidence, and returns stalled proof routes to research within the
   existing budget. Adopt stopped Mini work, inspect primary sources, and explore
@@ -58,11 +63,12 @@ September 2026 — highlights from the current source checkout:
   [Single claims](docs/USER_GUIDE.md#18-formalize-one-natural-language-claim) ·
   [Formalization campaigns](docs/USER_GUIDE.md#19-run-a-multi-file-formalization-campaign)
 
-Research reviews are not Lean proof certificates. Autonomous research and its
-integrated formalization/proof roles support the OpenAI API and Codex subscriptions.
-The standalone NL and formalization CLIs remain API-backed. Claude Code integration
-applies to Mini's prover/refiner roles. Older release snapshots may not include
-every feature above.
+Research reviews are not Lean proof certificates. Research inside ordinary Mini
+runs uses the configured Mini provider. The separate autonomous-research CLI and
+its integrated formalization/proof roles support the OpenAI API and Codex
+subscriptions. The standalone NL and formalization CLIs remain API-backed.
+Claude Code serves Mini's prover/refiner roles and their automatic research.
+Older release snapshots may not include every feature above.
 
 ## Start research from a saved run
 
@@ -88,7 +94,7 @@ other providers require an explicit supported selection.
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
 file and Lake project. PutnamBench files are supported through a compatibility
 adapter, and callers may attach a natural-language problem description as
-additional model context. Release 1.11 also includes
+additional model context. Release 1.12 also includes
 experimental natural-language entry points: `ensemble_prover.nl_input` for a
 single claim and `ensemble_prover.formalization` for resumable, multi-file
 projects. These translate text before proving; the resulting Lean statement
@@ -149,7 +155,7 @@ the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** 1.11 — research preview. Includes Mini Prover, experimental
+> **Release status:** 1.12 — research preview. Includes Mini Prover, experimental
 > single-claim NL input, and resumable multi-file formalization campaigns.
 > Optional Codex and Claude Code subscription backends serve Mini's prover and refiner,
 > alongside the existing API providers. Codex also serves autonomous research.

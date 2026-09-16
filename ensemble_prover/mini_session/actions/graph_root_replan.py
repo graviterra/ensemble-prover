@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 from collections.abc import Mapping
 from typing import Any
 
 from ...mini_falsification.model import content_hash
 from ...proof_dossier import canonical_dossier_statement_key
+from ...state_data import clone_json_value
 from ..action import MiniOutcome
 from ..planner_jobs import PlannerJobLaunch
 from .recursive_controller import RecursiveControllerAction
@@ -53,6 +55,83 @@ class GraphRootReplanAction(RecursiveControllerAction):
             str(session.acceptance_preamble() or ""),
             tuple(session._durable_formal_progress_evidence()),
         ))
+
+    @staticmethod
+    def _validated_research_guidance(guidance: Any) -> dict[str, Any]:
+        value = clone_json_value(guidance, label="native research planner guidance")
+        if (not isinstance(value, dict) or value.get("kernel_verified") is not False
+                or not isinstance(value.get("artifact_id"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", value["artifact_id"]) is None
+                or len(json.dumps(value, ensure_ascii=False, allow_nan=False)) > 14000):
+            raise ValueError("invalid or unbounded native research planner guidance")
+        return value
+
+    def request_research_replan(self, session: Any, guidance: dict[str, Any]) -> bool:
+        """Queue advisory material for the original root using existing passes.
+
+        A committed/pending planner retains its exact request. Its owner can
+        retry delivery after publication; research never replaces paid work.
+        """
+        advice = self._validated_research_guidance(guidance)
+        budget = session.budgets.get(self.id)
+        if (session.root_finalized or session.terminal_failure_reason
+                or session._run_governor_exhausted()
+                or self._pending_replan_request or self._active_replan_identity
+                or self._pending_planner_job_launch is not None
+                or self._recursive_driver_state.get("phase") == "planner_job_pending"
+                or self.id in getattr(session, "recursive_inflight_reservations", {})
+                or (budget is not None and budget.exhausted())
+                or int(getattr(session, self.budget_attr, 0) or 0) <= 0
+                or self.run_conversation_fn is None
+                or not getattr(session.conv, "allow_helper_decomposition", True)):
+            return False
+        root = str(session.problem.statement_type or "").strip()
+        if not root or session.dossier is None:
+            return False
+        environment = content_hash((root, session.acceptance_preamble()))
+        identity = content_hash(("native_research", environment, advice["artifact_id"]))
+        if identity in self._served_replan_requests:
+            return False
+        self._pending_replan_request = {
+            "node_id": str(session.dossier.proof_graph.root_node_id),
+            "work_type": "root_replan", "source": "root_replan",
+            "target_statement": root, "exact_target_statement": root,
+            "context_identity": self._context_identity(session),
+            "root_environment_identity": environment,
+            "request_identity": identity, "owner_action_id": "native_research",
+            "stalled_tool_attempts": 0, "diagnostic_kind": "research_alternative",
+            "native_research": advice,
+        }
+        session._record_event({
+            "phase": "session_root_replanning", "iteration": session.iteration,
+            "verdict": "research_root_replan_requested", "kernel_verified": False,
+            "research_artifact_id": advice["artifact_id"], "request_identity": identity,
+        })
+        return True
+
+    def _session_progress_signature(self, session: Any) -> str:
+        signature = super()._session_progress_signature(session)
+        advice = self._pending_replan_request.get("native_research")
+        if advice:
+            # New advisory work changes the planner's input, not the formal
+            # progress ledger. No other action's fixed point is reopened.
+            return content_hash((signature, "native_research", advice["artifact_id"]))
+        return signature
+
+    def _planner_problem_text(self, session: Any) -> str:
+        original = super()._planner_problem_text(session)
+        advice = self.selected_replan_work(session).get("native_research")
+        if not advice:
+            return original
+        return original + (
+            "\n\nUntrusted research advice for the ORIGINAL root:\n"
+            "Check the disputed inference and source hypotheses; construct a concrete "
+            "alternative plan. This is not a theorem, assumption, or proof certificate. "
+            "Archived fields are uninspected. Proof conversations can use "
+            "read_native_research_artifact for complete arguments; identify any "
+            "source check still required before relying on the advice.\n"
+            + json.dumps(advice, ensure_ascii=False, allow_nan=False)
+        )
 
     def observe_proof_outcome(
         self, session: Any, outcome: MiniOutcome, *, formal_progress: bool,
@@ -150,6 +229,13 @@ class GraphRootReplanAction(RecursiveControllerAction):
         )):
             return {}
         active = self._active_replan_identity == request.get("request_identity")
+        if not active and request.get("native_research"):
+            # Added checked helpers enrich the same-root investigation instead
+            # of stranding an unstarted handoff. Root/environment checks above
+            # remain mandatory, and active paid requests remain unchanged.
+            selected = copy.deepcopy(request)
+            selected["context_identity"] = self._context_identity(session)
+            return selected
         if not active and request.get("sustained_helper_progress"):
             # This is a request to replan the unchanged obligation *after*
             # earned work drains. Additional checked helpers enrich that
@@ -289,6 +375,15 @@ class GraphRootReplanAction(RecursiveControllerAction):
             raise ValueError("invalid root replanning request history")
         if not isinstance(active, str) or (active and active != pending.get("request_identity")):
             raise ValueError("invalid active root replanning request")
+        if "native_research" in pending:
+            advice = self._validated_research_guidance(pending["native_research"])
+            environment = pending.get("root_environment_identity")
+            if (not isinstance(environment, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", environment) is None
+                    or pending.get("request_identity") != content_hash((
+                        "native_research", environment, advice["artifact_id"],
+                    ))):
+                raise ValueError("native research replanning identity changed")
         # Legacy requests omit this optional pair. New intervention intent
         # must not silently change meaning through truthiness or coercion.
         if "sustained_helper_progress" in pending or "helper_only_progress_identity" in pending:

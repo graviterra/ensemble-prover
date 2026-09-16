@@ -23449,6 +23449,10 @@ class MiniSession:
                 self._dispatch_worker_poison_reason or "legacy_dispatch_worker_poisoned"
             )
             self._resume_dispatch_generation()
+        # A restored run can deliver saved research guidance before selecting
+        # more proof work. The native owner admits no fresh research on an
+        # untouched theorem and shares the existing run's settings and budget.
+        await self._native_research_boundary()
         while not self._run_governor_exhausted() and (
             self.should_continue()
             or (
@@ -23705,6 +23709,11 @@ class MiniSession:
                     # Recovery mutates budgets, deferrals, and suppressors.
                     # The next select may dispatch; recycle restores
                     # ``_latest_pre_select_snapshot``, so re-arm it.
+                    self._pre_select_snapshot_required = True
+                    continue
+                if await self._native_research_boundary(frontier_exhausted=True):
+                    # Research consumed only existing capacity. Newly queued
+                    # root planning must pass ordinary selection and budgets.
                     self._pre_select_snapshot_required = True
                     continue
                 break
@@ -24175,6 +24184,9 @@ class MiniSession:
                         "verdict": "solved_outcome_not_finalized",
                     }
                 )
+            # All action-owned work is settled and its checkpoint committed.
+            # A finalized proof above returns before research can dispatch.
+            await self._native_research_boundary(outcome)
         durable_proof = self._durable_final_proof()
         if durable_proof and self.root_finalized:
             self._retire_terminal_ready_planner_jobs()
@@ -24187,6 +24199,25 @@ class MiniSession:
             scope_ids=tuple(terminal_deadline_scope_ids),
         )
         return False, None
+
+    async def _native_research_boundary(
+        self, outcome: Optional[MiniOutcome] = None, *, frontier_exhausted: bool = False,
+    ) -> bool:
+        """Offer settled work to the run's owner without changing stop policy."""
+        if (self.root_finalized or self._proof_root_waiting_for_finalization()
+                or self.terminal_failure_reason or self._run_governor_exhausted()):
+            return False
+        from ..mini_research import maybe_research
+
+        if frontier_exhausted:
+            changed = await maybe_research(self, outcome, frontier_exhausted=True)
+        else:
+            changed = await maybe_research(self, outcome)
+        if getattr(self, "native_research_state", None) is not None:
+            # Even an inconclusive phase may spend a durable budget grant.
+            # A later dispatch recycle must restore the new committed state.
+            self._pre_select_snapshot_required = True
+        return changed
 
     async def _seed_same_problem_verified_helpers(self) -> None:
         """Import prior same-problem verified helpers before scheduling."""

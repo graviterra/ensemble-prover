@@ -5277,6 +5277,10 @@ async def _call_llm_with_tools_one_round_impl(
                             "JSON arguments; pass a JSON object matching the tool "
                             f"schema. Parse error: {args_parse_error}"
                         )
+                    elif name in {"request_native_research", "read_native_research_artifact"}:
+                        from ...mini_research import native_research_tool
+
+                        result_text = json.dumps(native_research_tool(name, args, conv), ensure_ascii=False)
                     elif name == "read_strategy_artifact" and strategy_runtime is not None:
                         result_text = json.dumps(strategy_runtime.read_artifact(args), ensure_ascii=False)
                     elif name == "request_strategy_review" and strategy_runtime is not None:
@@ -8065,6 +8069,16 @@ async def call_llm_with_tools_one_round(*args: Any, **kwargs: Any) -> ToolLoopRe
         for strategy_tool in (REQUEST_STRATEGY_REVIEW_TOOL, READ_STRATEGY_ARTIFACT_TOOL):
             if not any(tool.get("function", {}).get("name") == strategy_tool["function"]["name"] for tool in tool_list):
                 tool_list.append(strategy_tool)
+        kwargs.update(tools_list=tool_list, use_tools=True)
+
+    from ...mini_research import prepare_native_conversation
+
+    native_tools = prepare_native_conversation(kwargs["conv"], kwargs.get("dossier"))
+    if native_tools:
+        tool_list = list(kwargs.get("tools_list") or ())
+        for native_tool in native_tools:
+            if not any(tool.get("function", {}).get("name") == native_tool["function"]["name"] for tool in tool_list):
+                tool_list.append(native_tool)
         kwargs.update(tools_list=tool_list, use_tools=True)
 
     lease = begin_process_deadline(

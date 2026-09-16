@@ -127,6 +127,7 @@ from .provider_health import (
     ProviderLaneHealthRegistry,
     fresh_provider_lane_health_run,
 )
+from .mini_research import native_research_entrypoint
 from .mini_temperature import (
     MiniPhaseTemperatures,
     MiniTemperatureContext,
@@ -5672,6 +5673,9 @@ async def run_conversation(
     if strategy_runtime is not None:
         strategy_runtime.check()
         strategy_runtime.prepare_conversation(conv, dossier)
+    from .mini_research import prepare_native_conversation
+
+    native_tools = prepare_native_conversation(conv, dossier)
     compute_examples_tool_enabled = _effective_compute_examples_tool_enabled(
         compute_examples_tool_enabled,
         searcher=searcher,
@@ -5703,6 +5707,9 @@ async def run_conversation(
         base_tools_list.append(APPLY_DECL_TO_GOAL_TOOL)
     if strategy_runtime is not None:
         base_tools_list.extend((REQUEST_STRATEGY_REVIEW_TOOL, READ_STRATEGY_ARTIFACT_TOOL))
+        base_use_tools = True
+    if native_tools:
+        base_tools_list.extend(native_tools)
         base_use_tools = True
 
     def _current_feedback_lemmas() -> List[str]:
@@ -6741,6 +6748,10 @@ async def run_conversation(
                                 "matching the tool schema. Parse error: "
                                 f"{args_parse_error}"
                             )
+                        elif name in {"request_native_research", "read_native_research_artifact"}:
+                            from .mini_research import native_research_tool
+
+                            result_text = json.dumps(native_research_tool(name, args, conv), ensure_ascii=False)
                         elif name == "read_strategy_artifact" and strategy_runtime is not None:
                             result_text = json.dumps(strategy_runtime.read_artifact(args), ensure_ascii=False)
                         elif name == "request_strategy_review" and strategy_runtime is not None:
@@ -11047,6 +11058,7 @@ def _prove_problem_default_mini_phase_temperatures(
 
 
 @fresh_provider_lane_health_run
+@native_research_entrypoint
 async def prove_problem(
     *,
     problem: TheoremProblem,
@@ -11056,6 +11068,7 @@ async def prove_problem(
     lean: LeanRunner,
     max_prove_turns: int,
     max_refine_turns: int,
+    autonomous_research: bool = True,
     trace_prefix: str = "",
     recorder: Optional[RunRecorder] = None,
     searcher: Optional[MathlibApiSearcher] = None,
@@ -13153,6 +13166,16 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Maximum refiner conversation turns (default: %(default)s).",
     )
     p.add_argument(
+        "--autonomous-research",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Investigate alternative strategies when proof work stalls, using "
+            "the existing run budget (default: enabled for new runs). "
+            "Checkpoints created before this option retain disabled behavior."
+        ),
+    )
+    p.add_argument(
         "--cost-budget-usd",
         type=require_cost_budget_usd,
         default=0.0,
@@ -14920,6 +14943,10 @@ async def _main_async(args: argparse.Namespace) -> int:
     worker_started_monotonic = time.monotonic()
     worker_admitted_elapsed_s = None
     args = resolve_resume_args(args)
+    if not hasattr(args, "autonomous_research"):
+        # Programmatic namespaces must persist the same effective policy as
+        # parsed fresh launches; legacy resume has already supplied False.
+        args.autonomous_research = True
     args.cost_budget_usd = require_cost_budget_usd(getattr(args, "cost_budget_usd", 0.0))
     # CLI namespaces can also be supplied programmatically.  Validate the
     # complete falsification numeric surface before installing handlers,
@@ -15475,6 +15502,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 lean=lean,
                 max_prove_turns=int(args.max_prove_turns),
                 max_refine_turns=int(args.max_refine_turns),
+                autonomous_research=bool(getattr(args, "autonomous_research", True)),
                 recorder=recorder,
                 checkpoint_registry=checkpoint_registry,
                 searcher=searcher,

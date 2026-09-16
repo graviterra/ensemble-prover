@@ -705,6 +705,10 @@ class RecursiveControllerAction:
 
         return self.is_applicable(session)
 
+    def _planner_problem_text(self, session: Any) -> str:
+        """Model-visible problem context, with action-specific advisory input."""
+        return str(getattr(session.problem, "docstring", "") or "")
+
     async def run(self, session: Any) -> MiniOutcome:
         from ensemble_prover.mini_recursive import run_mini_recursive_attempt
         from ensemble_prover.mini_prover import Conversation
@@ -877,7 +881,7 @@ class RecursiveControllerAction:
             self._reserve_inflight(session, reserved_passes)
         setattr(session, self.budget_attr, remaining_after_reserve)
 
-        problem_text = str(getattr(session.problem, "docstring", "") or "")
+        problem_text = self._planner_problem_text(session)
         helpers_before = set(_verified_helper_names(session.dossier))
         recursive_helper_action = None
         registered_action = getattr(session, "registered_action", None)

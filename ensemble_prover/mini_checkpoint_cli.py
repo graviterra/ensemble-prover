@@ -59,6 +59,10 @@ def public_cli_config(args: argparse.Namespace) -> dict[str, Any]:
         if provider not in {config.get("prover"), config.get("refiner")}:
             # Preserve old policy shapes unless this transport is selected.
             config.pop(option, None)
+    if getattr(args, "_legacy_autonomous_research_policy", False):
+        # An older checkpoint predates this policy. Preserve its exact public
+        # identity and disabled behavior; source approval cannot widen spend.
+        config.pop("autonomous_research", None)
     return clone_json_value(config, label="checkpoint CLI configuration")
 
 
@@ -79,6 +83,15 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("Checkpoint does not contain a compatible public CLI configuration")
     saved = clone_json_value(identity["cli_config"], label="saved CLI configuration")
     current = public_cli_config(args)
+    explicit = getattr(args, "_explicit_cli_destinations", None)
+    if not isinstance(explicit, set):
+        raise ValueError("Resume configuration requires parsed explicit CLI options")
+    legacy_research = "autonomous_research" not in saved
+    if legacy_research:
+        if ("autonomous_research" in explicit
+                and current.get("autonomous_research") is not False):
+            raise ValueError("Resume configuration override is incompatible: autonomous_research")
+        current.pop("autonomous_research", None)
     for provider, (option, default) in _SUBSCRIPTION_BINARY_OPTIONS.items():
         if provider in {saved.get("prover"), saved.get("refiner")}:
             # Bare resume inherits the saved transport schema, but explicit
@@ -86,16 +99,18 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
             current[option] = getattr(args, option, default)
     if set(saved) != set(current):
         raise ValueError("Checkpoint CLI configuration schema has changed")
-    explicit = getattr(args, "_explicit_cli_destinations", None)
-    if not isinstance(explicit, set):
-        raise ValueError("Resume configuration requires parsed explicit CLI options")
     for name in explicit - _GENERATION_OPTIONS:
+        if legacy_research and name == "autonomous_research":
+            continue
         if name not in saved or current[name] != saved[name]:
             raise ValueError(f"Resume configuration override is incompatible: {name}")
     if saved.get("checkpoint_enabled") is not True:
         raise ValueError("Resume requires durable checkpointing")
     for name, value in saved.items():
         setattr(args, name, value)
+    if legacy_research:
+        args.autonomous_research = False
+        args._legacy_autonomous_research_policy = True
     args.resume_from = str(Path(resume_from).resolve())
     args._checkpoint_config_resolved = True
     return args

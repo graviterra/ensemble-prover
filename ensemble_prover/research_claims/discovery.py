@@ -263,6 +263,9 @@ class DiscoveryLoop:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         proof_runner: Any = None,
         owns_clients: bool = False,
+        native_mode: bool = False,
+        cost_controller: Any = None,
+        cost_roles: Mapping[str, str] | None = None,
     ):
         self.store = store
         self.providers = {"research": researcher, "review": reviewer}
@@ -270,6 +273,11 @@ class DiscoveryLoop:
         self.on_event = on_event
         self.proof_runner = proof_runner
         self.owns_clients = owns_clients
+        self.native_mode = native_mode
+        self.cost_controller = cost_controller
+        self.cost_roles = dict(cost_roles or {})
+        self._native_recovered = False
+        self._native_advancing = False
         from .strategy_discovery import StrategyIntegration
 
         self.strategy = StrategyIntegration(self) if store.run_record().get("strategy_review") is not None else None
@@ -295,7 +303,7 @@ class DiscoveryLoop:
         provider = self.providers[job["role"]]
         previous = self._clients.get(job["worker"])
         if (
-            self.strategy is not None
+            (self.strategy is not None or self.native_mode)
             and previous is not None
             and not hasattr(provider, "chat_raw")
             and (id(previous) in self._retiring_transports or id(previous) in self._retiring_closures)
@@ -345,7 +353,7 @@ class DiscoveryLoop:
         for identity in list(self._client_locks):
             if identity not in retained:
                 self._client_locks.pop(identity)
-        if self.strategy is not None:
+        if self.strategy is not None or self.native_mode:
             # Pool disposal is independent of mathematical work. Keep strong
             # ownership of slow disposals, and bound the whole cleanup batch.
             for identity in list(self._owned_clients):
@@ -420,7 +428,11 @@ class DiscoveryLoop:
                 },
                 "claim": self.store.get_claim(job["claim_id"]),
                 "experiments_enabled": run["experiments"],
-                "closed_loop_enabled": run["closed_loop"] is not None,
+                "closed_loop_enabled": run["closed_loop"] is not None and not self.native_mode,
+                **({"native_proof_owner": {
+                    "policy": "The original Mini session owns proof acceptance. Submit complete plans with formalize to return candidate guidance to it. Research and review never establish the root theorem or change its assumptions.",
+                    "kernel_verified": False,
+                }} if self.native_mode else {}),
                 "requests_remaining": run["max_requests"] - run["requests_used"],
                 # Explicit inventory, not replacement summaries of arguments.
                 # Complete artifacts remain addressable across every program.
@@ -527,7 +539,12 @@ class DiscoveryLoop:
     async def _request(self, job: dict[str, Any]) -> dict[str, Any]:
         from ..codex_subscription import CodexSubscriptionClient
         from ..llm_error_policy import SubscriptionBackendError
-        from ..llm_usage import provider_dispatch_observer
+        from ..llm_usage import (
+            call_with_optional_usage_callback,
+            metered_or_plain_call,
+            provider_dispatch_guard,
+            provider_dispatch_observer,
+        )
         from ..models import REQUIRED_PROMPT_CONTEXT_KEY, RequiredPromptContextOverflow
         from ..nl_input import _completion_error
 
@@ -536,7 +553,7 @@ class DiscoveryLoop:
         # instance is serialized; CLI factories give each worker its own one.
         lock = self._client_locks.setdefault(id(client), asyncio.Lock())
         async with lock:
-            if self.strategy is not None and (
+            if (self.strategy is not None or self.native_mode) and (
                 id(client) in self._retiring_transports
                 or id(client) in self._retiring_closures
             ):
@@ -606,9 +623,9 @@ class DiscoveryLoop:
 
             admission_open = True
             async def authorize(details: Any = None) -> Any:
+                if not admission_open:
+                    raise StrategyYield("retired_transport")
                 if self.strategy is not None:
-                    if not admission_open:
-                        raise StrategyYield("retired_transport")
                     try:
                         self.strategy.controller.admit_control(details["provider_dispatch_attempt_id"], job["job_id"], job["turn"])
                     except StrategyYield as exc:
@@ -627,15 +644,43 @@ class DiscoveryLoop:
                 run["request_timeout_s"], max(0, run["deadline"] - time.time())
             )
             try:
-                with provider_dispatch_observer(authorize):
+                # Native owners and cost metering already carry their own
+                # operation observer. Run admission must compose with that
+                # observer instead of replacing it (or being replaced by it).
+                admission = (
+                    provider_dispatch_guard
+                    if self.native_mode or self.cost_controller is not None
+                    else provider_dispatch_observer
+                )
+                with admission(authorize):
                     # The Codex envelope must be complete and valid, but the
                     # discovery parser owns the inner action. Persist malformed
                     # action text/refusals before giving correction feedback.
                     response_format = (
                         None if isinstance(client, CodexSubscriptionClient) else "json"
                     )
-                    operation = client.chat_raw(messages, response_format=response_format)
-                    if self.strategy is None:
+                    if self.cost_controller is None:
+                        operation = client.chat_raw(messages, response_format=response_format)
+                    else:
+                        config = getattr(client, "cfg", None)
+                        role = self.cost_roles.get(job["role"]) or str(
+                            getattr(config, "name", "") or job["role"]
+                        )
+                        operation = metered_or_plain_call(
+                            cost_controller=self.cost_controller,
+                            client=client,
+                            messages=messages,
+                            role=role,
+                            scope="native_research" if self.native_mode else "research",
+                            action_id="research_" + job["role"],
+                            call_kind="chat_raw",
+                            metadata={"research_job_id": job["job_id"], "research_turn": job["turn"]},
+                            invoke=lambda callback: call_with_optional_usage_callback(
+                                client.chat_raw, messages, usage_callback=callback,
+                                response_format=response_format,
+                            ),
+                        )
+                    if self.strategy is None and not self.native_mode:
                         _, response = await asyncio.wait_for(operation, timeout=timeout)
                     else:
                         task = asyncio.create_task(operation)
@@ -646,15 +691,11 @@ class DiscoveryLoop:
                             _, response = task.result()
                         except BaseException:
                             admission_open = False
-                            task.cancel()
-                            done, _ = await asyncio.wait({task}, timeout=.05)
-                            if not done:
-                                self._retiring_transports[id(client)] = task
                             def retired(completed: asyncio.Task[Any]) -> None:
                                 self._retiring_transports.pop(id(client), None)
                                 try:
                                     result = completed.result()
-                                    if time.time() <= run["deadline"] and len(json_text(result).encode()) <= 4 * 1024 * 1024:
+                                    if (self.native_mode or time.time() <= run["deadline"]) and len(json_text(result).encode()) <= 4 * 1024 * 1024:
                                         with self.store.atomic():
                                             artifact_id = self._blob(
                                                 {"candidate_only": True, "late_research_response": result,
@@ -683,7 +724,13 @@ class DiscoveryLoop:
                                             self._retiring_closures[identity] = asyncio.create_task(
                                                 self._close_retired_client(identity, owned)
                                             )
+                            # Publish ownership before awaiting cancellation:
+                            # another stop can interrupt the cleanup wait, but
+                            # cannot make a still-live transport reusable.
+                            self._retiring_transports[id(client)] = task
                             task.add_done_callback(retired)
+                            task.cancel()
+                            await asyncio.wait({task}, timeout=.05)
                             raise
                         finally:
                             admission_open = False
@@ -785,7 +832,11 @@ class DiscoveryLoop:
                         job.update(status="pending", last_error=reason)
                         self.store.save_job(job)
                     run = self.store.run_record()
-                    if self.strategy is not None and reason in {"context_overflow", "provider_timeout"} and not self.store.stop_reason(run):
+                    if self.native_mode or (
+                        self.strategy is not None
+                        and reason in {"context_overflow", "provider_timeout"}
+                        and not self.store.stop_reason(run)
+                    ):
                         if reason == "context_overflow":
                             run["context_char_limit"] = max(1200, int(run.get("context_char_limit", 20000) / 2))
                             job["messages_archive"] = self._blob(job["messages"], "worker-context-history.json")
@@ -1171,7 +1222,7 @@ class DiscoveryLoop:
                 },
                 requires_response=True,
             )
-            if self.store.run_record()["closed_loop"] is not None and (
+            if (self.native_mode or self.store.run_record()["closed_loop"] is not None) and (
                 evidence["kind"] == "written_proof"
                 and action["verdict"] == "supported"
                 or evidence["kind"] == "counterexample"
@@ -1243,6 +1294,8 @@ class DiscoveryLoop:
             polarity = action.get("polarity", "prove")
             if not isinstance(polarity, str) or polarity not in {"prove", "refute"}:
                 raise ValueError("formalization polarity must be prove or refute")
+            if self.native_mode:
+                return self._native_handoff(job, plan, polarity)
             if self.store.run_record()["closed_loop"] is not None:
                 return self._queue_formalization(job, plan, polarity)
             if polarity != "prove":
@@ -1254,6 +1307,8 @@ class DiscoveryLoop:
                 "kernel_verified": False,
             }
         if kind == "continue_formalization":
+            if self.native_mode:
+                raise ValueError("the original Mini session owns native proof work; submit a complete formalize plan")
             from .proof_bridge import handoff_bundle
 
             child = self.store.job(text(action["program_id"], "program_id"))
@@ -1346,6 +1401,8 @@ class DiscoveryLoop:
         *,
         preserve_active_parent: bool = False,
     ) -> dict[str, Any]:
+        if self.native_mode:
+            return self._native_handoff(job, plan, polarity)
         for older in self.store.jobs():
             if (
                 older["role"] == "formalization"
@@ -1378,6 +1435,26 @@ class DiscoveryLoop:
             "handoff_artifact": artifact,
             "kernel_verified": False,
         }
+
+    def _native_handoff(
+        self, job: dict[str, Any], plan: str, polarity: str
+    ) -> dict[str, Any]:
+        """Archive full guidance; original Mini alone may accept a proof."""
+        artifact = self._save_handoff(job, plan)
+        handoff = {
+            "artifact_id": artifact,
+            "job_id": job["job_id"],
+            "claim_id": job["claim_id"],
+            "revision": job["revision"],
+            "polarity": polarity,
+            "candidate_only": True,
+            "kernel_verified": False,
+        }
+        job.setdefault("native_handoffs", []).append(handoff)
+        job["status"] = "finished"
+        self.store.save_job(job)
+        self._notify(job["parent_job"], {"native_handoff": handoff}, requires_response=True)
+        return {**handoff, "status": "native_proof_guidance"}
 
     async def _advance_formalization(self, job: dict[str, Any]) -> None:
         from ..llm_error_policy import SubscriptionBackendError
@@ -1712,7 +1789,145 @@ class DiscoveryLoop:
                 self.store.save_job(job)
         self.apply_response(job)
 
+    def _recover_native_job(self, job: dict[str, Any]) -> None:
+        """Recover local persisted intent without replaying an uncertain tool."""
+        if job["role"] == "formalization":
+            return  # A native quantum has no campaign or proof authority.
+        if self.store.get_claim(job["claim_id"])["revision"] != job["revision"]:
+            self._mark_stale(job)
+        elif job["status"] == "running":
+            job.update(status="pending", last_error="interrupted_request_outcome_unknown")
+            self.store.save_job(job)
+        elif job["status"] == "tool_running":
+            job.update(status="responded", tool_result=self._blob(
+                {"status": "interrupted_outcome_unknown", "kernel_verified": False},
+                "interrupted-native-tool.json",
+            ))
+            self.store.save_job(job)
+
+    async def advance_native(
+        self, *, max_requests: int = 3, timeout_s: float = 120
+    ) -> dict[str, Any]:
+        """Borrow a bounded quantum from an already authorized native owner.
+
+        This never starts/extends a run, closes borrowed clients, executes a
+        formalization campaign, or grants mathematical acceptance. Admission
+        guards propagate into client retries and remain closed in retired
+        transport tasks after this method returns.
+        """
+        from ..llm_usage import provider_dispatch_guard
+
+        if not self.native_mode:
+            raise ValueError("native advancement requires native_mode")
+        if type(max_requests) is not int or max_requests < 0:
+            raise ValueError("native max_requests must be a nonnegative integer")
+        if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
+                or not math.isfinite(timeout_s) or timeout_s <= 0):
+            raise ValueError("native timeout must be finite and positive")
+        if self._native_advancing:
+            raise ValueError("native quantum already owns this discovery loop")
+        run = self.store.run_record()
+        if (run["status"] != "running" or run["started_at"] is None
+                or run["deadline"] is None):
+            raise ValueError("native owner must authorize the existing run first")
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        admitted = 0
+        transitions = 0
+        admission_open = True
+        reason = "no_ready_work"
+        current_job: str | None = None
+        transition_limit = 32 + 4 * min(max_requests, 32)
+        initial_handoffs = set(self.store.run_record()["handoffs"])
+
+        def authorize(details: Any = None) -> None:
+            nonlocal admitted
+            if (not admission_open or admitted >= max_requests
+                    or asyncio.get_running_loop().time() >= deadline):
+                raise StrategyYield("native_quantum_exhausted")
+            admitted += 1
+
+        self._native_advancing = True
+        try:
+            with self.store.execution_lock(), provider_dispatch_guard(authorize):
+                # Factory-owned workers from completed prior slices can be
+                # released; pending workers and in-flight tails stay owned.
+                await self._retire_clients(set(), preserve_failure=True)
+                if not self._native_recovered:
+                    with self.store.atomic():
+                        if self.strategy is not None:
+                            self.strategy.controller.recover()
+                        for job in self.store.jobs():
+                            self._recover_native_job(job)
+                    self._native_recovered = True
+                try:
+                    async with asyncio.timeout(timeout_s):
+                        while transitions < transition_limit:
+                            if self.strategy is not None:
+                                self.strategy.synchronize()
+                            run = self.store.run_record(scheduling=True)
+                            stop = self.store.stop_reason(run)
+                            if stop == "target_changed":
+                                reason = stop
+                                break
+                            jobs = self.store.jobs()
+                            ready = sorted(
+                                (job for job in jobs
+                                 if job["role"] != "formalization"
+                                 and (job["status"] == "responded" or (
+                                     job["status"] == "pending" and not stop
+                                     and admitted < max_requests
+                                     and job.get("retry_after", 0) <= time.time()
+                                 ))),
+                                key=lambda job: (
+                                    0 if job["status"] == "responded" else 1,
+                                    job.get("queue_order", 0),
+                                    0 if job["role"] == "review" else 1,
+                                ),
+                            )
+                            if not ready:
+                                if stop or admitted >= max_requests:
+                                    reason = stop or "quantum_exhausted"
+                                    break
+                                if self.strategy is not None and self.strategy.ensure_work():
+                                    transitions += 1
+                                    continue
+                                break
+                            current_job = ready[0]["job_id"]
+                            await self._advance(ready[0])
+                            transitions += 1
+                            current_job = None
+                            if set(self.store.run_record()["handoffs"]) - initial_handoffs:
+                                reason = "guidance_ready"
+                                break
+                        else:
+                            reason = "transition_limit"
+                except TimeoutError:
+                    reason = "quantum_timeout"
+                finally:
+                    admission_open = False
+                    if current_job is not None:
+                        with self.store.atomic():
+                            self._recover_native_job(self.store.job(current_job))
+        finally:
+            admission_open = False
+            try:
+                await self._retire_clients(set(), preserve_failure=True)
+            finally:
+                self._native_advancing = False
+        return {
+            "reason": reason,
+            "paid_dispatches": admitted,
+            "transitions": transitions,
+            "requests_used": self.store.run_record()["requests_used"],
+            "native_handoffs": [handoff for job in self.store.jobs()
+                                for handoff in job.get("native_handoffs", [])],
+            "candidate_only": True,
+            "kernel_verified": False,
+        }
+
     async def run(self) -> dict[str, Any]:
+        if self.native_mode:
+            raise ValueError("native owners must use bounded advance_native")
         from .proof_bridge import configuration, handoff_bundle
 
         config = configuration(self.store.run_record())

@@ -542,6 +542,47 @@ proof-state scheduling, falsification, verified-helper caching, API search, and
 federated mathematical retrieval. Start with the defaults and change one
 family at a time.
 
+### Automatic research when proof search stalls
+
+**Keep using your usual Mini or Putnam command.** New runs enable automatic
+research by default. When proof work stalls, the system investigates the
+obstacle, checks sources, and brings alternative strategies back to the same
+proof session. It can question an unsupported ancestor claim even while the
+current helper continues to produce apparent progress.
+
+Research becomes eligible after three paid, completed actions, ten provider
+attempts, paid work followed by stagnation or an exhausted proof frontier, or
+an explicit objection from the prover. These are investigation triggers;
+they do not establish that a mathematical claim is false. Source lookup and
+fresh research review can find an obstruction, but finding a particular
+counterexample or a successful alternative is not guaranteed.
+
+Each research phase borrows one remaining conversation invocation and one
+scheduler iteration, preserving capacity for another proof turn. It uses the
+same provider settings and cost budget, with at most six provider dispatches
+and 120 seconds per phase, further limited by the parent's remaining time and
+applicable hard deadlines. Research notes do not count as verified progress;
+Lean still decides whether the original theorem is proved.
+
+To disable automatic research, add this flag to your existing command:
+
+```text
+--no-autonomous-research
+```
+
+The terminal and `turns.jsonl` report research activity and the ledger path.
+With checkpointing enabled, sources, findings, and reviews persist in
+`native_research/` under the attempt's stable checkpoint registry directory.
+Resuming a new-format run preserves that work and its spent budget. Checkpoints
+created before this setting retain their previous, disabled behavior; running
+processes do not acquire the feature from a source update.
+
+The outer Putnam sweep's accepted-proof cutoffs remain in force, including the
+default 600-second first and 1800-second second acceptance deadlines. Research
+does not reset those clocks or count as an accepted proof. Isolated experiments
+are disabled in automatic recovery; the separate `./research` workflow remains
+available for a dedicated investigation.
+
 ### Direct turns and recursive work
 
 | Option | Default | Meaning |
@@ -1126,7 +1167,8 @@ CLI.
 `--llm-timeout-s`, `--prover-timeout-s`, `--refiner-timeout-s`,
 `--llm-request-timeout-s`, `--prover-request-timeout-s`,
 `--refiner-request-timeout-s`, `--llm-deadline-policy`,
-`--max-prove-turns`, `--max-refine-turns`, `--cost-budget-usd`,
+`--max-prove-turns`, `--max-refine-turns`, `--autonomous-research`,
+`--no-autonomous-research`, `--cost-budget-usd`,
 `--cost-budget-reserve-output-tokens`, `--lean-timeout-s`,
 `--lean-max-heartbeats`, `--mini-worker-timeout-s`,
 `--mini-run-wall-clock-budget-s`, `--mini-no-strong-progress-budget-s`,
