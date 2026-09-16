@@ -14,6 +14,7 @@ from functools import wraps
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 from pathlib import Path
@@ -126,6 +127,28 @@ def _allowed(session: Any) -> bool:
         if callable(check) and check():
             return False
     return True
+
+
+def _native_quantum_seconds(donor: Any) -> float:
+    """Size a finite research slice for the donated provider's normal latency.
+
+    A subscription reasoning request can legitimately need several minutes.
+    The former unconditional 120-second slice cancelled those requests before
+    they returned any usable answer, even under the parent's soft policy.
+    Provider timeouts are sizing hints here, not additional smaller hard caps:
+    the transport still enforces its own policy, and every existing donor or
+    parent hard limit takes precedence over this scheduling allowance.
+    """
+    seconds = 600.0
+    config = getattr(donor.client, "cfg", None)
+    for name in ("timeout_s", "operation_timeout_s", "request_timeout_s"):
+        value = getattr(config, name, None)
+        if (not isinstance(value, bool) and isinstance(value, (int, float))
+                and math.isfinite(value) and value > 0):
+            seconds = max(seconds, float(value))
+    if donor.remaining_seconds is not None:
+        seconds = min(seconds, donor.remaining_seconds)
+    return seconds
 
 
 class NativeResearchCoordinator:
@@ -331,14 +354,14 @@ class NativeResearchCoordinator:
             # Optional recovery cannot fund work by guessing a legacy refund.
             _event(session, "research_deferred", reason="ambiguous_legacy_grant_accounting")
             return False
-        timeout = min(120.0, donor.remaining_seconds if donor.remaining_seconds is not None else 120.0)
+        timeout = _native_quantum_seconds(donor)
         checkpoint = self._capture(session, reason)
         grant = {"id": uuid.uuid4().hex, "action_id": donor.action_id,
                  "requests": donor.request_limit, "accounted": 0,
                  "expires_at": time.time() + timeout,
                  "source_invocations": donor.initial_invocations + 1}
         donor = debit_donor(session, donor)
-        timeout = min(timeout, donor.remaining_seconds if donor.remaining_seconds is not None else timeout)
+        timeout = min(timeout, _native_quantum_seconds(donor))
         grant["expires_at"] = time.time() + timeout
         grant["seconds"] = timeout
         state["grant"] = grant
@@ -362,7 +385,7 @@ class NativeResearchCoordinator:
             # the current precommitted donor; no run-limit reset is involved.
             run.update(max_requests=run["requests_used"] + grant["requests"],
                        started_at=run.get("started_at") or time.time(), deadline=grant["expires_at"],
-                       max_seconds=timeout, status="running")
+                       max_seconds=timeout, request_timeout_s=timeout, status="running")
             grants[grant["id"]] = {**grant, "start_requests": run["requests_used"],
                                   "ordinal": len(grants), "closed": False}
             self.store.save_run(run)
@@ -375,16 +398,18 @@ class NativeResearchCoordinator:
             if not any(j["status"] in {"pending", "responded"} for j in self.store.jobs()):
                 self.store.add_job("native-root", f"Audit and redirect the native proof checkpoint {checkpoint}; investigate a different route and give its exact next inference.")
         state["rounds"] += 1
-        _event(session, "research_started", reason=reason, grant_id=grant["id"], requests=grant["requests"], ledger=str(self.store.directory))
+        _event(session, "research_started", reason=reason, grant_id=grant["id"],
+               requests=grant["requests"], timeout_s=timeout, ledger=str(self.store.directory))
         start = time.monotonic()
         token = _RESEARCH.set(True)
+        result: dict[str, Any] = {"reason": "parent_deadline_exhausted", "paid_dispatches": 0}
         try:
             remaining = grant["expires_at"] - time.time()
             parent_remaining = getattr(session, "_run_governor_remaining_s", lambda: None)()
             if parent_remaining is not None:
                 remaining = min(remaining, parent_remaining)
             if remaining > 0 and _allowed(session):
-                await self.loop.advance_native(max_requests=grant["requests"], timeout_s=remaining)
+                result = await self.loop.advance_native(max_requests=grant["requests"], timeout_s=remaining)
         finally:
             _RESEARCH.reset(token)
             elapsed = time.monotonic() - start
@@ -401,7 +426,17 @@ class NativeResearchCoordinator:
                 session.conv._native_research_objections = []
             self._deliver(session)
             await _checkpoint(session)
-        _event(session, "proof_resumed", research_round=state["rounds"], guidance_available=bool(self.guidance))
+        research_outcome = result.get("reason", "unknown")
+        if research_outcome in {"quantum_timeout", "deadline_exhausted", "parent_deadline_exhausted"}:
+            _event(session, "research_timed_out", reason=research_outcome,
+                   timeout_s=timeout, paid_dispatches=result.get("paid_dispatches", 0),
+                   guidance_available=bool(self.guidance))
+        _event(session, "research_round_complete", reason=research_outcome,
+               research_round=state["rounds"], research_elapsed_s=elapsed,
+               paid_dispatches=result.get("paid_dispatches", 0),
+               last_provider_error=result.get("last_provider_error"))
+        _event(session, "proof_resumed", research_round=state["rounds"],
+               research_outcome=research_outcome, guidance_available=bool(self.guidance))
         return bool(self.guidance)
 
     async def _ensure_loop(self, session: Any, client: Any, role: str) -> None:

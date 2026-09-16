@@ -1,6 +1,6 @@
 # Ensemble Prover
 
-Last updated: 2026-09-15.
+Last updated: 2026-09-16.
 
 This repository contains a research-grade autonomous theorem prover that
 combines language-model proof search with Lean verification. Given a formalized
@@ -24,6 +24,14 @@ screenshot is losslessly cropped; its retained code and logs are unchanged.
 ## Recent updates
 
 September 2026 — highlights from the current source checkout:
+
+- **1.13.0 — checked proof presentation and research deadlines:** verified Mini
+  exports remove unused helpers and shorten expanded signatures automatically,
+  with fresh Lean checks and an archived original. Automatic research now uses
+  a provider-aware time allowance instead of cancelling reasoning at 120 seconds,
+  and reports timeout/failure outcomes before proof search resumes.
+  [Proof presentation](docs/USER_GUIDE.md#automatic-proof-presentation) ·
+  [Automatic research](docs/USER_GUIDE.md#automatic-research-when-proof-search-stalls)
 
 - **1.12.1 — automatic research reliability:** interrupted parallel runs preserve
   research request accounting, large research notes fit alongside the original
@@ -99,7 +107,7 @@ other providers require an explicit supported selection.
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
 file and Lake project. PutnamBench files are supported through a compatibility
 adapter, and callers may attach a natural-language problem description as
-additional model context. Release 1.12.1 also includes
+additional model context. Release 1.13.0 also includes
 experimental natural-language entry points: `ensemble_prover.nl_input` for a
 single claim and `ensemble_prover.formalization` for resumable, multi-file
 projects. These translate text before proving; the resulting Lean statement
@@ -160,7 +168,7 @@ the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** 1.12.1 — research preview. Includes Mini Prover, experimental
+> **Release status:** 1.13.0 — research preview. Includes Mini Prover, experimental
 > single-claim NL input, and resumable multi-file formalization campaigns.
 > Optional Codex and Claude Code subscription backends serve Mini's prover and refiner,
 > alongside the existing API providers. Codex also serves autonomous research.

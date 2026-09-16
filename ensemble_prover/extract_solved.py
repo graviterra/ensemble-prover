@@ -920,6 +920,16 @@ def _export_root_name_for_content(stem: str, content: str) -> str:
     return candidates[-1] if candidates else str(stem or "").strip()
 
 
+def _remove_export_presentation_report(solved_dir: Path, stem: str) -> None:
+    """Retire the receipt only when its proof export is retired."""
+    if not str(stem or "").strip():
+        return
+    try:
+        (Path(solved_dir) / f"{stem}.presentation.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _remove_export_navigation_artifacts(
     solved_dir: Path,
     stem: str,
@@ -1612,7 +1622,12 @@ def _install_exported_lean(
 
     if not verify_lean:
         out_path.write_text(content, encoding="utf-8")
-        return False, "", "", ()
+        note = ""
+        try:
+            out_path.with_suffix(".presentation.json").unlink(missing_ok=True)
+        except OSError as exc:
+            note = f"[presentation] could not invalidate previous report: {exc}"
+        return False, "", note, ()
     if not str(theorem_name or "").strip():
         # Fail CLOSED: a verified install without an auditable root name
         # would silently skip the axiom backstop, making "no audit ran"
@@ -1698,15 +1713,72 @@ def _install_exported_lean(
                 f"{verification_output}\n{note}\n{audit_output}",
                 axioms,
             )
+    # Presentation is optional post-verification work. A failed cleanup keeps
+    # the original verified proof; it cannot withdraw a successful solve.
+    from .proof_presentation import (
+        PresentationResult, archive_original, present_export, write_report,
+    )
+
+    presentation = PresentationResult(content)
+    candidate_path: Optional[Path] = None
+    publish_path = temp_path
+    try:
+        presentation = present_export(
+            content, theorem_name, scratch_dir=out_path.parent,
+            project=Path(lean_project_dir) if lean_project_dir is not None
+            else PROJECT_ROOT / "external" / "PutnamBench" / "lean4",
+            timeout_s=lean_timeout_s, extra_lean_paths=extra_lean_paths,
+        )
+        if presentation.status == "applied" and presentation.content != content:
+            # Never rewrite the verified fallback, even on a partial write.
+            candidate_fd, candidate_name = tempfile.mkstemp(
+                prefix=f".{out_path.stem}.presentation.", suffix=".tmp.lean",
+                dir=str(out_path.parent),
+            )
+            os.close(candidate_fd)
+            candidate_path = Path(candidate_name)
+            candidate_path.write_text(presentation.content, encoding="utf-8")
+            archive_original(out_path, content, presentation)
+            publish_path = candidate_path
+    except Exception as exc:
+        presentation = PresentationResult(content, "fallback", f"{type(exc).__name__}: {exc}")
     if out_path.exists():
         publish_mode = out_path.stat().st_mode & 0o777
     else:
         # Solved artifacts are shared project outputs (the existing pool uses
-        # 0664).  Avoid reading umask via os.umask(), which is process-global
-        # and creates a cross-thread permission race.
+        # 0664). Avoid reading umask, which is process-global and races.
         publish_mode = 0o664
-    os.chmod(temp_path, publish_mode)
-    temp_path.replace(out_path)
+    try:
+        try:
+            os.chmod(publish_path, publish_mode)
+            publish_path.replace(out_path)
+        except OSError as exc:
+            if publish_path == temp_path:
+                raise
+            presentation = PresentationResult(content, "fallback", f"{type(exc).__name__}: {exc}")
+            os.chmod(temp_path, publish_mode)
+            temp_path.replace(out_path)
+    finally:
+        for leftover in (temp_path, candidate_path):
+            if leftover is not None:
+                try:
+                    leftover.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    if presentation.status == "applied" and presentation.axioms is not None:
+        axioms = tuple(presentation.axioms)
+    if presentation.status != "unchanged":
+        verification_output += (
+            f"\n[presentation] {presentation.status}: {presentation.reason}; "
+            f"removed {len(presentation.removed)}, shortened {len(presentation.rewritten)} declarations"
+        )
+    try:
+        # A failed new report must not leave an old 'checked' receipt attached
+        # to newly installed bytes. Receipts also carry hashes for consumers.
+        out_path.with_suffix(".presentation.json").unlink(missing_ok=True)
+        write_report(out_path, content, presentation)
+    except Exception as exc:
+        verification_output += f"\n[presentation] report unavailable: {type(exc).__name__}: {exc}"
     return True, "verified", verification_output, axioms
 
 
@@ -1873,6 +1945,7 @@ def _export_solved_files_locked(
             pass
         except Exception:
             pass
+        _remove_export_presentation_report(solved_dir, stem)
         _remove_export_navigation_artifacts(
             solved_dir,
             stem,
@@ -1887,9 +1960,12 @@ def _export_solved_files_locked(
         )
         version_re = re.compile(rf"^{re.escape(base)}_v[1-9][0-9]*$")
         stems = {base}
-        for path in solved_dir.glob(f"{base}_v*.lean"):
-            if version_re.fullmatch(path.stem):
-                stems.add(path.stem)
+        for pattern, suffix in ((f"{base}_v*.lean", ".lean"),
+                                (f"{base}_v*.presentation.json", ".presentation.json")):
+            for path in solved_dir.glob(pattern):
+                stem = path.name.removesuffix(suffix)
+                if version_re.fullmatch(stem):
+                    stems.add(stem)
         for stem in stems:
             remove_stale_output(stem)
 
@@ -1904,7 +1980,7 @@ def _export_solved_files_locked(
 
         def artifact_stem(path: Path) -> str:
             name = path.name
-            for suffix in (".source_map.json", ".source.html"):
+            for suffix in (".presentation.json", ".source_map.json", ".source.html"):
                 if name.endswith(suffix):
                     return name[: -len(suffix)]
             return path.stem
@@ -1927,6 +2003,7 @@ def _export_solved_files_locked(
                 pass
             except Exception:
                 pass
+            _remove_export_presentation_report(solved_dir, stem)
             _remove_export_navigation_artifacts(
                 solved_dir,
                 stem,
@@ -1971,6 +2048,7 @@ def _export_solved_files_locked(
             stale_single = solved_dir / f"{single_stem}.lean"
             if stale_single.exists():
                 stale_single.unlink()
+            _remove_export_presentation_report(solved_dir, single_stem)
             _remove_export_navigation_artifacts(
                 solved_dir,
                 single_stem,
@@ -2445,6 +2523,7 @@ def _export_solved_run_locked(
             (target_dir / f"{stale_stem}.lean").unlink()
         except FileNotFoundError:
             pass
+        _remove_export_presentation_report(target_dir, stale_stem)
         _remove_export_navigation_artifacts(
             target_dir,
             stale_stem,

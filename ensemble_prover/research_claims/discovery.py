@@ -507,7 +507,8 @@ class DiscoveryLoop:
     def _blob(self, value: Any, name: str) -> str:
         return self.store.put_artifact(json_text(value).encode(), name=name)
 
-    def _emit(self, event: str, job: dict[str, Any], *, action: str | None = None) -> None:
+    def _emit(self, event: str, job: dict[str, Any], *, action: str | None = None,
+              error: dict[str, Any] | None = None) -> None:
         if self.on_event is not None:
             try:
                 # Checkpoint creation can replace the saved job during an action.
@@ -526,6 +527,9 @@ class DiscoveryLoop:
                         "repeated_retrievals": memory.get("repeated_retrievals"),
                         "checkpoint_reason": current.get("research_control", {}).get("reason"),
                         "reorientation_for": current.get("research_reorientation_for"),
+                        **({"error_kind": error.get("kind"),
+                            "exception_type": error.get("exception_type")}
+                           if error is not None else {}),
                     }
                 )
             except Exception:
@@ -790,6 +794,10 @@ class DiscoveryLoop:
                             last_error="interrupted_request_outcome_unknown",
                         )
                         self.store.save_job(job)
+                self._emit("provider_cancelled", job, error={
+                    "kind": "interrupted_request_outcome_unknown",
+                    "exception_type": "CancelledError",
+                })
                 raise
             except Exception as exc:
                 if isinstance(exc, AdmissionStopped):
@@ -849,6 +857,7 @@ class DiscoveryLoop:
                         job["recovery_failures"] = job.get("recovery_failures", 0) + 1
                         self.store.save_job(job)
                         self.store.save_run(run)
+                        self._emit("provider_failed", job, error=error)
                         return job
                     # The first failure closes admission. A concurrent worker
                     # observing that stop (or failing later) must not replace
@@ -856,6 +865,7 @@ class DiscoveryLoop:
                     if run["status"] == "running":
                         run.update(status=reason, last_error=error)
                         self.store.save_run(run)
+                self._emit("provider_failed", job, error=error)
                 return job
 
     def _action(self, job: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -1839,6 +1849,7 @@ class DiscoveryLoop:
         admission_open = True
         reason = "no_ready_work"
         current_job: str | None = None
+        last_provider_error: dict[str, Any] | None = None
         transition_limit = 32 + 4 * min(max_requests, 32)
         initial_handoffs = set(self.store.run_record()["handoffs"])
 
@@ -1894,9 +1905,14 @@ class DiscoveryLoop:
                                 if self.strategy is not None and self.strategy.ensure_work():
                                     transitions += 1
                                     continue
+                                if last_provider_error is not None:
+                                    reason = last_provider_error["kind"]
                                 break
                             current_job = ready[0]["job_id"]
                             await self._advance(ready[0])
+                            advanced = self.store.job(current_job)
+                            if advanced.get("last_error_details"):
+                                last_provider_error = advanced["last_error_details"]
                             transitions += 1
                             current_job = None
                             if set(self.store.run_record()["handoffs"]) - initial_handoffs:
@@ -1922,6 +1938,7 @@ class DiscoveryLoop:
             "paid_dispatches": admitted,
             "transitions": transitions,
             "requests_used": self.store.run_record()["requests_used"],
+            "last_provider_error": last_provider_error,
             "native_handoffs": [handoff for job in self.store.jobs()
                                 for handoff in job.get("native_handoffs", [])],
             "candidate_only": True,

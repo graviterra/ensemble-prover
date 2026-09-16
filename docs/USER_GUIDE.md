@@ -560,8 +560,12 @@ counterexample or a successful alternative is not guaranteed.
 Each research phase borrows one remaining conversation invocation and one
 scheduler iteration, preserving capacity for another proof turn. It uses the
 same provider settings and cost budget, with at most six provider dispatches
-and 120 seconds per phase, further limited by the parent's remaining time and
-applicable hard deadlines. Research notes do not count as verified progress;
+per phase. Each phase receives 600 seconds, or the provider's larger configured
+time allowance, further limited by the parent's remaining time and applicable
+hard deadlines. The research request timeout uses that same funded allowance;
+there is no separate 120-second cutoff. Cancelled or failed research emits an
+explicit outcome before proof search resumes; `llm_usage_missing` describes
+missing accounting information and does not by itself explain the failure. Research notes do not count as verified progress;
 Lean still decides whether the original theorem is proved.
 
 The original proof context takes priority when a model's prompt is crowded.
@@ -832,6 +836,27 @@ For each graphed theorem, the graph set includes:
 
 The explicit directory-wide graph command below also writes an `index.html`
 page listing the generated graphs.
+
+### Automatic proof presentation
+
+Verified Mini and batch exports automatically receive a conservative presentation
+pass. It removes unused plain theorem/lemma helpers, including redundant assembly
+lemmas, and shortens fully explicit signatures when Lean can print a readable
+replacement. It preserves proof bodies, definitions, attributes, and scoped
+commands. This is source cleanup, not a generated explanation of the mathematics.
+
+Lean parses the command boundaries and checks the candidate again. Every retained
+declaration must keep its exact elaborated type; non-theorem declarations must
+also keep their implementations. The root receives a fresh axiom audit. A failed
+check, exhausted 60-second presentation allowance, or cleanup-write failure keeps
+the original verified proof and does not withdraw the solved result.
+
+When cleanup succeeds, the original is retained beside the export under
+`.presentation/<sha256>.lean`. `<name>.presentation.json` records the original
+and presented hashes, removed/shortened declarations, and whether cleanup was
+applied, unnecessary, or fell back. Source maps and graphs use the installed
+artifact. Existing launch commands need no additional flag. Exports made with
+`--skip-lean-verify` do not run this pass.
 
 To rebuild all eligible local solved exports (including automatic graph
 generation for PutnamBench-adapter exports):
