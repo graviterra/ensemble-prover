@@ -2348,6 +2348,29 @@ def _missing_claim_dependencies(
     return missing
 
 
+def _reused_statement_contract_evidence(
+    candidate: Any,
+) -> dict[str, str]:
+    """Carry the matched claim's Lean receipt across the telemetry boundary.
+
+    A reused declaration can have different binder syntax from the candidate.
+    Its source remains authoritative; the candidate needs its own bound receipt
+    so graph reconciliation can certify that differently spelled target.
+    """
+
+    if not _bound_variant_contract_identity(candidate):
+        return {}
+    return {
+        key: str(getattr(candidate, key, "") or "")
+        for key in (
+            "contract_identity",
+            "contract_identity_statement_key",
+            "contract_identity_environment_hash",
+            "contract_identity_evidence_receipt",
+        )
+    }
+
+
 def _reusable_verified_helper_match(
     rendered_helper_blocks: Sequence[str],
     candidate_statements: Sequence[str],
@@ -2355,6 +2378,21 @@ def _reusable_verified_helper_match(
     rendered_helper_identities: Sequence[str] = (),
     candidate_identities: Sequence[str] = (),
 ) -> tuple[str, str]:
+    name, statement, _index = _reusable_verified_helper_match_with_candidate(
+        rendered_helper_blocks, candidate_statements,
+        rendered_helper_identities=rendered_helper_identities,
+        candidate_identities=candidate_identities,
+    )
+    return name, statement
+
+
+def _reusable_verified_helper_match_with_candidate(
+    rendered_helper_blocks: Sequence[str],
+    candidate_statements: Sequence[str],
+    *,
+    rendered_helper_identities: Sequence[str] = (),
+    candidate_identities: Sequence[str] = (),
+) -> tuple[str, str, int]:
     """Name of a RENDERED verified-helper block that already proves one of the
     candidate statements, else ``("", "")``.
 
@@ -2429,15 +2467,15 @@ def _reusable_verified_helper_match(
                     and candidate_parsed_identity is not None
                     and helper_parsed_identity[0] == candidate_parsed_identity[0]
                 ):
-                    return name, str(candidate_statements[candidate_index] or "")
+                    return name, str(candidate_statements[candidate_index] or ""), candidate_index
         if require_identity_match:
             continue
         block_statement = exact_source_key(helper_decl_statement(source))
         if block_statement in wanted:
-            for candidate in candidate_statements:
+            for candidate_index, candidate in enumerate(candidate_statements):
                 if exact_source_key(candidate) == block_statement:
-                    return name, str(candidate or "").strip()
-    return "", ""
+                    return name, str(candidate or "").strip(), candidate_index
+    return "", "", -1
 
 
 def _reusable_verified_helper_name(
@@ -28302,13 +28340,13 @@ async def run_mini_recursive_driver(
                     *(variant.statement for variant in candidate.variants),
                 ]
                 reusable_identities = [
-                    _bound_claim_contract_identity(candidate),
+                    _bound_variant_contract_identity(candidate),
                     *(
                         _bound_variant_contract_identity(variant)
                         for variant in candidate.variants
                     ),
                 ]
-                reuse_helper_name, reuse_statement = _reusable_verified_helper_match(
+                reuse_helper_name, reuse_statement, reuse_candidate_index = _reusable_verified_helper_match_with_candidate(
                     prepriority_helper_blocks,
                     reusable_statements,
                     rendered_helper_identities=(prepriority_helper_identities),
@@ -28329,6 +28367,9 @@ async def run_mini_recursive_driver(
                             "claim_name": candidate_name,
                             "helper_name": reuse_helper_name,
                             "statement": reuse_statement,
+                            **_reused_statement_contract_evidence(
+                                (candidate, *candidate.variants)[reuse_candidate_index]
+                            ),
                             "verdict": "claim_reused_before_priority",
                         },
                     )
@@ -30184,13 +30225,13 @@ async def run_mini_recursive_driver(
                 *(variant.statement for _idx, variant in live_variants),
             ]
             reusable_candidate_identities = [
-                _bound_claim_contract_identity(claim),
+                _bound_variant_contract_identity(claim),
                 *(
-                    _bound_claim_contract_identity(variant)
+                    _bound_variant_contract_identity(variant)
                     for _idx, variant in live_variants
                 ),
             ]
-            reuse_helper_name, reuse_statement = _reusable_verified_helper_match(
+            reuse_helper_name, reuse_statement, reuse_candidate_index = _reusable_verified_helper_match_with_candidate(
                 reusable_helper_blocks,
                 reusable_candidate_statements,
                 rendered_helper_identities=reusable_helper_identities,
@@ -30211,6 +30252,9 @@ async def run_mini_recursive_driver(
                         "claim_name": claim.name,
                         "helper_name": reuse_helper_name,
                         "statement": reuse_statement,
+                        **_reused_statement_contract_evidence(
+                            (claim, *(variant for _idx, variant in live_variants))[reuse_candidate_index],
+                        ),
                         "verdict": "claim_reused_existing_verified_helper",
                     },
                 )

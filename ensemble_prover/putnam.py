@@ -472,6 +472,19 @@ def load_putnam_project(
             f"could not infer a Lake project for Putnam source {source_path}; "
             "pass --project-path"
         )
+    from .putnam_answer_input import PUTNAM_ANSWER_MARKER, load_putnam_answer_project
+
+    if raw_text.startswith(PUTNAM_ANSWER_MARKER + "\n"):
+        return load_putnam_answer_project(
+            TheoremProjectRequest(
+                lean_file=source_path,
+                theorem_name=selected.canonical_name,
+                project_path=resolved_project,
+                imports=tuple(imports),
+                source_dirs=tuple(Path(item) for item in source_dirs),
+                description=description,
+            )
+        )
     generic = _resolve_theorem_project(
         TheoremProjectRequest(
             lean_file=source_path,

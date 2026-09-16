@@ -667,10 +667,14 @@ class StrategyController:
                 >= run["max_requests"]
             ):
                 raise StrategyYield("global_limit")
+            from .research_control import admit_research
+
+            admit_research(self.store, job, state, run, self.clock(), self._reservations(state))
             run["requests_used"] += 1
             receipt = {
                 "attempt_id": attempt_id,
                 "allocation_id": None,
+                "admitted_at": self.clock(),
                 "consumer_id": job_id,
                 "status": "exposure_claimed",
                 "process_id": os.getpid(),

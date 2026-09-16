@@ -1653,6 +1653,16 @@ class PutnamProblem(TheoremProblem):
     adapter_id: str = PUTNAMBENCH_ADAPTER_ID
 
 
+def theorem_retrieval_excluded_source_paths(problem: Any) -> tuple[str, ...]:
+    """Keep a candidate's original answer-bearing source out of retrieval too."""
+    paths = list(
+        (getattr(problem, "adapter_metadata", {}) or {}).get("excluded_source_paths", ())
+    )
+    if getattr(problem, "exclude_entire_source_from_retrieval", False):
+        paths.insert(0, str(getattr(problem, "path", "") or ""))
+    return tuple(dict.fromkeys(str(path) for path in paths if str(path)))
+
+
 def _resolve_theorem_project(
     request: TheoremProjectRequest,
     *,

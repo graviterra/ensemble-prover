@@ -423,6 +423,7 @@ from .proof_state_executor import (
 from .proof_state_scheduler import _retrieve_proof_state_node_candidates_async
 from .putnam import load_putnam_project as load_putnam_problem, problem_docstring_text
 from .theorem_project import (
+    theorem_retrieval_excluded_source_paths,
     GENERIC_ADAPTER_ID,
     PUTNAMBENCH_ADAPTER_ID,
     TheoremProblem,
@@ -11330,13 +11331,7 @@ async def prove_problem(
     if callable(set_excluded_target):
         set_excluded_target(
             declaration_names=(problem.theorem_name,),
-            source_paths=(
-                (getattr(problem, "path", ""),)
-                if bool(
-                    getattr(problem, "exclude_entire_source_from_retrieval", False)
-                )
-                else ()
-            ),
+            source_paths=theorem_retrieval_excluded_source_paths(problem),
         )
 
     normalized_zero_hit_policy = str(premise_zero_hit_policy or "off").strip().lower()
@@ -14552,7 +14547,10 @@ def _resolve_cli_theorem_problem(args: argparse.Namespace) -> TheoremProblem:
     putnam_file = str(getattr(args, "putnam_file", "") or "").strip()
     project_path = str(getattr(args, "lean_project_dir", "") or "").strip()
     theorem_name = str(getattr(args, "theorem_name", "") or "").strip()
-    if generic_file:
+    # A saved Putnam configuration also contains the derived lean_file path.
+    # Keep its adapter on resume, including candidate receipts and original
+    # answer-source exclusions. argparse forbids two explicit input flags.
+    if generic_file and not putnam_file:
         if not theorem_name:
             raise ValueError("--lean-file requires --theorem-name")
         if not project_path:

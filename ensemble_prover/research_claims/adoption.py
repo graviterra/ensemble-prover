@@ -204,6 +204,9 @@ def import_artifacts(store: Any, adoption: dict[str, Any]) -> None:
             "mode": "new_research_with_revalidated_artifacts",
             "kernel_verified": False,
         }
+        record["inventory_artifact"] = store.put_artifact(
+            json_text(record).encode(), name="adoption-inventory.json"
+        )
         run = store.run_record()
         run["adopted_mini_run"] = record
         store.save_run(run)
@@ -211,7 +214,10 @@ def import_artifacts(store: Any, adoption: dict[str, Any]) -> None:
         job["question"] = (
             "First audit the imported attempt's strategy and exact bottlenecks. Read its saved evidence and search for known obstructions. "
             "Then execute a promising route toward the pinned original root. Prior helper claims and proof text are candidates requiring fresh checking. "
-            "Do not replay the stopped scheduler. Adoption inventory: "
-            + json_text(record)
+            "Do not replay the stopped scheduler or read its entire checkpoint sequentially. "
+            "Start with the named problem/source documents; use lookup_strategy_subject to locate an exact bottleneck. "
+            f"There are {len(inventory)} imported contracts. Complete adoption inventory artifact: "
+            + record["inventory_artifact"]
+            + ". Original checkpoint artifact for targeted inspection: " + checkpoint
         )
         store.save_job(job)

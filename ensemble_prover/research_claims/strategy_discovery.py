@@ -7,9 +7,11 @@ from contextlib import nullcontext
 
 from .model import json_text, text
 from .strategy import StrategyController, StrategyYield
+from .research_control import INSTRUCTIONS, REORIENTATION_FIELDS, ResearchControl
 
 
 ACTION_FIELDS = {
+    "research_reorientation": REORIENTATION_FIELDS,
     "request_strategy_review": {
         "subject_handle",
         "scope",
@@ -64,7 +66,7 @@ def _validate_action_values(action: dict[str, Any]) -> None:
             raise ValueError(f"{field} must be boolean")
 
 
-SYSTEM = """
+SYSTEM = INSTRUCTIONS + """
 This run has an autonomous research controller. Finishing one investigation
 does not stop the run. Pursue the original root within the authorized total
 budget; when a route stalls or is contradicted, execute a materially different
@@ -134,6 +136,7 @@ class StrategyIntegration:
         self.loop = loop
         self.store = loop.store
         self.controller = StrategyController(self.store)
+        self.research = ResearchControl(loop, self.controller)
 
     def context(self, job: dict[str, Any]) -> dict[str, Any]:
         from .literature import source_context
@@ -199,6 +202,7 @@ class StrategyIntegration:
     def synchronize(self) -> None:
         """Durable inbox intake and queued review work share the owner transaction."""
         self.controller.expire_holds()
+        self.research.synchronize()
         with self.store.atomic():
             state = self.controller.snapshot()
             root_claim = self.store.run_record(scheduling=True)["target_id"]
@@ -302,6 +306,8 @@ class StrategyIntegration:
     ) -> dict[str, Any]:
         _validate_action_values(action)
         kind = action["action"]
+        if kind == "research_reorientation":
+            return self.research.apply_reorientation(job, action)
         if kind == "report_investigation":
             if job["role"] != "research" or not job.get("alternative_for"):
                 raise ValueError(

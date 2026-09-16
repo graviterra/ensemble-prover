@@ -52,6 +52,22 @@ research-only execution, including reviews and literature tools.
 
 ## Adopt a stopped Mini run
 
+For the simplest start from the repository directory:
+
+```bash
+./research runs/mini_prover/YOUR_RUN
+```
+
+The launcher selects the saved model, provider and Lean project, then initializes
+and starts research. It defaults to 4 hours and 200 model calls; optional
+`--hours` and `--requests` set a different initial budget. Add `--source finding.txt`
+to include an outside finding, or `--prepare` to set up without model calls.
+The same command with the printed research directory resumes within its saved
+budget; adding `--status` inspects progress. Only saved Codex/OpenAI transports
+can be inherited. Other transports need an explicit supported `--provider`.
+
+For full control over individual settings, use the underlying discovery CLI:
+
 This command creates a **new** ledger. It never resumes the old scheduler or
 trusts the old helper proofs without rechecking them.
 
@@ -134,6 +150,25 @@ flowchart TD
 
 ### Actual exploration and progress
 
+Research itself has bounded attention intervals, including provider retries and
+work split among child researchers. A repeated retrieval loop, explicit gap, or
+completed interval commissions an independent checkpoint review. The reviewer
+prescribes a specific next question, its first uncertain inference, and a
+calculation or source check that can decide it. Inconclusive reviews lead to
+another concrete investigation. Existing active proof work and reviews get their
+results back before additional replanning.
+
+These handoffs continue within the run's original time and request budget; they
+do not stop the run or label a mathematical statement false. The default research
+interval is 10 dispatches or 600 seconds, and checkpoint reviewers receive at
+most 4 dispatches. The saved strategy policy supplies these limits.
+
+Workers retain a notebook of exact excerpts, read ranges, page references, source
+searches, uncertainties, and next steps. Stable source handles survive context
+compaction. A successor can use the prior notebook while independently checking
+the relevant evidence; another worker's notes never count as its own inspection.
+Late responses reach the successor as unverified candidates.
+
 A new title or `finish` message is insufficient to renew a stalled route.
 `report_investigation` records the method, actual derivation or checks, first
 uncertain inference, evidence artifacts, and remaining gap. A separate worker
@@ -159,6 +194,14 @@ public primary sources, and render numbered PDF pages from original bytes.
 Rendered page images reach both image-capable API requests and the Codex CLI.
 Sources retain URL, content hash, content type, and provenance. Unavailable search,
 metadata-only coverage, and uninspected documents remain unknown.
+
+`search_source` locates literal text in a saved source and returns bounded exact
+excerpts with page/line locations. For PDFs, extracted text is only a navigation
+aid: inspect the original page image to verify definitions and notation. A search
+with no matches is not evidence that a statement or definition is absent.
+Rendered pages and extracted text are cached by source bytes. Images are attached
+when requested, with recent pages available for comparison, rather than resent
+on every unrelated turn.
 
 Crossref is a bibliographic discovery channel, not comprehensive web search.
 Inspecting a known source is stronger coverage than finding no relevant metadata.

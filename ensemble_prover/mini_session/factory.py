@@ -52,7 +52,7 @@ from ..proof_dossier import (
 )
 from ..proof_state_cache import MiniVerifiedLemmaCache, _make_proof_state_cache
 from ..putnam import problem_docstring_text
-from ..theorem_project import TheoremProblem
+from ..theorem_project import TheoremProblem, theorem_retrieval_excluded_source_paths
 from ..quarantined_turn_recorder import QuarantinedTurnRecorder
 from ..deadline_guard import await_with_strict_deadline
 from ..mini_recursive import PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS
@@ -1176,11 +1176,7 @@ def _bind_answer_safe_retrieval_context(
     if callable(set_excluded_target):
         set_excluded_target(
             declaration_names=(str(getattr(problem, "theorem_name", "") or ""),),
-            source_paths=(
-                (str(getattr(problem, "path", "") or ""),)
-                if bool(getattr(problem, "exclude_entire_source_from_retrieval", False))
-                else ()
-            ),
+            source_paths=theorem_retrieval_excluded_source_paths(problem),
         )
     return searcher
 
@@ -2134,11 +2130,7 @@ def build_session_for_prove_problem(
     if callable(set_excluded_target):
         set_excluded_target(
             declaration_names=(problem.theorem_name,),
-            source_paths=(
-                (getattr(problem, "path", ""),)
-                if bool(getattr(problem, "exclude_entire_source_from_retrieval", False))
-                else ()
-            ),
+            source_paths=theorem_retrieval_excluded_source_paths(problem),
         )
 
     problem_text = problem_docstring_text(problem)
@@ -3551,11 +3543,7 @@ async def prove_problem_via_session(
     if callable(set_excluded_target):
         set_excluded_target(
             declaration_names=(problem.theorem_name,),
-            source_paths=(
-                (getattr(problem, "path", ""),)
-                if bool(getattr(problem, "exclude_entire_source_from_retrieval", False))
-                else ()
-            ),
+            source_paths=theorem_retrieval_excluded_source_paths(problem),
         )
     trace_prefix = str(kwargs.get("trace_prefix") or "")
     opaque_mode = bool(kwargs.get("opaque_mode", True))

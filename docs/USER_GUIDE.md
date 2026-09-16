@@ -298,7 +298,17 @@ Use the ordinary command; no separate discovery command is required:
 
 The project's imports must define its `answer(...)` notation. This is different
 from a missing proof (`:= by sorry`), which already goes straight to proof search.
-The PutnamBench adapter continues to use its existing answer handling.
+Opaque `--putnam-file` runs also discover a candidate when the theorem uses its
+`*_solution` constant. This supports a single top-level, nonparameterized answer
+constant and a theorem without section variables. Unsupported scopes fail
+explicitly. Visible official-answer runs retain their existing behavior.
+
+For Putnam questions, Mini removes the answer axiom and its comments from the
+discovery context and places one typed candidate outside the theorem's entire
+quantifier telescope. Lean first checks that this preserves the original opaque
+question. The candidate then becomes the actual proof target; Mini never assumes
+it equals the opaque official-answer constant. The original benchmark source
+remains excluded from retrieval, including after proof-checkpoint resume.
 
 Mini first checks the project, asks the configured prover model for explicit
 answers and a complete argument, checks the terms in Lean, and requests a
@@ -330,6 +340,14 @@ Mini run). After a proof checkpoint exists, resume it with:
 .venv/bin/python -m ensemble_prover.mini_prover \
   --resume-from runs/question-answer/proof
 ```
+
+For Putnam runs, preparation lives beside the requested output directory in
+`<output-dir>.answer_preparation/` (for example, `attempt_001.answer_preparation/`).
+Proof logs, summaries, and checkpoints stay directly in the output directory so
+sweep monitoring continues to work. That directory must be empty at startup;
+resume a proof checkpoint from that output directory directly.
+Older interrupted opaque-answer attempts need a new run to use this handoff;
+resuming an old checkpoint does not change its frozen theorem target.
 
 Interrupted answer preparation is recorded but is not itself resumable; restart
 with a new output directory. Disabling checkpointing also disables proof resume.

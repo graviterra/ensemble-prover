@@ -18065,6 +18065,18 @@ class ProofDossier:
             statement = str(record.get("statement", "") or "").strip()
             if not helper_name:
                 return
+            existing_helper = self.proof_graph.nodes.get(
+                self.proof_graph.helper_node_id(helper_name)
+            )
+            # Recorder text describes the attempted/reused candidate, not a
+            # replacement for a checked declaration. In particular semantic
+            # reuse may change binder spelling while retaining the same Lean
+            # type. Overwriting the source-bound statement breaks replay and
+            # causes the already certified fact to be scheduled again.
+            if existing_helper is not None and (
+                existing_helper.metadata.get("verified_helper_source")
+            ):
+                statement = ""
             node = self.proof_graph.ensure_helper(
                 helper_name,
                 statement=statement,

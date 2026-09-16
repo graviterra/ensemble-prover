@@ -61,9 +61,16 @@ Return exactly one JSON action per response, with no additional fields:
  "code":"complete Python 3 standard-library program"}
   Available only when the operator enables the isolated experiment tool.
 {"action":"read_artifact","artifact_id":"SHA256"}
-  Returns complete stored UTF-8 text. Nothing is silently truncated.
+  Retrieves stored UTF-8 text. Check coverage and next_offset: with strategy
+  recovery enabled, this returns a page, not necessarily the whole document.
 {"action":"read_claim","claim_id":"id"}
   Returns full ledger history, including review objections and artifact IDs.
+{"action":"record_note","note":"exact useful observations and uncertainties",
+ "next_step":"specific next check","source_artifact_ids":[]}
+  Preserves working notes across retrieval and independent handoffs. Notes are
+  unverified worker reports, not evidence of proof or independently checked facts.
+  Consult research_memory before rereading the same source. Record what you
+  learned and the next unresolved inference before changing topics.
 {"action":"formalize","proof_plan":"complete proposed formalization/proof plan"}
   With closed_loop enabled, automatically formalizes, reviews the statement,
   invokes Ensemble Prover and independently verifies the export. Otherwise it
@@ -109,6 +116,7 @@ _FIELDS = {
     "experiment": {"scope", "code"},
     "read_artifact": {"artifact_id"},
     "read_claim": {"claim_id"},
+    "record_note": {"note", "next_step", "source_artifact_ids"},
     "formalize": {"proof_plan"},
     "continue_formalization": {"program_id"},
     "finish": {"reason"},
@@ -435,8 +443,38 @@ class DiscoveryLoop:
                 ],
             }
             if self.strategy is not None:
+                adopted = run.get("adopted_mini_run")
+                prefix, marker, inventory = job["question"].partition("Adoption inventory: ")
+                if adopted and marker:
+                    try:
+                        exact_inventory = load_json(inventory) == adopted
+                    except (ValueError, RecursionError):
+                        exact_inventory = False
+                    if exact_inventory:
+                        # Older initialized runs carry all subject IDs in their
+                        # assignment. Project only this exact generated suffix;
+                        # arbitrary instructions and the saved job stay intact.
+                        context["assignment"]["question"] = (
+                            prefix + f"Imported contracts: {len(adopted['subjects'])}. "
+                            "Use lookup_strategy_subject to inspect the exact bottleneck; "
+                            "original checkpoint artifact: " + adopted["checkpoint_artifact"]
+                        )
+                # Give every document its own stable handle. A changing whole-run
+                # snapshot must not make an unchanged source look newly unread.
+                context["sources"] = {
+                    name: ({
+                        "artifact_id": run["sources"][name],
+                        "media_type": "text/plain",
+                        "characters": len(value),
+                        "text": value[:800],
+                        "coverage": "complete" if len(value) <= 800 else "excerpt",
+                        "read_with": "read_artifact",
+                    } if isinstance(value, str) else value)
+                    for name, value in context["sources"].items()
+                }
                 context.update(self.strategy.context(job))
-            if job["role"] == "review" and not job.get("strategy_review_id"):
+                context.update(self.strategy.research.context(job))
+            if job["role"] == "review" and not job.get("strategy_review_id") and not job.get("research_reorientation_for"):
                 evidence = next(
                     item
                     for item in self.store.history(job["claim_id"])["evidence"]
@@ -454,9 +492,13 @@ class DiscoveryLoop:
     def _blob(self, value: Any, name: str) -> str:
         return self.store.put_artifact(json_text(value).encode(), name=name)
 
-    def _emit(self, event: str, job: dict[str, Any]) -> None:
+    def _emit(self, event: str, job: dict[str, Any], *, action: str | None = None) -> None:
         if self.on_event is not None:
             try:
+                # Checkpoint creation can replace the saved job during an action.
+                # Report the committed state, without scanning transcripts.
+                current = self.store.job(job["job_id"])
+                memory = current.get("research_memory", {})
                 self.on_event(
                     {
                         "event": event,
@@ -464,6 +506,11 @@ class DiscoveryLoop:
                         "role": job["role"],
                         "turn": job["turn"],
                         "requests_used": self.store.run_record()["requests_used"],
+                        "action": action,
+                        "retrievals": memory.get("retrievals"),
+                        "repeated_retrievals": memory.get("repeated_retrievals"),
+                        "checkpoint_reason": current.get("research_control", {}).get("reason"),
+                        "reorientation_for": current.get("research_reorientation_for"),
                     }
                 )
             except Exception:
@@ -500,13 +547,23 @@ class DiscoveryLoop:
                 return job
             with self.store.atomic():
                 job = self.store.job(job["job_id"])
+                if self.strategy is not None and not self.strategy.research.before_request(job):
+                    return self.store.job(job["job_id"])
                 job["messages"].extend(job["inbox"])
                 job["inbox"] = []
                 context = self._context(job)
                 history = job["messages"]
                 if self.strategy is not None:
                     from .context_window import window
-                    context = window(self.store, context, limit=self.store.run_record().get("context_char_limit", 20000))
+                    from .research_memory import context as memory_context
+                    limit = self.store.run_record().get("context_char_limit", 20000)
+                    memory_limit = max(400, min(12000, limit // 2))
+                    memory = memory_context(self.store, job, limit=memory_limit)
+                    memory_size = len(json_text({"research_memory": memory})) - 1
+                    context = window(self.store, context, limit=limit - memory_size)
+                    # Do not archive the durable working memory again: that
+                    # recreates the very rereading cycle it exists to prevent.
+                    context["research_memory"] = memory
                     history = [{**item, "content": json_text(window(self.store, {"message": item["content"]}, limit=2500))}
                                if len(json_text(item["content"])) > 2500 and not item.get("_retrieval_page") else item for item in history[-4:]]
                 messages = [
@@ -525,10 +582,15 @@ class DiscoveryLoop:
                         for message in history
                     ],
                 ]
-                if job.get("source_pages"):
+                presented_images = set(job.get("source_images_presented", []))
+                pending_images = (job.get("source_pages", []) if any(
+                    page["image_artifact"] not in presented_images
+                    for page in job.get("source_pages", [])
+                ) else [])
+                if pending_images:
                     import base64
 
-                    for page in job["source_pages"]:
+                    for page in pending_images:
                         messages.append({"role": "user", REQUIRED_PROMPT_CONTEXT_KEY: True,
                             "content": [{"type": "text", "text": "Original source page: " + json_text(page)},
                                         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(self.store.read_artifact(page["image_artifact"])).decode(), "detail": "high"}}]})
@@ -603,6 +665,11 @@ class DiscoveryLoop:
                                             candidates = producer.setdefault("late_research_candidates", [])
                                             candidates.append({"artifact_id": artifact_id, "turn": job["turn"], "candidate_only": True})
                                             self.store.save_job(producer)
+                                            self._notify(producer["job_id"], {
+                                                "late_research_candidate": candidates[-1],
+                                                "producer_job": producer["job_id"],
+                                                "instruction": "Inspect this unverified candidate before using it; no action or proof was accepted.",
+                                            }, requires_response=True)
                                 except BaseException:
                                     pass  # Closed ledger/cancelled tail has no authority.
                                 finally:
@@ -631,6 +698,11 @@ class DiscoveryLoop:
                             or getattr(client, "last_truncated", False)
                         ),
                     )
+                    # Record exposure only after a provider response. A timeout
+                    # or interrupted request retains the pending images for retry.
+                    job["source_images_presented"] = sorted(
+                        presented_images | {page["image_artifact"] for page in pending_images}
+                    )
                     self.store.save_job(job)
                 self._emit("response_saved", job)
                 return job
@@ -646,6 +718,9 @@ class DiscoveryLoop:
                     elif exc.reason == "global_limit":
                         current.update(status="waiting", strategy_capacity_wait=True)
                         self.store.save_job(current)
+                    elif exc.reason.startswith("research_"):
+                        self.strategy.research.handle_yield(current, exc.reason)
+                        current = self.store.job(current["job_id"])
                     else:
                         current.update(status="pending", retry_after=time.time() + .2,
                                        last_error=exc.reason)
@@ -767,18 +842,20 @@ class DiscoveryLoop:
             "review",
             "read_artifact",
             "read_claim",
+            "record_note",
             "experiment",
             "strategy_review",
             "progress_review",
             "implication_review",
             "alternative_review",
+            "research_reorientation",
             "lookup_strategy_subject",
             *LITERATURE_FIELDS,
         }:
             raise ValueError(
                 "review workers may only inspect, experiment, or review their assigned evidence"
             )
-        if job["role"] != "review" and kind in {"review", "strategy_review", "progress_review", "implication_review", "alternative_review"}:
+        if job["role"] != "review" and kind in {"review", "strategy_review", "progress_review", "implication_review", "alternative_review", "research_reorientation"}:
             raise ValueError("an investigator cannot act as its own reviewer")
         if job.get("strategy_review_id") and kind == "review":
             raise ValueError("this assignment requires a strategy_review allocation decision")
@@ -790,10 +867,14 @@ class DiscoveryLoop:
             {"role": "user", "content": json_text(result),
              **({"_retrieval_page": True} if isinstance(result, dict) and "offset" in result and "text" in result else {})},
         ]
-        if job["status"] == "responded":
+        closed = job.get("research_control", {}).get("closed")
+        if closed:
+            job["status"] = "finished"
+        elif job["status"] == "responded":
             job["status"] = "pending"
         if (
             job["status"] in {"finished", "waiting"}
+            and not closed
             and job["role"] == "research"
             and any(self._requires_response(message) for message in job["inbox"])
         ):
@@ -818,6 +899,22 @@ class DiscoveryLoop:
         if job_id is None:
             return
         recipient = self.store.job(job_id)
+        # Closed researchers retain a copy for provenance; useful late results
+        # continue to their current reviewer/investigator instead of reopening
+        # the exhausted worker. Traverse defensively without recursive calls.
+        visited: set[str] = set()
+        while recipient.get("research_control", {}).get("closed"):
+            if recipient["job_id"] in visited:
+                raise ValueError("cyclic research successor chain")
+            visited.add(recipient["job_id"])
+            recipient["inbox"].append({"role": "user", "content": json_text(
+                {**payload, "requires_response": requires_response}
+            )})
+            self.store.save_job(recipient)
+            successor = recipient.get("research_successor")
+            if not successor:
+                return
+            recipient = self.store.job(successor)
         recipient["inbox"].append(
             {
                 "role": "user",
@@ -885,7 +982,12 @@ class DiscoveryLoop:
                 ):
                     raise RevisionConflict("original target changed")
                 result = self._apply_action(job, action)
+                if self.strategy is not None:
+                    from .research_memory import record_action
+                    novelty = record_action(self.store, job, action, result)
                 self._reply(job, content, result)
+                if self.strategy is not None:
+                    self.strategy.research.after_action(job, action, result, novelty)
                 self.store._event(
                     job["claim_id"],
                     job["revision"],
@@ -895,10 +997,13 @@ class DiscoveryLoop:
                         "turn": job["turn"],
                         "action": action["action"],
                         "response_artifact": job["response"],
-                        "result": result,
+                        # Embedding a read_claim result here embeds previous
+                        # read events inside the next read, doubling history.
+                        # Keep the exact result independently addressable.
+                        "result_artifact": self._blob(result, "research-action-result.json"),
                     },
                 )
-            self._emit("action_applied", job)
+            self._emit("action_applied", job, action=action["action"])
         except RevisionConflict as exc:
             job = self.store.job(job["job_id"])
             run = self.store.run_record()
@@ -942,14 +1047,25 @@ class DiscoveryLoop:
             if self.strategy is None:
                 raise ValueError("strategy recovery is not enabled for this run")
             return self.strategy.apply_action(job, action)
+        if kind == "record_note":
+            if self.strategy is None:
+                raise ValueError("working research notes require strategy recovery")
+            from .research_memory import save_note
+            return save_note(self.store, job, action)
         if kind in LITERATURE_FIELDS:
             if not job.get("tool_result"):
                 raise ValueError("literature action was not executed")
             result = load_json(self.store.read_artifact(job["tool_result"]).decode())
             if result.get("image_artifact"):
                 pages = job.setdefault("source_pages", [])
+                pages = [page for page in pages if page["image_artifact"] != result["image_artifact"]]
                 pages.append({key: result[key] for key in ("original_artifact", "page", "image_artifact")})
                 job["source_pages"] = pages[-3:]
+                # An explicit reread requests another view of this exact page.
+                job["source_images_presented"] = [
+                    image for image in job.get("source_images_presented", [])
+                    if image != result["image_artifact"]
+                ]
             return result
         if kind == "read_artifact":
             if self.strategy is not None:

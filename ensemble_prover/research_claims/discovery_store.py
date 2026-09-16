@@ -277,8 +277,34 @@ class DiscoveryStore(ResearchStore):
             configuration(run)
             proofs = []
             stale_proofs = []
-            for job in self.jobs():
-                if job["role"] == "formalization" and job["status"] == "verified":
+            fields = ("job_id", "claim_id", "role", "status", "turn",
+                      "last_error", "last_error_details")
+            # Project only displayed metadata. Multi-path json_extract returns
+            # a JSON array, preserving nested diagnostics and boolean values;
+            # an absent legacy last_error_details remains null. Full transcripts
+            # stay in SQLite unless a verified proof needs authority checks.
+            rows = self._connection.execute(
+                "SELECT job_id, json_extract(record, '$.job_id', '$.claim_id', "
+                "'$.role', '$.status', '$.turn', '$.last_error', "
+                "'$.last_error_details') FROM discovery_jobs ORDER BY rowid"
+            ).fetchall()
+            summaries = []
+            for row in rows:
+                summary = dict(zip(fields, json.loads(row[1])))
+                for field in fields[:-1]:
+                    if summary[field] is None:
+                        # JSON null and an absent key project identically.
+                        # Preserve the former dict-indexing failure for corrupt
+                        # required metadata, without loading its transcript.
+                        kind = self._connection.execute(
+                            "SELECT json_type(record, ?) FROM discovery_jobs WHERE job_id = ?",
+                            ("$." + field, row[0]),
+                        ).fetchone()[0]
+                        if kind is None:
+                            raise KeyError(field)
+                summaries.append(summary)
+                if summary["role"] == "formalization" and summary["status"] == "verified":
+                    job = self.job(row[0])
                     # A normal ledger revision retires this proof's authority;
                     # it does not corrupt its historical Lean artifacts. Check
                     # the handoff before opening the old campaign or receipt.
@@ -313,23 +339,7 @@ class DiscoveryStore(ResearchStore):
                 and run["status"] in {"proved", "refuted"}
                 and not any(item["claim_id"] == run["target_id"] for item in proofs)
                 else run["status"],
-                "jobs": [
-                    {
-                        **{
-                            key: job[key]
-                            for key in (
-                                "job_id",
-                                "claim_id",
-                                "role",
-                                "status",
-                                "turn",
-                                "last_error",
-                            )
-                        },
-                        "last_error_details": job.get("last_error_details"),
-                    }
-                    for job in self.jobs()
-                ],
+                "jobs": summaries,
                 "assessment": self.assessment(run["target_id"]),
                 "root_proved": any(
                     item["claim_id"] == run["target_id"] and item["polarity"] == "prove"

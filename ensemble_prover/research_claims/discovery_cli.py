@@ -253,8 +253,11 @@ async def _run(directory: Path) -> dict[str, Any]:
             return make
 
         def progress(event: dict[str, Any]) -> None:
+            from ..research_launcher import format_progress
+
             print(
-                json.dumps(event, ensure_ascii=False), file=sys.stderr, flush=True
+                json.dumps({**event, "summary": format_progress(event)}, ensure_ascii=False),
+                file=sys.stderr, flush=True
             )
 
         def proof_client(role: str, worker: str):

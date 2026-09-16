@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import shutil
 import socket
 import tempfile
@@ -26,9 +27,14 @@ FIELDS = {
     "literature_search": {"query"},
     "fetch_source": {"url"},
     "read_source_page": {"artifact_id", "page"},
+    "search_source": {"artifact_id", "query"},
 }
 INSTRUCTIONS = """
 Research tools (also available to independent reviewers):
+{"action":"search_source","artifact_id":"SHA256","query":"admissible"}
+  Finds literal text in a saved UTF-8 document or PDF's extracted text. Returns
+  exact excerpts and page/line locations; inspect the corresponding PDF images
+  to verify mathematics. Use this to locate definitions before reading pages.
 {"action":"literature_search","query":"bibliographic terms, authors or theorem"}
   Searches Crossref scholarly metadata. Follow source links and check the
   actual statement; search results alone are not source verification.
@@ -183,6 +189,8 @@ class LiteratureTools:
     ):
         self.store = store
         self.fetcher = fetcher
+        self._page_cache: dict[tuple[str, int], str] = {}
+        self._text_cache: dict[str, str] = {}
 
     async def run(
         self, action: dict[str, Any], *, remaining_s: float
@@ -197,7 +205,9 @@ class LiteratureTools:
             }
         try:
             async with asyncio.timeout(timeout):
-                if action["action"] == "read_source_page":
+                if action["action"] == "search_source":
+                    result = await self._search_source(action["artifact_id"], action["query"], timeout)
+                elif action["action"] == "read_source_page":
                     result = await self._page(
                         action["artifact_id"], action["page"], timeout
                     )
@@ -270,6 +280,64 @@ class LiteratureTools:
                 "kernel_verified": False,
             }
 
+    async def _search_source(self, artifact_id: str, query: str, timeout: float) -> dict[str, Any]:
+        text(query, "source search query")
+        if len(query) > 200:
+            raise ValueError("source search query must be at most 200 characters")
+        source = self.store.read_artifact(artifact_id)
+        if len(source) > MAX_BYTES:
+            raise ValueError("source exceeds 16 MiB")
+        pdf = source.startswith(b"%PDF-")
+        if pdf:
+            if artifact_id not in self._text_cache:
+                if not all(shutil.which(tool) for tool in ("pdftotext", "prlimit")):
+                    raise OSError("install poppler-utils and util-linux for PDF text search")
+                with tempfile.TemporaryDirectory(prefix="ensemble-source-search-") as raw:
+                    directory = Path(raw)
+                    original, output = directory / "source.pdf", directory / "text.txt"
+                    original.write_bytes(source)
+                    await _process([
+                        "prlimit", "--as=536870912", "--cpu=20", "--fsize=16777216", "--",
+                        "pdftotext", "-layout", str(original), str(output),
+                    ], timeout)
+                    extracted = output.read_bytes()
+                    if len(extracted) > MAX_BYTES:
+                        raise ValueError("extracted source text exceeds 16 MiB")
+                    extracted.decode("utf-8")
+                    if len(self._text_cache) >= 64:
+                        self._text_cache.pop(next(iter(self._text_cache)))
+                    self._text_cache[artifact_id] = self.store.put_artifact(extracted, name="source-search-text.txt")
+            text_artifact = self._text_cache[artifact_id]
+            content = self.store.read_artifact(text_artifact).decode("utf-8")
+            pages = content.split("\f")
+            if pages and not pages[-1].strip():
+                pages.pop()
+        else:
+            text_artifact = artifact_id
+            pages = [source.decode("utf-8")]
+        matcher = re.compile(re.escape(query), re.IGNORECASE)
+        matches: list[dict[str, Any]] = []
+        for page_number, page_text in enumerate(pages, 1):
+            for line_number, line in enumerate(page_text.splitlines(), 1):
+                match = matcher.search(line)
+                if match:
+                    matches.append({
+                        "page": page_number if pdf else None, "line": line_number,
+                        "excerpt": line[max(0, match.start() - 160):match.end() + 240],
+                    })
+                    if len(matches) > 8:
+                        break
+            if len(matches) > 8:
+                break
+        return {
+            "status": "completed", "original_artifact": artifact_id,
+            "text_artifact": text_artifact, "query": query,
+            "page_count": len(pages) if pdf else None,
+            "matches": matches[:8], "more_matches": len(matches) > 8,
+            "coverage": "text_matches_only",
+            "note": "Text extraction is fallible. No match is not evidence of absence; inspect original pages.",
+        }
+
     async def _page(
         self, artifact_id: str, page: int, timeout: float
     ) -> dict[str, Any]:
@@ -278,6 +346,11 @@ class LiteratureTools:
         data = self.store.read_artifact(artifact_id)
         if not data.startswith(b"%PDF-") or len(data) > MAX_BYTES:
             raise ValueError("a PDF of at most 16 MiB is required")
+        key = (artifact_id, page)
+        if key in self._page_cache:
+            cached = load_json(self.store.read_artifact(self._page_cache[key]).decode())
+            self.store.read_artifact(cached["image_artifact"])
+            return cached
         if not all(shutil.which(tool) for tool in ("pdftotext", "pdftoppm", "prlimit")):
             raise OSError(
                 "install poppler-utils and util-linux for original PDF page inspection"
@@ -319,7 +392,7 @@ class LiteratureTools:
                 timeout,
             )
             image = (directory / "page.png").read_bytes()
-            return {
+            result = {
                 "status": "completed",
                 "coverage": "one_original_page",
                 "page": page,
@@ -330,3 +403,9 @@ class LiteratureTools:
                 "extracted_text": (directory / "page.txt").read_text(encoding="utf-8"),
                 "note": "Text extraction is fallible; inspect the original page image.",
             }
+            if len(self._page_cache) >= 256:
+                self._page_cache.pop(next(iter(self._page_cache)))
+            self._page_cache[key] = self.store.put_artifact(
+                json_text(result).encode(), name="rendered-source-page.json"
+            )
+            return result

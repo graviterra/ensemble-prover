@@ -33,6 +33,7 @@ from .theorem_project import (
     TheoremProjectRequest,
     _active_command_scope_closers,
     merge_imports,
+    infer_lake_project,
     resolve_theorem_project,
     scan_lean_theorems,
     select_lean_theorem,
@@ -46,8 +47,15 @@ if TYPE_CHECKING:
 
 
 def should_discover(args: argparse.Namespace) -> bool:
-    if getattr(args, "resume_from", None) or getattr(args, "putnam_file", None):
+    if getattr(args, "resume_from", None):
         return False
+    if getattr(args, "putnam_file", None):
+        if not getattr(args, "opaque_mode", True) and getattr(
+            args, "allow_official_answer_visibility", False
+        ):
+            return False
+        request = _request(args)
+        return _template(args, request) is not None
     name = str(getattr(args, "theorem_name", "") or "")
     path = str(getattr(args, "lean_file", "") or "")
     return bool(
@@ -60,7 +68,8 @@ def should_discover(args: argparse.Namespace) -> bool:
 
 
 def _request(args: argparse.Namespace) -> TheoremProjectRequest:
-    if getattr(args, "allow_official_answer_visibility", False):
+    putnam_file = getattr(args, "putnam_file", None)
+    if getattr(args, "allow_official_answer_visibility", False) and not putnam_file:
         raise ValueError("official-answer visibility controls require --putnam-file")
     description = getattr(args, "theorem_project_description", None)
     if getattr(args, "theorem_project_description_file", None):
@@ -70,16 +79,37 @@ def _request(args: argparse.Namespace) -> TheoremProjectRequest:
             .read_bytes()
             .decode("utf-8")
         )
+    path = Path(putnam_file or args.lean_file).expanduser().resolve()
+    name = args.theorem_name
+    project = args.lean_project_dir
+    if putnam_file:
+        declarations = scan_lean_theorems(path.read_text(encoding="utf-8"))
+        declaration = select_lean_theorem(declarations, name) if name else declarations[0]
+        name = declaration.canonical_name
+        if description is None:
+            description = declaration.docstring
+        project = project or infer_lake_project(path)
+        if project is None:
+            raise ValueError("could not infer Putnam Lake project; pass --project-path")
     return TheoremProjectRequest(
-        lean_file=Path(args.lean_file),
-        theorem_name=args.theorem_name,
-        project_path=Path(args.lean_project_dir),
+        lean_file=path,
+        theorem_name=name,
+        project_path=Path(project),
         imports=tuple(getattr(args, "theorem_project_imports", ()) or ()),
         source_dirs=tuple(
             Path(p) for p in getattr(args, "theorem_project_source_dirs", ()) or ()
         ),
         description=description,
     ).normalized()
+
+
+def _template(args: argparse.Namespace, request: TheoremProjectRequest) -> AnswerTemplate | None:
+    source = request.lean_file.read_bytes().decode("utf-8")
+    if getattr(args, "putnam_file", None):
+        from .putnam_answer_input import find_putnam_answer_template
+
+        return find_putnam_answer_template(source, request.theorem_name)
+    return find_answer_template(source, request.theorem_name)
 
 
 def _runner(
@@ -155,6 +185,15 @@ async def validate_environment(
             raise RuntimeError(
                 "original question environment validation failed:\n" + output
             )
+        if template.original_source is not None:
+            from .putnam_answer_input import putnam_question_equivalence_probe
+
+            probe, probe_name = putnam_question_equivalence_probe(template)
+            ok, _, output = await runner.check_source_declaration_type(
+                merge_imports(probe, request.imports), probe_name, timeout_s=timeout_s
+            )
+            if not ok:
+                raise ValueError("Putnam answer substitution changed the original question:\n" + output)
     finally:
         await runner.aclose()
 
@@ -291,10 +330,14 @@ def proof_arguments(
     parser = _build_argparser()
     args = parser.parse_args(list(argv))
     replacements = {
-        "--lean-file": str(lean_file),
+        "--putnam-file" if args.putnam_file else "--lean-file": str(lean_file),
         "--description-file": str(description),
         "--output-dir": str(output_dir),
     }
+    if args.putnam_file:
+        request = _request(args)
+        replacements["--theorem-name"] = request.theorem_name
+        replacements["--project-path"] = str(request.project_path)
     for dest, flag in (
         ("cost_budget_usd", "--cost-budget-usd"),
         ("mini_worker_timeout_s", "--mini-worker-timeout-s"),
@@ -507,17 +550,25 @@ def run_cli(args: argparse.Namespace, argv: Sequence[str]) -> int:
     directory: Path | None = None
     try:
         request = _request(args)
-        source = request.lean_file.read_bytes().decode("utf-8")
-        template = find_answer_template(source, request.theorem_name)
+        template = _template(args, request)
         if template is None:
-            raise ValueError("selected theorem has no answer(sorry) slots")
+            raise ValueError("selected theorem has no supported answer slots")
+        putnam = bool(getattr(args, "putnam_file", None))
         if args.output_dir:
             directory = Path(args.output_dir).expanduser().resolve()
-            directory.mkdir(parents=True, exist_ok=False)
+            directory.mkdir(parents=True, exist_ok=putnam)
         else:
             directory = _allocate_default_mini_run_dir(
                 theorem_artifact_slug(request.theorem_name) + "_answer"
             )
+        proof_directory = directory if putnam else directory / "proof"
+        if putnam:
+            if any(directory.iterdir()):
+                raise ValueError("Putnam output directory already contains an attempt")
+            # Checkpoint startup requires an empty generation directory. Keep
+            # preparation beside it, like the sweep's external console log.
+            directory = directory.with_name(directory.name + ".answer_preparation")
+            directory.mkdir(exist_ok=False)
         print(
             f"Answer discovery: {request.theorem_name}; artifacts: {directory}",
             flush=True,
@@ -570,7 +621,7 @@ def run_cli(args: argparse.Namespace, argv: Sequence[str]) -> int:
             != candidate.source_sha256
         ):
             raise ValueError("checked answer file changed before proof dispatch")
-        child_dir = directory / "proof"
+        child_dir = proof_directory
         child_args = proof_arguments(
             argv,
             lean_file=candidate.lean_file,
@@ -632,9 +683,7 @@ def preparation_worker_main(argv: Sequence[str] | None = None) -> int:
         raise RuntimeError("answer preparation requires the Mini process supervisor")
     args = _build_argparser().parse_args(argv)
     request = _request(args)
-    template = find_answer_template(
-        request.lean_file.read_bytes().decode("utf-8"), request.theorem_name
-    )
+    template = _template(args, request)
     if template is None:
         raise ValueError("answer preparation has no selected answer slots")
     directory = Path(args.output_dir).resolve()
