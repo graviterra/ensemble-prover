@@ -23,6 +23,8 @@ import time
 from typing import Any
 import uuid
 
+from .proof_dossier import canonical_dossier_statement_key
+
 _CURRENT: contextvars.ContextVar[Any] = contextvars.ContextVar("native_research_owner", default=None)
 _SCOPED = contextvars.ContextVar("native_research_scoped", default=False)
 _RESEARCH = contextvars.ContextVar("native_research_phase", default=False)
@@ -118,7 +120,7 @@ def _grant_usage(run: dict[str, Any], grant: dict[str, Any]) -> tuple[int, bool]
 
 
 def _allowed(session: Any) -> bool:
-    if getattr(session, "scope", "problem") not in {"problem", "attempt", "sample", "parallel_fanin_recursive"}:
+    if getattr(session, "scope", "problem") not in {"problem", "attempt", "sample", "parallel_fanin_recursive", "subgoal"}:
         return False
     if getattr(session, "root_finalized", False) or getattr(session, "terminal_failure_reason", ""):
         return False
@@ -164,6 +166,7 @@ class NativeResearchCoordinator:
         self.donor_key = None
         self.temporary = None
         self.guidance: dict[str, Any] | None = None
+        self.guidance_by_target: dict[str, dict[str, Any]] = {}
         self.pending_objections: list[dict[str, Any]] = []
         self._session = None
         self.pin = {
@@ -174,6 +177,127 @@ class NativeResearchCoordinator:
             "checker_context_sha256": hashlib.sha256(str(getattr(problem, "lean_preamble", "")).encode()).hexdigest(),
         }
         self.binding = _hash(self.pin)
+
+    def _target(self, conv: Any) -> str:
+        return str(getattr(conv, "goal_statement", "") or self.pin["statement"]).strip()
+
+    def _target_context_binding(self, conv: Any) -> str:
+        """Identical Lean text can denote different claims in different contexts."""
+        preamble = str(getattr(conv, "preamble", self.pin["preamble"]))
+        checker = str(getattr(conv, "lean_preamble", getattr(
+            self.problem, "lean_preamble", preamble,
+        )))
+        return _hash({
+            "statement": canonical_dossier_statement_key(self._target(conv)),
+            "model_preamble_sha256": hashlib.sha256(preamble.encode()).hexdigest(),
+            "checker_preamble_sha256": hashlib.sha256(checker.encode()).hexdigest(),
+        })
+
+    def _guidance_for(self, conv: Any) -> dict[str, Any] | None:
+        key = canonical_dossier_statement_key(self._target(conv))
+        binding = self._target_context_binding(conv)
+        for guidance in (self.guidance, self.guidance_by_target.get(binding),
+                         self.guidance_by_target.get(key)):
+            if guidance is None:
+                continue
+            target = guidance.get("target_statement", self.pin["statement"])
+            context = guidance.get("target_context_binding")
+            # Legacy root advice has an original-context identity. Contextless
+            # child advice remains readable as history, never as a current answer.
+            if context is None:
+                if canonical_dossier_statement_key(target) != canonical_dossier_statement_key(self.pin["statement"]):
+                    continue
+                context = self._target_context_binding(None)
+            if canonical_dossier_statement_key(target) == key and context == binding:
+                return guidance
+        return None
+
+    def _objections_for(self, conv: Any) -> list[dict[str, Any]]:
+        key = canonical_dossier_statement_key(self._target(conv))
+        local = list(getattr(conv, "_native_research_objections", []) or [])
+        # A checkpoint/fork can retain the same request after another owner
+        # answered it. Existing durable grants are the receipt authority.
+        if self.store is not None:
+            answered = {
+                item["request_id"]
+                for grant in self.store.run_record()["native_grants"].values()
+                if self._grant_answers_context(grant, conv)
+                for item in grant.get("objections", []) if item.get("request_id")
+            }
+            local = [item for item in local if item.get("request_id") not in answered]
+            conv._native_research_objections = local
+            self.pending_objections[:] = [
+                item for item in self.pending_objections
+                if item.get("request_id") not in answered
+            ]
+        # Legacy conversation-local requests are already bound to that owner.
+        # A copied journal can also retain explicitly foreign targets. Keep
+        # their history, but never spend this session's grant answering them.
+        result = [
+            item for item in local
+            if canonical_dossier_statement_key(
+                item.get("target_statement", self._target(conv))
+            ) == key
+        ]
+        for item in self.pending_objections:
+            # Stamped requests are owned by the durable conversation journal.
+            # The shared index must not let a sibling answer them under its
+            # own grant while leaving the original owner to fund them again.
+            if item.get("request_id"):
+                continue
+            target = item.get("target_statement", self.pin["statement"])
+            if (key == canonical_dossier_statement_key(self.pin["statement"])
+                    and canonical_dossier_statement_key(target) == key and item not in result):
+                result.append(item)
+        return result
+
+    def _grant_answers_context(self, grant: dict[str, Any], conv: Any) -> bool:
+        target = grant.get("answered_target")
+        if target is None or canonical_dossier_statement_key(target) != canonical_dossier_statement_key(self._target(conv)):
+            return False
+        context = grant.get("answered_context_binding")
+        if context is None:
+            if canonical_dossier_statement_key(target) != canonical_dossier_statement_key(self.pin["statement"]):
+                return False
+            context = self._target_context_binding(None)
+        return context == self._target_context_binding(conv)
+
+    def _settle_answered_objections(self, session: Any, grant: dict[str, Any]) -> None:
+        """Retire only requests answered by this grant, including paid replay."""
+        saved = self.store.run_record()["native_grants"].get(grant["id"], {})
+        if not self._grant_answers_context(saved, session.conv):
+            return
+        serviced = grant.get("objections", [])
+        self.pending_objections[:] = [
+            item for item in self.pending_objections if item not in serviced
+        ]
+        session.conv._native_research_objections = [
+            item for item in getattr(session.conv, "_native_research_objections", [])
+            if item not in serviced
+        ]
+
+    def _queue_planner_impasse(self, session: Any, outcome: Any, state: dict[str, Any]) -> None:
+        metadata = getattr(outcome, "metadata", {}) or {}
+        if metadata.get("recursive_failure_reason") != "recursive_search_impasse":
+            return
+        receipt = metadata.get("action_dispatch_id") or [
+            getattr(session, "iteration", 0), getattr(outcome, "action_id", ""),
+        ]
+        if state.get("last_impasse_request") == receipt:
+            return
+        statement = self._target(session.conv)
+        objection = {
+            "statement": statement, "target_statement": statement,
+            "request_id": uuid.uuid4().hex,
+            "kind": "planner_impasse",
+            "reason": str(metadata.get("recursive_impasse_reason") or
+                          "The planner found no supported decomposition of this target."),
+            "instruction": "Investigate this search impasse for the exact active target; it is not evidence that the theorem is false.",
+        }
+        session.conv._native_research_objections = [
+            *getattr(session.conv, "_native_research_objections", []), objection,
+        ]
+        state["last_impasse_request"] = receipt
 
     def observe_dispatch(self, details: Any = None) -> None:
         if not _RESEARCH.get() and self.active and self.pid == os.getpid():
@@ -261,8 +385,8 @@ class NativeResearchCoordinator:
     async def boundary(self, session: Any, outcome: Any = None, *, frontier_exhausted: bool = False) -> bool:
         if not self.active or not _allowed(session):
             return False
-        # Root samples serialize the research phase but keep their proof engines
-        # and exact budgets. Children inherit advice without funding new owners.
+        # A single run owner services explicit child requests at their own
+        # settled boundaries, using that child's existing proof allocation.
         async with self.lock:
             if not _allowed(session):
                 return False
@@ -284,12 +408,15 @@ class NativeResearchCoordinator:
             except ValueError as exc:
                 _event(session, "research_unavailable", error_type=type(exc).__name__)
                 return delivery_changed
-            objections = list(getattr(getattr(session, "conv", None), "_native_research_objections", []) or [])
+            self._queue_planner_impasse(session, outcome, state)
+            objections = self._objections_for(getattr(session, "conv", None))
             if objections:
                 self.pending_objections.extend(item for item in objections if item not in self.pending_objections)
+            if getattr(session, "scope", "problem") == "subgoal" and not (objections or state.get("grant")):
+                return delivery_changed
             reason = (
                 "resume_research_grant" if state.get("grant") else
-                "reported_obstacle" if self.pending_objections else
+                "reported_obstacle" if objections else
                 "proof_frontier_exhausted" if frontier_exhausted and state["paid_actions"] else
                 "proof_interval_audit" if (state["paid_actions"] >= 3
                                           or state["requests_since_audit"] >= 10
@@ -352,13 +479,13 @@ class NativeResearchCoordinator:
             self.store = None
             raise ValueError("native research ledger belongs to a different original target")
         self.guidance = record.get("native_guidance")
+        self.guidance_by_target = dict(record.get("native_guidance_by_target") or {})
         state["ledger_initialized"] = True
 
     def _visible_target(self, session: Any) -> dict[str, Any]:
-        conv = getattr(session, "conv", None)
         return {"theorem_name": self.pin["theorem_name"], "statement": self.pin["statement"],
-                "model_preamble": str(getattr(conv, "preamble", self.pin["preamble"])),
-                "problem": str(getattr(conv, "problem_text", getattr(self.problem, "docstring", ""))),
+                "model_preamble": self.pin["preamble"],
+                "problem": str(getattr(self.problem, "docstring", "")),
                 "identity_binding": self.binding}
 
     def _capture(self, session: Any, reason: str) -> str:
@@ -369,9 +496,12 @@ class NativeResearchCoordinator:
             helpers = list(helpers.values())
         context = {
             "original_target": self._visible_target(session), "trigger": reason,
+            "active_target": {"statement": self._target(session.conv),
+                              "scope": getattr(session, "scope", "problem"),
+                              "lane": str(getattr(session, "checkpoint_lane_key", ""))},
             "proof_work": self._state(session).get("last_trigger_work", {}),
-            "first_uncertain_inference": "Determine the earliest unsupported ancestor, not just the current helper.",
-            "formal_context": self._visible_target(session)["model_preamble"],
+            "first_uncertain_inference": "Investigate the exact active target and the reported obstacle. Audit ancestors as context, without substituting their question for this one.",
+            "formal_context": str(getattr(session.conv, "preamble", self.pin["preamble"])),
             "selected_work": getattr(session, "selected_work_item_record", None),
             "proof_graph": graph.to_record() if graph is not None and hasattr(graph, "to_record") else None,
             "checked_helpers": [{"name": str(getattr(h, "name", "")), "source": str(getattr(h, "source", h))} for h in helpers],
@@ -379,10 +509,63 @@ class NativeResearchCoordinator:
                 if callable(getattr(getattr(session, "conv", None), "messages_for_llm", None))
                 else []),
             "failure": str(getattr(session, "last_failure_reason", "")),
-            "objections": self.pending_objections,
+            "objections": self._objections_for(session.conv),
             "authority": "Proof status and helpers remain controlled by Mini's original verifier; all research is advisory.",
         }
         return self.store.put_artifact(_json(context).encode(), name="native-proof-checkpoint.json")
+
+    def _research_claim(self, session: Any) -> str:
+        """Bind the exact question; older reviewers cannot answer a new request."""
+        from .research_claims.model import ClaimSpec, MathematicalContract
+
+        statement = self._target(session.conv)
+        key = canonical_dossier_statement_key(statement)
+        objections = self._objections_for(session.conv)
+        context = self._target_context_binding(session.conv)
+        if (not objections and key == canonical_dossier_statement_key(self.pin["statement"])
+                and context == self._target_context_binding(None)):
+            return "native-root"
+        request_keys = sorted(item.get("request_id") or _hash(item) for item in objections)
+        claim_id = "native-target-" + _hash({
+            "context": context, "requests": request_keys,
+        })
+        with self.store.atomic():
+            known = {claim["claim_id"] for claim in self.store.list_claims()}
+            if claim_id not in known:
+                self.store.create_claim(ClaimSpec(
+                    claim_id, MathematicalContract(
+                        statement, "Active Mini obligation; formal context is in its native proof checkpoint."
+                    ), "native-mini",
+                ))
+        return claim_id
+
+    def _queue_target_work(self, session: Any, checkpoint: str, claim_id: str) -> None:
+        statement = self._target(session.conv)
+        question = (
+            f"Read checkpoint {checkpoint}; investigate its exact active target "
+            f"{statement} and reported obstacle, and give a discriminating next inference."
+        )
+        jobs = {job["job_id"]: job for job in self.store.jobs()}
+        available = False
+        for job in jobs.values():
+            if (job["role"] not in {"research", "review"}
+                    or job["status"] not in {"pending", "waiting", "responded"}
+                    or self.loop.native_job_target(job, jobs) != claim_id):
+                continue
+            self.loop._notify(job["job_id"], {
+                "native_proof_checkpoint": checkpoint,
+                "active_target": statement,
+                "instruction": "Read the exact checkpoint and answer its active target and objections. Audit the route, constants, hypotheses and ancestors. Search original sources for the bottleneck or counterexamples when relevant. Execute a discriminating check or a substantively different derivation. A proof, refuted strengthening, corrected intermediate statement, or precise unresolved obstruction is useful; a renamed plan is insufficient. Never weaken the original theorem or treat a refuted strengthening as a refutation of it.",
+            }, requires_response=True)
+            updated = self.store.job(job["job_id"])
+            if updated["role"] == "research" and updated["claim_id"] == claim_id:
+                updated["question"] = question
+                self.store.save_job(updated)
+            available = available or updated["status"] in {"pending", "responded"}
+        if not available:
+            job = self.store.add_job(claim_id, question)
+            job["native_target_claim_id"] = claim_id
+            self.store.save_job(job)
 
     async def _investigate(self, session: Any, reason: str) -> bool:
         from .mini_research_budget import select_donor, debit_donor, charge_elapsed
@@ -403,17 +586,28 @@ class NativeResearchCoordinator:
                 # Applying an already paid response is permitted even after
                 # the old phase deadline. Zero admission prevents new work.
                 run["status"] = "running"
+                run["native_active_target_claim_id"] = grant.get("target_claim_id", "native-root")
+                run["native_grant_requests"] = grant["requests"]
                 self.store.save_run(run)
-                await self.loop.advance_native(max_requests=0, timeout_s=1)
+                await self.loop.advance_native(
+                    max_requests=0, timeout_s=1,
+                    target_claim_id=grant.get("target_claim_id", "native-root"),
+                )
             self._reconcile(session, grant, interrupted=True)
+            self._settle_answered_objections(session, grant)
             state["grant"] = None
             await _checkpoint(session)
             self._deliver(session)
-            return bool(self.guidance)
+            return self._guidance_for(session.conv) is not None
         if donor is None:
             _event(session, "research_deferred", reason="no_borrowable_proof_capacity")
             return False
         self._open(session, donor.client)
+        if reason == "reported_obstacle" and not self._objections_for(session.conv):
+            # Opening a restored ledger may reveal that this exact durable
+            # request was already answered by a different restored owner.
+            self._deliver(session)
+            return self._guidance_for(session.conv) is not None
         await self._ensure_loop(session, donor.client, donor.role)
         assert self.store is not None
         run = self.store.run_record()
@@ -425,8 +619,13 @@ class NativeResearchCoordinator:
             return False
         timeout = _native_quantum_seconds(donor)
         checkpoint = self._capture(session, reason)
+        claim_id = self._research_claim(session)
         grant = {"id": uuid.uuid4().hex, "action_id": donor.action_id,
                  "requests": donor.request_limit, "accounted": 0,
+                 "target_statement": self._target(session.conv),
+                 "target_context_binding": self._target_context_binding(session.conv),
+                 "target_claim_id": claim_id,
+                 "objections": self._objections_for(session.conv),
                  "expires_at": time.time() + timeout,
                  "source_invocations": donor.initial_invocations + 1}
         donor = debit_donor(session, donor)
@@ -454,18 +653,12 @@ class NativeResearchCoordinator:
             # the current precommitted donor; no run-limit reset is involved.
             run.update(max_requests=run["requests_used"] + grant["requests"],
                        started_at=run.get("started_at") or time.time(), deadline=grant["expires_at"],
-                       max_seconds=timeout, request_timeout_s=timeout, status="running")
+                       max_seconds=timeout, request_timeout_s=timeout, status="running",
+                       native_active_target_claim_id=claim_id, native_grant_requests=grant["requests"])
             grants[grant["id"]] = {**grant, "start_requests": run["requests_used"],
                                   "ordinal": len(grants), "closed": False}
             self.store.save_run(run)
-            for job in self.store.jobs():
-                if job["role"] in {"research", "review"} and job["status"] in {"pending", "waiting", "responded"}:
-                    self.loop._notify(job["job_id"], {
-                        "native_proof_checkpoint": checkpoint,
-                        "instruction": "Read the exact checkpoint. Independently audit the route, constants, hypotheses and ancestors. Search original sources for the bottleneck or counterexamples when relevant. Execute a discriminating check or a substantively different derivation. Return concrete advice via formalize/proof_plan; a renamed plan or generic encouragement is insufficient. Never weaken the original theorem.",
-                    }, requires_response=True)
-            if not any(j["status"] in {"pending", "responded"} for j in self.store.jobs()):
-                self.store.add_job("native-root", f"Audit and redirect the native proof checkpoint {checkpoint}; investigate a different route and give its exact next inference.")
+            self._queue_target_work(session, checkpoint, claim_id)
         state["rounds"] += 1
         _event(session, "research_started", reason=reason, grant_id=grant["id"],
                requests=grant["requests"], timeout_s=timeout, ledger=str(self.store.directory))
@@ -478,7 +671,10 @@ class NativeResearchCoordinator:
             if parent_remaining is not None:
                 remaining = min(remaining, parent_remaining)
             if remaining > 0 and _allowed(session):
-                result = await self.loop.advance_native(max_requests=grant["requests"], timeout_s=remaining)
+                result = await self.loop.advance_native(
+                    max_requests=grant["requests"], timeout_s=remaining,
+                    target_claim_id=claim_id,
+                )
         finally:
             _RESEARCH.reset(token)
             elapsed = time.monotonic() - start
@@ -490,9 +686,7 @@ class NativeResearchCoordinator:
                 accrue()
             state["grant"] = None
             state["paid_actions"] = 0
-            self.pending_objections.clear()
-            if getattr(session, "conv", None) is not None:
-                session.conv._native_research_objections = []
+            self._settle_answered_objections(session, grant)
             self._deliver(session)
             await _checkpoint(session)
         research_outcome = result.get("reason", "unknown")
@@ -506,7 +700,7 @@ class NativeResearchCoordinator:
                last_provider_error=result.get("last_provider_error"))
         _event(session, "proof_resumed", research_round=state["rounds"],
                research_outcome=research_outcome, guidance_available=bool(self.guidance))
-        return bool(self.guidance)
+        return self._guidance_for(session.conv) is not None
 
     async def _ensure_loop(self, session: Any, client: Any, role: str) -> None:
         from .mini_research_budget import clone_research_client
@@ -556,6 +750,18 @@ class NativeResearchCoordinator:
     def _research_event(self, event: dict[str, Any]) -> None:
         if self._session is not None:
             _event(self._session, "research_" + event["event"], **{k: v for k, v in event.items() if k != "event"})
+        if event.get("event") == "provider_dispatch" and self._session is not None:
+            # Bind advice to the question at dispatch, including paid responses
+            # replayed after restart under a different session boundary.
+            run = self.store.run_record()
+            grant = self._state(self._session).get("grant")
+            target = grant.get("target_statement") if grant is not None else None
+            context = grant.get("target_context_binding") if grant is not None else None
+            run.setdefault("native_job_targets", {})[event["job_id"]] = target or self._target(self._session.conv)
+            run.setdefault("native_job_contexts", {})[event["job_id"]] = context or self._target_context_binding(self._session.conv)
+            if grant is not None:
+                run.setdefault("native_job_grants", {})[event["job_id"]] = grant["id"]
+            self.store.save_run(run)
         if event.get("event") != "action_applied":
             return
         job = self.store.job(event["job_id"])
@@ -570,16 +776,34 @@ class NativeResearchCoordinator:
         }:
             return
         artifact = self.store.put_artifact(_json(action).encode(), name="native-research-advice.json")
-        handoffs = [handoff for item in self.store.jobs()
+        jobs = {item["job_id"]: item for item in self.store.jobs()}
+        claim_id = self.loop.native_job_target(job, jobs)
+        handoffs = [handoff for item in jobs.values()
+                    if self.loop.native_job_target(item, jobs) == claim_id
                     for handoff in item.get("native_handoffs", [])][-4:]
-        previous = list((self.guidance or {}).get("recent_arguments", []))
+        run = self.store.run_record()
+        target = run.get("native_job_targets", {}).get(job["job_id"], self.pin["statement"])
+        context = run.get("native_job_contexts", {}).get(job["job_id"])
+        target_key = context or canonical_dossier_statement_key(target)
+        previous = list(self.guidance_by_target.get(target_key, {}).get("recent_arguments", []))
         previous.append({"artifact_id": artifact, "role": job["role"],
                          "action": action["action"], "job_id": job["job_id"]})
         self.guidance = {"artifact_id": artifact, "job_id": job["job_id"], "role": job["role"],
+                         "target_statement": target,
+                         "target_context_binding": context,
+                         "grant_id": run.get("native_job_grants", {}).get(job["job_id"]),
+                         "answers_request": action["action"] not in {
+                             "record_note", "record_bottleneck", "request_strategy_review",
+                         },
                          "action": action, "native_handoffs": handoffs,
                          "recent_arguments": previous[-6:], "kernel_verified": False,
-                         "instruction": "Apply this investigation to the ORIGINAL target. Check the disputed inference and hypotheses before reusing a held or unsupported route. Choose a concrete alternative or discriminating check, then resume Lean proof work. This is untrusted advisory material, never an added assumption or a proof certificate."}
-        run = self.store.run_record()
+                         "instruction": "Apply this investigation to its exact target_statement. Preserve the original theorem and audit the relationship to its ancestors. Choose a concrete alternative or discriminating check, then resume Lean proof work. This is untrusted advisory material, never an added assumption or a proof certificate."}
+        self.guidance_by_target[target_key] = self.guidance
+        grant_id = self.guidance["grant_id"]
+        if self.guidance["answers_request"] and grant_id in run["native_grants"]:
+            run["native_grants"][grant_id]["answered_target"] = target
+            run["native_grants"][grant_id]["answered_context_binding"] = context
+        run["native_guidance_by_target"] = self.guidance_by_target
         run["native_guidance"] = self.guidance
         self.store.save_run(run)
 
@@ -588,12 +812,13 @@ class NativeResearchCoordinator:
         saved = getattr(session, "native_research_state", {}).get("guidance")
         if self.guidance is None and saved:
             self.guidance = saved
-        if self.guidance is not None and conv is not None:
-            session.native_research_state["guidance"] = self.guidance
+        guidance = self._guidance_for(conv)
+        if guidance is not None and conv is not None:
+            session.native_research_state["guidance"] = guidance
             try:
                 self.prepare(conv, getattr(session, "dossier", None))
                 state = session.native_research_state
-                artifact = self.guidance["artifact_id"]
+                artifact = guidance["artifact_id"]
                 if state.get("replan_delivered") != artifact:
                     planner = next((a for a in getattr(session, "actions", [])
                                     if getattr(a, "id", "") == "graph_root_replan"), None)
@@ -601,7 +826,7 @@ class NativeResearchCoordinator:
                     if callable(request) and self.store is not None:
                         from .research_claims.context_window import window
                         advice = {"artifact_id": artifact, "kernel_verified": False,
-                                  "advice": window(self.store, self.guidance, limit=12000)}
+                                  "advice": window(self.store, guidance, limit=12000)}
                         if request(session, advice):
                             state["replan_delivered"] = artifact
                             _event(session, "research_replan_queued", artifact_id=artifact)
@@ -614,10 +839,15 @@ class NativeResearchCoordinator:
         from .research_claims.context_window import window
         if hasattr(conv, "ensure_bootstrap"):
             conv.ensure_bootstrap()
-        context = {"guidance": self.guidance,
+        guidance = self._guidance_for(conv)
+        context = {"guidance": guidance,
+                   "active_target": self._target(conv),
                    "policy": "You may request_native_research when an ancestor claim, counting bound, or method is unsupported. Supply the exact bottleneck and source evidence. The run investigates at a committed action boundary and resumes under its existing budget. Use read_native_research_artifact for full archived arguments."}
         if getattr(conv, "goal_statement", None) != self.pin["statement"]:
             context["original_target"] = self.pin["statement"]
+        if guidance is None and self.guidance is not None:
+            context["ancestor_guidance"] = self.guidance
+            context["ancestor_guidance_status"] = "Context from another target; this does not answer the active request."
         if self.store is not None:
             context = window(self.store, context, limit=14000)
         content = "Native research recovery (advisory, not proof authority):\n" + _json(context)
@@ -665,13 +895,14 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
         if owner.store is None:
             raise ValueError("no native research artifacts yet")
         if "artifact_id" not in payload:
-            if owner.guidance is None:
-                raise ValueError("no native research advice yet")
+            guidance = owner._guidance_for(conv)
+            if guidance is None:
+                raise ValueError("no native research advice for the active target yet")
             # Optional prompt advice may be dropped to preserve the original
             # source. Keep its entire argument/handoff index discoverable even
             # when the provider never saw an artifact hash.
             payload = {**payload, "artifact_id": owner.store.put_artifact(
-                _json(owner.guidance).encode(), name="current-native-research-guidance.json",
+                _json(guidance).encode(), name="current-native-research-guidance.json",
             )}
         return read_page(owner.store, **payload)
     if name != "request_native_research":
@@ -686,12 +917,22 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
         if owner.store is None:
             raise ValueError("unknown native evidence")
         owner.store.read_artifact(artifact)
+    payload = {**payload, "target_statement": owner._target(conv)}
+    owner._objections_for(conv)  # Retire answered IDs before deduplicating a new request.
     objections = list(getattr(conv, "_native_research_objections", []) or [])
-    if payload not in objections:
-        objections.append(payload)
-    conv._native_research_objections = objections[-8:]
-    owner.pending_objections = objections[-8:]
+    if not any({key: value for key, value in item.items() if key != "request_id"} == payload
+               for item in objections):
+        objections.append({**payload, "request_id": uuid.uuid4().hex})
+    # Every stamped request must remain in checkpointed conversation state
+    # until an answering grant retires it. Capping this list would leave the
+    # evicted request only in the coordinator's non-durable shared index, where
+    # stamped sibling requests are intentionally ineligible for service.
+    conv._native_research_objections = objections
+    owner.pending_objections.extend(
+        item for item in objections if item not in owner.pending_objections
+    )
     return {"status": "queued_for_committed_boundary", "kernel_verified": False,
+            "target_statement": owner._target(conv), "service_scope": "requesting_session",
             "instruction": "Preserve exact reasoning and settle this action; research will inspect the obstacle within remaining settings."}
 
 

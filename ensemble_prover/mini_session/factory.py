@@ -55,7 +55,10 @@ from ..putnam import problem_docstring_text
 from ..theorem_project import TheoremProblem, theorem_retrieval_excluded_source_paths
 from ..quarantined_turn_recorder import QuarantinedTurnRecorder
 from ..deadline_guard import await_with_strict_deadline
-from ..mini_recursive import PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS
+from ..mini_recursive import (
+    PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
+    PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S,
+)
 from ..mini_theory.promotion_outbox import PromotionOutbox
 from ..mini_branching import (
     _GuardedProofCache,
@@ -1826,13 +1829,16 @@ def _mini_recursive_child_elapsed_budget_s(
     turns_per_claim: int,
     tactic_timeout_s: float,
 ) -> float:
-    """Derive one finite whole-claim lease from its admitted work.
+    """Derive one finite, fair whole-subtree lease from its admitted work.
 
     A recursive claim may consume at most ``turns_per_claim`` conversation
     turns across its prover/refiner handoff. Each turn also receives one
     bounded tactic allowance. Size every turn for the slowest admitted lane:
     hard conversations need their settlement-aware outer envelope, while soft
     lanes retain the finite planner-operation fallback used before this bound.
+    Cap the whole subtree independently of helper progress and turn limits so
+    descendants cannot monopolize the parent frontier for hours. The inherited
+    absolute deadline already survives child replans and checkpoint recovery.
     """
 
     provider_turn_s = 0.0
@@ -1850,7 +1856,7 @@ def _mini_recursive_child_elapsed_budget_s(
         if math.isfinite(candidate_turn_s):
             provider_turn_s = max(provider_turn_s, candidate_turn_s)
     if not math.isfinite(provider_turn_s) or provider_turn_s <= 0.0:
-        return 0.0
+        return PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S
     turns = max(1, int(turns_per_claim or 1))
     try:
         tactic_s = max(0.0, float(tactic_timeout_s or 0.0))
@@ -1858,7 +1864,10 @@ def _mini_recursive_child_elapsed_budget_s(
         tactic_s = 0.0
     if not math.isfinite(tactic_s):
         tactic_s = 0.0
-    return float(turns) * (provider_turn_s + tactic_s)
+    return min(
+        PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S,
+        float(turns) * (provider_turn_s + tactic_s),
+    )
 
 
 def _effective_compute_examples_tool_enabled(
@@ -3226,6 +3235,7 @@ def build_session_for_prove_problem(
                 ),
                 helper_turns=int(recursive_helper_turns or 5),
                 refine_enabled=bool(recursive_helper_refine),
+                max_elapsed_s=PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S,
             )
         )
         budget_invocations = recursive_helper_invocation_budget
@@ -7582,6 +7592,7 @@ async def _mini_session_run_conversation_callback(
                     kwargs.get("recursive_helper_turns", max_turns) or max_turns
                 ),
                 refine_enabled=bool(kwargs.get("recursive_helper_refine", False)),
+                max_elapsed_s=PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S,
             )
         )
         session.set_budget(

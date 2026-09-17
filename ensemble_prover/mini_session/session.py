@@ -29319,6 +29319,7 @@ class MiniSession:
         semantic_recursive_fixed_point = str(
             metadata.get("recursive_fixed_point_reason") or ""
         ).strip() in {
+            "recursive_search_impasse",
             "recursive_planner_empty_fixed_point",
             "recursive_helper_only_fixed_point",
             "recursive_progress_fixed_point",

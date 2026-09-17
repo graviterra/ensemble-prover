@@ -1349,6 +1349,7 @@ class RecursiveControllerAction:
         solved = bool(getattr(result, "ok", False))
         disproved = bool(getattr(result, "disproved", False))
         fixed_point_reasons = {
+            "recursive_search_impasse",
             "recursive_planner_empty_fixed_point",
             "recursive_helper_only_fixed_point",
             "recursive_progress_fixed_point",
@@ -1592,6 +1593,11 @@ class RecursiveControllerAction:
                     fixed_point_signature
                 ),
                 "recursive_failure_reason": failure_reason,
+                "recursive_impasse_reason": (
+                    str(durable_plan_record.get("impasse_reason") or "")
+                    if failure_reason == "recursive_search_impasse"
+                    else ""
+                ),
                 "replay_helpers": list(replay_helpers),
                 "helper_names": list(helper_names),
                 "root_finalization_already_applied": bool(

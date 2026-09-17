@@ -14,6 +14,44 @@ from ensemble_prover.state_data import clone_json_value
 from .action import require_current_action_dispatch
 
 
+@dataclass(frozen=True)
+class RecursiveChildLimits:
+    """Scheduling limits admitted before restoring a recursive child."""
+
+    deadline_epoch_s: float
+    strict_progress_accounting: bool
+    max_soft_progress_streak: int
+    max_helper_only_provider_quanta: int
+
+    @classmethod
+    def capture(cls, session: Any) -> RecursiveChildLimits:
+        return cls(
+            float(getattr(session, "recursive_elapsed_deadline_epoch_s", 0.0) or 0.0),
+            bool(getattr(session, "strict_progress_accounting", False)),
+            max(0, int(getattr(session, "max_soft_progress_streak", 4))),
+            max(0, int(getattr(session, "max_helper_only_provider_quanta", 24))),
+        )
+
+    def intersect_restored(self, child: Any, parent: Any) -> None:
+        """Retain stricter live or saved limits without refunding work counters."""
+        limits = (self, self.capture(child), self.capture(parent))
+        child.recursive_elapsed_deadline_epoch_s = min(
+            (item.deadline_epoch_s for item in limits if item.deadline_epoch_s > 0.0),
+            default=0.0,
+        )
+        child.strict_progress_accounting = any(
+            item.strict_progress_accounting for item in limits
+        )
+        # A zero soft streak allows no soft progress; a zero helper window
+        # disables that particular cap, so only positive windows constrain it.
+        child.max_soft_progress_streak = min(item.max_soft_progress_streak for item in limits)
+        child.max_helper_only_provider_quanta = min(
+            (item.max_helper_only_provider_quanta for item in limits
+             if item.max_helper_only_provider_quanta > 0),
+            default=0,
+        )
+
+
 def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
                                      separators=(",", ":")).encode()).hexdigest()
@@ -347,7 +385,12 @@ async def prepare_controller_child(
             child.recursive_elapsed_deadline_epoch_s = (
                 min(deadline_epoch_s, saved_deadline) if deadline_epoch_s > 0 else saved_deadline
             )
+    admitted_limits = RecursiveChildLimits.capture(child)
     publication_allowed()
     await registry.bind_session(lane, child)
     publication_allowed()
+    # Binding restores durable session fields. Reapply the intersection after
+    # restore so an older, longer child lease cannot overwrite today's tighter
+    # parent/allocation deadline. A restored shorter deadline still wins.
+    admitted_limits.intersect_restored(child, parent)
     return PreparedControllerChild(registry, parent, child, lane, dispatch_id, existing)

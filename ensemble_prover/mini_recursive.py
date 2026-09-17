@@ -490,6 +490,7 @@ def _theory_promotion_rollback_error(
 # after several helper-only slices instead of filling a 4- or 6-claim cap
 # and spending the clock proving a ladder with no terminal route.
 PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS = 20
+PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S = 1800.0
 
 
 @dataclass(frozen=True)
@@ -1062,7 +1063,13 @@ class _ContractIdentityCoverage:
 
 
 def _recursive_plan_state_record(plan: MiniSubgoalPlan) -> dict[str, Any]:
-    return asdict(plan)
+    record = asdict(plan)
+    # Default-valued additions must not invalidate authenticated pre-upgrade
+    # planner receipts. Explicit new dispositions are part of their hash.
+    for key in ("search_disposition", "impasse_reason", "bottleneck_claim"):
+        if not record[key]:
+            record.pop(key)
+    return record
 
 
 def _bind_plan_planner_receipt(
@@ -1347,6 +1354,9 @@ def _recursive_plan_from_state_record(raw: Mapping[str, Any]) -> MiniSubgoalPlan
         strategy=str(data.get("strategy") or ""),
         notes=tuple(str(item or "") for item in list(data.get("notes") or [])),
         raw_response=str(data.get("raw_response") or ""),
+        search_disposition=str(data.get("search_disposition") or ""),
+        impasse_reason=str(data.get("impasse_reason") or ""),
+        bottleneck_claim=str(data.get("bottleneck_claim") or ""),
         plan_complete=(
             data.get("plan_complete")
             if isinstance(data.get("plan_complete"), bool)
@@ -11892,6 +11902,7 @@ def _ready_suspended_dependency_claims(
     opaque_mode: bool = True,
     allow_official_answer_visibility: bool = False,
     max_claims: int,
+    prioritized_claim_keys: Sequence[str] = (),
     skip_keys: Sequence[str] = (),
     verified_support_statements_override: Optional[Sequence[str]] = None,
 ) -> list[MiniSubgoalClaim]:
@@ -11916,7 +11927,14 @@ def _ready_suspended_dependency_claims(
         )
     )
     cap = max(1, int(max_claims or 1))
-    for key, item in list(suspended_claims.items()):
+    prioritized = frozenset(prioritized_claim_keys)
+    suspended_items = list(suspended_claims.items())
+    if prioritized:
+        # Reserve scarce ready-queue slots for the authenticated mathematical
+        # focus before the cap is spent. Readiness checks below still decide
+        # whether any prioritized item can actually execute.
+        suspended_items.sort(key=lambda item: item[0] not in prioritized)
+    for key, item in suspended_items:
         if key in skipped:
             continue
         claim = item.claim
@@ -23641,6 +23659,23 @@ async def run_mini_recursive_driver(
             or canonical_dossier_statement_key(canonical_claim.statement)
             in skipped_statements
         )
+        focused_suspended_keys: list[str] = []
+        focus_by_receipt: dict[str, frozenset[str]] = {}
+        for key, (item, _canonical_claim, _ok) in promoted_by_key.items():
+            receipt_id = planner_receipt_id_for_claim(item.claim)
+            source_plan = planner_plan_receipts.get(receipt_id)
+            if source_plan is None:
+                continue
+            if receipt_id not in focus_by_receipt:
+                _source_root, source_root_names = _select_priority_root(
+                    source_plan.claims, max_claims=max_new_claims
+                )
+                focus_by_receipt[receipt_id] = _bottleneck_dependency_names(
+                    source_plan.claims, source_plan.bottleneck_claim,
+                    root_connected_names=source_root_names,
+                )
+            if item.claim.name in focus_by_receipt[receipt_id]:
+                focused_suspended_keys.append(key)
         ready = _ready_suspended_dependency_claims(
             shadow_suspended,
             root_statement=canonical_probe_plan.root_statement,
@@ -23658,6 +23693,7 @@ async def run_mini_recursive_driver(
             opaque_mode=opaque_mode,
             allow_official_answer_visibility=allow_official_answer_visibility,
             max_claims=max_new_claims,
+            prioritized_claim_keys=focused_suspended_keys,
             skip_keys=tuple(
                 old_to_new_key.get(str(key or ""), str(key or "")) for key in skip_keys
             )
@@ -23886,7 +23922,9 @@ async def run_mini_recursive_driver(
                     else (
                         f"Your previous planning response (pass {pass_index}) "
                         "was empty or contained no usable claims. An empty plan "
-                        "is never correct here: reply with the full JSON plan "
+                        "needs an explicit disposition: report search_disposition=impasse "
+                        "with impasse_reason if no supported route remains; otherwise "
+                        "reply with the full JSON plan "
                         "object whose claims array holds decisive Lean-checkable "
                         "claims and ends with one root_assembly terminal claim, "
                         "following the schema exactly."
@@ -23930,6 +23968,31 @@ async def run_mini_recursive_driver(
         empty_planner_frontier_key = ""
         empty_planner_streak = 0
         empty_planner_degeneracy_reason = ""
+
+    async def finish_search_impasse(impasse_plan: MiniSubgoalPlan) -> MiniRecursiveResult:
+        """Suspend this route durably without asserting mathematical invalidity."""
+        stats.passes_completed += 1
+        summaries.append(render_mini_subgoal_plan_summary(impasse_plan))
+        result = MiniRecursiveResult(
+            ok=False, proof=None, stats=stats,
+            plan_summaries=tuple(summaries),
+            failure_reason="recursive_search_impasse",
+        )
+        _record(record_event, {
+            "phase": "mini_recursive_plan", "pass_index": pass_index,
+            "verdict": "planner_search_impasse",
+            "target_statement": root_statement,
+            "impasse_reason": impasse_plan.impasse_reason,
+            "kernel_verified": False,
+        })
+        await publish_driver_state(
+            f"recursive_search_impasse:{pass_index}",
+            phase="terminal_committed", pass_index=pass_index + 1,
+            terminal_result=result, plan=impasse_plan,
+            pass_outcome_kind="research_impasse",
+            pass_helpers_accepted_before=pass_helpers_before,
+        )
+        return result
 
     # Set when an escalated planner call fails TERMINALLY (auth/quota): no
     # further premium attempts this invocation — every retry stays on the
@@ -25068,6 +25131,8 @@ async def run_mini_recursive_driver(
                     plan = await _request_plan_with(client)
                     planner_fallback_pending_pass_index = 0
                     planner_fallback_remaining_s = 0.0
+        if plan is not None and plan.search_disposition == "impasse":
+            return await finish_search_impasse(plan)
         if plan is None:
             planner_failure_reason = ""
             if int(stats.planner_call_failures or 0) > planner_call_failures_before:
@@ -27067,6 +27132,8 @@ async def run_mini_recursive_driver(
                         if resumed_replan_plan is not None
                         else None
                     )
+                if replan is not None and replan.search_disposition == "impasse":
+                    return await finish_search_impasse(replan)
                 if replan is not None:
                     replan_completion_intent = _plan_completion_intent(replan)
                     if replan_completion_intent[0] is False:
@@ -28412,6 +28479,17 @@ async def run_mini_recursive_driver(
                     "verdict": "proved_claims_skipped_before_priority",
                 },
             )
+        # Cap/dependency deferrals reconstruct a local plan without making a
+        # new provider call. Recover its focus from the authenticated original
+        # receipt so proving a prerequisite cannot erase the chosen bottleneck.
+        if not plan.bottleneck_claim:
+            for candidate in claim_candidates:
+                source_plan = planner_plan_receipts.get(
+                    planner_receipt_id_for_claim(candidate)
+                )
+                if source_plan is not None and source_plan.bottleneck_claim == candidate.name:
+                    plan = dataclass_replace(plan, bottleneck_claim=candidate.name)
+                    break
         provisional_root_claim_keys = []
         for candidate in claim_candidates:
             if str(candidate.role or "") != "root_assembly":
@@ -28431,6 +28509,7 @@ async def run_mini_recursive_driver(
                 max_claims=max_claims,
                 deprioritized_claim_keys=(),
                 provisional_root_claim_keys=provisional_root_claim_keys,
+                bottleneck_claim=plan.bottleneck_claim,
             )
         )
         plan_admission_migrated = False
@@ -34377,10 +34456,14 @@ async def _request_plan(
                     "in the prompt, they are also authorized evidence. Do not "
                     "invent axioms, cite unavailable "
                     "benchmark facts, or output proof code. Unavailable "
-                    "non-Mathlib facts should become explicit obligations "
-                    "with minimal statements, not reasons to abandon a "
-                    "route. Prefer auxiliary definitions, invariants, and "
-                    "bridge lemmas that can be proved independently."
+                    "non-Mathlib facts may become explicit obligations only "
+                    "when you can explain a plausible argument for them. "
+                    "Assess the decisive unproved bridge before optional "
+                    "identities. If the route lacks mathematical support, "
+                    "return search_disposition=impasse with an impasse_reason "
+                    "and empty claims. Suspected false strengthenings should "
+                    "be reported for investigation; only checked evidence "
+                    "can refute them. Naming an obligation is not proof."
                 ),
             },
             {
@@ -38754,20 +38837,42 @@ def _record_durable_bottleneck_obligation(
     }
 
 
-def _prioritize_claims(
+def _bottleneck_dependency_names(
+    claims: Sequence[MiniSubgoalClaim],
+    bottleneck_claim: str,
+    *,
+    root_connected_names: frozenset[str] = frozenset(),
+) -> frozenset[str]:
+    """Resolve scheduling focus without granting proof or admission authority."""
+    if root_connected_names and bottleneck_claim not in root_connected_names:
+        return frozenset()
+    by_name: dict[str, list[MiniSubgoalClaim]] = {}
+    for claim in claims:
+        by_name.setdefault(claim.name, []).append(claim)
+    bottlenecks = by_name.get(bottleneck_claim, ())
+    if len(bottlenecks) != 1 or bottlenecks[0].role == "root_assembly":
+        return frozenset()
+    names: set[str] = set()
+    pending = [bottleneck_claim]
+    while pending:
+        name = pending.pop()
+        candidates = by_name.get(name, ())
+        if name in names or len(candidates) != 1:
+            continue
+        names.add(name)
+        pending.extend(candidates[0].dependencies)
+    return frozenset(names)
+
+
+def _select_priority_root(
     claims: Sequence[MiniSubgoalClaim],
     *,
     max_claims: int,
-    deprioritized_claim_keys: Sequence[str] = (),
     provisional_root_claim_keys: Sequence[str] = (),
-) -> list[MiniSubgoalClaim]:
+) -> tuple[Optional[MiniSubgoalClaim], frozenset[str]]:
+    """Share the exact root-route gate across cap and readiness selection."""
     items = list(claims or ())
     cap = max(1, int(max_claims or 1))
-    deprioritized = {
-        str(key or "").strip()
-        for key in list(deprioritized_claim_keys or ())
-        if str(key or "").strip()
-    }
     provisional_roots = set(provisional_root_claim_keys or ())
     name_to_index = {str(claim.name or ""): idx for idx, claim in enumerate(items)}
     root_items = [
@@ -38826,6 +38931,31 @@ def _prioritize_claims(
         root_connected_names = set(root_connected_names)
         if selected_root.name:
             root_connected_names.add(selected_root.name)
+    return selected_root, frozenset(root_connected_names)
+
+
+def _prioritize_claims(
+    claims: Sequence[MiniSubgoalClaim],
+    *,
+    max_claims: int,
+    deprioritized_claim_keys: Sequence[str] = (),
+    provisional_root_claim_keys: Sequence[str] = (),
+    bottleneck_claim: str = "",
+) -> list[MiniSubgoalClaim]:
+    items = list(claims or ())
+    cap = max(1, int(max_claims or 1))
+    deprioritized = {
+        str(key or "").strip()
+        for key in list(deprioritized_claim_keys or ())
+        if str(key or "").strip()
+    }
+    name_to_index = {str(claim.name or ""): idx for idx, claim in enumerate(items)}
+    selected_root, root_connected_names = _select_priority_root(
+        items, max_claims=cap, provisional_root_claim_keys=provisional_root_claim_keys,
+    )
+    bottleneck_names = _bottleneck_dependency_names(
+        items, bottleneck_claim, root_connected_names=root_connected_names,
+    )
     remaining = list(enumerate(items))
     scheduled_names: set[str] = set()
     ordered: list[MiniSubgoalClaim] = []
@@ -38869,6 +38999,16 @@ def _prioritize_claims(
             if not tuple(getattr(item[1], "policy_risk_reasons", ()) or ())
         ]
         candidates = clean_ready if clean_ready else ready
+        # Explicit mathematical focus outranks lexical ease/risk heuristics.
+        # All admission, verified-invalidity, root-route and dependency gates
+        # have already run. A name grants no permission to bypass them.
+        focused_ready = [
+            item for item in ready
+            if item[1].name in bottleneck_names
+            and _dependency_contract_suspension_key(item[1]) not in deprioritized
+        ]
+        if focused_ready:
+            candidates = focused_ready
 
         def priority_key(item: tuple[int, MiniSubgoalClaim]) -> tuple[int, int]:
             base_score, base_index = _claim_priority_score(item[1], item[0])

@@ -53,10 +53,47 @@ def _limit(job: dict[str, Any], state: dict[str, Any]) -> int:
     return min(4, state["policy"]["interval_requests"]) if job["role"] == "review" else state["policy"]["interval_requests"]
 
 
-def _research_count(store: Any, state: dict[str, Any]) -> int:
+def native_job_target(job: dict[str, Any], jobs: dict[str, dict[str, Any]]) -> str:
+    """Resolve a native assignment through its durable investigator lineage."""
+    visited: set[str] = set()
+    while job["job_id"] not in visited:
+        visited.add(job["job_id"])
+        target = job.get("native_target_claim_id")
+        if target is not None:
+            return target
+        parent_id = job.get("parent_job")
+        parent = jobs.get(parent_id) if parent_id is not None else None
+        if parent is None:
+            return job["claim_id"]
+        job = parent
+    raise ValueError("cyclic native research job lineage")
+
+
+def _focused_jobs(store: Any, run: dict[str, Any]) -> list[dict[str, Any]]:
+    jobs = store.jobs()
+    target = run.get("native_active_target_claim_id")
+    if target is None:
+        return jobs
+    by_id = {job["job_id"]: job for job in jobs}
+    return [job for job in jobs if native_job_target(job, by_id) == target]
+
+
+def _reviewed_through(state: dict[str, Any], run: dict[str, Any]) -> int:
+    target = run.get("native_active_target_claim_id")
+    if target is not None:
+        return state.get("native_research_attention", {}).get(target, 0)
+    return state.get("research_attention", {}).get("reviewed_through", 0)
+
+
+def _review_reserve(state: dict[str, Any], run: dict[str, Any]) -> int:
+    capacity = run.get("native_grant_requests", run["max_requests"])
+    return min(state["policy"]["reserve_requests"], capacity // 2)
+
+
+def _research_count(store: Any, state: dict[str, Any], run: dict[str, Any]) -> int:
     # Old receipts have no role field. Resolve their durable producer rather
     # than resetting attention when a pre-upgrade run is resumed.
-    researchers = {job["job_id"] for job in store.jobs() if job["role"] == "research"}
+    researchers = {job["job_id"] for job in _focused_jobs(store, run) if job["role"] == "research"}
     return sum(item.get("allocation_id") is None and item["consumer_id"] in researchers
                for item in state["attempts"].values())
 
@@ -71,10 +108,10 @@ def _reason(store: Any, job: dict[str, Any], state: dict[str, Any], run: dict[st
     if record.get("started_at") is not None and now >= record["started_at"] + state["policy"]["interval_seconds"]:
         return "research_interval_expired"
     if job["role"] == "research":
-        reviewed = state.get("research_attention", {}).get("reviewed_through", 0)
-        if _research_count(store, state) - reviewed >= state["policy"]["interval_requests"]:
+        reviewed = _reviewed_through(state, run)
+        if _research_count(store, state, run) - reviewed >= state["policy"]["interval_requests"]:
             return "research_phase_exhausted"
-        reserve = min(state["policy"]["reserve_requests"], run["max_requests"] // 2)
+        reserve = _review_reserve(state, run)
         if run["requests_used"] + reservations >= run["max_requests"] - reserve:
             return "research_review_reserve"
         if record.get("requests_used") and now >= run["deadline"] - min(
@@ -113,9 +150,9 @@ class ResearchControl:
         global_remaining = max(0, run["max_requests"] - run["requests_used"] - self.controller._reservations(state))
         phase_remaining = None
         if job["role"] == "research":
-            reviewed = state.get("research_attention", {}).get("reviewed_through", 0)
-            phase_remaining = max(0, state["policy"]["interval_requests"] - (_research_count(self.store, state) - reviewed))
-            global_remaining = max(0, global_remaining - min(state["policy"]["reserve_requests"], run["max_requests"] // 2))
+            reviewed = _reviewed_through(state, run)
+            phase_remaining = max(0, state["policy"]["interval_requests"] - (_research_count(self.store, state, run) - reviewed))
+            global_remaining = max(0, global_remaining - _review_reserve(state, run))
         remaining = min(own_remaining, global_remaining,
                         phase_remaining if phase_remaining is not None else own_remaining)
         result = {"research_allocation": {
@@ -162,7 +199,7 @@ class ResearchControl:
     def synchronize(self) -> None:
         # Never close an in-flight/received turn: its response may contain the
         # useful argument earned by the final admitted request.
-        for job in self.store.jobs():
+        for job in _focused_jobs(self.store, self.store.run_record(scheduling=True)):
             if job["role"] in {"research", "review"} and job["status"] == "pending":
                 self.before_request(job)
 
@@ -225,7 +262,7 @@ class ResearchControl:
                 self._incomplete_review(job, reason)
                 self._fallback(job, checkpoint, reason)
             else:
-                existing = next((item for item in self.store.jobs()
+                existing = next((item for item in _focused_jobs(self.store, self.store.run_record(scheduling=True))
                                  if item.get("research_reorientation_for")
                                  and item["status"] in {"pending", "running", "responded", "tool_running"}
                                  and not item.get("research_control", {}).get("closed")), None)
@@ -261,7 +298,13 @@ class ResearchControl:
     def _complete_phase(self) -> None:
         """Independent review work permits new attention, never proof credit."""
         with self.controller._edit() as (state, _):
-            state["research_attention"] = {"reviewed_through": _research_count(self.store, state)}
+            run = self.store.run_record(scheduling=True)
+            count = _research_count(self.store, state, run)
+            target = run.get("native_active_target_claim_id")
+            if target is not None:
+                state.setdefault("native_research_attention", {})[target] = count
+            else:
+                state["research_attention"] = {"reviewed_through": count}
 
     def _incomplete_review(self, job: dict[str, Any], reason: str) -> None:
         review_id = job.get("strategy_review_id")
@@ -305,13 +348,20 @@ class ResearchControl:
         question = "\n".join(f"{key}: {directive[key]}" for key in (
             "next_question", "first_uncertain_inference", "discriminating_check", "avoid"
         ))
-        root_id = self.store.run_record(scheduling=True)["target_id"]
+        run = self.store.run_record(scheduling=True)
+        root_id = run.get("native_active_target_claim_id", run["target_id"])
         if reviewer["claim_id"] != root_id:
+            target_description = (
+                "the active native target" if "native_active_target_claim_id" in run
+                else "the original root"
+            )
             question = (
-                "Pursue the original root, using or avoiding the separately scoped bottleneck "
+                f"Pursue {target_description}, using or avoiding the separately scoped bottleneck "
                 + reviewer["claim_id"] + ". The stronger helper is not an assumption of the root.\n" + question
             )
         child = self.store.add_job(root_id, question, parent_job=reviewer["job_id"])
+        if "native_active_target_claim_id" in run:
+            child["native_target_claim_id"] = root_id
         child.update(research_directive=directive, research_prior_checkpoint=checkpoint,
                      research_route_signature=signature,
                      research_portfolio_checkpoints=reviewer.get("research_portfolio_checkpoints", []))

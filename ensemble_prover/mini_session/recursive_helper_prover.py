@@ -1445,6 +1445,9 @@ async def prove_helper_in_subsession(
         max_iterations=int(max_turns or 1) + 5,
         scope="subgoal",
         parent=parent_session,
+        strict_progress_accounting=parent_session.strict_progress_accounting,
+        max_soft_progress_streak=parent_session.max_soft_progress_streak,
+        max_helper_only_provider_quanta=parent_session.max_helper_only_provider_quanta,
         theory_library=child_theory_library,
         theory_candidate_builder=getattr(
             parent_session, "theory_candidate_builder", None
@@ -1963,10 +1966,15 @@ async def prove_helper_in_subsession(
     checkpoint_registry = getattr(parent_session, "checkpoint_registry", None)
     completed_checkpoint_result = None
     if checkpoint_registry is not None and checkpoint_child_lane:
+        from .durable_recursive_child import RecursiveChildLimits
+
         child_record = checkpoint_registry.child_record(checkpoint_child_lane)
         if child_record is None:
             raise ValueError("Recursive child has no durable reservation")
+        admitted_limits = RecursiveChildLimits.capture(child_session)
         await checkpoint_registry.bind_session(checkpoint_child_lane, child_session)
+        admitted_limits.intersect_restored(child_session, parent_session)
+        action_deadline_epoch_s = child_session.recursive_elapsed_deadline_epoch_s
         completed_checkpoint_result = child_record.get("result")
         if completed_checkpoint_result is not None:
             result = completed_checkpoint_result

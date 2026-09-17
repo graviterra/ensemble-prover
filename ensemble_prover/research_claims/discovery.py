@@ -278,6 +278,7 @@ class DiscoveryLoop:
         self.cost_roles = dict(cost_roles or {})
         self._native_recovered = False
         self._native_advancing = False
+        self._native_target_claim_id: str | None = None
         from .strategy_discovery import StrategyIntegration
 
         self.strategy = StrategyIntegration(self) if store.run_record().get("strategy_review") is not None else None
@@ -457,6 +458,11 @@ class DiscoveryLoop:
                     for item in self.store.jobs()
                 ],
             }
+            if self.native_mode and self._native_target_claim_id is not None:
+                context["original_target"] = context["target"]
+                context["target"] = self.store.get_claim(
+                    self._native_target_claim_id
+                )["spec"]
             if self.strategy is not None:
                 adopted = run.get("adopted_mini_run")
                 prefix, marker, inventory = job["question"].partition("Adoption inventory: ")
@@ -593,7 +599,14 @@ class DiscoveryLoop:
                 messages = [
                     {
                         "role": "system",
-                        "content": SYSTEM + (STRATEGY_SYSTEM + LITERATURE_INSTRUCTIONS if self.strategy is not None else ""),
+                        "content": SYSTEM + (STRATEGY_SYSTEM + LITERATURE_INSTRUCTIONS if self.strategy is not None else "") + (
+                            "\nThis native investigation is assigned to context.target. "
+                            "Answer that exact active obligation and its reported objection. "
+                            "context.original_target is ancestor context, not a replacement assignment. "
+                            "Preserve the original theorem while reporting a proof, a refuted "
+                            "intermediate strengthening, or a precise unresolved obstruction."
+                            if self.native_mode and self._native_target_claim_id is not None else ""
+                        ),
                         REQUIRED_PROMPT_CONTEXT_KEY: True,
                     },
                     {
@@ -1818,8 +1831,16 @@ class DiscoveryLoop:
             ))
             self.store.save_job(job)
 
+    @staticmethod
+    def native_job_target(job: dict[str, Any], jobs: dict[str, dict[str, Any]]) -> str:
+        """Resolve a native assignment through its durable investigator lineage."""
+        from .research_control import native_job_target
+
+        return native_job_target(job, jobs)
+
     async def advance_native(
-        self, *, max_requests: int = 3, timeout_s: float = 120
+        self, *, max_requests: int = 3, timeout_s: float = 120,
+        target_claim_id: str | None = None,
     ) -> dict[str, Any]:
         """Borrow a bounded quantum from an already authorized native owner.
 
@@ -1839,6 +1860,8 @@ class DiscoveryLoop:
             raise ValueError("native timeout must be finite and positive")
         if self._native_advancing:
             raise ValueError("native quantum already owns this discovery loop")
+        if target_claim_id is not None:
+            self.store.get_claim(target_claim_id)
         run = self.store.run_record()
         if (run["status"] != "running" or run["started_at"] is None
                 or run["deadline"] is None):
@@ -1861,6 +1884,7 @@ class DiscoveryLoop:
             admitted += 1
 
         self._native_advancing = True
+        self._native_target_claim_id = target_claim_id
         try:
             with self.store.execution_lock(), provider_dispatch_guard(authorize):
                 # Factory-owned workers from completed prior slices can be
@@ -1884,9 +1908,13 @@ class DiscoveryLoop:
                                 reason = stop
                                 break
                             jobs = self.store.jobs()
+                            jobs_by_id = {job["job_id"]: job for job in jobs}
                             ready = sorted(
                                 (job for job in jobs
                                  if job["role"] != "formalization"
+                                 and (target_claim_id is None or self.native_job_target(
+                                     job, jobs_by_id
+                                 ) == target_claim_id)
                                  and (job["status"] == "responded" or (
                                      job["status"] == "pending" and not stop
                                      and admitted < max_requests
@@ -1902,7 +1930,8 @@ class DiscoveryLoop:
                                 if stop or admitted >= max_requests:
                                     reason = stop or "quantum_exhausted"
                                     break
-                                if self.strategy is not None and self.strategy.ensure_work():
+                                if (target_claim_id is None and self.strategy is not None
+                                        and self.strategy.ensure_work()):
                                     transitions += 1
                                     continue
                                 if last_provider_error is not None:
@@ -1933,6 +1962,7 @@ class DiscoveryLoop:
                 await self._retire_clients(set(), preserve_failure=True)
             finally:
                 self._native_advancing = False
+                self._native_target_claim_id = None
         return {
             "reason": reason,
             "paid_dispatches": admitted,

@@ -200,6 +200,12 @@ class MiniSubgoalPlan:
     # ``True`` never grants root-route authority unless the post-filter,
     # dependency-closed frontier contains an executable root assembly.
     plan_complete: Optional[bool] = None
+    # A search outcome, never a certificate that a proposition is false.
+    # Empty defaults preserve the legacy planner receipt representation.
+    search_disposition: str = ""
+    impasse_reason: str = ""
+    # Scheduling advice scoped to this plan, never proof or admission authority.
+    bottleneck_claim: str = ""
 
 
 def sanitize_theorem_name(
@@ -683,6 +689,9 @@ def parse_mini_subgoal_plan_response(raw_response: str) -> MiniSubgoalPlan:
             Sequence[str],
             str,
             Optional[bool],
+            str,
+            str,
+            str,
         ]
     ] = None
     for order, (candidate, kind, context_score) in enumerate(
@@ -705,6 +714,10 @@ def parse_mini_subgoal_plan_response(raw_response: str) -> MiniSubgoalPlan:
                 data
             )
             plan_complete = _plan_completion_from_json(data)
+            disposition, impasse_reason = _plan_search_disposition_from_json(data)
+            bottleneck_claim = _plan_bottleneck_from_json(data)
+            if disposition == "impasse" and (claims_data or plan_complete is True):
+                raise ValueError("an impasse requires empty claims and plan_complete=false")
         except Exception as exc:
             parse_errors.append(str(exc))
             continue
@@ -757,7 +770,8 @@ def parse_mini_subgoal_plan_response(raw_response: str) -> MiniSubgoalPlan:
         )
         if best_key is None or key > best_key:
             best_key = key
-            best = (claims, strategy, notes, root_statement, plan_complete)
+            best = (claims, strategy, notes, root_statement, plan_complete,
+                    disposition, impasse_reason, bottleneck_claim)
 
     if best is None:
         details = parse_errors[0] if parse_errors else "no JSON candidate found"
@@ -769,7 +783,8 @@ def parse_mini_subgoal_plan_response(raw_response: str) -> MiniSubgoalPlan:
     # already ensures that when claims DO exist anywhere (e.g. wrapped under an
     # unrecognized key), they are recovered instead of an empty primary winning.
 
-    claims, strategy, notes, root_statement, plan_complete = best
+    (claims, strategy, notes, root_statement, plan_complete,
+     disposition, impasse_reason, bottleneck_claim) = best
     return MiniSubgoalPlan(
         root_statement=root_statement,
         claims=claims,
@@ -777,6 +792,9 @@ def parse_mini_subgoal_plan_response(raw_response: str) -> MiniSubgoalPlan:
         notes=tuple(notes),
         raw_response=str(raw_response or ""),
         plan_complete=plan_complete,
+        search_disposition=disposition,
+        impasse_reason=impasse_reason,
+        bottleneck_claim=bottleneck_claim,
     )
 
 
@@ -789,6 +807,9 @@ def compile_mini_subgoal_plan(
     notes: Sequence[str] = (),
     raw_response: str = "",
     plan_complete: Optional[bool] = None,
+    search_disposition: str = "",
+    impasse_reason: str = "",
+    bottleneck_claim: str = "",
     answer_safe_preamble_used: bool = False,
     name_prefix: str = "mini_subgoal",
     max_prefix_chars: int = 600,
@@ -969,6 +990,9 @@ def compile_mini_subgoal_plan(
         notes=tuple(compiled_notes),
         raw_response=str(raw_response or ""),
         plan_complete=plan_complete if isinstance(plan_complete, bool) else None,
+        search_disposition=search_disposition,
+        impasse_reason=impasse_reason,
+        bottleneck_claim=bottleneck_claim,
         answer_safe_preamble_used=bool(answer_safe_preamble_used),
     )
 
@@ -992,6 +1016,9 @@ def compile_parsed_mini_subgoal_plan(
         notes=parsed_plan.notes,
         raw_response=parsed_plan.raw_response,
         plan_complete=parsed_plan.plan_complete,
+        search_disposition=parsed_plan.search_disposition,
+        impasse_reason=parsed_plan.impasse_reason,
+        bottleneck_claim=parsed_plan.bottleneck_claim,
         answer_safe_preamble_used=answer_safe_preamble_used,
         max_prefix_chars=max_prefix_chars,
         max_variants=max_variants,
@@ -1029,6 +1056,25 @@ def render_mini_subgoal_planner_prompt(
             "Each claim should expose one stable mathematical interface that "
             "removes a real bottleneck. Split claims that prove multiple facts "
             "or combine a construction with its consequences."
+        ),
+        (
+            "First assess the hardest unproved bridge, including whether a "
+            "proposed strengthening is plausible. A sufficient characterization "
+            "does not prove that bridge. If you have no supported route, return "
+            "search_disposition=impasse, impasse_reason describing the exact "
+            "missing argument or suspected counterexample, plan_complete=false, "
+            "and claims=[]. This suspends this search route; it does not certify "
+            "the theorem or any strengthening false. Do not rename the same "
+            "unproved bridge or add independently easy consequences to conceal "
+            "an impasse. Otherwise use search_disposition=plan and schedule the "
+            "decisive bridge before optional bookkeeping."
+        ),
+        (
+            "Set bottleneck_claim to the exact name of the decisive unproved "
+            "claim in this plan. The executor will prioritize that claim and "
+            "its prerequisites before independent easy siblings. Name the "
+            "mathematical gap, not a routine consequence; leave it empty only "
+            "when reporting an impasse or when no single gap dominates."
         ),
         (
             "Do not spend claims on generic library facts, weak bounds, "
@@ -1214,6 +1260,9 @@ def render_mini_subgoal_planner_prompt(
             json.dumps(
                 {
                     "strategy": "proof decomposition summary naming the main bottleneck",
+                    "search_disposition": "plan or impasse",
+                    "impasse_reason": "required for impasse; otherwise empty",
+                    "bottleneck_claim": "exact claim name of the decisive unproved bridge",
                     "plan_complete": False,
                     "claims": [
                         {
@@ -1241,6 +1290,8 @@ def render_mini_subgoal_planner_prompt(
             "root_assembly with a complete dependency chain to the root. Set "
             "it to false when another durable tranche is needed, even if this "
             "tranche includes a provisional root_assembly.",
+            "A complete obligation DAG does not mean the theorem is proved. "
+            "Only a kernel-checked proof closes the theorem.",
         ]
     )
     return "\n".join(parts).strip()
@@ -1259,6 +1310,10 @@ def render_mini_subgoal_plan_summary(
         lines.append(f"Strategy: {plan.strategy}")
     if plan.plan_complete is not None:
         lines.append(f"Plan complete: {str(plan.plan_complete).lower()}")
+    if plan.search_disposition == "impasse":
+        lines.append(f"Research impasse (unverified): {plan.impasse_reason}")
+    if plan.bottleneck_claim:
+        lines.append(f"Bottleneck claim: {plan.bottleneck_claim}")
     lines.append(f"Claims: {len(plan.claims)}")
     for idx, claim in enumerate(plan.claims, start=1):
         deps = f" deps=[{', '.join(claim.dependencies)}]" if claim.dependencies else ""
@@ -1761,6 +1816,32 @@ def _plan_completion_from_json(data: object) -> Optional[bool]:
     if isinstance(nested, Mapping):
         return _plan_completion_from_json(nested)
     return None
+
+
+def _plan_search_disposition_from_json(data: object) -> tuple[str, str]:
+    if not isinstance(data, Mapping):
+        return "", ""
+    if "search_disposition" not in data:
+        nested = data.get("plan")
+        return _plan_search_disposition_from_json(nested)
+    disposition = data.get("search_disposition")
+    if disposition not in {"plan", "impasse"}:
+        raise ValueError("search_disposition must be plan or impasse")
+    reason = data.get("impasse_reason", "")
+    if not isinstance(reason, str) or (disposition == "impasse" and not reason.strip()):
+        raise ValueError("impasse_reason must describe the unresolved argument")
+    return disposition, reason.strip()
+
+
+def _plan_bottleneck_from_json(data: object) -> str:
+    if not isinstance(data, Mapping):
+        return ""
+    if "bottleneck_claim" not in data:
+        return _plan_bottleneck_from_json(data.get("plan"))
+    name = data["bottleneck_claim"]
+    if not isinstance(name, str):
+        raise ValueError("bottleneck_claim must be an exact claim name")
+    return sanitize_theorem_name(name) if name.strip() else ""
 
 
 def _claim_items(raw_claims: object) -> list[object]:
