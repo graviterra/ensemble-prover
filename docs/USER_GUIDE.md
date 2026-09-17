@@ -450,6 +450,13 @@ Accepted effort values are `none`, `low`, `medium`, `high`, and `max`.
 Provider support varies. Explicit controls are fail-closed: if a provider
 rejects a required control, the request fails instead of silently dropping it.
 
+OpenRouter model IDs are accepted without a fixed supported-model list.
+Answer discovery and ordinary proof search resolve reasoning capabilities
+before dispatch. Each answer proposal/review freezes its reasoning controls
+and output allowance so cost admission and the provider request agree. The
+small fallback tables for known routes do not determine whether a new model
+ID can be used.
+
 Each run records the resolved reasoning configuration in `turns.jsonl` and
 prints it before long model work. When a provider reports reasoning usage,
 `reasoning_output_tokens=0` confirms that the successful response reported no
@@ -557,6 +564,13 @@ they do not establish that a mathematical claim is false. Source lookup and
 fresh research review can find an obstruction, but finding a particular
 counterexample or a successful alternative is not guaranteed.
 
+Paid resumptions count even when the scheduler preserves its iteration number.
+The coordinator records each committed action once, carries that accounting
+through checkpoints, and excludes research's own requests. The
+`proof_work_accounted` events show paid actions and requests since the last
+audit and requests since verified progress. Replaying a saved outcome does
+not create additional research work.
+
 Each research phase borrows one remaining conversation invocation and one
 scheduler iteration, preserving capacity for another proof turn. It uses the
 same provider settings and cost budget, with at most six provider dispatches
@@ -587,9 +601,18 @@ Resuming a new-format run preserves that work and its spent budget. Checkpoints
 created before this setting retain their previous, disabled behavior; running
 processes do not acquire the feature from a source update.
 
-The outer Putnam sweep's accepted-proof cutoffs remain in force, including the
-default 600-second first and 1800-second second acceptance deadlines. Research
-does not reset those clocks or count as an accepted proof. Isolated experiments
+The outer Putnam sweep prints its acceptance policy at startup. Its default
+deadlines are 600 seconds for the first accepted proof/helper and 1800 seconds
+for the second, measured from attempt launch **including startup**. Research
+does not reset those clocks or count as an accepted proof. To let each problem
+run under MiniProver's own limits, pass `--no-acceptance-cutoffs` to the sweep
+launcher **before** the `--` separating MiniProver arguments. Alternatively,
+set either `--first-accepted-by-s 0` or `--second-accepted-by-s 0` to disable
+that individual gate. These settings persist in the sweep manifest; resume
+uses the saved policy without overrides. Sweep stop notices and final result
+lines in the per-attempt console identify the cutoff that requested SIGINT,
+even if the worker describes the received signal as `user_interrupted`.
+Isolated experiments
 are disabled in automatic recovery; the separate `./research` workflow remains
 available for a dedicated investigation.
 

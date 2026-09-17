@@ -187,7 +187,76 @@ class NativeResearchCoordinator:
             session.native_research_state = state
         if state.get("schema") != 1 or state.get("binding") != self.binding:
             raise ValueError("native research checkpoint target changed")
+        # These additive fields keep schema-one checkpoints resumable. Counts
+        # come from proof outcomes, never the session's combined proof/research
+        # provider totals (which would make research trigger more research).
+        state.setdefault("requests_since_audit", 0)
+        state.setdefault("requests_since_verified_progress", 0)
         return state
+
+    def _account_proof_work(self, session: Any, state: dict[str, Any], outcome: Any) -> None:
+        """Count committed dispatches, including iteration-neutral resumptions.
+
+        The scheduler's existing durable outcome ledger owns deduplication
+        receipts. Reusing it avoids a second ever-growing dispatch-id ledger in
+        multi-day runs. Unstamped legacy callers use their original boundary
+        identity; they cannot distinguish resumptions without a dispatch id.
+        """
+        if outcome is None:
+            return
+        metadata = dict(getattr(outcome, "metadata", {}) or {})
+        dispatch_id = str(metadata.get("action_dispatch_id") or "").strip()
+        boundary = [int(getattr(session, "iteration", 0)), str(getattr(outcome, "action_id", ""))]
+        committed = getattr(session, "_applied_action_dispatch_outcomes", {}) or {}
+        committed = committed.get(dispatch_id) if isinstance(committed, dict) and dispatch_id else None
+        committed_metadata = getattr(committed, "metadata", None)
+        if isinstance(committed_metadata, dict):
+            metadata = committed_metadata
+            receipt_owner = committed_metadata
+            receipt_key = "native_research_work_receipt"
+        else:
+            # Compatibility for old/standalone boundary callers that do not
+            # expose MiniSession's committed-outcome ledger.
+            receipt_owner = state.setdefault("legacy_work_receipts", {})
+            receipt_key = "dispatch:" + dispatch_id if dispatch_id else "boundary:" + _json(boundary)
+            if (not dispatch_id and receipt_key not in receipt_owner
+                    and state.get("last_boundary") == boundary):
+                return
+        prior = receipt_owner.get(receipt_key)
+        if prior is not None and (not isinstance(prior, dict) or prior.get("binding") != self.binding):
+            raise ValueError("native research work receipt target changed")
+        requests = 0
+        for key in ("provider_request_count", "provider_calls", "provider_dispatches",
+                    "provider_calls_completed", "provider_dispatches_started"):
+            try:
+                count = int(metadata.get(key, 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            requests = max(requests, count)
+        previous_requests = int(prior.get("requests", 0)) if prior else 0
+        new_requests = max(0, requests - previous_requests)
+        if new_requests and not previous_requests:
+            state["paid_actions"] += 1
+        state["requests_since_audit"] += new_requests
+        state["requests_since_verified_progress"] += new_requests
+        # apply() derives strong_progress from fresh kernel-facing evidence,
+        # before publishing this committed outcome. A bare progress claim or
+        # an older receipt replay must never reset the stalled-work counter.
+        verified_progress = bool(isinstance(committed_metadata, dict)
+                                 and committed_metadata.get("strong_progress"))
+        credited_progress = bool(prior and prior.get("verified_progress"))
+        if verified_progress and not credited_progress:
+            state["requests_since_verified_progress"] = 0
+        receipt_owner[receipt_key] = {
+            "binding": self.binding, "requests": max(requests, previous_requests),
+            "verified_progress": verified_progress or credited_progress,
+        }
+        state["last_boundary"] = boundary
+        if new_requests:
+            _event(session, "proof_work_accounted", action_dispatch_id=dispatch_id,
+                   paid_actions=state["paid_actions"], new_requests=new_requests,
+                   requests_since_audit=state["requests_since_audit"],
+                   requests_since_verified_progress=state["requests_since_verified_progress"])
 
     async def boundary(self, session: Any, outcome: Any = None, *, frontier_exhausted: bool = False) -> bool:
         if not self.active or not _allowed(session):
@@ -210,17 +279,11 @@ class NativeResearchCoordinator:
                     _event(session, "research_unavailable", error_type=type(exc).__name__)
                     return False
             delivery_changed = self._deliver(session)
-            action = str(getattr(outcome, "action_id", ""))
-            boundary = [int(getattr(session, "iteration", 0)), action]
-            if outcome is not None and boundary != state["last_boundary"]:
-                state["last_boundary"] = boundary
-                metadata = dict(getattr(outcome, "metadata", {}) or {})
-                paid = any(
-                    int(metadata.get(key, 0) or 0) > 0
-                    for key in ("provider_request_count", "provider_calls", "provider_dispatches", "provider_calls_completed", "provider_dispatches_started")
-                )
-                if paid:
-                    state["paid_actions"] += 1
+            try:
+                self._account_proof_work(session, state, outcome)
+            except ValueError as exc:
+                _event(session, "research_unavailable", error_type=type(exc).__name__)
+                return delivery_changed
             objections = list(getattr(getattr(session, "conv", None), "_native_research_objections", []) or [])
             if objections:
                 self.pending_objections.extend(item for item in objections if item not in self.pending_objections)
@@ -228,12 +291,17 @@ class NativeResearchCoordinator:
                 "resume_research_grant" if state.get("grant") else
                 "reported_obstacle" if self.pending_objections else
                 "proof_frontier_exhausted" if frontier_exhausted and state["paid_actions"] else
-                "proof_interval_audit" if state["paid_actions"] >= 3 or self.dispatches - self.last_research_dispatches >= 10 else
+                "proof_interval_audit" if (state["paid_actions"] >= 3
+                                          or state["requests_since_audit"] >= 10
+                                          or self.dispatches - self.last_research_dispatches >= 10) else
                 "stagnation" if state["paid_actions"] and int(getattr(session, "stagnation_counter", 0)) >= 3 else None
             )
             if reason is None:
                 return delivery_changed
+            state["last_trigger_work"] = {key: state[key] for key in (
+                "paid_actions", "requests_since_audit", "requests_since_verified_progress")}
             state["paid_actions"] = 0
+            state["requests_since_audit"] = 0
             self.last_research_dispatches = self.dispatches
             try:
                 return await self._investigate(session, reason)
@@ -301,6 +369,7 @@ class NativeResearchCoordinator:
             helpers = list(helpers.values())
         context = {
             "original_target": self._visible_target(session), "trigger": reason,
+            "proof_work": self._state(session).get("last_trigger_work", {}),
             "first_uncertain_inference": "Determine the earliest unsupported ancestor, not just the current helper.",
             "formal_context": self._visible_target(session)["model_preamble"],
             "selected_work": getattr(session, "selected_work_item_record", None),

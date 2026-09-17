@@ -41,13 +41,17 @@ def find_putnam_answer_template(
     from .putnam import _sanitize_preamble
 
     declarations = scan_lean_theorems(source)
+    if not declarations:
+        raise ValueError("Putnam input contains no theorem or lemma declaration")
     declaration = (
         select_lean_theorem(declarations, theorem_name)
         if theorem_name
         else declarations[0]
     )
     symbol = declaration.canonical_name + "_solution"
-    pattern = re.compile(r"(?<![\w.'«»])" + re.escape(symbol) + r"(?![\w.'«»])")
+    # A following dot can introduce field notation or a tuple projection.
+    # Keep the left namespace boundary and the right identifier boundary.
+    pattern = re.compile(r"(?<![\w.'«»])" + re.escape(symbol) + r"(?![\w'«»])")
     root = declaration.statement_type
     if f"«{symbol}»" in root:
         raise ValueError(
@@ -90,11 +94,10 @@ def find_putnam_answer_template(
         raise ValueError(
             "Putnam answer discovery does not support preamble dependencies on the answer"
         )
-    if re.search(
-        r"(?:∀|fun|λ|let|[({\[])\s*" + re.escape(symbol) + r"(?=\s*[:,=])",
-        _answer_code(root),
-    ):
-        raise ValueError("Putnam answer symbol is shadowed in the theorem")
+    # Rename local occurrences together with the global answer reference.
+    # Parenthesized type ascriptions are not evidence of shadowing. Lean's
+    # mandatory abstract-question equivalence probe below checks the resulting
+    # binding/field interpretation before any answer proposal can be requested.
     fresh = "_ensembleMachineAnswer"
     # Escaped identifiers denote the same Lean name as their unescaped form.
     # Include their raw spelling in freshness checks, or an inner binder such
@@ -138,10 +141,28 @@ def putnam_question_equivalence_probe(template: AnswerTemplate) -> tuple[str, st
     probe_name = "_ensembleQuestionEquivalent"
     while probe_name in preamble + original.statement_type + adapted.statement_type:
         probe_name += "_"
+    # Type*/Sort* create fresh rigid universe parameters at declaration time.
+    # Elaborate the original exactly once in the header, then let `change`
+    # instantiate only the adapted side against those fixed original levels.
+    # Inference must happen inside the proof; underscores in an equality's
+    # header would be generalized independently before `rfl` can unify them.
+    adapted_type = adapted.statement_type
+    anonymous_sorts = list(re.finditer(
+        r"(?<![\w.'«»])(?:Type|Sort)\*", _answer_code(adapted_type)
+    ))
+    for occurrence in reversed(anonymous_sorts):
+        adapted_type = (
+            adapted_type[:occurrence.start()]
+            + occurrence[0][:-1] + " _"
+            + adapted_type[occurrence.end():]
+        )
+    question_name = probe_name + "Original"
     return (
         preamble
-        + f"\ntheorem {probe_name} :\n"
-        + f"({original.statement_type}) = ({adapted.statement_type}) := by rfl\n",
+        + f"\ntheorem {probe_name}{original.universe_suffix} :\n"
+        + f"  let {question_name} : Prop := (\n{original.statement_type}\n  );\n"
+        + f"  {question_name} = {question_name} := by\n"
+        + f"  change _ = (\n{adapted_type}\n  )\n  rfl\n",
         probe_name,
     )
 

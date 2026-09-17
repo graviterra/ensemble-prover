@@ -478,6 +478,7 @@ def refresh_openrouter_pricing_cache(
 def _openrouter_async_refresh_future(
     *,
     timeout_s: float = 10.0,
+    force: bool = False,
 ) -> concurrent.futures.Future[dict[str, PricingTuple]]:
     """Return one process-wide refresh future without occupying waiter threads.
 
@@ -500,7 +501,9 @@ def _openrouter_async_refresh_future(
 
         def run_refresh() -> None:
             try:
-                result = refresh_openrouter_pricing_cache(timeout_s=timeout_s)
+                result = refresh_openrouter_pricing_cache(
+                    timeout_s=timeout_s, force=force
+                )
             except BaseException as exc:
                 future.set_exception(exc)
             else:
@@ -625,8 +628,14 @@ async def ensure_openrouter_reasoning_capabilities_async(
     model: str,
     *,
     deadline: Optional[float] = None,
+    refresh_missing: bool = False,
 ) -> Optional[OpenRouterReasoningCapabilities]:
-    """Refresh capability discovery when needed, then return a fresh record."""
+    """Return fresh capabilities; optionally refresh missing model rows.
+
+    Legacy raw callers may rely on a known static contract when a fresh
+    snapshot omits their model. Evidence-driven callers can opt into a new
+    shared refresh without invalidating cached records for other models.
+    """
 
     if provider_for_base_url(base_url) != "openrouter":
         return None
@@ -639,8 +648,10 @@ async def ensure_openrouter_reasoning_capabilities_async(
             and time.time() - _OPENROUTER_REASONING_CAPABILITY_FETCHED_AT
             < _OPENROUTER_PRICING_CACHE_TTL_S
         )
-    if cache_fresh:
-        # The model was absent from a successfully refreshed catalog.
+    if cache_fresh and not refresh_missing:
+        # Raw callers may have a known static contract for an absent row.
+        # Preserve their cache-only behavior; evidence-driven Mini admission
+        # explicitly opts into refreshing incomplete snapshots on retry.
         return None
     remaining_s: Optional[float] = None
     if deadline is not None and float(deadline) > 0.0:
@@ -654,7 +665,7 @@ async def ensure_openrouter_reasoning_capabilities_async(
         # caller independently enforces its absolute deadline without
         # cancelling or shortening the refresh needed by longer-lived peers.
         await _await_openrouter_refresh_future(
-            _openrouter_async_refresh_future(timeout_s=10.0),
+            _openrouter_async_refresh_future(timeout_s=10.0, force=cache_fresh),
             timeout_s=remaining_s,
         )
     except asyncio.TimeoutError:

@@ -57,6 +57,13 @@ def _seconds(value: Any) -> float:
     return number
 
 
+def _acceptance_seconds(value: Any) -> float:
+    """Zero disables an acceptance gate; polling/cleanup still require > 0."""
+    if not isinstance(value, bool) and isinstance(value, (int, float)) and value == 0:
+        return 0.0
+    return _seconds(value)
+
+
 @dataclass
 class AcceptanceGate:
     start_monotonic: float
@@ -65,9 +72,10 @@ class AcceptanceGate:
     accepted: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.first_accepted_by_s = _seconds(self.first_accepted_by_s)
-        self.second_accepted_by_s = _seconds(self.second_accepted_by_s)
-        if self.second_accepted_by_s < self.first_accepted_by_s:
+        self.first_accepted_by_s = _acceptance_seconds(self.first_accepted_by_s)
+        self.second_accepted_by_s = _acceptance_seconds(self.second_accepted_by_s)
+        if (self.first_accepted_by_s and self.second_accepted_by_s
+                and self.second_accepted_by_s < self.first_accepted_by_s):
             raise ValueError("second acceptance deadline must not precede the first")
 
     def observe(self, record: Mapping[str, Any], *, now: float) -> bool:
@@ -97,12 +105,13 @@ class AcceptanceGate:
 
     def cutoff_reason(self, *, now: float) -> str | None:
         elapsed = now - self.start_monotonic
-        if elapsed >= self.first_accepted_by_s and not any(
+        if self.first_accepted_by_s and elapsed >= self.first_accepted_by_s and not any(
             value <= self.first_accepted_by_s for value in self.accepted.values()
         ):
             return "first_acceptance_deadline"
         if (
-            elapsed >= self.second_accepted_by_s
+            self.second_accepted_by_s
+            and elapsed >= self.second_accepted_by_s
             and sum(
                 value <= self.second_accepted_by_s for value in self.accepted.values()
             )
@@ -297,8 +306,8 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise ValueError("malformed solved-export directories")
     AcceptanceGate(
         0,
-        _seconds(data.get("first_accepted_by_s")),
-        _seconds(data.get("second_accepted_by_s")),
+        _acceptance_seconds(data.get("first_accepted_by_s")),
+        _acceptance_seconds(data.get("second_accepted_by_s")),
     )
     names = set()
     for row in data["queue"]:
@@ -521,6 +530,17 @@ def run_attempt(
             interrupted = isinstance(exc, KeyboardInterrupt)
         needs_stop = proc.poll() is None or _process_group_alive(proc.pid)
         if needs_stop:
+            stop_reason = "sweep_interrupted" if interrupted else (
+                cutoff or ("sweep_monitor_error" if monitor_error else "child_cleanup")
+            )
+            try:
+                console.write(
+                    f"\n[sweep] stop requested: {stop_reason}; sending SIGINT to this attempt\n".encode()
+                )
+                console.flush()
+                relay.copy_available()
+            except OSError as exc:
+                monitor_error = monitor_error or f"could not record stop reason: {exc}"
             try:
                 # One SIGINT reaches CLI + supervisor. Keep the supervisor
                 # alive to reap worker/Lean children in their own sessions.
@@ -550,18 +570,41 @@ def run_attempt(
                     gate.observe(record, now=now)
             except (OSError, ValueError) as exc:
                 monitor_error = f"{type(exc).__name__}: {exc}"
+        monitor_error = monitor_error or relay.error
+        if not cleaned:
+            status = "cleanup_unconfirmed"
+        elif _summary_solved(output_dir, proc.returncode):
+            status, cutoff = "solved", ""
+        elif interrupted:
+            status, cutoff = "interrupted", ""
+        elif monitor_error:
+            status = "monitor_error"
+        else:
+            status = "cutoff" if cutoff else "failed"
+        def record_result() -> None:
+            console.write(
+                f"\n[sweep] result={status}; cutoff_reason={cutoff or 'none'}; "
+                f"accepted={len(gate.accepted)}; cleanup_confirmed={cleaned}\n".encode()
+            )
+            console.flush()
+
+        if needs_stop:
+            try:
+                record_result()
+            except OSError as exc:
+                monitor_error = monitor_error or f"could not record result: {exc}"
         relay.copy_available(final=True)
         monitor_error = monitor_error or relay.error
-    if not cleaned:
-        status = "cleanup_unconfirmed"
-    elif _summary_solved(output_dir, proc.returncode):
-        status, cutoff = "solved", ""
-    elif interrupted:
-        status = "interrupted"
-    elif monitor_error:
-        status = "monitor_error"
-    else:
-        status = "cutoff" if cutoff else "failed"
+        if monitor_error and status not in {"cleanup_unconfirmed", "solved", "interrupted", "monitor_error"}:
+            status = "monitor_error"
+            # The result notice itself can discover a broken output pipe.
+            # Keep the durable final result aligned with the manifest even
+            # when the terminal can no longer receive the correction.
+            if needs_stop:
+                try:
+                    record_result()
+                except OSError:
+                    pass  # The original write/relay failure remains recorded.
     return {
         "status": status,
         "console_log": str(console_path),
@@ -666,7 +709,8 @@ def run_sweep(
             row["status"] = result["status"]
             save_manifest(manifest_path, manifest)
             print(
-                f"  {result['status']}; accepted={len(result.get('accepted_identities', []))}",
+                f"  {result['status']}; accepted={len(result.get('accepted_identities', []))}; "
+                f"cutoff_reason={result.get('cutoff_reason') or 'none'}",
                 flush=True,
             )
             if row["status"] in {"cleanup_unconfirmed", "monitor_error"}:
@@ -689,8 +733,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Skip existing exported filenames (default), or only verified manifest entries",
     )
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--first-accepted-by-s", type=float)
-    parser.add_argument("--second-accepted-by-s", type=float)
+    parser.add_argument("--first-accepted-by-s", type=float, help="First acceptance deadline from launch, including startup (default: 600; 0 disables)")
+    parser.add_argument("--second-accepted-by-s", type=float, help="Second acceptance deadline from launch, including startup (default: 1800; 0 disables)")
+    parser.add_argument("--no-acceptance-cutoffs", action="store_true", help="Disable both sweep acceptance cutoffs; retain MiniProver's own limits")
     parser.add_argument("--poll-interval-s", type=float, default=1)
     parser.add_argument("--cleanup-timeout-s", type=float, default=130)
     parser.add_argument(
@@ -720,7 +765,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.second_accepted_by_s,
                     )
                 )
-                or mini_args
+                or mini_args or args.no_acceptance_cutoffs
             ):
                 raise ValueError(
                     "resume uses persisted queue/settings; do not override them"
@@ -732,6 +777,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             manifest = load_manifest(manifest_path)
         else:
+            if args.no_acceptance_cutoffs and (
+                args.first_accepted_by_s is not None or args.second_accepted_by_s is not None
+            ):
+                raise ValueError("choose --no-acceptance-cutoffs or individual deadlines, not both")
             directory = args.sweep_dir or ROOT / "runs" / "mini_prover" / "sweeps" / (
                 datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(3)
             )
@@ -747,10 +796,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     seed=args.seed if args.seed is not None else secrets.randbits(64),
                     mini_args=mini_args,
                     solved_policy=args.solved_policy or "exported",
-                    first_accepted_by_s=args.first_accepted_by_s
+                    first_accepted_by_s=0 if args.no_acceptance_cutoffs else args.first_accepted_by_s
                     if args.first_accepted_by_s is not None
                     else 600,
-                    second_accepted_by_s=args.second_accepted_by_s
+                    second_accepted_by_s=0 if args.no_acceptance_cutoffs else args.second_accepted_by_s
                     if args.second_accepted_by_s is not None
                     else 1800,
                 )
@@ -761,6 +810,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"selection policy: {manifest.get('solved_policy', 'verified')}\n"
             f"Unsolved queue: {len(manifest['queue'])}"
         )
+        first, second = manifest["first_accepted_by_s"], manifest["second_accepted_by_s"]
+        policy = "disabled" if not first and not second else (
+            f"first={str(first) + 's' if first else 'disabled'}, "
+            f"second={str(second) + 's' if second else 'disabled'} from attempt launch (includes startup)"
+        )
+        print(f"Acceptance cutoffs: {policy}", flush=True)
         if args.dry_run:
             for row in manifest["queue"]:
                 print(f"  {row['problem_id']} [{row['status']}]")

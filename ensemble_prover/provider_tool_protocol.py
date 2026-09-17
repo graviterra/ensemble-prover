@@ -515,8 +515,16 @@ class MiniRequestEnvelopePolicy:
                         await ensure_openrouter_reasoning_capabilities_async(
                             base_url,
                             model,
+                            refresh_missing=True,
                         )
                     )
+                    if capability is None:
+                        # A catalog row explicitly denying reasoning is
+                        # incompatible; an absent row proves nothing. Preserve
+                        # the same retry/static-fallback boundary as outages.
+                        raise LookupError(
+                            f"OpenRouter catalog has no capability row for model={model}"
+                        )
                 except Exception as exc:
                     # Dated DeepSeek v4 snapshots are not on the exact
                     # explicit-enable allowlist. Visibility recovery still
@@ -814,6 +822,17 @@ def _resolve_mini_leaf_output_cap(
         elif mandatory:
             reasoning_on = True
             transport_mode = "mandatory"
+        elif not effort and _provider_default_reasoning_requested(cfg):
+            # An unmodified provider-default request is not an opt-out. In
+            # particular, structured answer phases impose no effort floor.
+            reasoning_on = bool(
+                capability is None
+                or (
+                    capability.supports_reasoning
+                    and capability.default_enabled is not False
+                )
+            )
+            transport_mode = "provider_default"
     elif base_url_matches_provider(base_url, "deepseek") and _mini_deepseek_v4_model(
         model
     ):
@@ -999,9 +1018,9 @@ def _resolve_mini_reasoning_transport_control(
     effort = str(effective_effort or "").strip().lower()
     if not base_url_matches_provider(base_url, "openrouter"):
         return effort, {}
+    if transport_mode == "provider_default":
+        return "", {}
     if _mini_deepseek_v4_model(model):
-        if transport_mode == "provider_default":
-            return "", {}
         if transport_mode in {"disabled", "disabled_without_budget"}:
             return "none", {"reasoning": {"enabled": False}}
         if transport_mode == "bounded":

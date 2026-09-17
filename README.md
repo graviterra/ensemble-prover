@@ -25,6 +25,15 @@ screenshot is losslessly cropped; its retained code and logs are unchanged.
 
 September 2026 — highlights from the current source checkout:
 
+- **1.13.1 — sweep and answer-discovery reliability:** OpenRouter capability
+  checks refresh missing model metadata, automatic research accounts for resumed
+  proof work, and sweep results retain their actual completion and cutoff causes.
+  Putnam answer discovery handles casts, field references, and arbitrary
+  universes while requiring Lean to verify that the question is preserved.
+  Sweep acceptance cutoffs can be disabled with `--no-acceptance-cutoffs`.
+  [Answer discovery](docs/USER_GUIDE.md#questions-with-an-unknown-answer) ·
+  [User Guide](docs/USER_GUIDE.md)
+
 - **1.13.0 — checked proof presentation and research deadlines:** verified Mini
   exports remove unused helpers and shorten expanded signatures automatically,
   with fresh Lean checks and an archived original. Automatic research now uses
@@ -107,7 +116,7 @@ other providers require an explicit supported selection.
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
 file and Lake project. PutnamBench files are supported through a compatibility
 adapter, and callers may attach a natural-language problem description as
-additional model context. Release 1.13.0 also includes
+additional model context. Release 1.13.1 also includes
 experimental natural-language entry points: `ensemble_prover.nl_input` for a
 single claim and `ensemble_prover.formalization` for resumable, multi-file
 projects. These translate text before proving; the resulting Lean statement
@@ -168,7 +177,7 @@ the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** 1.13.0 — research preview. Includes Mini Prover, experimental
+> **Release status:** 1.13.1 — research preview. Includes Mini Prover, experimental
 > single-claim NL input, and resumable multi-file formalization campaigns.
 > Optional Codex and Claude Code subscription backends serve Mini's prover and refiner,
 > alongside the existing API providers. Codex also serves autonomous research.

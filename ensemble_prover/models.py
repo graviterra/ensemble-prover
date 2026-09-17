@@ -52,6 +52,7 @@ from .request_gate import (
     formal_provider_exclusive_requested,
 )
 from .provider_tool_protocol import (
+    MiniReasoningCapabilityUnavailable,
     MiniRequestEnvelopePolicy,
     MiniRequestEnvelopeReceipt,
     bind_mini_request_envelope_receipt,
@@ -3730,6 +3731,19 @@ class OpenAICompatClient:
                         normalized,
                         capabilities,
                     )
+                if not selected and capabilities is not None and (
+                    capabilities.default_enabled is True
+                    or capabilities.mandatory is True
+                ):
+                    # Match the frozen-envelope contract: some catalog
+                    # entries advertise enablement without named efforts.
+                    control = {"enabled": True}
+                    payload["reasoning"] = control
+                    self.last_reasoning_control_sent = dict(control)
+                    self.last_reasoning_control_decision = (
+                        "catalog_explicit_enabled_unbounded"
+                    )
+                    return
                 if not selected:
                     raise RuntimeError(
                         "explicit reasoning-on has no advertised effort "
@@ -5102,22 +5116,39 @@ class OpenAICompatClient:
             effective_reasoning_effort is not None
             and str(effective_reasoning_effort).strip()
             and base_url_matches_provider(self.base_url, "openrouter")
+            and current_mini_request_envelope_receipt() is None
             and (
                 _deepseek_v4_model(getattr(self.cfg, "model", ""))
                 or _openrouter_reasoning_mandatory_model(
                     getattr(self.cfg, "model", "")
                 )
+                or str(
+                    getattr(self.cfg, "reasoning_requested_mode", "") or ""
+                ).strip().lower() == "on"
             )
             and not _gpt_oss_120b_model(getattr(self.cfg, "model", ""))
         ):
-            # Capability discovery is an explicit preflight for every routed
-            # DeepSeek V4 reasoning request. It does not depend on whether a
-            # dollar-budget path happened to refresh pricing first.
-            await ensure_openrouter_reasoning_capabilities_async(
+            # Explicit reasoning-on needs advertised capabilities regardless
+            # of model spelling or family. Mini envelopes already froze their
+            # catalog evidence before cost admission; never refresh that
+            # evidence between reservation and transport.
+            capability = await ensure_openrouter_reasoning_capabilities_async(
                 self.base_url,
                 getattr(self.cfg, "model", ""),
                 deadline=deadline,
+                refresh_missing=not (
+                    _deepseek_v4_model(self.cfg.model)
+                    or _openrouter_reasoning_mandatory_model(self.cfg.model)
+                ),
             )
+            if capability is None and not (
+                _deepseek_v4_model(getattr(self.cfg, "model", ""))
+                or _openrouter_reasoning_mandatory_model(self.cfg.model)
+            ):
+                raise MiniReasoningCapabilityUnavailable(
+                    "OpenRouter catalog has no capability row for "
+                    f"model={self.cfg.model}"
+                )
         budget = self._effective_prompt_budget(max_tokens_override)
         url = self._chat_url()
         requested_tools = bool(tools)

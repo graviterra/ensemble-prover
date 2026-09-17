@@ -17842,7 +17842,18 @@ def main() -> int:
     if not is_watchdog_worker():
         from .answer_input_cli import run_cli as run_answer_input, should_discover
 
-        if should_discover(args):
+        try:
+            discover_answer = should_discover(args)
+        except (ValueError, OSError) as error:
+            print(
+                f"Answer discovery input rejected: {error}\n"
+                "Check the selected Lean file and theorem; answer discovery "
+                "requires a supported template.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 2
+        if discover_answer:
             return run_answer_input(args, sys.argv[1:])
         try:
             worker_timeout_s = remaining_worker_timeout_s(args)

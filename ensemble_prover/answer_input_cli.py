@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
 
 from .answer_input import (
     AnswerCandidate,
@@ -25,9 +25,19 @@ from .answer_input import (
 from .config import LeanConfig
 from .lean_runner import LeanRunner
 from .lean_parser import has_infra_failure, has_timeout
-from .llm_usage import CostBudgetController, metered_or_plain_call
+from .llm_usage import (
+    CostBudgetController,
+    call_with_optional_usage_callback,
+    metered_or_plain_call,
+)
 from .nl_input import _completion_error
 from .nl_lean import _GUARD, _lean_string
+from .provider_tool_protocol import (
+    MiniReasoningCapabilityUnavailable,
+    mini_request_envelope_policy,
+    preflight_mini_reasoning_contract,
+    resolve_mini_request_envelopes,
+)
 from .subprocess_environment import trusted_provider_worker_environment
 from .theorem_project import (
     TheoremProjectRequest,
@@ -84,6 +94,8 @@ def _request(args: argparse.Namespace) -> TheoremProjectRequest:
     project = args.lean_project_dir
     if putnam_file:
         declarations = scan_lean_theorems(path.read_text(encoding="utf-8"))
+        if not declarations:
+            raise ValueError(f"Putnam input has no theorem declarations: {path}")
         declaration = select_lean_theorem(declarations, name) if name else declarations[0]
         name = declaration.canonical_name
         if description is None:
@@ -442,8 +454,95 @@ async def _prepare(
     ]
     limit = min((value for value in limits if value > 0), default=0)
     theory_library = None
+    capability_cancelled: tuple[str, int] | None = None
+
+    def record_capability(
+        phase: str, status: str, attempt: int, error: str = ""
+    ) -> None:
+        with (directory / "capability_preflight.jsonl").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "phase": phase,
+                        "model": cfg.model,
+                        "status": status,
+                        "attempt": attempt,
+                        "error": error,
+                        "provider_dispatches": 0,
+                    }
+                ) + "\n"
+            )
+
+    async def prepare_capabilities(
+        operation: Callable[[], Awaitable[Any]], phase: str
+    ) -> None:
+        nonlocal capability_cancelled
+        capability_cancelled = None
+        # Catalog reads spend no inference budget. A transient outage is not
+        # evidence of an unsupported model, and must not consume a proposal.
+        def record(status: str, attempt: int, error: str = "") -> None:
+            record_capability(phase, status, attempt, error)
+
+        remaining = max(0, started + limit - time.monotonic()) if limit else None
+        if remaining is not None and remaining <= 0:
+            record("budget_exhausted", 0)
+            raise TimeoutError("run budget exhausted before capability preparation")
+        deadline = asyncio.timeout(remaining)
+        attempt = 0
+        try:
+            async with deadline:
+                for attempt in range(1, 4):
+                    try:
+                        await operation()
+                    except MiniReasoningCapabilityUnavailable as exc:
+                        record(
+                            "retry" if attempt < 3 else "unavailable", attempt, str(exc)
+                        )
+                        if attempt == 3:
+                            raise
+                        print(
+                            "[answer_discovery] capability catalog unavailable; "
+                            f"retrying {attempt + 1}/3",
+                            flush=True,
+                        )
+                        await asyncio.sleep(float(attempt))
+                    except RuntimeError as exc:
+                        record("incompatible", attempt, str(exc))
+                        raise
+                    else:
+                        record("ready", attempt)
+                        return
+        except asyncio.CancelledError:
+            # The enclosing discovery deadline may own this cancellation.
+            # Preserve external cancellation; only its timeout owner may label it.
+            capability_cancelled = (phase, attempt)
+            raise
+        except TimeoutError as exc:
+            if not deadline.expired():
+                raise
+            detail = f"run budget exhausted during capability preparation ({phase})"
+            record("budget_exhausted", attempt, detail)
+            raise TimeoutError(detail) from exc
 
     async def ask(messages: list[dict[str, Any]], phase: str) -> str:
+        # Freeze capability, reasoning controls and the complete answer/plan
+        # allowance before cost admission. Passing the same policy at send
+        # time prevents a catalog refresh from changing the paid request.
+        policy = mini_request_envelope_policy(
+            work_type="answer_discovery",
+            session_max_tokens_override=(
+                cfg.conversation_max_tokens_override or cfg.max_tokens
+            ),
+        ).for_request(
+            request_kind=phase,
+            reasoning_mode="floor",
+            reasoning_effort="",
+        )
+        await prepare_capabilities(
+            lambda: resolve_mini_request_envelopes(client, policy), phase
+        )
         response = await metered_or_plain_call(
             cost_controller=meter,
             client=client,
@@ -451,8 +550,15 @@ async def _prepare(
             role="answer_discovery",
             scope="answer_input",
             call_kind="chat_raw_json_answer",
-            invoke=lambda callback: client.chat_raw(
-                messages, response_format="json", usage_callback=callback
+            max_tokens_override=policy,
+            metadata={"answer_phase": phase},
+            invoke=lambda callback: call_with_optional_usage_callback(
+                client.chat_raw,
+                messages,
+                response_format="json",
+                max_tokens_override=policy,
+                usage_callback=callback,
+                required_keywords=("response_format", "max_tokens_override"),
             ),
         )
         text, raw = response
@@ -506,6 +612,10 @@ async def _prepare(
         )
         if callable(getattr(client, "preflight", None)):
             await client.preflight()
+        await prepare_capabilities(
+            lambda: preflight_mini_reasoning_contract(client, role="answer_discovery"),
+            "startup",
+        )
         await _validate_cost_budget_pricing(
             max_cost_usd=float(args.cost_budget_usd),
             role_clients=(("answer_discovery", client),),
@@ -516,15 +626,24 @@ async def _prepare(
         # setup. Once ready, proposal/review use the ordinary run deadlines.
         signal_worker_ready()
         remaining = max(0, started + limit - time.monotonic()) if limit else None
-        async with asyncio.timeout(remaining):
-            candidate = await discover_answer(
-                template,
-                request,
-                directory=directory / "answers",
-                ask=ask,
-                validate=validate,
-                max_attempts=args.answer_attempts,
-            )
+        discovery_deadline = asyncio.timeout(remaining)
+        try:
+            async with discovery_deadline:
+                candidate = await discover_answer(
+                    template,
+                    request,
+                    directory=directory / "answers",
+                    ask=ask,
+                    validate=validate,
+                    max_attempts=args.answer_attempts,
+                )
+        except TimeoutError as exc:
+            if not discovery_deadline.expired() or capability_cancelled is None:
+                raise
+            phase, attempt = capability_cancelled
+            detail = f"run budget exhausted during capability preparation ({phase})"
+            record_capability(phase, "budget_exhausted", attempt, detail)
+            raise TimeoutError(detail) from exc
     finally:
         _arm_shutdown_deadline(args)
         try:
