@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 import time
-from typing import Any, Callable, ClassVar, FrozenSet, Optional
+from typing import Any, Callable, ClassVar, FrozenSet, Iterator, Optional
 import weakref
 
 from ensemble_prover.proof_dossier import (
@@ -53,6 +54,38 @@ from ensemble_prover.mini_session.planner_jobs import (
 
 from ..action import MiniOutcome
 from ..state_codec import StateSnapshotCompatibilityError, StateSnapshotError
+
+
+@contextmanager
+def preserve_helper_continuations_during_selection(session: Any) -> Iterator[None]:
+    """Bind exact helper cursors across synchronous scheduler reconciliation.
+
+    Selection reduces completed graph work into lifecycle observations and
+    derived search metadata. Only cursors matching the context BEFORE that
+    reduction may move with it. Earlier or later unrelated changes still fail
+    the driver's strict admission, including all root/route/policy checks.
+    """
+    from ensemble_prover.mini_recursive import _recursive_proof_idea_cognition_hash
+
+    pending = []
+    for action in session.actions:
+        if not isinstance(action, RecursiveControllerAction):
+            continue
+        frame = action._recursive_driver_state
+        if (
+            frame.get("phase") == "helper_accepted"
+            and frame.get("proof_idea_cognition_hash")
+            == _recursive_proof_idea_cognition_hash(session.dossier, action.config)
+        ):
+            pending.append((action, frame, copy.deepcopy(frame)))
+    yield
+    updates = [
+        (frame, _recursive_proof_idea_cognition_hash(session.dossier, action.config))
+        for action, frame, before in pending
+        if action._recursive_driver_state is frame and frame == before
+    ]
+    for frame, cognition_hash in updates:
+        frame["proof_idea_cognition_hash"] = cognition_hash
 
 
 def _verified_helper_names(dossier: Any) -> tuple[str, ...]:
@@ -1070,6 +1103,10 @@ class RecursiveControllerAction:
             recursive_helper_budget=0,
             recursion_depth=int(getattr(session, "recursion_depth", 0) or 0),
             progress_callback=checkpoint_recursive_driver,
+            # Only this controller can publish a mid-pass helper outcome and
+            # retain/refund the cursor for its remaining work. Nested graph
+            # actions and standalone drivers keep ordinary pass boundaries.
+            helper_accept_yield_enabled=True,
             provider_account_pause_enabled=getattr(session, "checkpoint_registry", None) is not None,
             verified_helper_accept_callback=getattr(
                 session,
@@ -1218,6 +1255,9 @@ class RecursiveControllerAction:
         failure_reason = str(
             getattr(result, "failure_reason", "") or ""
         ).strip()
+        helper_accept_yielded = bool(
+            failure_reason == "recursive_helper_accept_yield"
+        )
         identity_pending_yielded = bool(
             failure_reason == "recursive_contract_identity_pending_yield"
         )
@@ -1244,12 +1284,13 @@ class RecursiveControllerAction:
             or identity_service_blocked
             or identity_infrastructure_unknown
         )
-        if identity_prepass_deferred:
-            # These yields happen before a mathematical pass is admitted.
-            # Return this invocation's reservation, but never exceed the
-            # controller pool observed at admission.  Identity exhaustion is
-            # intentionally excluded: it is the bounded terminal retry for
-            # this pass and must remain charged.
+        if identity_prepass_deferred or helper_accept_yielded:
+            # Identity-pending yields happen before a mathematical pass is
+            # admitted. Helper-accept yields happen mid-pass so MiniSession
+            # can apply the helper receipt before speculative root-close;
+            # return the reservation so the same pass resumes. Identity
+            # exhaustion is intentionally excluded: it is the bounded
+            # terminal retry for this pass and must remain charged.
             setattr(
                 session,
                 self.budget_attr,
@@ -1548,6 +1589,7 @@ class RecursiveControllerAction:
                 "passes_used": passes_used,
                 "passes_reserved": reserved_passes,
                 "recursive_pass_quantum_yield": quantum_yielded,
+                "recursive_helper_accept_yield": helper_accept_yielded,
                 "recursive_contract_identity_pending_yield": (
                     identity_pending_yielded
                 ),

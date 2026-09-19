@@ -8,6 +8,7 @@ from typing import Any
 RESUMABLE_MINI_RECURSIVE_FAILURE_REASONS = frozenset(
     {
         "recursive_pass_quantum_yield",
+        "recursive_helper_accept_yield",
         "recursive_contract_identity_pending_yield",
         "recursive_contract_identity_service_unavailable",
         "recursive_contract_identity_infrastructure_unknown",

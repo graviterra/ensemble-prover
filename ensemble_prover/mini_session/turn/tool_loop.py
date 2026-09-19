@@ -4474,6 +4474,20 @@ async def _call_llm_with_tools_one_round_impl(
                         and not final_no_tools_recovery_attempted
                     ):
                         if provider_call_quantum_boundary_reached():
+                            if (
+                                final_resolution.error
+                                == "final_no_tools_token_exhausted"
+                            ):
+                                # A tool-enabled round that filled the output
+                                # cap with zero tools already spent the prove
+                                # quantum (Putnam 1970 B6). Parking a
+                                # visibility-recovery continuation preserves
+                                # the same action until cutoff; cut and let
+                                # the scheduler replan instead.
+                                _terminalize_retryable_unusable_output(
+                                    final_resolution.error
+                                )
+                                break
                             # The visibility repair is a separate provider
                             # request. Persist that bounded continuation and
                             # yield after the settled response instead of

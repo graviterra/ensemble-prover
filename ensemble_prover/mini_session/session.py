@@ -20989,6 +20989,14 @@ class MiniSession:
         return False
 
     def select_next_action(self) -> Optional[Action]:
+        from .actions.recursive_controller import (
+            preserve_helper_continuations_during_selection,
+        )
+
+        with preserve_helper_continuations_during_selection(self):
+            return self._select_next_action()
+
+    def _select_next_action(self) -> Optional[Action]:
         """Frontier-first then static priority fallback.
 
         M0 returns the first action whose ``is_applicable(session)`` is

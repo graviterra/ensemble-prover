@@ -53,6 +53,10 @@ _RUNTIME_FIELDS = frozenset({
     "_mini_recursive_hard_timeout_lease",
     "_checkpoint_initial_theory_context_hash",
 })
+# The recursive prove/refine handoff reuses its conversation, including this
+# parent-bound commit/rollback handle. Only the accompanying theory provenance
+# belongs on disk; the factory recreates the handle when a child returns/replays.
+_CONVERSATION_RUNTIME_FIELDS = frozenset({"mini_theory_commit_promotion"})
 _IDENTITY_CONV_FIELDS = (
     "goal_statement", "lean_signature", "preamble", "lean_preamble", "opaque_mode",
     "allow_official_answer_visibility", "official_answer_payload_present",
@@ -282,7 +286,10 @@ def capture_session_record(session: Any) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "clock": {"epoch_s": time.time(), "monotonic_s": time.monotonic()},
         "identity": session_checkpoint_identity(session),
-        "conversation": _encode(vars(session.conv), path="conversation"),
+        "conversation": _encode({
+            key: value for key, value in vars(session.conv).items()
+            if key not in _CONVERSATION_RUNTIME_FIELDS
+        }, path="conversation"),
         "dossier": session.dossier.to_execution_record(),
         "proof_state": session.proof_state.to_execution_record() if session.proof_state is not None else None,
         "scheduler": scheduler,
@@ -409,6 +416,10 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
     if data.get("identity") != expected_identity:
         raise ValueError("checkpoint identity differs from the fresh target, environment or policy")
     conversation = _decode(data["conversation"])
+    if type(conversation) is not dict or any(type(key) is not str for key in conversation):
+        raise ValueError("malformed checkpoint conversation")
+    if _CONVERSATION_RUNTIME_FIELDS.intersection(conversation):
+        raise ValueError("checkpoint conversation cannot restore runtime capabilities")
     values = {key: _decode(value) for key, value in data["session_values"].items()}
     verifier_view = await _prepare_theory_checkpoint_context(session, data, values)
     if expected_identity != session_checkpoint_identity(verifier_view):
@@ -437,8 +448,6 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
     values["_falsification_backend_timeout_recycle_retry_monotonic"] = rebase_deadline(
         values.get("_falsification_backend_timeout_recycle_retry_monotonic", 0.0)
     )
-    if type(conversation) is not dict or any(type(key) is not str for key in conversation):
-        raise ValueError("malformed checkpoint conversation")
     if any(key in _RUNTIME_FIELDS or field_is_runtime_capability(key) for key in values):
         raise ValueError("checkpoint cannot restore runtime capabilities")
     if set(values) & set(data["scheduler"]["session_state"]):
@@ -516,6 +525,12 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
     (published_values, published_budgets, published_conversation,
      published_dossier, published_graph, published_proof_state,
      published_actions) = _prepare_bound_publication(session, staged)
+    # Runtime handles stay outside staging and come only from the destination.
+    # Never copy an old parent's authority or restore its transaction state.
+    published_conversation.update({
+        key: value for key, value in vars(session.conv).items()
+        if key in _CONVERSATION_RUNTIME_FIELDS
+    })
 
     # No awaits follow publication. Preserve all objects bound by factory
     # callbacks while installing independently prepared value state.

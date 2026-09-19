@@ -29,13 +29,26 @@ from tempfile import NamedTemporaryFile
 from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
 
 from .solved_export_policy import effective_solved, export_boundary_present
-from .subprocess_environment import trusted_provider_worker_environment
+from .subprocess_environment import (
+    sanitized_subprocess_environment,
+    trusted_provider_worker_environment,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_FIRST_ACCEPTED_BY_S = 1200.0
+DEFAULT_SECOND_ACCEPTED_BY_S = 1800.0
+DEFAULT_STARTUP_LIVENESS_S = 180.0
+_MATHLIB_PREWARM_SOURCE = "import Mathlib\nexample : True := by trivial\n"
 _PROBLEM = re.compile(r"putnam_\d{4}_[ab][1-6]")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_TERMINAL = {"solved", "failed", "cutoff", "skipped_solved"}
+_TERMINAL = {
+    "solved",
+    "failed",
+    "cutoff",
+    "skipped_solved",
+    "answer_preparation_failed",
+}
 _STATUSES = _TERMINAL | {
     "pending",
     "running",
@@ -67,8 +80,8 @@ def _acceptance_seconds(value: Any) -> float:
 @dataclass
 class AcceptanceGate:
     start_monotonic: float
-    first_accepted_by_s: float = 600.0
-    second_accepted_by_s: float = 1800.0
+    first_accepted_by_s: float = DEFAULT_FIRST_ACCEPTED_BY_S
+    second_accepted_by_s: float = DEFAULT_SECOND_ACCEPTED_BY_S
     accepted: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -128,6 +141,7 @@ class AcceptanceEventTail:
         self.path = Path(path)
         self.offset = 0
         self.identity: tuple[int, int] | None = None
+        self.alive = False
 
     def read(self) -> list[dict[str, Any]]:
         try:
@@ -152,12 +166,198 @@ class AcceptanceEventTail:
                     record = json.loads(line)
                 except (ValueError, UnicodeError):
                     continue
-                if (
-                    isinstance(record, dict)
-                    and record.get("phase") == "session_accepted_proof"
-                ):
+                if not isinstance(record, dict):
+                    continue
+                self.alive = True
+                if record.get("phase") == "session_accepted_proof":
                     records.append(record)
         return records
+
+
+class AttemptStartupLiveness:
+    """Observe preparation separately, then allow a fresh proof startup window."""
+
+    def __init__(self, output_dir: Path, *, start: float, timeout_s: float):
+        self.output_dir = output_dir
+        self.start = start
+        self.timeout_s = timeout_s
+        self.proof_started_at: float | None = None
+        self.preparation = AcceptanceEventTail(
+            answer_preparation_dir(output_dir) / "capability_preflight.jsonl"
+        )
+
+    def expired(self, *, now: float, proof_alive: bool) -> bool:
+        if not self.timeout_s or proof_alive:
+            return False
+        if self.proof_started_at is None:
+            if (answer_preparation_dir(self.output_dir) / "prover_command.json").is_file():
+                self.proof_started_at = now
+            else:
+                # Preparation readiness is liveness, never accepted proof.
+                # Its own worker watchdog and the original acceptance gate
+                # continue to bound this phase, including long provider calls.
+                self.preparation.read()
+                discovery = _load_answer_discovery(self.output_dir) or {}
+                if self.preparation.alive or discovery.get("status") in {
+                    "running", "candidate_ready",
+                }:
+                    return False
+        start = self.start if self.proof_started_at is None else self.proof_started_at
+        return now - start >= self.timeout_s
+
+
+def default_lean_project_dir() -> Path:
+    return ROOT / "lean_project"
+
+
+def prewarm_shared_mathlib_runtime(
+    *,
+    project_dir: Path | None = None,
+    timeout_s: float = 180.0,
+) -> dict[str, Any]:
+    """Import Mathlib once so attempt processes do not pay a cold lake start.
+
+    Problem-specific ``proof_state_cache_seed`` still runs after attempt launch
+    and counts against the acceptance clock. Missing lake/project is a skip,
+    not a sweep failure.
+    """
+    project = Path(project_dir or default_lean_project_dir()).expanduser()
+    try:
+        project = project.resolve()
+    except OSError:
+        return {"status": "skipped", "reason": "lean_project_missing", "elapsed_s": 0.0}
+    if not project.is_dir() or not any(
+        (project / name).is_file() for name in ("lakefile.lean", "lakefile.toml")
+    ):
+        return {"status": "skipped", "reason": "lean_project_missing", "elapsed_s": 0.0}
+    timeout_s = _seconds(timeout_s)
+    snippet: Path | None = None
+    proc: subprocess.Popen | None = None
+    cleanup_confirmed = True
+    status, reason = "failed", ""
+    started = time.monotonic()
+    try:
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".lean",
+            prefix="sweep_mathlib_prewarm_",
+            dir=project,
+            delete=False,
+        ) as handle:
+            snippet = Path(handle.name)
+            handle.write(_MATHLIB_PREWARM_SOURCE)
+            handle.flush()
+        proc = subprocess.Popen(
+            ["lake", "env", "lean", str(snippet)],
+            cwd=str(project),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=sanitized_subprocess_environment(),
+            start_new_session=True,
+        )
+        returncode = proc.wait(timeout=timeout_s)
+        status = "ok" if returncode == 0 else "failed"
+        reason = "" if status == "ok" else "lake_env_lean_failed"
+    except FileNotFoundError:
+        status, reason = "skipped", "lake_not_found"
+    except subprocess.TimeoutExpired:
+        status, reason = "timeout", "mathlib_prewarm_timeout"
+    except Exception as exc:
+        status, reason = "failed", f"{type(exc).__name__}: {exc}"
+    finally:
+        if proc is not None:
+            # Lake spawns Lean rather than exec'ing it. Keep its PGID even
+            # after the leader exits, and clean the entire group on every
+            # path (including cancellation and a successful leader exit).
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                cleanup_confirmed = False
+            try:
+                cleanup_confirmed = _wait_for_cleanup(
+                    proc, timeout_s=5.0, poll_interval_s=.01,
+                ) and cleanup_confirmed
+            except Exception:
+                cleanup_confirmed = False
+            if not cleanup_confirmed:
+                status, reason = "failed", "mathlib_prewarm_cleanup_unconfirmed"
+        if snippet is not None:
+            try:
+                snippet.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return {
+        "status": status,
+        "reason": reason,
+        "elapsed_s": time.monotonic() - started,
+        "returncode": proc.returncode if proc is not None else None,
+        "cleanup_confirmed": cleanup_confirmed,
+    }
+
+
+def _normalize_prewarm_report(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {
+            "status": "failed",
+            "reason": "prewarm_invalid_report",
+            "elapsed_s": 0.0,
+        }
+    status = raw.get("status") if isinstance(raw.get("status"), str) else "failed"
+    reason = raw.get("reason") if isinstance(raw.get("reason"), str) else ""
+    elapsed = raw.get("elapsed_s")
+    try:
+        elapsed_s = float(elapsed)
+    except (TypeError, ValueError):
+        elapsed_s = 0.0
+    if not math.isfinite(elapsed_s):
+        elapsed_s = 0.0
+    report = {
+        "status": status or "failed",
+        "reason": reason,
+        "elapsed_s": elapsed_s,
+    }
+    error = raw.get("error")
+    if isinstance(error, str) and error:
+        report["error"] = error
+    returncode = raw.get("returncode")
+    if isinstance(returncode, int) and not isinstance(returncode, bool):
+        report["returncode"] = returncode
+    if type(raw.get("cleanup_confirmed")) is bool:
+        report["cleanup_confirmed"] = raw["cleanup_confirmed"]
+    return report
+
+
+def _record_prewarm_report(directory: Path, raw: Any) -> None:
+    """Persist prewarm telemetry without being able to abort the sweep."""
+    report = _normalize_prewarm_report(raw)
+    try:
+        payload = json.dumps(report, indent=2, allow_nan=False) + "\n"
+    except (TypeError, ValueError):
+        report = {
+            "status": "failed",
+            "reason": "prewarm_unserializable_report",
+            "elapsed_s": 0.0,
+        }
+        payload = json.dumps(report, indent=2, allow_nan=False) + "\n"
+    try:
+        (Path(directory) / "mathlib_prewarm.json").write_text(
+            payload, encoding="utf-8"
+        )
+    except OSError:
+        pass
+    try:
+        print(
+            f"Mathlib prewarm: {report.get('status')}; "
+            f"elapsed={float(report.get('elapsed_s') or 0):.1f}s; "
+            f"reason={report.get('reason') or 'none'}",
+            flush=True,
+        )
+    except OSError:
+        pass
 
 
 def _solved_policy(value: Any) -> str:
@@ -209,14 +409,19 @@ def build_manifest(
     seed: int,
     mini_args: Sequence[str],
     solved_policy: str = "exported",
-    first_accepted_by_s: float = 600,
-    second_accepted_by_s: float = 1800,
+    first_accepted_by_s: float = DEFAULT_FIRST_ACCEPTED_BY_S,
+    second_accepted_by_s: float = DEFAULT_SECOND_ACCEPTED_BY_S,
+    startup_liveness_s: float = DEFAULT_STARTUP_LIVENESS_S,
+    prewarm_shared_mathlib: bool = True,
 ) -> dict[str, Any]:
     source_dir = Path(source_dir).resolve()
     solved_dirs = [Path(path).resolve() for path in solved_dirs]
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("seed must be an integer")
     gate = AcceptanceGate(0, first_accepted_by_s, second_accepted_by_s)
+    startup_liveness_s = _acceptance_seconds(startup_liveness_s)
+    if not isinstance(prewarm_shared_mathlib, bool):
+        raise ValueError("prewarm_shared_mathlib must be a boolean")
     build_command(source_dir / "putnam_2000_a1.lean", Path("unused"), mini_args)
     solved_policy = _solved_policy(solved_policy)
     solved = _scan_solved(solved_dirs, policy=solved_policy)
@@ -249,6 +454,8 @@ def build_manifest(
         "mini_args": list(mini_args),
         "first_accepted_by_s": gate.first_accepted_by_s,
         "second_accepted_by_s": gate.second_accepted_by_s,
+        "startup_liveness_s": startup_liveness_s,
+        "prewarm_shared_mathlib": prewarm_shared_mathlib,
         "corpus_count": len(sources),
         "excluded_solved_count": len(sources) - len(queue),
         "queue": queue,
@@ -309,6 +516,17 @@ def load_manifest(path: Path) -> dict[str, Any]:
         _acceptance_seconds(data.get("first_accepted_by_s")),
         _acceptance_seconds(data.get("second_accepted_by_s")),
     )
+    if "startup_liveness_s" in data:
+        data["startup_liveness_s"] = _acceptance_seconds(data.get("startup_liveness_s"))
+    else:
+        data["startup_liveness_s"] = 0.0
+    if "prewarm_shared_mathlib" in data:
+        if not isinstance(data.get("prewarm_shared_mathlib"), bool):
+            raise ValueError("malformed prewarm_shared_mathlib")
+    else:
+        data["prewarm_shared_mathlib"] = False
+    if "prewarm_cleanup_unconfirmed" in data and type(data["prewarm_cleanup_unconfirmed"]) is not bool:
+        raise ValueError("malformed prewarm_cleanup_unconfirmed")
     names = set()
     for row in data["queue"]:
         name = row.get("problem_id", "") if isinstance(row, dict) else ""
@@ -343,6 +561,114 @@ def _summary_solved(output_dir: Path, exit_code: int | None = None) -> bool:
     # A pre-export solved summary can defer a cutoff while export finishes;
     # a failed/interrupted exit still needs the explicit verified boundary.
     return export_boundary_present(data) or exit_code in (None, 0)
+
+
+def answer_preparation_dir(output_dir: Path) -> Path:
+    resolved = Path(output_dir).resolve()
+    return resolved.with_name(resolved.name + ".answer_preparation")
+
+
+def _load_answer_discovery(output_dir: Path) -> dict[str, Any] | None:
+    path = answer_preparation_dir(output_dir) / "answers" / "answer_discovery.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _capability_outage_recorded(output_dir: Path) -> bool:
+    path = answer_preparation_dir(output_dir) / "capability_preflight.jsonl"
+    last: dict[str, Any] | None = None
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                last = record
+    except OSError:
+        return False
+    return bool(last) and last.get("status") == "unavailable"
+
+
+def classify_answer_preparation_reason(
+    output_dir: Path, *, console_text: str = ""
+) -> str:
+    """Classify a pre-proof discovery failure; empty means proof search started."""
+    discovery = _load_answer_discovery(output_dir)
+    if discovery and discovery.get("status") == "candidate_ready":
+        return ""
+    if (output_dir / "summary.json").is_file() or (output_dir / "turns.jsonl").is_file():
+        return ""
+    if discovery and discovery.get("status") == "no_candidate":
+        return "no_admissible_answer"
+    if _capability_outage_recorded(output_dir):
+        return "capability_outage"
+    error_type = str((discovery or {}).get("error_type") or "")
+    lowered = console_text.lower()
+    if "CapabilityUnavailable" in error_type or "capability catalog" in lowered:
+        return "capability_outage"
+    if discovery and discovery.get("status") in {"error", "running", "cancelled"}:
+        return "error"
+    if "answer discovery input rejected" in lowered or "no supported answer slots" in lowered:
+        return "no_slots"
+    if "answer discovery stopped" in lowered or "answer preparation failed" in lowered:
+        return "error"
+    if answer_preparation_dir(output_dir).is_dir():
+        return "error"
+    return ""
+
+
+def summarize_manifest(manifest: Mapping[str, Any]) -> dict[str, int]:
+    """Count terminal outcomes without folding prep failures into proof cutoffs."""
+    totals = {
+        "solved": 0,
+        "cutoff": 0,
+        "failed": 0,
+        "answer_preparation_failed": 0,
+        "answer_preparation_capability_outage": 0,
+        "answer_preparation_no_admissible_answer": 0,
+        "interrupted": 0,
+        "pending": 0,
+        "skipped_solved": 0,
+        "running": 0,
+        "cleanup_unconfirmed": 0,
+        "monitor_error": 0,
+    }
+    queue = manifest.get("queue")
+    if not isinstance(queue, list):
+        return totals
+    for row in queue:
+        if not isinstance(row, dict):
+            continue
+        status = row.get("status")
+        if isinstance(status, str):
+            totals[status] = totals.get(status, 0) + 1
+        if status != "answer_preparation_failed":
+            continue
+        attempts = row.get("attempts")
+        last = attempts[-1] if isinstance(attempts, list) and attempts else {}
+        reason = last.get("answer_preparation_reason") if isinstance(last, dict) else ""
+        if reason == "capability_outage":
+            totals["answer_preparation_capability_outage"] += 1
+        elif reason == "no_admissible_answer":
+            totals["answer_preparation_no_admissible_answer"] += 1
+    return totals
+
+
+def _print_sweep_totals(manifest: Mapping[str, Any]) -> None:
+    totals = summarize_manifest(manifest)
+    print(
+        "Sweep totals: "
+        f"solved={totals['solved']} cutoff={totals['cutoff']} "
+        f"answer_preparation_failed={totals['answer_preparation_failed']} "
+        f"(capability_outage={totals['answer_preparation_capability_outage']} "
+        f"no_admissible_answer={totals['answer_preparation_no_admissible_answer']}) "
+        f"failed={totals['failed']}",
+        flush=True,
+    )
 
 
 def _process_group_alive(pgid: int) -> bool:
@@ -468,8 +794,9 @@ def run_attempt(
     command: Sequence[str],
     output_dir: Path,
     *,
-    first_accepted_by_s: float = 600,
-    second_accepted_by_s: float = 1800,
+    first_accepted_by_s: float = DEFAULT_FIRST_ACCEPTED_BY_S,
+    second_accepted_by_s: float = DEFAULT_SECOND_ACCEPTED_BY_S,
+    startup_liveness_s: float = 0,
     poll_interval_s: float = 1,
     cleanup_timeout_s: float = 130,
     should_stop: Callable[[], bool] = lambda: False,
@@ -480,6 +807,7 @@ def run_attempt(
         _seconds(poll_interval_s),
         _seconds(cleanup_timeout_s),
     )
+    startup_liveness_s = _acceptance_seconds(startup_liveness_s)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     if any(
@@ -490,6 +818,7 @@ def run_attempt(
     start = time.monotonic()
     gate = AcceptanceGate(start, first_accepted_by_s, second_accepted_by_s)
     tail = AcceptanceEventTail(output_dir / "turns.jsonl")
+    startup = AttemptStartupLiveness(output_dir, start=start, timeout_s=startup_liveness_s)
     cutoff = ""
     interrupted = False
     monitor_error = ""
@@ -520,7 +849,10 @@ def run_attempt(
                 for record in records:
                     gate.observe(record, now=now)
                 interrupted = bool(should_stop())
-                cutoff = gate.cutoff_reason(now=now) or ""
+                if startup.expired(now=now, proof_alive=tail.alive):
+                    cutoff = "startup_liveness_deadline"
+                else:
+                    cutoff = gate.cutoff_reason(now=now) or ""
                 if interrupted or (cutoff and not _summary_solved(output_dir)):
                     break
                 cutoff = ""
@@ -581,9 +913,26 @@ def run_attempt(
             status = "monitor_error"
         else:
             status = "cutoff" if cutoff else "failed"
+        prep_reason = ""
+        if status in {"failed", "cutoff"}:
+            try:
+                console_text = console_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                console_text = ""
+            prep_reason = classify_answer_preparation_reason(
+                output_dir, console_text=console_text
+            )
+            # Preparation diagnostics describe the phase, while a supervisor
+            # cutoff records why the process was stopped. Keep that cause and
+            # its terminal status even if cancellation writes a prep error.
+            if prep_reason and status == "failed":
+                status = "answer_preparation_failed"
         def record_result() -> None:
             console.write(
                 f"\n[sweep] result={status}; cutoff_reason={cutoff or 'none'}; "
+                f"answer_preparation_reason={prep_reason or 'none'}; "
                 f"accepted={len(gate.accepted)}; cleanup_confirmed={cleaned}\n".encode()
             )
             console.flush()
@@ -610,6 +959,7 @@ def run_attempt(
         "console_log": str(console_path),
         "exit_code": proc.returncode,
         "cutoff_reason": cutoff,
+        "answer_preparation_reason": prep_reason,
         "accepted_identities": sorted(gate.accepted),
         "accepted_elapsed_s": gate.accepted,
         "cleanup_confirmed": cleaned,
@@ -642,6 +992,10 @@ def run_sweep(
     manifest_path = Path(manifest_path).resolve()
     with _manifest_lock(manifest_path):
         manifest = load_manifest(manifest_path)
+        if manifest.get("prewarm_cleanup_unconfirmed"):
+            raise ValueError(
+                "previous Mathlib prewarm cleanup is unconfirmed; refusing to start new work"
+            )
         if any(
             row["status"] in {"running", "cleanup_unconfirmed", "monitor_error"}
             for row in manifest["queue"]
@@ -649,9 +1003,34 @@ def run_sweep(
             raise ValueError(
                 "previous attempt cleanup is unconfirmed; refusing to start new work"
             )
+        if manifest.get("prewarm_shared_mathlib"):
+            try:
+                raw = prewarm_shared_mathlib_runtime()
+            except Exception as exc:
+                raw = {
+                    "status": "failed",
+                    "reason": "prewarm_exception",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "elapsed_s": 0.0,
+                }
+            if isinstance(raw, dict) and raw.get("cleanup_confirmed") is False:
+                # Preserve the cleanup failure across --resume, even if the
+                # optional telemetry sidecar cannot be written.
+                manifest["prewarm_cleanup_unconfirmed"] = True
+                save_manifest(manifest_path, manifest)
+            try:
+                _record_prewarm_report(manifest_path.parent, raw)
+            except Exception:
+                pass
+            if isinstance(raw, dict) and raw.get("cleanup_confirmed") is False:
+                # Optional warmup failure is harmless only once it owns no
+                # running work. Do not overlap a sweep with a leaked compiler.
+                return 1
+        exit_code = 0
         for index, row in enumerate(manifest["queue"]):
             if should_stop():
-                return 130
+                exit_code = 130
+                break
             if row["status"] in _TERMINAL:
                 continue
             if row["problem_id"] in _scan_solved(
@@ -700,6 +1079,7 @@ def run_sweep(
                 output_dir,
                 first_accepted_by_s=manifest["first_accepted_by_s"],
                 second_accepted_by_s=manifest["second_accepted_by_s"],
+                startup_liveness_s=manifest.get("startup_liveness_s", 0),
                 poll_interval_s=poll_interval_s,
                 cleanup_timeout_s=cleanup_timeout_s,
                 should_stop=should_stop,
@@ -710,14 +1090,18 @@ def run_sweep(
             save_manifest(manifest_path, manifest)
             print(
                 f"  {result['status']}; accepted={len(result.get('accepted_identities', []))}; "
-                f"cutoff_reason={result.get('cutoff_reason') or 'none'}",
+                f"cutoff_reason={result.get('cutoff_reason') or 'none'}; "
+                f"answer_preparation_reason={result.get('answer_preparation_reason') or 'none'}",
                 flush=True,
             )
             if row["status"] in {"cleanup_unconfirmed", "monitor_error"}:
-                return 2
+                exit_code = 2
+                break
             if row["status"] == "interrupted":
-                return 130
-    return 0
+                exit_code = 130
+                break
+        _print_sweep_totals(manifest)
+        return exit_code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -733,9 +1117,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Skip existing exported filenames (default), or only verified manifest entries",
     )
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--first-accepted-by-s", type=float, help="First acceptance deadline from launch, including startup (default: 600; 0 disables)")
-    parser.add_argument("--second-accepted-by-s", type=float, help="Second acceptance deadline from launch, including startup (default: 1800; 0 disables)")
+    parser.add_argument(
+        "--first-accepted-by-s",
+        type=float,
+        help=(
+            "First acceptance deadline from launch, including startup "
+            f"(default: {DEFAULT_FIRST_ACCEPTED_BY_S:g}; 0 disables)"
+        ),
+    )
+    parser.add_argument(
+        "--second-accepted-by-s",
+        type=float,
+        help=(
+            "Second acceptance deadline from launch, including startup "
+            f"(default: {DEFAULT_SECOND_ACCEPTED_BY_S:g}; 0 disables)"
+        ),
+    )
     parser.add_argument("--no-acceptance-cutoffs", action="store_true", help="Disable both sweep acceptance cutoffs; retain MiniProver's own limits")
+    parser.add_argument(
+        "--startup-liveness-s",
+        type=float,
+        help=(
+            "Cut a silent launch with no turns.jsonl events "
+            f"(default: {DEFAULT_STARTUP_LIVENESS_S:g}; 0 disables). "
+            "Does not subtract Mathlib/runtime boot from the acceptance clock."
+        ),
+    )
+    parser.add_argument(
+        "--no-prewarm",
+        action="store_true",
+        help="Skip the shared Mathlib lake-env import before the first attempt",
+    )
     parser.add_argument("--poll-interval-s", type=float, default=1)
     parser.add_argument("--cleanup-timeout-s", type=float, default=130)
     parser.add_argument(
@@ -763,9 +1175,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.seed,
                         args.first_accepted_by_s,
                         args.second_accepted_by_s,
+                        args.startup_liveness_s,
                     )
                 )
-                or mini_args or args.no_acceptance_cutoffs
+                or mini_args or args.no_acceptance_cutoffs or args.no_prewarm
             ):
                 raise ValueError(
                     "resume uses persisted queue/settings; do not override them"
@@ -798,10 +1211,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     solved_policy=args.solved_policy or "exported",
                     first_accepted_by_s=0 if args.no_acceptance_cutoffs else args.first_accepted_by_s
                     if args.first_accepted_by_s is not None
-                    else 600,
+                    else DEFAULT_FIRST_ACCEPTED_BY_S,
                     second_accepted_by_s=0 if args.no_acceptance_cutoffs else args.second_accepted_by_s
                     if args.second_accepted_by_s is not None
-                    else 1800,
+                    else DEFAULT_SECOND_ACCEPTED_BY_S,
+                    startup_liveness_s=(
+                        args.startup_liveness_s
+                        if args.startup_liveness_s is not None
+                        else DEFAULT_STARTUP_LIVENESS_S
+                    ),
+                    prewarm_shared_mathlib=not args.no_prewarm,
                 )
                 save_manifest(manifest_path, manifest)
         print(
@@ -815,7 +1234,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"first={str(first) + 's' if first else 'disabled'}, "
             f"second={str(second) + 's' if second else 'disabled'} from attempt launch (includes startup)"
         )
-        print(f"Acceptance cutoffs: {policy}", flush=True)
+        startup = manifest.get("startup_liveness_s", 0)
+        startup_text = f"{startup:g}s" if startup else "disabled"
+        print(
+            f"Acceptance cutoffs: {policy}; startup_liveness={startup_text}; "
+            f"prewarm_shared_mathlib={bool(manifest.get('prewarm_shared_mathlib'))}",
+            flush=True,
+        )
         if args.dry_run:
             for row in manifest["queue"]:
                 print(f"  {row['problem_id']} [{row['status']}]")

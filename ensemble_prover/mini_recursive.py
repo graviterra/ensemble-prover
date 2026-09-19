@@ -7244,6 +7244,24 @@ def _bounded_planner_proof_idea_projection(
     return compact
 
 
+def _recursive_proof_idea_cognition_hash(
+    dossier: Any,
+    config: MiniRecursiveConfig,
+    selected_parent_context: str = "",
+) -> str:
+    lifecycle = (
+        _project_planner_proof_idea_lifecycle_context(
+            dossier,
+            max_chars=max(0, int(getattr(config, "planner_context_max_chars", 98304) or 0)),
+        )
+        if dict(getattr(dossier, "proof_ideas", {}) or {}) else ""
+    )
+    return text_hash(json.dumps(
+        {"selected_parent": str(selected_parent_context or ""), "global_lifecycle": lifecycle},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ))
+
+
 def _project_planner_proof_idea_lifecycle_context(
     dossier: Any,
     *,
@@ -17368,6 +17386,7 @@ async def run_mini_recursive_attempt(
     strict_progress_accounting: bool = False,
     soft_progress_streak_cap: int = 4,
     progress_callback: Optional[ProgressCallback] = None,
+    helper_accept_yield_enabled: bool = False,
     verified_helper_accept_callback: Optional[Callable[[Any, Any], Any]] = None,
     continuation_state: Optional[Mapping[str, Any]] = None,
     prior_root_tactic_context_keys: Sequence[str] = (),
@@ -20245,6 +20264,7 @@ async def run_mini_recursive_attempt(
             cost_controller=cost_controller,
             enforce_root_finalization_contract=not suppress_root_solved,
             progress_callback=progress_callback,
+            helper_accept_yield_enabled=helper_accept_yield_enabled,
             continuation_state=continuation_state,
             prior_root_tactic_context_keys=prior_root_tactic_context_keys,
             root_tactic_portfolio_state=root_tactic_portfolio_state,
@@ -20733,6 +20753,7 @@ async def run_mini_recursive_driver(
     enforce_root_finalization_contract: bool = True,
     prove_root_close: Optional[ProveRootCloseFn] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    helper_accept_yield_enabled: bool = False,
     continuation_state: Optional[Mapping[str, Any]] = None,
     prior_root_tactic_context_keys: Sequence[str] = (),
     root_tactic_portfolio_state: Optional[Mapping[str, Any]] = None,
@@ -20869,18 +20890,8 @@ async def run_mini_recursive_driver(
     def current_proof_idea_cognition_hash() -> str:
         """Identity of the exact selected route plus the live global lifecycle."""
 
-        return text_hash(
-            json.dumps(
-                {
-                    "selected_parent": str(selected_parent_proof_idea_context or ""),
-                    "global_lifecycle": (
-                        current_planner_proof_idea_lifecycle_context()
-                    ),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-            )
+        return _recursive_proof_idea_cognition_hash(
+            dossier, config, selected_parent_proof_idea_context,
         )
 
     stats = MiniRecursiveStats()
@@ -24191,9 +24202,26 @@ async def run_mini_recursive_driver(
                 or root_tactic_direct_portfolio_exhausted_execution_keys
             )
         )
+        pending_helpers_waiting = bool(pending_unproved_plan_claims)
         run_preplan_root_tactic = bool(
-            not resuming_this_pass or resume_root_tactic_portfolio
+            (
+                not resuming_this_pass
+                and not pending_helpers_waiting
+            )
+            or resume_root_tactic_portfolio
         )
+        if pending_helpers_waiting and not resume_root_tactic_portfolio:
+            _record(
+                record_event,
+                {
+                    "phase": "mini_recursive_pending_unproved_claims",
+                    "pass_index": pass_index,
+                    "pending_unproved_plan_claim_count": len(
+                        pending_unproved_plan_claims
+                    ),
+                    "verdict": "pre_plan_root_close_skipped",
+                },
+            )
         root = (
             TacticCloseResult(
                 ok=False,
@@ -24279,10 +24307,13 @@ async def run_mini_recursive_driver(
         llm_root_proof = (
             await _maybe_llm_root_close("pre_plan", None, None)
             if (
-                not resuming_this_pass
-                or retry_pending_pre_plan_root_close
-                or resume_after_completed_root_tactic
-                or resume_root_tactic_portfolio
+                (
+                    not resuming_this_pass
+                    or retry_pending_pre_plan_root_close
+                    or resume_after_completed_root_tactic
+                    or resume_root_tactic_portfolio
+                )
+                and (resume_root_tactic_portfolio or not pending_helpers_waiting)
             )
             else None
         )
@@ -29648,6 +29679,35 @@ async def run_mini_recursive_driver(
                     ),
                 )
             )
+            if (
+                publish_acceptance
+                and helper_accept_yield_enabled
+                and pass_quantum > 0
+                and progress_callback is not None
+                and not root_tactic_already_completed
+                and not root_close_ready
+            ):
+                # Quantized MiniSession apply publishes the committed helper
+                # receipt. Speculative root-close is follow-up work on resume;
+                # doing it in this invocation can cancel before apply, as in
+                # Putnam 2006 B1.
+                _record(
+                    record_event,
+                    {
+                        "phase": "mini_recursive_helper_accept_yield",
+                        "pass_index": pass_index,
+                        "after_helper": accepted,
+                        "statement": statement,
+                        "verdict": "yield_before_speculative_root_close",
+                    },
+                )
+                return MiniRecursiveResult(
+                    ok=False,
+                    proof=None,
+                    stats=stats,
+                    plan_summaries=tuple(summaries),
+                    failure_reason="recursive_helper_accept_yield",
+                )
             if not root_tactic_already_completed and not root_close_ready:
                 _record(
                     record_event,

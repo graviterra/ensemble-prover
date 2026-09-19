@@ -10,6 +10,97 @@ from typing import Any
 
 from .proof_dossier import canonical_dossier_statement_key, helper_decl_statement, text_hash
 
+_RESTORED_HELPER_PHASE_TOKENS = ("cache", "seed", "import", "restore")
+_SCOPED_PROPOSITION_SYNTAX = re.compile(
+    r"[,;∀∃λ↦∑∏⨆⨅$→↔]|=>|->|<\||\|>|"
+    r"\b(?:forall|exists|fun|let|match|if|then|else|do|by|show|have|suffices|from)\b"
+)
+
+
+def helper_phase_is_restored(phase: str) -> bool:
+    lowered = str(phase or "").lower()
+    return any(token in lowered for token in _RESTORED_HELPER_PHASE_TOKENS)
+
+
+def helper_restates_restored_knowledge(helper: Any, helpers: Any) -> bool:
+    """True when a helper only restates cache/import/restore knowledge.
+
+    Exact proposition copies of a restored helper do not earn a sweep identity.
+    Cached dependencies alone do not establish restatement: a proof may also
+    use Mathlib or new reasoning. Suppress connective wrappers only when the
+    target directly wraps existing facts under identical binders.
+    """
+
+    if helper_phase_is_restored(str(getattr(helper, "phase", "") or "")):
+        return True
+    helper_map = helpers if isinstance(helpers, dict) else {}
+    source = str(getattr(helper, "source", "") or "")
+    identity = (
+        accepted_statement_identity(helper_decl_statement(source)) if source else ""
+    )
+    helper_name = str(getattr(helper, "name", "") or "")
+    if identity:
+        for other in helper_map.values():
+            if other is helper:
+                continue
+            if str(getattr(other, "name", "") or "") == helper_name:
+                continue
+            if not helper_phase_is_restored(str(getattr(other, "phase", "") or "")):
+                continue
+            other_source = str(getattr(other, "source", "") or "")
+            if not other_source:
+                continue
+            if identity == accepted_statement_identity(
+                helper_decl_statement(other_source)
+            ):
+                return True
+    supports = [
+        str(name or "").strip()
+        for name in list(getattr(helper, "support_names", []) or [])
+        if str(name or "").strip()
+    ]
+    if not supports:
+        return False
+    from .finite_claim_check import _first_forall_chunk
+    from .helper_quality import _conclusion_is_projection_of_premise
+
+    def telescope(statement: str) -> tuple[tuple[str, ...], str]:
+        body = canonical_dossier_statement_key(statement)
+        binders = []
+        while (quantifier := _first_forall_chunk(body)) is not None:
+            binder, body = quantifier
+            binders.append(binder)
+        return tuple(binders), body
+
+    target_binders, target_body = telescope(helper_decl_statement(source))
+    # Only ordinary connective wrappers are recognized. Unknown scope stays
+    # eligible, and a small connective cap bounds the recursive projection.
+    if _SCOPED_PROPOSITION_SYNTAX.search(target_body):
+        return False
+    if sum(target_body.count(token) for token in ("∧", "∨", "/\\", "\\/")) > 32:
+        return False
+    premises = []
+    for name in supports:
+        support = helper_map.get(name)
+        if support is None or not helper_phase_is_restored(
+            str(getattr(support, "phase", "") or "")
+        ):
+            return False
+        support_source = str(getattr(support, "source", "") or "")
+        if not support_source:
+            return False
+        binders, body = telescope(helper_decl_statement(support_source))
+        # Never infer a fact about another binder domain by dropping its
+        # telescope (e.g. a Nat fact cannot establish the same text over Int).
+        if binders != target_binders or _SCOPED_PROPOSITION_SYNTAX.search(body):
+            return False
+        premises.append(body)
+    # Keep cached statements opaque. Even propositional reasoning that derives
+    # a new conclusion from several cached facts can earn a fresh receipt.
+    return _conclusion_is_projection_of_premise(
+        target_body, premise_keys=set(premises),
+    )
+
 
 # The graph key shields literals/quoted identifiers in NUL-delimited atoms.
 # Keep those atoms, qualified names, and complete symbolic tokens intact while
@@ -43,7 +134,9 @@ def committed_acceptance_records(
 
     Helper additions must still exist in the accepted dossier. Cache and import
     actions restore previously known results and do not earn sweep milestones.
-    The sweep merges proposition identities across samples and recursive scopes.
+    Exact restatements and demonstrated propositional wrappers of restored
+    facts do not earn milestones. The sweep merges proposition identities
+    across samples and recursive scopes.
     """
 
     dossier = session.dossier
@@ -81,8 +174,7 @@ def committed_acceptance_records(
         helper = helpers.get(name)
         if helper is None:
             continue
-        phase = str(getattr(helper, "phase", "") or "").lower()
-        if any(token in phase for token in ("cache", "seed", "import", "restore")):
+        if helper_restates_restored_knowledge(helper, helpers):
             continue
         source = str(getattr(helper, "source", "") or "")
         if not source or getattr(helper, "source_hash", "") != text_hash(source):
