@@ -532,9 +532,7 @@ async def _prepare(
         # time prevents a catalog refresh from changing the paid request.
         policy = mini_request_envelope_policy(
             work_type="answer_discovery",
-            session_max_tokens_override=(
-                cfg.conversation_max_tokens_override or cfg.max_tokens
-            ),
+            session_max_tokens_override=cfg.conversation_max_tokens_override,
         ).for_request(
             request_kind=phase,
             reasoning_mode="floor",

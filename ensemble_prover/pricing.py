@@ -79,6 +79,21 @@ _DEEPSEEK_MODEL_PRICING: tuple[tuple[str, PricingTuple], ...] = (
     ("deepseek-v4-pro", (0.435, 0.003625, 0.87)),
 )
 
+# Verified at https://api-docs.deepseek.com/quick_start/pricing on this UTC
+# date. The legacy Flash endpoints now serve V4.1 Flash at the current price.
+# Peak prices are ceilings for both reservations and token-based valuations:
+# receipts do not identify the billing period or Chinese holiday calendar.
+# Retain the preceding policy for explicitly historical receipts, without
+# pretending that today's schedule establishes its own historical start date.
+_DEEPSEEK_CURRENT_PRICING_VERIFIED_FROM = date(2026, 9, 21)
+_DEEPSEEK_CURRENT_MODEL_PRICING: dict[str, PricingTuple] = {
+    "deepseek-flash": (0.30, 0.006, 1.20),
+    "deepseek-v4-flash": (0.30, 0.006, 1.20),
+    "deepseek-v4-flash-vision-exp": (0.30, 0.006, 1.20),
+    "deepseek-v4-pro": (1.32, 0.044, 3.96),
+    "deepseek-v4-pro-0813": (1.32, 0.044, 3.96),
+}
+
 _KNOWN_PROVIDER_HOSTS: dict[str, tuple[str, ...]] = {
     "openai": ("api.openai.com",),
     "deepseek": ("api.deepseek.com",),
@@ -570,6 +585,14 @@ def lookup_known_token_pricing(
                     return pricing
         return None
     if provider == "deepseek":
+        if _valuation_date(at_date) >= _DEEPSEEK_CURRENT_PRICING_VERIFIED_FROM:
+            # Only documented aliases inherit this schedule. A future dated
+            # model may carry a different price even within the same family.
+            for alias in _direct_provider_model_aliases(name):
+                pricing = _DEEPSEEK_CURRENT_MODEL_PRICING.get(alias)
+                if pricing is not None:
+                    return pricing
+            return None
         for prefix, pricing in _DEEPSEEK_MODEL_PRICING:
             for alias in _direct_provider_model_aliases(name):
                 if _model_matches_known_prefix(alias, prefix):
@@ -826,6 +849,17 @@ def quote_model_pricing(
     policy_version = _PRICING_POLICY_VERSION
     rates_observed_at = None
     rate_source = "verified_static_policy"
+    if (
+        provider == "deepseek"
+        and _valuation_date(at_date) >= _DEEPSEEK_CURRENT_PRICING_VERIFIED_FROM
+    ):
+        policy_version = _DEEPSEEK_CURRENT_PRICING_VERIFIED_FROM.isoformat()
+        if pricing is not None:
+            rate_source = "verified_peak_rate_ceiling"
+            assumptions.extend((
+                "deepseek_peak_rates_used_as_conservative_estimate",
+                "deepseek_billing_period_not_resolved",
+            ))
     if provider == "openrouter":
         with _OPENROUTER_PRICING_LOCK:
             fetched_at = _OPENROUTER_PRICING_FETCHED_AT

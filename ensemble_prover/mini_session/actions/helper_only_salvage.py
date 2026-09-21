@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from typing import Any, ClassVar, FrozenSet, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from ...proof_dossier import strong_progress_for_accepted_helpers
 from ...mini_runtime_defaults import DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S
@@ -526,6 +526,7 @@ class HelperOnlySalvageAction:
                     )
 
             # ---- Pathway (5): post-salvage child-closure ----
+            child_closure_status: Dict[str, Any] = {}
             if (
                 not solved
                 and accepted
@@ -547,6 +548,7 @@ class HelperOnlySalvageAction:
                         max_decl_applications=self.max_decl_applications,
                         batch_parallelism=self.batch_parallelism,
                         proof_cache=proof_cache,
+                        status_out=child_closure_status,
                     )
                 except Exception:
                     state_ok, state_proof, ps_helpers = False, None, []
@@ -591,7 +593,15 @@ class HelperOnlySalvageAction:
                     )
 
             # ---- Pathway (6): root-tactic close ----
-            if not solved and accepted and self.max_candidates > 0 and dossier is not None:
+            # Preserve a root portfolio quantum already consumed by child
+            # closure instead of restarting its candidates in this fallback.
+            if (
+                not solved
+                and accepted
+                and self.max_candidates > 0
+                and dossier is not None
+                and not child_closure_status.get("root_tactic_candidate_quantum_exhausted")
+            ):
                 try:
                     helper_blocks = dossier.verified_helper_blocks()
                     root_tactic = await try_close_root_with_active_lift(

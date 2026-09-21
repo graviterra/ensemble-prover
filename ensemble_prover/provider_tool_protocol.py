@@ -143,7 +143,9 @@ def mini_model_output_capacity(client: Any, *, fallback: int = 8192) -> int:
     if configured > 0:
         return configured
     model = str(getattr(cfg, "model", "") or "").strip().lower().rsplit("/", 1)[-1]
-    if model.startswith("deepseek-v4"):
+    if model.startswith("deepseek-v4") or mini_deepseek_v4_model(
+        getattr(cfg, "model", ""), base_url=str(getattr(cfg, "base_url", "") or "")
+    ):
         return 384_000
     if model.startswith("gpt-5.2"):
         return 128_000
@@ -450,7 +452,7 @@ class MiniRequestEnvelopePolicy:
         # mandatory.
         if (
             base_url_matches_provider(base_url, "deepseek")
-            and _mini_deepseek_v4_model(model)
+            and mini_deepseek_v4_model(model, base_url=base_url)
             and not bool(getattr(cfg, "thinking_enabled", False))
             and bool(getattr(cfg, "reasoning_control_required", False))
         ):
@@ -612,9 +614,16 @@ class MiniRequestEnvelopePolicy:
         return receipt
 
 
-def _mini_deepseek_v4_model(model: str) -> bool:
-    return str(model or "").strip().lower().rsplit("/", 1)[-1].startswith(
-        "deepseek-v4-"
+def mini_deepseek_v4_model(model: str, *, base_url: str = "") -> bool:
+    """Recognize V4 routes and the official direct V4.1 Flash alias.
+
+    The unversioned alias is provider-scoped: its name alone does not establish
+    capabilities for a third-party route. Keep the HTTP model identity intact.
+    """
+    name = str(model or "").strip().lower()
+    return name.rsplit("/", 1)[-1].startswith("deepseek-v4-") or (
+        name == "deepseek-flash"
+        and base_url_matches_provider(base_url, "deepseek")
     )
 
 
@@ -645,7 +654,7 @@ def _static_openrouter_deepseek_v4_family_capability(
 ) -> Optional[OpenRouterReasoningCapabilities]:
     """Return the outage-safe DeepSeek v4 contract for any dated snapshot."""
 
-    if not _mini_deepseek_v4_model(model):
+    if not mini_deepseek_v4_model(model):
         return None
     return OpenRouterReasoningCapabilities(
         supports_reasoning=True,
@@ -755,7 +764,7 @@ def _resolve_mini_leaf_output_cap(
             (capability is not None and capability.mandatory is True)
             or _mini_openrouter_mandatory_model(model)
         )
-        if _mini_deepseek_v4_model(model):
+        if mini_deepseek_v4_model(model):
             supports_budget = bool(
                 capability is not None and capability.supports_max_tokens
             )
@@ -833,8 +842,8 @@ def _resolve_mini_leaf_output_cap(
                 )
             )
             transport_mode = "provider_default"
-    elif base_url_matches_provider(base_url, "deepseek") and _mini_deepseek_v4_model(
-        model
+    elif base_url_matches_provider(base_url, "deepseek") and mini_deepseek_v4_model(
+        model, base_url=base_url
     ):
         reasoning_on = effort != "none"
         transport_mode = "enabled" if reasoning_on else "disabled"
@@ -845,7 +854,7 @@ def _resolve_mini_leaf_output_cap(
         return explicit_cap, "operator_override", transport_mode, True
 
     leaf_name = model.lower().rsplit("/", 1)[-1]
-    if _mini_deepseek_v4_model(model) and reasoning_on:
+    if mini_deepseek_v4_model(model, base_url=base_url) and reasoning_on:
         automatic_cap = _MINI_DEEPSEEK_REASONING_TOTAL_OUTPUT_CAP
         cap_source = "deepseek_reasoning_headroom"
     elif mandatory and reasoning_on:
@@ -1020,7 +1029,7 @@ def _resolve_mini_reasoning_transport_control(
         return effort, {}
     if transport_mode == "provider_default":
         return "", {}
-    if _mini_deepseek_v4_model(model):
+    if mini_deepseek_v4_model(model):
         if transport_mode in {"disabled", "disabled_without_budget"}:
             return "none", {"reasoning": {"enabled": False}}
         if transport_mode == "bounded":

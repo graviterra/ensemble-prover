@@ -58,6 +58,7 @@ from .provider_tool_protocol import (
     bind_mini_request_envelope_receipt,
     current_mini_request_envelope_receipt,
     extract_dsml_tool_calls,
+    mini_deepseek_v4_model,
     mini_openrouter_deepseek_v4_explicit_enable_model,
     mini_request_envelope_receipt_is_valid_for,
     resolve_mini_request_output_tokens,
@@ -1063,13 +1064,8 @@ def _request_safe_tool_calls(calls: Any) -> List[Dict[str, Any]]:
     return safe_calls
 
 
-def _deepseek_v4_model(model: str) -> bool:
-    # OpenRouter namespaces models as ``provider/model``.  Provider-specific
-    # capability checks must inspect the leaf name, otherwise
-    # ``deepseek/deepseek-v4-pro`` is incorrectly treated as an unrelated
-    # generic OpenRouter model.
-    name = str(model or "").strip().lower().rsplit("/", 1)[-1]
-    return name.startswith("deepseek-v4-")
+def _deepseek_v4_model(model: str, *, base_url: str = "") -> bool:
+    return mini_deepseek_v4_model(model, base_url=base_url)
 
 
 def _gpt_oss_120b_model(model: str) -> bool:
@@ -1101,7 +1097,9 @@ def _resolved_reasoning_effort(
     # the dataclass default as an opt-out disabled independent planner clients.
     if (
         base_url_matches_provider(getattr(cfg, "base_url", ""), "deepseek")
-        and _deepseek_v4_model(getattr(cfg, "model", ""))
+        and _deepseek_v4_model(
+            getattr(cfg, "model", ""), base_url=getattr(cfg, "base_url", "")
+        )
         and not bool(getattr(cfg, "thinking_enabled", False))
         and bool(getattr(cfg, "reasoning_control_required", False))
     ):
@@ -3496,7 +3494,9 @@ class OpenAICompatClient:
         self.last_reasoning_control_requested = normalized
         self.last_reasoning_control_required = bool(reasoning_control_required)
         if base_url_matches_provider(self.base_url, "openrouter"):
-            if _deepseek_v4_model(getattr(self.cfg, "model", "")):
+            if _deepseek_v4_model(
+                getattr(self.cfg, "model", ""), base_url=self.base_url
+            ):
                 capabilities = lookup_openrouter_reasoning_capabilities(
                     self.base_url,
                     getattr(self.cfg, "model", ""),
@@ -3525,7 +3525,9 @@ class OpenAICompatClient:
                         mini_openrouter_deepseek_v4_explicit_enable_model(
                             getattr(self.cfg, "model", "")
                         )
-                        or _deepseek_v4_model(getattr(self.cfg, "model", ""))
+                        or _deepseek_v4_model(
+                            getattr(self.cfg, "model", ""), base_url=self.base_url
+                        )
                     ):
                         # Static DeepSeek v4 contract omits supports_disable.
                         # Visibility recovery still has to send enabled=false
@@ -3841,7 +3843,9 @@ class OpenAICompatClient:
         if payload.get("thinking") == {"type": "disabled"}:
             return
         thinking = bool(getattr(self.cfg, "thinking_enabled", False))
-        is_v4 = _deepseek_v4_model(getattr(self.cfg, "model", ""))
+        is_v4 = _deepseek_v4_model(
+            getattr(self.cfg, "model", ""), base_url=self.base_url
+        )
         if not thinking and not is_v4:
             return
         if not thinking and not bool(
@@ -3884,7 +3888,9 @@ class OpenAICompatClient:
             and (
                 bool(getattr(self.cfg, "thinking_enabled", False))
                 or (
-                    _deepseek_v4_model(getattr(self.cfg, "model", ""))
+                    _deepseek_v4_model(
+                        getattr(self.cfg, "model", ""), base_url=self.base_url
+                    )
                     and not bool(
                         getattr(
                             self.cfg,
@@ -5118,7 +5124,9 @@ class OpenAICompatClient:
             and base_url_matches_provider(self.base_url, "openrouter")
             and current_mini_request_envelope_receipt() is None
             and (
-                _deepseek_v4_model(getattr(self.cfg, "model", ""))
+                _deepseek_v4_model(
+                    getattr(self.cfg, "model", ""), base_url=self.base_url
+                )
                 or _openrouter_reasoning_mandatory_model(
                     getattr(self.cfg, "model", "")
                 )
@@ -5142,7 +5150,9 @@ class OpenAICompatClient:
                 ),
             )
             if capability is None and not (
-                _deepseek_v4_model(getattr(self.cfg, "model", ""))
+                _deepseek_v4_model(
+                    getattr(self.cfg, "model", ""), base_url=self.base_url
+                )
                 or _openrouter_reasoning_mandatory_model(self.cfg.model)
             ):
                 raise MiniReasoningCapabilityUnavailable(

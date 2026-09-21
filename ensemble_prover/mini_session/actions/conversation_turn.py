@@ -81,7 +81,10 @@ from ensemble_prover.pricing import (
     lookup_openrouter_reasoning_capabilities,
     provider_for_base_url,
 )
-from ensemble_prover.provider_tool_protocol import mini_request_envelope_policy
+from ensemble_prover.provider_tool_protocol import (
+    mini_deepseek_v4_model,
+    mini_request_envelope_policy,
+)
 from ensemble_prover.proof_graph import (
     graph_negated_statement_key,
     graph_node_frontier_quarantined,
@@ -568,7 +571,12 @@ def _reasoning_aware_conversation_cap(cfg: Any) -> int:
     deepseek_default_thinking = bool(
         provider == "openrouter" or (not effort and not required)
     )
-    if model.startswith("deepseek-v4") and (
+    if (
+        model.startswith("deepseek-v4")
+        or mini_deepseek_v4_model(
+            model, base_url=str(getattr(cfg, "base_url", "") or "")
+        )
+    ) and (
         effort in {"high", "max"}
         or thinking_enabled and effort not in {"none", "low", "medium"}
         or deepseek_default_thinking
@@ -20902,6 +20910,7 @@ async def _run_helpers_only_cascade(
             )
 
     # ---- Pathway (5): post-salvage child-closure ------------------
+    child_closure_status: Dict[str, Any] = {}
     if (
         proof_state is not None
         and child_tactics_enabled
@@ -20921,6 +20930,7 @@ async def _run_helpers_only_cascade(
             max_decl_applications=max_decl_apps,
             batch_parallelism=parallelism,
             proof_cache=session.proof_cache,
+            status_out=child_closure_status,
         )
         sync_proof_state_to_graph(
             proof_state,
@@ -21007,7 +21017,13 @@ async def _run_helpers_only_cascade(
     inline_timeout_s = _budget_clamped_timeout(
         session, action_id="helper_only_salvage", requested_s=timeout_s
     )
-    if max_candidates > 0 and inline_timeout_s > 0.0:
+    # Child closure can consume a root portfolio quantum and preserve its
+    # cursor. A fresh fallback would restart the same candidates here.
+    if (
+        max_candidates > 0
+        and inline_timeout_s > 0.0
+        and not child_closure_status.get("root_tactic_candidate_quantum_exhausted")
+    ):
         tactic_started = time.monotonic()
         helper_blocks = dossier.verified_helper_blocks()
         root_tactic = await try_close_root_with_active_lift(

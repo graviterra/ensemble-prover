@@ -367,6 +367,7 @@ from .provider_tool_protocol import (
     handle_deepseek_dsml_after_budget,
     is_deepseek_client,
     mini_bounded_visible_output_reasoning_effort,
+    mini_deepseek_v4_model,
     mini_gpt6_model,
     mini_model_output_capacity,
     mini_visible_output_reasoning_effort,
@@ -12519,7 +12520,9 @@ def _canonical_openrouter_model_id(model: str) -> str:
     return canonical_openrouter_model_id(model)
 
 
-def _model_token_defaults(model: Optional[str]) -> Tuple[Optional[int], int]:
+def _model_token_defaults(
+    model: Optional[str], *, provider: Optional[str] = None,
+) -> Tuple[Optional[int], int]:
     """Return (context_window, max_tokens) defaults for a given model name.
 
     Per-model overrides handle frontier models whose context/output limits
@@ -12533,7 +12536,9 @@ def _model_token_defaults(model: Optional[str]) -> Tuple[Optional[int], int]:
     # OpenRouter IDs are namespaced as ``provider/model``. Capability matching
     # is about the routed model, not the transport namespace.
     name = _routed_model_name(model)
-    if name.startswith("deepseek-v4"):
+    if name.startswith("deepseek-v4") or mini_deepseek_v4_model(
+        str(model or ""), base_url=_PROVIDER_BASE_URLS.get(str(provider or "").lower(), "")
+    ):
         return 1_000_000, 384_000
     if name.startswith("gpt-5.2"):
         return 400_000, 128_000
@@ -12553,7 +12558,9 @@ def _model_timeout_default(
 ) -> float:
     name = _routed_model_name(model)
     provider_name = str(provider or "").strip().lower()
-    if name.startswith("deepseek-v4"):
+    if name.startswith("deepseek-v4") or mini_deepseek_v4_model(
+        str(model or ""), base_url=_PROVIDER_BASE_URLS.get(str(provider or "").lower(), "")
+    ):
         return 600.0
     if provider_name == "openrouter" or "qwen" in name:
         return 1200.0
@@ -12589,7 +12596,7 @@ def _make_role_cfg(
         )
     if provider == "openrouter":
         resolved_model = _canonical_openrouter_model_id(resolved_model)
-    context_window, max_out = _model_token_defaults(resolved_model)
+    context_window, max_out = _model_token_defaults(resolved_model, provider=provider)
     if timeout_s is None:
         timeout_s = _model_timeout_default(resolved_model, provider=provider)
     try:

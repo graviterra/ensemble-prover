@@ -560,6 +560,7 @@ class DiscoveryLoop:
         )
         from ..models import REQUIRED_PROMPT_CONTEXT_KEY, RequiredPromptContextOverflow
         from ..nl_input import _completion_error
+        from ..provider_tool_protocol import mini_request_envelope_policy
 
         client = self._client(job)
         # A client carries last-response metadata. A user-supplied shared
@@ -679,8 +680,30 @@ class DiscoveryLoop:
                     response_format = (
                         None if isinstance(client, CodexSubscriptionClient) else "json"
                     )
+                    # Native research borrows Mini's model roles, whose raw
+                    # capacity is not a request budget. Keep one unresolved
+                    # policy for both reservation and concrete-leaf dispatch.
+                    request_policy = (
+                        mini_request_envelope_policy(work_type="native_research").for_request(
+                            request_kind="native_research_json",
+                            reasoning_mode="floor",
+                            reasoning_effort="",
+                        )
+                        if self.native_mode else None
+                    )
+                    request_kwargs = {"response_format": response_format}
+                    if request_policy is not None:
+                        request_kwargs.update(
+                            max_tokens_override=request_policy,
+                            reasoning_effort_override=None,
+                            required_keywords=("max_tokens_override", "reasoning_effort_override"),
+                        )
                     if self.cost_controller is None:
-                        operation = client.chat_raw(messages, response_format=response_format)
+                        operation = (
+                            call_with_optional_usage_callback(client.chat_raw, messages, **request_kwargs)
+                            if self.native_mode else
+                            client.chat_raw(messages, response_format=response_format)
+                        )
                     else:
                         config = getattr(client, "cfg", None)
                         role = self.cost_roles.get(job["role"]) or str(
@@ -694,10 +717,11 @@ class DiscoveryLoop:
                             scope="native_research" if self.native_mode else "research",
                             action_id="research_" + job["role"],
                             call_kind="chat_raw",
+                            max_tokens_override=request_policy,
                             metadata={"research_job_id": job["job_id"], "research_turn": job["turn"]},
                             invoke=lambda callback: call_with_optional_usage_callback(
                                 client.chat_raw, messages, usage_callback=callback,
-                                response_format=response_format,
+                                **request_kwargs,
                             ),
                         )
                     if self.strategy is None and not self.native_mode:
