@@ -1583,6 +1583,30 @@ async def _request_envelope_receipts(
     return await resolve_mini_request_envelopes(client, max_tokens_override)
 
 
+def _reservation_output_token_limits(
+    client: Any,
+    max_tokens_override: Optional[int],
+    fallback_output_tokens: int,
+) -> List[int]:
+    """Reserve each concrete transport's cap without changing its request.
+
+    The configured reserve is only an estimate for opaque leaves without an
+    output limit. Capping a known allowance by that estimate admits provider
+    exposure that the dollar budget cannot actually fund.
+    """
+
+    limits: List[int] = []
+    for _leaf, cfg in mini_request_concrete_leaf_bindings(client):
+        configured = getattr(cfg, "max_tokens", None)
+        value = (
+            max_tokens_override
+            if max_tokens_override is not None
+            else configured if configured is not None else fallback_output_tokens
+        )
+        limits.append(max(0, int(value or 0)))
+    return limits
+
+
 def reservation_pricing_targets(client: Any) -> tuple[tuple[str, str], ...]:
     """Return every concrete model/provider leaf that a client may charge."""
     return tuple(_reservation_pricing_targets(client))
@@ -2463,18 +2487,9 @@ class CostBudgetController:
             # lower-bound probe must fail open rather than either coercing an
             # unresolved policy or broadcasting one sibling's cap.
             return True
-        cfg_max_tokens = getattr(getattr(client, "cfg", None), "max_tokens", None)
-        if max_tokens_override is not None:
-            reserved_output_tokens = max(0, int(max_tokens_override or 0))
-        elif cfg_max_tokens is not None:
-            reserved_output_tokens = max(
-                0,
-                min(int(cfg_max_tokens or 0), int(self.reserve_output_tokens or 0))
-                if self.reserve_output_tokens > 0
-                else int(cfg_max_tokens or 0),
-            )
-        else:
-            reserved_output_tokens = int(self.reserve_output_tokens or 0)
+        reserved_output_tokens_by_target = _reservation_output_token_limits(
+            client, max_tokens_override, self.reserve_output_tokens,
+        )
         targets = _reservation_pricing_targets(client)
         multipliers = _candidate_output_multipliers(
             client,
@@ -2511,7 +2526,7 @@ class CostBudgetController:
                 return True
             _input_per_m, _cached_per_m, output_per_m = pricing
             model_costs.append(
-                reserved_output_tokens
+                reserved_output_tokens_by_target[index]
                 * max(0, output_multiplier)
                 * attempt_multiplier
                 * output_per_m
@@ -2589,7 +2604,6 @@ class CostBudgetController:
             estimated_input_tokens_by_target,
             default=0,
         )
-        cfg_max_tokens = getattr(getattr(client, "cfg", None), "max_tokens", None)
         if envelope_receipts:
             reserved_output_tokens_by_target = [
                 max(0, int(receipt.max_output_tokens))
@@ -2599,26 +2613,11 @@ class CostBudgetController:
                 reserved_output_tokens_by_target,
                 default=0,
             )
-        elif max_tokens_override is not None:
-            reserved_output_tokens = max(0, int(max_tokens_override or 0))
-            reserved_output_tokens_by_target = [
-                reserved_output_tokens for _ in targets
-            ]
-        elif cfg_max_tokens is not None:
-            reserved_output_tokens = max(
-                0,
-                min(int(cfg_max_tokens or 0), int(self.reserve_output_tokens or 0))
-                if self.reserve_output_tokens > 0
-                else int(cfg_max_tokens or 0),
-            )
-            reserved_output_tokens_by_target = [
-                reserved_output_tokens for _ in targets
-            ]
         else:
-            reserved_output_tokens = int(self.reserve_output_tokens or 0)
-            reserved_output_tokens_by_target = [
-                reserved_output_tokens for _ in targets
-            ]
+            reserved_output_tokens_by_target = _reservation_output_token_limits(
+                client, max_tokens_override, self.reserve_output_tokens,
+            )
+            reserved_output_tokens = max(reserved_output_tokens_by_target, default=0)
 
         multipliers = _candidate_output_multipliers(
             client,
@@ -4875,7 +4874,15 @@ class CostBudgetController:
                 # Preserve the caller's live pre-dispatch hook. Budget state is
                 # extended first so the live hold includes new authority.
                 if inherited_dispatch_observer is not None:
-                    observed = inherited_dispatch_observer()
+                    observer_details = dict(receipt)
+                    try:
+                        inspect.signature(inherited_dispatch_observer).bind(
+                            observer_details
+                        )
+                    except (TypeError, ValueError):
+                        observed = inherited_dispatch_observer()
+                    else:
+                        observed = inherited_dispatch_observer(observer_details)
                     if inspect.isawaitable(observed):
                         await observed
             except BaseException:

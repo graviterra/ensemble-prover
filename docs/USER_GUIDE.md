@@ -538,8 +538,13 @@ heartbeat budget. Raising heartbeats does not raise `--lean-timeout-s`.
 cost when the provider reports them. A positive budget performs pre-dispatch
 reservations and requires known pricing for every configured paid role.
 
-`--cost-budget-reserve-output-tokens` controls the output-token reserve used by
-that pre-dispatch check. Final accounting prefers provider-reported usage.
+`--cost-budget-reserve-output-tokens` sets the fallback output-token reserve for
+clients without a configured output limit. Known request limits and each concrete
+provider's configured output allowance are reserved in full, including inside
+model chains and pools. This option does not change provider output limits.
+A budget that previously admitted a request using a smaller reserve can now
+reject it before dispatch; lower the request limit or raise the dollar budget
+to fund that request. Final accounting prefers provider-reported usage.
 Parallel sampling can multiply cost approximately with the number of samples.
 
 ## 8. Control search breadth

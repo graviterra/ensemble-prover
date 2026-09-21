@@ -13196,7 +13196,9 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=1024,
         help=(
-            "Output-token reserve used for pre-dispatch dollar-budget checks. "
+            "Fallback output-token reserve for clients without a configured "
+            "output limit. Known request/leaf limits are reserved in full; "
+            "this option does not change provider output limits. "
             "Final cost uses provider-reported usage when present."
         ),
     )

@@ -625,12 +625,11 @@ async def await_with_strict_deadline(
             _raise_deadline_expired_for_scope(
                 detached=(detached and operation_ownership == "transaction_state")
             )
-        try:
-            result = task.result()
-        except asyncio.CancelledError as exc:
-            raise asyncio.TimeoutError from exc
-        # A task can finish after its wait wakes but before the result is read.
+        # Check authority before observing either a value or an exception. A
+        # completed failure can contain the same late writes as a success and
+        # must not bypass the owning dispatch's mutation incident accounting.
         if time.monotonic() >= expires_at:
+            _consume_task_exception(task)
             # The task is already done, so ``_cancel_and_abandon`` would
             # intentionally ignore it.  Its writes nevertheless occurred
             # after authority expired.  Publish the same per-scope integrity
@@ -645,7 +644,10 @@ async def await_with_strict_deadline(
             _raise_deadline_expired_for_scope(
                 detached=(operation_ownership == "transaction_state")
             )
-        return result
+        try:
+            return task.result()
+        except asyncio.CancelledError as exc:
+            raise asyncio.TimeoutError from exc
     except BaseException as exc:
         if not timeout_cleanup_completed and not task.done():
             _cancel_and_abandon(

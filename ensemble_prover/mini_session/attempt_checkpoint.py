@@ -154,6 +154,7 @@ class AttemptCheckpointRegistry:
         self._execution_audit: dict[str, dict[str, int]] = {}
         self._sequence = 0
         self._closed = False
+        self._publication_failed = False
         self._lock_fp = None
         self._restored_cost_record = None
         self._restored_recorder_record = None
@@ -326,13 +327,19 @@ class AttemptCheckpointRegistry:
             "predecessor": getattr(self, "predecessor", None),
         }
 
-    def _publish(self, record: dict[str, Any]) -> None:
+    def _require_writable(self) -> None:
         if self._closed:
             raise RuntimeError("Attempt checkpoint writer is closed")
+        if self._publication_failed:
+            raise RuntimeError(
+                "Attempt checkpoint writer failed; close and resume from the validated attempt head"
+            )
+
+    def _publish(self, record: dict[str, Any]) -> None:
+        self._require_writable()
         next_sequence = self._sequence + 1
         snapshot_path = self.directory / "checkpoints" / f"{next_sequence:012d}.json"
         snapshot = _json(record)
-        _write(snapshot_path, snapshot)
         head = {"generation_id": self.generation_id, "snapshot_path": str(snapshot_path),
                 "snapshot_hash": _digest(snapshot)}
         manifest = {"schema_version": _SCHEMA, "attempt_id": self.attempt_id,
@@ -340,8 +347,17 @@ class AttemptCheckpointRegistry:
                     "head": head}
         # The shared head prevents a later restart from silently restoring an
         # older generation's cost capacity. Never fall back past this head.
-        _write(self.directory / _MANIFEST, manifest)
-        _write(self.registry_root / "head.json", head)
+        try:
+            _write(snapshot_path, snapshot)
+            _write(self.directory / _MANIFEST, manifest)
+            _write(self.registry_root / "head.json", head)
+        except BaseException:
+            # A rename may have published the new head before its durability
+            # acknowledgement failed. Reusing this sequence would overwrite a
+            # committed snapshot with stale in-memory state. Keep ownership,
+            # but fence sibling, shutdown and journal writes until fresh resume.
+            self._publication_failed = True
+            raise
         self._sequence = next_sequence
 
     @property
@@ -404,6 +420,7 @@ class AttemptCheckpointRegistry:
         return _json(self._outer_state)
 
     async def bind_session(self, lane_key: str, session: Any) -> None:
+        self._require_writable()
         from .durable_checkpoint import restore_session_record
         from .durable_session_record import (
             initialize_theory_checkpoint_context, session_checkpoint_identity,
@@ -498,6 +515,7 @@ class AttemptCheckpointRegistry:
         # accounting lock may await durable_cost_event, which uses only the
         # independent journal lock and never acquires this transaction lock.
         async with self._lock:
+            self._require_writable()
             publication_guard = updates.pop("publication_guard", None)
             if publication_guard is not None and not publication_guard():
                 raise RuntimeError("Planner publication ownership was revoked")
@@ -588,6 +606,7 @@ class AttemptCheckpointRegistry:
         action_runtime: dict[str, Any], selected_work: dict[str, Any],
         *, publication_guard: Any = None,
     ) -> str:
+        self._require_writable()
         if publication_guard is not None and not publication_guard():
             raise RuntimeError("Child publication ownership was revoked")
         if parent_lane not in self._sessions:
@@ -631,8 +650,7 @@ class AttemptCheckpointRegistry:
 
     async def durable_cost_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         async with self._journal_lock:
-            if self._closed:
-                raise RuntimeError("Attempt checkpoint writer is closed")
+            self._require_writable()
             return self._journal_writer.append(kind="cost_ledger", payload=_json(payload))
 
     def close(self) -> None:
