@@ -11,6 +11,7 @@ from .helper_salvage import (
     dedupe_helpers_by_name_last_wins,
     order_helpers_for_incremental_validation,
 )
+from .lean_decl_parser import find_decl_header_end
 from .lean_syntax import normalize_nat_factorial_notation
 from .proof_dossier import (
     helper_decl_body,
@@ -2311,61 +2312,14 @@ def _top_level_chunks_from_reply(llm_output: str) -> List[str]:
 
 
 def _find_top_level_assign(src: str) -> int:
-    """Position AFTER the example's body separator ``:=``.
+    """Position after the declaration's ``:=``, excluding local bindings.
 
-    The hard cases here are ``:=`` tokens that appear *inside the type* —
-    `let x := 1; x = 1 := by ...`, `let x := 1\\n  x = 1 := by ...`
-    (layout-let), `(a : Nat := 0) → ...` (default arg), etc.
-
-    Strategy: walk paren-depth-aware (so `:=` inside `(...)` or `[...]` or
-    `{...}` are skipped). Prefer the first top-level ``:=`` that's followed
-    by ``by`` — our prompt tells the model to write tactic proofs starting
-    with `by`, and `let x := <value>` bindings have a value (number, name,
-    expr) after `:=`, not the keyword `by`. Fall back to the first top-level
-    ``:=`` overall so term-mode proofs (`:= rfl`, `:= True.intro`) on a
-    plain `example` still work.
-
-    This is a heuristic, not a real Lean parser. It wins on the cases the
-    PutnamBench parser tests cover (inline let, layout let, split-line let)
-    without having to model Lean's full layout rules. The only contrived
-    miss is `let x := by <tac>` *in the type*, where the let value itself
-    starts with `by` — extremely rare.
+    Use the same boundary scanner as input loading. A local value can itself
+    start with ``by``, and the actual proof can be a term such as ``rfl``.
+    Neither is evidence for choosing an assignment token as the boundary.
     """
-    # The comment/string masker is length-preserving, so positions found in
-    # ``scan_src`` remain valid in ``src`` while non-code ``:=`` tokens cannot
-    # masquerade as the declaration body separator.
-    scan_src = _strip_lean_comments_and_strings(src)
-    i = 0
-    n = len(scan_src)
-    depth = 0          # paren/bracket/brace nesting
-    fallback = -1      # first top-level `:=` we see (term-mode safety net)
-    while i < n:
-        quoted_end = _lean_quoted_identifier_end(scan_src, i)
-        if quoted_end > i:
-            i = quoted_end
-            continue
-        c = scan_src[i]
-        if c in "([{":
-            depth += 1
-            i += 1
-        elif c in ")]}":
-            depth = max(0, depth - 1)
-            i += 1
-        elif depth == 0 and scan_src.startswith(":=", i):
-            stripped = scan_src[i + 2 :].lstrip()
-            # Word-boundary check for `by` (so `byName` and `byzantine`
-            # don't accidentally match).
-            if stripped.startswith("by") and (
-                len(stripped) == 2
-                or not (stripped[2].isalnum() or stripped[2] == "_")
-            ):
-                return i + 2
-            if fallback < 0:
-                fallback = i + 2
-            i += 2
-        else:
-            i += 1
-    return fallback
+    end = find_decl_header_end(src, 0)
+    return -1 if end is None else end
 
 
 def _take_leading_example_binder_group(

@@ -12,6 +12,8 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
+from .lean_decl_parser import find_decl_header_end
+
 
 def now_ts() -> float:
     return time.time()
@@ -3461,6 +3463,20 @@ def _strip_trailing_subgoal_explanation_lines(s: str) -> str:
     raw = str(s or "").strip()
     if "\n" not in raw:
         return raw
+    # The prose heuristics below infer scope from ordinary named ``let``
+    # bindings. Anonymous instances, recursive functions and other local forms do not
+    # have that scope model; trimming their body can change the proposition.
+    # Keep these terms intact and let Lean reject any actual trailing prose.
+    first_assign = _first_top_level_assign(raw)
+    local_prefix = raw[:first_assign] if first_assign >= 0 else raw
+    if any(
+        _first_top_level_keyword(local_prefix, keyword) >= 0
+        for keyword in (
+            "letI", "let_delayed", "let_tmp", "let_fun", "let_λ", "let_mvar%", "let_expr",
+            "have", "haveI", "rec",
+        )
+    ):
+        return raw
     lines = raw.splitlines()
     while len(lines) > 1:
         trailer = lines[-1]
@@ -4489,49 +4505,6 @@ def _first_top_level_assign(s: str) -> int:
     return -1
 
 
-def _top_level_assign_positions(s: str) -> list[int]:
-    """Return all top-level ':=' positions."""
-    positions: list[int] = []
-    depth = 0
-    i = 0
-    while i < len(s) - 1:
-        skip_to = _lean_lexical_skip_end(s, i)
-        if skip_to is not None:
-            i = skip_to
-            continue
-        ch = s[i]
-        if ch in _GROUP_OPEN_TO_CLOSE:
-            depth += 1
-        elif ch in _GROUP_OPEN_TO_CLOSE.values():
-            depth = max(0, depth - 1)
-        elif ch == ":" and s[i + 1] == "=" and depth == 0:
-            positions.append(i)
-            i += 1
-        i += 1
-    return positions
-
-
-def _top_level_semicolon_positions(s: str) -> list[int]:
-    """Return all top-level semicolon positions."""
-    positions: list[int] = []
-    depth = 0
-    i = 0
-    while i < len(s):
-        skip_to = _lean_lexical_skip_end(s, i)
-        if skip_to is not None:
-            i = skip_to
-            continue
-        ch = s[i]
-        if ch in _GROUP_OPEN_TO_CLOSE:
-            depth += 1
-        elif ch in _GROUP_OPEN_TO_CLOSE.values():
-            depth = max(0, depth - 1)
-        elif ch == ";" and depth == 0:
-            positions.append(i)
-        i += 1
-    return positions
-
-
 def _looks_like_declaration_proof_tail(s: str) -> bool:
     tail = str(s or "").strip()
     if not tail:
@@ -4563,59 +4536,11 @@ def _looks_like_declaration_proof_tail(s: str) -> bool:
     )
 
 
-def _assign_is_local_let_binding(raw: str, idx: int) -> bool:
-    """Return True when the top-level ``:=`` at *idx* is a local-let binder."""
-    text = str(raw or "")
-    if idx < 0:
-        return False
-    segment_start = 0
-    _binders, body = _split_leading_forall_statement(text)
-    body_start = text.rfind(body) if body else -1
-    if body_start != -1:
-        implication_prefix, conclusion = _split_top_level_implication_conclusion(
-            body
-        )
-        if conclusion.startswith("let "):
-            segment_start = body_start + len(implication_prefix)
-    for semicolon_idx in _top_level_semicolon_positions(text):
-        if segment_start <= semicolon_idx < idx:
-            segment_start = semicolon_idx + 1
-    segment = text[segment_start:]
-    segment_stripped = segment.lstrip()
-    segment_offset = segment_start + (len(segment) - len(segment_stripped))
-    if not segment_stripped.startswith("let "):
-        return False
-    segment_assign = _first_top_level_assign(segment_stripped)
-    return segment_assign != -1 and idx == segment_offset + segment_assign
-
-
-def _assign_is_tactic_local_binding(raw: str, idx: int) -> bool:
-    """Return True for tactic-local bindings like ``have h := by ...``."""
-    text = str(raw or "")
-    if idx < 0:
-        return False
-    line_start = text.rfind("\n", 0, idx) + 1
-    semicolon_start = text.rfind(";", 0, idx) + 1
-    assign_start = text.rfind(":=", 0, idx) + 2
-    segment_start = max(line_start, semicolon_start, assign_start)
-    lhs = text[segment_start:idx].strip()
-    if not lhs and line_start > 0:
-        prev_line_end = line_start - 1
-        prev_line_start = text.rfind("\n", 0, prev_line_end) + 1
-        lhs = text[prev_line_start:prev_line_end].strip()
-    if lhs.startswith("by "):
-        lhs = lhs[3:].lstrip()
-    return bool(re.match(r"^(?:haveI|letI|have|let|suffices)\b", lhs))
-
-
 def _strip_trailing_declaration_proof_assign(s: str) -> str:
     raw = str(s or "").strip()
-    for idx in _top_level_assign_positions(raw):
-        if _assign_is_local_let_binding(raw, idx) or _assign_is_tactic_local_binding(raw, idx):
-            continue
-        rhs = raw[idx + 2 :].strip()
-        if _looks_like_declaration_proof_tail(rhs):
-            return raw[:idx].rstrip()
+    end = find_decl_header_end(raw, 0)
+    if end is not None and _looks_like_declaration_proof_tail(raw[end:]):
+        return raw[: end - 2].rstrip()
     return raw
 
 
@@ -5434,28 +5359,16 @@ def normalize_subgoal_statement(
             for _ in range(paren_layers):
                 s = f"({s})"
 
-    assign_idx = _first_top_level_assign(s)
-    _binders, body = _split_leading_forall_statement(s)
-    body_candidate = (body or s).strip()
-    _implication_prefix, conclusion_candidate = (
-        _split_top_level_implication_conclusion(body_candidate)
-    )
-    preserve_local_let = s.startswith("let ") or _looks_like_top_level_let_expression(s) or (
-        conclusion_candidate.startswith("let")
-        and _looks_like_top_level_let_expression(conclusion_candidate)
-    )
-    if assign_idx != -1:
-        lhs = s[:assign_idx].rstrip()
-        rhs = s[assign_idx + 2 :].strip()
-        # Preserve local `let ... := ...; ...` style expressions; their
-        # top-level assignment is part of the statement, not a declaration
-        # wrapper.  Also preserve truncated `:=` tails so validation can fail
-        # closed instead of silently turning malformed statements into
-        # apparently valid binder-only theorems.
-        stripped = _strip_trailing_declaration_proof_assign(s)
-        if stripped != s:
-            s = stripped
-        elif not preserve_local_let and _first_top_level_semicolon(s) == -1 and rhs:
+    header_end = find_decl_header_end(s, 0)
+    if header_end is not None:
+        lhs = s[: header_end - 2].rstrip()
+        rhs = s[header_end:].strip()
+        # The shared declaration scanner skips local assignments, including
+        # multiline instance bindings. Keep incomplete proof tails for Lean
+        # validation rather than turning them into apparently valid claims.
+        if _looks_like_declaration_proof_tail(rhs):
+            s = lhs
+        elif _first_top_level_semicolon(s) == -1 and rhs:
             # A top-level `:=` in a type expression separates the statement
             # (LHS) from an attached proof term.  Strip the RHS for
             # declaration-shaped planner echoes like `... := by sorry`.

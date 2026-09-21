@@ -78,7 +78,6 @@ from .utils import (
     has_sorry_or_admit,
     is_standalone_sort_like_lean_expr,
     short_id,
-    strip_lean_comments_and_string_literals,
 )
 
 if TYPE_CHECKING:
@@ -206,9 +205,17 @@ private partial def ensembleCheckCommandBoundary (command : Lean.Syntax) : Bool 
 """
 
 
+def _type_identity_probe_command(name: str, statement: str) -> str:
+    """Elaborate a type once, finalizing auxiliaries without assuming its truth."""
+    return (
+        f"noncomputable def {name} (_miniStatement : {str(statement).strip()}\n"
+        ") := @_miniStatement"
+    )
+
+
 def _check_source_boundary_file(
     preamble: str, statement: str, proof: str, lemmas: str,
-    *, max_heartbeats: Optional[int] = None,
+    *, goal_name: str, max_heartbeats: Optional[int] = None,
 ) -> str:
     """Parse candidate data before any untrusted command can be elaborated.
 
@@ -229,6 +236,15 @@ def _check_source_boundary_file(
     )))
     if isinstance(max_heartbeats, int) and max_heartbeats > 0:
         trusted += f"\nset_option maxHeartbeats {max_heartbeats}\n"
+    # The first line is embedded after a declaration header in the checked
+    # file. Parsing it at column zero instead changes Lean's offside rule:
+    # a newline-delimited ``let rec`` body can become part of its last local
+    # definition. Preserve the actual columns, while still requiring each
+    # candidate to parse as one complete term before elaborating any of it.
+    declaration_prefix = f"opaque {goal_name} : "
+    statement_input = " " * len(declaration_prefix) + statement
+    proof_prefix = (declaration_prefix + statement + " := ").rsplit("\n", 1)[-1]
+    proof_input = " " * len(proof_prefix) + proof
     return trusted + "\n\n" + _CHECK_SOURCE_BOUNDARY_GUARD + f"""
 run_cmd do
   let input := Lean.Parser.mkInputContext {_lean_string(lemmas)} "scratch-helpers.lean"
@@ -275,10 +291,10 @@ run_cmd do
       Lean.Elab.Command.elabCommand command
 {target_context}
 run_cmd do
-  match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(statement)} with
+  match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(statement_input)} with
   | .error error => Lean.throwError m!"scratch source boundary: invalid target term: {{error}}"
   | .ok _ => pure ()
-  match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(proof)} with
+  match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(proof_input)} with
   | .error error => Lean.throwError m!"scratch source boundary: invalid proof term: {{error}}"
   | .ok _ => pure ()
 """
@@ -1775,20 +1791,35 @@ _SUGGESTION_TACTICS = frozenset(
 # Compiled regex for matching the first `sorry` in a proof.
 _SORRY_PATTERN = re.compile(r"\bsorry\b")
 
-# Free universe-variable detection (structural fix, 2026-04-16):
-# Match `Type u`, `Type u_1`, `Sort u_2`, `Type.{u}`, etc. where the
-# universe identifier is a lowercase token starting with a letter.
-# We exclude bound names like `Type 0`, `Type _`, `Type max u v` from
-# the simple detection — collected names are filtered through a
-# stoplist of Lean keywords.
-_UNIVERSE_VAR_RE = re.compile(
-    r"\b(?:Type|Sort)(?:\.\{)?\s*\(?\s*([a-z][A-Za-z0-9_']*)\b"
-)
 # Lean keywords / common identifiers that look like universe vars
 # but aren't free universes when they appear in a Type/Sort position.
 _UNIVERSE_VAR_STOPLIST: frozenset[str] = frozenset(
     {"max", "imax", "of", "Type", "Sort", "Prop", "in", "let", "fun", "do"}
 )
+_UNIVERSE_IDENT_COMPONENT = r"(?:«[^»\r\n]+»|(?:[^\W\d]|_)[\w'?!]*)"
+_UNIVERSE_DOTTED_IDENT = (
+    rf"(?:_root_\.)?{_UNIVERSE_IDENT_COMPONENT}(?:\.{_UNIVERSE_IDENT_COMPONENT})*"
+)
+
+
+def _universe_scan_source(source: str) -> str:
+    """Mask non-code without losing escaped identifiers or source offsets."""
+    from .theorem_project import _mask_attribute_contents, _mask_noncode
+
+    text = str(source or "")
+    protected = list(text)
+    cursor = 0
+    while cursor < len(text):
+        end = _lean_surface_lexical_skip_end(text, cursor)
+        if end is None:
+            cursor += 1
+            continue
+        if text[cursor] == "«":
+            # Quoted names can contain comment markers and command keywords.
+            # Preserve their spans, then recover their spelling from source.
+            protected[cursor:end] = "_" * (end - cursor)
+        cursor = end
+    return _mask_attribute_contents(_mask_noncode("".join(protected)))
 
 
 def _free_universe_names(statement: str) -> tuple[str, ...]:
@@ -1797,38 +1828,43 @@ def _free_universe_names(statement: str) -> tuple[str, ...]:
     text = str(statement or "")
     if not text:
         return ()
+    scan = _universe_scan_source(text)
     seen: List[str] = []
+    seen_keys: set[str] = set()
 
-    def collect(fragment: str) -> None:
-        for name in re.findall(r"\b[a-z][A-Za-z0-9_']*\b", fragment):
-            if name not in _UNIVERSE_VAR_STOPLIST and name not in seen:
+    def collect(start: int, end: int) -> None:
+        for match in re.finditer(_UNIVERSE_DOTTED_IDENT, scan[start:end]):
+            name = text[start + match.start():start + match.end()]
+            key = _universe_name_key(name)
+            if name != "_" and name not in _UNIVERSE_VAR_STOPLIST and key not in seen_keys:
                 seen.append(name)
+                seen_keys.add(key)
 
-    for match in re.finditer(r"\.\{([^{}]*)\}", text):
-        collect(match.group(1))
-    for match in re.finditer(r"\b(?:Type|Sort)\b", text):
+    for match in re.finditer(r"\.\{([^{}]*)\}", scan):
+        collect(match.start(1), match.end(1))
+    for match in re.finditer(r"\b(?:Type|Sort)\b", scan):
         cursor = match.end()
-        while cursor < len(text) and text[cursor].isspace():
+        while cursor < len(scan) and scan[cursor].isspace():
             cursor += 1
-        if cursor >= len(text) or text.startswith(".{", cursor):
+        if cursor >= len(scan) or scan.startswith(".{", cursor):
             continue
-        if text[cursor] == "(":
+        if scan[cursor] == "(":
             depth = 0
             end = cursor
-            while end < len(text):
-                if text[end] == "(":
+            while end < len(scan):
+                if scan[end] == "(":
                     depth += 1
-                elif text[end] == ")":
+                elif scan[end] == ")":
                     depth -= 1
                     if depth == 0:
                         end += 1
                         break
                 end += 1
-            collect(text[cursor:end])
+            collect(cursor, end)
         else:
-            level = re.match(r"[a-z][A-Za-z0-9_']*", text[cursor:])
+            level = re.match(_UNIVERSE_DOTTED_IDENT, scan[cursor:])
             if level:
-                collect(level.group(0))
+                collect(cursor, cursor + level.end())
     # Lean's delaborator assigns u_1, u_2, ... by declaration parameter
     # order, even when their first textual occurrences are reversed.
     if seen and all(re.fullmatch(r"u_[0-9]+", name) for name in seen):
@@ -1836,12 +1872,77 @@ def _free_universe_names(statement: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
+def _universe_name_key(name: str) -> str:
+    """Normalize optional quoting without collapsing escaped dotted atoms."""
+    return re.sub(r"«((?:[^\W\d]|_)[\w'?!]*)»", r"\1", name)
+
+
 def _declared_universe_names(source: str) -> frozenset[str]:
+    """Return universe parameters visible at the end of this command stream."""
+    from .theorem_project import (
+        _COMMAND_KEYWORD, _DOTTED_IDENT, _END_RE, _MUTUAL_RE,
+        _NAMESPACE_RE, _SECTION_RE, _multiline_scoped_prefix_before,
+    )
+
+    text = str(source or "")
+    scan = _universe_scan_source(text)
+    events = []
+    for kind, pattern in (
+        ("namespace", _NAMESPACE_RE), ("section", _SECTION_RE),
+        ("mutual", _MUTUAL_RE), ("end", _END_RE),
+        ("universe", re.compile(r"(?<!\S)universe(?=\s)")),
+    ):
+        # This scope reader must also recognize Lean's ?/! identifier suffixes;
+        # keep the broader grammar local rather than changing theorem scans.
+        pattern = re.compile(
+            pattern.pattern.replace(_DOTTED_IDENT, _UNIVERSE_DOTTED_IDENT),
+            pattern.flags,
+        )
+        events.extend((match.start(), kind, match) for match in pattern.finditer(scan))
+    events.sort(key=lambda item: item[0])
     names: set[str] = set()
-    scan = strip_lean_comments_and_string_literals(str(source or ""))
-    for match in re.finditer(r"(?m)^\s*universe\s+([^\r\n]+)", scan):
-        for name in re.findall(r"\b[a-z][A-Za-z0-9_']*\b", match.group(1)):
-            names.add(name)
+    scopes: list[tuple[str, set[str]]] = []
+    for _offset, kind, match in events:
+        if kind != "universe":
+            scope_name = (
+                _universe_name_key(text[match.start("name"):match.end("name")])
+                if "name" in match.groupdict() and match.group("name") else ""
+            )
+            if kind != "end":
+                scopes.append((scope_name, set(names)))
+            elif scopes:
+                for index in range(len(scopes) - 1, -1, -1):
+                    name, snapshot = scopes[index]
+                    if not scope_name or name == scope_name or name.endswith("." + scope_name):
+                        names = set(snapshot)
+                        del scopes[index:]
+                        break
+            continue
+        if _multiline_scoped_prefix_before(scan, match.start())[1]:
+            # A command wrapper restores its scope after this declaration.
+            continue
+        cursor = match.end()
+        declared: list[str] = []
+        while cursor < len(scan):
+            while cursor < len(scan) and scan[cursor].isspace():
+                cursor += 1
+            token = re.match(_UNIVERSE_DOTTED_IDENT, scan[cursor:])
+            if token is None:
+                break
+            word = token.group(0)
+            if word == "in":
+                # ``universe u in <command>`` has no persistent scope effect.
+                declared.clear()
+                break
+            if re.fullmatch(_COMMAND_KEYWORD, word) or word in {
+                "import", "prelude", "public", "private", "protected",
+                "noncomputable", "unsafe", "partial", "initialize", "builtin_initialize",
+            }:
+                break
+            name = text[cursor:cursor + token.end()]
+            declared.append(_universe_name_key(name))
+            cursor += token.end()
+        names.update(declared)
     return frozenset(names)
 
 
@@ -1856,7 +1957,10 @@ def _free_universe_decl(statement: str, *, declared_in: str = "") -> str:
     present (the common case for fully-monomorphic statements).
     """
     declared = _declared_universe_names(declared_in)
-    names = [name for name in _free_universe_names(statement) if name not in declared]
+    names = [
+        name for name in _free_universe_names(statement)
+        if _universe_name_key(name) not in declared
+    ]
     if not names:
         return ""
     return "universe " + " ".join(names)
@@ -4914,7 +5018,7 @@ class LeanRunner:
         universe_scan_text = "\n".join(
             part for part in (statement, lemma_block, proof_code) if part
         )
-        universe_decl = _free_universe_decl(universe_scan_text)
+        universe_decl = _free_universe_decl(universe_scan_text, declared_in=preamble)
         # ── set_option scoping fix (2026-04-16) ──────────────────────
         # `set_option X in <command>` scopes the option AND any
         # declarations within it to a single command. Putting
@@ -5743,6 +5847,7 @@ class LeanRunner:
             boundary_content = _check_source_boundary_file(
                 self._resolve_preamble(preamble_override, proof_code=proof_code),
                 statement, proof_code, "\n".join(lemmas or ()),
+                goal_name=goal_name,
                 max_heartbeats=max_heartbeats,
             )
             file_path, execution, write_error = await self._execute_generated_file(
@@ -6899,7 +7004,7 @@ class LeanRunner:
         # `#check` itself. Live trace 2001_a1_16apr_11.jsonl: every
         # `check_type` call on a solved synthetic lemma hit this path.
         universe_scan_text = "\n".join(part for part in (lemma_block,) if part)
-        universe_decl = _free_universe_decl(universe_scan_text)
+        universe_decl = _free_universe_decl(universe_scan_text, declared_in=preamble)
         head_universe_decl = f"{universe_decl}\n\n" if universe_decl else ""
         rendered_term = (
             f"@{sanitized}"
@@ -7057,7 +7162,7 @@ class LeanRunner:
             aliases = _observation_preamble_solution_ref_aliases(context)
             if _observation_expression_references_proof_alias(sanitized, aliases):
                 return "Error: that declaration is not available for inspection"
-        universe_decl = _free_universe_decl(lemma_block)
+        universe_decl = _free_universe_decl(lemma_block, declared_in=preamble)
         marker_id = uuid.uuid4().hex
         begin, end = f"ensemble_print_begin_{marker_id}", f"ensemble_print_end_{marker_id}"
         content = (
@@ -7132,7 +7237,7 @@ class LeanRunner:
         # default delaborator omits dependent Pi/Exists binder types whenever
         # the surrounding expression supplies enough expected-type context
         # (for example ``∃ n t, ... t i ...``). Once copied into a standalone
-        # axiom that context is gone and the rendered type no longer
+        # type probe that context is gone and the rendered type no longer
         # elaborates. Force binder annotations at the source boundary while
         # retaining readable notation and names.
         printer_prefix = (
@@ -7198,60 +7303,77 @@ class LeanRunner:
             return parse_lean_output(output, 1), output, 1
         operation_timeout = max(1.0, float(timeout_s))
         operation_deadline = time.monotonic() + operation_timeout
-        universe_decl = _free_universe_decl(candidate, declared_in=source)
-        candidate_literal = json.dumps(candidate, ensure_ascii=False)
-        source_term_literal = json.dumps(
-            f"@_root_.{sanitized}",
-            ensure_ascii=False,
+        resolved_preamble = self._resolve_preamble(preamble_override)
+        _clean_preamble, target_scoped_prefix, target_omit_variables = (
+            decode_theorem_target_context(resolved_preamble)
         )
-        probe = "\n".join(
-            (
-                "run_cmd Lean.Elab.Command.liftTermElabM do",
-                "  let candidateStx ←",
-                "    match Lean.Parser.runParserCategory (← Lean.getEnv) `term",
-                f"        {candidate_literal} with",
-                "    | .ok stx => pure stx",
-                "    | .error error => Lean.throwError error",
-                "  let candidateType ← Lean.Elab.Term.withoutErrToSorry do",
-                "    Lean.Elab.Term.elabType candidateStx",
-                "  Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing",
-                "  let candidateType ← Lean.instantiateMVars candidateType",
-                "  let candidateLevelParams :=",
-                "    (Lean.collectLevelParams {} candidateType).params.toList",
-                "  let sourceStx ←",
-                "    match Lean.Parser.runParserCategory (← Lean.getEnv) `term",
-                f"        {source_term_literal} with",
-                "    | .ok stx => pure stx",
-                "    | .error error => Lean.throwError error",
-                "  let sourceTerm ← Lean.Elab.Term.withoutErrToSorry do",
-                "    Lean.Elab.Term.elabTerm sourceStx none",
-                "  let some sourceName := sourceTerm.getAppFn.constName?",
-                '    | Lean.throwError "source theorem did not elaborate to a constant"',
-                "  let sourceInfo ← Lean.getConstInfo sourceName",
-                "  let sourceLevelParams :=",
-                "    (Lean.collectLevelParams {} sourceInfo.type).params.toList",
-                "  unless sourceLevelParams.length ==",
-                "      candidateLevelParams.length do",
-                '    Lean.throwError "rendered type changed the source universe arity"',
-                "  let commonLevels := sourceLevelParams.map Lean.Level.param",
-                "  let sourceType := sourceInfo.type.instantiateLevelParams",
-                "    sourceLevelParams commonLevels",
-                "  let candidateType := candidateType.instantiateLevelParams",
-                "    candidateLevelParams commonLevels",
-                "  unless ← Lean.Meta.isDefEq sourceType candidateType do",
-                '    Lean.throwError "rendered type is not definitionally equal to the source declaration type"',
+        candidate_name = f"miniSourceCandidate_{uuid.uuid4().hex}"
+        candidate_command = _type_identity_probe_command(
+            f"_root_.{candidate_name}", candidate
+        )
+        if target_omit_variables:
+            candidate_command = (
+                f"omit {' '.join(target_omit_variables)} in\n{candidate_command}"
             )
+        if target_scoped_prefix:
+            candidate_command = f"{target_scoped_prefix}\n{candidate_command}"
+        source_text = str(source or "").rstrip()
+        trailing_closers = re.search(
+            r"(?ms)(?P<closers>(?:^\s*end(?:\s+[^\s]+)?\s*$\n?)+)\s*\Z",
+            source_text,
         )
-        content = (
-            str(source or "").rstrip()
+        insertion = (
+            trailing_closers.start("closers")
+            if trailing_closers
+            else len(source_text)
+        )
+        universe_decl = _free_universe_decl(
+            candidate, declared_in=source_text[:insertion]
+        )
+        candidate_block = "\n".join(
+            part for part in (universe_decl, candidate_command) if part
+        )
+        module_content = (
+            source_text[:insertion].rstrip()
             + "\n\n"
-            + (universe_decl + "\n" if universe_decl else "")
-            + probe
+            + candidate_block
+            + "\n"
+            + source_text[insertion:]
             + "\n"
         )
+        source_literal = json.dumps(f"@_root_.{sanitized}", ensure_ascii=False)
+        # Compile the identity before comparing types. Direct elabType leaves
+        # let-rec auxiliaries as opaque metavariables until a declaration is
+        # finalized; neither pretty-printing nor defeq may inspect those metas.
+        probe = f"""run_cmd Lean.Elab.Command.liftTermElabM do
+  let sourceStx ←
+    match Lean.Parser.runParserCategory (← Lean.getEnv) `term {source_literal} with
+    | .ok stx => pure stx
+    | .error error => Lean.throwError error
+  let sourceTerm ← Lean.Elab.Term.withoutErrToSorry do
+    Lean.Elab.Term.elabTerm sourceStx none
+  let some sourceName := sourceTerm.getAppFn.constName?
+    | Lean.throwError "source theorem did not elaborate to a constant"
+  let sourceInfo ← Lean.getConstInfo sourceName
+  let .defnInfo candidateDef ← Lean.getConstInfo (Lean.Name.mkSimple "{candidate_name}")
+    | Lean.throwError "candidate type witness is not a definition"
+  let candidateType ← Lean.Meta.lambdaTelescope candidateDef.value fun params body => do
+    unless params.size > 0 && body == params.back! do
+      Lean.throwError "candidate type witness is not an identity"
+    Lean.Meta.mkForallFVars params.pop (← Lean.Meta.inferType body)
+  let sourceParams := (Lean.collectLevelParams {{}} sourceInfo.type).params.toList
+  let candidateParams := (Lean.collectLevelParams {{}} candidateType).params.toList
+  unless sourceParams.length == candidateParams.length do
+    Lean.throwError "rendered type changed the source universe arity"
+  let commonLevels := sourceParams.map Lean.Level.param
+  let sourceType := sourceInfo.type.instantiateLevelParams sourceParams commonLevels
+  let candidateType := candidateType.instantiateLevelParams candidateParams commonLevels
+  unless ← Lean.Meta.isDefEq sourceType candidateType do
+    Lean.throwError "rendered type is not definitionally equal to the source declaration type"
+"""
         _path, execution, write_error = await self._execute_generated_file(
-            goal_name=f"source_type_equiv_{short_id(content)}",
-            content=content,
+            goal_name=f"source_type_equiv_{short_id(module_content + probe)}",
+            content=module_content + "\n" + probe,
             timeout_s=max(1.0, min(15.0, operation_timeout * 0.4)),
             fast_fail_timeout_s=None,
             semaphore=self.sem,
@@ -7266,92 +7388,14 @@ class LeanRunner:
             return parsed, output, returncode
 
         # Core-only projects need not import Lean's command meta API. Compile
-        # the exact source and an independently elaborated candidate axiom into
-        # one temporary module *before* importing Meta, then compare the two
-        # stored ConstantInfo types from a second module. This preserves the
-        # original elaboration environment and gives neither side an expected
-        # type or coercion path from the other.
-        resolved_preamble = self._resolve_preamble(preamble_override)
-        _clean_preamble, target_scoped_prefix, target_omit_variables = (
-            decode_theorem_target_context(resolved_preamble)
-        )
-        candidate_name = f"miniSourceCandidate_{uuid.uuid4().hex}"
-        candidate_command = f"axiom _root_.{candidate_name} : {candidate}"
-        if target_omit_variables:
-            candidate_command = (
-                f"omit {' '.join(target_omit_variables)} in\n{candidate_command}"
-            )
-        if target_scoped_prefix:
-            candidate_command = f"{target_scoped_prefix}\n{candidate_command}"
-        candidate_universe_decl = _free_universe_decl(
-            candidate,
-            declared_in=source,
-        )
-        candidate_block = "\n".join(
-            part for part in (candidate_universe_decl, candidate_command) if part
-        )
-        source_text = str(source or "").rstrip()
-        trailing_closers = re.search(
-            r"(?ms)(?P<closers>(?:^\s*end(?:\s+[^\s]+)?\s*$\n?)+)\s*\Z",
-            source_text,
-        )
-        insertion = (
-            trailing_closers.start("closers")
-            if trailing_closers
-            else len(source_text)
-        )
-        module_content = (
-            source_text[:insertion].rstrip()
-            + "\n\n"
-            + candidate_block
-            + "\n"
-            + source_text[insertion:]
-            + "\n"
-        )
+        # the source and candidate in their original environment first, then
+        # import their finalized declarations alongside Meta for the comparison.
         module_name = f"MiniSourceEquiv{uuid.uuid4().hex}"
         module_path = self.temp_dir / f"{module_name}.lean"
         olean_path = self.temp_dir / f"{module_name}.olean"
         ilean_path = self.temp_dir / f"{module_name}.ilean"
         probe_path = self.temp_dir / f"{module_name}Probe.lean"
-        source_literal = json.dumps(f"@_root_.{sanitized}", ensure_ascii=False)
-        candidate_literal = json.dumps(
-            f"@_root_.{candidate_name}",
-            ensure_ascii=False,
-        )
-        module_probe = f"""import Lean.Elab.Command
-import {module_name}
-
-run_cmd Lean.Elab.Command.liftTermElabM do
-  let sourceStx ←
-    match Lean.Parser.runParserCategory (← Lean.getEnv) `term {source_literal} with
-    | .ok stx => pure stx
-    | .error error => Lean.throwError error
-  let sourceTerm ← Lean.Elab.Term.withoutErrToSorry do
-    Lean.Elab.Term.elabTerm sourceStx none
-  let some sourceName := sourceTerm.getAppFn.constName?
-    | Lean.throwError "source theorem did not elaborate to a constant"
-  let candidateStx ←
-    match Lean.Parser.runParserCategory (← Lean.getEnv) `term {candidate_literal} with
-    | .ok stx => pure stx
-    | .error error => Lean.throwError error
-  let candidateTerm ← Lean.Elab.Term.withoutErrToSorry do
-    Lean.Elab.Term.elabTerm candidateStx none
-  let some candidateName := candidateTerm.getAppFn.constName?
-    | Lean.throwError "candidate witness did not elaborate to a constant"
-  let sourceInfo ← Lean.getConstInfo sourceName
-  let candidateInfo ← Lean.getConstInfo candidateName
-  let sourceParams := (Lean.collectLevelParams {{}} sourceInfo.type).params.toList
-  let candidateParams :=
-    (Lean.collectLevelParams {{}} candidateInfo.type).params.toList
-  unless sourceParams.length == candidateParams.length do
-    Lean.throwError "rendered type changed the source universe arity"
-  let commonLevels := sourceParams.map Lean.Level.param
-  let sourceType := sourceInfo.type.instantiateLevelParams sourceParams commonLevels
-  let candidateType :=
-    candidateInfo.type.instantiateLevelParams candidateParams commonLevels
-  unless ← Lean.Meta.isDefEq sourceType candidateType do
-    Lean.throwError "rendered type is not definitionally equal to the source declaration type"
-"""
+        module_probe = f"import Lean.Elab.Command\nimport {module_name}\n\n{probe}"
         lifecycle_task: Optional[asyncio.Task[Any]] = None
         sem_acquired = False
         remaining = operation_deadline - time.monotonic()
@@ -7627,6 +7671,10 @@ run_cmd Lean.Elab.Command.liftTermElabM do
         and required to be definitionally equal to the original closed
         ``Expr`` before the nonce-bound batch marker is emitted.
 
+        A conditional definition takes those closed goals as proof parameters.
+        Lean finalizes local recursive helpers and kernel-checks that definition
+        before any receipt is emitted; unreturned helper holes are rejected.
+
         Human diagnostic goal text is deliberately absent from this API. A
         non-``by`` partial proof is interpreted as exactly one
         ``refine (<term>)`` tactic so its term holes remain residual mvars.
@@ -7718,10 +7766,15 @@ run_cmd Lean.Elab.Command.liftTermElabM do
         proof_stub_sha256 = hash_text(raw_proof)
         nonce = uuid.uuid4().hex
         serializer_prefix = f"miniResidual_{nonce}"
+        witness_name = f"miniResidualWitness_{nonce}"
+        proof_witness = f"miniResidualProof_{nonce}"
+        capture_syntax = f"miniResidualCapture_{nonce}"
         proof_rejection_marker = f"MINI_RESIDUAL_PROOF_REJECTION_{nonce}"
         postprocess_marker = f"MINI_RESIDUAL_POSTPROCESS_FAILURE_{nonce}"
         statement_literal = json.dumps(raw_statement, ensure_ascii=False)
-        proof_literal = json.dumps(raw_proof, ensure_ascii=False)
+        proof_header = f"opaque goal_{short_id(raw_statement + raw_proof)} : {raw_statement} := "
+        proof_column = len(proof_header.rsplit("\n", 1)[-1])
+        proof_literal = json.dumps(" " * proof_column + raw_proof, ensure_ascii=False)
         serializer = f"""
 private def {serializer_prefix}_binderInfo :
     Lean.BinderInfo → Lean.Json
@@ -7791,6 +7844,42 @@ private def {serializer_prefix}_parse
   | .ok stx => pure stx
   | .error error => Lean.throwError error
 
+private def {serializer_prefix}_prepare : Lean.Elab.Command.CommandElabM Unit := do
+  let source := {statement_literal}
+  let name := `{witness_name}
+  let headerText := "noncomputable def _root_." ++ name.toString ++ " (_miniStatement : "
+  let parserSource := String.ofList (List.replicate headerText.length ' ') ++ source
+  let stx ← Lean.Elab.Command.liftCoreM <|
+    {serializer_prefix}_parse `term parserSource
+  let stx : Lean.TSyntax `term := ⟨stx⟩
+  let ident := Lean.mkIdent (`_root_ ++ name)
+  let before ← Lean.getEnv
+  Lean.Elab.Command.elabCommand (← `(command|
+    noncomputable def $ident:ident (_miniStatement : $stx) := @_miniStatement))
+  for (introduced, _) in (← Lean.getEnv).constants.map₂.toList do
+    if name.isPrefixOf introduced && before.contains introduced then
+      Lean.throwError "residual witness name collides with an existing declaration"
+
+private def {serializer_prefix}_parentType : Lean.Elab.Term.TermElabM Lean.Expr := do
+  let name := `{witness_name}
+  let .defnInfo witness ← Lean.getConstInfo name
+    | Lean.throwError "residual parent witness is not a definition"
+  let type ← Lean.Meta.lambdaTelescope witness.value fun params body => do
+    if params.isEmpty || body != params.back! then
+      Lean.throwError "residual parent witness is not an identity"
+    Lean.Meta.mkForallFVars params.pop (← Lean.Meta.inferType body)
+  -- Fresh recursive auxiliaries cannot appear in a durable receipt or in its
+  -- standalone goal sources. Preserve all trusted context declarations.
+  let isAux := fun constant => name.isPrefixOf constant && constant != name
+  let type ← Lean.Meta.deltaExpand type isAux
+  if type.find? (fun expr => match expr with
+      | .const constant _ => isAux constant
+      | _ => false) |>.isSome then
+    Lean.throwError "residual parent auxiliary could not be serialized"
+  if type.hasMVar || type.hasFVar || type.hasLooseBVars || type.hasSorry then
+    Lean.throwError "residual parent type is not closed and sound"
+  pure type
+
 private def {serializer_prefix}_elabType
     (source : String) : Lean.Elab.Term.TermElabM Lean.Expr := do
   let stx ← {serializer_prefix}_parse `term source
@@ -7802,10 +7891,10 @@ private def {serializer_prefix}_elabType
     Lean.throwError "elaborated type is not closed"
   pure type
 """
-        probe = "\n".join(
+        capture = "\n".join(
             (
-                "run_cmd Lean.Elab.Command.liftTermElabM do",
-                f"  let statementType ← {serializer_prefix}_elabType {statement_literal}",
+                f'elab "{capture_syntax}" : term => Lean.Meta.withLCtx {{}} #[] do',
+                f"  let statementType ← {serializer_prefix}_parentType",
                 "  let proofMessageCount :=",
                 "    (\u2190 Lean.Core.getMessageLog).reportedPlusUnreported.size",
                 "  let proofStx ← try",
@@ -7819,8 +7908,8 @@ private def {serializer_prefix}_elabType
                 "    match proofStx with",
                 "    | `(term| by $tactics:tacticSeq) => pure tactics.raw",
                 "    | _ =>",
-                f"      {serializer_prefix}_parse `tactic "
-                f"(\"refine (\" ++ {proof_literal} ++ \")\")",
+                "      let term : Lean.TSyntax `term := ⟨proofStx⟩",
+                "      pure (← `(tactic| refine $term)).raw",
                 "  catch",
                 "  | .error ref message =>",
                 "      Lean.logErrorAt ref message",
@@ -7828,13 +7917,14 @@ private def {serializer_prefix}_elabType
                 "  | exception => throw exception",
                 "  let rootGoal ← Lean.Meta.mkFreshExprSyntheticOpaqueMVar statementType",
                 "  let tacticResult ← try",
-                "    Lean.Elab.runTactic rootGoal.mvarId! tacticStx",
+                "    Lean.Elab.runTactic rootGoal.mvarId! tacticStx (← read) (← get)",
                 "  catch",
                 "  | .error ref message =>",
                 "      Lean.logErrorAt ref message",
                 f'      Lean.throwError "{proof_rejection_marker}"',
                 "  | exception => throw exception",
-                "  let (goals, _) := tacticResult",
+                "  let (goals, tacticState) := tacticResult",
+                "  set tacticState",
                 "  let proofMessages :=",
                 "    (\u2190 Lean.Core.getMessageLog).reportedPlusUnreported.toArray",
                 "  let proofLoggedError :=",
@@ -7852,7 +7942,18 @@ private def {serializer_prefix}_elabType
                 "    let rootProof ← Lean.instantiateMVars rootGoal",
                 "    if rootProof.hasSorry then",
                 '      Lean.throwError "residual proof contains sorry"',
-                "    let reachableGoals ← Lean.Meta.getMVarsNoDelayed rootProof",
+                "    let mut allReachableGoals ← Lean.Meta.getMVarsNoDelayed rootProof",
+                "    for auxiliary in (← Lean.Elab.Term.getLetRecsToLift) do",
+                "      let auxiliaryHoles ← Lean.Meta.withLCtx auxiliary.lctx auxiliary.localInstances do",
+                "        let value ← Lean.instantiateMVars auxiliary.val",
+                "        if value.hasSorry then",
+                '          Lean.throwError "residual recursive helper contains sorry"',
+                "        Lean.Meta.getMVarsNoDelayed value",
+                "      for goalId in auxiliaryHoles do",
+                "        if !allReachableGoals.contains goalId then",
+                "          allReachableGoals := allReachableGoals.push goalId",
+                "    let reachableGoals ← allReachableGoals.filterM fun goalId => do",
+                "      return !(← Lean.Elab.Term.isLetRecAuxMVar goalId)",
                 "    let returnedGoals := goals.toArray",
                 "    let goalsMatch :=",
                 "      reachableGoals.size == returnedGoals.size &&",
@@ -7868,8 +7969,9 @@ private def {serializer_prefix}_elabType
                 "        let fvars := (← Lean.getLCtx).getFVarIds.map Lean.mkFVar",
                 "        let closed ← Lean.Meta.mkForallFVars fvars target",
                 "        let closed ← Lean.instantiateMVars closed",
-                "        if closed.hasMVar then",
-                '          Lean.throwError "residual goal depends on unresolved metavariables; choose the existential witnesses or resolve dependent holes before extracting standalone goals"',
+                "        for hole in (← Lean.Meta.getMVarsNoDelayed closed) do",
+                "          unless ← Lean.Elab.Term.isLetRecAuxMVar hole do",
+                '            Lean.throwError "residual goal depends on unresolved metavariables; choose the existential witnesses or resolve dependent holes before extracting standalone goals"',
                 "        if closed.hasSorry then",
                 '          Lean.throwError "residual proof goal contains sorry"',
                 "  catch",
@@ -7877,15 +7979,91 @@ private def {serializer_prefix}_elabType
                 "      Lean.logErrorAt ref message",
                 f'      Lean.throwError "{proof_rejection_marker}"',
                 "  | exception => throw exception",
+                "  let closedGoals ← goals.mapM fun goalId => goalId.withContext do",
+                "    let target ← Lean.instantiateMVars (← goalId.getType)",
+                "    let lctx ← Lean.getLCtx",
+                "    let fvars := lctx.getFVarIds.map Lean.mkFVar",
+                "    let closed ← Lean.Meta.mkForallFVars fvars target",
+                "      (usedOnly := false) (usedLetOnly := false) (generalizeNondepLet := false)",
+                "    let args := fvars.filter fun fvar => !(lctx.get! fvar.fvarId!).isLet",
+                "    let fresh ← Lean.Meta.withLCtx {} #[] <|",
+                "      Lean.Meta.mkFreshExprSyntheticOpaqueMVar closed",
+                "    let replacement := Lean.mkAppN fresh args",
+                "    Lean.Meta.check replacement",
+                "    goalId.assign replacement",
+                "    pure fresh.mvarId!",
+                "  let rec package (remaining : List Lean.MVarId) :",
+                "      Lean.Elab.Term.TermElabM Lean.Expr := do",
+                "    match remaining with",
+                "    | [] =>",
+                "      let proof ← Lean.instantiateMVars rootGoal",
+                "      Lean.Meta.mkAppM ``PProd.mk #[proof, Lean.mkNatLit goals.length]",
+                "    | goalId :: rest =>",
+                "      Lean.Meta.withLocalDeclD `residualProof (← goalId.getType) fun parameter => do",
+                # Delayed assignments created by local recursion must know the
+                # parameter's scope before lambda abstraction can traverse them.
+                # The recursive auxiliaries themselves must not capture it.
+                "        let parameterDecl := (← Lean.getLCtx).get! parameter.fvarId!",
+                "        let needed ← rootGoal.getMVarDependencies (includeDelayed := true)",
+                "        for id in needed.toList do",
+                "          let decl ← id.getDecl",
+                "          if !(← Lean.Elab.Term.isLetRecAuxMVar id) &&",
+                "              !decl.lctx.contains parameter.fvarId! then",
+                "            Lean.modifyMCtx fun mctx => mctx.modifyExprMVarLCtx id fun lctx =>",
+                "              lctx.mkLocalDecl parameter.fvarId! parameterDecl.userName",
+                "                parameterDecl.type parameterDecl.binderInfo",
+                "        goalId.assign parameter",
+                "        Lean.Meta.mkLambdaFVars #[parameter] (← package rest)",
+                "  package closedGoals",
+            )
+        )
+        finalize = f"""run_cmd do
+  let before := (← get).messages.reportedPlusUnreported.size
+  try
+    let ident := Lean.mkIdent `_root_.{proof_witness}
+    Lean.Elab.Command.elabCommand (← `(command|
+      noncomputable def $ident:ident := {capture_syntax}))
+  catch
+  | .error ref message => Lean.logErrorAt ref message
+  | exception => throw exception
+  let messages := (← get).messages.reportedPlusUnreported.toArray
+  let fresh := messages.extract before messages.size
+  let mut marked := false
+  for message in fresh do
+    if ((← message.toString).splitOn "{proof_rejection_marker}").length > 1 then
+      marked := true
+  if !marked && fresh.any (fun message => message.severity matches .error) then
+    Lean.throwError "{proof_rejection_marker}"
+"""
+        probe = "\n".join(
+            (
+                "run_cmd Lean.Elab.Command.liftTermElabM do",
+                f"  let statementType ← {serializer_prefix}_parentType",
+                f"  let .defnInfo conditional ← Lean.getConstInfo `{proof_witness}",
+                '    | Lean.throwError "residual conditional proof is not a definition"',
+                "  if conditional.value.hasSorry || conditional.type.hasSorry then",
+                '    Lean.throwError "residual conditional proof contains sorry"',
+                "  let (closedGoals, rootProofType) ←",
+                "    Lean.Meta.lambdaTelescope conditional.value fun parameters packet => do",
+                "      let args := packet.getAppArgs",
+                "      unless packet.getAppFn.constName? == some ``PProd.mk && args.size == 4 do",
+                '        Lean.throwError "residual conditional proof packet is malformed"',
+                "      let some count ← Lean.Meta.getNatValue? args[3]!",
+                '        | Lean.throwError "residual conditional proof count is malformed"',
+                "      unless count == parameters.size do",
+                '        Lean.throwError "residual conditional proof parameter count changed"',
+                "      let closedGoals ← parameters.mapM fun parameter => Lean.Meta.inferType parameter",
+                "      pure (closedGoals, ← Lean.Meta.inferType args[2]!)",
+                "  unless ← Lean.Meta.isDefEq rootProofType statementType do",
+                '    Lean.throwError "residual conditional proof changed the parent type"',
+                "  let isAux := fun constant =>",
+                f"    (`{proof_witness}).isPrefixOf constant && constant != `{proof_witness} ||",
+                f"    (`{witness_name}).isPrefixOf constant && constant != `{witness_name}",
                 "  let goalPayloads ← try",
                 "    let mut goalPayloads : Array Lean.Json := #[]",
-                "    for slot in [:goals.length] do",
-                "      let goalId := goals[slot]!",
-                "      let goalPayload ← goalId.withContext do",
-                "        let target ← Lean.instantiateMVars (← goalId.getType)",
-                "        let fvars := (← Lean.getLCtx).getFVarIds.map Lean.mkFVar",
-                "        let closed ← Lean.Meta.mkForallFVars fvars target",
-                "        let closed ← Lean.instantiateMVars closed",
+                "    for slot in [:closedGoals.size] do",
+                "      let goalPayload ← do",
+                "        let closed ← Lean.Meta.deltaExpand closedGoals[slot]! isAux",
                 "        if closed.hasMVar || closed.hasFVar || closed.hasLooseBVars then",
                 '          Lean.throwError "residual goal did not close"',
                 "        if closed.hasSorry then",
@@ -7929,22 +8107,39 @@ private def {serializer_prefix}_elabType
                 f'  Lean.logInfo m!"MINI_RESIDUAL_BATCH_{nonce}:{{payload.compress}}"',
             )
         )
+        # Keep finalization and attestation in one command. Lean resets message
+        # logs between commands, and a failed definition can leave a recovery
+        # constant that must never authorize a residual receipt.
+        finalize = (
+            finalize.rstrip()
+            + "\n  unless fresh.any (fun message => message.severity matches .error) do\n"
+            + "    Lean.Elab.Command.liftTermElabM do\n"
+            + "\n".join("    " + line for line in probe.splitlines()[1:])
+        )
         # Hard-math goals can contain hundreds of nested applications. Keep
         # the elevated recursion allowance scoped to this generated receipt
         # command: it prevents Lean's serializer/elaborator from rejecting a
         # valid deep goal without altering the user's theorem environment or
         # placing an artificial depth cap on ordinary proof search.
-        probe = "set_option maxRecDepth 1000000 in\n" + probe
+        finalize = "set_option maxRecDepth 1000000 in\n" + finalize
         if isinstance(max_heartbeats, int) and max_heartbeats > 0:
-            probe = f"set_option maxHeartbeats {int(max_heartbeats)} in\n{probe}"
+            finalize = f"set_option maxHeartbeats {int(max_heartbeats)} in\n{finalize}"
         if target_omit_variables:
-            probe = f"omit {' '.join(target_omit_variables)} in\n{probe}"
+            finalize = f"omit {' '.join(target_omit_variables)} in\n{finalize}"
         if target_scoped_prefix:
-            probe = f"{target_scoped_prefix}\n{probe}"
+            finalize = f"{target_scoped_prefix}\n{finalize}"
+        prepare = "set_option maxRecDepth 1000000 in\n" + f"run_cmd {serializer_prefix}_prepare"
+        if isinstance(max_heartbeats, int) and max_heartbeats > 0:
+            prepare = f"set_option maxHeartbeats {int(max_heartbeats)} in\n{prepare}"
+        if target_omit_variables:
+            prepare = f"omit {' '.join(target_omit_variables)} in\n{prepare}"
+        if target_scoped_prefix:
+            prepare = f"{target_scoped_prefix}\n{prepare}"
 
         lemma_block = "\n".join(exact_lemmas)
         universe_decl = _free_universe_decl(
-            "\n".join((raw_statement, raw_proof, lemma_block))
+            "\n".join((raw_statement, raw_proof, lemma_block)),
+            declared_in=preamble,
         )
         content = "\n\n".join(
             part
@@ -7954,7 +8149,9 @@ private def {serializer_prefix}_elabType
                 lemma_block.strip(),
                 "open Lean Elab Command Meta",
                 serializer.strip(),
-                probe,
+                capture,
+                prepare,
+                finalize,
                 "#check Prop",
             )
             if part
@@ -8167,6 +8364,16 @@ private def {serializer_prefix}_elabType
             for index in range(len(raw_statements))
         )
         serializer_prefix = f"miniContract_{nonce}"
+        witness_names = {
+            statement: f"mini_contract_witness_{nonce}_{index}"
+            for index, statement in enumerate(raw_statements)
+            if statement
+        }
+        witness_prefixes = ", ".join(f"`{name}" for name in witness_names.values())
+        witness_lookup = "\n".join(
+            f"  | {json.dumps(statement, ensure_ascii=False)} => `{name}"
+            for statement, name in witness_names.items()
+        )
         serializer = f"""
 private def {serializer_prefix}_binderInfo :
     Lean.BinderInfo → Lean.Json
@@ -8266,19 +8473,78 @@ private def {serializer_prefix}_binders (type : Lean.Expr) :
         ]
     pure binders
 
-private def {serializer_prefix}_elabType (source : String) :
-    Lean.Elab.Term.TermElabM Lean.Expr := do
+-- A declaration compiles local recursive auxiliaries; standalone elabType
+-- deliberately leaves those auxiliaries pending until declaration finalization.
+private def {serializer_prefix}_parserSource (source : String) (name : Lean.Name) : String :=
+  let headerText := "noncomputable def _root_." ++ name.toString ++ " (_miniStatement : "
+  String.ofList (List.replicate headerText.length ' ') ++ source
+
+private def {serializer_prefix}_prepare (source : String) (name : Lean.Name) :
+    Lean.Elab.Command.CommandElabM Unit := do
   let stx ←
-    match Lean.Parser.runParserCategory (← Lean.getEnv) `term source with
+    match Lean.Parser.runParserCategory (← Lean.getEnv) `term
+        ({serializer_prefix}_parserSource source name) with
+    | .ok stx => pure stx
+    | .error error => Lean.throwError error
+  let stx : Lean.TSyntax `term := ⟨stx⟩
+  let ident := Lean.mkIdent (`_root_ ++ name)
+  let before ← Lean.getEnv
+  Lean.Elab.Command.elabCommand (← `(command|
+    noncomputable def $ident:ident (_miniStatement : $stx) := @_miniStatement))
+  -- Never unfold a trusted declaration whose name happens to share a prefix.
+  for (introduced, _) in (← Lean.getEnv).constants.map₂.toList do
+    if name.isPrefixOf introduced && before.contains introduced then
+      Lean.throwError "contract witness name collides with an existing declaration"
+
+private def {serializer_prefix}_witnessName (source : String) : Lean.Name :=
+  match source with
+{witness_lookup}
+  | _ => .anonymous
+
+private def {serializer_prefix}_isRecursiveAux (constant : Lean.Name) : Bool :=
+  ([{witness_prefixes}] : List Lean.Name).any fun name =>
+    name.isPrefixOf constant && constant != name
+
+private def {serializer_prefix}_recursiveType (source : String) :
+    Lean.Elab.Term.TermElabM Lean.Expr := do
+  let name := {serializer_prefix}_witnessName source
+  if name.isAnonymous then Lean.throwError "missing recursive contract witness"
+  let .defnInfo witness ← Lean.getConstInfo name
+    | Lean.throwError "recursive contract witness is not a definition"
+  let type ← Lean.Meta.lambdaTelescope witness.value fun params body => do
+    if params.isEmpty || body != params.back! then
+      Lean.throwError "recursive contract witness is not an identity"
+    Lean.Meta.mkForallFVars params.pop (← Lean.Meta.inferType body)
+  -- Remove only fresh auxiliary constants. Their nonce names must never enter
+  -- persisted identities; trusted library constants retain existing semantics.
+  -- Lean may share a compiled matcher across witnesses in this batch.
+  let type ← Lean.Meta.deltaExpand type {serializer_prefix}_isRecursiveAux
+  if type.find? (fun expr => match expr with
+      | .const constant _ => {serializer_prefix}_isRecursiveAux constant
+      | _ => false) |>.isSome then
+    Lean.throwError "recursive contract auxiliary could not be serialized"
+  pure type
+
+private def {serializer_prefix}_elabType (source : String) :
+    Lean.Elab.Term.TermElabM Lean.Expr :=
+  Lean.Elab.withoutModifyingStateWithInfoAndMessages do
+  let stx ←
+    match Lean.Parser.runParserCategory (← Lean.getEnv) `term
+        ({serializer_prefix}_parserSource source ({serializer_prefix}_witnessName source)) with
     | .ok stx => pure stx
     | .error error => Lean.throwError error
   let type ← Lean.Elab.Term.withoutErrToSorry do
     Lean.Elab.Term.elabType stx
   Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing
   let type ← Lean.instantiateMVars type
+  let type ← if (← Lean.Elab.Term.getLetRecsToLift).isEmpty then
+      pure type
+    else {serializer_prefix}_recursiveType source
   let type ← Lean.Elab.Term.levelMVarToParam type
   if type.hasMVar then
     Lean.throwError "statement type contains unresolved metavariables"
+  if type.hasSorry then
+    Lean.throwError "statement type contains an admitted term"
   unless ← Lean.Meta.isProp type do
     Lean.throwError "statement is not a proposition"
   pure type
@@ -8343,20 +8609,8 @@ private def {serializer_prefix}_contractDefeq
                 (
                     "run_cmd Lean.Elab.Command.liftTermElabM do",
                     "  try",
-                    "    let stx ←",
-                    "      match Lean.Parser.runParserCategory (← Lean.getEnv) `term",
-                    f"          {json.dumps(statement, ensure_ascii=False)} with",
-                    "      | .ok stx => pure stx",
-                    "      | .error error => Lean.throwError error",
-                    "    let type ← Lean.Elab.Term.withoutErrToSorry do",
-                    "      Lean.Elab.Term.elabType stx",
-                    "    Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing",
-                    "    let type ← Lean.instantiateMVars type",
-                    "    let type ← Lean.Elab.Term.levelMVarToParam type",
-                    "    if type.hasMVar then",
-                    '      Lean.throwError "statement type contains unresolved metavariables"',
-                    "    unless ← Lean.Meta.isProp type do",
-                    '      Lean.throwError "statement is not a proposition"',
+                    f"    let type ← {serializer_prefix}_elabType",
+                    f"      {json.dumps(statement, ensure_ascii=False)}",
                     "    let displayType ← Lean.withOptions",
                     f"      {serializer_prefix}_printerOptions do",
                     "      Lean.Meta.ppExpr type",
@@ -8433,6 +8687,12 @@ private def {serializer_prefix}_contractDefeq
                 preamble.strip(),
                 "open Lean Elab Command Meta",
                 serializer,
+                *(
+                    "run_cmd do\n"
+                    f"  {serializer_prefix}_prepare "
+                    f"{json.dumps(statement, ensure_ascii=False)} `{name}"
+                    for statement, name in witness_names.items()
+                ),
                 *probes,
                 "#check Prop",
             )
@@ -8968,7 +9228,7 @@ private def {serializer_prefix}_contractDefeq
         )
         universe_decl = _free_universe_decl(statement, declared_in=preamble)
         witness = f"theoremProjectPreflightWitness_{short_id(statement)}"
-        witness_command = f"axiom {witness} : {str(statement).strip()}"
+        witness_command = _type_identity_probe_command(witness, statement)
         if target_omit_variables:
             witness_command = (
                 f"omit {' '.join(target_omit_variables)} in\n{witness_command}"

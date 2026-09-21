@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+from .lean_decl_parser import find_decl_header_end
 from .lean_syntax import (
     lean_relation_binder_bound_names,
     lean_relation_binder_equivalent,
@@ -6055,7 +6056,9 @@ def helper_decl_statement(src: str) -> str:
         _strip_lean_decl_comments_preserving_strings(tail[colon + 1 : marker_index]),
         canonicalize_guarded_iff=False,
     )
-    binders = _strip_declaration_binder_defaults(" ".join(tail[:colon].split()))
+    binders = _strip_declaration_binder_defaults(
+        " ".join(_strip_lean_decl_comments_preserving_strings(tail[:colon]).split())
+    )
     if kind in {"theorem", "lemma"} and binders:
         return f"∀ {binders}, {statement}"
     return statement
@@ -6093,50 +6096,14 @@ def helper_decl_body(src: str) -> str:
 
 
 def _declaration_body_marker(tail: str, *, start: int) -> Optional[Tuple[int, int]]:
-    """Return the top-level declaration body marker, skipping comments/strings."""
+    """Use the shared scanner for local-binding-aware declaration boundaries."""
 
-    depth = 0
-    in_top_level_let = False
     s = str(tail or "")
-    index = max(0, int(start or 0))
-    while index < len(s):
-        if s.startswith("--", index):
-            newline = s.find("\n", index)
-            if newline < 0:
-                return None
-            index = newline + 1
-            continue
-        if s.startswith("/-", index):
-            index = _skip_lean_block_comment(s, index)
-            continue
-        ch = s[index]
-        if ch == '"':
-            index = _skip_lean_string(s, index)
-            continue
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth = max(0, depth - 1)
-        elif depth == 0 and _starts_token(s, index, "let"):
-            in_top_level_let = True
-            index += len("let")
-            continue
-        elif depth == 0 and in_top_level_let and ch == ";":
-            in_top_level_let = False
-        elif depth == 0 and in_top_level_let and ch in "\n\r":
-            in_top_level_let = False
-        elif depth == 0 and s.startswith(":=", index):
-            if in_top_level_let:
-                index += 2
-                continue
-            return index, 2
-        elif (
-            depth == 0
-            and not in_top_level_let
-            and _starts_token(s, index, "where")
-        ):
-            return index, len("where")
-        index += 1
+    end = find_decl_header_end(s, max(0, int(start or 0)), allow_where=True)
+    if end is not None:
+        if s.startswith("where", end):
+            return end, len("where")
+        return end - 2, 2
     return None
 
 
@@ -6186,9 +6153,10 @@ def _strip_lean_decl_comments_preserving_strings(text: str) -> str:
             continue
         if s.startswith("/-", index):
             index = _skip_lean_block_comment(s, index)
+            out.append(" ")
             continue
-        if s[index] == '"':
-            end = _skip_lean_string(s, index)
+        end = _lean_lexical_skip_end(s, index)
+        if end is not None:
             out.append(s[index:end])
             index = end
             continue
@@ -6301,13 +6269,21 @@ def _declaration_type_colon(tail: str) -> Optional[int]:
     """Return the top-level theorem-type colon after optional binders."""
 
     depth = 0
-    for index, ch in enumerate(str(tail or "")):
+    text = str(tail or "")
+    index = 0
+    while index < len(text):
+        end = _lean_lexical_skip_end(text, index)
+        if end is not None:
+            index = end
+            continue
+        ch = text[index]
         if ch in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
             depth += 1
         elif ch in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE.values():
             depth = max(0, depth - 1)
         elif ch == ":" and depth == 0:
             return index
+        index += 1
     return None
 
 
