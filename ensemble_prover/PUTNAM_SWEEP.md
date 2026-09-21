@@ -54,7 +54,7 @@ Each problem gets one clock, starting before its MiniProver process launches:
 
 | Time from launch | Requirement to continue |
 | --- | --- |
-| 600 seconds | At least one distinct, newly accepted proof |
+| 1,200 seconds | At least one distinct, newly accepted proof |
 | 1,800 seconds | At least two distinct, newly accepted proofs |
 
 Accepted proofs are committed Lean-verified helpers or completed subgoal/root
@@ -64,7 +64,7 @@ failed checks, and proposed plans do not earn extra milestones. A completed
 problem finishes normally.
 
 These are **absolute deadlines**, not rolling inactivity timers. For example,
-a first acceptance at 590 seconds leaves until 1,800 seconds for the second.
+a first acceptance at 1,190 seconds leaves until 1,800 seconds for the second.
 After two timely acceptances, these gates impose no further cutoff; MiniProver's
 normal budgets still apply and may end an attempt earlier.
 The sweep does not add `run_mini_unattended.sh`'s three time-limit presets. To
@@ -84,7 +84,7 @@ Override the deadlines before `--`, if needed:
 
 ```bash
 ./scripts/sweep_putnam_unsolved.sh \
-  --first-accepted-by-s 600 --second-accepted-by-s 1800 \
+  --first-accepted-by-s 1200 --second-accepted-by-s 1800 \
   -- --prover openai --parallel-samples 2
 ```
 

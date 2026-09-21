@@ -602,7 +602,7 @@ created before this setting retain their previous, disabled behavior; running
 processes do not acquire the feature from a source update.
 
 The outer Putnam sweep prints its acceptance policy at startup. Its default
-deadlines are 600 seconds for the first accepted proof/helper and 1800 seconds
+deadlines are 1200 seconds for the first accepted proof/helper and 1800 seconds
 for the second, measured from attempt launch **including startup**. Research
 does not reset those clocks or count as an accepted proof. To let each problem
 run under MiniProver's own limits, pass `--no-acceptance-cutoffs` to the sweep

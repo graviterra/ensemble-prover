@@ -1,6 +1,6 @@
 # Ensemble Prover
 
-Last updated: 2026-09-16.
+Last updated: 2026-09-20.
 
 This repository contains a research-grade autonomous theorem prover that
 combines language-model proof search with Lean verification. Given a formalized
@@ -24,6 +24,14 @@ screenshot is losslessly cropped; its retained code and logs are unchanged.
 ## Recent updates
 
 September 2026 — highlights from the current source checkout:
+
+- **1.14 — request limits and proof-search reliability:** direct DeepSeek Flash
+  uses reasoning-aware request limits and explicit thinking controls. Answer
+  discovery and native research reserve the same output allowance they send;
+  current DeepSeek pricing estimates carry their assumptions. Helper salvage
+  preserves tactic-search continuation instead of repeating a consumed search.
+  Lean declaration extraction preserves local bindings, and recursive
+  checkpoints exclude live theory-promotion handles.
 
 - **1.13.1 — sweep and answer-discovery reliability:** OpenRouter capability
   checks refresh missing model metadata, automatic research accounts for resumed
@@ -116,7 +124,7 @@ other providers require an explicit supported selection.
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
 file and Lake project. PutnamBench files are supported through a compatibility
 adapter, and callers may attach a natural-language problem description as
-additional model context. Release 1.13.1 also includes
+additional model context. Release 1.14 also includes
 experimental natural-language entry points: `ensemble_prover.nl_input` for a
 single claim and `ensemble_prover.formalization` for resumable, multi-file
 projects. These translate text before proving; the resulting Lean statement
@@ -177,7 +185,7 @@ the proof files and answers are not.
 | 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
 | 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
 
-> **Release status:** 1.13.1 — research preview. Includes Mini Prover, experimental
+> **Release status:** 1.14 — research preview. Includes Mini Prover, experimental
 > single-claim NL input, and resumable multi-file formalization campaigns.
 > Optional Codex and Claude Code subscription backends serve Mini's prover and refiner,
 > alongside the existing API providers. Codex also serves autonomous research.
@@ -305,7 +313,7 @@ To sweep all locally unsolved PutnamBench problems in random order:
   -- --prover openai --parallel-samples 2
 ```
 
-Each attempt must commit one distinct accepted proof by 600 seconds and two by
+Each attempt must commit one distinct accepted proof by 1,200 seconds and two by
 1,800 seconds, both measured from launch. After two timely acceptances, normal
 budgets apply. See the [sweep guide](ensemble_prover/PUTNAM_SWEEP.md) for a
 no-provider-call preview, resume commands, and counting/cleanup rules.
