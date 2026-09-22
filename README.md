@@ -1,6 +1,6 @@
 # Ensemble Prover
 
-Last updated: 2026-09-21.
+Last updated: 2026-09-22.
 
 This repository contains a research-grade autonomous theorem prover that
 combines language-model proof search with Lean verification. Given a formalized
@@ -10,8 +10,8 @@ Lean-checked result without further user interaction. The maintained entry
 point for proof search is `ensemble_prover.mini_prover`.
 
 > **Ongoing progress — September 2026:** Ensemble Prover has produced
-> Lean-verified proofs for **178 distinct Putnam problems** across research and
-> evaluation runs. **65 have been accepted by PutnamBench; the additional 113
+> Lean-verified proofs for **189 distinct Putnam problems** across research and
+> evaluation runs. **65 have been accepted by PutnamBench; the additional 124
 > have not yet been independently verified by the PutnamBench team.** Development
 > and solving continue, with recent runs using **Astra**, **Fable**,
 > **deepseek-v4.1-flash**, and **Opus**. This cumulative count combines models,
@@ -73,25 +73,6 @@ subscriptions. The standalone NL and formalization CLIs remain API-backed.
 Claude Code serves Mini's prover/refiner roles and their automatic research.
 Older release snapshots may not include every feature above.
 
-## Start research from a saved run
-
-From the repository directory, use one command:
-
-```bash
-./research runs/mini_prover/YOUR_RUN
-```
-
-This creates and starts integrated research, independent reviews and Lean proof
-search using the saved Mini model, provider and project. It prints the new research
-directory. New runs default to 4 hours and 200 model calls across all roles;
-use `--hours 8 --requests 600` to choose a larger initial budget.
-
-Pass the printed research directory to the same command to resume. Add `--status`
-to inspect progress. Resuming preserves the original budget. Add `--prepare` when
-creating a run to save it without starting model work, or `--source finding.txt`
-to include an outside finding. Saved Codex and OpenAI providers are supported;
-other providers require an explicit supported selection.
-
 ## Overview
 
 The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
@@ -116,12 +97,12 @@ With a built Lake project, the same run formalizes candidate arguments, searches
 for proofs, independently checks exports, and returns failures or results to
 research. Omitting the project keeps a standalone research-only run.
 
-As of September 21, 2026, across research and evaluation runs, the system has
-produced Lean-verified proofs for **178 distinct Putnam problems**, counting
+As of September 22, 2026, across research and evaluation runs, the system has
+produced Lean-verified proofs for **189 distinct Putnam problems**, counting
 repeated solves and configuration variants once. **PutnamBench has accepted the
 original 65 submitted proofs**, and Ensemble Prover is listed on the
 [PutnamBench leaderboard](https://trishullab.github.io/PutnamBench/leaderboard.html).
-The **113 additional problems** have locally Lean-verified proof exports but
+The **124 additional problems** have locally Lean-verified proof exports but
 **have not yet been independently verified by the PutnamBench team**.
 This is a cumulative result across models, configurations, and budgets, not a
 controlled benchmark solve rate under one fixed setup.
@@ -134,7 +115,7 @@ models.
 
 Ensemble Prover is an actively developed research-grade tool. It continues to
 solve Putnam problems and is now attempting frontier-mathematics problems.
-The 65 accepted proofs and 113 additional locally verified solves are a dated
+The 65 accepted proofs and 124 additional locally verified solves are a dated
 snapshot of this ongoing work.
 
 Every result reported as a solved proof by Mini Prover is checked by Lean.
@@ -148,7 +129,7 @@ search and verification history.
 ## Putnam proofs accepted by PutnamBench
 
 The following **65 problem identifiers** are the independently accepted subset
-of the 178-problem cumulative result above. Their Lean proof files were submitted
+of the 189-problem cumulative result above. Their Lean proof files were submitted
 privately to the PutnamBench
 verification team for independent review on August 31, 2026; PutnamBench has
 since accepted all 65 proofs. Only the problem identifiers are published here;
@@ -170,6 +151,25 @@ the proof files and answers are not.
 > alongside the existing API providers. Codex also serves autonomous research.
 > The current source also includes experimental coordinated and autonomous
 > research; older release snapshots may not contain these entry points.
+
+## Start research from a saved run
+
+From the repository directory, use one command:
+
+```bash
+./research runs/mini_prover/YOUR_RUN
+```
+
+This creates and starts integrated research, independent reviews and Lean proof
+search using the saved Mini model, provider and project. It prints the new research
+directory. New runs default to 4 hours and 200 model calls across all roles;
+use `--hours 8 --requests 600` to choose a larger initial budget.
+
+Pass the printed research directory to the same command to resume. Add `--status`
+to inspect progress. Resuming preserves the original budget. Add `--prepare` when
+creating a run to save it without starting model work, or `--source finding.txt`
+to include an outside finding. Saved Codex and OpenAI providers are supported;
+other providers require an explicit supported selection.
 
 ## Documentation
 
