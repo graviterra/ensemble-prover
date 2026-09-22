@@ -95,6 +95,8 @@ class SubscriptionCLIClient:
         self.cfg = cfg
         self.base_url = self.subscription_base_url
         self.provider_defer_fingerprint = provider_serving_fingerprint(cfg)
+        if not str(getattr(cfg, "provider_defer_fingerprint", "") or "").strip():
+            self._generated_provider_defer_fingerprint = self.provider_defer_fingerprint
         self.last_truncated = False
         self.last_raw_response_data: dict[str, Any] = {}
         self.last_request_envelope_receipt: dict[str, Any] = {}

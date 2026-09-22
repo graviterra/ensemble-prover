@@ -1161,19 +1161,28 @@ provider client creates `provider-identity.key` and `provider-identity.lock` in
 `${XDG_STATE_HOME:-~/.local/state}/ensemble-prover/`. The directory is private to
 the owner (`0700`), and both files use `0600` permissions. Keep them across
 restarts and separate from exported proofs, checkpoints, and shared diagnostics.
+Home and state-root paths may pass through symlinks. An initialized identity
+store can also be accessed through directories that allow traversal without
+directory listing. First initialization requires permission to read and
+synchronize ancestor directories. The private `ensemble-prover` directory
+and its key and lock files must not be symlinks.
 Identity state is checked when first loaded into a process and then cached.
 Insecure or malformed files, or a missing key in an initialized directory, cause
 an explicit error; the prover does not silently replace that key or fall back
 to an unkeyed hash. Removing the entire identity directory causes new identities
 to be created on its next initialization.
+Concurrent initialization waits up to five seconds for the identity lock. If
+another process holds it longer, startup reports an error; retry after that
+process finishes.
 
 Existing recorded provider cooldowns retain their deadlines after an upgrade.
 Moving a checkpoint to another installation uses that installation's key for
 new provider identities, while retaining recorded waits and proof progress.
 Preserving identical new lane identities across installations requires securely
 transferring the private identity state separately from run artifacts. Older
-artifacts may contain unkeyed credential fingerprints; keep those private,
-especially when using low-entropy custom provider keys.
+artifacts and resumed runs retaining their receipts may contain unkeyed
+credential fingerprints; keep those private, especially when using low-entropy
+custom provider keys.
 
 Configured providers may receive:
 

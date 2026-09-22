@@ -7,6 +7,7 @@ import hmac
 import os
 import stat
 import threading
+import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -18,6 +19,7 @@ _INITIALIZED = b"ensemble-prover-provider-identity-v2\n"
 _DOMAIN = b"ensemble-prover/provider-credential/v2\x00"
 _KEY_CACHE: dict[Path, bytes] = {}
 _KEY_CACHE_LOCK = threading.Lock()
+_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 def _before_fork() -> None:
@@ -74,23 +76,58 @@ def _validate_private(fd: int, *, directory: bool = False) -> None:
 
 
 @contextmanager
-def _open_state_directory(path: Path) -> Iterator[int]:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+def _open_state_directory(path: Path) -> Iterator[tuple[int, bool]]:
+    # Resolve only ancestors on a cold load. The protected final directory
+    # stays subject to O_NOFOLLOW, and cached identities need no path I/O.
+    try:
+        path = path.parent.resolve() / path.name
+    except (OSError, RuntimeError) as exc:
+        raise ProviderIdentityError(
+            "Cannot resolve provider identity state root"
+        ) from exc
+    flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    skipped_parent_sync = False
     with ExitStack() as stack:
-        current = os.open(path.anchor, flags)
+        current = os.open(path.anchor, os.O_PATH | flags)
         stack.callback(os.close, current)
-        for component in path.parts[1:]:
+        for index, component in enumerate(path.parts[1:], 1):
+            final = index == len(path.parts) - 1
             try:
-                os.mkdir(component, 0o700, dir_fd=current)
-            except FileExistsError:
-                pass
-            # Also retry durability after an earlier mkdir succeeded but its
-            # parent fsync failed. A successful cold load persists the path.
-            os.fsync(current)
-            current = os.open(component, flags, dir_fd=current)
+                os.stat(component, dir_fd=current, follow_symlinks=False)
+                existing = True
+            except FileNotFoundError:
+                existing = False
+            try:
+                parent = os.open(".", os.O_RDONLY | flags, dir_fd=current)
+            except PermissionError:
+                if not existing:
+                    raise
+                # An unchanged ancestor requires search permission, not list
+                # permission. No directory entry is created through this fd.
+                parent = None
+                skipped_parent_sync = True
+            if parent is not None:
+                try:
+                    if not existing:
+                        # Obtain a sync-capable parent before creating a child:
+                        # a failed read-open must never leave an unsynced entry.
+                        try:
+                            os.mkdir(component, 0o700, dir_fd=current)
+                        except FileExistsError:
+                            pass
+                    # Retry even for existing readable ancestors after a prior
+                    # mkdir succeeded but its parent fsync failed.
+                    os.fsync(parent)
+                finally:
+                    os.close(parent)
+            current = os.open(
+                component,
+                (os.O_RDONLY if final else os.O_PATH) | flags,
+                dir_fd=current,
+            )
             stack.callback(os.close, current)
         _validate_private(current, directory=True)
-        yield current
+        yield current, skipped_parent_sync
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -149,7 +186,7 @@ def _read_or_create_key(directory: int, initialized: bool) -> bytes:
 
 
 def _load_key(path: Path) -> bytes:
-    with _open_state_directory(path) as directory:
+    with _open_state_directory(path) as (directory, skipped_parent_sync):
         flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
         try:
             lock_fd = os.open(
@@ -163,11 +200,27 @@ def _load_key(path: Path) -> bytes:
         with ExitStack() as stack:
             stack.callback(os.close, lock_fd)
             _validate_private(lock_fd)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ProviderIdentityError(
+                            "Provider identity initialization lock timed out; retry after the other process finishes"
+                        ) from None
+                    time.sleep(min(0.01, remaining))
             marker = _read_bounded(lock_fd, len(_INITIALIZED))
             if marker not in (b"", _INITIALIZED):
                 raise ProviderIdentityError(
                     "Provider identity initialization record is invalid"
+                )
+            if skipped_parent_sync and marker != _INITIALIZED:
+                raise ProviderIdentityError(
+                    "Cannot initialize provider identity through an unreadable ancestor; "
+                    "restore directory read permission and retry"
                 )
             key = _read_or_create_key(directory, marker == _INITIALIZED)
             if not marker:

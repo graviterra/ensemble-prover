@@ -15,13 +15,22 @@ Usage::
 
 from __future__ import annotations
 
+import os
+import sys
+
+if __name__ == "__main__" and not __package__:
+    # Resolve this checkout before package imports, and keep its types.py from
+    # shadowing the standard library when Python launches this file directly.
+    _script_dir = os.path.dirname(os.path.realpath(__file__))
+    sys.path[:] = [os.path.dirname(_script_dir)] + [
+        entry for entry in sys.path if os.path.realpath(entry) != _script_dir
+    ]
+
 import argparse
 import hashlib
 import html
 import json
-import os
 import re
-import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path

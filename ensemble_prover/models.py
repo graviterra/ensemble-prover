@@ -112,6 +112,14 @@ def provider_serving_fingerprint(client: Any) -> str:
     explicit = str(getattr(client, "provider_defer_fingerprint", "") or "").strip()
     if explicit:
         return explicit
+    return _provider_serving_fingerprint_for_config(client)
+
+
+def _provider_serving_fingerprint_for_config(
+    client: Any, *, legacy_receipt: bool = False,
+) -> str:
+    """Encode a lane; legacy output is only used for saved-receipt comparison."""
+
     cfg = getattr(client, "cfg", None)
     if cfg is None:
         cfg = client
@@ -125,7 +133,12 @@ def provider_serving_fingerprint(client: Any) -> str:
         return ""
 
     api_key = str(getattr(cfg, "api_key", "") or "").strip()
-    credential_digest = credential_hmac_sha256(api_key) if api_key else ""
+    credential_digest = ""
+    if api_key:
+        credential_digest = (
+            hashlib.sha256(api_key.encode("utf-8", errors="replace")).hexdigest()
+            if legacy_receipt else credential_hmac_sha256(api_key)
+        )
     revision_fields = {}
     for key in (
         "model_revision",
@@ -154,10 +167,10 @@ def provider_serving_fingerprint(client: Any) -> str:
         if value not in (None, "", (), [], {}):
             routing_fields[key] = value
     payload = {
-        "schema": 2,
+        "schema": 1 if legacy_receipt else 2,
         "base_url": base_url,
         "model": model,
-        "credential_hmac_sha256": credential_digest,
+        ("credential_sha256" if legacy_receipt else "credential_hmac_sha256"): credential_digest,
         "revision": revision_fields,
         "routing": routing_fields,
     }
@@ -169,6 +182,42 @@ def provider_serving_fingerprint(client: Any) -> str:
         default=str,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _provider_defer_fingerprint_matches(client: Any, saved_fingerprint: str) -> bool:
+    """Authenticate a saved cooldown against this client's exact capacity lane.
+
+    Old receipts can first become scheduler-visible after a checkpoint's paid
+    verifier work settles. Compare their v1 identity in memory only; newly
+    created clients and receipts always retain their keyed v2 identity.
+    """
+
+    current = provider_serving_fingerprint(client)
+    if not current or not saved_fingerprint:
+        return False
+    if saved_fingerprint == current:
+        return True
+    explicit = str(getattr(client, "provider_defer_fingerprint", "") or "").strip()
+    if explicit and explicit != getattr(
+        client, "_generated_provider_defer_fingerprint", None,
+    ):
+        # Caller-owned overrides intentionally separate lanes even when their
+        # visible configuration is identical. Do not consult key state merely
+        # to second-guess an explicit override.
+        return False
+    if len(saved_fingerprint) != 64 or any(
+        char not in "0123456789abcdef" for char in saved_fingerprint
+    ):
+        return False
+    if explicit and current != _provider_serving_fingerprint_for_config(client):
+        # A client's cached lane must still describe the configuration used
+        # to authenticate the old receipt; do not rebind after config drift.
+        return False
+    # Current identity resolution above must succeed before compatibility is
+    # considered. Never turn an unavailable private key into an unkeyed lane.
+    return saved_fingerprint == _provider_serving_fingerprint_for_config(
+        client, legacy_receipt=True,
+    )
 
 
 def provider_defer_record_from_exception(client: Any, exc: BaseException) -> Dict[str, Any]:
@@ -2664,6 +2713,8 @@ class OpenAICompatClient:
         self.cfg = cfg
         self.base_url = cfg.base_url.rstrip("/")
         self.provider_defer_fingerprint = provider_serving_fingerprint(cfg)
+        if not str(getattr(cfg, "provider_defer_fingerprint", "") or "").strip():
+            self._generated_provider_defer_fingerprint = self.provider_defer_fingerprint
         self._configured_provider_lane_health_registry = (
             provider_lane_health_registry
             if isinstance(

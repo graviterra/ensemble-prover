@@ -108,7 +108,7 @@ from ensemble_prover.proof_lineage import (
     structural_statement_identity,
 )
 from ensemble_prover.llm_error_policy import ProviderAccountUnavailable, llm_failure_scope
-from ensemble_prover.models import provider_serving_fingerprint
+from ensemble_prover.models import _provider_defer_fingerprint_matches
 from ensemble_prover.llm_usage import (
     ProviderDispatchExposureTracker,
     bind_provider_dispatch_exposure_tracker,
@@ -29068,8 +29068,9 @@ class MiniSession:
                         str(action.id or "").strip()
                         for action in self.actions
                         if str(action.id or "").strip()
-                        and self._action_provider_defer_fingerprints(action)
-                        == {provider_defer_fingerprint}
+                        and self._action_matches_provider_defer_fingerprint(
+                            action, provider_defer_fingerprint,
+                        )
                     )
             deferred_retry_context_fields = _deferred_retry_context_fields()
             selected_action_key = (
@@ -36225,8 +36226,10 @@ class MiniSession:
             return True
         return False
 
-    def _action_provider_defer_fingerprints(self, action: Any) -> Set[str]:
-        """Return exact serving lanes an action can use for its next call.
+    def _action_matches_provider_defer_fingerprint(
+        self, action: Any, fingerprint: str,
+    ) -> bool:
+        """Whether all serving lanes for an action own this saved cooldown.
 
         An action with a genuinely different alternative remains schedulable;
         the shared cooldown is not a provider-global or model-family tombstone.
@@ -36247,12 +36250,11 @@ class MiniSession:
                 clients.append(self.prover_client)
             elif defer_family == "recursive_planner":
                 clients.append(self.prover_client)
-        fingerprints = {
-            provider_serving_fingerprint(client)
+        clients = [client for client in clients if client is not None]
+        return bool(clients) and all(
+            _provider_defer_fingerprint_matches(client, fingerprint)
             for client in clients
-            if client is not None
-        }
-        return {fingerprint for fingerprint in fingerprints if fingerprint}
+        )
 
     @staticmethod
     def _persistent_infrastructure_defer(metadata: Dict[str, Any]) -> bool:
