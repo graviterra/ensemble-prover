@@ -196,7 +196,7 @@ class FailureAnalyzer:
                     lines.append(
                         f"- {label}: `{_prompt_safe_lean_diagnostic_text(value, limit=240)}`"
                     )
-                    # Fix 2 (2026-05-22): when the LLM cites a hallucinated
+                    # when the LLM cites a hallucinated
                     # mini_* helper, append the verified-helper inventory so
                     # the next turn can self-correct. This prevents repeated
                     # hallucinated-helper cascades in long repair sessions.
@@ -270,12 +270,8 @@ class FailureAnalyzer:
 
         lines.append("")
         lines.append("Repair contract:")
-        # B7 STRUCTURAL FIX (2026-05-18 audit): the "Repair delta:" prompt
-        # instruction was prompt theater — zero parsers, zero gates, zero
-        # metrics consumed it. Removed to avoid promising enforced behavior
-        # the orchestrator does not actually enforce. The remaining rules
-        # (material change, try_lean self-check, exact <hyp> for direct
-        # closes) DO have backing enforcement gates.
+        # Keep prompt rules aligned with enforced gates: material change,
+        # try_lean self-check, and exact-hypothesis direct closure.
         lines.append(
             "- The next Lean block must materially change the failed step; do not retry the same tactic, rewrite set, or lemma on the same target."
         )
@@ -332,7 +328,7 @@ class FailureAnalyzer:
                 "summary": self._compact(summary or message, limit=360),
                 # Keep the full raw message alongside the (truncated) summary
                 # so per-diagnostic rules can scan the full text without
-                # falling back to the cross-boundary flat scan. (D4 fix.)
+                # falling back to the cross-boundary flat scan.
                 "message": self._compact(message, limit=600),
             }
             for attr in ("line", "col"):
@@ -786,14 +782,10 @@ class FailureAnalyzer:
     def _specialized_repair_actions(self, analysis: Dict[str, Any]) -> List[str]:
         """Return broad Lean/Mathlib repair hints keyed off recurring diagnostics.
 
-        D4 fix (2026-05-08): scope each rule's conjunction to ONE
-        diagnostic or to one explicit structured detail predicate. The
-        previous implementation joined every analysis field into a single
-        blob, so a rule like ``"nat.pow_pos" in lower and "function expected"
-        in lower`` could fire when ``Nat.pow_pos`` appeared in one diagnostic
-        or remaining goal and ``function expected`` came from a different
-        diagnostic. Goal text is intentionally not conjoined with diagnostic
-        predicates; it is already surfaced elsewhere in feedback.
+        Scope each conjunction to one diagnostic or one structured detail
+        predicate. Combining fields across diagnostic boundaries could pair
+        ``Nat.pow_pos`` in one message with ``function expected`` in another.
+        Goal text is surfaced separately and does not satisfy diagnostic rules.
         """
 
         actions: List[str] = []

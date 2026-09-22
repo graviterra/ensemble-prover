@@ -1051,13 +1051,7 @@ class RecursiveHelperProverAction:
         return node if self._deterministic_child_work_exhausted(session, node) else None
 
     def _node_under_attempt_cap(self, node: Any) -> bool:
-        # Adversarial review fix (2026-05-09): align with
-        # _node_under_giveup_cap convention: <=0 means UNCAPPED
-        # (always allow). Previously this returned False (always
-        # blocked) when max_attempts_per_node was 0 — the asymmetry
-        # was a footgun. The factory passes int(... or 2) which
-        # masks the bug for default callers, but direct constructors
-        # could hit it.
+        # Match _node_under_giveup_cap: a nonpositive attempt cap is uncapped.
         attempts = int(getattr(node, "recursive_attempts", 0) or 0)
         frame = self._nested_execution_frame
         descriptor = (
@@ -1203,12 +1197,8 @@ class RecursiveHelperProverAction:
 
     @staticmethod
     def _depth_under_cap(session: Any) -> bool:
-        # Adversarial-review fix (2026-05-09): align with the nudge
-        # convention where ``max_recursion_depth=0`` means "uncapped"
-        # (give-up nudge stays in normal protocol framing). The action
-        # previously read ``max_recursion_depth=0`` as "active cap of
-        # 0" → action never runs. Two layers, two different semantics
-        # for the same field. Now both treat 0 as "uncapped" consistently.
+        # Treat max_recursion_depth=0 as uncapped, consistently with the
+        # normal-protocol framing of the give-up nudge.
         depth = int(getattr(session, "recursion_depth", 0) or 0)
         # Read directly without ``or 3`` fallback to preserve 0 → uncapped.
         raw_cap = getattr(session, "max_recursion_depth", 3)
@@ -1275,15 +1265,10 @@ class RecursiveHelperProverAction:
         return self.is_applicable(session)
 
     async def run(self, session: Any) -> MiniOutcome:
-        # CRITICAL fix (2026-05-09): helper_decl_from_proof lives in
-        # mini_recursive, NOT proof_dossier. Wrong import would
-        # ImportError on every successful child sub-session — caught
-        # by adversarial review.
-        #
-        # Also: imports MUST happen BEFORE the attempt-counter bump
-        # so an ImportError doesn't bypass the bump (the bump exists
-        # specifically to prevent infinite loops on hard nodes; if a
-        # crash bypassed it, the same node would be selected forever).
+        # Import helper_decl_from_proof from mini_recursive before bumping
+        # the attempt counter. Resolve dependencies before charging a recursive
+        # attempt, while retaining the counter's protection against repeated
+        # attempts on hard nodes.
         from ensemble_prover.mini_recursive import helper_decl_from_proof
         from ensemble_prover.proof_dossier import is_answer_unsafe_statement_text
         from ensemble_prover.proof_state_executor import (
@@ -1303,7 +1288,7 @@ class RecursiveHelperProverAction:
         def _emit_telemetry(record: dict) -> None:
             """Best-effort telemetry write that ALSO logs failures.
 
-            Adversarial review (2026-05-09) HIGH: silent try/except
+            Silent try/except
             around recorder calls makes classifier crashes invisible
             in JSONL post-mortem. This wrapper retries via the raw
             recorder if _record_event raises.
@@ -1451,7 +1436,7 @@ class RecursiveHelperProverAction:
                 },
             )
 
-        # Validate target BEFORE bumping attempt counter (HIGH-4 fix:
+        # Validate target BEFORE bumping attempt counter (
         # don't burn budget on degenerate nodes).
         target_statement = str(getattr(node, "target", "") or "").strip()
         if not target_statement:
@@ -2306,11 +2291,9 @@ class RecursiveHelperProverAction:
                 # paid invocation or the node's mathematical attempt.
                 cleanup_continuation_granted = True
 
-        # Persist any give-up cluster the child sub-session tripped.
-        # ``prove_helper_in_subsession`` exports the most-recent
-        # cluster id under ``telemetry["giveup_cluster"]`` (None if no
-        # give-up fired). Bumping per-cluster counts here closes the
-        # adversarial-review HIGH-3 ("dead giveup-cap" finding).
+        # Persist the child's most recent give-up cluster from
+        # ``telemetry["giveup_cluster"]`` (None if no give-up fired).
+        # The per-cluster counts enforce the give-up cap.
         child_giveup = telemetry.get("giveup_cluster") if isinstance(telemetry, dict) else None
         child_giveup_match = telemetry.get("giveup_match") if isinstance(telemetry, dict) else ""
         if child_giveup:
@@ -2341,7 +2324,7 @@ class RecursiveHelperProverAction:
             # against the PARENT context (parent's preamble +
             # parent's verified helpers).
             #
-            # CRITICAL ordering (HIGH-1 fix from review): _accept_
+            # CRITICAL ordering: _accept_
             # proof_state_helper must run BEFORE any verified-helper
             # merge from the child dossier. _accept_ short-circuits
             # via dossier.has_helper(name); if the child already

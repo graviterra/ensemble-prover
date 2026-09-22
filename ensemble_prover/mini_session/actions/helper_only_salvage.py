@@ -208,7 +208,7 @@ class HelperOnlySalvageAction:
         # Defensive probe so test stubs (SimpleNamespace) without
         # ``has_open_decomposition_task`` fall through to the salvage
         # path. Real proof_state implementations have the method.
-        # D2 gate-side fix (2026-05-09): open ad-hoc decomposition_task
+        # open ad-hoc decomposition_task
         # when sorry-stubs are present so the lemma-DAG path proceeds.
         if (
             helpers

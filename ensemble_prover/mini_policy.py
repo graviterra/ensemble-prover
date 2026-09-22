@@ -17,6 +17,8 @@ from .mini_lean_extract import (
     _is_plausible_main_proof,
     _lean_body_is_sorry_stub,
     _non_code_response_text,
+    _partition_redundant_preamble_commands,
+    _partition_scoped_open_prefix,
     _root_equivalent_sorry_stub_helper_names_from_blocks,
     _sorry_stub_helper_names,
     _split_top_level_chunks,
@@ -38,6 +40,7 @@ from .proof_dossier import (
     official_answer_visible_to_llm,
     text_hash,
 )
+from .provider_tool_protocol import _checked_code_body
 from .utils import extract_code_fences, parse_tool_arguments
 
 
@@ -281,7 +284,7 @@ def _responses_output_matches_advertised_tool_calls(
     output_items: Sequence[Dict[str, Any]],
     advertised_tool_calls: Sequence[Dict[str, Any]],
 ) -> bool:
-    """Return whether exact Responses replay preserves the visible B1 pairs."""
+    """Return whether exact Responses replay preserves the visible assistant/tool pairs."""
 
     output_calls = [
         (
@@ -958,12 +961,7 @@ def _summarize_compacted_tool_evidence(
                     score = 40
                     evidence_class = "accepted_proof"
                     raw_code = str(args.get("code", "") or "")
-                    fenced_blocks = extract_code_fences(raw_code)
-                    checked_code = (
-                        str(fenced_blocks[0] or "").strip()
-                        if fenced_blocks
-                        else raw_code.strip()
-                    )
+                    checked_code = _checked_code_body(raw_code).strip()
                     code_lines = _prompt_safe_code_snippet(
                         checked_code,
                         limit=1200,
@@ -973,11 +971,13 @@ def _summarize_compacted_tool_evidence(
                         ensure_ascii=False,
                     ) if code_lines else ""
                     if code:
-                        if re.match(r"^\s*example(?=\s|[:({\[])", checked_code):
+                        if _COMPLETE_REPAIR_PROOF_PREFIX_RE.match(
+                            _strip_lean_comments(checked_code).strip()
+                        ) is None:
                             score = 31
                             evidence_class = "accepted_example"
                             structured_detail = (
-                                "Lean-accepted standalone example evidence, not "
+                                "Lean-accepted auxiliary scratch evidence, not "
                                 f"a proof of the handoff target: {code}"
                             )
                         else:
@@ -1162,23 +1162,14 @@ def _compact_history_summary_text(text: str, *, limit: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Decomposition-request detection (orchestration redirect for "give up" turns).
+# Decomposition-request detection for replies that report inability to proceed.
+# The post-Lean gate replaces generic rejection feedback with a targeted
+# redirect; pre-Lean callers also require a structural-collapse signal.
 #
-# Empirical analysis (2026-05-09) of 8,077 prove/refine turns across 500 failed
-# runs found 12 distinct linguistic clusters where the LLM self-reports
-# inability to proceed. The hardest signals (HARD tier below) match 100% of
-# the time on Lean-rejected turns — zero of the regex-flagged turns ever
-# passed Lean. This empirical precision justifies acting on the LLM's
-# self-reported decomposition request without violating the
-# "Lean = source of truth" contract: the gate runs AFTER Lean has already
-# rejected, replacing the generic feedback with a cluster-specific
-# directive that forces decomposition into named helpers rather than
-# letting the LLM repeat the give-up shape.
-#
-# Cluster IDs (decoupled from regex bodies for routing):
+# Cluster IDs are independent of the routing regexes:
 #   helpers_insufficient — opaque helpers / additional lemmas / would-need
-#   answer_opaque        — putnam_X_solution is opaque axiom
-#   lemma_not_found      — specific named lemma missing from environment
+#   answer_opaque        — putnam_X_solution is an opaque axiom
+#   lemma_not_found      — specific named lemma missing from the environment
 #   no_sorry_allowed     — meta-commentary about the no-sorry rule
 #   environment_hedge    — global proof/goal strategy-stuck hedge
 #   scaffold_reject      — fail_if_success / placeholder / stub markers
@@ -1186,16 +1177,12 @@ def _compact_history_summary_text(text: str, *, limit: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-# Helpers-insufficient: highest-precision target. Empirical clusters #4, #6, #12.
-# The "(?:...){0,8}\s+" quantified gap allows up to 8 filler words between
-# "additional/intermediate lemmas" and the trailing modal verb (e.g.
-# "additional intermediate lemmas about the induced order on ℚ are needed")
-# without losing precision (the noun list constrains matches).
-#
-# Code review fix (2026-05-09): the "X opaque helper lemma" arm previously
-# allowed unconstrained ``\w+`` for X, which would have matched routine
-# math sentences like "the opaque helper lemma is referenced". Constrained
-# to a closed list of quantifier-style words.
+# Helpers-insufficient: high-precision linguistic signal.
+# The "(?:...){0,8}\s+" gap allows up to 8 filler words between
+# "additional/intermediate lemmas" and the trailing modal verb.
+# The noun list constrains matches. For "X opaque helper lemma", X
+# must be a quantifier-style word so routine mathematical prose such
+# as "the opaque helper lemma is referenced" does not match.
 _GIVEUP_HELPERS_INSUFFICIENT_QUANTIFIERS = (
     r"(?:two|three|four|five|six|seven|eight|nine|ten|several|few|some|many|"
     r"all|both|these|those|the|its|just|merely|\d+)"
@@ -1255,16 +1242,10 @@ _GIVEUP_NO_SORRY_RE = re.compile(
     r")"
 )
 
-# Environment-hedge: clusters #1, #3, #7, #11. Generic global
-# proof/goal-level "cannot finish here".
-# Code review fix (2026-05-09): the bare ``in this environment`` phrase
-# matches routine prose ("we work in this context with ring axioms…")
-# and was generating false positives on innocuous Lean error commentary.
-# Tightened again after a live trace showed local proof-planning comments
-# such as "this helper is not derivable" being misread as global give-up.
-# This cluster now requires first-person inability language or an explicit
-# root/proof/goal subject; local facts/helpers can still be handled by the
-# more specific missing-lemma clusters when they say something is unavailable.
+# Environment-hedge: global proof/goal-level "cannot finish here".
+# Require first-person inability language or an explicit root/proof/goal
+# subject. Bare ``in this environment`` and local helper-planning prose
+# are too broad. Missing-lemma clusters handle unavailable local facts.
 _GIVEUP_ENVIRONMENT_HEDGE_RE = re.compile(
     r"(?ix)"
     r"(?:"
@@ -1304,13 +1285,11 @@ _GIVEUP_RESEARCH_STATUS_RE = re.compile(
     r"[^\n.!?]{0,100}\b(?:open|unresolved|unsolved)\b"
 )
 
-# Scaffold-reject: clusters #2, #10. Stub/placeholder/fail_if_success markers.
-# Code review fix (2026-05-09): ``skeleton`` removed — it's standard math
-# vocabulary (``2-skeleton of CW complex``, ``simplicial skeleton``,
-# ``skeleton category``) and matched routine topology / category-theory
-# prose. The remaining tokens (``stub``, ``placeholder``, ``dummy``,
-# ``no-op``) only fire as scaffold markers in the LLM's idiom, with
-# ``fail_if_success`` being a hard structural indicator.
+# Scaffold-reject: stub/placeholder/fail_if_success markers.
+# Exclude ``skeleton``, which is standard mathematical vocabulary in
+# ``2-skeleton of CW complex``, ``simplicial skeleton``, and
+# ``skeleton category``. ``fail_if_success`` is a structural indicator;
+# ``stub``, ``placeholder``, ``dummy``, and ``no-op`` mark scaffolding.
 _GIVEUP_SCAFFOLD_REJECT_RE = re.compile(
     r"(?ix)"
     r"(?:"
@@ -1333,10 +1312,9 @@ _GIVEUP_CLUSTERS: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
 )
 
 
-# Structural collapse shapes: proofs that close via False.elim/absurd
-# without justifying evidence, or are pure sorry/admit. Empirically these
-# never pass Lean. Used as a co-condition to gate against false positives
-# from aspirational mid-proof prose.
+# Structural-collapse signals include unsupported False.elim/absurd
+# and pure sorry/admit bodies. Combine them with linguistic signals to
+# avoid rejecting ordinary mid-proof planning prose.
 _PROOF_COLLAPSE_FALSE_ELIM_TRIVIAL_RE = re.compile(
     r"(?:False\.elim|absurd)\s*\(\s*by\s+[^()]{0,120}?\b(?:trivial|rfl|exact\s+(?:rfl|trivial|⟨⟩|\(\)))\b",
     re.IGNORECASE | re.DOTALL,
@@ -1477,14 +1455,12 @@ def _classify_giveup_signal(
     The dual condition (linguistic + structural) is the precision guarantee:
     a turn that says "cannot finish" but emits a real proof attempt is
     routed to Lean as before; only when both signals fire is the turn
-    redirected to decomposition. Empirical precision in mini_prover history:
-    ~100% — zero linguistic-flagged turns passed Lean.
+    redirected to decomposition.
 
     ``require_structural_collapse=False`` is reserved for callers that have
     already confirmed Lean rejection; when the proof was already adjudicated
     failed by Lean, the structural co-condition is redundant and the gate
-    can fire on linguistic signal alone (per the user's "post-Lean cascade
-    redirect" design).
+    can fire on linguistic signal alone.
 
     Search scope is asserted assistant prose outside fenced code blocks,
     quotations, and copied instructions. Lean comments inside proof code are
@@ -1493,7 +1469,7 @@ def _classify_giveup_signal(
     rejection via ``_silent_giveup_cluster_from_proof``.
     """
 
-    # Code review fix (2026-05-09): require_structural_collapse=False
+    # require_structural_collapse=False
     # callers (the post-Lean cascade) want to fire on linguistic signal
     # alone — Lean rejection IS the structural failure signal. Move the
     # ``proof is None`` short-circuit AFTER the structural-collapse
@@ -1546,19 +1522,15 @@ def _giveup_decomposition_nudge(
     """Compose the cluster-specific decomposition-redirect feedback text.
 
     Returned text replaces the generic post-Lean failure feedback when the
-    give-up gate fires. These nudges no longer offer helper-only
+    give-up gate fires. These nudges do not offer helper-only
     decomposition as the response to give-up prose. If a turn already
     externalized the hard step ("full formalization would proceed...",
     "Mathlib lacks...", etc.), the next prompt must steer back to an
     executable active-goal attempt or a genuinely different route.
 
-    Code review fix (2026-05-09): nudge bodies are paraphrased to AVOID
-    re-quoting the trigger phrasing. Prior templates contained the exact
-    keywords that fire the regexes (``cannot finish in this environment``,
-    ``additional intermediate lemmas would be needed``,
-    ``stub/placeholder``), which would re-fire the gate when the LLM
-    quoted the nudge in its next reply. Matched phrasing is rendered with
-    backticks escaped to prevent markdown-injection on chat platforms.
+    Paraphrase nudge bodies to avoid repeating the trigger phrases.
+    Quoting those phrases in a subsequent reply could re-trigger the gate.
+    Escape backticks in matched text to prevent Markdown injection.
 
     Answer visibility semantics:
       - ``True`` (default; the no-answer-leaderboard target variant) —
@@ -1602,7 +1574,7 @@ def _giveup_decomposition_nudge(
         )
 
     if at_recursion_limit:
-        # Phase 2 (2026-05-09): at the recursion-depth cap, the nudge
+        # at the recursion-depth cap, the nudge
         # MUST stop asking for further decomposition. Otherwise sub-
         # conversations chain forever (the LLM at depth N decomposes
         # into helper at depth N+1, which itself gives up at depth
@@ -1892,7 +1864,7 @@ def _repair_content_is_helper_only_decomposition(
     by ``try_lean`` in that same turn. A helper-only sorry-stub decomposition
     request is a different protocol and is deliberately handled by the no-proof
     cascade. Letting the tool loop reject it first strands valid sorry-stub
-    child goals before D2's decomposition-task opener can materialize them.
+    child goals before the decomposition-task opener can materialize them.
     """
 
     try:
@@ -2064,12 +2036,12 @@ _TRANSIENT_GOAL_LOW_SIGNAL_ATOMS = {
     # produces these as standalone ``⊢ ∃`` lines (truncated/malformed
     # diagnostic). They carry zero semantic content as goal targets,
     # bloat feedback messages, and cannot meaningfully match the
-    # narrow gate's ``: <target> := sorry`` shape. Round-3 fix.
+    # narrow gate's ``: <target> := sorry`` shape.
     "∃",
     "∀",
     # Bare Unicode True/False propositions — appear as ``⊢ ⊤`` /
     # ``⊢ ⊥`` after ``simp``-style rewrites. Same low-signal-content
-    # rationale as ∃/∀. Round-4 fix.
+    # rationale as ∃/∀.
     "⊤",
     "⊥",
     # Bare Unicode logical connectives — same rationale; can appear
@@ -2116,8 +2088,7 @@ def _extract_rejected_code_fragments(analysis: Dict[str, Any]) -> List[str]:
     ``_extract_transient_goal_targets`` and are surfaced under a separate
     header with non-prohibitive framing. Conflating the two poisons the LLM
     by telling it to "not reuse" expressions it never submitted as code,
-    which on putnam_2012_a2 (2026-05-12) caused the LLM to abandon a
-    fixable type_mismatch and pivot to sorry-stub decomposition.
+    which can divert a repairable type mismatch into sorry-stub decomposition.
     """
 
     fragments: List[str] = []
@@ -2314,11 +2285,8 @@ def _repair_feedback_messages_in_current_cycle(conv: Any) -> List[Dict[str, Any]
     Assistant / tool / system messages are skipped: tool outputs in the middle
     of a turn do not end the cycle; only a new *user* message can.
 
-    Structural root-cause fix for B1-B4 (2026-05-18 audit). Prior to this
-    helper, repair-state was cached on ``Conversation`` attributes that
-    survived history mutations (compaction at line 1080+, history reset at
-    10800, branch-B asymmetric updates at 1233-1240). Deriving from history
-    means there is nothing to invalidate: every reader sees the current
+    Deriving repair state from history means there is nothing to invalidate:
+    every reader sees the current
     source of truth, while still accumulating fragments across consecutive
     repair messages so a self-check marker does not erase the prior
     rejection's fragments.
@@ -2361,9 +2329,8 @@ def _repair_feedback_texts_in_current_cycle(conv: Any) -> List[str]:
 def _repair_turn_requires_self_check(conv: Any) -> bool:
     """True iff there is at least one repair feedback in the current cycle.
 
-    History-derived (B1-B4 fix, 2026-05-18). Replaces a cached
-    ``repair_self_check_active`` attribute read that could go stale across
-    history mutations.
+    Derive the result from current history so compaction, reset, and other
+    transcript mutations cannot leave a stale repair-state flag.
     """
 
     return bool(_repair_feedback_texts_in_current_cycle(conv))
@@ -2482,15 +2449,10 @@ def _parse_bullets_under_header(text: str, header: str) -> List[str]:
 def _rejected_fragments_from_feedback_text(content: Any) -> List[str]:
     """Parse the "Rejected code fragment(s)" bullets only.
 
-    Adversarial-review 2026-05-13 (regression-from-Fix-#1): Yesterday's
-    fix merged BOTH this header and the "Lean's unsolved goal
-    target(s)" header into a single banned-fragment list fed to the
-    strict identifier-bounded gate
-    (``_proof_reuses_rejected_fragments``). The strict gate then banned
-    the goal expression itself — including the bare ``∃`` token — from
-    appearing in any subsequent proof, which makes any honest proof of
-    an existential goal impossible. The two sections are now parsed by
-    separate functions and gated separately:
+    Keep this header separate from "Lean's unsolved goal target(s)".
+    Feeding goal targets into the strict identifier-bounded gate would
+    ban the goal expression itself, including ``∃``, from subsequent
+    proofs. Parse and gate the two sections separately:
 
     - Rejected code fragments go through the strict
       ``_proof_reuses_rejected_fragments`` gate (substring + identifier
@@ -2500,8 +2462,7 @@ def _rejected_fragments_from_feedback_text(content: Any) -> List[str]:
       ``_transient_goal_targets_from_feedback_text`` and fed to the
       narrow ``_proof_repackages_transient_goal_target`` gate, which
       only fires when the target appears as the type of a sorry-bodied
-      declaration — the original "goal-as-helper" failure mode that
-      motivated Fix #1 — without banning the goal expression in any
+      declaration, without banning the goal expression in any
       other context.
     """
 
@@ -2539,7 +2500,7 @@ def _rejected_fragments_from_latest_feedback(conv: Any) -> List[str]:
             if fragment and fragment not in fragments:
                 fragments.append(fragment)
 
-    # History-derived (B1-B4 fix, 2026-05-18). Unions fragments across all
+    # History-derived. Unions fragments across all
     # consecutive repair-feedback user messages at the tail of history. Private
     # payload metadata is authoritative when present, so compaction can keep a
     # later policy-feedback message without forgetting the Lean rejection payload
@@ -2584,15 +2545,11 @@ def _compact_lean_for_fragment_match(value: Any) -> str:
             text,
         )
     text = _canonicalize_simp_bracket_lists(text)
-    # B5 fix REVERTED (2026-05-18 audit, adversary C): angle brackets in Lean
-    # are NOT commutative in general — they denote ``Exists.intro``,
-    # ``And.intro``, positional structure literals, ``Sigma.mk``, etc., all of
-    # which are order-sensitive. Canonicalizing by sort would produce false
-    # positives on legitimate repair attempts where the LLM swaps witness/
-    # proof or restructures a positional constructor. The original B5 claim
-    # ("swapping ⟨a,b,c⟩ to ⟨c,b,a⟩ is the same proof") was semantically
-    # wrong — a swapped angle-bracket IS a different Lean expression that
-    # the LLM is legitimately allowed to try.
+    # Angle brackets in Lean are order-sensitive: they denote
+    # ``Exists.intro``, ``And.intro``, positional structure literals,
+    # ``Sigma.mk``, and similar constructors. Sorting their contents would
+    # incorrectly reject repairs that swap witnesses/proofs or restructure
+    # a positional constructor.
     text = re.sub(r"\s*([\[\],])\s*", r"\1", text)
     return text
 
@@ -2917,9 +2874,9 @@ def _transient_goal_targets_from_latest_feedback(conv: Any) -> List[str]:
     """Mirror of ``_rejected_fragments_from_latest_feedback`` for the
     transient-goal-target channel.
 
-    History-derived (B1-B4 fix, 2026-05-18). Parses the most-recent user message
-    iff it is a repair feedback. Ignores any cached ``conv.transient_goal_targets``
-    attribute, which previously could go stale across history mutations.
+    Parse the most recent user message when it is repair feedback.
+    Read current history instead of cached ``conv.transient_goal_targets``
+    so history mutations cannot leave stale targets.
     """
 
     targets: List[str] = []
@@ -2966,10 +2923,8 @@ def _proof_repackages_transient_goal_target(
     the same target through real tactics (``exact ⟨5, ..., rfl⟩``,
     ``refine ⟨_, _, _⟩``, ``constructor; ...``, etc.) do NOT contain
     the ``: <target> := <maybe by> sorry`` shape and are therefore
-    unaffected — closing the regression where the previous unified
-    gate banned the bare ``∃`` token (or the full existential
-    target) from any subsequent proof, making honest existential
-    proofs impossible.
+    unaffected. The bare ``∃`` token and full existential target remain
+    available to ordinary proofs.
     """
 
     if not proof:
@@ -2988,7 +2943,7 @@ def _proof_repackages_transient_goal_target(
         escaped = re.escape(normalized)
         # ": <target> := [by ]? [exact|refine|apply ]? [(⟨]? stub [)⟩]?"
         # — captures the sorry/admit-helper repackaging shape, including the
-        # one-character bypasses agents flagged in round 4 (``(sorry)``
+        # parenthesized forms (``(sorry)``
         # and ``⟨sorry⟩``) and the small-token bypasses
         # (``refine sorry`` / ``apply sorry``).
         wrapper_prefix = r"(?:(?:by\s+)?(?:exact|refine|apply)\s+[\(⟨{]*\s*)"
@@ -3155,16 +3110,7 @@ def _format_repackaged_goal_target_feedback(
 ) -> str:
     """Feedback for the narrow goal-as-sorry-helper repackaging gate.
 
-    Adversarial-review 2026-05-13: previously the narrow-gate hits
-    were merged into the ``reused_rejected_fragments`` list and routed
-    through ``_format_reused_fragment_feedback``. That formatter wrote
-    the goal-target string under ``_REJECTED_FRAGMENT_HEADER``, which
-    ``Conversation.append_user`` then parsed back into
-    ``rejected_code_fragments`` on the next turn — re-poisoning the
-    strict identifier-bounded gate and re-creating the regression
-    Fix A was designed to close, just one turn later.
-
-    The dedicated formatter below writes the repackaged targets under
+    Write repackaged targets under
     ``_TRANSIENT_GOAL_TARGET_HEADER`` instead, so the next turn's
     re-parse routes them to ``transient_goal_targets`` (consumed only
     by the narrow gate), never to ``rejected_code_fragments``.
@@ -3287,15 +3233,16 @@ def _repair_self_check_matches_submission(
                 continue
             registry_codes.append(str(getattr(item, "normalized_code", "") or ""))
     for code in [*list(checked_codes or ()), *registry_codes]:
-        checked_norm = _normalized_repair_code(
+        checked_norm = _normalized_checked_repair_code(
             code,
-            preserve_declaration=require_declaration,
+            goal_statement=goal_statement,
+            require_declaration=require_declaration,
         )
         if not checked_norm:
             continue
         if exact_only:
             # Durable cross-turn evidence demands the EXACT normalized proof
-            # body (Sol audit 2026-07-29 F4): local-fragment containment is
+            # body: local-fragment containment is
             # only valid for current-turn diagnostic probes, where the model
             # demonstrably ran the verifier this turn. An old accepted
             # fragment embedded inside a newly written proof is not evidence
@@ -3393,6 +3340,47 @@ _COMPLETE_REPAIR_PROOF_PREFIX_RE = re.compile(
 )
 
 
+def _normalized_checked_repair_code(
+    code: Any,
+    *,
+    goal_statement: str = "",
+    require_declaration: bool = False,
+) -> str:
+    """Keep a checked declaration's target when interpreting repair evidence."""
+
+    if require_declaration:
+        return _normalized_repair_code(code, preserve_declaration=True)
+    source = _strip_lean_comments(_checked_code_body(code)).strip()
+    source, leading_opens = _partition_redundant_preamble_commands(source)
+    if leading_opens:
+        return ""
+    if (
+        _COMPLETE_REPAIR_PROOF_PREFIX_RE.match(source)
+        or _LOCAL_REPAIR_FRAGMENT_PREFIX_RE.match(source)
+    ):
+        return _normalized_repair_code(source)
+    _declaration, local_opens = _partition_scoped_open_prefix(source)
+    if local_opens:
+        # An open can change the meaning of the declaration's type, including
+        # scoped notation. Matching its unscoped type text to the active goal
+        # does not establish that the accepted declaration proves that goal.
+        return ""
+    # Anonymous examples need a temporary name only for statement parsing.
+    # Never infer that their accepted body closes the active goal merely
+    # because it equals, or prefixes, the submitted proof body.
+    declaration = re.sub(
+        r"^(noncomputable\s+)?example(?=\s|[:({\[])",
+        lambda match: (match.group(1) or "") + "theorem mini_repair_evidence",
+        source,
+        count=1,
+    )
+    if not _helper_statement_root_equivalent(
+        declaration, goal_statement=goal_statement,
+    ):
+        return ""
+    return _normalized_repair_code(source)
+
+
 def _repair_checked_code_is_local_fragment(checked_norm: str) -> bool:
     """Whether accepted repair evidence is a local proof fragment.
 
@@ -3462,6 +3450,8 @@ def _repair_norm_has_executable_tail(
 def _repair_self_check_has_terminal_continuation(
     checked_codes: Sequence[str],
     submitted: Optional[str],
+    *,
+    goal_statement: str = "",
 ) -> bool:
     """Detect final proofs that continue after an accepted complete proof body.
 
@@ -3477,7 +3467,9 @@ def _repair_self_check_has_terminal_continuation(
     if not submitted_norm:
         return False
     for code in list(checked_codes or ()):
-        checked_norm = _normalized_repair_code(code)
+        checked_norm = _normalized_checked_repair_code(
+            code, goal_statement=goal_statement,
+        )
         if not checked_norm or checked_norm == submitted_norm:
             continue
         if _repair_checked_code_is_local_fragment(checked_norm):

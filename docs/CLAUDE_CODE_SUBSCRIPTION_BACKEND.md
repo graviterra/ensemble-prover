@@ -78,7 +78,7 @@ policy violation rather than undoing an action already performed by the CLI.
 
 ## Controls and accounting
 
-- `--reasoning-effort low|medium|high|max` maps directly to Claude Code's effort
+- `--reasoning-effort low|medium|high|xhigh|max` maps directly to Claude Code's effort
   setting. Support depends on the selected model. Explicit reasoning-off and
   `minimal` are rejected instead of silently changing the requested policy.
   Automatic bounded-output recovery uses `low`, which the transport supports.
@@ -95,12 +95,24 @@ policy violation rather than undoing an action already performed by the CLI.
   remains marked incomplete. Zeroed crash totals also use this fallback.
   Partial snapshots are incomplete observations, not final token totals; they
   count as one provider exposure while retaining missing-usage status.
+  Reported thinking tokens are a subset of output tokens, not additional output.
+  Live thinking estimates are not authoritative usage receipts.
+- `llm_provider_progress` events show request activity, current-block thinking
+  estimates, retries, and completion or failure in the live trace. Repeated
+  activity is throttled to one update per 30 seconds; status changes appear
+  immediately. These events contain no thinking text, do not count as verified
+  proof progress, and do not extend request deadlines. Completion is reported
+  only after the structured response passes validation.
 - Usage is unpriced subscription usage. Claude Code's API-dollar estimate is
   not treated as an authoritative subscription charge. `--cost-budget-usd 0`
   is required; the account's applicable allowances and usage limits still apply.
 - Request deadlines cover preflight, admission, startup and stream processing.
   Batch samples share an operation deadline. Cancellation reaps local process
   groups; terminating a local process cannot guarantee remote generation stopped.
+  A retry starts a fresh invocation with the retained Mini conversation; it
+  cannot resume the interrupted invocation's unfinished reasoning. A per-request
+  timeout therefore does not bound the whole problem. Use
+  `--mini-worker-timeout-s` for an overall worker limit.
 - Proven unsent requests return their exact dispatch ticket. Missing or uncertain
   provider receipts retain conservative accounting and durable recovery behavior.
 

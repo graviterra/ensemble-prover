@@ -715,9 +715,8 @@ class RunRecorder:
         "repair_gate_error",
         "proof_patch_failed",
         "reused_rejected_lean_fragment",
-        # Round-3 fix: narrow-gate hits had no metric counter, so
-        # telemetry-driven failure-mode dashboards silently
-        # under-counted this rejection class.
+        # Count narrow-gate hits so failure-mode telemetry includes this
+        # rejection class.
         "transient_goal_target_sorry_helper",
         "repair_requires_api_search",
         "formalization_requires_declaration",

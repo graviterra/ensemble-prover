@@ -1145,8 +1145,8 @@ def _replace_type_symbols_capture_safe(text: str) -> str:
     """Glyph->name normalization that cannot merge distinct identifiers.
 
     Rewriting ``ℕ`` to ``Nat`` inside a statement that ALSO binds or uses the
-    identifier ``Nat`` textually merges two different things — external
-    review reproduced `∀ (Nat : Type), Nonempty ℕ` (TRUE) colliding with
+    identifier ``Nat`` can merge distinct propositions: for example,
+    `∀ (Nat : Type), Nonempty ℕ` (TRUE) can collide with
     `∀ (Foo : Type), Nonempty Foo` (FALSE). When both spellings of a pair
     coexist, skip that pair (false-mismatch direction only; single-spelling
     statements keep full unification).
@@ -1181,7 +1181,7 @@ def _replace_type_symbols_capture_safe(text: str) -> str:
 # A bare ascription/binder colon — not the first/second half of ``:=`` or
 # ``::``. Identity must be invariant under colon spacing (``(0:ℝ)`` ≡
 # ``(0 : ℝ)``): before this normalization, spacing depended on which
-# canonicalization path a subterm happened to take (b2 digest-pin regression).
+# canonicalization path a subterm happened to take .
 _IDENTITY_COLON_SPACING_RE = re.compile(r"[ \t]*(?<!:)(:)(?![:=])[ \t]*")
 
 
@@ -2925,7 +2925,7 @@ def _implicit_chained_relation_binder(text: str) -> Tuple[str, str]:
     # with big-operator commas inside the bound, but never with an
     # unparenthesized top-level arrow or quantifier token — reject those
     # slices, or the fabricated binder breaks α-stability of the identity key
-    # (b2 digest-pin regression: dangling ``_b`` name + inner variable left
+    # (dangling ``_b`` name + inner variable left
     # un-renamed).
     if _split_top_level_operator_sequence(binder, ("→", "->")) is not None:
         return "", raw
@@ -4216,7 +4216,7 @@ def canonicalize_lean_statement_for_identity(
     text = _normalize_colon_spacing_outside_lean_quotes(text)
     replacements: Dict[str, str] = {}
     # Reserve fresh-name space: a statement literally containing _bN tokens
-    # must not collide with generated alpha names (external review: canon of
+    # must not collide with generated alpha names (canon of
     # `∀ x : Nat, x = _b0` equalled canon of `∀ x : Nat, x = x`).
     next_index = _next_free_alpha_index(text)
     for name in extra_bound_names:
@@ -4558,7 +4558,7 @@ class ProofStateAssemblyAttempt:
     # without this marker remain fail-closed rather than laundering terminal
     # work back to open.
     attestation_quarantine_previous_status: str = ""
-    # E4 (2026-05-09): tuple of "<child_node_id>:<proved_helper_name>"
+    # tuple of "<child_node_id>:<proved_helper_name>"
     # strings (sorted) captured at the moment the most recent
     # assembly attempt fired. Lets us distinguish "tried with these
     # exact witnesses before" from "tried, but a child has since been
@@ -5049,7 +5049,7 @@ class ProofStateNode:
     # acceptance directly instead of paying to rediscover the proof.
     pending_helper_acceptance: Dict[str, Any] = field(default_factory=dict)
     proved_helper_name: str = ""
-    # Phase 2 (2026-05-09) — recursive helper prover telemetry.
+    # recursive helper prover telemetry.
     # ``recursive_attempts`` increments each time a
     # ``RecursiveHelperProverAction`` runs against this node;
     # ``last_recursive_attempt_iteration`` records the parent session's
@@ -5352,7 +5352,7 @@ class ProofStateCheckpoint:
     them. Rollback always deepcopies on restore so inadvertent post-
     rollback mutation cannot back-propagate into the snapshot anyway.
 
-    Snapshot scope (deliberate choices, see Gap 3 design notes):
+    Snapshot scope:
 
     - ``nodes`` (deepcopy) — speculative children + decomposition tasks
       added during the checkpoint window are wiped on rollback.
@@ -5589,7 +5589,7 @@ class ProofSearchState:
                 priority=100.0,
             )
         }
-        # Backtracking primitive (Gap 3 fix, 2026-05-08). LIFO stack of
+        # Backtracking primitive. LIFO stack of
         # snapshots; rollback truncates everything opened after a target id,
         # commit pops a single snapshot. Verified helpers in the dossier are
         # NEVER snapshotted (they are kernel-verified durable wins). The
@@ -5601,12 +5601,12 @@ class ProofSearchState:
         self._checkpoint_id_prefix = uuid.uuid4().hex[:8]
         self._checkpoint_counter: itertools.count = itertools.count(1)
         self._checkpoint_stack: List["ProofStateCheckpoint"] = []
-        # E1 inverse index: child_node_id -> set of (parent_node_id, assembly_id)
+        # Inverse index: child_node_id -> set of (parent_node_id, assembly_id)
         # pairs whose assembly group lists that child. Maintained alongside
         # ``parent.assembly_attempt_groups[].child_node_ids`` so a newly proved
         # child can be propagated to its parents in O(parents) instead of an
         # O(n) frontier scan, and so ``_priority`` can compute closure value
-        # without enumerating every node's groups (E3).
+        # without enumerating every node's groups.
         self._assembly_parents_by_child: Dict[str, Set[Tuple[str, str]]] = {}
 
     def _restore_durable_metric_counters(self, metrics: Any) -> None:
@@ -6743,9 +6743,9 @@ class ProofSearchState:
                 )
                 if isinstance(item, dict)
             ],
-            # F1 fix (2026-05-11): see to_record companion. Rehydrate
-            # Phase 2 recursive helper prover counters from the record
-            # so B8's attempt + giveup caps survive parallel-sample
+            # see to_record companion. Rehydrate
+            # Recursive helper prover counters from the record
+            # so the attempt + giveup caps survive parallel-sample
             # cloning. Defaults match the dataclass init.
             recursive_attempts=_proof_state_durable_nonnegative_int(
                 record.get("recursive_attempts")
@@ -8347,7 +8347,7 @@ class ProofSearchState:
                     else "needs_llm_or_split"
                 )
                 node.priority = self._priority(node)
-        # Adversarial review fix 2026-05-09: this method bulk-mutates
+        # this method bulk-mutates
         # ``group.child_node_ids`` without going through
         # ``_attach_child_to_parent``. Rebuild the inverse index here so
         # any future caller that doesn't pair this with a separate
@@ -8451,7 +8451,7 @@ class ProofSearchState:
     ) -> List[Dict[str, Any]]:
         """Re-promote OPEN proof_state child_goals matching durable dossier helpers.
 
-        B2 fix (2026-05-11): the rollback contract restores
+        the rollback contract restores
         ``proof_state.nodes`` from a deep-copied snapshot (terminal
         statuses such as ``"proved"`` revert to ``"open"``), but
         ``dossier.verified_helpers`` is preserved as durable wins. The
@@ -8465,9 +8465,8 @@ class ProofSearchState:
         This method closes the gap by re-marking matching child_goal
         nodes as ``status="proved"`` with ``proved_helper_name`` set.
 
-        Eligibility (F2 hardening, 2026-05-11): ONLY nodes currently
-        in ``status="open"`` are promoted. The first cut of B2 reused
-        ``record_verified_helper_matches``, which also accepts
+        Eligibility: ONLY nodes currently in ``status="open"`` are promoted.
+        ``record_verified_helper_matches`` also accepts
         ``rejected``/``failed``/``blocked`` — that would resurrect
         intentionally-failed nodes from old durable helpers and cascade
         sibling obsolete-cancellations. Post-rollback semantics: the
@@ -8524,7 +8523,7 @@ class ProofSearchState:
             # ``status=proved`` plus ``falsified=True`` during recovery.
             if node.falsified:
                 continue
-            # F2 hardening: only re-promote OPEN nodes. Other terminal
+            # only re-promote OPEN nodes. Other terminal
             # statuses are deliberate close states that rollback should
             # not undo.
             if node.status != "open":
@@ -9137,7 +9136,7 @@ class ProofSearchState:
             return False
         # Exact trimmed equality: production certifies the node's target
         # STRING verbatim, and canonical keys sit in the identity-
-        # collision blast radius (external review: a certificate for a false
+        # collision blast radius (a certificate for a false
         # statement was accepted for a true one via a canonical-key merge).
         return str(statement).strip() == str(
             getattr(node, "target", "") or ""
@@ -9635,7 +9634,7 @@ class ProofSearchState:
             helper_name=helper_name,
         ):
             return
-        # E6 fix (adversarial review 2026-05-09): obsolete is a sticky
+        # obsolete is a sticky
         # terminal status. Re-proving an obsolete node would cancel
         # its assembly groups again and resurrect orphaned subtrees.
         # Refuse the close.
@@ -9652,7 +9651,7 @@ class ProofSearchState:
             node.successful_family = "tactic"
             node.priority = 0.0
             self._clear_terminal_node_verifier_work(node)
-            # E6 (2026-05-09): tactic-close cannot use any of node's
+            # tactic-close cannot use any of node's
             # assembly groups, so all open/retryable sibling groups are
             # obsolete.
             self._cancel_obsolete_or_siblings(node.node_id)
@@ -9708,7 +9707,7 @@ class ProofSearchState:
             helper_name=helper_name,
         ):
             return
-        # E6 fix: obsolete nodes are sticky terminal — see
+        # obsolete nodes are sticky terminal — see
         # ``record_tactic_result`` for the rationale.
         if node.status == "obsolete":
             return
@@ -9723,7 +9722,7 @@ class ProofSearchState:
             node.successful_family = "assembler"
             node.priority = 0.0
             self._clear_terminal_node_verifier_work(node)
-            # E6 (2026-05-09): the caller mutated exactly one group to
+            # the caller mutated exactly one group to
             # status="proved" before this method ran. That group is
             # the winner; sibling groups (still "open") are obsolete.
             winning_assembly_id = ""
@@ -9968,7 +9967,7 @@ class ProofSearchState:
             helper_name=helper_name,
         ):
             return
-        # E6 fix: obsolete nodes are sticky terminal.
+        # obsolete nodes are sticky terminal.
         if node.status == "obsolete":
             return
         if str(decl_application_signature or "").strip():
@@ -9985,7 +9984,7 @@ class ProofSearchState:
             node.successful_family = "decl_application"
             node.priority = 0.0
             self._clear_terminal_node_verifier_work(node)
-            # E6: decl-application closed the node directly; all
+            # decl-application closed the node directly; all
             # assembly groups are obsolete.
             self._cancel_obsolete_or_siblings(node.node_id)
             self._refresh_priorities_for_neighbors(node.node_id)
@@ -10022,7 +10021,7 @@ class ProofSearchState:
             helper_name=helper_name,
         ):
             return
-        # E6 fix: obsolete nodes are sticky terminal.
+        # obsolete nodes are sticky terminal.
         if node.status == "obsolete":
             return
         node.cache_hits += 1
@@ -10032,7 +10031,7 @@ class ProofSearchState:
         node.successful_family = "persistent_cache"
         node.priority = 0.0
         self._clear_terminal_node_verifier_work(node)
-        # E6: cache hit closed the node directly; assembly groups are
+        # cache hit closed the node directly; assembly groups are
         # obsolete.
         self._cancel_obsolete_or_siblings(node.node_id)
         self._refresh_priorities_for_neighbors(node.node_id)
@@ -10122,7 +10121,7 @@ class ProofSearchState:
                 continue
             if node.falsified:
                 continue
-            # E6 fix: obsolete is sticky terminal — a verified helper
+            # obsolete is sticky terminal — a verified helper
             # match for an already-cancelled node would resurrect it
             # into orphaned ghost work without informing scheduling.
             if node.status == "obsolete":
@@ -10145,7 +10144,7 @@ class ProofSearchState:
                 )
                 node.priority = 0.0
                 self._clear_terminal_node_verifier_work(node)
-                # E6: helper match closed the node directly; assembly
+                # helper match closed the node directly; assembly
                 # groups are obsolete.
                 self._cancel_obsolete_or_siblings(node.node_id)
                 self._refresh_priorities_for_neighbors(node.node_id)
@@ -10250,7 +10249,7 @@ class ProofSearchState:
         node = self.nodes.get(str(node_id or "").strip())
         if node is None or node.status == "proved":
             return False
-        # E6 fix (adversarial review 2026-05-09): refuse to reopen
+        # refuse to reopen
         # obsolete nodes. Their assembly groups are also obsolete; a
         # naive reopen would set status="open" but leave every group
         # locked, producing a "looks alive in frontier, makes zero
@@ -10352,15 +10351,11 @@ class ProofSearchState:
     ) -> str:
         """Public, idempotent decomposition-task opener.
 
-        D2 fix (2026-05-09): the lemma-DAG path
-        (``_try_proof_state_lemma_dag_helpers``) early-returns when
-        ``has_open_decomposition_task()`` is False, which silently
-        drops sorry-stub helpers the LLM emits in response to the
-        Phase 1 give-up gate's decomposition nudge. The previous
-        only-trigger was inside ``record_construction_collapse`` —
-        too narrow.
+        The lemma-DAG path requires an open decomposition task. Open one
+        before routing sorry-stub helpers from decomposition nudges so the
+        gate admits those helpers.
 
-        This wrapper is the public entry point for Phase 2's helper
+        This wrapper is the public entry point for the helper
         decomposition pipeline: any caller that detects the LLM has
         explicitly requested decomposition (sorry-stub helpers, or
         any cluster of the give-up gate firing) can call this to
@@ -10391,7 +10386,7 @@ class ProofSearchState:
         reuse_closed_structural: bool = True,
         reuse_closed_lemma_dag: bool = False,
     ) -> str:
-        # B9 fix (2026-05-11): refuse to open or surface ANY decomposition
+        # refuse to open or surface ANY decomposition
         # task when the root is already in a terminal status. Late callers
         # (sorry-stub detector at conversation_turn.py, construction-collapse
         # handler at mini_prover.py, helper-only salvage cascade) may still
@@ -10850,7 +10845,7 @@ class ProofSearchState:
     ) -> str:
         """Record an LLM-proposed lemma-DAG candidate as a graph node.
 
-        ``is_sorry_stub_body`` (Phase 2, 2026-05-09): when True, the
+        ``is_sorry_stub_body``: when True, the
         helper's body was just ``by sorry`` / ``by admit`` — i.e., the
         LLM was explicitly REQUESTING decomposition rather than
         attempting a proof. The rejection is structurally expected
@@ -10859,7 +10854,7 @@ class ProofSearchState:
         sorry-stub helper would arrive in the graph with
         ``failed_attempts=1`` even though no real proof attempt was
         made, which would degrade the node's priority unfairly when
-        downstream actions (Phase 2 RecursiveHelperProverAction,
+        downstream actions (RecursiveHelperProverAction,
         ChildClosureAction) try to attack it.
         """
 
@@ -11055,7 +11050,7 @@ class ProofSearchState:
             return ""
         if existing and existing != self.root_node_id:
             node = self.nodes[existing]
-            # E6: obsolete is sticky terminal. Refuse before mutating
+            # obsolete is sticky terminal. Refuse before mutating
             # dependencies/root children so stale lemma-DAG completions
             # cannot pollute the live graph with a cancelled node.
             if node.status == "obsolete":
@@ -11148,7 +11143,7 @@ class ProofSearchState:
                 child_node_id=node_id,
             )
         if accepted:
-            # E6 fix: obsolete is sticky terminal — refuse the close.
+            # obsolete is sticky terminal — refuse the close.
             if node.status == "obsolete":
                 self.record_transition(
                     node_id=node.node_id,
@@ -11168,7 +11163,7 @@ class ProofSearchState:
             node.blocker = "verified LLM lemma-DAG helper"
             node.priority = 0.0
             self._clear_terminal_node_verifier_work(node)
-            # E6: lemma-DAG-verified helper closed the node directly;
+            # lemma-DAG-verified helper closed the node directly;
             # assembly groups are obsolete.
             self._cancel_obsolete_or_siblings(node.node_id)
             self._refresh_priorities_for_neighbors(node.node_id)
@@ -11200,7 +11195,7 @@ class ProofSearchState:
                 )
                 return node.node_id
             node.status = "open"
-            # Phase 2 fix (2026-05-09): suppress the failed_attempts bump
+            # suppress the failed_attempts bump
             # for sorry-stub bodies. The LLM's `:= by sorry` is a
             # decomposition REQUEST, not a meaningful proof attempt;
             # bumping would mis-calibrate the node's priority for
@@ -11378,7 +11373,7 @@ class ProofSearchState:
             )
 
     # ------------------------------------------------------------------
-    # Backtracking primitive — Gap 3 fix (2026-05-08).
+    # Backtracking primitive.
     # ------------------------------------------------------------------
 
     def checkpoint(
@@ -11489,7 +11484,7 @@ class ProofSearchState:
             getattr(snapshot, "decl_application_context_fingerprint", "") or ""
         )
         self.graph_frontier_errors = copy.deepcopy(snapshot.graph_frontier_errors)
-        # E1: rollback restored ``self.nodes`` from a deepcopy; rebuild the
+        # rollback restored ``self.nodes`` from a deepcopy; rebuild the
         # inverse index from the restored assembly groups so newly proved
         # children find their (parent, group) pairs again.
         self._rebuild_assembly_index()
@@ -11555,7 +11550,7 @@ class ProofSearchState:
         root.action = "root_solved"
         root.priority = 0.0
         self._clear_terminal_node_verifier_work(root)
-        # E6 (2026-05-09): when root is solved via a top-level path
+        # when root is solved via a top-level path
         # (not via the assembly fixpoint), all of root's open assembly
         # groups become obsolete and their unique children should be
         # cancelled. If root was proved via assembly, the winning
@@ -11578,14 +11573,9 @@ class ProofSearchState:
                 action=node.action,
                 blocker=node.blocker,
             )
-        # Adversarial review fix 2026-05-09: this is the 9th
-        # status="proved" close site (the 8 in record_* methods plus
-        # this one). Without this refresh, any open child of the root
-        # carrying a closure-bonus credit for closing the now-proved
-        # root retains its stale priority. Currently benign because
-        # ``mark_root_solved`` typically ends the search, but
-        # ``reconcile_with_dossier`` can reopen the root and the open
-        # children would then use stale ranks. Refresh is cheap.
+        # Refresh closure priorities when the root becomes proved. Open
+        # children must not retain credit for closing an already-proved root,
+        # since ``reconcile_with_dossier`` can later reopen the root.
         self._refresh_priorities_for_neighbors(self.root_node_id)
 
     def _residual_goal_attestation_validation(
@@ -14172,7 +14162,7 @@ class ProofSearchState:
                     )
                 )
                 return
-            # B6 fix (2026-05-11): the graph emits work records with
+            # the graph emits work records with
             # ``unblocked_by_graph=True`` for nodes whose graph status
             # is ``blocked`` but whose blocker has been resolved (the
             # graph's causal readiness signal). ``refresh_graph_readiness``
@@ -14248,17 +14238,10 @@ class ProofSearchState:
                         graph_record=record,
                     )
             elif work_type == "child_llm_prove":
-                # B8 fix (2026-05-11): consume the graph-source
-                # ``child_llm_prove`` work_type. Mirrors the legacy
-                # local-path cap check at the unified frontier loop
-                # (attempt cap + per-cluster giveup cap). Without this
-                # branch, child_llm_prove records emitted by the graph
-                # would be silently dropped — defeating the B8 emission
-                # fix. Caller-driven gating: only fires when
-                # ``include_child_llm_prove`` is True AND the per-node
-                # attempt/giveup budgets are not yet exhausted. Ordering
-                # below keeps this expensive LLM lane behind retrieval,
-                # decl-probe, and tactic-swarm work for the same child.
+                # Consume graph-source ``child_llm_prove`` work with the same attempt
+                # and per-cluster give-up caps as the local frontier. The lane is
+                # enabled only by ``include_child_llm_prove`` and remains behind
+                # retrieval, declaration probes, and tactic swarms for the same child.
                 if not include_child_llm_prove:
                     return
                 if (
@@ -14282,16 +14265,10 @@ class ProofSearchState:
                     node.node_id == self.root_node_id
                     and node.status in acceptable_local_statuses
                 ):
-                    # B7 fix extension (2026-05-11): the original B7
-                    # guard only suppressed the LEGACY root_repair
-                    # emission site. The graph-source path here can
-                    # ALSO emit root_repair concurrently with the
-                    # legacy assembly emission, producing the same
-                    # duplicate-dispatch hazard. The structural check
-                    # ``_node_ready_for_assembly(root)`` is independent
-                    # of emission order; if assembly is viable, the
-                    # repair lane is moot regardless of which side
-                    # emits first.
+                    # The graph-source path can emit root_repair concurrently with
+                    # legacy assembly work. Check ``_node_ready_for_assembly(root)``
+                    # independently of emission order: if assembly is viable, defer the
+                    # repair lane to avoid duplicate dispatch.
                     if not self._node_ready_for_assembly(node):
                         add(node, "root_repair", source="graph", graph_record=record)
 
@@ -14434,7 +14411,7 @@ class ProofSearchState:
                 add(node, "formal_state_expand")
         root = self.nodes.get(self.root_node_id)
         if root is not None and root.status == "open":
-            # B7 fix (2026-05-11): suppress root_repair emission when
+            # suppress root_repair emission when
             # the same node has already emitted ``assembly`` work this
             # turn. Both work items target the root with different
             # work_types — the per-node ``seen`` tuple
@@ -15575,15 +15552,15 @@ class ProofSearchState:
                         limit=240,
                         redact_solution_refs=redact_solution_refs,
                     ),
-                    # F1 fix (2026-05-11): round-trip Phase 2 recursive
+                    # round-trip Recursive
                     # helper prover counters so the per-node attempt
                     # cap and per-cluster giveup cap survive the
                     # ``to_record`` → graph metadata → ``_node_from_record``
                     # rehydration that ``ProofSearchState.from_graph``
                     # performs when a parallel sample clones the parent
-                    # proof_graph (B5). Without this, the sample sees
+                    # proof_graph. Without this, the sample sees
                     # the child as if no recursive attempts had ever
-                    # happened, silently bypassing B8's cap.
+                    # happened, silently bypassing the cap.
                     "recursive_attempts": int(node.recursive_attempts or 0),
                     "last_recursive_attempt_iteration": int(
                         node.last_recursive_attempt_iteration
@@ -16174,7 +16151,7 @@ class ProofSearchState:
         stub = str(proof_stub or "").strip()
         if parent is None or not stub:
             return ""
-        # E6 fix (adversarial review 2026-05-09): refuse to add a fresh
+        # refuse to add a fresh
         # assembly group to a parent that has already been closed
         # (proved) or cancelled (obsolete/rejected/failed). Otherwise
         # the orphan group would index ghost children that can never
@@ -16203,7 +16180,7 @@ class ProofSearchState:
         parent = self.nodes.get(str(parent_node_id or ""))
         if parent is None or child_node_id not in self.nodes:
             return False
-        # E6 fix (adversarial review 2026-05-09): refuse to attach
+        # refuse to attach
         # children to a closed/cancelled parent. The new child would be
         # indexed forever as a ghost-work node — its parent's groups
         # are obsolete and will never be ready, but the inverse-index
@@ -16280,7 +16257,7 @@ class ProofSearchState:
         child.parent_node_id = parent.node_id
 
     # ------------------------------------------------------------------
-    # E1 inverse index maintenance + lookup
+    # Inverse index maintenance + lookup
     # ------------------------------------------------------------------
 
     def _register_assembly_child(
@@ -16364,7 +16341,7 @@ class ProofSearchState:
             for group in parent.assembly_attempt_groups:
                 if group.assembly_id != assembly_id:
                     continue
-                # E4: include groups that are tryable on the current
+                # include groups that are tryable on the current
                 # witness, including previously-failed groups whose
                 # witness has changed since the last attempt.
                 if not self._group_tryable_for_attempt(group):
@@ -16391,16 +16368,14 @@ class ProofSearchState:
         exclude_parent: str = "",
     ) -> bool:
         """Return True if ``child_id`` is in any open assembly group of
-        a parent OTHER than ``exclude_parent``. Used by E6 cancellation
+        a parent OTHER than ``exclude_parent``. Used by cancellation
         to decide whether a child made obsolete by one parent's close
         is still load-bearing for another open parent.
 
-        Adversarial review fix 2026-05-09 (E6 F8) plus follow-up:
-        terminal parent states are NOT a source of open work. Blocked
+        Terminal parent states are NOT a source of open work. Blocked
         and rejected parents are kept load-bearing because graph readiness
         can reopen them; failed/obsolete/proved parents cannot consume
-        the child without an explicit replan. At the group level, E4
-        means an already-failed group can still be live if its current
+        the child without an explicit replan. An already-failed group can still be live if its current
         witness differs from ``last_attempt_witness``.
         """
 
@@ -16434,7 +16409,7 @@ class ProofSearchState:
         _seen_parents: Optional[Set[str]] = None,
         _depth: int = 0,
     ) -> List[str]:
-        """E6: when ``parent_id`` closes, mark its non-winning open
+        """when ``parent_id`` closes, mark its non-winning open
         assembly groups ``"obsolete"`` and propagate to each child of
         those groups whose proof would no longer support any open
         parent work.
@@ -16446,7 +16421,7 @@ class ProofSearchState:
         ``winning_assembly_id`` is empty and ALL open or retryable/failed
         assembly groups are marked obsolete.
 
-        Adversarial review fix 2026-05-09 (E6 F5): cascade transitively
+        cascade transitively
         through cancelled subtrees. After flipping a child to
         ``"obsolete"``, recurse to cancel ITS sibling groups too, so
         granchildren that only supported the now-cancelled child are
@@ -16494,7 +16469,7 @@ class ProofSearchState:
             child.status = "obsolete"
             child.priority = 0.0
             flipped.append(child_id)
-            # E6 F5: transitively cancel the grandchild subtree. The
+            # transitively cancel the grandchild subtree. The
             # newly-obsolete child closes itself "via no path", so all
             # of its own assembly groups are obsolete (empty
             # ``winning_assembly_id``). Recurse with the seen-set so
@@ -16512,13 +16487,13 @@ class ProofSearchState:
         self,
         group: ProofStateAssemblyAttempt,
     ) -> Tuple[str, ...]:
-        """E4 (2026-05-09): compute the current witness tuple for a
+        """compute the current witness tuple for a
         group — sorted ``"<child_id>:<proved_helper_name>"`` entries.
 
         Open children contribute an empty helper name. Children no
         longer in ``self.nodes`` are skipped. Duplicate child slots
         (legacy two-slot residual semantics) collapse to one witness
-        entry — adversarial review fix 2026-05-09 (E4 F4): without
+        entry: without
         this dedup, ``("X:hX", "X:hX")`` would change spuriously to
         ``("X:hX",)`` if the duplicate is later folded out, masking
         as a witness change. The result is stable for a given (group,
@@ -16543,7 +16518,7 @@ class ProofSearchState:
         self,
         group: ProofStateAssemblyAttempt,
     ) -> bool:
-        """E4 readiness: a group is tryable when its terminal status
+        """Readiness: a group is tryable when its terminal status
         permits it AND either no attempt has fired yet OR the children's
         witnesses have changed since the last attempt.
 
@@ -16556,8 +16531,7 @@ class ProofSearchState:
             candidates that may now succeed. A "failed" group with
             ``attempt_count == 0`` is malformed (state is never set
             without firing at least one candidate); refuse retry to
-            avoid acting on inconsistent state. (Adversarial review
-            fix 2026-05-09, E4 F2.)
+            avoid acting on inconsistent state.
           - ``"proved"`` / ``"obsolete"``: terminal; never retried.
         """
 
@@ -16676,15 +16650,14 @@ class ProofSearchState:
     def _is_structurally_dead(self, node_id: str) -> bool:
         """Return True if a node cannot contribute to its parent's closure.
 
-        E5 dead-path bubble (2026-05-09; refined after adversarial
-        review): a node is structurally dead in TWO cases.
+        Dead-path propagation: a node is structurally dead in TWO cases.
 
         1. Its own status is ``rejected``/``failed``/``obsolete`` —
-           Lean rejected it, the search exhausted its options, or E6
+           Lean rejected it, the search exhausted its options, or cancellation
            cancelled it as part of an OR-sibling cleanup.
 
         2. Its status is ``"open"`` AND every assembly group is in the
-           explicit dead set ``{"failed", "obsolete"}``, with E4
+           explicit dead set ``{"failed", "obsolete"}``, with witness-based
            retryable failed groups treated as live. The
            ``"open"`` precondition matters:
              - a ``"proved"`` node is terminal-alive (it CLOSED — its
@@ -16739,13 +16712,13 @@ class ProofSearchState:
         O(parent_groups_containing_this_child) using the inverse index;
         cheap relative to a full graph scan.
 
-        Dead-group skip (adversarial review fix 2026-05-09): a group
+        Dead-group skip: a group
         containing a ``rejected`` or ``failed`` sibling can never
         close, so this node's proof would not make it ready. Such
         groups are excluded entirely so the bonus reflects realistic
         unblock potential.
 
-        Duplicate-slot dedup (adversarial review fix 2026-05-09):
+        Duplicate-slot dedup:
         ``group.child_node_ids`` may legitimately contain duplicates
         from the legacy two-slot residual semantics. Counting each
         occurrence inflates ``unresolved``; dedup before counting so
@@ -16764,7 +16737,7 @@ class ProofSearchState:
             for group in parent.assembly_attempt_groups:
                 if group.assembly_id != assembly_id:
                     continue
-                # E4: include groups that are tryable on the current
+                # include groups that are tryable on the current
                 # witness — covers both fresh open groups AND
                 # previously-failed groups whose witness changed.
                 if not self._group_tryable_for_attempt(group):
@@ -16778,7 +16751,7 @@ class ProofSearchState:
                 )
                 if not child_ids or node.node_id not in child_ids:
                     break
-                # E5 dead-path bubble: skip the group when ANY non-self
+                # Dead-path propagation: skip the group when ANY non-self
                 # sibling is structurally dead (rejected/failed status
                 # OR all of its own assembly groups exhausted). The
                 # node we're scoring can still be in the candidate set;
@@ -16803,7 +16776,7 @@ class ProofSearchState:
     def _refresh_priorities_for_neighbors(self, node_id: str) -> None:
         """Recompute priority for the closed node's neighborhood.
 
-        E3 closure-value bonuses are computed at priority-refresh time
+        Closure-value bonuses are computed at priority-refresh time
         from the inverse index. When a node flips to ``"proved"`` three
         sets of priorities go stale and need recomputation:
 
@@ -16816,8 +16789,7 @@ class ProofSearchState:
            Without this third set, a parent that closes via the cache /
            direct tactic path leaves its still-open children carrying
            stale closure-bonus credit for closing a parent that no
-           longer needs them (caught by adversarial review,
-           2026-05-09).
+           longer needs them.
 
         Transitive refresh up/down beyond one hop is intentionally not
         performed — the bonus calculation only depends on direct
@@ -16836,7 +16808,7 @@ class ProofSearchState:
             parent = self.nodes.get(parent_id)
             if parent is None:
                 continue
-            # E6 (2026-05-09): "obsolete" is a sticky terminal status —
+            # "obsolete" is a sticky terminal status —
             # the scheduler ignores it; recomputing priority would
             # clobber the zero we set during cancellation. Only refresh
             # nodes whose status leaves them schedulable.
@@ -16890,17 +16862,15 @@ class ProofSearchState:
         is exhausted — closure value still applies, just at the lower
         weight).
 
-        Depth cap raised from 8 to 32 (adversarial review 2026-05-09):
-        Putnam decompositions can chain lemma-DAG → multi-step proof →
-        structural decomposition + helper splits past 8 levels, and an
-        8-cap silently zeros the +4 root-path bonus for legitimate
-        deep paths. 32 matches the order of magnitude of the
-        ``_run_proof_state_assembly_fixpoint`` safety cap.
+        The default depth cap of 32 accommodates chains of lemma-DAG,
+        multi-step, structural, and helper decompositions while bounding
+        traversal cost. This is comparable in scale to the assembly
+        fixpoint safety cap.
         """
 
         if not parent_id:
             return False
-        # E6 fix (adversarial review 2026-05-09): refuse to traverse
+        # refuse to traverse
         # into obsolete or proved parents — neither can ever close
         # the root, so any path through them is a phantom that would
         # award a stale +4 root-path bonus.
@@ -17043,11 +17013,9 @@ class ProofSearchState:
             _proof_state_text_has_prompt_control(item) for item in context
         ):
             return "prompt_unsafe_remaining_goal"
-        # A reconstructed obligation must never carry a proof placeholder in its
-        # own statement: `sorry`/`admit` leaking from a partial parent proof
-        # yields an unsound, unprovable target.  (See the putnam_2004_a1
-        # child-closure regression — pretty-printed goal text can embed both a
-        # collapsed ∑ domain and a `sorry` hole.)
+        # Reject reconstructed obligations containing sorry/admit placeholders.
+        # A partial parent proof can leak those holes into pretty-printed goal
+        # text, which cannot serve as an authoritative child target.
         if has_sorry_or_admit(compact_target) or any(
             has_sorry_or_admit(item) for item in context
         ):
@@ -17857,7 +17825,7 @@ class ProofSearchState:
                 and self.nodes[child_id].status != "proved"
             )
             base += max(0.0, 10.0 - 3.0 * unresolved)
-        # E3: closure-value bonus. An open child whose proof would close
+        # closure-value bonus. An open child whose proof would close
         # one or more parent assembly groups gets a bonus. Scaled by
         # whether any unblocked parent is on the root-closure path
         # (those moves are strictly more valuable than closing a side

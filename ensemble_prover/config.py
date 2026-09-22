@@ -345,7 +345,7 @@ class LeanConfig:
     # 0 means unlimited / disabled.
     max_full_checks: int = 0
     min_score_full_check: float = -1.0
-    # Phase 9: cached lean environment
+    # cached lean environment
     # Default to True: this skips per-check `lake env` overhead when possible,
     # and falls back safely if environment resolution fails.
     use_repl: bool = True
@@ -473,18 +473,18 @@ class SearchConfig:
     # Max failed proof candidates to send through the generic refiner after a
     # candidate batch fails Lean. 0 disables generic failed-candidate refinement.
     refine_max_failures_per_round: int = 3
-    # Phase 2: multi-turn + best-of-N
+    # multi-turn + best-of-N
     best_of_n: int = 1
     multi_turn_refine: bool = False
-    # Phase 3: parallel goals
+    # parallel goals
     parallel_candidates: bool = False
     # 0 = auto-size to Lean verifier capacity; otherwise max in-flight candidate
     # checks per ordered batch.
     parallel_candidate_window: int = 0
     parallel_goals: int = 1
-    # Phase 3b: parallel beam node processing (all beam nodes proved concurrently)
+    # parallel beam node processing (all beam nodes proved concurrently)
     parallel_beam_nodes: bool = True
-    # Phase 5: tactic-level search
+    # tactic-level search
     tactic_level: bool = False
     tactic_beam_width: int = 3
     tactic_max_steps: int = 20
@@ -514,24 +514,22 @@ class SearchConfig:
     composition_refine_failures: bool = True
     composition_refine_max_failures_per_round: int = 1
     composition_refine_turns: int = 2
-    # Phase 7: structured feedback
+    # structured feedback
     structured_feedback: bool = True
     include_goal_state_in_prompt: bool = True
     strategy_prompting: bool = True
     strategy_prompting_max_calls: int = 2
     adaptive_llm_temperature: bool = True
-    # Role-specific temperature ceilings — formal proof generation degrades
-    # above ~0.7 for code-oriented LLMs (DeepSeek-Prover optimized 0.0–0.6).
-    # Phase 8: Raised from 0.75 to 0.90.  On hard problems where the system
-    # is stuck, the MEO policy needs headroom to push temperature higher for
-    # diversity.  The adaptive pipeline EMA-smooths temperature changes,
-    # preventing sudden jumps that degrade output quality.
+    # Role-specific temperature ceilings bound proof-generation diversity.
+    # A prover ceiling of 0.90 gives the MEO policy headroom on stuck goals.
+    # EMA smoothing limits abrupt temperature changes; the refiner and planner
+    # use lower ceilings.
     prover_temp_ceiling: float = 0.90
     refiner_temp_ceiling: float = 0.50
     planner_temp_ceiling: float = 0.30
-    # Phase 8: domain-aware prompts
+    # domain-aware prompts
     domain_aware: bool = True
-    # Phase 8.5: explicit planner artifacts — generate Lean-checkable
+    # explicit planner artifacts — generate Lean-checkable
     # intermediate claims before tactic generation.  Disabled by default so
     # ordinary proof turns stay artifact-first instead of planner-first.
     proof_sketch: bool = False
@@ -545,7 +543,7 @@ class SearchConfig:
     sketch_max_haves: int = 5
     # Max token budget for planner text injected into prover prompt context.
     sketch_budget_tokens: int = 256
-    # Phase 10: curriculum + smoke
+    # curriculum + smoke
     curriculum_order: bool = True
     curriculum_shuffle: bool = True
     curriculum_band_width: float = 15.0
@@ -572,16 +570,15 @@ class SearchConfig:
     # Hard per-probe timeout cap (seconds) for deterministic fast-path checks.
     # Prevents fast-path from consuming full "candidate" Lean timeout budgets.
     fast_path_probe_timeout_s: float = 12.0
-    # Phase 0 invariant probes — pure observation, no behavior change.
-    # See architecture_mapping_for_analysis/proof_graph_first_refactor_plan_2026-04-23.md.
+    # Invariant probes provide observation without changing behavior.
     probes_enabled: bool = False
     probes_output_dir: str = ""
-    # Phase 1.5 RootWorkset shadow mode. Writes always happen (zero behavior
+    # RootWorkset shadow mode. Writes always happen (zero behavior
     # impact); when this is true, the dual-path guard at
     # _build_root_support_context compares workset support against the
     # existing reconstruction and logs divergence to probes/metrics.
     use_root_workset: bool = False
-    # Phase 6 three-lane arbiter gate. True by default: ProofSession.step()
+    # three-lane arbiter gate. True by default: ProofSession.step()
     # drives lane selection between root-planning, local-proving, and
     # root-integration. Set False only to force the legacy sequential path.
     composition_first: bool = True
@@ -639,7 +636,7 @@ class SearchConfig:
     # EMA smoothing factor for adaptive prover temperature (0 = frozen EMA,
     # 1 = no smoothing).
     prover_temp_ema_alpha: float = 0.65
-    # ── Structural-fix feature gates (commit 20e779b) ──
+    # ── Search feature gates ──
     # Goal-scoped synth-hash sharing: block proofs containing synthetic lemma
     # refs when they failed on the same goal fingerprint within this session.
     session_synth_hash_sharing: bool = True
@@ -818,7 +815,7 @@ class StrategyConfig:
     # Kill beam nodes after this many consecutive no-progress attempts.
     # 0 = disabled.  Prevents 500-attempt stagnation loops on stuck goals.
     beam_stagnation_threshold: int = 20
-    # Structural fix #2 (2026-04-16): hard cap on total per-goal failures.
+    # hard cap on total per-goal failures.
     # Distinct from beam_stagnation_threshold (soft, error-type-sensitive,
     # only deprioritizes). When a goal accumulates this many TOTAL failures
     # (no reset on error-type churn), the scheduler permanently drops it
@@ -926,7 +923,7 @@ class EnsembleConfig:
     )
     quality_line_target: float = 4.0
     quality_tactic_target: float = 3.0
-    # Phase 6: persistent memory + diversity
+    # persistent memory + diversity
     persistent_memory_path: Optional[str] = None
     # Optional online model persistence path (manual/explicit use only).
     # Startup auto-load is intentionally disabled; cached embedding models
@@ -969,7 +966,7 @@ class EnsembleConfig:
     #   because models can over-index on them.
     failed_strategy_prior_enabled: bool = True
     failed_strategy_prior_penalty: float = 0.35
-    # Phase 8: Enabled by default.  Without this, the LLM repeatedly tries
+    # Enabled by default.  Without this, the LLM repeatedly tries
     # strategies that have already failed many times on the same goal, wasting
     # budget.  The prompt hint lists recently-failed strategy families so the
     # LLM can diversify.
@@ -985,7 +982,7 @@ class EnsembleConfig:
     # L2 weight decay for online models (WorldModel, UtilityPredictor).
     # Prevents weight drift in long runs.
     weight_decay: float = 1e-4
-    # MLP + Experience Replay (M4/M5 fix).
+    # MLP + Experience Replay.
     model_hidden_dim: int = (
         32  # Hidden layer width for WorldModel/UtilityPredictor MLPs
     )
@@ -1398,14 +1395,9 @@ def _role_from_dict(name: str, data: Dict[str, Any]) -> RoleConfig:
     # from the environment. This prevents accidental key commits and makes CLI
     # usage consistent with the `run_*_chatgpt.sh` wrappers.
     if not api_key or str(api_key).strip() == "REPLACE_WITH_OPENAI_API_KEY":
-        # Use ONLY the provider-specific env var. The previous fallback
-        # from ``DEEPSEEK_API_KEY`` to ``OPENAI_API_KEY`` (and similar)
-        # silently sent an OpenAI key to DeepSeek's endpoint, producing
-        # mysterious intermittent 401s for roles whose fallback chain
-        # included a DeepSeek model. If the required env var is missing
-        # we leave ``api_key`` unset; the role-level validation at
-        # lines ~1397 will surface a precise error pointing the user at
-        # the exact variable to set.
+        # Use only the provider-specific environment variable so credentials
+        # cannot be sent to another provider's endpoint. Leave a missing key
+        # unset for role validation to report the required variable.
         provider = provider_for_base_url(base_url)
         if provider == "deepseek":
             env_key = os.getenv("DEEPSEEK_API_KEY")
@@ -1703,7 +1695,7 @@ def validate_config(cfg: AppConfig) -> None:
                     f"roles.{name}: weight must be > 0, got {rc.weight} for model {rc.model}",
                 )
 
-    # --- Lean (C2: max_parallel=0 → Semaphore(0) deadlock at lean_runner.py:31) ---
+    # --- Lean (max_parallel=0 → Semaphore(0) deadlock at lean_runner.py:31) ---
     _require(
         cfg.lean.max_parallel >= 1,
         f"lean.max_parallel must be >= 1, got {cfg.lean.max_parallel}",
@@ -2077,7 +2069,7 @@ def validate_config(cfg: AppConfig) -> None:
                 ),
             )
 
-    # --- Ensemble (C3: embedding_dim=0 silently disables embeddings) ---
+    # --- Ensemble (embedding_dim=0 silently disables embeddings) ---
     e = cfg.ensemble
     _require(
         e.embedding_dim >= 1,
@@ -2524,7 +2516,7 @@ def validate_config(cfg: AppConfig) -> None:
         0.0 <= e.delta_homeostasis_closure_factor <= 1.0,
         f"ensemble.delta_homeostasis_closure_factor must be in [0,1], got {e.delta_homeostasis_closure_factor}",
     )
-    # Phase 3D / online-model / meta-signal fields
+    # online-model / meta-signal fields
     _require(
         0.0 <= e.memory_success_reserve_ratio <= 1.0,
         f"ensemble.memory_success_reserve_ratio must be in [0,1], got {e.memory_success_reserve_ratio}",
@@ -3871,7 +3863,7 @@ def load_config(path: str | Path) -> AppConfig:
             ],
         ),
         selector_vectors=_as_float_vector_map(ensemble_data.get("selector_vectors")),
-        # Meta-signal weights (Phase 3B)
+        # Meta-signal weights
         meta_signal_w_success=float(ensemble_data.get("meta_signal_w_success", 0.40)),
         meta_signal_w_reward=float(ensemble_data.get("meta_signal_w_reward", 0.20)),
         meta_signal_w_delta=float(ensemble_data.get("meta_signal_w_delta", 0.15)),

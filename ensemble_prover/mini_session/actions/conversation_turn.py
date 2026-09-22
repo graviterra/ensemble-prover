@@ -4651,11 +4651,9 @@ def _formalization_parent_target_binding(
 ) -> Tuple[str, Any, bool, str]:
     """Resolve and validate the graph node covered by a Lean parent replay.
 
-    Statement replay and graph mutation used to resolve their targets through
-    independent fallback chains.  A stale parent-obligation id could therefore
-    promote and retire a proposition that Lean had never checked.  Keep the
-    mutation fail-closed unless the selected record, live node, statement
-    identity, and (when stamped) Lean environment all agree.
+    Require the selected record, live node, statement identity, and stamped
+    Lean environment to agree before mutation. A stale obligation ID must
+    never promote or retire a proposition that Lean did not check.
     """
 
     selected = dict(contract.get("selected_graph_work") or {})
@@ -8827,7 +8825,7 @@ class ConversationTurnAction:
         self._provider_quantum_yield_consumed_generation: int = 0
         self._provider_quantum_checkpoint: Dict[str, Any] = {}
         self._provider_quantum_runtime_loaded: bool = False
-        # MED-4 (2026-05-08): max_turns_for_budget represents the OUTER-
+        # max_turns_for_budget represents the OUTER-
         # loop iteration count for the budget footer, NOT the always-1
         # inner-turn count. Callers (factory.py) should pass the role's
         # outer turn budget so the LLM sees "turn N of MAX". When unset,
@@ -11766,7 +11764,7 @@ class ConversationTurnAction:
         return True
 
     async def run(self, session: Any) -> MiniOutcome:  # noqa: C901, PLR0912, PLR0915
-        # M4 fix (2026-05-08): every return path must clear
+        # every return path must clear
         # ``session.last_turn_extraction`` and ``session.last_lean_verdict``
         # so a subsequent outer-loop dispatch (HelperOnlySalvageAction,
         # PostLeanFailureAction) does not act on stale data from a prior
@@ -12780,7 +12778,7 @@ class ConversationTurnAction:
             else None
         )
 
-        # Absolute turn index — see R12.5.
+        # Absolute conversation-turn index.
         role_key = str(getattr(conv, "role", "") or self.role or "prove")
         if answer_safe_pending_replay:
             conv_turn_offset = max(
@@ -12874,11 +12872,11 @@ class ConversationTurnAction:
             ) + 1
             session._conversation_role_turn_exposure_counts = exposure_counts
 
-        # M5: reset per-turn fired flags. The session lives across many
+        # reset per-turn fired flags. The session lives across many
         # turns; observability dedup is scoped to the current turn only.
         _reset_per_turn_fired_flags(session, absolute_turn)
 
-        # MED-4: the budget footer max_turns is the outer-loop iteration
+        # the budget footer max_turns is the outer-loop iteration
         # count, not the inner always-1 turn. Use the action's configured
         # value when set, else fall back to the session's max_iterations.
         max_turns_footer = self.max_turns_for_budget or int(
@@ -13822,7 +13820,7 @@ class ConversationTurnAction:
                     # visibility, or policy changes with unchanged source.
                     _stage_verified_helper_receipt(session, helper, dossier)
             if not workspace_published:
-                # Preserve only the owner-produced B1 timeout transcript.  A
+                # Preserve only the owner-produced timeout transcript.  A
                 # resistant child can continue mutating its discarded private
                 # workspace but can no longer overwrite live proof state.
                 conv.history = copy.deepcopy(
@@ -15053,7 +15051,7 @@ class ConversationTurnAction:
                 except Exception:
                     durable_submission_evidence = False
                 if durable_submission_evidence:
-                    # Sol audit 2026-07-29 F3: rewrite the status so a later
+                    # rewrite the status so a later
                     # GENUINE Lean failure on this turn cannot be reclassified
                     # from the stale "no_try_lean_call" back into a policy
                     # refusal (which would recreate repair narrowing). The
@@ -15398,7 +15396,7 @@ class ConversationTurnAction:
                         "verdict": "proof_policy_rejected",
                     },
                 )
-            # H7 telemetry: emit verdict=llm_call_failed mirroring legacy
+            # Telemetry: emit verdict=llm_call_failed mirroring legacy
             # mini_prover.py:3538-3548.
             structured_failure_kind = str(
                 getattr(loop_result, "llm_failure_kind", "") or ""
@@ -15695,7 +15693,7 @@ class ConversationTurnAction:
                     compaction_kwargs["keep_recent_tool_rounds"] = 3
                 elif counterexample_certification_infrastructure:
                     # The exact candidate is deterministic paid work. Keep its
-                    # B1-complete tool round so a bounded scheduler retry can
+                    # complete assistant/tool round so a bounded scheduler retry can
                     # replay certification instead of asking the model to
                     # rediscover the same negation.
                     compaction_kwargs["keep_recent_tool_rounds"] = 1
@@ -16105,7 +16103,7 @@ class ConversationTurnAction:
                 or ""
             ),
         )
-        # M4 wiring: publish the extraction on the session so direct replay
+        # publish the extraction on the session so direct replay
         # wrappers and helper salvage code can read it without knowing this
         # action's local state.
         session.last_turn_extraction = extraction
@@ -16159,13 +16157,11 @@ class ConversationTurnAction:
             and not provider_artifact_consumed
         )
         if forced_final_no_artifact:
-            # Only the authoritative turn extractor can decide whether the
-            # forced no-tools response contained a usable Lean artifact.  A
-            # lexical classifier here previously confused English "By
-            # contradiction" and comment-only fences with proofs.  Preserve
-            # the model response for audit, but expose the exact protocol miss
-            # so this proof-only lane can hand off without another provider
-            # call or a false helper-policy diagnosis.
+            # Use the authoritative turn extractor to determine whether a forced
+            # no-tools response contains a Lean artifact. English "By contradiction"
+            # and comment-only fences alone do not establish a proof. Preserve the
+            # response for audit and report the protocol miss so the proof-only
+            # lane can hand off without another provider call.
             tool_progress_metadata.update({
                 "final_no_tools_event": "final_no_tools_no_proof_artifact",
                 "final_no_tools_finish_reason": str(
@@ -16733,6 +16729,7 @@ class ConversationTurnAction:
                     ),
                     proof,
                     (),
+                    goal_statement=extraction_goal_statement,
                     exact_only=True,
                 )
             )
@@ -16851,7 +16848,7 @@ class ConversationTurnAction:
             )
             repair_has_accepted_evidence = _repair_self_check_has_accepted_evidence(
                 repair_self_check_codes,
-                goal_statement=conv.goal_statement,
+                goal_statement=extraction_goal_statement,
                 preamble=conv.preamble,
                 context_lemmas=repair_context_lemmas,
             )
@@ -16864,7 +16861,7 @@ class ConversationTurnAction:
                     repair_self_check_codes,
                     repair_submission,
                     (),
-                    goal_statement=conv.goal_statement,
+                    goal_statement=extraction_goal_statement,
                     preamble=conv.preamble,
                     context_lemmas=repair_context_lemmas,
                     exact_only=repair_requires_declaration,
@@ -16876,6 +16873,7 @@ class ConversationTurnAction:
                     _repair_self_check_has_terminal_continuation(
                         repair_self_check_codes,
                         proof,
+                        goal_statement=extraction_goal_statement,
                     )
                 )
         except Exception as exc:
@@ -17506,7 +17504,7 @@ class ConversationTurnAction:
                         operation="salvage_forbidden_policy_helpers",
                         exc=exc,
                     )
-            # H4 fix (2026-05-08): the construction-collapse rejection
+            # the construction-collapse rejection
             # carries proof_state side effects in legacy
             # mini_prover.py:4154-4188 (record_construction_collapse +
             # sync_to_graph + recorder.record_turn(verdict=known_answer_no_construction_collapse)).
@@ -17533,14 +17531,12 @@ class ConversationTurnAction:
                             phase="proof_state_construction_collapse",
                             turn_index=phase_turn,
                         )
-                # H7 telemetry: known_answer_no_construction_collapse.
+                # Telemetry: known_answer_no_construction_collapse.
                 check_lemmas_for_record = merge_context_helpers(
                     context_helpers, helpers
                 ) if proof is not None else helpers
-                # Round-5 fix: bank helpers from the construction-collapse
-                # branch (the explicit verdict-kind path missed by the
-                # umbrella `else`). Round-3 umbrella covered the other
-                # verdict kinds; this one was still discarding.
+                # Bank helpers from the explicit construction-collapse verdict path
+                # so the prover's decomposition signal survives rejection.
                 _banked_collapse: list[str] = []
                 if not turn_giveup:
                     _banked_collapse = _bank_turn_sources_as_proposed(
@@ -17580,15 +17576,9 @@ class ConversationTurnAction:
                         pass
                 _emit_record(session, collapse_record)
             else:
-                # Other policy rejections — emit verdict=proof_policy_rejected
-                # mirroring mini_prover.py:3593-3607, 3635-3649, 3669-3691,
-                # 4104-4120, 4207-4222.
-                # Round-3 fix: bank any helpers the LLM proposed in this
-                # turn BEFORE rejecting. This umbrella branch is the
-                # largest unbanked rejection path — covered forbidden
-                # command / post-main-helper / extra-main /
-                # helper-stub-with-main and silently discarded the
-                # prover's decomposition signal on all of them.
+                # Emit proof_policy_rejected and bank proposed helpers before
+                # rejecting forbidden commands, post-main helpers, extra main proofs,
+                # or helper stubs with a main proof. Preserve the decomposition signal.
                 banked_umbrella_names: list[str] = []
                 if (
                     not turn_giveup
@@ -17764,14 +17754,14 @@ class ConversationTurnAction:
                 conv,
                 reuse_scan_text,
             )
-            # Narrow companion gate (2026-05-13 regression fix):
+            # Narrow companion gate:
             # detects goal-as-sorry-helper repackaging without banning
             # the goal expression itself from honest proofs.
             repackaged_goal_targets = _proof_repackages_transient_goal_target(
                 conv,
                 reuse_scan_text,
             )
-            # Channel-split (2026-05-13 round-2 fix): keep the two
+            # Channel-split: keep the two
             # lists separate so the strict-fragment feedback formatter
             # doesn't poison ``rejected_code_fragments`` on the next
             # turn with goal-target text.
@@ -17781,7 +17771,7 @@ class ConversationTurnAction:
             repackaged_goal_targets = []
             repair_gate_error = f"{type(exc).__name__}: {exc}"
         if repair_gate_error:
-            # Round-4 fix: bank helpers from ordinary rejected turns so the
+            # bank helpers from ordinary rejected turns so the
             # prover's decomposition signal survives the gate failure. Do
             # not bank give-up helper stubs.
             if turn_giveup:
@@ -17915,7 +17905,7 @@ class ConversationTurnAction:
                     operation="record_repair_policy_attempt",
                     exc=exc,
                 )
-            # Round-4 fix: bank helpers from ordinary rejected turns so the
+            # bank helpers from ordinary rejected turns so the
             # prover's decomposition signal survives the mismatch. Give-up
             # turns are excluded: those helper stubs describe the route the
             # model is avoiding, not a planner-ready subgoal.
@@ -17985,10 +17975,9 @@ class ConversationTurnAction:
                 },
             )
         if reused_rejected_fragments or repackaged_goal_targets:
-            # Bank proposed helpers BEFORE rejecting (Claim 1 banking
-            # ordering fix): the no_proof_extracted path is unreachable
-            # from here. Proposed helpers extracted in a policy-rejected
-            # turn still encode the prover's decomposition signal.
+            # Bank proposed helpers before rejecting so the decomposition signal
+            # survives. The no_proof_extracted path is unreachable after this
+            # return; the planner still needs these helpers on its next pass.
             if turn_giveup:
                 banked_proposed_helpers = []
             else:
@@ -18008,10 +17997,9 @@ class ConversationTurnAction:
                     )
                 except Exception:
                     banked_proposed_helpers = []
-            # Route each channel to its own rejection reason and
-            # feedback formatter. Mixing them re-poisoned the strict
-            # channel on the next round-trip — adversarial-review
-            # finding 2026-05-13 round-2.
+            # Route each channel to its own rejection reason and feedback
+            # formatter so goal-target text cannot enter the strict fragment
+            # channel on the next round-trip.
             primary_reason = (
                 "reused_rejected_lean_fragment"
                 if reused_rejected_fragments
@@ -18245,7 +18233,7 @@ class ConversationTurnAction:
             )
 
         # No proof to verify — the LLM emitted helpers only. Run the
-        # full legacy helpers-only salvage cascade (H2 fix). The
+        # full legacy helpers-only salvage cascade. The
         # cascade's 5 pathways are:
         #   (1) lemma-DAG decomposition (when has_open_decomposition_task)
         #   (2) post-decomp child-closure (may solve root)
@@ -18254,7 +18242,7 @@ class ConversationTurnAction:
         #   (5) post-salvage child-closure (may solve root)
         #   (6) try_close_with_tactics — root tactic close (may solve root)
         #
-        # Live-trace fix (2026-05-08): clear ``session.last_turn_extraction``
+        # clear ``session.last_turn_extraction``
         # before returning. ``HelperOnlySalvageAction`` and
         # ``LemmaDagDecomposeAction`` consult this signal in their
         # ``is_applicable`` checks; with the cascade running inline, a
@@ -18867,7 +18855,7 @@ class ConversationTurnAction:
                     common_payload=common_payload,
                 )
             # No cascade pathway solved AND the LLM emitted no proof —
-            # H6 fix: emit verdict=no_proof_extracted and nudge the LLM.
+            # emit verdict=no_proof_extracted and nudge the LLM.
             # Mirrors mini_prover.py:4051-4076.
             #
             # Bank the proposed helpers into the dossier so the
@@ -19076,7 +19064,7 @@ class ConversationTurnAction:
                     correction_recheck_fallback_context_helpers = None
                     correction_recheck_fallback_verification_helpers = None
 
-        # H3 fix (2026-05-08): pre-Lean lemma-DAG decomposition runs
+        # pre-Lean lemma-DAG decomposition runs
         # BEFORE the primary Lean check when the proof_state has open
         # decomposition work. Mirrors mini_prover.py:4264-4286. Without
         # it, beam search sees stale decomposition state during the
@@ -19121,7 +19109,7 @@ class ConversationTurnAction:
         conv.append_assistant(content)
 
         # ---- Step 4: Lean check (primary + answer-safe recheck) ------
-        # H5 fix (2026-05-08): wrap verify_with_lean in try/except so
+        # wrap verify_with_lean in try/except so
         # exceptions surface as ``verdict=lean_infra_error`` + a user
         # nudge instead of bubbling out as a generic action exception.
         # Legacy: mini_prover.py:4292-4328.
@@ -19446,7 +19434,7 @@ class ConversationTurnAction:
         lean_elapsed = round(time.monotonic() - lean_started, 3)
 
         if lean_infra_error is not None:
-            # M9 fix (2026-05-08): dedupe consecutive infra errors. The
+            # dedupe consecutive infra errors. The
             # first occurrence appends a nudge; if the IMMEDIATELY-PRIOR
             # error was identical, suppress the nudge text so conv.history
             # doesn't accumulate duplicate "infrastructure error" lines
@@ -19463,7 +19451,7 @@ class ConversationTurnAction:
             cap = int(getattr(session, "max_consecutive_lean_infra_errors", 3) or 3)
             retry_deferred = consecutive >= cap
             verdict_name = "lean_infra_error"
-            # Round-5 fix: bank helpers from ordinary rejected turns even
+            # bank helpers from ordinary rejected turns even
             # when Lean's infra fails. Give-up/off-ramp helper stubs are
             # still suppressed: infra flakiness must not turn "missing
             # bridge" prose into durable decomposition work.
@@ -19649,13 +19637,13 @@ class ConversationTurnAction:
             )
 
         assert lean_verdict is not None  # noqa: S101 — exhaustive case handling
-        # M9 fix: a successful Lean check (returned a verdict at all,
+        # a successful Lean check (returned a verdict at all,
         # accepted or rejected) means the runtime is healthy. Reset the
         # consecutive infra-error counter so a future intermittent
         # failure doesn't immediately trip the termination cap.
         session.consecutive_lean_infra_errors = 0
         session.last_lean_infra_error = None
-        # M4 wiring: publish the verdict for the inline post-failure cascade
+        # publish the verdict for the inline post-failure cascade
         # and direct replay wrappers. Normal scheduler registration has a
         # single owner and does not dispatch PostLeanFailureAction separately.
         session.last_lean_verdict = lean_verdict
@@ -19977,7 +19965,7 @@ class ConversationTurnAction:
                             **_repair_self_check_metadata(common_payload),
                         },
                     )
-            # H7 telemetry: verdict=solved.
+            # Telemetry: verdict=solved.
             _emit_record(session, {
                 **common_payload,
                 "dossier_context_helpers": list(context_helpers),
@@ -20163,7 +20151,7 @@ class ConversationTurnAction:
         # for the outer loop's frontier-first scheduling between turns;
         # mid-turn the cascade always runs inline.
         #
-        # Live-trace fix (2026-05-08): clear ``session.last_lean_verdict``
+        # clear ``session.last_lean_verdict``
         # AFTER the inline cascade returns. The post-failure cascade is owned
         # here; the standalone PostLeanFailureAction remains importable for
         # replay tests but is not registered in normal sessions. Consuming the
@@ -20223,13 +20211,8 @@ async def _run_helpers_only_cascade(
     conv_turn_offset: int,
     started: float,
 ) -> Optional[MiniOutcome]:
-    """Legacy helpers-only cascade.
-
-    Defect H2 + MED-2 + MED-3 fix (2026-05-08): restores the full
-    five-pathway cascade that legacy mini_prover.py:3693-3991 ran in
-    the no-proof branch. Without these pathways, helpers-only replies
-    that legacy could solve via lemma-DAG → assembly → root-tactic
-    were silently re-prompted in the new pipeline.
+    """Run the helpers-only cascade through decomposition, child closure,
+    helper salvage, assembly, and root tactics before requesting another proof.
     """
 
     from ensemble_prover.helper_salvage import HelperSalvager
@@ -20338,7 +20321,7 @@ async def _run_helpers_only_cascade(
 
     # ---- Pathway (1) + (2): lemma-DAG decomposition + child closure ----
     # Mirrors mini_prover.py:3693-3795.
-    # D2 gate-side fix (2026-05-09): open ad-hoc decomposition_task when
+    # open ad-hoc decomposition_task when
     # the LLM emitted sorry-stub helpers as a decomposition request.
     # Without this, the gate immediately below skips and the helpers
     # fall on the floor — observed in putnam_2020_a2 run 22:57 with
@@ -20367,7 +20350,7 @@ async def _run_helpers_only_cascade(
         and bool(getattr(conv, "allow_helper_decomposition", True))
         and not proof_state.has_open_decomposition_task()
     ):
-        # MED-3 + M5: no-open-task observability record. Both the
+        # no-open-task observability record. Both the
         # helpers-only cascade (no-proof branch) and the pre-Lean
         # decomposition (proof-extracted branch) can observe the same
         # content; track per-turn fired-state on the session to ensure
@@ -20655,7 +20638,7 @@ async def _run_helpers_only_cascade(
                         "new_child_node_ids": list(lemma_dag_child_node_ids),
                         "linked_child_node_ids": list(lemma_dag_linked_child_node_ids),
                         **skeleton_route_metadata,
-                        # HIGH #4 follow-up (2026-05-22): use the strict
+                        # use the strict
                         # classifier so statement-duplicate helpers don't
                         # falsely reset the stagnation counter.
                         "strong_progress": _strong_progress_for_accepted_helpers(
@@ -20713,7 +20696,7 @@ async def _run_helpers_only_cascade(
                     "new_child_node_ids": list(lemma_dag_child_node_ids),
                     "linked_child_node_ids": list(lemma_dag_linked_child_node_ids),
                     **skeleton_route_metadata,
-                    # HIGH #4 follow-up (2026-05-22): see comment at the
+                    # see comment at the
                     # sibling site above.
                     "strong_progress": _strong_progress_for_accepted_helpers(
                         dossier,
@@ -21008,7 +20991,7 @@ async def _run_helpers_only_cascade(
             )
 
     # ---- Pathway (6): root tactic close ---------------------------
-    # H6 fix (2026-05-08): charge inline cascade Lean spend against the
+    # charge inline cascade Lean spend against the
     # ``helper_only_salvage`` budget. Without this, the inline cascade
     # ignores the budget the factory allocated for it, and a session
     # with many failed turns can spend 12s/turn × N turns on tactic
@@ -21224,7 +21207,7 @@ async def _run_helpers_only_cascade(
                 },
             )
 
-    # H6: when the inline tactic-close was skipped because the
+    # when the inline tactic-close was skipped because the
     # helper_only_salvage budget exhausted, surface a record so RCA can
     # see the cascade WAS attempted, just bounded out.
     if max_candidates > 0 and inline_timeout_s <= 0.0:
@@ -21281,15 +21264,10 @@ async def _run_helpers_only_cascade(
             "new_child_node_ids": list(lemma_dag_child_node_ids),
             "linked_child_node_ids": list(lemma_dag_linked_child_node_ids),
             **skeleton_route_metadata,
-            # Fix HIGH-#4 (2026-05-22): the previous expression
-            # `bool(accepted_helper_names)` was identical to `progress`,
-            # which defeated Fix 3's strict-progress accounting — bogus
-            # contradiction-route helpers were classified as "strong
-            # progress" and kept resetting the stagnation counter.
-            # Strong helper progress now comes from the dossier's graph
-            # impact ledger: accepted helpers are strong only when they
-            # discharge a parent claim/variant/obligation. Novel helpers
-            # without graph impact remain valuable theory progress.
+            # Strong helper progress comes from the dossier's graph impact ledger:
+            # accepted helpers are strong only when they discharge a parent
+            # claim, variant, or obligation. Novel helpers without graph impact
+            # remain valuable theory progress without resetting stagnation.
             "strong_progress": _strong_progress_for_accepted_helpers(
                 dossier, accepted_helper_names
             ),
@@ -21302,7 +21280,7 @@ async def _run_helpers_only_cascade(
 
 
 # ---------------------------------------------------------------------------
-# Pre-Lean lemma-DAG decomposition: H3 + MED-2 fix.
+# Pre-Lean lemma-DAG decomposition.
 # Legacy mini_prover.py:4264-4286.
 # ---------------------------------------------------------------------------
 
@@ -21339,7 +21317,7 @@ async def _run_pre_lean_lemma_dag_decomposition(
         return
     if not bool(getattr(conv, "allow_helper_decomposition", True)):
         return
-    # D2 gate-side fix (2026-05-09): open ad-hoc decomposition_task when
+    # open ad-hoc decomposition_task when
     # sorry-stubs are present so the gate below proceeds.
     if not proof_state.has_open_decomposition_task():
         lemma_dag_open_attempt = ensure_decomposition_task_open_for_lemma_dag_candidates(
@@ -21350,7 +21328,7 @@ async def _run_pre_lean_lemma_dag_decomposition(
     else:
         lemma_dag_open_attempt = {}
     if not proof_state.has_open_decomposition_task():
-        # MED-3 + M5: no-open-task observability record (legacy
+        # no-open-task observability record (legacy
         # mini_prover.py). Dedupe per-turn so we don't emit the event
         # from BOTH the no-proof branch and the proof-extracted branch
         # on the same turn.
@@ -21391,7 +21369,7 @@ async def _run_pre_lean_lemma_dag_decomposition(
 
 
 # ---------------------------------------------------------------------------
-# Inline post-failure cascade: H7 + MED-1 fix.
+# Inline post-failure cascade.
 # ---------------------------------------------------------------------------
 
 
@@ -21421,11 +21399,11 @@ async def _run_post_failure_cascade_inline(
 ) -> MiniOutcome:
     """Run the post-failure cascade inline with full legacy telemetry.
 
-    H7 fix: emits ``proof_state_update``, child-closure-solved,
+    emits ``proof_state_update``, child-closure-solved,
     helper-salvage-assembly-solved, helper-salvage-root-tactic-solved/-rejected,
     and the rejected-with-feedback record.
 
-    MED-1 fix: emits ``dossier.record_attempt(verdict=tactic_rejected)``
+    emits ``dossier.record_attempt(verdict=tactic_rejected)``
     for the tactic-close arm of the salvage cascade.
     """
 
@@ -21664,7 +21642,7 @@ async def _run_post_failure_cascade_inline(
             allow_helper_decomposition=bool(
                 getattr(conv, "allow_helper_decomposition", True)
             ),
-            # Phase 2 (2026-05-09): plumb the session's recursion depth so
+            # plumb the session's recursion depth so
             # the give-up nudge can swap to "depth-cap reached" framing in
             # child sessions spawned by RecursiveHelperProverAction.
             recursion_depth=int(getattr(session, "recursion_depth", 0) or 0),
@@ -21729,7 +21707,7 @@ async def _run_post_failure_cascade_inline(
             elapsed_s=time.monotonic() - cascade_started,
         )
 
-    # H7: proof_state_update + child-closure observability records when
+    # proof_state_update + child-closure observability records when
     # the cascade engaged proof_state but did NOT solve. The cascade
     # itself does not emit these high-level verdicts; we mirror legacy
     # mini_prover.py:4589-4598 + 4626-4654 here.
@@ -21823,7 +21801,7 @@ async def _run_post_failure_cascade_inline(
         common_payload
     )
     if cascade.solved:
-        # H3 fix (2026-05-08): emit the legacy verdict that matches the
+        # emit the legacy verdict that matches the
         # cascade phase that solved, instead of collapsing all paths to
         # ``solved_after_proof_state_child``. RCA tooling filters by
         # verdict tag.
@@ -21964,7 +21942,7 @@ async def _run_post_failure_cascade_inline(
             },
         )
 
-    # MED-1: when the salvage cascade ran the root-tactic close arm
+    # when the salvage cascade ran the root-tactic close arm
     # but did not solve, legacy mini_prover.py:4787-4798 records a
     # tactic_rejected attempt on the dossier. The orchestrator in
     # post_failure.py does not own this; we replicate it here when the
@@ -21992,7 +21970,7 @@ async def _run_post_failure_cascade_inline(
             pass
 
     # Cascade did not solve — append feedback for the next turn AND
-    # emit the rejected-with-feedback recorder record (H7).
+    # emit the rejected-with-feedback recorder record.
     if cascade.feedback_text:
         if cascade.giveup_cluster or cascade.target_integrity_signals:
             _drop_last_assistant_if_content(conv, llm_output)
@@ -22111,7 +22089,7 @@ async def _run_post_failure_cascade_inline(
         # "Lean rejected and we redirected to decomposition" from "Lean
         # rejected with generic feedback".
         #
-        # User-mandated debug-visibility (2026-05-09): KEEP verdict
+        # Preserve diagnostic visibility: KEEP verdict
         # ``lean_rejected`` so existing RCA tooling that filters by
         # ``verdict==lean_rejected`` continues to count these turns.
         # The redirect is exposed as a parallel field, not by replacing
@@ -22280,7 +22258,7 @@ async def _run_post_failure_cascade_inline(
             "failure_residual_replan_node_count": len(
                 getattr(cascade, "failure_residual_replan_node_ids", []) or []
             ),
-            # HIGH #4 follow-up (2026-05-22): this is the post-failure
+            # this is the post-failure
             # cascade emitter — the most-exercised one. Use the strict
             # classifier so a salvaged statement-duplicate doesn't
             # falsely reset stagnation. The cascade.solved gate is
@@ -22515,11 +22493,8 @@ def _emit_record(session: Any, record: Dict[str, Any]) -> None:
     exception here is swallowed because telemetry must never break the
     proof loop.
 
-    M10 fix (2026-05-08): stamp ``conv_turn_absolute`` on every per-turn
-    recorder record so post-mortem JSONL grep can disambiguate the
-    always-1 inner ``turn_in_phase`` from the absolute outer turn
-    counter. R12.5's promise was previously fulfilled only on the outer
-    ``session_action_outcome`` event.
+    Stamp ``conv_turn_absolute`` on each per-turn record to distinguish
+    the absolute outer turn counter from the always-1 inner ``turn_in_phase``.
     """
 
     record = dict(record)
@@ -22588,7 +22563,7 @@ def _budget_clamped_timeout(
     action_id: str,
     requested_s: float,
 ) -> float:
-    """H6: clamp a requested timeout to the named action's remaining budget.
+    """Clamp a requested timeout to the named action's remaining budget.
 
     Returns the smaller of the action's remaining wall-time budget and
     the requested timeout. Returns 0.0 (caller skips the work) when the
@@ -22622,7 +22597,7 @@ def _charge_inline_cascade_budget(
     action_id: str,
     elapsed_s: float,
 ) -> None:
-    """H6: charge wall-time spent in an inline cascade against the named budget.
+    """Charge wall-time spent in an inline cascade against the named budget.
 
     The ConversationTurnAction's inline post-Lean cascade fires
     sub-pipelines (helper-only salvage, pre-Lean lemma-DAG decomposition,
@@ -22649,10 +22624,9 @@ def _charge_inline_cascade_budget(
 def _reset_per_turn_fired_flags(session: Any, absolute_turn: int) -> None:
     """Reset the per-turn dedup flags carried on the session.
 
-    M5 (2026-05-08): some observability events used to fire from both
-    the no-proof and proof-extracted branches in the same turn. We
-    dedupe by tagging the session with the turn we last reset for; if
-    the turn has advanced, clear the flags.
+    Tag the session with the last reset turn and clear the flags only when
+    the turn advances. This deduplicates events shared by the no-proof and
+    proof-extracted branches.
     """
 
     last_reset = getattr(session, "_per_turn_flags_turn", -1)

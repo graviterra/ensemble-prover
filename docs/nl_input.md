@@ -144,17 +144,3 @@ The transcript preserves the response content and parsed provider payload
 available through the shared client, not raw HTTP wire bytes. It contains the
 submitted mathematical text and should be treated as private if the input is
 private.
-
-## Testing
-
-The following commands are for the development repository. Tests and its
-local `lean_project` fixture are not part of the public runtime distribution.
-
-```bash
-.venv/bin/python -m pytest -q tests/test_nl_input.py tests/test_nl_lean.py \
-  tests/test_nl_artifacts.py tests/test_nl_context_handoff.py tests/test_nl_cli.py
-```
-
-Most tests use deterministic fake model responses. The real Lean test uses the
-local `lean_project` Mathlib build and skips if that build is unavailable. Tests
-do not call a paid model API.

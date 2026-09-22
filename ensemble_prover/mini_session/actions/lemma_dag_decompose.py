@@ -24,7 +24,7 @@ from ..graph_sync import sync_proof_state_to_graph
 def _resync_graph_from_dossier(dossier: Any) -> None:
     """Re-materialize graph helper nodes for surviving verified_helpers.
 
-    Defect found by adversarial review (2026-05-08): rollback restores
+    rollback restores
     proof_graph to its pre-checkpoint state, but verified_helpers are
     durable wins and survive rollback. ``dossier.record_verified_helper``
     writes to BOTH stores synchronously, so after rollback the dossier
@@ -33,7 +33,7 @@ def _resync_graph_from_dossier(dossier: Any) -> None:
     Re-running the dossier's existing ``_sync_legacy_helpers_to_graph``
     re-creates graph nodes for every surviving verified helper.
 
-    M7 fix (2026-05-08): ``_sync_legacy_helpers_to_graph`` REWRITES
+    ``_sync_legacy_helpers_to_graph`` REWRITES
     ``dossier.verified_helpers`` to drop entries it considers unsafe
     (empty source, answer-unsafe, or name mismatch). On a rollback path
     that should be purely additive to the graph, that drop can lose
@@ -143,7 +143,7 @@ class LemmaDagDecomposeAction:
         ps = session.proof_state
         has_open = getattr(ps, "has_open_decomposition_task", None)
         if callable(has_open) and not has_open():
-            # D2 gate-side fix (2026-05-09): if any helper is a
+            # if any helper is a
             # sorry-stub (LLM's decomposition request), this action
             # IS applicable — it will open the task itself in run().
             from ensemble_prover.proof_state_executor import (
@@ -201,7 +201,7 @@ class LemmaDagDecomposeAction:
         accepted: list = []
         success = False
         new_child_node_ids: list[str] = []
-        # Phase 2 (2026-05-09): commit when any child_goal nodes were
+        # commit when any child_goal nodes were
         # added by this attempt, even if zero helpers were Lean-verified.
         # The user-mandated rollback contract is:
         #   - Commit when >=1 well-formed child_goal node was added
@@ -377,7 +377,7 @@ class LemmaDagDecomposeAction:
                         # are durable. Re-materialize their graph nodes so
                         # the dossier and graph stay consistent.
                         _resync_graph_from_dossier(session.dossier)
-                        # B2 fix (2026-05-11): the prior step re-syncs
+                        # the prior step re-syncs
                         # ``dossier.proof_graph`` from durable helpers but
                         # does NOT re-sync ``proof_state.nodes``. Without
                         # this step a child_goal whose target matches a
@@ -391,7 +391,7 @@ class LemmaDagDecomposeAction:
                                 ps, "reconcile_helpers_to_dossier", None
                             )
                             if callable(reconciler):
-                                # F5 fix (2026-05-11): pass the session's
+                                # pass the session's
                                 # absolute turn index so reconcile-driven
                                 # transitions don't all get timestamped 0.
                                 reconciler(

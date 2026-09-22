@@ -42,6 +42,7 @@ from ...mini_lean_extract import (
     _find_forbidden_lean_command,
     _has_plausible_lean_proof_head,
     _is_plausible_lean_symbolic_atom,
+    _partition_redundant_preamble_commands,
     _strip_balanced_outer_proof_parentheses,
     _strip_lean_comments,
 )
@@ -920,10 +921,8 @@ _CONVERSATION_FINALIZER_PROVIDER_QUANTUM_MAX_RETRIES = 8
 # logical response in the same action merely because transport retries have a
 # separate allowance of two dispatches.
 _CONVERSATION_PROVIDER_CALL_QUANTUM = 1
-# 0 disables the cumulative cancel/yield knife. Soft LLM policy waits for
-# each admitted provider response. Putnam 1978 A2 000415 searched Mathlib
-# for 300s, then this default cancelled the next DeepSeek call in-flight
-# and the scheduler terminalized the run.
+# Zero disables cumulative cancellation/yield. Soft LLM policy waits
+# for each admitted provider response to finish.
 _CONVERSATION_PROVIDER_WALL_QUANTUM_S = 0.0
 # A scheduler yield is a fairness boundary, not a fresh wall-clock grant. One
 # production-sized quantum is the cumulative lease for every resumed segment
@@ -1541,44 +1540,119 @@ def _named_checked_bridge_source(
     *,
     reserved_names: Sequence[str] = (),
     allow_named_declarations: bool = False,
+    preamble: str = "",
 ) -> tuple[str, str]:
     """Prepare one already-accepted scratch declaration for durable storage."""
 
+    from ...utils import _lean_qualified_identifier_segments
+    from ...proof_graph import _SCOPED_OPEN_DECL_PREFIX_RE
+
+    def name_key(name: str) -> tuple[str, ...]:
+        parts = tuple(
+            part[1:-1] if part.startswith("«") and part.endswith("»") else part
+            for part in _lean_qualified_identifier_segments(name)
+        )
+        return parts[1:] if parts and parts[0] == "_root_" else parts
+
     raw = str(code or "").strip()
+    reserved = {str(item or "").strip() for item in reserved_names if item}
+    reserved_keys = {name_key(name) for name in reserved}
+    if str(preamble or "").strip():
+        from ...theorem_project import scan_lean_declarations
+
+        scope_source = str(preamble).rstrip() + "\n"
+        try:
+            scope = scan_lean_declarations(
+                scope_source + "theorem mini_checked_bridge_scope : True := by trivial"
+            )[-1]
+        except (ValueError, IndexError):
+            return "", ""
+        namespace = name_key(".".join(scope.namespace))
+        if namespace:
+            reserved_keys.update(
+                key[len(namespace):]
+                for key in tuple(reserved_keys)
+                if key[:len(namespace)] == namespace
+            )
     if allow_named_declarations:
         from ...proof_graph import helper_decl_kind
         from ...helper_salvage import _fresh_helper_collision_name, _rename_helper_identifier
 
         name = helper_decl_name(raw)
         if name and helper_decl_kind(raw) in {"lemma", "theorem"}:
-            reserved = {canonical_lean_identifier(item) for item in reserved_names}
-            if canonical_lean_identifier(name) in reserved:
+            if name_key(name) in reserved_keys:
                 fresh_name = _fresh_helper_collision_name(name, reserved_names=reserved)
+                while name_key(fresh_name) in reserved_keys:
+                    reserved.add(fresh_name)
+                    fresh_name = _fresh_helper_collision_name(name, reserved_names=reserved)
                 raw = _rename_helper_identifier(raw, name, fresh_name)
                 name = fresh_name
             return name, raw
-    match = _PLAIN_EXAMPLE_DECL_RE.match(raw)
+    # The scratch verifier preserves redundant opens as command-local scopes.
+    # Rename only the inner declaration; its binders, type, and proof must all
+    # retain the same name resolution when independently rechecked below.
+    declaration_offset = 0
+    while scoped_open := _SCOPED_OPEN_DECL_PREFIX_RE.match(raw[declaration_offset:]):
+        declaration_offset += scoped_open.end()
+    match = _PLAIN_EXAMPLE_DECL_RE.match(raw[declaration_offset:])
     if match is None:
         return "", ""
     digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
     base_name = f"mini_checked_bridge_{digest}"
-    reserved = {
-        canonical_lean_identifier(str(item or "").strip())
-        for item in reserved_names
-        if str(item or "").strip()
-    }
     name = base_name
     suffix = 2
-    while canonical_lean_identifier(name) in reserved:
+    while name_key(name) in reserved_keys:
         name = f"{base_name}_{suffix}"
         suffix += 1
     source = (
-        raw[: match.start()]
+        raw[: declaration_offset + match.start()]
         + str(match.group("prefix") or "")
         + f"lemma {name}"
-        + raw[match.end() :]
+        + raw[declaration_offset + match.end() :]
     )
     return name, source
+
+
+def _accepted_scratch_can_finalize(
+    code: str,
+    *,
+    goal_statement: str,
+    require_declaration: bool,
+) -> bool:
+    """Classify accepted artifacts for finalization, not proof acceptance.
+
+    Auxiliary scratch declarations can be useful verifier evidence without
+    proving the selected target. The caller still applies the ordinary Lean
+    acceptance gate to any artifact returned here.
+    """
+    from ...provider_tool_protocol import _checked_code_body
+    from ...proof_graph import _SCOPED_OPEN_DECL_PREFIX_RE, helper_decl_kind
+    from ...mini_recursive import _iter_checked_lean_target_headers
+
+    candidate = _checked_code_body(code)
+    if not candidate:
+        return False
+    if re.match(r"^\s*(?:by|show|calc|exact|refine|fun)(?![\w'])", _strip_lean_comments(candidate)):
+        # These forms were checked directly against the active tool goal.
+        return True
+    if require_declaration:
+        return helper_decl_kind(candidate) in {"lemma", "theorem"}
+    if _SCOPED_OPEN_DECL_PREFIX_RE.match(_strip_lean_comments(candidate)):
+        # Local notation/name resolution can change the meaning of a header
+        # whose text matches the goal. Bank it as a helper, not root evidence.
+        return False
+    if not (
+        _PLAIN_EXAMPLE_DECL_RE.match(_strip_lean_comments(candidate))
+        or helper_decl_kind(candidate)
+    ):
+        # Legacy receipts can contain an unnormalized prelude. Do not search
+        # through it for a matching header: imports/opens can change its type.
+        return False
+    target = canonical_dossier_statement_key(goal_statement)
+    return bool(target) and any(
+        canonical_dossier_statement_key(header) == target
+        for header in _iter_checked_lean_target_headers(candidate)
+    )
 
 
 _LEAN_LOCATION_RE = re.compile(
@@ -2498,6 +2572,7 @@ async def _call_llm_with_tools_one_round_impl(
     partial_try_lean_promotions = 0
     accepted_try_lean_helper_names: list[str] = []
     accepted_exact_target_code = ""
+    accepted_target_negation_code = ""
     final_no_tools_event = ""
     final_no_tools_finish_reason = ""
     final_no_tools_reasoning_content_chars = 0
@@ -3213,19 +3288,12 @@ async def _call_llm_with_tools_one_round_impl(
                 "request_timeout_override_s": request_window_s,
                 "operation_timeout_override_s": operation_window_s,
             }
-        # The operation window must be larger than one request window:
-        # a single hung attempt otherwise consumes the whole operation
-        # budget and every provider-level retry dies with "LLM retry would
-        # exceed deadline (attempt=1)" — the pre-ed5e8941 failure mode from
-        # the 2026-06-22..25 run corpus. Reserve one extra request window
-        # so at least one retry can run; overall turn wall-clock stays
-        # bounded by max_turn_elapsed_s via await_with_elapsed_budget.
-        # This branch is live whenever a role request-timeout override is
-        # configured (``--prover-request-timeout-s`` / ``--refiner-request-
-        # timeout-s`` set ``request_timeout_override_s``); the x2 keeps the
-        # zero-retry failure from resurfacing on this path. The admission gate
-        # in ``models._transport_retry_window_admissible`` must not charge the
-        # backoff sleep against the reserved window, or the x2 is defeated.
+        # Keep the operation window larger than one request window so a
+        # hung request leaves room for a provider-level retry. Reserve one
+        # extra request window; max_turn_elapsed_s still bounds the turn
+        # through await_with_elapsed_budget. Role request-timeout overrides
+        # set request_timeout_override_s. The transport admission gate must
+        # not charge retry backoff against the reserved request window.
         return {
             "request_timeout_override_s": request_timeout_override_f,
             "operation_timeout_override_s": request_timeout_override_f * 2.0,
@@ -4480,7 +4548,7 @@ async def _call_llm_with_tools_one_round_impl(
                             ):
                                 # A tool-enabled round that filled the output
                                 # cap with zero tools already spent the prove
-                                # quantum (Putnam 1970 B6). Parking a
+                                # quantum. Parking a
                                 # visibility-recovery continuation preserves
                                 # the same action until cutoff; cut and let
                                 # the scheduler replan instead.
@@ -4740,6 +4808,11 @@ async def _call_llm_with_tools_one_round_impl(
                     signature
                     for signature in round_call_signatures
                     if signature in accepted_try_lean_receipts
+                    and _accepted_scratch_can_finalize(
+                        accepted_try_lean_receipts[signature],
+                        goal_statement=tool_goal_statement,
+                        require_declaration=try_lean_require_declaration,
+                    )
                 ),
                 "",
             )
@@ -5002,7 +5075,7 @@ async def _call_llm_with_tools_one_round_impl(
             conv.ensure_bootstrap()
 
             # Append the assistant's tool-call message containing only the
-            # calls we'll actually execute (B1 invariant).
+            # calls we'll actually execute.
             batch_search_cadence_skipped = False
             batch_formal_cadence_requested = False
             assistant_tool_content = (
@@ -5116,7 +5189,7 @@ async def _call_llm_with_tools_one_round_impl(
             _bind_provider_continuation_policy_receipt(assistant_message, conv)
             conv.history.append(assistant_message)
 
-            # Per-tc dispatch — B1 + Bonus #1 invariants preserved.
+            # Dispatch each tool call with its own failure boundary.
             for index, tc in enumerate(calls_to_run):
                 fn = tc.get("function") or {}
                 name = str(fn.get("name", "") or "")
@@ -5606,10 +5679,19 @@ async def _call_llm_with_tools_one_round_impl(
                                 for name in registry
                                 if str(name or "").strip()
                             }
+                            reserved_bridge_names.update(
+                                str(getattr(owner, field, "") or "").strip()
+                                for owner in (dossier, authority_dossier)
+                                for field in (
+                                    "theorem_name", "cache_owner_theorem_name"
+                                )
+                                if str(getattr(owner, field, "") or "").strip()
+                            )
                             bridge_name, bridge_source = (
                                 _named_checked_bridge_source(
                                     accepted_try_lean_code,
                                     reserved_names=reserved_bridge_names,
+                                    preamble=str(conv.preamble or ""),
                                     allow_named_declarations=(
                                         try_lean_allow_declarations
                                         and not try_lean_require_declaration
@@ -5617,9 +5699,22 @@ async def _call_llm_with_tools_one_round_impl(
                                 )
                             )
                             accepted_target_negation = False
+                            confirmed_target_negation = False
                             accepted_exact_target = False
                             checked_target_headers: tuple[str, ...] = ()
-                            if accepted_try_lean_code:
+                            from ...proof_graph import _SCOPED_OPEN_DECL_PREFIX_RE
+
+                            _, scratch_leading_opens = _partition_redundant_preamble_commands(
+                                _strip_lean_comments(accepted_try_lean_code)
+                            )
+                            scratch_has_local_scope = bool(
+                                scratch_leading_opens
+                                or
+                                _SCOPED_OPEN_DECL_PREFIX_RE.match(
+                                    _strip_lean_comments(accepted_try_lean_code)
+                                )
+                            )
+                            if accepted_try_lean_code and not scratch_has_local_scope:
                                 try:
                                     from ensemble_prover.mini_recursive import (
                                         _accepted_try_lean_negates_statement,
@@ -5638,6 +5733,7 @@ async def _call_llm_with_tools_one_round_impl(
                                             tool_goal_statement,
                                         )
                                     )
+                                    confirmed_target_negation = accepted_target_negation
                                     active_target_key = (
                                         canonical_dossier_statement_key(
                                             tool_goal_statement
@@ -5662,6 +5758,8 @@ async def _call_llm_with_tools_one_round_impl(
                                 accepted_exact_target_code = (
                                     accepted_try_lean_code
                                 )
+                            if confirmed_target_negation:
+                                accepted_target_negation_code = accepted_try_lean_code
                             if accepted_target_negation or accepted_exact_target:
                                 bridge_name = ""
                                 bridge_source = ""
@@ -6383,7 +6481,7 @@ async def _call_llm_with_tools_one_round_impl(
                     )
                 except Exception as exc:
                     runner_raised = True
-                    # B1: synthesize a tool error message so the
+                    # synthesize a tool error message so the
                     # tool_call_id is matched. Without this, conv.history
                     # ends up with an ``assistant`` tool-calls message
                     # whose tool_call_ids have no matching ``tool``
@@ -6806,7 +6904,7 @@ async def _call_llm_with_tools_one_round_impl(
                     )
                     # Reuse the scheduler's bounded scoped-infrastructure
                     # recovery lane while the precise tool failure remains in
-                    # ``llm_failure_kind`` and the B1 receipt.
+                    # ``llm_failure_kind`` and the tool-call receipt.
                     llm_failure_reason = "llm_network_error"
                     llm_retryable = True
                     llm_terminal = False
@@ -7004,7 +7102,7 @@ async def _call_llm_with_tools_one_round_impl(
                     break
 
                 if semantic_no_progress_detected:
-                    # Preserve the B1 transcript invariant for every call the
+                    # Preserve the transcript invariant for every call the
                     # provider advertised, but do not execute more expensive
                     # variants after this route's formal progress governor
                     # fired.
@@ -7070,6 +7168,7 @@ async def _call_llm_with_tools_one_round_impl(
                 replaying_durable_progress_tool
                 and not pending_tool_replay
                 and not accepted_exact_target_code
+                and not accepted_target_negation_code
                 and not accepted_try_lean_helper_names
                 and not tool_state_update_statuses
                 and not authoritative_falsification
@@ -7080,6 +7179,13 @@ async def _call_llm_with_tools_one_round_impl(
                 # Accepted work must remain replayable if the outer workspace
                 # later loses its publication race.
                 durable_progress_tool_replay_exhausted = True
+
+            if accepted_target_negation_code:
+                # Hand paid negative evidence to the caller's independent
+                # negation replay and axiom audit before a scheduler yield.
+                # This is neither root success nor an accepted final proof.
+                content = _accepted_lean_artifact_content(accepted_target_negation_code)
+                break
 
             if accepted_exact_target_code:
                 # The kernel already accepted the active target. Publish that
@@ -7511,7 +7617,11 @@ async def _call_llm_with_tools_one_round_impl(
         (
             str(code or "")
             for code in reversed(repair_self_check_codes)
-            if str(code or "").strip()
+            if _accepted_scratch_can_finalize(
+                str(code or ""),
+                goal_statement=tool_goal_statement,
+                require_declaration=try_lean_require_declaration,
+            )
         ),
         "",
     )
@@ -7522,8 +7632,9 @@ async def _call_llm_with_tools_one_round_impl(
         and repair_self_check_status == "accepted"
         and _finalizer_recovery_authority_current()
     ):
-        # Lean's paid acceptance is the authoritative artifact. Any settled
-        # provider failure while merely serializing it must not erase it.
+        # Preserve an accepted artifact for this target if serialization fails.
+        # Auxiliary acceptance must not turn a cooperative yield into a final
+        # submission of an unrelated statement.
         # Cancellation and runtime-capability revocation are re-raised above.
         _retain_recovered_finalizer_failure_receipt()
         content = _accepted_lean_artifact_content(accepted_fallback_code)

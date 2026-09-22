@@ -62,7 +62,7 @@ class InterTurnAssemblyAction:
                         return False
                     if not ready_nodes:
                         return False
-                    # M8 fix (2026-05-08): when the scheduler selected a
+                    # when the scheduler selected a
                     # specific (node_id, assembly_id) pair, validate the
                     # assembly_id against the node's actual ready
                     # assembly groups. ``assembly_targets`` ignores

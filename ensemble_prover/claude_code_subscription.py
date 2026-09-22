@@ -31,6 +31,7 @@ from .models import (
     _sanitize_request_messages,
 )
 from .provider_response import publish_provider_response
+from .provider_progress import PROGRESS_KEY, progress_snapshot
 from .sampling_controls import is_api_default_temperature_override
 from .subscription_cli import (
     SubscriptionCLIClient,
@@ -126,6 +127,7 @@ _USAGE_KEYS = (
 
 
 def _usage_counts(usage: Any) -> dict[str, int] | None:
+    """Validate provider counts; streamed thinking estimates are not receipts."""
     if not isinstance(usage, dict) or not all(key in usage for key in _USAGE_KEYS[:2]):
         return None
     if any(
@@ -133,7 +135,18 @@ def _usage_counts(usage: Any) -> dict[str, int] | None:
         for key in _USAGE_KEYS
     ):
         return None
-    return {key: usage.get(key, 0) for key in _USAGE_KEYS}
+    details = usage.get("output_tokens_details")
+    if details is None:
+        details = {}
+    if not isinstance(details, dict):
+        return None
+    thinking_tokens = details.get("thinking_tokens", 0)
+    if type(thinking_tokens) is not int or not 0 <= thinking_tokens <= usage["output_tokens"]:
+        return None
+    return {
+        **{key: usage.get(key, 0) for key in _USAGE_KEYS},
+        "thinking_tokens": thinking_tokens,
+    }
 
 
 def _cli_failure(diagnostic: str) -> ClaudeCodeBackendError:
@@ -476,6 +489,40 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
         structured_ids: set[str] = set()
         message_usage: dict[str, dict[str, int]] = {}
         initialized = False
+        progress: dict[str, Any] = {
+            "backend": "claude_code_subscription", "status": "requesting",
+            "event_count": 0, "thinking_event_count": 0,
+            "retry_event_count": 0, "assistant_event_count": 0,
+        }
+        final_progress_status = "failed"
+
+        def report_progress(status: str, event: dict[str, Any] | None = None) -> None:
+            progress["status"] = status
+            progress["elapsed_s"] = time.monotonic() - started
+            if event is not None:
+                progress["event_count"] += 1
+                if event.get("subtype") == "thinking_tokens":
+                    progress["thinking_event_count"] += 1
+                    # This total resets for each thinking block. Never sum it
+                    # into usage, or pretend that it is a whole-request total.
+                    progress["current_block_estimated_tokens"] = event.get("estimated_tokens")
+                elif event.get("subtype") == "api_retry":
+                    progress["retry_event_count"] += 1
+                    for source, target in (
+                        ("attempt", "retry_attempt"), ("max_retries", "max_retries"),
+                        ("retry_delay_ms", "retry_delay_ms"), ("error_status", "error_status"),
+                    ):
+                        progress[target] = event.get(source)
+                elif event.get("type") == "assistant":
+                    progress["assistant_event_count"] += 1
+            clean = progress_snapshot(progress)
+            if clean is not None:
+                metadata[PROGRESS_KEY] = clean
+                try:
+                    publish_provider_request_metadata(metadata)
+                except Exception:
+                    # Live observers are secondary to the provider result.
+                    pass
 
         def record_usage(usage: Any, *, partial: bool = False) -> None:
             nonlocal usage_payload, usage_observed
@@ -492,6 +539,9 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 "input_tokens_details": {
                     "cached_tokens": counts["cache_read_input_tokens"],
                     "cache_write_tokens": counts["cache_creation_input_tokens"],
+                },
+                "output_tokens_details": {
+                    "reasoning_tokens": counts["thinking_tokens"],
                 },
             }
             record = provider_usage_from_payload(
@@ -560,6 +610,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                             "Claude Code exposed MCP servers", kind="capability"
                         )
                     initialized = True
+                    report_progress("initialized", event)
                 elif not initialized or subtype not in (
                     "status",
                     "compact_boundary",
@@ -578,6 +629,16 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                         "checkpoint-owned context can no longer be verified.",
                         kind="context",
                     )
+                elif subtype == "thinking_tokens":
+                    report_progress("thinking", event)
+                elif subtype == "api_retry":
+                    report_progress("retrying", event)
+                elif subtype == "status":
+                    status = event.get("status")
+                    if status in ("requesting", "compacting"):
+                        report_progress(status, event)
+                    else:
+                        report_progress("idle", event)
                 return
             if kind in ("assistant", "user"):
                 if not initialized:
@@ -647,6 +708,8 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                             "Claude Code attempted a native action; only inert StructuredOutput is permitted.",
                             kind="capability",
                         )
+                if kind == "assistant":
+                    report_progress("responding", event)
                 return
             if kind == "rate_limit_event":
                 return  # The final result establishes whether the request succeeded.
@@ -697,6 +760,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             nonlocal dispatched
             dispatched = True
             mark_provider_dispatched(**authority)
+            report_progress("requesting")
 
         with tempfile.TemporaryDirectory(prefix="ensemble-claude-code-") as cwd:
             Path(cwd, "response.json").write_text(
@@ -743,6 +807,14 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     on_event=on_event,
                     on_started=on_started,
                 )
+                if completed and not failed_turn and code == 0:
+                    final_progress_status = "finished"
+            except asyncio.CancelledError:
+                final_progress_status = "cancelled"
+                raise
+            except TimeoutError:
+                final_progress_status = "timed_out"
+                raise
             finally:
                 if not dispatched:
                     # No prompt has been written: retire this exact admission
@@ -761,33 +833,48 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                         # and retain the explicit incomplete-response marker.
                         record_usage(
                             {
-                                key: sum(item[key] for item in message_usage.values())
-                                for key in _USAGE_KEYS
+                                **{
+                                    key: sum(item[key] for item in message_usage.values())
+                                    for key in _USAGE_KEYS
+                                },
+                                "output_tokens_details": {
+                                    "thinking_tokens": sum(
+                                        item["thinking_tokens"]
+                                        for item in message_usage.values()
+                                    ),
+                                },
                             },
                             partial=True,
                         )
+                if dispatched and final_progress_status != "finished":
+                    report_progress(final_progress_status)
         if code or not completed or failed_turn:
             raise _cli_failure(
                 failure + "\n" + stderr.decode("utf-8", errors="replace")
             )
-        if structured_answer is None:
-            raise self._response_validation_error("missing_response") from None
         # Completion includes the full wire stream and a successful process exit.
         # Keep native actions and transport failures authoritative until then.
         try:
-            answer = json.dumps(structured_answer, allow_nan=False)
-        except (ValueError, RecursionError):
-            raise self._response_validation_error("envelope_json") from None
-        content, calls = self._decode_answer(
-            answer, allowed, bool(selected or tool_choice == "required")
-        )
-        if response_format == "json":
+            if structured_answer is None:
+                raise self._response_validation_error("missing_response") from None
             try:
-                inner = json.loads(content, parse_constant=_reject_json_constant)
+                answer = json.dumps(structured_answer, allow_nan=False)
             except (ValueError, RecursionError):
-                raise self._response_validation_error("json_content") from None
-            if not isinstance(inner, dict):
-                raise self._response_validation_error("json_content_object") from None
+                raise self._response_validation_error("envelope_json") from None
+            content, calls = self._decode_answer(
+                answer, allowed, bool(selected or tool_choice == "required")
+            )
+            if response_format == "json":
+                try:
+                    inner = json.loads(content, parse_constant=_reject_json_constant)
+                except (ValueError, RecursionError):
+                    raise self._response_validation_error("json_content") from None
+                if not isinstance(inner, dict):
+                    raise self._response_validation_error("json_content_object") from None
+        except Exception:
+            report_progress("failed")
+            raise
+        report_progress("finished")
         raw = {
             "id": thread_id,
             "model": self.cfg.model,

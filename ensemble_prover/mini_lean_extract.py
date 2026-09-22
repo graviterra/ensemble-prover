@@ -19,6 +19,7 @@ from .proof_dossier import (
     helper_decl_name,
     helper_decl_statement,
 )
+from .proof_graph import _SCOPED_OPEN_DECL_PREFIX_RE, _helper_decl_header
 from .proof_state import lean_referenced_helper_names
 from .utils import (
     _first_top_level_colon,
@@ -46,7 +47,9 @@ def _extract_first_proof(llm_output: str) -> Optional[str]:
 # ``by`` are the main-proof markers. The regex anchors to start-of-line so we
 # don't misclassify ``theorem`` keywords inside nested ``have`` blocks.
 _TOP_LEVEL_HEADER_RE = re.compile(
-    r"^(?:@\[[^\]]*\]\s*)*"
+    r"^(?=\S)(?:"
+    + _SCOPED_OPEN_DECL_PREFIX_RE.pattern.removeprefix("^")
+    + r")*(?:@\[[^\]]*\]\s*)*"
     r"(?:(?:private|protected|noncomputable|unsafe|partial)\s+)*"
     r"(theorem|lemma|def|abbrev|instance|example|by\b)",
     re.MULTILINE,
@@ -483,6 +486,20 @@ def _scope_helper_with_open_commands(
     scoped_lines = [f"  {command} in" for command in commands]
     indented_body = [f"  {line}" if line else "" for line in body_lines]
     return "\n".join([*scoped_lines, *indented_body]).strip()
+
+
+def _partition_scoped_open_prefix(src: str) -> tuple[str, list[str]]:
+    """Peel supported local opens while preserving declaration body columns."""
+
+    offset = 0
+    commands: list[str] = []
+    while match := _SCOPED_OPEN_DECL_PREFIX_RE.match(src[offset:]):
+        commands.append(re.sub(r"\bin\s*$", "", match.group()).strip())
+        offset += match.end()
+    if not commands:
+        return src, []
+    column = offset - (src.rfind("\n", 0, offset) + 1)
+    return " " * column + src[offset:], commands
 
 
 def _is_local_open_scoped_proof(src: str) -> bool:
@@ -1396,6 +1413,10 @@ def _find_forbidden_lean_command(helpers: List[str], proof: str) -> Optional[str
                     stripped[match.start(1) :]
                 )
                 or re.match(
+                    r"^\s*(?:noncomputable\s+)?example\b",
+                    _partition_scoped_open_prefix(stripped[match.start(1) :])[0],
+                )
+                or re.match(
                     r"^(?:@\[[^\]]*\]\s*)*"
                     r"(?:(?:private|protected|noncomputable|unsafe|partial)\s+)*"
                     r"(?:theorem|lemma|def|abbrev|instance)\b",
@@ -1855,9 +1876,8 @@ def _top_level_declaration_registry_with_opens(
     each declaration (for dependency resolution). Header scanning runs on the
     length-preserving comment- and string-blanked shadow of the source, so
     declaration-looking text inside block comments (nested included), line
-    comments, string literals, and interpolations never registers (Sol audit
-    2026-07-29 F1: a commented-out fake ``*_solution`` definition replaced the
-    real value shown to the planner). Spans are then sliced from the ORIGINAL
+    comments, string literals, and interpolations never registers. Spans are
+    then sliced from the ORIGINAL
     source, preserving exact text. A name genuinely declared more than once at
     top level is AMBIGUOUS: it is excluded from ``blocks`` so every consumer
     fails closed instead of guessing which copy is authoritative.
@@ -1874,7 +1894,7 @@ def _top_level_declaration_registry_with_opens(
         matched = match.group(0)
         return match.start() + (len(matched) - len(matched.lstrip()))
 
-    # Namespace/section tracking (Sol audit 2026-07-29 R2): declarations are
+    # Namespace/section tracking: declarations are
     # registered under their FULLY QUALIFIED names, scope commands form block
     # boundaries (an intervening ``end``/``open`` never attaches to the
     # previous declaration), and same-named declarations in different
@@ -2294,19 +2314,33 @@ def _top_level_chunks_from_reply(llm_output: str) -> List[str]:
     """Best-effort top-level proof/helper chunks across all Lean fences."""
     chunks: List[str] = []
     for raw_src in extract_code_fences(llm_output or ""):
-        src = normalize_nat_factorial_notation(
-            _strip_redundant_preamble_commands(raw_src.strip())
+        stripped_src, open_commands = _partition_redundant_preamble_commands(
+            raw_src.strip()
         )
+        src = normalize_nat_factorial_notation(stripped_src)
         if not src:
             continue
         _leading, structured_chunks = _split_top_level_chunks(src)
         if structured_chunks:
-            chunks.extend(structured_chunks)
+            for chunk in structured_chunks:
+                if helper_decl_kind(chunk) or re.match(
+                    r"^\s*(?:noncomputable\s+)?example\b",
+                    _partition_scoped_open_prefix(chunk)[0],
+                ):
+                    chunks.append(
+                        _scope_helper_with_open_commands(chunk, open_commands)
+                    )
+                else:
+                    chunks.append(
+                        _scope_proof_with_open_commands(chunk, open_commands) or chunk
+                    )
             continue
         candidates = extract_proof_candidates(src)
         for candidate in candidates:
             if _is_plausible_main_proof(candidate):
-                chunks.append(candidate)
+                chunks.append(
+                    _scope_proof_with_open_commands(candidate, open_commands) or candidate
+                )
                 break
     return chunks
 
@@ -2472,6 +2506,11 @@ def _extract_example_body(chunk: str) -> Optional[str]:
     such as ``example (h : P) : Q := by exact h`` can satisfy a goal like
     ``P → Q`` instead of being silently discarded.
     """
+    declaration, open_commands = _partition_scoped_open_prefix(chunk)
+    if open_commands:
+        return _scope_proof_with_open_commands(
+            _extract_example_body(declaration), open_commands
+        )
     s = chunk.strip()
     example_start = len(chunk) - len(chunk.lstrip())
     if s.startswith("noncomputable"):
@@ -2516,7 +2555,7 @@ def _extract_single_decl_body(chunk: str) -> Optional[str]:
     instead of being trusted.
     """
 
-    s = (chunk or "").strip()
+    s, open_commands = _partition_scoped_open_prefix(chunk or "")
     if not re.match(
         r"^\s*(?:@\[[^\]]*\]\s*)*"
         r"(?:(?:private|protected|noncomputable|unsafe|partial)\s+)*"
@@ -2524,12 +2563,21 @@ def _extract_single_decl_body(chunk: str) -> Optional[str]:
         s,
     ):
         return None
-    body = helper_decl_body(s)
+    header = _helper_decl_header(s)
+    if header is None:
+        return None
+    # Reuse example binder handling, keeping the original proof's column so
+    # an inline `by` followed by multiline tactics retains its indentation.
+    tail = header[2]
+    tail_offset = len(s) - len(tail)
+    body = _extract_example_body(
+        " " * max(0, tail_offset - len("example")) + "example" + tail
+    )
     if not body:
         return None
     if not _is_plausible_main_proof(body):
         return None
-    return body
+    return _scope_proof_with_open_commands(body, open_commands)
 
 
 def _normalize_statement_for_contract(text: object) -> str:
@@ -2608,8 +2656,9 @@ def _extract_helpers_and_main(
         text = normalize_nat_factorial_notation((llm_output or "").strip())
         if _find_forbidden_lean_command([], text) is not None:
             return [], None
-        if text.startswith("example"):
-            return [], _extract_example_body(text)
+        example_body = _extract_example_body(text)
+        if example_body is not None:
+            return [], example_body
         if _is_plausible_main_proof(text):
             return [], text
         return [], None
@@ -2678,7 +2727,10 @@ def _extract_helpers_and_main(
             # type (`example : let x := 1; ...`), or inside binder defaults.
             main_proof = example_body
             from_example = True
-        elif last.startswith("example") or last.startswith("noncomputable example"):
+        elif re.match(
+            r"^\s*(?:noncomputable\s+)?example\b",
+            _partition_scoped_open_prefix(last)[0],
+        ):
             continue
         elif last.startswith("by"):
             main_proof = last
@@ -2691,26 +2743,21 @@ def _extract_helpers_and_main(
                     and not _lean_body_is_sorry_stub(decl_body)
                     and allow_decl_main
                     and _decl_matches_main_target(
-                        last,
+                        scoped_chunks[-1],
                         theorem_name=theorem_name,
                         goal_statement=goal_statement,
                         allow_anonymous=not bool(theorem_name or goal_statement),
                     )
                 ):
-                    # Single-chunk case: a lone named non-sorry decl may
-                    # serve as the root proof only when its name matches
-                    # the benchmark (or no name was supplied). Without
-                    # this guard, an LLM that emits a single helper-named
-                    # theorem with a non-root body would have that body
-                    # submitted against the root goal (A4-symmetric fix
-                    # for the single-chunk path; mirrors the multi-chunk
-                    # branch below).
+                    # A lone named non-sorry declaration is a root proof only when its
+                    # name matches the benchmark, or no benchmark name was supplied.
+                    # Otherwise its helper body would be submitted against the wrong goal.
                     lone_decl_body_candidate = decl_body
                     lone_decl_open_commands = list(leading_open_commands)
                 elif (
                     allow_decl_main
                     and _decl_matches_main_target(
-                        last,
+                        scoped_chunks[-1],
                         theorem_name=theorem_name,
                         goal_statement=goal_statement,
                     )
@@ -2721,7 +2768,7 @@ def _extract_helpers_and_main(
                     # Sorry-stub root declarations are decomposition/policy
                     # artifacts, not checked root proofs.
                     # Otherwise we'd submit a helper's body against the wrong
-                    # goal (A4 structural fix, 2026-05-08).
+                    # goal.
                     main_proof = decl_body
             if main_proof is None:
                 # The last chunk was a helper, not a main proof. Keep helper-only
@@ -2768,12 +2815,7 @@ def _extract_lemma_dag_helper_declarations(
         _leading, chunks = _split_top_level_chunks(src)
         for chunk in chunks:
             raw_text = str(chunk or "").strip()
-            if not re.match(
-                r"^\s*(?:@\[[^\]]*\]\s*)*"
-                r"(?:(?:private|protected|noncomputable|unsafe|partial)\s+)*"
-                r"(?:theorem|lemma)\b",
-                raw_text,
-            ):
+            if helper_decl_kind(raw_text) not in {"theorem", "lemma"}:
                 continue
             text = _scope_helper_with_open_commands(
                 raw_text,

@@ -14,7 +14,7 @@ class ProofStateRetrievalAction:
     id: str = "proof_state_retrieval"
     priority: int = 25
     cost_estimate_s: float = 5.0
-    # H2 fix (2026-05-08): run() calls sync_to_graph(session.dossier, ...)
+    # run() calls sync_to_graph(session.dossier, ...)
     # which mutates the dossier's proof_graph. Every other action that
     # touches sync_to_graph declares "dossier" in WRITES; preserving the
     # invariant lets a write-conflict scheduler reason about safe
@@ -256,7 +256,7 @@ class ProofStateRetrievalAction:
             turn_index=int(getattr(session, "iteration", 0)),
             refresh_target_node_ids=selected_ids or None,
         )
-        # M6 fix (2026-05-08): bare ``bool(records)`` reports True even
+        # bare ``bool(records)`` reports True even
         # when retrieval scanned a node and got zero hits — _retrieve_*
         # emits a record per scanned node regardless of result count.
         # That false-positive cleared ``consumed_frontier_work_keys`` and

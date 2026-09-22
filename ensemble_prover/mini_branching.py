@@ -167,16 +167,9 @@ def _copy_dossier_contents(dst: ProofDossier, src: ProofDossier) -> None:
         )
         or {}
     )
-    # Fix 1 follow-up (2026-05-22): the original Fix 1 commit
-    # (d08b3958) added ``verified_helper_statement_aliases`` to
-    # ProofDossier but did not extend ``_copy_dossier_contents`` to
-    # propagate it across branch/merge boundaries. In the observed failure,
-    # two helpers with byte-identical
-    # canonical statements were both stored, while ``summary.json``
-    # showed an empty alias map — because the session-dossier's
-    # ``verified_helper_statement_aliases`` was rebuilt correctly during
-    # the session, then silently dropped on the snapshot back to the
-    # parent dossier. This propagation closes the gap.
+    # Propagate ``verified_helper_statement_aliases`` across branch and
+    # merge boundaries so the parent dossier retains the session's
+    # canonical helper identities.
     dst.verified_helper_statement_aliases = copy.deepcopy(
         getattr(src, "verified_helper_statement_aliases", {}) or {}
     )
@@ -195,8 +188,8 @@ def _copy_dossier_contents(dst: ProofDossier, src: ProofDossier) -> None:
         getattr(src, "lean_environment_content_digests", {}) or {}
     )
     # Install the source proof boundary before importing its falsification
-    # ledger.  This removes stale destination proof state (which used to
-    # quarantine a valid source disproof) while preserving a genuine conflict
+    # ledger. Remove stale destination proof state so it cannot quarantine
+    # a valid source disproof, while preserving a genuine conflict
     # owned by the source as a conflict instead of temporarily promoting its
     # negative certificate beside a later-copied proof.
     dst.final_proof = getattr(src, "final_proof", None)
@@ -1161,9 +1154,9 @@ def _copy_branch_failure_observability(dst: ProofDossier, src: ProofDossier) -> 
 def merge_lean_environment_ancestry(dst: ProofDossier, src: ProofDossier) -> bool:
     """Union source Lean-environment ancestry into destination before helpers.
 
-    Branch / sibling merges previously dropped the ancestry map that interprets
-    ``verification_environment_hash`` while still importing per-node ancestor
-    metadata. Union the maps (cycle-safe) so dossier and graph agree.
+    Union the ancestry maps cycle-safely so imported node metadata and
+    ``verification_environment_hash`` are interpreted consistently by both
+    the destination dossier and graph.
 
     Do **not** advance ``current_lean_environment_hash`` here: a parent or
     winning sample that remained in an ancestor environment must keep rejecting

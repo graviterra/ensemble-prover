@@ -417,16 +417,5 @@ unknown top-level fields, duplicate keys, and nonfinite numbers. CLI submission
 objects must include every field shown in the relevant example, including
 `details`, `artifact_ids`, and explicit cost acceptance where applicable.
 
-From the Git repository root:
-
-```bash
-.venv/bin/python -m pytest ensemble_prover/research_claims/tests
-```
-
-These tests are included in the repository's normal pytest discovery and
-excluded from runtime release snapshots, together with internal review and
-validation reports.
-
 See [IMPLEMENTATION.md](IMPLEMENTATION.md) for the implementation boundary and
-follow-on work. Tests cover local workflows and the ledger's admission rules;
-they do not prove submitted mathematics.
+limitations. Ledger records do not prove submitted mathematics.

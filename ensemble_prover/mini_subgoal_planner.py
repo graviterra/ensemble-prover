@@ -631,8 +631,8 @@ def parse_mini_subgoal_plan_response(raw_response: str) -> MiniSubgoalPlan:
     #     source. (A real plan is usually stated up front and is the most
     #     complete decomposition; trailing schema/reference echoes and embedded
     #     examples typically carry fewer / placeholder claims.)
-    # Metadata richness is deliberately NOT used to rank candidates: adversarial
-    # review showed it is not a reliable signal (a schema example/template can be
+    # Metadata richness is deliberately NOT used to rank candidates: it
+    # is not a reliable signal (a schema example/template can be
     # metadata-rich while the real plan is terse, OR vice versa), so using it
     # merely trades one mis-selection for another.
     #
@@ -665,7 +665,7 @@ def parse_mini_subgoal_plan_response(raw_response: str) -> MiniSubgoalPlan:
     #                       plan wrapped under an unrecognized key, where the real
     #                       claims live in a recovery/fragment that should win),
     #                       and any 0-claim recovery/fragment.
-    # Distilled from the adversarial audit: a real recovery beats a wrapped
+    # A real recovery beats a wrapped
     # primary (3>0); an INTENTIONAL empty primary plan beats sibling aliases by
     # same-object suppression and beats a phantom fragment (3>1); but a MIS-SHAPED
     # primary with no claim-list key does NOT bury the fragment/recovery that

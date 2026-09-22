@@ -1554,21 +1554,15 @@ _consume_future_exception = mark_runtime_owned_callback(
 # Tactic Oracle — goal-aware vocabulary planning
 # ---------------------------------------------------------------------------
 
-# Tier 1: structural/trivial — tried as a combined `first | ... | sorry`
-# in ONE Lean call. The trailing fallback lets misses compile, while the
-# parser distinguishes real unresolved-sorry warnings from benign linter
-# messages like "'sorry' tactic does nothing".
+# Tier 1: combine structural/trivial tactics in one Lean call with a
+# trailing sorry fallback. The parser distinguishes unresolved-sorry
+# warnings from benign linter messages such as "'sorry' tactic does nothing".
 #
-# Each alternative is prefixed by ``intros`` so goals with leading ∀/Π
-# binders (e.g. scaffold slot targets like
-# ``∀ (S : Type*) [CommSemigroup S] (a c d : S), a*(c*d) = (a*c)*d``)
-# can be discharged. Without the intros prefix, tactics like ``rfl`` /
-# ``ac_rfl`` / ``assumption`` run against the forall itself and fail
-# with ``equality expected`` / ``no hypotheses`` — live trace
-# 2012_a2_19apr_15.jsonl: 0/126 oracle calls produced a Tier-1 hit
-# because every scaffold slot target carries leading ∀ binders.
-# ``intros`` on a non-forall goal is a benign no-op (linter warning only)
-# and does not change the outcome of subsequent tactics.
+# Prefix each alternative with ``intros`` to expose hypotheses under ∀/Π
+# binders before running ``rfl``, ``ac_rfl``, or ``assumption``. Without
+# introductions those tactics see the forall itself and can report
+# ``equality expected`` or ``no hypotheses``. On a non-forall goal,
+# ``intros`` is a benign no-op with at most a linter warning.
 _TIER1_COMBINED = (
     "intros; first | rfl | trivial | assumption | contradiction | tauto | ac_rfl"
 )
@@ -3591,12 +3585,9 @@ class LeanRunner:
         self._sorry_check_ok_count: int = 0
         self._sorry_check_fail_count: int = 0
         self._oracle_check_count: int = 0
-        # RCA 2026-04-24: count of "Try this:" suggestions dropped because
-        # their source line was BEFORE the goal block. Catches Mathlib
-        # introMerge linter (and similar) emitting against context-lemma
-        # bodies preceding the goal — historically harvested as cross-goal
-        # proof candidates that produced binder_arity_mismatch cascades.
-        # See WORK_VALIDATION_LOG_2026-04-24_oracle_try_this_harvest_root_fix.md.
+        # Count "Try this:" suggestions dropped because their source line
+        # precedes the goal block. Linters can emit suggestions against context
+        # lemmas; those suggestions are not proof candidates for the goal.
         self._oracle_suggestions_off_block_dropped: int = 0
         self._total_check_time_s: float = 0.0
         self._total_queue_wait_s: float = 0.0
@@ -4929,13 +4920,9 @@ class LeanRunner:
                 future.set_result(payload)
             return payload
         except BaseException as exc:
-            # BaseException (not just Exception) so we also catch
-            # asyncio.CancelledError — which in Python 3.8+ is a
-            # BaseException subclass, not an Exception. Leaving
-            # CancelledError unhandled here would previously leave the
-            # coalescing Future in PENDING state forever, causing any
-            # waiter inside asyncio.shield(future) to hang until its
-            # own upstream cancellation fired.
+            # Catch BaseException to include asyncio.CancelledError. Resolve the
+            # coalescing Future on cancellation so shielded waiters do not remain
+            # pending until their own upstream cancellation.
             if not future.done():
                 if isinstance(exc, asyncio.CancelledError):
                     # An independent subscriber has not been canceled. Let
@@ -4994,42 +4981,17 @@ class LeanRunner:
         preamble, target_scoped_prefix, target_omit_variables = (
             decode_theorem_target_context(preamble)
         )
-        # ── Free-universe-variable binding (structural fix, 2026-04-16) ──
-        # When ANY part of the generated file references a free universe
-        # variable (e.g. `Type u_1`, `Sort u`), the fresh top-level scope
-        # must declare those universes explicitly. PutnamBench's
-        # lakefile.lean sets `autoImplicit: false`, and the persistent
-        # verifier (LSP mode: `lake env lean --server`) STRICTLY enforces
-        # that — universe auto-binding is gated on `autoImplicit`. CLI
-        # mode (`lake env lean`) is more permissive (Mathlib import
-        # appears to override), which is why this bug was invisible to
-        # CLI tests yet cascaded under the live LSP runtime.
-        #
-        # Live trace 2001_a1_16apr_11.jsonl: solved lemmas like
-        # `lemma lemma_X : ∀ (S : Type u) ..., ... := by tauto` were
-        # injected into lemma_block. `_free_universe_decl(statement)` (the
-        # earlier scope) only scanned `statement`, missing the `Type u`
-        # in lemma_block. LSP rejected with `unknown universe level u`
-        # at the lemma definition; downstream tactics cascaded to
-        # "incorrect number of universe levels" on `check_type`.
-        # Verified empirically: scanning `statement + lemma_block +
-        # proof_code` collects all free universes and a single top-level
-        # `universe ...` declaration unblocks elaboration.
+        # Bind free universe variables referenced anywhere in the generated file.
+        # With autoImplicit disabled, the persistent Lean verifier requires an
+        # explicit universe declaration. Scan the statement, lemma block, and
+        # proof code so a helper's ``Type u`` cannot remain undeclared.
         universe_scan_text = "\n".join(
             part for part in (statement, lemma_block, proof_code) if part
         )
         universe_decl = _free_universe_decl(universe_scan_text, declared_in=preamble)
-        # ── set_option scoping fix (2026-04-16) ──────────────────────
-        # `set_option X in <command>` scopes the option AND any
-        # declarations within it to a single command. Putting
-        # `universe u_2` inside the scope means the universe variable
-        # only exists for that one universe declaration — the
-        # `example` that follows sees `Type u_2` as an undeclared
-        # universe, falls back to `sorry`, and `intro` fails with
-        # "no additional binders to introduce". The universe
-        # declaration MUST be a top-level command before any
-        # `set_option ... in` wrapper. (Live trace 2001_a1_16apr_8.jsonl
-        # had 49 valid proofs rejected this way.)
+        # Keep universe declarations at top level, before any ``set_option ... in``
+        # wrapper. The wrapper scopes its contents to one command, so a universe
+        # declared inside it is unavailable to the following example.
         audit_requested = axiom_audit_names is not None
         delta_before, delta_after = ("", "")
         if audit_requested and lemma_block:
@@ -5053,15 +5015,10 @@ class LeanRunner:
             )
         if target_scoped_prefix:
             scoped_block = f"{target_scoped_prefix}\n{scoped_block}"
-        # Belt-and-suspenders: when warnings aren't promoted to errors we
-        # are running an oracle / sorry-fill check. Mathlib's
-        # ``Mathlib.Tactic.TacticAnalysis.introMerge`` linter (and any
-        # similar future linter) emits ``Try this: intro X Y Z`` suggestions
-        # against context-lemma bodies that have consecutive ``intro``
-        # tactics. The parser-side source-line filter (see lean_parser.py:
-        # ``extract_tactic_suggestions``) is the load-bearing fix; this
-        # ``set_option`` silences the noise at the source so the linter
-        # never produces the spurious suggestion in the first place.
+        # Suppress introMerge linter noise when stylistic warnings are allowed.
+        # The linter can suggest intro tactics for context lemmas rather than the
+        # goal. The parser's source-line filter independently excludes those
+        # suggestions from goal proof candidates.
         if not warning_as_error:
             option_lines = ["set_option warningAsError false in"]
             # ``linter.tacticAnalysis.introMerge`` is registered by Mathlib,
@@ -5079,12 +5036,9 @@ class LeanRunner:
         # the lemma_block's `Type u` references with `unknown universe
         # level u` under LSP-strict autoImplicit=false.
         head_universe_decl = f"{universe_decl}\n\n" if universe_decl else ""
-        # The check budget applies to the complete generated environment, not
-        # only to the final goal command. Context helpers are re-elaborated in
-        # this file; leaving them at Lean's 200k default allowed a previously
-        # verified helper to time out before the goal while the goal itself had
-        # the caller's larger budget. Lean then recovered with ``sorryAx``,
-        # making an unverified goal look like a harmless harness failure.
+        # Apply the check budget to the whole generated environment, including
+        # re-elaboration of context helpers. A helper timeout before the goal
+        # can introduce recovery sorryAx, so helpers need the caller's budget too.
         heartbeat_option = (
             f"set_option maxHeartbeats {int(max_heartbeats)}\n\n"
             if isinstance(max_heartbeats, int) and max_heartbeats > 0
@@ -5761,31 +5715,16 @@ class LeanRunner:
         warning_as_error: bool = False,
         dispatch_observer: Optional[Callable[[], None]] = None,
     ) -> LeanResult:
-        # Phase A fix (2026-05-09): default ``warning_as_error`` flipped
-        # to False. Lean's stylistic warnings — `try simp instead of
-        # simpa`, `unused variable`, `unused simp argument`,
-        # deprecation notes — escalated to errors and rejected
-        # mathematically-valid proofs. PutnamBench grading does NOT
-        # fail on warnings (only on `sorry`/`admit`/errors), so a
-        # warning-passing proof IS a correct submission. Rejecting it
-        # for style burned LLM turns AND Lean checks for zero
-        # correctness gain.
-        #
-        # Callers that genuinely need strict mode (e.g., a final
-        # publishable Lean file) can opt in via ``warning_as_error=True``.
-        # The lower-level ``check_with_sorry()``,
-        # ``check_term_type()``, and apply_decl_to_goal paths kept
-        # their pre-existing False default unchanged.
-        #
-        # Warnings are still surfaced in the output, so the
-        # post-failure cascade (and the LLM's next-turn feedback)
-        # still see them — this just stops them from being a hard
-        # rejection signal.
+        # Stylistic warnings do not invalidate proofs by default. These include
+        # suggestions to prefer simp over simpa, unused variables/arguments,
+        # and deprecation notices. Errors and sorry/admit remain rejections.
+        # Callers can opt into strict style checks with ``warning_as_error=True``.
+        # The other probe paths also default to allowing stylistic warnings.
         await self.ensure_project_imports_built()
         await self._ensure_extra_imports_built(
             self._required_extra_imports_for_proof(proof_code)
         )
-        # 2026-05-22: when the caller does not specify max_heartbeats,
+        # when the caller does not specify max_heartbeats,
         # fall back to an opt-in instance attribute set by callers like
         # mini_prover (`--lean-max-heartbeats`). This lifts the heartbeats
         # budget for every check call (try_lean tool + primary proof
@@ -5880,11 +5819,9 @@ class LeanRunner:
                     operation_deadline=operation_deadline,
                 )
         if execution is None:
-            # Parse the disk-write-failed / write-error string so the
-            # resulting LeanResult.parsed exposes infra_failure=True to
-            # callers. Previously this returned parsed=None, leaving
-            # downstream classification to treat the disk-I/O failure as
-            # a real Lean rejection.
+            # Parse disk-write failures into LeanResult.parsed with
+            # infra_failure=True so callers classify them as infrastructure
+            # failures rather than mathematical Lean rejections.
             output = str(write_error or "disk write failed")
             return LeanResult(
                 ok=False,
@@ -5975,7 +5912,7 @@ class LeanRunner:
                 parsed.axiom_audit_ok = True
         # Track off-block "Try this:" drops from the full check path too —
         # protects against a future caller that reads parsed.suggestions
-        # from a non-oracle path. See RCA 2026-04-24.
+        # from a non-oracle path.
         dropped = int(getattr(parsed.suggestions, "rejected_off_block", 0))
         if dropped:
             self._oracle_suggestions_off_block_dropped += dropped
@@ -6166,12 +6103,9 @@ class LeanRunner:
         await self._ensure_extra_imports_built(
             self._required_extra_imports_for_proof(proof_code)
         )
-        # Fix follow-up (2026-05-22): mirror the maxHeartbeats fallback from
-        # ``check`` so the sorry-probe path (helper_salvage, mini_recursive
-        # preamble validation) also inherits the bumped budget. Previously
-        # this method emitted no ``set_option maxHeartbeats`` and ran at
-        # Lean's built-in 200k ceiling — sufficient for trivial probes but
-        # too tight for genuine proof-body sorry checks.
+        # Use the same default maxHeartbeats as ``check`` for sorry probes,
+        # including helper salvage and recursive preamble validation. Genuine
+        # proof bodies can require more than Lean's built-in heartbeat allowance.
         if max_heartbeats is None:
             instance_default = getattr(self, "default_max_heartbeats", None)
             if isinstance(instance_default, int) and instance_default > 0:
@@ -6994,15 +6928,9 @@ class LeanRunner:
             return error
         goal_name = f"check_{short_id(sanitized)}"
         lemma_block = "\n".join(list(lemmas or []))
-        # Same free-universe declaration as _build_file: under LSP-strict
-        # autoImplicit=false, lemma_block content like
-        # `lemma helper_x : ∀ (S : Type u), ...` requires a top-level
-        # `universe u` declaration BEFORE the lemma. Without it the
-        # whole `#check` wrapper rejects with `unknown universe level u`
-        # at the lemma definition, then `[Error pretty printing
-        # signature: incorrect number of universe levels ...]` for the
-        # `#check` itself. Live trace 2001_a1_16apr_11.jsonl: every
-        # `check_type` call on a solved synthetic lemma hit this path.
+        # Declare free universe variables before helper declarations in the
+        # ``#check`` wrapper. Under autoImplicit=false, an undeclared ``Type u``
+        # can invalidate both the helper and the type information requested from it.
         universe_scan_text = "\n".join(part for part in (lemma_block,) if part)
         universe_decl = _free_universe_decl(universe_scan_text, declared_in=preamble)
         head_universe_decl = f"{universe_decl}\n\n" if universe_decl else ""
@@ -9058,13 +8986,9 @@ private def {serializer_prefix}_contractDefeq
                 output,
                 int(execution.returncode or 0),
             )
-        # Parse diagnostics one line at a time.  The previous multiline regex
-        # began with ``.*?`` and was attempted at every output line.  Structural
-        # contract markers are very large one-line JSON values containing many
-        # colons; when even one later claim failed, backtracking across those
-        # marker lines made a 32-statement batch consume ~46 minutes of CPU in
-        # production despite a 60-second backend timeout.  Bound the diagnostic
-        # header prefix and never run it against marker lines.
+        # Parse diagnostic headers one line at a time with a bounded prefix.
+        # Large structural-contract JSON markers contain many colons and must
+        # not participate in diagnostic regex backtracking.
         diagnostic_header_re = re.compile(
             r"^.{0,4096}?:(?P<line>\d+):\d+:\s+"
             r"(?:error|warning)(?:\([^\r\n)]*\))?:"
@@ -9732,15 +9656,9 @@ private def {serializer_prefix}_contractDefeq
         base_result["error_kind"] = last_error_kind or "unknown_error"
         if last_error_text:
             base_result["error"] = last_error_text
-        # Enrich failure responses with the decl's actual type signature
-        # so the tool-loop LLM can see what the lemma really requires
-        # instead of repeatedly guessing a wrong statement. Without this
-        # enrichment, a type_mismatch is opaque: the LLM only knows its
-        # guess was wrong, not WHAT the correct signature is, so it keeps
-        # hallucinating applications (live trace 2012_a2_19apr_15.jsonl,
-        # composition rounds 2–4: 9/13 candidate failures were
-        # type_mismatch applying bridge lemmas with fabricated signatures).
-        # Only emitted on failure so the success path adds no extra probe.
+        # Include the declaration's actual type signature on failure so the
+        # model can repair an application using the lemma's real requirements.
+        # Probe only on failure; successful applications need no extra type lookup.
         decl_type = ""
         type_lookup_timeout_s, _unused_fast_fail_timeout_s = probe_timeouts()
         if type_lookup_timeout_s > 0.0:
@@ -9807,7 +9725,7 @@ private def {serializer_prefix}_contractDefeq
         """Refuse new Lean work while leaving cleanup facilities alive.
 
         First step of the manual-cancellation child-work barrier
-        (MP-FU-009): after this call no new scratch ``.lean`` file can be
+        After this call no new scratch ``.lean`` file can be
         written and no new check can start, but in-flight cleanup, kills,
         and ``aclose()`` still function. Idempotent.
 

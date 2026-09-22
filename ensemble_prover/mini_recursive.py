@@ -523,11 +523,8 @@ class MiniRecursiveConfig:
     # ``planner_escalation_client``). Bounded per driver invocation so a
     # degenerate strong model cannot burn unbounded premium spend.
     planner_escalation_max_calls: int = 3
-    # One premium logical call previously inherited infinite request/operation
-    # timeouts and the transport's multi-attempt retry policy, allowing several
-    # failed calls to run for hours with unbounded cost. Bound both concrete
-    # dispatch count and elapsed time;
-    # the premium lane remains tighter than the ordinary composite pass.
+    # Bound premium planning by both concrete dispatch count and elapsed
+    # time. Its allowance is tighter than the ordinary composite pass.
     planner_escalation_provider_max_attempts: int = 2
     planner_escalation_request_timeout_s: float = 180.0
     planner_escalation_operation_timeout_s: float = 365.0
@@ -542,11 +539,10 @@ class MiniRecursiveConfig:
     planner_operation_timeout_s: float = 600.0
     planner_composite_timeout_s: float = 600.0
     planner_fallback_reserve_s: float = 120.0
-    # MP-FU-001: reasoning-enabled deliberation phase feeding the
-    # full-effort planner execution call. The DATACLASS default stays
-    # False so raw test configs stay inert; PRODUCTION construction
-    # (mini_prover/factory) enables it by default (operator decision
-    # 2026-07-31), disable via --no-mini-planner-deliberation.
+    # Reasoning-enabled deliberation feeds the full-effort planner call.
+    # The dataclass default is False; normal construction through
+    # mini_prover/factory enables it. Disable with
+    # --no-mini-planner-deliberation.
     planner_deliberation_enabled: bool = False
     planner_deliberation_max_calls: int = 3
     # Visible JSON floor for planner request kinds. Hidden-reasoning models
@@ -1648,7 +1644,7 @@ def seed_verified_helpers(
 ) -> None:
     """Seed a child dossier with already-verified helper declarations only.
 
-    B5 fix (2026-05-11): the default behavior (``reset_graph=True``)
+    the default behavior (``reset_graph=True``)
     matches the historical contract — wipe ``dst.verified_helpers`` and
     ``dst.proof_graph`` so the child mirrors ``src``'s verified helpers
     exactly. The recursive-subgoal callsite (mini_recursive.py:393)
@@ -1665,7 +1661,7 @@ def seed_verified_helpers(
     """
 
     dst.verified_helpers = {}
-    # Fix 1 follow-up (2026-05-22): clear stale alias entries that
+    # clear stale alias entries that
     # pointed at the now-emptied verified_helpers. The re-recording
     # loop below rebuilds the map organically via record_verified_helper.
     if hasattr(dst, "verified_helper_statement_aliases"):
@@ -1716,7 +1712,7 @@ def seed_verified_helpers(
         else:
             dst.verified_helpers[item.name] = clone_verified_helper(item)
 
-    # Adversarial-review follow-up (2026-05-22):
+    #
     #   (a) Order preservation: re-recording rebuilds aliases in
     #       iteration-order of ``src.verified_helpers``. If that order
     #       differs from src's original insertion sequence (e.g., the
@@ -5033,7 +5029,7 @@ def _solution_names_in_text(text: str) -> tuple[str, ...]:
 def _materialized_solution_name_visible(preamble: str, name: str) -> bool:
     """Whether *name* has one authoritative materialized preamble definition.
 
-    Comment/string-aware (Sol audit 2026-07-29 F1): declaration-looking text
+    Comment/string-aware: declaration-looking text
     inside comments or strings never counts, and a duplicated top-level name
     is ambiguous — fail closed.
     """
@@ -5181,8 +5177,7 @@ def _visible_answer_definitions_for_planner(
 
         Qualified references match directly; unqualified references resolve
         against the owner's enclosing namespaces innermost-first, then the
-        lexical ``open`` targets in effect at the owner's declaration (Sol
-        audit 2026-07-29 R2/S3).
+        lexical ``open`` targets in effect at the owner's declaration.
         """
 
         dep = str(dep or "").strip()
@@ -5258,7 +5253,7 @@ def _visible_answer_definitions_for_planner(
                 return ""
         return ""
 
-    # Bounded transitive dependency closure (Sol audit 2026-07-29 F2): an
+    # Bounded transitive dependency closure: an
     # indirect definition like ``abbrev X_solution := officialWitness`` is
     # useless to the planner without ``officialWitness``. Walk identifiers in
     # the comment-stripped bodies to other unambiguous top-level preamble
@@ -5389,7 +5384,7 @@ def _visible_answer_definitions_for_planner(
             item,
         )
     )
-    # Sol audit 2026-07-29 R3/S4: sanitize each declaration INDIVIDUALLY
+    # sanitize each declaration INDIVIDUALLY
     # (never truncating), then pack complete sanitized blocks under ONE
     # aggregate hard limit — required solutions first, then dependencies —
     # rendering admitted blocks in topological order. Anything that does not
@@ -11790,7 +11785,7 @@ def _recursive_route_environment_hash(
 ) -> str:
     """Stable scope for durable recursive facts and failed-route memory.
 
-    The answer-visibility policy is part of the identity (RS-7 / MP-FU-007):
+    The answer-visibility policy is part of the identity:
     the planner-visible official-answer definitions are derived from the
     preamble AND these flags, so a frame persisted under one policy must not
     resume under another even when the preamble text is unchanged.
@@ -12061,7 +12056,7 @@ def _restore_contract_claim_surfaces(
                     match_index = index
                     break
         if match_index is None:
-            # Audit residual R-A (2026-07-30): even without a canonical pair,
+            # even without a canonical pair,
             # prefer an original-plan surface over keeping the incoming
             # (potentially printer-rendered) statement.
             fallback_original = next(
@@ -12085,7 +12080,7 @@ def _restore_contract_claim_surfaces(
             continue
         used.add(match_index)
         original_claim = pairs[match_index][1]
-        # MP-FU-010: the ``original_plan`` passed here already carries the
+        # the ``original_plan`` passed here already carries the
         # recovered (repaired/substituted) EXECUTABLE sources — repair and
         # substitution edit it in place before canonicalization. Restoring
         # ``original_claim`` therefore restores the recovered source too;
@@ -17379,7 +17374,7 @@ async def run_mini_recursive_attempt(
     recursive_helper_budget: int = 0,
     recursion_depth: int = 0,
     cost_controller: Any = None,
-    # Fix 3 (2026-05-22): child sessions inherit the parent's strict
+    # child sessions inherit the parent's strict
     # progress-accounting flag. Without this, the swamp pathology that
     # actually lives inside recursive decomposition chains would run
     # with strict mode off even if the parent had it on.
@@ -18010,7 +18005,7 @@ async def run_mini_recursive_attempt(
                     copied = clone_verified_helper(helper)
                     copied.support_names = support_names
                     attempt_dossier.verified_helpers[name] = copied
-            # Adversarial-review follow-up (2026-05-22): when the merge
+            # when the merge
             # repopulates verified_helpers, also lock the alias map to
             # the subgoal's authoritative direction (filtered to
             # surviving names). The merge is incremental — unlike
@@ -18838,7 +18833,7 @@ async def run_mini_recursive_attempt(
             )
             if not owned_provider_continuation and callable(summarize_suppressed):
                 summarize_suppressed()
-            # Bonus #4 fix (2026-05-08): defense-in-depth — sanitize any
+            # defense-in-depth — sanitize any
             # orphan assistant tool_calls left in the prover's transcript
             # before the refiner inherits it. Without this, an unrelated
             # crash in the prover loop could cascade into a 400 from the
@@ -20325,7 +20320,7 @@ async def run_mini_recursive_attempt(
         ]
         # When invoked as a sub-pass on an obligation (not the root), suppress
         # the root-solved write-back: the proof is for the sub-claim, not the
-        # root theorem. Adversary C verified this would corrupt the shared
+        # root theorem. Writing it back would corrupt the shared
         # parent dossier's final_proof_hash + proof_graph.root_proof.
         if not suppress_root_solved:
             already_durable_proof = _durable_root_solution_for_statement(
@@ -23360,13 +23355,10 @@ async def run_mini_recursive_driver(
                 "after_helper": after_helper,
             }
             if speculative_assembly:
-                # The newly added post-helper opportunity is intentionally a
-                # one-turn synthesis probe.  Keep the configured multi-turn
-                # budget for route-ready/certificate closes so this liveness
-                # fix does not reduce authoritative solving power. Preserve
-                # the prior five-keyword callback contract for injected/test
-                # implementations; the production callback advertises this
-                # optional governor and therefore always receives the cap.
+                # The speculative post-helper synthesis probe gets one turn.
+                # Route-ready/certificate closes retain their configured multi-turn
+                # budget. Pass the optional governor only to callbacks that declare it,
+                # preserving compatibility with the five-keyword callback contract.
                 if _callable_accepts_keyword(
                     prove_root_close,
                     "max_conversation_turns",
@@ -24983,10 +24975,9 @@ async def run_mini_recursive_driver(
                 )
 
             async def _request_plan_with(request_client: Any):
-                # A failed premium planner falls back to the main planner in
-                # this same pass. Do not silently invoke the premium
-                # deliberator again inside that fallback; that previously
-                # doubled the supposedly bounded escalation exposure.
+                # A failed premium planner falls back to the main planner in the same
+                # pass. Do not invoke premium deliberation again inside that fallback;
+                # the escalation allowance applies to the entire pass.
                 fallback_after_escalation = bool(
                     plan_client is not client and request_client is client
                 )
@@ -26065,7 +26056,7 @@ async def run_mini_recursive_driver(
                         if index < len(prior_coverage.claim_elaborated)
                         and not prior_coverage.claim_elaborated[index]
                     }
-                    # MP-FU-014: LLM-repaired statements re-run the full
+                    # LLM-repaired statements re-run the full
                     # non-contract surface gate stack (polarity, sanity,
                     # counterexample, binder), not just answer safety.
                     original_contract_plan = apply_surface_plan_filters(
@@ -26229,7 +26220,7 @@ async def run_mini_recursive_driver(
                 )
             root_assembly_substitution_statement = ""
             substitution_source_kind = ""
-            # MP-FU-010: substitute the ORIGINAL executable root shell, never
+            # substitute the ORIGINAL executable root shell, never
             # the canonicalizer's printer rendering — printer output fed back
             # through surface normalization re-elaborates with unresolved
             # metavariables (observed: ``CommMonoid (Sort ?u...)``). The
@@ -27294,7 +27285,7 @@ async def run_mini_recursive_driver(
                             ),
                         )
                         if repaired_replan != replan_original:
-                            # MP-FU-014: replan repairs get the same gates.
+                            # replan repairs get the same gates.
                             replan_original = apply_surface_plan_filters(
                                 repaired_replan,
                                 filter_stats=stats,
@@ -28004,8 +27995,8 @@ async def run_mini_recursive_driver(
                     if replan_adopted:
                         plan = replan_filtered
                         compiled_claim_count = replan_compiled_count
-                        # COMPILE-TIME semantics are intentional here (2026-07-30
-                        # self-audit): downstream route-outcome classification
+                        # COMPILE-TIME semantics are intentional here:
+                        # downstream route-outcome classification
                         # distinguishes "planner emitted a root claim that
                         # filtering disconnected" (root_assembly_filtered_or_
                         # deferred) from "planner never emitted one"
@@ -28155,7 +28146,7 @@ async def run_mini_recursive_driver(
             if plan.claims
             else "plan_rejected_after_filters"
         )
-        # MP-FU-010 item 4: an accepted plan with no executable root route is
+        # an accepted plan with no executable root route is
         # a PARTIAL plan — mark the unresolved root-assembly obligation
         # explicitly instead of reporting plain acceptance.
         executable_root_route_names = _plan_root_assembly_claim_names(
@@ -29299,13 +29290,10 @@ async def run_mini_recursive_driver(
                 and not restored_selected_plan
                 and not rehydrated_pre_plan_claims
             ):
-                # A planner can be just as degenerate by repeatedly emitting a
-                # nonempty JSON plan whose entire DAG is rejected locally.  In
-                # particular, intent-policy false positives used to reset the
-                # empty streak forever, so the strong-planner recovery could
-                # never arm.  Track this as its own stable degeneracy class;
-                # genuine environment/helper changes still change the frontier
-                # key and grant a fresh bounded recovery.
+                # Repeated nonempty plans whose entire DAG is rejected locally are a
+                # stable degeneracy class. Track them separately from empty responses
+                # so bounded recovery can activate. Genuine environment/helper changes
+                # alter the frontier key and permit a fresh recovery allowance.
                 empty_planner_fixed_point = register_empty_planner_frontier(
                     reason="all_claims_filtered"
                 )
@@ -29687,10 +29675,9 @@ async def run_mini_recursive_driver(
                 and not root_tactic_already_completed
                 and not root_close_ready
             ):
-                # Quantized MiniSession apply publishes the committed helper
-                # receipt. Speculative root-close is follow-up work on resume;
-                # doing it in this invocation can cancel before apply, as in
-                # Putnam 2006 B1.
+                # Quantized MiniSession apply publishes the committed helper receipt.
+                # Speculative root-close runs on resume so cancellation cannot
+                # interrupt this invocation before apply.
                 _record(
                     record_event,
                     {
@@ -32247,10 +32234,8 @@ def _planner_request_envelope(
 async def _resolve_planner_output_tokens(client: Any, envelope: Any) -> int:
     """Resolve a planner envelope without turning a catalog outage into a miss.
 
-    Conversation turns already fail closed when OpenRouter capability discovery
-    is down. Planner dispatch previously used a local integer cap and must keep
-    working: a catalog blip must not recreate the Aug 7 drought by skipping
-    the only planning call.
+    Planner dispatch uses a bounded local fallback when capability discovery
+    is unavailable, preserving the planning opportunity during catalog outages.
     """
 
     try:
@@ -32866,9 +32851,11 @@ def _compile_planner_response(
 
 
 def production_planner_deliberation_default() -> bool:
-    """Production default for MP-FU-001 deliberation: ON (operator decision
-    2026-07-31). Disable with ENSEMBLE_MINI_PLANNER_DELIBERATION=0. The
-    dataclass default stays False so raw test configs remain inert."""
+    """Enable deliberation by default in normal construction.
+
+    Disable with ENSEMBLE_MINI_PLANNER_DELIBERATION=0. The dataclass
+    default is False for callers that construct a raw configuration.
+    """
 
     import os
 
@@ -33227,7 +33214,7 @@ def _planner_deliberation_trigger(
     last_pass_lacked_root_route: bool,
     empty_planner_streak: int,
 ) -> str:
-    """Ledger MP-FU-001 item 3: re-deliberate only on meaningful signals."""
+    """Record re-deliberation only for meaningful signals."""
 
     if not bool(getattr(config, "planner_deliberation_enabled", False)):
         return ""
@@ -36248,8 +36235,7 @@ async def _request_plan(
                     "pass_index": pass_index,
                     "planner_elapsed_s": round(time.monotonic() - started, 3),
                     "error": f"{type(exc).__name__}: {exc}",
-                    # Capture what failed so parse failures are diagnosable
-                    # (previously the raw planner output was never logged).
+                    # Capture the raw planner output so parse failures are diagnosable.
                     "content_preview": str(content or "")[:280],
                     "finish_reason": planner_response.finish_reason,
                     "visible_content_chars": len(planner_response.content),

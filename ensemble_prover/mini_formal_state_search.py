@@ -919,7 +919,7 @@ class FormalStateSearchConfig:
     # substantive rank improvement (novelty-only churn). A much tighter
     # governor than the stall window above: a lane that never produces a
     # checkable candidate switches strategy after this many quanta instead of
-    # paying the full window (MP-FU-008). Zero explicitly disables.
+    # paying the full window. Zero explicitly disables.
     max_zero_yield_quanta: int = 2
     value_weight: float = 0.25
     novelty_weight: float = 0.15

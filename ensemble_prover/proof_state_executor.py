@@ -375,19 +375,12 @@ async def _await_serialized_lean_operation(
     try:
         completed, value = await await_with_strict_deadline(
             operation_task,
-            # Admission above reserved the complete operation capability.
-            # Reapplying the enclosing deadline here would shave lock and
-            # scheduler latency off that capability and recreate the 7-second
-            # remainder bug at a lower layer.
-            #
-            # Headroom on top: the operation was handed this same budget as
-            # its own ``timeout_s``, and only its copy reclaims -- it kills
-            # and reaps the Lean child. This guard can merely cancel and
-            # detach (``result_only`` joins for 0.005s, far short of a reap),
-            # so arming it with the identical number made a guard win discard
-            # a landing verdict and leave the child alive holding the lock.
-            # Funding and admission above are deliberately left untouched, so
-            # nothing defers that would previously have run.
+            # Admission reserves the complete operation capability. Keep that
+            # budget intact rather than subtracting enclosing scheduler/lock latency.
+            # The operation owns Lean cancellation and reaping. Give this outer
+            # guard additional headroom: it can cancel and detach but cannot reap
+            # the child, so an equal timeout could discard a completed verdict
+            # while leaving the child alive and holding the lock.
             timeout_s=outer_guard_timeout_s(admitted),
             deadline_monotonic=0.0,
             operation_label=operation_label,
@@ -4750,12 +4743,9 @@ async def _accept_proof_state_helper(
                     name,
                     preamble=_proof_state_check_preamble(conv),
                     timeout_s=operation_timeout,
-                    # Aggregate cap for the whole revalidation sweep. These are
-                    # `while pending:` over `for block in pending:` loops, so
-                    # they can run O(N^2) sequential Lean checks each funded
-                    # with the full per-check timeout. The outer strict-deadline
-                    # guard used to be the only thing bounding them, and it
-                    # bounded them by discarding the verdict.
+                    # Cap the aggregate revalidation sweep. Nested pending-block loops can
+                    # run O(N^2) sequential Lean checks, each with a full per-check timeout.
+                    # An aggregate cap bounds the work without discarding a landing verdict.
                     deadline_monotonic=time.monotonic() + float(operation_timeout),
                     true_statement="True",
                     true_proof="by\n  trivial",
@@ -4995,12 +4985,9 @@ async def _accept_proof_state_helper(
                     context,
                     preamble=_proof_state_check_preamble(conv),
                     timeout_s=operation_timeout,
-                    # Aggregate cap for the whole revalidation sweep. These are
-                    # `while pending:` over `for block in pending:` loops, so
-                    # they can run O(N^2) sequential Lean checks each funded
-                    # with the full per-check timeout. The outer strict-deadline
-                    # guard used to be the only thing bounding them, and it
-                    # bounded them by discarding the verdict.
+                    # Cap the aggregate revalidation sweep. Nested pending-block loops can
+                    # run O(N^2) sequential Lean checks, each with a full per-check timeout.
+                    # An aggregate cap bounds the work without discarding a landing verdict.
                     deadline_monotonic=time.monotonic() + float(operation_timeout),
                     true_statement="True",
                     true_proof="by\n  trivial",
@@ -7256,7 +7243,7 @@ async def _try_proof_state_parent_assembly(
                 )
             continue
         elif not readiness:
-            # E4 (2026-05-09): try open groups OR previously-failed groups
+            # try open groups OR previously-failed groups
             # whose child witnesses have changed since the last attempt.
             tryable = getattr(proof_state, "_group_tryable_for_attempt", None)
             if callable(tryable):
@@ -7274,7 +7261,7 @@ async def _try_proof_state_parent_assembly(
         ]
         if not children or any(child.status != "proved" for child in children):
             continue
-        # E4: capture the witness BEFORE attempting so a partial
+        # capture the witness BEFORE attempting so a partial
         # interrupt still records what we tried with. After the loop,
         # ``last_attempt_witness`` reflects the configuration this
         # attempt observed; future tryable() calls compare against it.
@@ -7295,14 +7282,9 @@ async def _try_proof_state_parent_assembly(
                     turn_index=turn,
                     payload={"assembly_id": group.assembly_id},
                 )
-        # E4: re-open the group if it was previously failed but a
-        # witness change made it tryable again. Status moves back to
-        # "open" so the loop's normal terminal-status updates apply.
-        # Track whether we re-opened so we can revert correctly if
-        # ``_assembly_proof_candidates`` returns nothing actionable
-        # (E4 F1 fix, adversarial review 2026-05-09). Reset
-        # ``attempt_count`` to 0 so downstream budget consumers see a
-        # fresh attempt counter for this witness (E4 F5 fix).
+        # Reopen a failed group when its witness changes. Track the reopen
+        # so a no-candidate result can restore failure state, and reset
+        # ``attempt_count`` so downstream budgets start fresh for this witness.
         was_previously_failed = group.status == "failed"
         previous_attempt_count = max(0, int(group.attempt_count or 0))
         if was_previously_failed:
@@ -7480,7 +7462,7 @@ async def _try_proof_state_parent_assembly(
                 exit_reason="parent assembly failed after child helpers proved",
             )
         else:
-            # E4 follow-up (adversarial review 2026-05-09): no proof
+            # no proof
             # candidates is still an observable assembler result. This
             # can happen after rehydration when children are marked
             # proved but lack helper names. Mark the group failed against
@@ -8428,8 +8410,7 @@ async def _run_proof_state_assembly_fixpoint(
 ) -> Tuple[bool, Optional[str], List[str], List[Dict[str, Any]]]:
     """Run parent assembly until no newly proved parent can unblock another.
 
-    E1 fix (2026-05-09): replaces the 5-pass polling loop with
-    inverse-index event-driven propagation. After a parent is proved
+    Use inverse-index event-driven propagation. After a parent is proved
     in one pass, ``ProofSearchState._assembly_parents_by_child`` is
     consulted to find every grandparent whose assembly group now lists
     that parent — including diamond patterns where the just-proved
@@ -8462,13 +8443,13 @@ async def _run_proof_state_assembly_fixpoint(
     def _next_target_ids(current_ids: Sequence[str]) -> Tuple[str, ...]:
         """Walk one step UP the dependency DAG from just-proved nodes.
 
-        Uses the E1 inverse index so a single proved child can advance
+        Uses the inverse index so a single proved child can advance
         the wave to ALL of its parents (diamond patterns). Falls back
         to the legacy ``parent_node_id`` reference ONLY when the index
         has no entry for this node — we treat the index as
         authoritative when populated, so a stale or aliased
         ``parent_node_id`` cannot inject a phantom target alongside
-        valid index hits (adversarial review fix 2026-05-09).
+        valid index hits.
         """
 
         out: List[str] = []
@@ -8497,8 +8478,7 @@ async def _run_proof_state_assembly_fixpoint(
                     out.append(legacy_parent)
         return tuple(out)
 
-    # E1: was capped at 5 (line 1098 pre-fix). Raised to a safety cap
-    # (64) so deep dependency chains close in a single fixpoint call.
+    # A safety cap of 64 lets deep dependency chains close in one fixpoint call.
     # Natural termination remains "no helpers accepted in last pass".
     safety_pass_cap = 64
     for pass_index in range(safety_pass_cap):
@@ -9436,20 +9416,11 @@ async def _try_proof_state_cache_hit(
     return "", records
 
 
-# D2 fix (2026-05-09, gate-side):
-# Adversarial review found the original D2 ad-hoc opener was placed
-# INSIDE _try_proof_state_lemma_dag_helpers, but every production caller
-# guards that function with a `not has_open_decomposition_task()`
-# precondition that returns early before invoking — making the in-
-# function fix unreachable from real runs. The proper fix is at the
-# CALL SITES: detect sorry-stub helpers BEFORE the gate, open a task
-# if any are present, then let the existing gate logic proceed.
-#
-# This module-level helper is the shared entry point. Production callers
-# (mini_prover.py twin sites, conversation_turn.py twin sites,
-# helper_only_salvage.py, lemma_dag_decompose.py) all call this BEFORE
-# their `has_open_decomposition_task()` gate. When the helper opens a
-# task, the gate now passes and the lemma-DAG path proceeds.
+# Detect sorry-stub helpers before the decomposition-task gate.
+# Callers guard ``_try_proof_state_lemma_dag_helpers`` with
+# ``not has_open_decomposition_task()``, so opening the task inside
+# that function would be unreachable. This shared entry point opens
+# needed tasks before callers evaluate their existing gate.
 def _is_sorry_stub_body(helper_block: str) -> bool:
     """Detect a single helper as a sorry-stub body.
 
@@ -9530,7 +9501,7 @@ def ensure_decomposition_task_open_for_lemma_dag_candidates(
 
     Returns a structured record so callers can distinguish "already open",
     "opened for sorry stubs", "opened for parent/root stubs", and the many
-    no-op cases that used to collapse into a misleading "task closed" trace.
+    no-op cases without conflating their causes.
     """
 
     record: Dict[str, Any] = {
@@ -9657,7 +9628,7 @@ async def _try_proof_state_lemma_dag_helpers(
         )
     else:
         tasks = proof_state.decomposition_frontier(max_nodes=1)
-    # D2 (2026-05-09, defense-in-depth): if a direct caller (tests,
+    # if a direct caller (tests,
     # future code) bypassed the gate-side opener and reaches here
     # with no open task, still open one ad hoc when sorry-stubs are
     # present. Production code paths are expected to call
@@ -10176,12 +10147,12 @@ async def _try_proof_state_lemma_dag_helpers(
             )
             _publish_batch_record("lemma_dag_parent_stub_closed")
             return accepted_helpers
-        # Phase 2 (2026-05-09): detect sorry-stub bodies to suppress the
+        # detect sorry-stub bodies to suppress the
         # failed_attempts bump on the resulting child_goal. The LLM's
         # ``:= by sorry`` is a decomposition request — registering it
         # is durable evidence; the rejection is structurally expected.
         #
-        # Adversarial review fix: real LLM output frequently uses
+        # real LLM output frequently uses
         # multi-line / commented / whitespace-irregular forms:
         #   "by\n  sorry"
         #   "by  sorry"

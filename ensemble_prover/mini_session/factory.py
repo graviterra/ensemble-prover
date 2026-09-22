@@ -1439,7 +1439,7 @@ def _clone_dossier_for_session(supplied: ProofDossier) -> ProofDossier:
         )
         or {}
     )
-    # Fix 1 follow-up (2026-05-22): mirror the alias propagation that
+    # mirror the alias propagation that
     # ``_copy_dossier_contents`` does on the return path. Without
     # seeding the session-scoped dossier with the parent's alias map,
     # the now-symmetric writeback would actively *overwrite* the
@@ -2046,14 +2046,14 @@ def build_session_for_prove_problem(
     mini_phase_temperatures: Optional[Any] = None,
     proof_cache_override: Optional[MiniVerifiedLemmaCache] = None,
     session_scope: str = "problem",
-    # Phase 2 (2026-05-09) — recursive helper prover.
+    # recursive helper prover.
     recursive_helper_prover_enabled: bool = False,
     recursive_helper_budget: int = 0,
     recursive_helper_max_depth: int = 3,
     recursive_helper_max_attempts_per_node: int = 2,
     recursive_helper_turns: int = 5,
     recursive_helper_refine: bool = False,
-    # Fix 3 (2026-05-22) — strict-progress accounting feature flag.
+    # strict-progress accounting feature flag.
     # When True, ``outcome.metadata["strong_progress"]`` is required for a
     # progress=True outcome to reset the stagnation counter; soft-only
     # progress accumulates a streak that ticks stagnation once saturated.
@@ -2176,19 +2176,11 @@ def build_session_for_prove_problem(
             problem_text=problem_text,
         )
     else:
-        # Adversarial-review fix #5 (2026-05-08): mirror legacy
-        # ``sample_dossier`` isolation (mini_prover.py:5918-5934). When the
-        # caller supplies a dossier, the session previously mutated it
-        # directly — speculative graph nodes from failed attempts,
-        # failed_attempts counters, and projection nodes from
-        # ``sync_to_graph`` would persist in the caller's dossier even
-        # after rollback or session failure. Clone the supplied dossier
-        # into an isolated session-scoped workspace and seed the verified
-        # helpers from the original. Callers that want to absorb wins
-        # back into their dossier do so explicitly via
-        # ``seed_verified_helpers`` (or similar) after the session
-        # completes; the session itself never mutates state across the
-        # isolation boundary.
+        # Clone the supplied dossier into an isolated session workspace and
+        # seed its verified helpers. Speculative nodes, attempt counters, and
+        # graph projections must not leak into the caller on failure or rollback.
+        # Callers explicitly merge accepted results back, for example with
+        # ``seed_verified_helpers``, after the session completes.
         supplied = dossier
         dossier = _clone_dossier_for_session(supplied)
     dossier.opaque_mode = bool(opaque_mode)
@@ -2279,7 +2271,7 @@ def build_session_for_prove_problem(
         + 5  # safety headroom
     )
 
-    # Build the prove-role Conversation up front. M2 uses one conversation
+    # Build the prove-role Conversation up front. The session uses one conversation
     # for the whole session; the refine-role action (when registered)
     # mutates ``conv.role`` before invoking the typed conversation-turn
     # pipeline, mirroring the legacy transcript semantics.
@@ -2399,30 +2391,11 @@ def build_session_for_prove_problem(
             repair_semantics=_REPAIR_CONTINUATION,
         )
 
-    # Construct ``ProofSearchState`` and attach to the session
-    # (closes the M2 deferral). Without this, ``MiniSession.select_next_action``
-    # never enters the frontier-first branch (session.py:162 gates on
-    # ``proof_state is not None``), and every frontier-mappable action
-    # (``child_closure``, ``lemma_dag_decompose``, ``inter_turn_assembly``)
-    # registers but stays unfireable. Inside ``ConversationTurnAction``,
-    # proof-state-mediated recovery (``_run_pre_lean_lemma_dag_decomposition``,
-    # child closures, salvaged-helper assembly) silently skips when
-    # ``proof_state`` is None, leaving the session with only LLM-driven
-    # conv_turn cycles. Mirrors legacy mini_prover.py:5935-5950.
-    #
-    # Adversarial-review fix (2026-05-08): single fence around the whole
-    # block. The prior version wrapped only ``reconcile_with_dossier``
-    # and ``sync_to_graph``, so:
-    #   (a) ``from_graph(...)`` was OUTSIDE the guard — its failure
-    #       would crash the session build despite the "defensive"
-    #       wrapping suggesting otherwise.
-    #   (b) ``reconcile_with_dossier`` raising MID-LOOP would leave the
-    #       proof_state half-mutated, then ``sync_to_graph`` would run
-    #       on that partial state and write inconsistencies to the
-    #       graph.
-    # Both are addressed by a single try/except that either produces a
-    # fully-initialized proof_state OR falls back to None and emits a
-    # recorder event so the failure is visible.
+    # Construct and attach ProofSearchState so frontier-first dispatch
+    # and proof-state recovery can run. Guard initialization, reconciliation,
+    # and graph synchronization together: either attach a fully initialized
+    # state or fall back to None and emit a recorder event. Partial
+    # reconciliation must not write inconsistent state to the graph.
     proof_state: Optional[Any] = None
     proof_state_init_error: Optional[str] = None
     if proof_state_engine_enabled:
@@ -2917,16 +2890,11 @@ def build_session_for_prove_problem(
         )
 
     if graph_recursive_cfg is not None:
-        # Graph-native recursive decomposition for ``mine_missing_obligation``
-        # and ``route_replan`` work items. Verified blocker (2026-05-18): the
-        # mini-recursive failure path emits obligation/replan frontier items
-        # that have no recursive-decomposition consumer in the default
-        # pipeline — ``GraphNativeShortcutAction`` only matches against
-        # already-verified helpers, and the conversation-turn fallback
-        # re-invokes the same flat-LLM loop that just failed. This action
-        # invokes ``run_mini_recursive_attempt`` on the obligation's smaller
-        # statement and writes back via ``mark_obligation_proved_by_helper``.
-        # Depth, cycle, and budget guards are inside the action.
+        # Route ``mine_missing_obligation`` and ``route_replan`` work to recursive
+        # decomposition. Existing verified helpers remain eligible for the shortcut
+        # path; otherwise this action invokes ``run_mini_recursive_attempt`` on the
+        # smaller obligation and writes back via ``mark_obligation_proved_by_helper``.
+        # The action enforces depth, cycle, and budget guards.
         session.register(
             GraphRecursiveDecomposeAction(
                 config=graph_recursive_cfg,
@@ -3078,7 +3046,7 @@ def build_session_for_prove_problem(
         )
         session.fallback_action_ids.add("adaptive_recursive_fallback")
 
-    # ---- M4 subactions ----------------------------------------------
+    # ---- subactions ----------------------------------------------
     # Register helper-only-salvage / inter-turn assembly actions BEFORE
     # ConversationTurnAction so the host action can dispatch them via
     # ``session.dispatch_subaction`` and the outer loop's frontier-first
@@ -3150,8 +3118,8 @@ def build_session_for_prove_problem(
         # Frontier-mappable workhorses also registered for the outer
         # loop's _map_work_item_to_action: ProofStateRetrievalAction,
         # ChildClosureAction, and
-        # LemmaDagDecomposeAction. M2 already registers them implicitly
-        # via the cascade; M4 makes them explicit on the session so the
+        # LemmaDagDecomposeAction. They are reachable implicitly
+        # via the cascade and are registered on the session so the
         # frontier-first selector can dispatch them.
         # ``proof_state_retrieval`` precedes root repair in the scheduler's
         # static prepass set, so it is opt-in: ``repair_retrieval_enabled``
@@ -3210,17 +3178,14 @@ def build_session_for_prove_problem(
             "lemma_dag_decompose",
             ActionBudget(
                 max_invocations=max(1, int(max_prove_turns or 1)),
-                # Parent-stub decomposition can hand off to the mandatory
-                # 300-second typed-residual verifier. An unrelated 120-second
-                # cumulative action cap used to cancel that hard operation
-                # before it could publish its receipt. Invocation count bounds
-                # this lane; verifier operations retain their own generous,
-                # recoverable deadlines.
+                # Parent-stub decomposition can hand off to the 300-second typed
+                # residual verifier. Bound this lane by invocation count while letting
+                # verifier operations retain their own recoverable deadlines.
                 max_total_seconds=0.0,
             ),
         )
 
-    # Phase 2 (2026-05-09): RecursiveHelperProverAction. Registered when
+    # RecursiveHelperProverAction. Registered when
     # the caller opts in; the CLI operational profile now supplies that opt-in
     # by default. Priority 35 — before conv_turn=50.
     # Depth bound enforced by the action's is_applicable + the
@@ -3246,7 +3211,7 @@ def build_session_for_prove_problem(
                 max_total_seconds=0.0,
             ),
         )
-        # Phase 2: propagate the depth cap to the session so the
+        # propagate the depth cap to the session so the
         # give-up nudge fires the depth-aware framing in child
         # sessions.
         raw_max_depth = recursive_helper_max_depth
@@ -3395,10 +3360,9 @@ def _is_complex_for_m2(
     parallel_samples: int,
     opaque_mode: bool,
 ) -> Tuple[bool, str]:
-    """Historical M2 detector retained for compatibility with old tests/tools.
+    """Compatibility detector for existing external callers.
 
-    M5 no longer uses this to delegate; container cases are handled by
-    ``prove_problem_via_session`` below.
+    Container cases are handled by ``prove_problem_via_session`` below.
     """
 
     if int(parallel_samples or 0) > 1:
@@ -5127,7 +5091,7 @@ async def prove_problem_via_session(
                         )
                         or ("sample" if sample_count > 1 else "problem")
                     ),
-                    # Fix 3 (2026-05-22): turn on strict-progress accounting
+                    # turn on strict-progress accounting
                     # for the production prove path. Soft-only progress
                     # (bogus contradiction-route helpers, statement-duplicate
                     # helpers from the 1962_a5 5×Icc→range cascade) no
@@ -5283,7 +5247,7 @@ async def prove_problem_via_session(
                         trace_prefix,
                         f"proof-state cache: merge warning: {error}",
                     )
-            # B3 fix (2026-05-11): surface store failures alongside
+            # surface store failures alongside
             # merge failures (parallel to mini_prover.py's summary).
             store_failures = int(getattr(base_cache, "total_store_failures", 0) or 0)
             if store_failures:

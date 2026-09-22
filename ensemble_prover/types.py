@@ -39,15 +39,13 @@ def redact_internal_obligation_handles(text: str) -> str:
     return _INTERNAL_OBLIGATION_HANDLE_RE.sub("<internal-obligation>", cleaned)
 
 
-# ── Proof signals (replaces string-encoded control flow in output) ────
+# ── Typed proof control signals ─────────────────────────────────────
 
 
 class ProofSignal(enum.Enum):
     """Typed control signals carried by ProofResult.
 
-    Replaces ad-hoc ``output.startswith("REPLAN_REQUESTED:")`` /
-    ``output.startswith("self_reference:")`` string checks with an enum
-    that can be pattern-matched and exhaustively audited.
+    Use enum matching for control flow independently of output text.
     """
 
     NONE = "none"
@@ -870,9 +868,8 @@ class ResourceLimits:
 class BudgetContext:
     """Immutable per-phase cost budget.
 
-    Replaces the mutable ``_cost_ceiling_usd`` scalar that was shared across
-    search and formalization phases.  Each phase constructs its own context;
-    no shared mutable ceiling state.
+    Search and formalization phases each construct their own context
+    without sharing a mutable cost ceiling.
 
     Fields:
         ceiling_usd:       Maximum USD spend allowed in this phase (0 = unlimited).
@@ -912,7 +909,7 @@ class ComplexityState:
     policy: Optional[MasterPolicy] = None
     candidates_adj: int = 0
     refine_adj: int = 0
-    # E4: dimension-informed adjustments from delta analysis
+    # dimension-informed adjustments from delta analysis
     temperature_adj: float = 0.0  # LLM temperature delta (clamped ±0.15)
     retrieval_boost: float = 0.0  # Retrieval min_score adjustment (clamped ±0.1)
     best_strategy: str = ""  # Recommended strategy tag from delta analysis
@@ -1575,27 +1572,17 @@ class CompiledScaffoldSlot:
     proof: str = ""
     failure_fingerprints: List[str] = field(default_factory=list)
     attempt_count: int = 0
-    # Closure-gap A3 (deeper fix): preserve the full Lean failure
-    # preview (not the 64-char fingerprint) from the most recent failed
-    # attempt on this slot. ``failure_fingerprints`` are short hashes
-    # used as predicates ("did we have a plan_locked_exhausted failure
-    # before?"); the deeper structural fix is to also carry the
-    # actionable Lean output forward so the refiner / repair prompts
-    # can surface PRIOR failure context, not just the current attempt's
-    # error. Populated at the executor's failure-record point;
-    # consumed by ``_plan_locked_refine_tactic`` and other prompt
-    # builders when ``attempt_count > 0``.
+    # Preserve the full Lean failure preview from the most recent failed
+    # attempt on this slot. Short ``failure_fingerprints`` support history
+    # predicates; the full output gives repair/refiner prompts actionable
+    # prior context. The executor records it and prompt builders such as
+    # ``_plan_locked_refine_tactic`` consume it after an attempt.
     last_failure_preview: str = ""
-    # Number of local hypotheses Lean lifted into the slot's target as
-    # leading Pi-binders (e.g. when `have h : T := by refine ?_` precedes
-    # this slot's hole, `h` is lifted into the goal as `∀ h : T, body`).
-    # When stitching the standalone proof back into the scaffold's have-
-    # binding, the proof must be specialized via `(proof) _ _ ... _` with
-    # `local_argc` underscores. Without this, the substituted proof has
-    # the wrong intro count and `introN` fails — see live trace
-    # 2001_a1_16apr_14.jsonl: slot_2 solved standalone, refresh failed
-    # with compile_stopped because proof was stitched raw with
-    # local_argc=0 hardcoded. Propagated from RootContractHole.local_argc.
+    # Count local hypotheses lifted into the slot target as leading Pi-binders.
+    # For example, ``have h : T := by refine ?_`` can give the hole a target
+    # ``∀ h : T, body``. When stitching a standalone proof back into the
+    # scaffold, specialize it with ``local_argc`` underscores so its binders
+    # match the surrounding context. Propagated from RootContractHole.local_argc.
     local_argc: int = 0
     # Planner-proposed Lean tactic (``by <tactics>``) that closes this slot's
     # target. Propagated from ``ValidatedSubgoal.proof_plan`` when the
@@ -2113,13 +2100,9 @@ class CompositionSummary:
 
 @dataclass
 class CompositionSetup:
-    """Phase 2a setup bundle for ``_attempt_composition_outcome``.
+    """Setup bundle for ``_attempt_composition_outcome``.
 
-    Populated by ``Orchestrator._build_composition_setup`` — an
-    intentionally pure/read-only helper that lifts the opening 70-ish
-    lines of ``_attempt_composition_outcome`` into a single call. See
-    architecture_mapping_for_analysis/proof_graph_first_refactor_plan_2026-04-23.md
-    §4 Phase 2a.
+    Populated by the read-only ``Orchestrator._build_composition_setup`` helper.
 
     Notes:
     - ``selected_prover_client`` holds a live client handle. Code must
@@ -2554,7 +2537,7 @@ class RootIntegrationState:
     failure_counts_by_support: Dict[str, int] = field(default_factory=dict)
     exhausted_support_controller_keys: set[str] = field(default_factory=set)
     exhausted_support_fingerprints: set[str] = field(default_factory=set)
-    # Phase 5 Blocker 2 — granular per-support exhaustion counter.
+    # Granular per-support exhaustion counter.
     # The binary set above tells the legacy retrigger "is this support
     # currently cooled off?"; the count tells the three-lane arbiter
     # "how many times has this support already been focus-scheduled?"
@@ -2573,10 +2556,8 @@ class RootIntegrationState:
 class SearchSession:
     """Explicit mutable state for run_tree_search().
 
-    Replaces implicit closure capture and nonlocal variables with a single
-    dataclass that is threaded through all closures.  Every field that was
-    previously a ``nonlocal`` or a captured mutable in ``run_tree_search()``
-    is declared here, making the state surface auditable and testable.
+    Pass this dataclass through the search closures so mutable fields and
+    their ownership remain explicit.
     """
 
     # ── Identity ──────────────────────────────────────────────────────
@@ -2586,7 +2567,7 @@ class SearchSession:
     # ``[x:T]`` / ``⦃x:T⦄``) are auto-bound by the elaborator; the LLM,
     # reading raw text, counts them as explicit and over-extends
     # ``intro`` chains. ``make_forall_binders_explicit`` (utils.py:3067)
-    # rewrites them to ``(x:T)``. See worklogs/2026-04-24_intro_binder_rewrite_fix.log.
+    # rewrites them to ``(x:T)``.
     # Kept SEPARATE from ``statement`` because the rewrite mutates the
     # theorem type in Lean 4 — only prompt surfaces use this form;
     # verification, cache keys, proven-lemma index, and lemma lookup

@@ -187,7 +187,7 @@ class ProofTree:
         Failed nodes can be revisited if their attempt count is below
         max_failed_attempts (useful when context/lemmas evolve).
 
-        T2#5 root fix (2026-04-28): SOLVED nodes are also excluded from the
+        SOLVED nodes are also excluded from the
         live-children filter. Without this exclusion, a SOLVED leaf with
         q=1.0 dominates PUCT selection after its first visit (siblings drop
         to q+explore < 1.0 once visited), causing the simulation budget to
@@ -210,7 +210,7 @@ class ProofTree:
                 and (c.status != NodeStatus.FAILED or c.attempts < max_failed_attempts)
             ]
             if not live:
-                # T2#5 amendment (2026-04-28): the empty-live branch fires
+                # the empty-live branch fires
                 # when ALL children are DEAD/SOLVED/FAILED-exhausted. The
                 # parent's status depends on which: if any child SOLVED,
                 # the decomposition succeeded → parent is SOLVED-by-children

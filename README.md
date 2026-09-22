@@ -199,7 +199,7 @@ troubleshooting, and the public Mini CLI option map.
 ## Requirements
 
 - Linux
-- Standard CPython 3.11 or 3.12 (release audited on both)
+- Standard CPython 3.11 or 3.12
 - Lean toolchain compatible with the target Lake project
 - An API key for the selected provider, or a ChatGPT Codex / Claude Code
   subscription sign-in for Mini's prover and refiner
@@ -213,8 +213,7 @@ The public runtime snapshot pins the complete dependency closure for four core
 Python packages in `requirements.txt`: HTTP transport, graph search,
 environment loading, and YAML parsing. Numerical acceleration, learned
 retrieval, provider-specific tokenization, and native SMT bindings are optional
-features and are not installed by default. The development worktree may retain
-a broader research environment than the public snapshot.
+features and are not installed by default.
 
 ## Setup
 
@@ -413,10 +412,8 @@ standalone formalization; that separate command's requests are outside the
 research cap. New ledgers use schema 7; schemas 1–6 require an explicit upgrade.
 Migration preserves providers, budgets, and saved schema-6 closed-loop settings;
 it does not authorize strategy recovery on existing ledgers.
-Three offline scripted/fake-Codex trajectories have exercised real Lean checks;
-they are integration tests, not a discovery-performance benchmark. There is no
-established autonomous discovery success rate. Recovery workers can search
-Crossref metadata, fetch public primary sources, and inspect original PDF pages;
+There is no established autonomous discovery success rate. Recovery workers can
+search Crossref metadata, fetch public primary sources, and inspect original PDF pages;
 these tools do not provide comprehensive literature coverage.
 See the [research
 walkthrough](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research) and

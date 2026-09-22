@@ -715,7 +715,7 @@ async def prove_helper_in_subsession(
         target_statement: the Lean type signature to prove.
         max_turns: max_prove_turns budget for the sub-conversation.
         refine_enabled: when True, also runs a refine pass (dormant by
-            default per Phase 2 design).
+            default).
         trace_label: prefix for trace lines (e.g. "[helper-recursion d1]").
         max_elapsed_s: total wall-clock allowance for this nested action.
         action_deadline_epoch_s: durable absolute deadline owned by the
@@ -740,7 +740,7 @@ async def prove_helper_in_subsession(
         - ``verdict``: one of "ran" | "empty_target" |
           "depth_cap_exceeded" | "parent_session_required".
 
-    Adversarial review fixes (2026-05-09):
+    Child-session invariants:
         - Defensive guards: parent_session/dossier/conv None.
         - Empty target_statement validated up front.
         - Depth-cap enforced inside (defense-in-depth, even though
@@ -775,7 +775,7 @@ async def prove_helper_in_subsession(
     from .actions.recursive_helper_prover import RecursiveHelperProverAction
     from .actions.tactic_close import RootTacticCloseAction
 
-    # Defensive guards (LOW from review).
+    # Defensive guards.
     if parent_session is None:
         return False, None, {
             "verdict": "parent_session_required",
@@ -1053,7 +1053,7 @@ async def prove_helper_in_subsession(
     nested_decomposition_allowed = False
 
     # --- Build the child dossier seeded with parent's verified helpers ---
-    # MED-3 fix (2026-05-09): seed via record_verified_helper so each
+    # seed via record_verified_helper so each
     # seeded helper goes through the answer-unsafe filter
     # (is_answer_unsafe_helper_source) and gets a graph node. Direct
     # clone_verified_helper assignment to the dict skipped the filter,
@@ -1063,7 +1063,7 @@ async def prove_helper_in_subsession(
     _parent_root_statement = str(
         getattr(parent_dossier, "root_statement", "") or ""
     )
-    # D2 guard (adversarial-review 2026-05-13): if the helper target IS
+    # if the helper target IS
     # the parent root (degenerate extraction), drop the orientation
     # context to avoid contradicting instructions ("goal is the parent
     # root" + "do not prove the parent root").
@@ -1237,7 +1237,7 @@ async def prove_helper_in_subsession(
             parent_helper_items
         ):
             # Skip helpers whose name matches the child's theorem (would
-            # cause Lean dup-decl rejection — adversarial review LOW-MED).
+            # cause Lean dup-decl rejection).
             if name == helper_name:
                 continue
             if str(name or "").strip() in target_dependent_names:
@@ -2079,7 +2079,7 @@ async def prove_helper_in_subsession(
     # Defense-in-depth: sanitize orphan tool_calls before driving the
     # child loop. The parent's prover may have left an unconsumed
     # assistant tool_calls entry in conv.history; the child's first
-    # OpenAI call would 400 on that. (Bonus #4 carried forward.)
+    # OpenAI call would 400 on that.
     sanitize_orphan = getattr(child_conv, "sanitize_orphan_tool_calls", None)
     if callable(sanitize_orphan):
         try:
@@ -2384,14 +2384,10 @@ async def prove_helper_in_subsession(
                 getattr(child_session, "last_giveup_match", "") or ""
             )
 
-    # --- Merge child verified helpers back into parent ---
-    # HIGH fix (2026-05-09): route merge through record_verified_helper
-    # so the answer-unsafe filter applies and proof_graph stays
-    # consistent. Direct dict assignment (the prior approach) bypassed
-    # both. Skip the proposed_name ``helper_name`` so the parent's
-    # subsequent recheck path can see it as "not yet in dossier" and
-    # adjudicate fresh (the action's CRITICAL ordering depends on
-    # this).
+    # Merge through record_verified_helper so the answer-unsafe filter
+    # applies and the proof graph stays consistent. Skip the proposed
+    # helper_name: the parent must independently recheck that candidate
+    # before it enters the parent's verified-helper registry.
     if publication_guard is not None:
         publication_guard()
     merge_eligible_child_verified_helpers()

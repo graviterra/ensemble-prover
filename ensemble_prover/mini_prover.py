@@ -1162,14 +1162,11 @@ class Conversation:
     # Active repair-turn state. This is intentionally scoped to the latest
     # Lean-feedback repair, not the full conversation lifetime.
     rejected_code_fragments: List[str] = field(default_factory=list)
-    # Lean's unsolved-goal targets from the latest repair feedback. Stored
-    # separately from ``rejected_code_fragments`` (2026-05-13 regression
-    # fix): these are pending-goal expressions, not LLM-written code, and
-    # are gated by a narrow sorry-helper-repackaging detector — NOT the
-    # strict identifier-bounded gate that ``rejected_code_fragments`` uses.
-    # Banning the bare goal expression context-free (e.g. ``∃``) would
-    # ban any honest existential proof; the narrow gate only catches the
-    # specific abuse it was designed for.
+    # Lean's unsolved-goal targets are pending expressions, not rejected
+    # LLM-written code. Keep them separate from ``rejected_code_fragments``
+    # and apply the narrow sorry-helper-repackaging gate. The strict
+    # identifier-bounded gate would ban legitimate goal expressions such
+    # as ``∃`` from all subsequent proofs.
     transient_goal_targets: List[str] = field(default_factory=list)
     repair_self_check_active: bool = False
     opaque_mode: bool = True
@@ -2120,24 +2117,13 @@ class Conversation:
         repair_semantics: Optional[str] = None,
         repair_payload: Optional[Dict[str, Sequence[str]]] = None,
     ) -> Dict[str, Any]:
-        # CRITICAL: bootstrap before appending so the initial user message
-        # (problem statement + Lean preamble + no-leak placeholder note) is
-        # always present in history. Without this, ``messages_for_llm``'s
-        # bootstrap path is bypassed (since history is no longer empty
-        # after the first append) and the model would see only the
-        # post-bootstrap user messages — missing the actual problem.
-        # Mirrors ``append_assistant``'s pattern.
+        # Bootstrap before appending so the initial user message, including
+        # the problem and Lean preamble, remains present in history. Mirrors
+        # ``append_assistant``; otherwise ``messages_for_llm`` skips bootstrap.
         #
-        # Repair-state (rejected_code_fragments / transient_goal_targets /
-        # repair_self_check_active) is NOT cached on the instance any more
-        # — readers derive it from ``self.history`` via
-        # ``_repair_feedback_texts_in_current_cycle`` (B1-B4 structural fix,
-        # 2026-05-18 audit). The previous cache-write branches here suffered
-        # asymmetric updates (Branch B), survived history mutations
-        # (compaction, history reset, role transition), and could poison
-        # gates against content the LLM could no longer see in its
-        # transcript. Deriving from history removes the staleness vector
-        # entirely.
+        # Repair state is derived from ``self.history`` via
+        # ``_repair_feedback_texts_in_current_cycle`` so compaction, resets,
+        # and role transitions cannot leave stale policy-gate inputs.
         if (
             repair_semantics is None
             and _repair_feedback_messages_in_current_cycle(self)
@@ -2206,7 +2192,7 @@ class Conversation:
         """No-op kept for backward compatibility with external callers.
 
         Repair-state is derived from ``conv.history`` by readers via
-        ``_repair_feedback_texts_in_current_cycle`` (B1-B4 fix, 2026-05-18).
+        ``_repair_feedback_texts_in_current_cycle``.
         There is no cached state to clear; mutating history (or simply
         appending a non-repair user message) ends the repair cycle as the
         invariant requires.
@@ -2219,23 +2205,12 @@ class Conversation:
     def sanitize_orphan_tool_calls(self) -> int:
         """Repair historical assistant/tool exchanges before replay.
 
-        This appends synthetic ``tool`` results for orphan assistant
-        ``tool_calls`` and uniquifies duplicate call ids within one exchange so
-        the transcript stays well-formed for the next
-        OpenAI call.
-
-        Bonus #4 fix (2026-05-08): the per-tc try/except added by B1 closes
-        the orphan window inside ``run_conversation``'s main loop, but the
-        recursive controller hands ``subgoal_conv`` to a refiner *after*
-        the prover may have crashed somewhere outside the audited path
-        (e.g. a future tool runner not yet wrapped, an exception on a
-        pre-call helper that bypasses B1's wrapper, or a transcript built
-        by an older code path). This sanitizer is defense-in-depth: it
-        scans ``history`` and ensures every advertised ``tool_call_id``
-        on an assistant message has a matching ``tool`` message before
-        the NEXT assistant turn. Orphans get a synthetic tool message
-        explaining the missing result so OpenAI returns 200 instead of
-        a 400 ``tool_call_id has no corresponding tool message``.
+        Append synthetic ``tool`` results for orphan assistant ``tool_calls``
+        and uniquify duplicate call IDs within an exchange. Per-call exception
+        handling protects live dispatch; replay also needs this check when a
+        crash interrupted another path or a transcript comes from an older
+        implementation. Every advertised tool call must have a result before
+        the next assistant turn.
 
         Returns the number of transcript repairs applied.
         """
@@ -5138,9 +5113,9 @@ async def _run_apply_decl_to_goal_tool_impl(
             }
         )
     if dossier is not None:
-        # Bonus #1 fix (2026-05-08): isolate the dossier write so a
+        # isolate the dossier write so a
         # graph-corruption / I/O / record-shape error here cannot escape
-        # past this function. The B1 dispatcher try/except would catch
+        # past this function. The tool dispatcher try/except would catch
         # it, but the synthesized "Tool runner error" message would lose
         # the Lean-derived result the model needs (proof_stub, remaining
         # goals, decl type). Trace the dossier failure but keep rendering
@@ -6715,7 +6690,7 @@ async def run_conversation(
                 _bind_provider_continuation_policy_receipt(assistant_message, conv)
                 conv.history.append(assistant_message)
                 # Execute each retained call and append the tool result.
-                # B1 fix (2026-05-08): each per-tc dispatch is wrapped in
+                # each per-tc dispatch is wrapped in
                 # its own try/except so a runner exception cannot leave an
                 # ``assistant`` tool-calls message without a matching
                 # ``tool`` message for every advertised tool_call_id. The
@@ -7747,7 +7722,7 @@ async def run_conversation(
                 except Exception:
                     durable_submission_evidence = False
                 if durable_submission_evidence:
-                    # Sol audit 2026-07-29 F3: rewrite the status so a later
+                    # rewrite the status so a later
                     # GENUINE Lean failure cannot be reclassified from the
                     # stale "no_try_lean_call" back into a policy refusal.
                     # attempted stays False — no tool ran this turn.
@@ -8096,15 +8071,9 @@ async def run_conversation(
                 "mini_preamble_redeclarations_dropped",
                 len(preamble_redeclarations_dropped),
             )
-        # Bonus #7 fix (2026-05-08): hoist the lemma-DAG candidate
-        # extraction so both downstream branches (no-proof at :3517 and
-        # proof-extracted at :4028) share ONE extraction. Two sites
-        # previously called ``_extract_lemma_dag_helper_declarations``
-        # independently — only one ran per turn (they're mutually
-        # exclusive on ``proof is None``), but the source duplication
-        # was a maintenance hazard and meant any future signature
-        # change had to be made in two places. Memoizing also opens the
-        # door to the observability trace below.
+        # Extract lemma-DAG candidates once and share them between the
+        # no-proof and proof-extracted branches. The shared result also
+        # supplies extraction telemetry.
         _lemma_dag_extracted_from_content = (
             _extract_lemma_dag_helper_declarations(
                 content,
@@ -8545,7 +8514,7 @@ async def run_conversation(
             conv,
             reuse_scan_text,
         )
-        # Narrow companion gate (2026-05-13 round-2 fix): detect
+        # Narrow companion gate: detect
         # goal-as-sorry-helper repackaging WITHOUT banning the goal
         # expression context-free, AND without merging into
         # ``reused_rejected_fragments`` — that merge routed the goal
@@ -8558,13 +8527,9 @@ async def run_conversation(
             reuse_scan_text,
         )
         if reused_rejected_fragments or repackaged_goal_targets:
-            # Bank any proposed helpers BEFORE rejecting (Claim 1 banking
-            # ordering fix): the no_proof_extracted path at line ~7000
-            # is unreachable from here because we ``continue`` below.
-            # Helpers proposed in a turn that the policy gate rejects
-            # still encode the prover's decomposition signal, so they
-            # belong in the dossier so the planner can seed claims from
-            # them on the next phase.
+            # Bank proposed helpers before rejecting so the decomposition signal
+            # survives. The no_proof_extracted path is unreachable after the
+            # continue below; the planner still needs these helpers on its next pass.
             _banked = _bank_helpers_as_proposed(
                 dossier,
                 helpers,
@@ -8577,7 +8542,7 @@ async def run_conversation(
             # rejection-reason tags and feedback formatters so the
             # narrow-gate hits don't poison ``rejected_code_fragments``
             # via the strict-fragment feedback formatter on the next
-            # round-trip (the round-2 regression Agent A surfaced).
+            # round-trip.
             primary_reason = (
                 "reused_rejected_lean_fragment"
                 if reused_rejected_fragments
@@ -8798,7 +8763,7 @@ async def run_conversation(
                     })
                 continue
             lemma_dag_helpers: List[str] = []
-            # Bonus #7 fix: reuse the memoized extraction from the top of
+            # reuse the memoized extraction from the top of
             # the per-turn block instead of re-running it here.
             lemma_dag_candidate_helpers = helpers or _lemma_dag_extracted_from_content
             root_equivalent_names = _root_equivalent_sorry_stub_helper_names_from_blocks(
@@ -8851,7 +8816,7 @@ async def run_conversation(
                 )
                 continue
 
-            # D2 gate-side fix (2026-05-09): if the LLM emitted sorry-stub
+            # if the LLM emitted sorry-stub
             # helpers (decomposition request), open a task ad hoc so the
             # subsequent gate passes and helpers materialize as child_goals.
             # See ensure_decomposition_task_open_for_sorry_stubs docstring.
@@ -9479,7 +9444,7 @@ async def run_conversation(
                 # extractor recovers when the primary extractor missed
                 # them. Without this, no_proof turns whose helpers were
                 # extracted only via the lemma-DAG fallback would not
-                # be banked. (Adversarial-review 2026-05-13.)
+                # be banked.
                 bankable_sources = list(helpers or ())
                 if not bankable_sources:
                     bankable_sources = list(lemma_dag_candidate_helpers or ())
@@ -9739,11 +9704,11 @@ async def run_conversation(
             )
             continue
 
-        # Bonus #7 fix: reuse the memoized extraction from the top of
+        # reuse the memoized extraction from the top of
         # the per-turn block (the proof-extracted branch shares the
         # same content as the no-proof branch above).
         lemma_dag_candidate_helpers = helpers or _lemma_dag_extracted_from_content
-        # D2 gate-side fix (2026-05-09): open task if sorry-stub helpers
+        # open task if sorry-stub helpers
         # are present so the lemma-DAG path proceeds.
         if (
             lemma_dag_candidate_helpers
@@ -10512,7 +10477,7 @@ async def run_conversation(
                         return True, state_proof
                 root_tactic = None
                 if helper_probe_candidates > 0:
-                    # B3 fix (2026-05-08): see helper-only-reply path above.
+                    # see helper-only-reply path above.
                     # The post-failure salvage cascade must use the same
                     # preamble as the proof-state assembly arm.
                     helper_blocks = _root_tactic_helper_blocks_for_names(
@@ -11152,7 +11117,7 @@ async def prove_problem(
     run_wall_clock_budget_s: Optional[float] = None,
     no_strong_progress_budget_s: Optional[float] = None,
     default_profile: str = "operational",
-    # Phase 2 (2026-05-09) — recursive helper prover.
+    # recursive helper prover.
     recursive_helper_prover_enabled: Optional[bool] = None,
     recursive_helper_budget: int = 0,
     recursive_helper_max_depth: int = 3,
@@ -12935,8 +12900,9 @@ def _build_argparser() -> argparse.ArgumentParser:
             "different policies per role. Each run records the resolved config "
             "at startup in run_config and prints a 'Reasoning controls: ...' "
             "line before long LLM work.\n"
-            "  reasoning_output_tokens=0 on successful usage records confirms "
-            "the provider reported no hidden reasoning tokens.\n"
+            "  reasoning_output_tokens=0 can mean the provider omitted the "
+            "reasoning breakdown; it does not by itself confirm that no "
+            "hidden reasoning occurred.\n"
             "LLM deadline policy:\n"
             "  The default --llm-deadline-policy soft is patient for "
             "OpenRouter/long-reasoning calls: phase/retry deadlines do not "
@@ -14143,7 +14109,7 @@ def _build_argparser() -> argparse.ArgumentParser:
             "critical transactional liveness leases remain supervisor-enforced."
         ),
     )
-    # ----- Phase 2: recursive helper prover ---------------------------
+    # ----- recursive helper prover ---------------------------
     # Spawns a child MiniSession to prove ONE open child_goal helper
     # via a bounded LLM sub-conversation, after the deterministic
     # actions (tactic swarm, retrieval) have already attacked it.
@@ -14317,7 +14283,7 @@ def _install_cooperative_stop_signal_handlers(
     cancel_all_tasks: bool = False,
     hard_stop_timeout_s: float = 0.0,
 ) -> Callable[[], None]:
-    """MP-FU-009: convert a delivered stop signal into cooperative shutdown.
+    """Convert a delivered stop signal into cooperative shutdown.
 
     The first signal routes the run through ordinary CancelledError teardown:
     cancellation barrier, terminal summary, session-cancelled cutpoint, and
@@ -14842,7 +14808,7 @@ async def _run_cancellation_barrier(
     drain_timeout_s: float = 5.0,
     close_timeout_s: float = 10.0,
 ) -> Dict[str, Any]:
-    """MP-FU-009: stop child work BEFORE the event stream closes.
+    """Stop child work BEFORE the event stream closes.
 
     Order matters: (1) refuse new Lean admissions so no fresh scratch file or
     subprocess can start, (2) join detached deadline tasks so cancellation-
@@ -15355,7 +15321,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             },
         )
         lean = LeanRunner(lean_cfg)
-        # 2026-05-22: lift Lean's maxHeartbeats default for the run so
+        # lift Lean's maxHeartbeats default for the run so
         # tsum-heavy elaboration (e.g. putnam_1978_b2) has enough
         # kernel-step budget. LeanRunner.check() reads this attribute
         # when callers don't supply max_heartbeats explicitly.
@@ -17012,7 +16978,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                     **_mini_solved_export_status("not_attempted"),
                     "mini_solved_export_downgrades_solved": 0,
                 }
-                # MP-FU-009: join child work (Lean subprocess trees, detached
+                # join child work (Lean subprocess trees, detached
                 # deadline tasks, theory workers) BEFORE the terminal summary
                 # is written and the event stream closes. The report is part
                 # of that terminal record; failure here must never block the

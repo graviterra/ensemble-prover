@@ -338,7 +338,7 @@ class LemmaIndex:
 def _fingerprint_files(paths: Iterable[Path]) -> str:
     h = hashlib.sha256()
     count = 0
-    # L8 fix: sort by path string so fingerprint is filesystem-order-independent.
+    # sort by path string so fingerprint is filesystem-order-independent.
     for p in sorted(paths, key=lambda x: str(x)):
         try:
             st = p.stat()
@@ -1904,7 +1904,7 @@ class LemmaRetriever:
             if self._cross_encoder_is_llm
             else ("cpu" if self._cross_encoder_force_cpu_fallback else "layerwise")
         )
-        # L7 fix: use \0 separator to avoid collisions when query contains newlines.
+        # use \0 separator to avoid collisions when query contains newlines.
         payload = (mode + "\0" + query + "\0" + entry.name + "\0" + entry.type).encode(
             "utf-8"
         )

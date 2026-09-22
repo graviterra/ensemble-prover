@@ -74,7 +74,7 @@ _GENERIC_QUERY_TOKENS = {
 _IDENTIFIER_QUERY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_'.]*$")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_'.]+")
 _LEAN_SYMBOL_RE = re.compile(r"->|=>|:=|[∀∃∑→↔=<>≤≥∈∉⊆∣∧∨¬⊢≠]")
-# D3 fix (2026-05-08): map Lean operator symbols to stable token names so
+# map Lean operator symbols to stable token names so
 # BM25 retrieval can match operator semantics, not just identifiers. Tokens
 # are namespaced with leading + trailing double underscore so they cannot
 # collide with any valid Lean identifier (which forbids leading double

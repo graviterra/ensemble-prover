@@ -264,7 +264,5 @@ Recovery workers and reviewers can search Crossref metadata, fetch public source
 and inspect original PDF pages. Coverage is not comprehensive; unavailable or
 uninspected sources remain unknown. Other current limits include no learned
 portfolio allocator, cross-run method library, distributed execution, or empirical
-discovery-performance claim. Three offline scripted/fake-Codex trajectories exercise real Lean
-verification and feedback; these are integration tests, not discovery-performance
-benchmarks. Optional computation has separate isolation tests. Paid model
+discovery-performance claim. Paid model
 benchmarks require separate authorization.

@@ -471,7 +471,7 @@ def _openai_chat_tools_require_reasoning_effort_none(
 ) -> bool:
     """Whether this family rejects function tools unless effort is 'none'.
 
-    Live falsification (2026-07-29, gpt-5.6-terra): ``/v1/chat/completions``
+    For this model family, ``/v1/chat/completions``
     returns HTTP 400 "Function tools with reasoning_effort are not supported
     ... use /v1/responses or set reasoning_effort to 'none'" whenever tools
     are present and the effective effort is anything but the explicit string
@@ -489,7 +489,7 @@ def _openai_chat_tools_require_reasoning_effort_none(
 def _openai_chat_stop_unsupported(base_url: str, model: str) -> bool:
     """Whether this family rejects the ``stop`` parameter outright.
 
-    Observed on gpt-5.6 (live, 2026-07-29): "Unsupported parameter: 'stop'
+    The model returns: "Unsupported parameter: 'stop'
     is not supported with this model." Pre-negotiate instead of paying one
     deterministic 400 before the removed-stop compatibility retry heals it.
     """
@@ -1077,8 +1077,8 @@ def _openrouter_reasoning_mandatory_model(model: str) -> bool:
     """Known routed endpoints that reject explicit reasoning disablement."""
 
     name = str(model or "").strip().lower().rsplit("/", 1)[-1]
-    # Verified live against OpenRouter: qwen3.8-max (2026-08-03) and
-    # gpt-oss-120b (2026-08-16) return HTTP 400 "Reasoning is mandatory for
+    # On OpenRouter, qwen3.8-max and
+    # gpt-oss-120b return HTTP 400 "Reasoning is mandatory for
     # this endpoint" for reasoning.enabled=false.
     return name.startswith("qwen3.8-max") or _gpt_oss_120b_model(model)
 
@@ -3532,7 +3532,7 @@ class OpenAICompatClient:
                         # Static DeepSeek v4 contract omits supports_disable.
                         # Visibility recovery still has to send enabled=false
                         # or a discarded receipt (int cap + effort none)
-                        # raises before HTTP, as on Putnam 1978 A2 215944.
+                        # raises before HTTP.
                         # Match the leaf family, not only the alias allowlist:
                         # OpenRouter may rewrite ~flash-latest to a dated id.
                         control = {"enabled": False}
@@ -4001,7 +4001,7 @@ class OpenAICompatClient:
                 if bool(
                     getattr(self.cfg, "reasoning_control_required", False)
                 ):
-                    # Sol audit 2026-07-29 F5: an explicitly REQUIRED
+                    # an explicitly REQUIRED
                     # reasoning level must never be silently reinterpreted as
                     # 'none'. Internal tool-phase effort requests downgrade
                     # below; a configuration-level requirement fails closed
@@ -4319,7 +4319,7 @@ class OpenAICompatClient:
                     if bool(
                         getattr(self.cfg, "reasoning_control_required", False)
                     ):
-                        # Sol audit 2026-07-29 F5/R1: never silently downgrade
+                        # never silently downgrade
                         # an explicitly required reasoning level to 'none'.
                         # CACHE the discovered constraint first, so the next
                         # call on this client fails closed BEFORE dispatch
@@ -5844,13 +5844,12 @@ class OpenAICompatClient:
                 "reasoning_capability_record": {},
             }
         )
-        # Bounded self-heal for provider parameter drift (audit residual R-C):
+        # Bounded self-heal for provider parameter drift:
         # ``tool_choice`` and the optional encrypted-reasoning include may be
         # dropped on an explicit unsupported-parameter 400.
-        # ``reasoning`` is the point of this path (silently dropping it would
-        # reintroduce the F5 downgrade), and dropping ``max_output_tokens``
-        # would uncap billing — both surface instead, with the provider error
-        # message preserved in artifacts.
+        # ``reasoning`` must remain enabled, and ``max_output_tokens`` must
+        # continue to cap billing. Unsupported values for either surface the
+        # provider error, with its message preserved in artifacts.
         resp: Optional[httpx.Response] = None
         for _context_attempt in range(2):
             request_messages = _sanitize_request_messages(

@@ -280,9 +280,6 @@ Python cannot forcibly stop arbitrary blocking threads or synchronous code.
 
 ## Evidence and limits
 
-This implementation has scripted control-flow tests, adversarial replay/restart
-and network tests, separate-process Codex attachment tests, and actual Lean tests
-for original-target identity and final export. These establish implementation
-behavior. They do not establish a measured improvement in autonomous theorem
-solving. Independent model reviews can still
-be wrong; their allocation decisions are scoped, auditable, and appealable.
+A measured improvement in autonomous theorem solving has not been established.
+Independent model reviews can still be wrong; their allocation decisions are
+scoped, auditable, and appealable.

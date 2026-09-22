@@ -1451,10 +1451,10 @@ class GraphRecursiveDecomposeAction:
             )
             return False
         statement_key = self._statement_key(statement)
-        # B-HIGH (Adversary C): if a proved helper already matches the
+        # if a proved helper already matches the
         # obligation statement, cede to ``graph_native_shortcut`` — it can
         # close the obligation instantly without spending a sub-pass.
-        # B-LOW (Adversary B-2): filter tombstones; otherwise we'd cede to a
+        # filter tombstones; otherwise we'd cede to a
         # shortcut that the shortcut itself would skip, deadlocking the
         # obligation.
         matcher = getattr(graph, "_proved_helper_for_statement", None)
@@ -2262,7 +2262,7 @@ class GraphRecursiveDecomposeAction:
                 soft_progress_streak_cap=int(
                     getattr(session, "max_soft_progress_streak", 4) or 0
                 ),
-                # B-CRIT (Adversary C): suppress root-solved write-back —
+                # suppress root-solved write-back —
                 # the proof is for the obligation sub-claim, not the root.
                 suppress_root_solved=True,
                 progress_callback=publish_subpass_progress,
@@ -2571,7 +2571,7 @@ class GraphRecursiveDecomposeAction:
             sub_pass_interrupted = True
             raise
         except Exception as exc:
-            # B-CRIT (Adversary B): exception out of the sub-pass must NOT
+            # exception out of the sub-pass must NOT
             # break the MiniOutcome contract. Capture, treat as failure.
             sub_pass_exception = exc
         finally:
@@ -2757,7 +2757,7 @@ class GraphRecursiveDecomposeAction:
             # no mathematical work. Reopen this exact sub-pass while the
             # scheduler durably backs off the selected frontier action.
             session.graph_recursive_decompose_remaining = remaining_before
-        # B-HIGH (Adversary B): ok=True with empty proof must NOT write back —
+        # ok=True with empty proof must NOT write back —
         # would mark obligation proved with empty source_hash and cascade to
         # phantom replan resolution.
         if success and not proof_text:

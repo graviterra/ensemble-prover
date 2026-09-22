@@ -20,15 +20,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOP_K: int = 8
 _MAX_TYPE_CHARS: int = 240
 _MAX_OBSERVATION_TERMS: int = 5
-# Mathlib entry kinds that are useful to surface as "premise candidates"
-# the model might cite in a proof. Instances are typeclass plumbing —
-# almost never what the model wants — and defs are usually too low-level
-# (e.g., ``Mathlib.Tactic.ITauto.whenOk``). Live evidence from
-# putnam_1988_b2 retrieval at 2026-05-01: the unfiltered top-8 included
-# two ``(instance)`` declarations from manifold and measure-regularity
-# files, and an ITauto def — none of which a polynomial-inequality
-# proof can use. Filtering to just theorems and lemmas removes the
-# noise floor.
+# Surface theorems and lemmas as premise candidates. Instances provide
+# typeclass plumbing and low-level definitions are rarely useful proof steps.
 _ALLOWED_KINDS: frozenset = frozenset({"theorem", "lemma"})
 # Over-fetch from the searcher so post-hoc filtering still leaves
 # enough useful results to fill ``top_k``. With the unfiltered top-8

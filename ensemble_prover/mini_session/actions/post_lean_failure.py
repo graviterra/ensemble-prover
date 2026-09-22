@@ -235,9 +235,9 @@ class PostLeanFailureAction:
             turn=phase_turn,
             max_turns=max_turns,
             role=getattr(session.conv, "role", "prove"),
-            # Code review fix (2026-05-09): plumb llm_output + opaque_mode
+            # plumb llm_output + opaque_mode
             # so the give-up gate fires on this subaction path too. Without
-            # this, the M4 subaction dispatch silently skips the
+            # this, the subaction dispatch silently skips the
             # decomposition redirect.
             llm_output=str(getattr(session, "last_llm_content", "") or ""),
             opaque_mode=bool(getattr(session.conv, "opaque_mode", True)),
@@ -252,7 +252,7 @@ class PostLeanFailureAction:
             allow_helper_decomposition=bool(
                 getattr(session.conv, "allow_helper_decomposition", True)
             ),
-            # Phase 2 (2026-05-09): plumb recursion depth for depth-aware nudge.
+            # plumb recursion depth for depth-aware nudge.
             recursion_depth=int(getattr(session, "recursion_depth", 0) or 0),
             max_recursion_depth=int(
                 getattr(session, "max_recursion_depth", 3)
@@ -270,8 +270,7 @@ class PostLeanFailureAction:
                 "conv_turn_index_absolute": conv_turn_absolute,
             },
         )
-        # Stash the result for observers (e.g., downstream tests, M5+
-        # validation harness reads this).
+        # Stash the result so downstream observers can inspect it.
         session.last_post_failure_result = cascade
 
         # Append cascade feedback to conv if we did not solve.

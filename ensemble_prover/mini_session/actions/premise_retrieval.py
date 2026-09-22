@@ -564,7 +564,7 @@ class PremiseRetrievalAction:
             )
         cost = time.monotonic() - started
         # Stash the rendered block on the session so the
-        # ConversationTurnAction (M1.5) can include it in the LLM prompt.
+        # ConversationTurnAction can include it in the LLM prompt.
         if action_deadline_exhausted() and not hits:
             # No hits to publish and the clock is spent: mark the one-shot done.
             # When hits DO exist we fall through and publish them below rather

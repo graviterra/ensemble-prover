@@ -100,7 +100,7 @@ for mutations and a consistent read snapshot for reports. Assignments fence
 history and assessment tokens as well as revisions, including new evidence that
 arrives without a statement change.
 
-## Validation targets
+## Behavioral requirements
 
 - Reopen a ledger without losing exact source bytes, evidence or review history.
 - Reject malformed input, cycles, missing dependencies and stale publications.
@@ -113,11 +113,6 @@ arrives without a statement change.
   assessments.
 - Generate bounded assignments with exact context, prior failures, an owned
   output, quantitative checks and permission to report a gap or counterexample.
-- Exercise the CLI lifecycle without providers or Lean, then run affected
-  existing tests to confirm package isolation.
-- Exercise research → formalization → Mini → independently checked export →
-  feedback against real Lean with scripted/fake-Codex responses. Three tested
-  trajectories validate integration; they do not measure discovery performance.
 - Reject stale bindings, modified exports, missing receipts, and manual kernel
   reports as proof authority; enforce shared admission at nested dispatches.
 

@@ -132,20 +132,11 @@ _ERROR_SUGGESTIONS = {
 # ---------------------------------------------------------------------------
 # Domain-specific error pattern detection
 # ---------------------------------------------------------------------------
-# These patterns scan Lean diagnostics for specific failure reasons and
-# provide precise, actionable guidance that the generic _ERROR_SUGGESTIONS
-# cannot.  Order matters: first match wins.
-#
-# 2026-04-28 fix: patterns are SINGLE-LINE within a diagnostic message
-# (no ``re.DOTALL``; ``.*`` replaced with ``[^\n]*``) and the scanner iterates
-# ``parsed.diagnostics`` per-message rather than the unbounded raw blob. The
-# previous DOTALL+unanchored design bridged source-code echo (e.g.,
-# ``field_simp [h]`` shown by Lean's CLI) to unrelated "failed" tokens in
-# later diagnostics, mis-firing the denominator-nonzero hint on type
-# mismatches, parse errors, and unsolved-goal failures. cache.jsonl evidence:
-# 25/137 field_simp records mis-fired the original pattern (e.g., "field_simp
-# made no progress" — a simp_no_progress failure — got the
-# establish-nonzeroness hint).
+# Scan Lean diagnostics for specific failure reasons and provide precise
+# guidance that the generic _ERROR_SUGGESTIONS cannot. First match wins.
+# Patterns are single-line within each diagnostic message. Scanning per
+# message prevents source-code echoes such as ``field_simp [h]`` from
+# matching unrelated failure text in later diagnostics.
 
 # Each entry: (branch_name, compiled_regex, suggestion_text). The branch name
 # is exposed via ``StructuredFeedback.domain_suggestion_branch`` so live
@@ -245,8 +236,8 @@ def helper_inventory_hint_for_unknown_identifier(
     if not name or not name.startswith("mini_") or dossier is None:
         return None
 
-    # Prefer the deduped LLM-facing view; fall back if the dossier predates
-    # Fix 1 (e.g., a SimpleNamespace stub).
+    # Prefer the deduplicated LLM-facing view; fall back for dossiers
+    # that do not expose it (e.g., a SimpleNamespace stub).
     blocks_getter = getattr(
         dossier, "verified_helper_blocks_unique_by_statement", None
     ) or getattr(dossier, "verified_helper_blocks", None)
@@ -257,10 +248,8 @@ def helper_inventory_hint_for_unknown_identifier(
     except Exception:
         return None
 
-    # Call the canonical parser instead of duplicating regex logic. This
-    # avoids the capability regression observed during adversarial review
-    # (multiple `@[...]` attribute clauses were silently dropped by the
-    # previous inline regex).
+    # Call the canonical parser so multiple ``@[...]`` attribute clauses
+    # are preserved when extracting declarations.
     from .proof_dossier import helper_decl_name
 
     helper_names: List[str] = []
@@ -424,7 +413,7 @@ def build_structured_feedback(
     suggestion, domain_branch = _detect_domain_suggestion(parsed, raw_output)
     if not suggestion:
         suggestion = _ERROR_SUGGESTIONS.get(error_type, "")
-        # T2#7 root fix (2026-04-28): the priority classifier returns ONE
+        # the priority classifier returns ONE
         # error_type. When `tactic_failed` and `unsolved_goals` co-occur
         # (cache.jsonl evidence: ~735/15,811 records), the LLM gets only the
         # tactic_failed advice, missing the "address each remaining goal"
@@ -486,7 +475,7 @@ def build_structured_feedback(
         details.append(f"Failed tactic: {parsed.failed_tactic}")
     if parsed.unknown_identifier_name:
         details.append(f"Unknown identifier: {parsed.unknown_identifier_name}")
-        # Fix 2 (2026-05-22): when the LLM cites a hallucinated mini_*
+        # when the LLM cites a hallucinated mini_*
         # helper, append the actual verified-helper inventory so the next
         # turn can self-correct. This prevents repeated hallucinated-helper
         # cascades observed in long repair sessions.

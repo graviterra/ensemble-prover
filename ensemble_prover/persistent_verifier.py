@@ -742,9 +742,8 @@ class PersistentVerifierPool:
     def __init__(self, cfg: LeanConfig):
         self.cfg = cfg
         self.project_dir = Path(cfg.project_dir).resolve()
-        # Main worker count: used to be `worker_count`. Kept under
-        # that name for backward compatibility with stats callers
-        # and existing tests that set pool.worker_count directly.
+        # Retain worker_count as the main-worker count for compatibility with
+        # callers that read statistics or configure the pool directly.
         self.main_worker_count = max(1, int(cfg.persistent_workers or 1))
         # Oracle sub-pool: reserved for requests tagged with
         # queue_class="oracle" (tactic oracle calls like exact?/apply?)
@@ -921,15 +920,10 @@ class PersistentVerifierPool:
         # mode) goes back to main, and an oracle worker always goes
         # back to oracle.
         target_queue = self._target_queue_for(worker)
-        # Explicit ownership flag — the previous implementation gated
-        # worker re-queue on worker.state == "idle" in a finally block,
-        # which was unsafe: any cleanup path that left the state as
-        # something other than "idle" (cancellation → "poisoned",
-        # restart-in-progress → "starting", etc.) permanently lost the
-        # worker from the pool. With persistent_workers=1, a single
-        # cancellation would drain the pool forever and every
-        # subsequent request would wait persistent_worker_start_timeout_s
-        # before falling back to REPL.
+        # Track pool ownership separately from worker state. Cancellation or
+        # restart can leave a worker poisoned or starting; either state still
+        # requires explicit cleanup and eventual requeue/replacement. Otherwise
+        # a single-worker pool could lose its only worker and stall later requests.
         worker_owned = True
 
         try:
@@ -968,7 +962,7 @@ class PersistentVerifierPool:
         except asyncio.CancelledError as cancel_exc:
             # Worker.execute's own cancellation handler has already
             # killed the subprocess and marked the worker as poisoned
-            # (see PersistentVerifierWorker.execute — Fix 4). We must
+            # (see PersistentVerifierWorker.execute). We must
             # restart the worker (fresh subprocess) rather than re-queue the
             # poisoned one. Run the restart in its own task so a second
             # cancellation of this caller cannot orphan the worker.

@@ -1428,7 +1428,7 @@ def make_score_fn(
         prior = node.prior * weight_prior
 
         # Ensemble prediction.
-        # Phase 2A: blend statement-domain and proof-domain models.
+        # blend statement-domain and proof-domain models.
         ens = 0.0
         if ensemble is not None and node.tactic:
             try:
@@ -1613,12 +1613,10 @@ async def _evaluate_tactic_candidate(
         if not hard_timeout_writeback_allowed():
             return None, None
         stats["lean_checks"] += 1
-        # Legacy orchestration adapters predate goal-feature scoring and may
-        # return ``None`` in the feature slot.  Search used to tolerate that
-        # for completed candidates, but durable checkpointing serializes
-        # every transition and solved node.  Normalize before the cache/WAL
-        # receipt so scoring, persistence, and exact resume share one complete
-        # representation.  Passing the parse result retains diagnostic flags.
+        # Legacy orchestration adapters may return None for goal features.
+        # Normalize before cache/WAL publication so scoring, persistence, and
+        # exact resume share a complete representation for every transition
+        # and solved node. Pass the parse result to retain diagnostic flags.
         features = normalized_features(features, goals, parse_result)
         state = CachedGoalState(
             goals=goals,
@@ -1691,7 +1689,7 @@ async def _evaluate_tactic_candidate(
             child.composite_score = 1.0
             tree.backpropagate(child.node_id, 1.0)
             stats["nodes_created"] += 1
-            # Phase 2A: tactic-level feedback for solved proof.
+            # tactic-level feedback for solved proof.
             if feedback_fn is not None:
                 try:
                     feedback_fn(tree.statement, tactic, True, "", 0)
@@ -1763,7 +1761,7 @@ async def _evaluate_tactic_candidate(
             child.dead_end_reason = "unknown_identifier"
         else:
             child.dead_end_reason = "tactic_failed"
-        # Phase 2A: tactic-level feedback for failures.
+        # tactic-level feedback for failures.
         if feedback_fn is not None:
             try:
                 feedback_fn(
@@ -1780,7 +1778,7 @@ async def _evaluate_tactic_candidate(
     if goal_explosion_penalty and features.goal_count > parent.features.goal_count + 1:
         child.prior *= 0.3
 
-    # Phase 2A: tactic-level feedback for successful child creation.
+    # tactic-level feedback for successful child creation.
     if feedback_fn is not None:
         try:
             feedback_fn(tree.statement, tactic, None, "", features.goal_count)
@@ -2358,11 +2356,9 @@ async def tactic_tree_beam_search(
         beam_ids = {item.node_id for item in beam}
         recovery_ids = {item.node_id for item in recovery}
         for retry_parent in retry_parents:
-            # Infrastructure retry owners are not mathematical backtracking.
-            # Keep them in the separately scheduled recovery lane even when
-            # backtracking is disabled. Appending them directly to the beam
-            # bypassed ``beam_width`` and inflated a configured four-wide B2
-            # search to 117 concurrent retry owners.
+            # Infrastructure retry owners use the separately scheduled recovery
+            # lane even when mathematical backtracking is disabled. Appending
+            # them directly to the beam would bypass ``beam_width``.
             reserve = [
                 item for item in reserve if item.node_id != retry_parent.node_id
             ]

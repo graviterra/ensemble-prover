@@ -2582,7 +2582,7 @@ def _run_cli_worker_in_dedicated_supervisor(
                 if parent_state == b"":
                     violation = "watchdog_supervisor_parent_lost"
                     break
-            # MP-FU-009 cooperative stop: forward the first termination
+            # cooperative stop: forward the first termination
             # signal to the worker as SIGTERM so it can run its
             # cancellation barrier and author its own terminal summary.
             # The SIGSTOP/SIGKILL sweep remains the bounded backstop.
@@ -2799,8 +2799,8 @@ def _wait_for_supervisor(proc: Any, *, max_interrupts: int = 5) -> int:
     CPython's ``subprocess.run`` kills its child on ANY exception — including
     the KeyboardInterrupt the parent shares with the supervisor's own SIGINT.
     That race could orphan the worker (own session, dead subreaper) with no
-    summary and no reaper: the exact late-child-work failure MP-FU-009
-    closes. The supervisor owns teardown; the parent just keeps waiting. If
+    summary and no reaper. The supervisor owns teardown; the parent keeps
+    waiting. If
     the user keeps interrupting, the parent eventually stops waiting WITHOUT
     killing the supervisor — parent exit closes ``parent_watch_fd``, and the
     supervisor's parent-lost path sweeps the worker tree.
@@ -2917,7 +2917,7 @@ def _dedicated_supervisor_main(argv: Sequence[str]) -> int:
         cooperative_stop_signals: list = []
 
         def terminate_supervisor(signum: int, _frame: Any) -> None:
-            # First signal: request a cooperative worker stop (MP-FU-009);
+            # First signal: request a cooperative worker stop;
             # the poll loop forwards SIGTERM and starts the bounded grace.
             # A repeat signal escalates to the immediate freeze-and-kill
             # sweep, and further repeats are ignored while it runs.

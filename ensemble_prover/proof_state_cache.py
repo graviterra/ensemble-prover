@@ -367,8 +367,26 @@ def _find_forbidden_lean_command(helpers: List[str], proof: str) -> Optional[str
 
 
 def _split_top_level_chunks(src: str) -> Tuple[str, List[str]]:
+    from .mini_lean_extract import _find_top_level_assign
+    from .lean_syntax import lean_expression_delimiters_balanced
+
     scan_src = _strip_lean_comments_and_strings(src)
-    matches = list(_TOP_LEVEL_HEADER_RE.finditer(scan_src))
+    matches: List[re.Match[str]] = []
+    for match in _TOP_LEVEL_HEADER_RE.finditer(scan_src):
+        if match.group(1) == "by" and matches and matches[-1].group(1) != "by":
+            previous = matches[-1]
+            prefix = scan_src[previous.start():match.start()]
+            separator = _find_top_level_assign(prefix)
+            if separator >= 0:
+                body = prefix[separator:]
+                nested = match.start(1) - match.start() > previous.start(1) - previous.start()
+                if not body.strip() or nested or not lean_expression_delimiters_balanced(body):
+                    # A parenthesized/indented proof term belongs to its
+                    # declaration, including the isolated body returned by
+                    # the scratch verifier. Keep other declaration matches:
+                    # an indented second theorem is still a second command.
+                    continue
+        matches.append(match)
     if not matches:
         return src.strip(), []
     leading = src[: matches[0].start()].strip()
@@ -431,7 +449,7 @@ def _cached_semantic_record_analysis(
 class MiniVerifiedLemmaCache:
     """Persistent cache for kernel-checked proof-state helper declarations.
 
-    Two-tier in-memory index (2026-05-08, Gap 2 fix):
+    Two-tier in-memory index:
 
     - **Tier 1** (``_by_exact_key``) — keyed by ``(canonical_stmt_hash, preamble_hash)``.
       Fast path for same-preamble rehydration: when a problem is re-attempted
@@ -474,7 +492,7 @@ class MiniVerifiedLemmaCache:
     normalization became Lean-lexer-aware.  Earlier keys collapsed whitespace
     inside strings, raw strings, character literals, and quoted identifiers,
     allowing different executable propositions to share a cache bucket.
-    Schema migration (2026-08-19).  A bump must not silently zero the cache:
+    Schema migration.  A bump must not silently zero the cache:
     every dropped row is a helper the Lean kernel already verified and would
     have to prove again.  ``_record_ingest_keys`` therefore admits every row at
     or below the current version and re-derives its identity keys
@@ -594,17 +612,11 @@ class MiniVerifiedLemmaCache:
         self.total_ingest_field_rejected = 0
         self.total_ingest_owner_deduped = 0
         self._ingest_metrics_published: Dict[str, int] = {}
-        # B3 fix (2026-05-11): observability for ``store`` failures.
-        # ``store`` previously swallowed IO exceptions silently and
-        # returned ``False``; the five callers (mini_prover, helper_only_salvage,
-        # proof_state_executor) discard the bool. A failed store leaves the
-        # helper durable in the dossier+graph but ABSENT from the on-disk
-        # cache JSONL — breaking the cross-problem Tier-2 reuse that
-        # ``_by_canonical_statement`` enables. Mirroring the
-        # ``last_merge_errors`` pattern lets the summary writer surface
-        # this drift in run.log/summary.json without changing caller
-        # semantics. Capped to ``_STORE_ERROR_RETENTION`` to bound
-        # memory under pathological failure loops.
+        # Retain store errors so summaries can report helpers that remain in
+        # the dossier/graph but could not enter the persistent cross-problem
+        # cache. ``last_store_errors`` complements ``last_merge_errors`` without
+        # requiring callers to consume the store return value. Bound retained
+        # details with ``_STORE_ERROR_RETENTION``.
         self.last_store_errors: List[str] = []
         # Total uncapped count complements the 64-entry list. The list
         # gives diagnostic detail (last N error strings); this counter
@@ -1832,7 +1844,7 @@ class MiniVerifiedLemmaCache:
             finally:
                 self._release_path_lock(lock_file)
         except Exception as exc:
-            # B3 fix (2026-05-11): record the failure observably so the
+            # record the failure observably so the
             # summary writer can surface it. Without this trace, callers
             # who ignore the False return (all 5 production sites) would
             # silently lose cross-problem cache reuse for this helper.
@@ -2108,8 +2120,7 @@ class MiniVerifiedLemmaCache:
         hit-aware per-tier caps (8 / 64). The Tier 2 cap is higher because a
         popular canonical statement may have been proven under many
         problem-specific preambles; capping at 8 silently evicts
-        cross-problem witnesses (defect surfaced by adversarial review,
-        2026-05-08). Hot entries are retained by lookup count with recency
+        cross-problem witnesses. Hot entries are retained by lookup count with recency
         as the tie-breaker, so a useful cross-problem witness is not displaced
         by a stream of cold variants."""
 
@@ -2885,10 +2896,20 @@ def _proof_state_helper_policy_rejection(
     source = str(helper_block or "").strip()
     if not source:
         return "empty_helper"
-    forbidden = _find_forbidden_lean_command([source], "by\n  trivial")
+    # Generated local opens scope the entire checked declaration. Inspect its
+    # inner command for policy purposes while retaining the exact scoped source
+    # for storage and Lean replay; an unscoped environment command stays banned.
+    from .proof_graph import _SCOPED_OPEN_DECL_PREFIX_RE
+
+    masked = _strip_lean_comments_and_strings(source)
+    declaration_offset = 0
+    while scoped_open := _SCOPED_OPEN_DECL_PREFIX_RE.match(masked[declaration_offset:]):
+        declaration_offset += scoped_open.end()
+    policy_source = source[declaration_offset:]
+    forbidden = _find_forbidden_lean_command([policy_source], "by\n  trivial")
     if forbidden is not None:
         return f"forbidden_lean_command:{forbidden}"
-    leading, chunks = _split_top_level_chunks(source)
+    leading, chunks = _split_top_level_chunks(policy_source)
     if leading.strip() or len(chunks) != 1:
         return "not_single_helper_declaration"
     sanitized_chunk = _strip_lean_comments_and_strings(chunks[0])
@@ -2908,7 +2929,7 @@ def _proof_state_helper_policy_rejection(
         right = _normalize_cache_statement(expected_statement)
         if left != right:
             return "statement_mismatch"
-    stripped_source = _strip_lean_comments_and_strings(source).strip()
+    stripped_source = _strip_lean_comments_and_strings(policy_source).strip()
     stripped_chunk = _strip_lean_comments_and_strings(chunks[0]).strip()
     if stripped_source != stripped_chunk:
         return "not_single_helper_declaration"

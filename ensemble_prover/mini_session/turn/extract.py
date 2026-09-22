@@ -25,7 +25,7 @@ def _legacy_imports():
     """Lazy import of the legacy extraction primitives.
 
     Keeps mini_prover.py decoupled from the mini_session subpackage at
-    module load time. M6 may inline these once mini_prover.py shrinks.
+    module load time.
     """
 
     from ensemble_prover.mini_prover import (
@@ -108,26 +108,11 @@ def _usable_lemma_dag_candidates(
     theorem_name: str = "",
     suppress_solution_placeholders: bool = True,
 ) -> List[str]:
-    """Return helper declarations that can sensibly feed lemma-DAG routing.
+    """Return helpers suitable for lemma-DAG routing.
 
-    M3 documentation note (2026-05-08): legacy ``run_conversation``
-    passed helpers verbatim to the lemma-DAG path. This filter is an
-    INTENTIONAL deviation from a faithful port — it drops two classes
-    of helper that legacy would have processed and inevitably failed
-    on:
-
-    1. **Same-name-as-theorem helpers.** The LLM occasionally restates
-       the theorem itself as a helper. Lemma-DAG decomposition always
-       fails on this (the helper IS the goal) and wastes the slot.
-
-    2. **Empty-body ``:=`` stubs.** A helper of shape ``theorem h : P :=``
-       with no body is a sorry-stub — Lean rejects every variant.
-
-    Both classes are caught later by the salvage Lean check anyway, so
-    legacy behavior is observably equivalent except for slightly less
-    wasted Lean time. The filter is documented here so reviewers know
-    it's not a port mistake. Disable by replacing the call site if a
-    diagnostic comparison run wants raw legacy behavior.
+    Skip helpers named after the root theorem, which merely restate the goal,
+    and empty-body ``:=`` stubs, which provide no proof body. Filtering these
+    before the salvage Lean check avoids spending a decomposition slot on them.
     """
 
     out: List[str] = []
@@ -187,6 +172,7 @@ def _same_target_decl_proof_metadata(
     first-class telemetry for the normalized declaration shape instead of
     making dashboards infer it from generic proof/no-proof verdicts.
     """
+    from ensemble_prover.mini_lean_extract import _extract_single_decl_body
 
     proof_text = " ".join(str(proof or "").split())
     if not proof_text:
@@ -205,7 +191,7 @@ def _same_target_decl_proof_metadata(
     matches: List[dict[str, object]] = []
     for chunk_index, chunk in enumerate(chunks):
         text = str(chunk or "").strip()
-        body = helper_decl_body(text)
+        body = _extract_single_decl_body(text)
         if not body:
             continue
         name = helper_decl_name(text) or ""
@@ -316,7 +302,7 @@ def extract_helpers_and_proof(
             )
         ]
 
-    # Memoize lemma-DAG candidates ONCE (Bonus #7 single-extraction
+    # Memoize lemma-DAG candidates once (single-extraction
     # invariant). The legacy code re-extracted on the proof-extracted
     # branch even when helpers were present; here we always run the
     # extractor and let downstream consumers use ``helpers`` if non-

@@ -536,6 +536,9 @@ def graph_statement_non_theorem_reason(text: str) -> str:
     compact = graph_identity_text(text)
     if not compact:
         return ""
+    scoped_open = _SCOPED_OPEN_DECL_PREFIX_RE.match(compact)
+    if scoped_open is not None:
+        return graph_statement_non_theorem_reason(compact[scoped_open.end() :])
 
     def direct_non_theorem_reason(candidate: str) -> str:
         candidate = _graph_strip_balanced_outer_parens(graph_identity_text(candidate))
@@ -2558,6 +2561,12 @@ def graph_statement_is_executable(text: str) -> bool:
         or contains_metavariable_placeholder(raw_compact)
     ):
         return False
+    # Scope changes name resolution, not whether the operand is type-shaped.
+    # Inspect its shape recursively; identity and stored types retain the
+    # complete prefix, and Lean still checks the original scoped proposition.
+    scoped_open = _SCOPED_OPEN_DECL_PREFIX_RE.match(raw_compact)
+    if scoped_open is not None:
+        return graph_statement_is_executable(raw_compact[scoped_open.end() :])
 
     stmt = graph_formal_statement_text(text)
     compact = graph_identity_text(stmt)
@@ -3278,7 +3287,7 @@ def graph_statement_key(text: str) -> str:
     normalized = normalize_statement(
         _shield_lean_quotes_for_identity(_scoped_statement_identity_text(text))
     )
-    # Capture guard (external review): rewriting Nat→ℕ in a statement that
+    # Capture guard: rewriting Nat→ℕ in a statement that
     # ALSO contains ℕ merges a binder named Nat with the real ℕ — skip the
     # unification when both spellings coexist (false-mismatch only).
     if not re.search(r"(?<![\w'✝.])ℕ(?![\w'✝])", normalized):
@@ -6039,7 +6048,7 @@ def _helper_decl_header(src: str) -> Optional[Tuple[str, str, str]]:
 
 
 def helper_decl_statement(src: str) -> str:
-    """Best-effort statement extraction from a Lean helper declaration."""
+    """Extract a helper type with the local scope that gives it meaning."""
 
     header = _helper_decl_header(src)
     if header is None:
@@ -6060,7 +6069,16 @@ def helper_decl_statement(src: str) -> str:
         " ".join(_strip_lean_decl_comments_preserving_strings(tail[:colon]).split())
     )
     if kind in {"theorem", "lemma"} and binders:
-        return f"∀ {binders}, {statement}"
+        statement = f"∀ {binders}, {statement}"
+    # A command-local open scopes binder types and the conclusion together.
+    # Replaying just the unqualified surface type in the ambient preamble can
+    # resolve it to a different proposition and corrupt contract/cache keys.
+    source = str(src or "").strip()
+    scope_end = 0
+    while scoped_open := _SCOPED_OPEN_DECL_PREFIX_RE.match(source[scope_end:]):
+        scope_end += scoped_open.end()
+    if scope_end:
+        return f"{source[:scope_end].strip()} {statement}"
     return statement
 
 
@@ -7939,12 +7957,10 @@ class ProofGraph:
         route.metadata.pop("route_assembly_contract_last_verdict", None)
         route.metadata.pop("route_assembly_contract_missing_node_ids", None)
         route.metadata.pop("route_assembly_contract_unproved_node_ids", None)
-        # Drop dependency edges to targets that are no longer required.  The
-        # setter previously only ADDED edges, so shrinking or replacing a
-        # contract on the same route left stale route_requires/route_blocked_by
-        # edges — which the status check then flags as
-        # route_dependency_not_in_contract.  (retarget_route_assembly_contract_
-        # requirement already unwinds edges via _remove_route_dependency_edges.)
+        # Drop dependency edges for targets no longer required by the route
+        # contract. Shrinking or replacing the contract must also remove stale
+        # route_requires/route_blocked_by edges so status checks see the same
+        # requirements. Retargeting uses _remove_route_dependency_edges too.
         required_id_set = set(required_ids)
         stale_dependency_targets = {
             str(edge.target or "").strip()
@@ -8742,17 +8758,11 @@ class ProofGraph:
                 not certified and route_contract_node_is_branch_local_candidate(node)
             )
             if not certified and not branch_local_candidate:
-                # Reaching here means the node neither carries a certificate
-                # nor bridges the target: ``route_contract_node_is_branch_local
-                # _candidate`` already requires ``graph_statement_is_root_bridge``.
-                # cf5ce8c9 admitted such a node as proved when its source was
-                # hash-locked, but a hash lock only says "this is a real proved
-                # object", never "this certifies the target". That made ``ready``
-                # true for a non-bridging helper, a blank formalization-support
-                # statement, and a hollow reducer without its premise. The
-                # leftover-helper liveness case it was aiming at is handled
-                # below, over ``branch_local_candidate_node_ids``, where the
-                # node does bridge and only its premises are outstanding.
+                # The node neither carries a certificate nor bridges the target:
+                # ``route_contract_node_is_branch_local_candidate`` requires a root
+                # bridge. A source hash lock identifies a proved object but does not
+                # certify the target. Branch-local bridge candidates with outstanding
+                # premises are handled below.
                 unproved_node_ids.append(node_id)
                 continue
             if branch_local_candidate:
@@ -10716,9 +10726,9 @@ class ProofGraph:
             self._add_edge(obligation, node.node_id, "obligation_replan")
         if route_poisoned:
             if existing_reused:
-                # Re-recording through a now-poisoned route must not wipe a
-                # previously queued item.  Frontier already skips terminally
-                # poisoned routes; destroying the node made revival impossible.
+                # Preserve queued work when re-recording through a poisoned route.
+                # The frontier skips terminally poisoned routes while retaining their
+                # nodes so an eligible revival can reuse them.
                 return node
             node.status = "rejected"
             node.proof_hash = ""
@@ -10933,7 +10943,7 @@ class ProofGraph:
             # Never let an admission receipt introduce a solution-bearing
             # declaration name or a *new* solution symbol through the proof
             # body. A visible-answer proof may legitimately unfold the exact
-            # target constant already present in its statement (as B1 does),
+            # target constant already present in its statement,
             # but the receipt cannot launder any additional answer reference.
             statement_solution_refs = _helper_source_solution_references(
                 source_statement
@@ -17120,16 +17130,10 @@ class ProofGraph:
                     unblocked_by_graph=unblocked,
                     reopened_by_new_evidence=retry_rejected,
                 )
-                # B8 fix (2026-05-11): emit ``child_llm_prove`` from the
-                # graph-source path. Previously only the legacy local
-                # frontier in proof_state.work_frontier could surface
-                # this work_type, so the recursive helper prover starved
-                # whenever the graph view took precedence over local
-                # (B6 territory — graph blocked/rejected/failed with a
-                # later sync-pending local-open transition). The
-                # consumer in proof_state.work_frontier applies the
-                # attempt + giveup caps so a turn-budget-exhausted
-                # node won't dispatch.
+                # Emit ``child_llm_prove`` from the graph-source path so recursive
+                # helper work remains available when the graph view takes precedence.
+                # The consumer in proof_state.work_frontier applies attempt and
+                # give-up caps before dispatching the node.
                 add(
                     graph_node,
                     "child_llm_prove",
@@ -18136,13 +18140,8 @@ class ProofGraph:
                 statement=node.statement,
                 phase=node.phase,
                 turn_index=node.turn_index,
-                # E4 fix (2026-05-08): use deep copy so nested dicts/lists
-                # in metadata are NOT shared between source and merged
-                # graphs. Without this, a parallel sample's post-merge
-                # mutation would leak across to other samples sharing the
-                # base graph (latent under current code paths but a
-                # fragile invariant — explicit copy is the structural
-                # fix).
+                # Deep-copy nested metadata so post-merge mutations in one parallel
+                # sample cannot affect the source graph or sibling samples.
                 support_names=list(node.support_names),
                 metadata=copy.deepcopy(node.metadata),
             )

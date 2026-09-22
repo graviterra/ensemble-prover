@@ -71,8 +71,7 @@ class RootTacticCloseAction:
 
     async def run(self, session: Any) -> MiniOutcome:
         # Lazy import keeps mini_prover.py decoupled from mini_session at
-        # module load time. M2 will make mini_prover.prove_problem invoke
-        # this action; both directions of the import are exercised then.
+        # module load time while allowing calls in both directions.
         from ensemble_prover.mini_prover import _try_root_tactic_close
 
         context_key = self._context_key(session)

@@ -326,6 +326,7 @@ def _summarize_result(
     redact_solution_refs: bool = True,
     suppress_helper_warnings: bool = False,
     submitted_code_line_span: Optional[tuple[int, int]] = None,
+    submitted_helper_source_span: Optional[tuple[int, int]] = None,
 ) -> TryLeanOutcome:
     ok = bool(getattr(result, "ok", False))
     if ok:
@@ -371,12 +372,6 @@ def _summarize_result(
 
             goal_start_line = getattr(result, "generated_goal_start_line", 0)
             if isinstance(goal_start_line, int) and goal_start_line > 0:
-                error_lines = [
-                    line
-                    for diag in error_diagnostics
-                    if isinstance((line := getattr(diag, "line", None)), int)
-                    and line > 0
-                ]
                 submitted_start = 0
                 submitted_end = -1
                 if submitted_code_line_span is not None:
@@ -385,14 +380,45 @@ def _summarize_result(
                 def is_submitted_line(line: int) -> bool:
                     return submitted_start > 0 and submitted_start <= line <= submitted_end
 
-                has_context_error = any(
-                    line < goal_start_line and not is_submitted_line(line)
-                    for line in error_lines
-                )
-                has_goal_error = any(
-                    line >= goal_start_line or is_submitted_line(line)
-                    for line in error_lines
-                )
+                has_context_error = False
+                has_goal_error = False
+                has_boundary_error = False
+                for diag in error_diagnostics:
+                    message = str(getattr(diag, "message", "") or "")
+                    helper_location = re.match(
+                        r"^scratch-helpers\.lean:(\d+):(\d+):", message
+                    )
+                    helper_line = (
+                        int(helper_location.group(1)) if helper_location else None
+                    )
+                    if str(getattr(diag, "file", "") or "") == "scratch-helpers.lean":
+                        helper_line = getattr(diag, "line", None)
+                    if helper_line is not None:
+                        # Admission parses the original joined helper source,
+                        # then logs its location inside a generated run_cmd.
+                        # The outer run_cmd line is not a source-owner location.
+                        has_boundary_error = True
+                        if isinstance(helper_line, int) and helper_line > 0:
+                            if submitted_helper_source_span is None:
+                                has_context_error = True
+                            else:
+                                start, end = submitted_helper_source_span
+                                if start <= helper_line <= end:
+                                    has_goal_error = True
+                                elif helper_line < start:
+                                    has_context_error = True
+                        continue
+                    if message.startswith("scratch source boundary:"):
+                        # A wrapper failure carries no original-source location.
+                        # Do not interpret its generated run_cmd line as context.
+                        has_boundary_error = True
+                        continue
+                    line = getattr(diag, "line", None)
+                    if isinstance(line, int) and line > 0:
+                        if line >= goal_start_line or is_submitted_line(line):
+                            has_goal_error = True
+                        else:
+                            has_context_error = True
                 if has_context_error and has_goal_error:
                     diagnostic_source_note = (
                         "Source ownership: diagnostics span the supplied "
@@ -415,6 +441,13 @@ def _summarize_result(
                         "Source ownership: this diagnostic is inside the "
                         "submitted scratch goal or its audit block, not an "
                         "ignorable harness diagnostic; the proof was not accepted."
+                    )
+                elif has_boundary_error:
+                    diagnostic_source_note = (
+                        "Source ownership: source-boundary validation failed "
+                        "before elaboration; the generated guard location does "
+                        "not identify the failing source block. The proof was "
+                        "not accepted."
                     )
 
         def diagnostic_rank(item: tuple[int, Any]) -> tuple[int, int]:
@@ -819,7 +852,15 @@ async def _run_try_lean_tool_impl(
         )
 
     submitted_code_line_span: Optional[tuple[int, int]] = None
+    submitted_helper_source_span: Optional[tuple[int, int]] = None
     if declaration_mode or example_mode:
+        helper_start = 1 + sum(
+            str(block).count("\n") + 1 for block in check_lemmas[:-1]
+        )
+        submitted_helper_source_span = (
+            helper_start,
+            helper_start + str(check_lemmas[-1]).count("\n"),
+        )
         spans = tuple(getattr(result, "generated_lemma_line_spans", ()) or ())
         if spans and len(spans) >= len(check_lemmas):
             candidate_span = spans[len(check_lemmas) - 1]
@@ -837,6 +878,7 @@ async def _run_try_lean_tool_impl(
         # real error so a helper's warning is not mis-attributed to the goal.
         suppress_helper_warnings=bool(context_lemmas),
         submitted_code_line_span=submitted_code_line_span,
+        submitted_helper_source_span=submitted_helper_source_span,
     )
     if dossier is not None:
         dossier.record_scratch(

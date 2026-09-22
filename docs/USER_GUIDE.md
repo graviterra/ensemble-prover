@@ -84,9 +84,8 @@ work. Manual ledger commands run offline. The autonomous research CLI uses
 OpenAI API credentials or Codex ChatGPT subscription sign-in; optional experiments additionally require unprivileged
 Linux namespace isolation as described in [section 21](#optional-research-experiments).
 
-The release audit is performed with both CPython 3.11 and 3.12. The setup script accepts
-standard CPython 3.11 and 3.12 and rejects trace-reference builds because the
-runtime relies on the ordinary CPython object layout for exact rollback.
+The setup script accepts standard CPython 3.11 and 3.12 and rejects
+trace-reference builds because the runtime relies on the ordinary CPython object layout for exact rollback.
 
 Clone the source checkout, or unpack a release archive, and enter its root:
 
@@ -458,9 +457,10 @@ small fallback tables for known routes do not determine whether a new model
 ID can be used.
 
 Each run records the resolved reasoning configuration in `turns.jsonl` and
-prints it before long model work. When a provider reports reasoning usage,
-`reasoning_output_tokens=0` confirms that the successful response reported no
-hidden reasoning tokens.
+prints it before long model work. `reasoning_output_tokens` records the
+provider's reported reasoning breakdown. A zero can also mean the provider
+omitted that breakdown; it does not by itself prove that no hidden reasoning
+occurred. Live thinking estimates are separate from reported usage totals.
 
 ## 7. Set time and cost boundaries
 
@@ -1839,9 +1839,7 @@ own cap also excludes nested Mini calls and transport retries; see
 Lean statements and use the campaign's checked export workflow before claiming
 a proved result.
 
-The research loop is experimental. Three offline scripted/fake-Codex trajectories
-exercise real Lean verification, including proof feedback; this is integration
-validation, not a discovery-performance benchmark. Literature coverage is not
+The research loop is experimental. Literature coverage is not
 comprehensive, and distributed fleets are not implemented. No autonomous mathematical discovery
 success rate or literature novelty claim has been established. The [full research
 execution contract](../ensemble_prover/research_claims/DISCOVERY.md) documents

@@ -36,6 +36,7 @@ from .provider_dispatch_continuation import (
 from .llm_deadline import llm_retry_deadline_record_from_exception
 from .cost_policy import require_cost_budget_usd
 from .proof_lineage import ProofLineageEnvelope
+from .provider_progress import PROGRESS_KEY, ProviderProgressForwarder, progress_snapshot
 from .pricing import (
     compute_quoted_cost_usd,
     conservative_reservation_token_pricing,
@@ -4680,6 +4681,14 @@ class CostBudgetController:
         dispatch_observer_token: Optional[contextvars.Token] = None
         provider_metadata_token: Optional[contextvars.Token] = None
         provider_request_metadata: Dict[str, Any] = {}
+        provider_progress = ProviderProgressForwarder(self.event_sink, {
+            "llm_request_id": reservation.request_id,
+            "llm_reservation_id": reservation.reservation_id,
+            "role": reservation.role,
+            "session_scope": reservation.scope,
+            "action_id": reservation.action_id,
+            "call_kind": reservation.call_kind,
+        })
         inherited_provider_metadata_observer = (
             _PROVIDER_REQUEST_METADATA_OBSERVER.get()
         )
@@ -4687,7 +4696,12 @@ class CostBudgetController:
         def _record_provider_request_metadata(
             metadata: Mapping[str, Any],
         ) -> None:
-            provider_request_metadata.update(dict(metadata or {}))
+            metadata = dict(metadata or {})
+            progress = progress_snapshot(metadata.pop(PROGRESS_KEY, None))
+            if progress is not None:
+                metadata[PROGRESS_KEY] = progress
+                provider_progress.publish(progress)
+            provider_request_metadata.update(metadata)
             if inherited_provider_metadata_observer is not None:
                 inherited_provider_metadata_observer(metadata)
         inherited_dispatch_observer = _PROVIDER_DISPATCH_OBSERVER.get()
@@ -5293,6 +5307,7 @@ class CostBudgetController:
             nonlocal dispatch_context_token, dispatch_observer_token
             nonlocal pending_dispatch_receipt_token
             nonlocal provider_metadata_token
+            provider_progress.active = False
             if dispatch_context_token is not None:
                 _PROVIDER_DISPATCH_MARKER.reset(dispatch_context_token)
                 dispatch_context_token = None

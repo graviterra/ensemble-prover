@@ -70,7 +70,7 @@ def apply_policy_gates(
     coverage.
 
     Preserves:
-    - A3: forbidden-cmd anchor uses column-0 only via
+    - Forbidden-cmd anchor uses column-0 only via
       ``_find_forbidden_lean_command``.
     - Construction collapse: only fires under ``opaque_mode`` (the
       legacy gate at mini_prover.py:3704 has the same opacity guard).

@@ -1019,10 +1019,8 @@ class FormalStateSearchAction:
 
         ``ProofStateRetrievalAction`` attaches declaration names to a specific
         node, while ``PremiseRetrievalAction`` publishes target-wide names on
-        the session.  Formal search previously consumed only the former, so a
-        successful mathematical retrieval prepass was invisible to the tactic
-        policy.  Keep both channels explicit and make the joined set part of
-        the formal context identity.
+        the session. Keep both channels explicit, expose their union to the
+        tactic policy, and bind the joined set into formal context identity.
         """
 
         return tuple(
@@ -1609,18 +1607,13 @@ class FormalStateSearchAction:
         )
         if stalled:
             live = False
-        # MP-FU-008 zero-yield governor: a lane may keep earning bounded
-        # exploration through novelty while never producing a single complete
-        # candidate. Rank improvement (fewer/harder residual goals, later
-        # diagnostic phase) resets this counter; novelty alone does not.
-        # HONEST SEMANTICS (2026-07-30 self-audit): a solved candidate exits
-        # through the acceptance path ABOVE and never reaches this block, so
-        # every quantum accounted here is definitionally zero-candidate — the
-        # governor is therefore a TIGHTER stall window (default 2) that
-        # preempts the six-quantum window for any lane whose last quanta were
-        # novelty-only, exactly MP-FU-008's "switch instead of paying all six
-        # quanta". The candidate term below is defensive future-proofing for
-        # a flow where solved quanta ever fall through.
+        # A lane may earn bounded exploration through novelty without
+        # producing a complete candidate. Rank improvement resets this counter;
+        # novelty alone does not. Solved candidates exit through acceptance above,
+        # so this block accounts for zero-candidate quanta. The tighter stall
+        # window preempts the normal six-quantum window for novelty-only lanes.
+        # The candidate term also permits future flows where solved quanta reach
+        # this block.
         quantum_candidate_found = bool(run.result.solved)
         prior_zero_yield = max(0, int(record.get("zero_yield_quanta", 0) or 0))
         zero_yield_quanta = (

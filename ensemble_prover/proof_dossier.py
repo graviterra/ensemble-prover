@@ -8067,7 +8067,7 @@ class ProofDossier:
     # reads a post-repair session as one that never moved.  This only ever
     # increases, so it separates regression from stasis.
     verified_helper_eviction_generation: int = 0
-    # Fix 1 (2026-05-22): when a helper with the same canonical statement
+    # when a helper with the same canonical statement
     # arrives under a fresh name, alias it to the original instead of minting
     # a new verified record. Maps requested_name → canonical verified name.
     # Drives the "5 duplicate Icc → range" collapse seen in putnam_1962_a5.
@@ -13642,7 +13642,7 @@ class ProofDossier:
             # silently moves backwards onto an already-seen signature.
             self.verified_helper_eviction_generation += removed_by_sync
         self.verified_helpers = safe_helpers
-        # Fix 1 follow-up (2026-05-22): drop alias entries that point at
+        # drop alias entries that point at
         # filtered-out helpers, or whose own key was filtered out.
         # Without this, ``resolve_verified_helper_name`` could return a
         # name no longer in verified_helpers.
@@ -13947,7 +13947,7 @@ class ProofDossier:
     def verified_helper_blocks_unique_by_statement(self) -> List[str]:
         """LLM-prompt-safe dedup view of verified_helper_blocks.
 
-        Fix 1 (2026-05-22): two helpers with the same canonical statement key
+        two helpers with the same canonical statement key
         are mathematically interchangeable for *citation* purposes, but the
         underlying ``verified_helper_blocks()`` cannot drop either — it feeds
         Lean replay contexts and the ``_support_names_for_proof`` parser,
@@ -15875,9 +15875,9 @@ class ProofDossier:
             # edge. Preserve its name/hash tombstone so integrity and
             # renderability checks reject a dependent whose compilation
             # environment has been removed.
-        # Fix 1 follow-up (2026-05-22): clean up alias map entries that
-        # reference the removed helper. Code-reviewer adversarial finding
-        # 3 flagged that ``resolve_verified_helper_name(alias)`` would
+        # clean up alias map entries that
+        # reference the removed helper. Otherwise,
+        # ``resolve_verified_helper_name(alias)`` would
         # return a name no longer in ``verified_helpers`` after this
         # method ran — a dangling-reference analogue.
         # Drop alias entries whose canonical target is being removed.
@@ -16817,7 +16817,7 @@ class ProofDossier:
         ready_route_ids_before_accept = self._ready_route_ids()
         if is_answer_unsafe_helper_source(src, **self._answer_safety_kwargs()):
             return None
-        # Fix 1 (2026-05-22): canonical-statement dedup (soft).
+        # canonical-statement dedup (soft).
         # If another verified helper already exists under a DIFFERENT name
         # with the same canonical statement, record an alias so downstream
         # consumers can collapse them. Both helpers remain stored.
@@ -17051,16 +17051,10 @@ class ProofDossier:
                 "mini_verified_helper_same_name_corrections_replaced",
                 1,
             )
-        # Last write wins on ``name`` at the dict level. Note (Bonus #3
-        # fix, 2026-05-08, after A8): the helper-salvage path now allows
-        # (name, statement_signature) corrections to reach this assignment
-        # — i.e. when the model emits a same-name helper with a DIFFERENT
-        # statement that Lean accepts, the corrected version replaces the
-        # stale entry here. Earlier comments claimed callers should avoid
-        # conflicting redefinitions; that's no longer accurate, so the
-        # write must remain unconditional and idempotent at the dict
-        # level (proof_graph also reflects the new statement via
-        # ``ensure_helper`` below).
+        # Last write wins on ``name``. Helper salvage permits same-name
+        # statement corrections after Lean accepts the new declaration.
+        # Keep this assignment unconditional and idempotent; ``ensure_helper``
+        # also updates the proof graph to the corrected statement.
         existing = self.verified_helpers.get(name)
         if existing is not None:
             old_hash = str(getattr(existing, "source_hash", "") or "").strip()
@@ -17107,10 +17101,8 @@ class ProofDossier:
             if prior_proposed is not None
             else ()
         )
-        # A verified helper supersedes any prior proposal under the same
-        # name — the planner should not see "still proposed" for a helper
-        # the prover has already proved. (Banking-from-direct-author fix,
-        # 2026-05-13: proposed_helpers seeds the planner; verified evicts.)
+        # Remove newly verified names from proposed helpers. Proposed helpers
+        # seed the planner; verified helpers must not be proposed for proof again.
         self.proposed_helpers.pop(name, None)
         parent_progress_claim_ids: List[str] = []
         parent_progress_variant_ids: List[str] = []
@@ -21086,11 +21078,8 @@ class ProofDossier:
                 str(name): [str(value) for value in list(values or [])]
                 for name, values in self.verified_helper_source_hash_history.items()
             },
-            # Fix 1 follow-up (2026-05-22): persist the soft-alias map so
-            # downstream consumers (summary.json analysis, replay, cached
-            # dossier reload) can see that duplicate-statement helpers
-            # were detected. Architect adversarial review's finding 1.6
-            # confirmed this gap.
+            # Persist the soft-alias map so summary analysis, replay, and cached
+            # dossier reloads retain duplicate-statement helper identities.
             "verified_helper_statement_aliases": dict(
                 self.verified_helper_statement_aliases
             ),
@@ -21796,7 +21785,7 @@ class ProofDossier:
             verified_helpers=verified_helpers,
             superseded_verified_helper_hashes=superseded_verified_helper_hashes,
             verified_helper_source_hash_history=verified_helper_source_hash_history,
-            # Fix 1 follow-up (2026-05-22): rehydrate the alias map from
+            # rehydrate the alias map from
             # persisted records. Older records pre-dating this field
             # produce an empty dict via the default_factory, which is
             # the safe no-op.

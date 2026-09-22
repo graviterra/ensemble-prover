@@ -322,13 +322,9 @@ _BINDER_ARITY_MISMATCH_RE = re.compile(
     r"there are no additional binders(?: or [`']?let[`']? bindings)? in the goal to introduce",
     re.IGNORECASE,
 )
-# Unknown universe level (typically `Type u_N` referenced without a
-# matching `universe u_N` declaration). When this fires, every
-# downstream binder/intro tactic emits cascading errors because the
-# elaborated goal is `S : sorry / inst : Mul sorry / ⊢ sorry`.
-# Recognizing it as a distinct error type prevents the parser from
-# flattening the symptom (introN failed) over the actual root cause
-# (live trace 2001_a1_16apr_8.jsonl: 49 valid proofs misclassified).
+# Recognize an undeclared universe as the root error. A missing
+# ``universe u_N`` for ``Type u_N`` can turn the elaborated goal into
+# ``sorry`` and trigger misleading downstream binder/intro failures.
 _UNKNOWN_UNIVERSE_RE = re.compile(
     r"unknown universe level\s+[`']?([A-Za-z_][A-Za-z0-9_']*)[`']?",
     re.IGNORECASE,
@@ -429,7 +425,7 @@ _TIMEOUT_RE = re.compile(
     # arrive within the per-request budget. Historically this string was
     # not matched, leading infra timeouts to be silently classified as
     # "no error, 0 unsolved goals" and routed as legitimate failures
-    # through every downstream gate. See WORK_VALIDATION_LOG_2026-04-19.
+    # through every downstream gate.
     r"persistent verifier timed out",
     re.IGNORECASE,
 )
@@ -515,8 +511,7 @@ def extract_tactic_suggestions(
     When ``goal_start_line`` is provided, suggestions whose source line is
     BEFORE that line are rejected. This prevents harvesting ``Try this:``
     output from linters like ``Mathlib.Tactic.TacticAnalysis.introMerge``
-    that fire against context-lemma bodies preceding the actual goal — see
-    `WORK_VALIDATION_LOG_2026-04-24_oracle_try_this_harvest_root_fix.md`.
+    that fire against context-lemma bodies preceding the actual goal.
     """
     suggestions: List[str] = []
     seen: set[str] = set()
@@ -553,13 +548,9 @@ def extract_tactic_suggestions(
                     suggestions.append(tactic)
                     seen.add(tactic)
 
-    # --- Pass 2: raw text scan (handles multi-line CLI output) ---
-    # Re-walk diagnostic blocks via _DIAG_RE so each ``Try this:`` carries
-    # its source line and severity. The previous unanchored ``raw.splitlines()``
-    # scan was the load-bearing bug: any ``Try this:`` from any source position
-    # got harvested, including from inside ``lemma`` bodies preceding the
-    # goal — which produced cross-goal proof reuse and binder_arity_mismatch
-    # cascades when context lemmas had consecutive ``intro`` calls.
+    # Scan raw diagnostic blocks with _DIAG_RE to preserve source line and
+    # severity for each Try this suggestion. Suggestions emitted inside
+    # context lemmas before the goal are not candidates for the goal proof.
     if raw:
         for m_diag in _DIAG_RE.finditer(raw):
             try:
@@ -842,16 +833,10 @@ def _goal_hypothesis_needs_continuation(text: str) -> bool:
         return True
     if _goal_hypothesis_balance(rhs) > 0:
         return True
-    # Lean's pretty-printer wraps long hypothesis types across lines, typically
-    # after a binary operator that requires a right operand. Without these
-    # tokens in the continuation set, a wrapped hypothesis like
-    #   h : ∀ x, √(log (9-x)) / (√(log (9-x)) + √(log (x+3))) +
-    #     √(log (x+3)) / (√(log (x+3)) + √(log (9-x))) = 1
-    # flushes the first line as a "complete" hypothesis and silently drops the
-    # continuation — the resulting goal statement becomes unparseable when
-    # re-elaborated (live trace 1987_b1_21ap_12.jsonl: 132 parse-error rejects
-    # all ending in ``+)`` because the truncated hypothesis was wrapped as a
-    # ``(h : ... +)`` Pi binder by ``_goal_state_with_target_body``).
+    # Lean can wrap hypothesis types after binary operators that require a
+    # right operand. Treat such lines as incomplete so continuation text is
+    # retained. Otherwise a hypothesis ending in ``+`` becomes an invalid
+    # ``(h : ... +)`` Pi-binder when the goal is reconstructed.
     return rhs.endswith(
         (
             "→", "↔", "∧", "∨", ",", "(", "[", "{", "⦃",
@@ -1241,24 +1226,13 @@ def has_focus_structure_mismatch(text: str) -> bool:
     )
 
 
-# Keep parsed-flag and text-fallback classification in lockstep so mixed-signal
-# diagnostics resolve to the same canonical family everywhere.
-# Prefer explicit missing names over downstream instance fallout. Note:
-# `unknown_universe` sits at the top because an undeclared universe
-# variable turns the whole goal into `sorry / sorry / sorry / ⊢ sorry`,
-# and every downstream tactic (intro, exact, rfl) emits cascading
-# introN/type_mismatch errors. Without this priority, the parser flattens
-# the whole diagnostic to binder_arity_mismatch and the LLM chases the
-# wrong symptom (live trace 2001_a1_16apr_8.jsonl: 49 valid proofs
-# misclassified this way). `type_mismatch` is placed above
-# `binder_arity_mismatch` because the `introN failed: no additional
-# binders` regex spuriously matches inside `simpa`/`simp` internal
-# expansions when the real error is a type mismatch (live trace
-# 2001_a1_16apr_7.jsonl: 73× identical regeneration cascade).
-# `binder_arity_mismatch` stays ahead of generic
-# `simp_no_progress`/`tactic_failed` for cases where the binder error
-# truly is the top-level failure (e.g. `intro a b c` against a 2-binder
-# goal — the only error Lean emits is introN).
+# Prioritize explicit missing names over downstream instance errors.
+# An unknown universe can invalidate the entire goal and cause cascading
+# binder and type errors, so classify it first. Prefer type_mismatch over
+# binder_arity_mismatch because simpa/simp expansions can emit introN errors
+# while elaborating mismatched types. Keep binder_arity_mismatch above
+# generic tactic failures when the binder error is the primary failure,
+# such as introducing three names into a two-binder goal.
 _CANONICAL_ERROR_PRIORITY: tuple[str, ...] = (
     "infra_failure",
     "forbidden_axioms",
@@ -1268,7 +1242,7 @@ _CANONICAL_ERROR_PRIORITY: tuple[str, ...] = (
     "parse_error",
     "unknown_identifier",
     "missing_instance",
-    # D1 fix (2026-05-08): ``proposition_falsified`` ranks above
+    # ``proposition_falsified`` ranks above
     # ``type_mismatch``/``unification_failed`` because Lean's ``decide``
     # has DEFINITIVELY refuted the proposition. No witness polishing or
     # type alignment can recover a goal whose proposition is provably

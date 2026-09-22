@@ -415,8 +415,7 @@ class ActionBudget:
     identities is what the semantic scopes otherwise forbid: a caller that
     sets one is declaring that total spend, not per-identity spend, is the
     bound it wants.  Without such a ceiling a semantic-scope budget can never
-    exhaust at all -- ``formal_state_search`` ran unbounded for exactly this
-    reason (5 dispatches, 611s, zero progress, on putnam_1977_a2 2026-08-19).
+    exhaust across distinct work identities.
     """
 
     max_invocations: int

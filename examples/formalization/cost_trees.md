@@ -21,10 +21,9 @@ weight n becomes n + k; bump acts recursively on both children of a fork.
 ## Archival appendix
 
 This space can contain unrelated archival material. Its contents impose no
-additional mathematical assumptions. The regression test inserts more than
-two mebibytes here to exercise exact indexed retrieval of the later claims.
+additional mathematical assumptions.
 
-<!-- TEST_APPENDIX -->
+<!-- ARCHIVAL_APPENDIX -->
 
 ## BumpCostIdentity
 

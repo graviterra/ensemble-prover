@@ -58,6 +58,7 @@ from ensemble_prover.theorem_project import (  # noqa: E402
     is_valid_lean_qualified_name,
     is_valid_lean_universe_suffix,
     merge_imports,
+    scan_lean_declarations,
     scan_lean_theorems,
     select_lean_theorem,
     split_lean_import_header,
@@ -83,6 +84,7 @@ from ensemble_prover.solved_export_policy import (  # noqa: E402
 from ensemble_prover.subprocess_environment import (  # noqa: E402
     sanitized_subprocess_environment,
 )
+from ensemble_prover.utils import _lean_qualified_identifier_segments  # noqa: E402
 
 RUNS_DIR = PROJECT_ROOT / "runs" / "mini_prover"
 SOLVED_DIR = RUNS_DIR / "solved"
@@ -1029,6 +1031,78 @@ def _preamble_for_export(
     return clean.rstrip()
 
 
+def _export_name_parts(name: str) -> tuple[str, ...]:
+    """Compare Lean names without treating quoted dots as qualification."""
+
+    name = name.removeprefix("_root_.")
+    return tuple(
+        part[1:-1] if part.startswith("«") and part.endswith("»") else part
+        for part in _lean_qualified_identifier_segments(name)
+    )
+
+
+def _export_root_replay_witness(
+    context: str, theorem_name: str, statement: str, proof: str,
+) -> Optional[tuple[str, str]]:
+    """Reuse a proved root while checking its type and the recorded replay.
+
+    A helper closure can already contain the public root declaration. Keep
+    those declarations and all their references intact. Replay the final proof
+    under a fresh name and compare the two kernel types with rigid universes;
+    an ordinary type ascription could instead insert a coercion or specialize
+    a polymorphic helper.
+    """
+
+    root_parts = _export_name_parts(theorem_name)
+    # An equation-style definition at the end of a context needs the next
+    # declaration boundary for the source scanner to delimit its body.
+    scan_context = context.rstrip() + "\n"
+    try:
+        declarations = scan_lean_declarations(
+            scan_context + "theorem miniExportContextEnd : True := True.intro\n"
+        )
+    except ValueError:
+        return None
+    collisions = [
+        decl for decl in declarations
+        if decl.keyword_start < len(scan_context)
+        and _export_name_parts(decl.canonical_name) == root_parts
+    ]
+    if not collisions:
+        return "", ""
+    if len(collisions) != 1 or collisions[0].private or collisions[0].kind not in {
+        "theorem", "lemma",
+    }:
+        return None
+    material = "\n".join((context, theorem_name, statement, proof))
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+    witness = f"miniExportRootReplay_{digest}"
+    while witness in material:
+        witness += "_"
+    root_components = ", ".join(json.dumps(part, ensure_ascii=False) for part in root_parts)
+    allowed_axioms = ", ".join(json.dumps(name) for name in sorted(_ALLOWED_EXPORT_AXIOMS))
+    guard = f'''run_cmd Lean.Elab.Command.liftTermElabM do
+  let rootName := ([{root_components}] : List String).foldl Lean.Name.str Lean.Name.anonymous
+  let rootInfo ← Lean.getConstInfo rootName
+  let replayInfo ← Lean.getConstInfo (Lean.Name.mkSimple "{witness}")
+  let rootParams := (Lean.collectLevelParams {{}} rootInfo.type).params.toList
+  let replayParams := (Lean.collectLevelParams {{}} replayInfo.type).params.toList
+  unless rootParams.length == replayParams.length do
+    Lean.throwError "export root type has a different universe arity from the original target"
+  let commonLevels := rootParams.map Lean.Level.param
+  let rootType := rootInfo.type.instantiateLevelParams rootParams commonLevels
+  let replayType := replayInfo.type.instantiateLevelParams replayParams commonLevels
+  unless ← Lean.Meta.isDefEq rootType replayType do
+    Lean.throwError "export root type is not definitionally equal to the original target"
+  let allowedAxioms := ([{allowed_axioms}] : List String)
+  for name in [rootName, Lean.Name.mkSimple "{witness}"] do
+    for axiomName in (← Lean.collectAxioms name) do
+      unless allowedAxioms.contains axiomName.toString do
+        Lean.throwError "export root replay uses an unsupported axiom"
+'''
+    return f"_root_.{witness}", guard
+
+
 def _build_solved_file(
     problem_name: str,
     proof: str,
@@ -1141,8 +1215,14 @@ def _build_solved_file(
     if problem.docstring.strip():
         parts.append(problem.docstring.strip())
     proof_block = sanitize_lean_artifact_text(proof)
+    replay = _export_root_replay_witness(
+        "\n".join(parts), problem.theorem_name, problem.statement_type, proof_block,
+    )
+    if replay is None:
+        return None
+    replay_name, replay_guard = replay
     declaration_block = (
-        f"theorem {problem.theorem_name} : {problem.statement_type.strip()} := "
+        f"theorem {replay_name or problem.theorem_name} : {problem.statement_type.strip()} := "
         f"{proof_block}"
     )
     target_omit_variables = tuple(getattr(problem, "target_omit_variables", ()) or ())
@@ -1156,7 +1236,11 @@ def _build_solved_file(
     if proof_scoped_prefix:
         declaration_block = f"{proof_scoped_prefix}\n{declaration_block}"
     parts.append(declaration_block)
-    return "\n".join(parts) + "\n"
+    content = "\n".join(parts) + "\n"
+    if replay_guard:
+        content = merge_imports(content, ("Lean.Elab.Command", "Lean.Util.CollectAxioms"))
+        content += "\n" + replay_guard
+    return content
 
 
 def _build_theorem_project_solved_file(
@@ -1240,6 +1324,12 @@ def _build_theorem_project_solved_file(
         safe_description = description.replace("/-", "/ -").replace("-/", "- /")
         rendered_description = f"/-- {safe_description} -/"
     proof_block = sanitize_lean_artifact_text(proof)
+    replay = _export_root_replay_witness(
+        "\n".join(parts), theorem_name, statement_type, proof_block,
+    )
+    if replay is None:
+        return None
+    replay_name, replay_guard = replay
     # The exact type comes from Lean's elaborated declaration and its pretty
     # printer may alpha-rename universe parameters (for example source ``u``
     # becomes ``u_1``). Reusing the source suffix would bind the wrong level.
@@ -1249,7 +1339,7 @@ def _build_theorem_project_solved_file(
     if rendered_description:
         declaration_lines.append(rendered_description)
     declaration_lines.append(
-        f"{public_prefix}theorem {declaration_name} : {statement_type} := {proof_block}"
+        f"{public_prefix}theorem {replay_name or declaration_name} : {statement_type} := {proof_block}"
     )
     declaration_block = "\n".join(declaration_lines)
     target_scoped_prefix = theorem_proof_scoped_prefix(
@@ -1280,7 +1370,11 @@ def _build_theorem_project_solved_file(
             f"omit {' '.join(target_omit_variables)} in\n{signature_check}"
         )
     parts.extend(("", signature_check))
-    return "\n".join(parts) + "\n"
+    content = "\n".join(parts) + "\n"
+    if replay_guard:
+        content = merge_imports(content, ("Lean.Elab.Command", "Lean.Util.CollectAxioms"))
+        content += "\n" + replay_guard
+    return content
 
 
 # Lean exits 0 even when a declaration uses ``sorry``/``admit`` (it is a warning,

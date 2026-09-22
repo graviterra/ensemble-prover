@@ -1585,7 +1585,7 @@ def merge_context_helpers(
     in Lean while preserving the name for the proof body). When the current
     turn re-emits a helper with the same name but a DIFFERENT statement, the
     fresh version replaces the verified one — that is the model's self-
-    correction (A8 fix, 2026-05-08). Without this, model corrections were
+    correction. Without this, model corrections were
     silently lost and the verified helper poisoned the proof body.
     """
     # Build maps over verified helpers so we can decide replacement on
@@ -1757,7 +1757,7 @@ class HelperSalvager:
         self.true_proof = true_proof
         self.timeout_s = timeout_s
         self.verified_helper_accept_callback = verified_helper_accept_callback
-        # Claim 4 fix (FINDING_2026-05-12 Defect 6): when set to a
+        # when set to a
         # non-trivial root goal, the salvager additionally runs a Lean
         # apply/simp probe to confirm the helper is INTERACTABLE with
         # the root, not merely Lean-typechecking. Counterexample
@@ -1769,7 +1769,7 @@ class HelperSalvager:
         self.relevance_gate_root_statement = str(
             relevance_gate_root_statement or ""
         )
-        # Adversarial-review 2026-05-13 (Agent B caveat): probing only
+        # probing only
         # against the root statement is over-strict — helpers that are
         # useful for an OPEN SUBGOAL but not directly applicable to
         # the root would be falsely rejected. The salvager now also
@@ -2001,7 +2001,7 @@ class HelperSalvager:
             validation_context = context
             pending_collision: Optional[Tuple[str, str]] = None
             if dossier.has_helper(name):
-                # A8 fix (2026-05-08): only skip if the existing verified
+                # only skip if the existing verified
                 # helper has the same statement signature. When the model
                 # emits a corrected version (same name, different statement),
                 # re-validate so the corrected version replaces the stale
@@ -2119,7 +2119,7 @@ class HelperSalvager:
                     continue
 
             if bool(getattr(lean_result, "ok", False)):
-                # Claim 4 fix (FINDING_2026-05-12 Defect 6): structural
+                # structural
                 # relevance gate. A helper that Lean-typechecks may still
                 # be SEMANTICALLY off-topic relative to the root goal
                 # (e.g. a verified counterexample helper for a universal

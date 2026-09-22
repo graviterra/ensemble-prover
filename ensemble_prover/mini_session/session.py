@@ -3313,10 +3313,8 @@ def _copy_mapping_for_rollback_scoped(
     the Mathlib retrieval service, the Lean handle, the recorder.  A rolled
     back dispatch must be handed the *same* handle it had, never a private
     clone, so these are shared by reference rather than copied.  Cloning them
-    is also ruinously expensive: ``searcher_override`` reaches the 214k-entry
-    Mathlib index, and 887fa7f2 turned this helper from an O(1) dict return
-    into a per-action deep copy, which put ~10s of cloning on every dispatch
-    for each searcher-bearing action.  Only genuinely owned mutable state --
+    also traverses external resources such as the Mathlib index behind
+    ``searcher_override``. Only session-owned mutable state --
     cursors, attempted-key ledgers, counters -- needs a real copy.
     """
 
@@ -10219,8 +10217,7 @@ def _isolated_dispatch_tail_blocks_scheduler(
 class MiniSession:
     """Owner of cross-action state for one prove invocation.
 
-    Construct via ``build_session_for_prove_problem`` (M2). M0 ships the
-    skeleton with no factory yet — only direct instantiation in tests.
+    Construct via ``build_session_for_prove_problem``.
 
     The session is shared by all actions during one ``run()`` invocation.
     Child sessions (parallel samples, recursive subgoals) are separate
@@ -10229,9 +10226,6 @@ class MiniSession:
     children fork session-local retrieval visibility and receive fresh dossier
     and proof-state objects.
 
-    M0 deliverables: skeleton compiles, run() with zero registered actions
-    terminates returning (False, None), and per-iteration recorder records
-    fire.
     """
 
     # Required core state. Most fields are typed Any to avoid pulling
@@ -10604,7 +10598,7 @@ class MiniSession:
         init=False,
         repr=False,
     )
-    # Fix 3 (2026-05-22): when ``strict_progress_accounting`` is True,
+    # when ``strict_progress_accounting`` is True,
     # ``outcome.progress=True`` without ``metadata["strong_progress"]=True``
     # is "soft" progress (helper accepted but no root-impactful change).
     # Soft progress is tolerated up to ``max_soft_progress_streak`` before
@@ -10623,7 +10617,7 @@ class MiniSession:
     max_helper_only_provider_quanta: int = 24
     helper_only_provider_quanta: int = 0
     helper_only_progress_identity: str = ""
-    # H1 (2026-05-08): action ids treated as "fallback" — if stagnation
+    # action ids treated as "fallback" — if stagnation
     # hits the cap, ``apply()`` flips ``fallback_actions_attempted`` once
     # any of these run, so the next ``should_continue`` call terminates
     # cleanly. Empty default means stagnation alone terminates the loop
@@ -10873,7 +10867,7 @@ class MiniSession:
         repr=False,
     )
 
-    # Recursive controller pool (B4 / R12) for scheduled/prepass recursive
+    # Recursive controller pool for scheduled/prepass recursive
     # work. Adaptive fallback has a separate pool below so the last-resort
     # action remains available after the upfront prepass spends its budget.
     recursive_pass_budget_remaining: int = 0
@@ -10882,7 +10876,7 @@ class MiniSession:
     # must not make the fallback disappear before it can run after stall.
     adaptive_recursive_pass_budget_remaining: int = 0
 
-    # Phase 2 (2026-05-09): recursion-depth bound for the helper-prover
+    # recursion-depth bound for the helper-prover
     # action. The root MiniSession is depth=0; child sessions spawned by
     # ``RecursiveHelperProverAction`` get depth = parent.depth + 1.
     # ``_giveup_decomposition_nudge`` reads ``recursion_depth`` and at
@@ -10893,7 +10887,7 @@ class MiniSession:
     recursion_depth: int = 0
     max_recursion_depth: int = 3
 
-    # Absolute turn-index counter (R12.5). ConversationTurnAction calls
+    # Absolute turn-index counter. ConversationTurnAction calls
     # run_conversation(max_turns=1), which stamps every internal record
     # with turn_in_phase=1. The session normalizes those records via
     # ``apply()``'s outcome metadata.
@@ -11015,7 +11009,7 @@ class MiniSession:
     repair_policy_scope_materialization_keys: Set[str] = field(default_factory=set)
     root_finalized: bool = False
 
-    # M1 fix (2026-05-08): subactions consult these via ``getattr(...,
+    # subactions consult these via ``getattr(...,
     # None)`` for defense-in-depth, but a fresh MiniSession with no
     # ConversationTurnAction yet would otherwise have NO attribute. Make
     # the contract explicit: both fields are part of the documented
@@ -11023,7 +11017,7 @@ class MiniSession:
     # are cleared by ConversationTurnAction on each return path.
     last_turn_extraction: Optional[Any] = None
     last_lean_verdict: Optional[Any] = None
-    # Decomposition-request gate (2026-05-09): the most-recent LLM reply
+    # Decomposition-request gate: the most-recent LLM reply
     # text is published here so the post-Lean inline cascade can run the
     # give-up classifier without re-extracting from conv.history. Cleared
     # on every ConversationTurnAction return path.
@@ -11033,7 +11027,7 @@ class MiniSession:
     # binding before replaying it.
     answer_safe_recheck_pending: Optional[Dict[str, Any]] = None
 
-    # M9 fix (2026-05-08): repeated lean infrastructure failures append a
+    # repeated lean infrastructure failures append a
     # fresh nudge per turn with no dedup. Track the immediately-prior
     # nudge text to dedupe; once N consecutive infra failures fire,
     # ConversationTurnAction can refuse further attempts and emit
@@ -11153,7 +11147,7 @@ class MiniSession:
         default_factory=dict
     )
 
-    # ----- M0 surface --------------------------------------------------
+    # ----- Session surface --------------------------------------------------
 
     def acceptance_preamble(self) -> str:
         """Return the preamble allowed to certify root-level work.
@@ -11175,9 +11169,8 @@ class MiniSession:
     def register(self, action: Action) -> None:
         """Add an action to the registry and ensure it has a budget entry.
 
-        Default budget (max_invocations=1, max_total_seconds=0.0) is a
-        placeholder; M1+ tests should set explicit budgets via
-        ``register(action, budget=...)`` once that overload exists.
+        The default budget is a placeholder. Pass an explicit budget via
+        ``register(action, budget=...)`` to configure invocation/time limits.
         """
 
         self.actions.append(action)
@@ -13161,12 +13154,9 @@ class MiniSession:
             "assembly",
         }:
             return False
-        # Narrowing is an authorization boundary, not merely a statement that
-        # *some* graph work is selected.  The saved record may only be rebound
-        # to an action that owns this exact work kind/resource.  Previously a
-        # procedural ``formalize_missing_obligation`` record was restored onto
-        # ChildClosure and finite-reindexing actions; both silently treated the
-        # foreign selection as absent and ran unrestricted root work.
+        # Narrowing binds the saved record to an action that owns its exact
+        # work kind and resource. Reject foreign selections so an action cannot
+        # interpret them as absent and run unrestricted root work.
         return self._selected_work_action_compatible(action_text, record)
 
     def _discharge_repair_policy_narrowing_after_action(
@@ -15473,9 +15463,8 @@ class MiniSession:
         A scheduler can run out of ordinary dispatch lanes before the numeric
         stagnation threshold is reached.  The adaptive recursive fallback is
         still registered, budgeted, and applicable in that state, but the
-        fallback selector is deliberately gated by the threshold.  Returning
-        quiescent here used to make the factory run that same recursive driver
-        after the session had already declared quiescence.
+        fallback selector is deliberately gated by the threshold. Give that
+        selector ownership before declaring quiescence.
 
         Advance only the scheduling signal needed to enter the existing
         fallback selector. The fallback action remains the sole owner of its
@@ -17400,23 +17389,11 @@ class MiniSession:
                     )
                 return True
             return False
-        # The prior code
-        # unconditionally terminated when ``stagnation_counter >=
-        # max_stagnation`` because ``fallback_actions_attempted`` was
-        # never written. That killed real runs at iter=3, BEFORE
-        # the LLM ever ran (deterministic prepass actions take 3
-        # iterations without adding proof_state nodes; signature stays
-        # constant; stagnation hits cap; loop dies).
-        #
-        # New behavior: stagnation cap is INFORMATIVE, not terminal.
-        # max_iterations and all-budgets-exhausted remain the hard
-        # terminators. When fallback actions ARE registered and the
-        # cap is hit, the next ``select_next_action`` should prefer
-        # them (caller wires this); ``fallback_actions_attempted``
-        # flips once any of them runs. When no fallbacks are
-        # registered, the loop simply continues — letting other
-        # actions (e.g. ``conversation_turn_prove``) get their
-        # budgeted shots.
+        # Stagnation is a scheduling signal, not a terminal condition.
+        # When the cap is reached, select registered fallback actions and mark
+        # them attempted once dispatched. Without fallbacks, other actions
+        # still receive their budgeted opportunities. Max iterations and
+        # exhaustion of all budgets remain the hard termination bounds.
         return True
 
     def _accrue_run_governor_elapsed(self) -> float:
@@ -17690,15 +17667,10 @@ class MiniSession:
             action_attribute_states.append(
                 (action, saved_state, missing_fields)
             )
-        # Narrow identity image instead of a whole-__dict__ deepcopy of the
-        # dossier/proof_state/conv. 887fa7f2 added the wide revert so a
-        # mutation-boundary failure stayed retryable, and it is genuinely
-        # load-bearing: without it a half-applied dispatch is retried against
-        # its own leftovers forever. But reverting everything also destroyed
-        # helpers, graph nodes and lineage the dispatch had verified before it
-        # failed. Capture only what a torn dispatch must not be allowed to
-        # redefine -- the identity of the theorem being proved and the provider
-        # transcript -- and leave the mathematics alone.
+        # Capture the theorem identity and provider transcript so a torn
+        # dispatch cannot redefine them on retry. Preserve verified helpers,
+        # graph nodes, and lineage produced before failure; reverting the
+        # entire dossier would discard that mathematical progress.
         identity_image: Dict[str, Any] = {}
         dossier = self.dossier
         graph = getattr(dossier, "proof_graph", None) if dossier is not None else None
@@ -17853,7 +17825,7 @@ class MiniSession:
             except Exception as exc:
                 # The restore path must not raise, but a failed transcript
                 # repair leaves the 400 hazard live -- say so instead of
-                # failing closed silently (the 0f4246ba lesson).
+                # failing closed silently.
                 try:
                     self._record_event(
                         {
@@ -18245,12 +18217,9 @@ class MiniSession:
         completed_scheduled_callbacks: List[Dict[str, Any]] = []
         pending_scheduled_callbacks: List[asyncio.Handle] = []
         if task_tracker is not None:
-            # The outer strict deadline owns the primary action task itself.
-            # ``operation_children()`` deliberately excludes that task, so a
-            # cancellation-resistant primary used to disappear from the
-            # mutation incident set even while the deadline registry reported
-            # it as live. Retain and observe that exact tail before returning
-            # a poisoned session to the caller.
+            # The outer deadline owns the primary task, which operation_children()
+            # excludes. Retain and observe any cancellation-resistant primary tail
+            # as part of the mutation incident before returning a poisoned session.
             deadline_primary_pending = bool(
                 deadline_pending > 0
                 and task_tracker.primary_task is not None
@@ -20997,12 +20966,10 @@ class MiniSession:
             return self._select_next_action()
 
     def _select_next_action(self) -> Optional[Action]:
-        """Frontier-first then static priority fallback.
+        """Select frontier work first, then fall back to static priority.
 
-        M0 returns the first action whose ``is_applicable(session)`` is
-        True and whose budget is not exhausted, scanning in priority
-        order. The frontier-first pre-pass (see ``_map_work_item_to_action``)
-        is implemented in M2 once the action mapping table is populated.
+        Fallback considers applicable actions with remaining budget in priority
+        order. ``_map_work_item_to_action`` maps frontier work to actions.
         """
 
         reconcile_facts = getattr(
@@ -21577,7 +21544,7 @@ class MiniSession:
             record_repair_first_fairness_outcome(fixed_point_family_action)
             return fixed_point_family_action
 
-        # 1. Frontier-first (placeholder until M2 populates the mapping).
+        # 1. Frontier-first.
         #
         # A persistent scoped action may explicitly request one fair static
         # dispatch after making progress.  Preserve its exact frontier
@@ -22064,15 +22031,10 @@ class MiniSession:
                         ensure_ascii=True,
                     ).encode("utf-8")
                 ).hexdigest()
-                # The one-shot ledger must be spent on a grant that actually
-                # moves the ceiling.  ``expand_max_iterations_to_action_budgets``
-                # sets max_iterations from the registered invocation budgets
-                # (413 root / 170 subgoal on putnam_1977_a2 2026-08-19), so
-                # ``iteration + 2`` is a no-op for almost the whole session.
-                # Recording those no-ops as "granted" both mis-reported the
-                # ceiling and burned the signature, so the one grant it was
-                # entitled to could never fire at the boundary where the
-                # deferred root repair actually needed it.
+                # Spend the one-shot ledger only when the grant raises the ceiling.
+                # ``expand_max_iterations_to_action_budgets`` sets max_iterations from
+                # registered invocation budgets, so ``iteration + 2`` may be a no-op.
+                # Keep the grant available until deferred root repair needs it.
                 old_max_iterations = int(self.max_iterations or 0)
                 required_max_iterations = int(self.iteration or 0) + 2
                 extends_ceiling = required_max_iterations > old_max_iterations
@@ -23742,10 +23704,9 @@ class MiniSession:
                 self._clear_selected_work_item()
                 continue
             dispatched_id = str(action.id or "")
-            # Conversation exemptions must outlive the first committed turn.
-            # Discarding them here re-armed leftover skipped root_repair /
-            # route_replan suppression, so nested prove died after one
-            # unsolved dispatch (Putnam 1977 A2 nested subgoal).
+            # Conversation exemptions must outlive the first committed turn so
+            # skipped root_repair / route_replan suppression cannot re-arm and
+            # terminate a nested prove after one unsolved dispatch.
             if not (
                 dispatched_id.startswith("conversation_turn")
                 or self._is_unscoped_root_authoring_action(dispatched_id)
@@ -24442,7 +24403,7 @@ class MiniSession:
     async def dispatch_subaction(self, action_id: str) -> Optional[MiniOutcome]:
         """Invoke a registered action by id WITHOUT going through select_next_action.
 
-        M4 invariant: subaction calls share budgets with top-level dispatch,
+        subaction calls share budgets with top-level dispatch,
         consume time/invocation count, but do NOT bump
         ``self.iteration`` (only top-level select_next_action does) and
         do NOT advance stagnation tracking. This lets a host action
@@ -24627,10 +24588,8 @@ class MiniSession:
                 self.selected_work_item = saved_target
                 self.selected_work_item_action_id = saved_action_id
                 self.selected_work_item_record = saved_record
-        # H5 fix (2026-05-08): a subaction id with no matching registered
-        # action used to silently return None. Emit telemetry so a typo'd
-        # id surfaces in JSONL post-mortem instead of becoming an
-        # invisible no-op.
+        # Emit telemetry for an unregistered subaction ID so misspelled or
+        # unavailable actions remain visible instead of becoming silent no-ops.
         self._record_event(
             {
                 "phase": "session_subaction_outcome",
@@ -28938,7 +28897,7 @@ class MiniSession:
                 }
             )
 
-        # H1: when stagnation has crossed the threshold and a registered
+        # when stagnation has crossed the threshold and a registered
         # fallback action ran, mark fallback as attempted so the next
         # ``should_continue`` terminates cleanly.
         if (
@@ -29574,40 +29533,11 @@ class MiniSession:
         elif model_call_defer_authorized and not model_call_deferred_action_registered:
             _record_model_call_deferred_action()
 
-        # Stagnation: any progress resets; same proof-state signature
-        # advances counter; signature drift WITHOUT progress is also
-        # stagnation-protective (the live-trace fix below).
-        #
-        # A frontier-first dispatch that
-        # consumed a work-item but didn't make progress is NOT
-        # stagnation — the consumed-work tracking is itself the search
-        # advance signal. Each (node_id, work_type, ...) tuple gets
-        # exactly one shot before being marked consumed; once all
-        # frontier work is consumed, frontier-first returns nothing
-        # and static-priority kicks in. Counting these as stagnation
-        # killed sessions after a few dedup-driven no-ops, well before
-        # conversation-turn budget exhaustion.
-        #
-        # The prior
-        # all-stagnates-unless-signature-equal logic preserves a
-        # critical safety guarantee — deterministic prepass actions
-        # (premise_retrieval, tactic_close) mutate the graph each
-        # iteration without setting ``outcome.progress`` (because they
-        # didn't solve), so a strict "no progress = stagnation" rule
-        # tripped termination before the LLM ever ran. Reverted to
-        # signature-equality semantics: signature unchanged AND no
-        # progress = stagnation; signature drift = soft progress signal.
-        # The previous fix exempted ALL
-        # frontier-consumed no-progress from stagnation — too liberal.
-        # In the observed failure, several child closures ran in a row with
-        # real Lean tactic work but no progress and no stagnation ticks because
-        # each had a unique (node_id, work_type) key.
-        #
-        # Threshold: 1.0s. A frontier-consumed dispatch with cost < 1s
-        # was a real no-op (is_applicable found nothing fresh, returned
-        # immediately) — that's not stagnation. A dispatch with cost
-        # ≥ 1s ran genuine work and failed — repeated such dispatches
-        # IS stagnation, even if each consumes a different key.
+        # Progress resets stagnation. With no progress, an unchanged proof-state
+        # signature advances stagnation; signature drift is a soft-progress signal.
+        # A consumed frontier item below 1 second is treated as a scheduling no-op.
+        # A dispatch costing at least 1 second performed substantive work, so a
+        # no-progress result counts toward stagnation even for a new frontier key.
         new_signature = (
             self._proof_state_signature() if self.proof_state is not None else None
         )
@@ -29676,7 +29606,7 @@ class MiniSession:
                 # is fulfilled even if another bounded continuation remains.
                 # Keeping it would later resurrect already-advanced work.
                 self._clear_policy_repair_redirect_selected_work()
-            # Fix 3 (2026-05-22): under strict accounting, separate
+            # under strict accounting, separate
             # root-impactful "strong" progress from accepted-helper "soft"
             # progress. Soft-only progress is tolerated up to
             # ``max_soft_progress_streak``; beyond that it ticks stagnation
@@ -29694,7 +29624,7 @@ class MiniSession:
                 if self.soft_progress_streak > self.max_soft_progress_streak:
                     self.stagnation_counter += 1
                     saturated_streak = self.soft_progress_streak
-                    # HIGH-#9 fix (2026-05-22, adversarial review): reset the
+                    # reset the
                     # streak after each saturation tick so the counter
                     # re-arms instead of incrementing stagnation on every
                     # subsequent soft outcome. Without this, with default
@@ -29811,7 +29741,7 @@ class MiniSession:
             )
 
         # Top-level iteration counter — incremented exactly once per
-        # ``apply`` call. Subaction dispatch (M4) does NOT route through
+        # ``apply`` call. Subaction dispatch does NOT route through
         # ``apply``; it returns to its parent action's ``run`` body.
         if not bool(metadata.get("iteration_neutral")):
             self.iteration += 1
@@ -29851,7 +29781,7 @@ class MiniSession:
         }
         if isinstance(metadata.get("proof_lineage"), dict):
             record["proof_lineage"] = dict(metadata["proof_lineage"])
-        # R12.5: surface the absolute conversation-turn index for any
+        # surface the absolute conversation-turn index for any
         # ConversationTurnAction outcome so post-mortem analysis can
         # disambiguate the always-1 inner-turn value recorded by
         # run_conversation(max_turns=1).
@@ -30440,10 +30370,8 @@ class MiniSession:
     def _proof_state_root_solved(self) -> bool:
         if self.proof_state is None:
             return False
-        # The actual ProofSearchState API uses ``find_root_proof_node`` /
-        # ``mark_root_proved`` / ``is_root_solved`` depending on phase.
-        # Probe defensively to keep M0 working before the proof_state
-        # surface is finalized for sessions.
+        # Probe the supported root lookup and closure APIs defensively
+        # across proof-state implementations.
         for attr in ("is_root_solved", "root_solved", "is_root_proved"):
             method = getattr(self.proof_state, attr, None)
             if callable(method):
@@ -32689,9 +32617,8 @@ class MiniSession:
     def _recover_live_failed_root_frontier(self, graph: Any) -> bool:
         """Reopen a failed root when the containing session is still live.
 
-        Older live state may contain the pre-fix feedback loop where a
-        ``frontier_work_no_progress`` attempt failed ``proof_state:root`` and
-        graph hydration then failed the local root.  A session that has not
+        Restored state can contain a ``frontier_work_no_progress`` attempt that
+        marked ``proof_state:root`` failed and propagated through hydration.  A session that has not
         finalized or declared a terminal failure still intends to search, so
         that state is scheduler exhaustion rather than a proof of mathematical
         impossibility.  Reopen only the root and release only root-scoped
@@ -40084,7 +40011,7 @@ class MiniSession:
     ) -> Optional[Action]:
         """Map a typed work-frontier item to a registered Action.
 
-        M4 wiring: ``ProofStateWorkItem.work_type`` selects the action class:
+        ``ProofStateWorkItem.work_type`` selects the action class:
         - ``assembly`` → ``InterTurnAssemblyAction``
         - ``lemma_dag_decomposition`` → ``LemmaDagDecomposeAction``
         - ``child_llm_prove`` → ``RecursiveHelperProverAction``
@@ -40135,7 +40062,7 @@ class MiniSession:
             "mine_missing_obligation",
             "route_replan",
         }:
-            # Path B fix (2026-05-18): obligation/replan work types are first
+            # obligation/replan work types are first
             # offered to graph_recursive_decompose, which invokes
             # ``run_mini_recursive_attempt`` on the obligation's smaller
             # statement. Falls through to graph_native_shortcut (helper-match

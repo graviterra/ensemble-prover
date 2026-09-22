@@ -312,7 +312,7 @@ class FalsificationService:
                     operation_ownership="result_only",
                 )
             except TimeoutError:
-                # Preserve the completed prefix (external review: partial
+                # Preserve the completed prefix (partial
                 # progress was replaced by checks_run=0 / no cursor, so the
                 # same witnesses were re-checked from zero — observed six
                 # restarts of one statement in a single run).

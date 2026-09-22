@@ -209,21 +209,21 @@ class PostFailureResult:
     repair_retrieval_block: str = ""
     repair_retrieval_record: Optional[Dict[str, Any]] = None
     failure_analysis: Dict[str, Any] = field(default_factory=dict)
-    # H3 fix (2026-05-08): identify which cascade phase produced the
+    # identify which cascade phase produced the
     # solve so the caller can emit the matching legacy verdict
     # (``solved_after_proof_state_child`` / ``solved_after_helper_salvage``
     # / ``tactic_solved``) instead of collapsing them all to one event.
     # Values: "" (not solved) | "proof_state_child" | "helper_salvage_assembly" |
     # "helper_salvage_root_tactic"
     solved_via: str = ""
-    # H4 fix (2026-05-08): the helper-salvage Phase-7 root-tactic-close
+    # the helper-salvage Phase-7 root-tactic-close
     # arm runs ``try_close_with_tactics`` but legacy mini_prover.py:4884-4907
     # also emits a ``recorder.record_turn(verdict=tactic_solved/_rejected/
     # _skipped)`` event with attempt details. Carry the result back so
     # the caller (or the cascade itself) can emit it without
     # re-implementing the call.
     helper_salvage_root_tactic_record: Optional[Dict[str, Any]] = None
-    # Decomposition-request redirect (2026-05-09):
+    # Decomposition-request redirect:
     # When the LLM's reply matches a give-up signal cluster
     # (helpers_insufficient / answer_opaque / lemma_not_found /
     # no_sorry_allowed / scaffold_reject / environment_hedge),
@@ -239,7 +239,7 @@ class PostFailureResult:
     target_integrity_obligation_node_ids: List[str] = field(default_factory=list)
     target_integrity_replan_node_ids: List[str] = field(default_factory=list)
     target_integrity_adjudication_materialized: bool = False
-    # Rejected-complete-helper triage (2026-05-11): when a normal
+    # Rejected-complete-helper triage: when a normal
     # helpers+main-proof response fails Lean, independently run the
     # helper declarations through the lemma-DAG helper path so rejected
     # helper statements become durable child_goal nodes instead of
@@ -1623,7 +1623,7 @@ async def run_post_failure_cascade(
                         "salvage_root_tactic",
                     ),
                 )
-                # H4 fix (2026-05-08): emit the legacy recorder event so
+                # emit the legacy recorder event so
                 # tactic_solved / tactic_rejected / tactic_skipped tags
                 # don't disappear from the JSONL stream. Mirror
                 # mini_prover.py:4884-4907.
@@ -1810,7 +1810,7 @@ async def run_post_failure_cascade(
                 if result.helper_salvage_root_tactic_record is None:
                     _emit_helper_salvage_root_tactic_record()
             elif helper_probe_candidates <= 0:
-                # H4 fix: legacy mini_prover.py:4855-4875 emits a
+                # legacy mini_prover.py:4855-4875 emits a
                 # tactic_skipped record when the budget zeros it out.
                 helper_salvage_record = {
                     "phase": "helper_salvage_root_tactic",
@@ -1833,13 +1833,13 @@ async def run_post_failure_cascade(
         lean_feedback = primitives["format_raw_lean_feedback"](feedback_result)
         result.feedback_mode = "raw"
     else:
-        # Fix 2 follow-up (2026-05-22): the session-path cascade is the
+        # the session-path cascade is the
         # actually-exercised feedback emitter (the legacy mini_prover.py
         # call site is NOT reached through prove_problem_via_session).
         # Pass ``dossier`` so the helper-inventory injection in
         # ``FailureAnalyzer.format_feedback`` actually fires when the
         # LLM cites a hallucinated mini_* identifier. Without this kwarg
-        # the prior fix was dead in production despite the unit tests.
+        # the prompt would omit the available helper inventory.
         try:
             lean_feedback = primitives["format_lean_failure_feedback"](
                 result.failure_analysis,

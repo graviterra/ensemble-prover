@@ -493,17 +493,11 @@ class ProofToolkit:
     async def check_type(self, term: str = "", **_kw: Any) -> str:
         """Run ``#check <term>`` via the Lean runner.
 
-        Structural fix (2026-04-16): the prior early-rejection branch
-        rejected any unqualified name (no ``.``) that wasn't in the local
-        decl cache, even when Lean would resolve it correctly via the
-        ``import Mathlib`` preamble (e.g. ``mul_comm``, ``mul_assoc``,
-        ``congrArg``).  That asymmetry made the tool loop diverge — the
-        sibling ``search_mathlib`` would find the lemma but ``check_type``
-        would falsely reject it, leading to "repeated call detected,
-        forcing finalize" failures (see putnam_2012_a2 trace).  Lean is
-        now the sole authority for resolution; the static-index hits are
-        still preferred when present (cheaper, no Lean call), but absence
-        from the index no longer blocks Lean from being consulted.
+        Ask Lean to resolve the name, including unqualified imported
+        declarations such as ``mul_comm``, ``mul_assoc``, and ``congrArg``.
+        If the check fails, use available local or static-index metadata as
+        a fallback.
+        An index miss alone cannot establish that a declaration is unavailable.
         """
         term = str(term or "").strip()
         if not term:
@@ -522,8 +516,8 @@ class ProofToolkit:
         # Lean is authoritative — always try resolution rather than
         # bypassing it for unqualified names.  Static Mathlib index
         # signatures omit implicit typeclass binders for declarations such
-        # as `mul_assoc`; returning those as checked types misled prover
-        # prompts into using associativity in a bare `[Mul S]` context.
+        # as `mul_assoc`; treating those as checked types could incorrectly
+        # suggest that associativity is available in a bare `[Mul S]` context.
         try:
             result = await self.lean.check_term_type(
                 term,
@@ -615,22 +609,11 @@ class ProofToolkit:
                     ensure_ascii=False,
                     sort_keys=True,
                 )
-        # Note: an earlier short-circuit here returned ``unknown_decl_name``
-        # for any unqualified identifier not already in the local /
-        # support-retriever index, WITHOUT consulting Lean. That created
-        # an asymmetry with ``check_type`` (which DOES ask Lean for
-        # unqualified names via Real.Mathlib resolution). Live evidence
-        # from 2009_b2_18apr_10.jsonl and 1983_a1_18apr_3.jsonl: the LLM
-        # first ran ``check_type("sub_nonneg")`` — Lean resolved it
-        # successfully — then the orchestrator auto-called
-        # ``apply_decl_to_goal("sub_nonneg", ...)`` which pre-rejected
-        # with ``unknown_decl_name`` because ``sub_nonneg`` was not in any
-        # static index. The Apr-16 blocker then banned the (real) decl
-        # for the rest of the run. Removing the short-circuit lets Lean
-        # be the authority for unqualified names; truly-fake names come
-        # back from Lean as ``unknown_identifier`` (not
-        # ``unknown_decl_name``) and the blocker's decisive set does
-        # NOT include ``unknown_identifier`` so no false bans.
+        # Ask Lean to resolve unqualified names even when the local declaration
+        # and support-retriever indexes have no match. This keeps declaration
+        # application consistent with ``check_type`` and permits imported names
+        # such as ``sub_nonneg``. Unknown names return ``unknown_identifier``,
+        # which does not justify a permanent declaration ban.
         try:
             result = await self.lean.apply_decl_to_goal(
                 statement,

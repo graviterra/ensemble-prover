@@ -1125,9 +1125,7 @@ def split_proofs(text: str) -> list[str]:
         # newline (no blank line, no ``-- PROOF --``) between them. Splitting
         # on ``\n(?=by\b)`` recovers them as sibling candidates instead of
         # letting ``_extract_tactic_block`` merge them into a malformed
-        # concatenation (live trace 1987_b1_21ap_15.jsonl: 2 parse-error
-        # rejects of shape ``by ... \n by ... \n by ...`` producing
-        # ``unexpected token 'by'; expected command``).
+        # concatenation that produces an unexpected top-level ``by`` token.
         parts = [p.strip() for p in re.split(r"\n(?=by\b)", raw) if p.strip()]
     return [p for p in parts if p]
 
