@@ -1,6 +1,6 @@
 # Ensemble Prover
 
-Last updated: 2026-09-20.
+Last updated: 2026-09-21.
 
 This repository contains a research-grade autonomous theorem prover that
 combines language-model proof search with Lean verification. Given a formalized
@@ -8,6 +8,14 @@ Lean target, it plans a proof, retrieves relevant declarations, decomposes hard
 goals into helper claims, tests and repairs candidate proofs, and finalizes a
 Lean-checked result without further user interaction. The maintained entry
 point for proof search is `ensemble_prover.mini_prover`.
+
+> **Ongoing progress — September 2026:** Ensemble Prover has produced
+> Lean-verified proofs for **178 distinct Putnam problems** across research and
+> evaluation runs. **65 have been accepted by PutnamBench; the additional 113
+> have not yet been independently verified by the PutnamBench team.** Development
+> and solving continue, with recent runs using **Astra**, **Fable**,
+> **deepseek-v4.1-flash**, and **Opus**. This cumulative count combines models,
+> configurations, and budgets; it is not a controlled benchmark solve rate.
 
 ## Ensemble Prover in action
 
@@ -25,36 +33,6 @@ screenshot is losslessly cropped; its retained code and logs are unchanged.
 
 September 2026 — highlights from the current source checkout:
 
-- **1.14 — request limits and proof-search reliability:** direct DeepSeek Flash
-  uses reasoning-aware request limits and explicit thinking controls. Answer
-  discovery and native research reserve the same output allowance they send;
-  current DeepSeek pricing estimates carry their assumptions. Helper salvage
-  preserves tactic-search continuation instead of repeating a consumed search.
-  Lean declaration extraction preserves local bindings, and recursive
-  checkpoints exclude live theory-promotion handles.
-
-- **1.13.1 — sweep and answer-discovery reliability:** OpenRouter capability
-  checks refresh missing model metadata, automatic research accounts for resumed
-  proof work, and sweep results retain their actual completion and cutoff causes.
-  Putnam answer discovery handles casts, field references, and arbitrary
-  universes while requiring Lean to verify that the question is preserved.
-  Sweep acceptance cutoffs can be disabled with `--no-acceptance-cutoffs`.
-  [Answer discovery](docs/USER_GUIDE.md#questions-with-an-unknown-answer) ·
-  [User Guide](docs/USER_GUIDE.md)
-
-- **1.13.0 — checked proof presentation and research deadlines:** verified Mini
-  exports remove unused helpers and shorten expanded signatures automatically,
-  with fresh Lean checks and an archived original. Automatic research now uses
-  a provider-aware time allowance instead of cancelling reasoning at 120 seconds,
-  and reports timeout/failure outcomes before proof search resumes.
-  [Proof presentation](docs/USER_GUIDE.md#automatic-proof-presentation) ·
-  [Automatic research](docs/USER_GUIDE.md#automatic-research-when-proof-search-stalls)
-
-- **1.12.1 — automatic research reliability:** interrupted parallel runs preserve
-  research request accounting, large research notes fit alongside the original
-  proof context, and final cleanup closes owned research transports. Complete
-  advice remains available to the prover even when it is omitted from a crowded
-  prompt. Existing launch commands and budgets still apply.
 - **1.12 — automatic research during ordinary proof runs:** new Mini and Putnam runs
   investigate stalled approaches and feed alternative strategies back into
   proof search, using the existing run budget. Keep using your usual command;
@@ -65,11 +43,6 @@ September 2026 — highlights from the current source checkout:
   existing budget. Adopt stopped Mini work, inspect primary sources, and explore
   alternative methods while preserving the exact original Lean target.
   [Strategy recovery](ensemble_prover/research_claims/STRATEGY_RECOVERY.md)
-- **1.10 — proof-search reliability:** resumed helper verification preserves its
-  saved time allowance; planner admission recognizes restated verified helpers;
-  proof finalization retains the configured output capacity. Recovered usage
-  reports keep planner and prover counts separate, and equivalent helper
-  promotion work is reused without repeatedly scanning earlier receipts.
 - **Unknown-answer questions — experimental:** Mini can propose and review
   explicit terms for `answer(sorry)` slots, then try to prove the exact filled
   theorem. The original question is preserved; a proposed answer is not a proof.
@@ -143,21 +116,26 @@ With a built Lake project, the same run formalizes candidate arguments, searches
 for proofs, independently checks exports, and returns failures or results to
 research. Omitting the project keeps a standalone research-only run.
 
-As of August 2026, across research and evaluation runs, the system has produced
-Lean-verified proofs for **65 distinct Putnam problems**, counting repeated
-solves and configuration variants once. **PutnamBench has accepted all 65
-submitted proofs**, and Ensemble Prover is listed on the
+As of September 21, 2026, across research and evaluation runs, the system has
+produced Lean-verified proofs for **178 distinct Putnam problems**, counting
+repeated solves and configuration variants once. **PutnamBench has accepted the
+original 65 submitted proofs**, and Ensemble Prover is listed on the
 [PutnamBench leaderboard](https://trishullab.github.io/PutnamBench/leaderboard.html).
-This is a cumulative demonstrated
-result, not a claim of a controlled benchmark solve rate under one fixed model,
-configuration, or budget. The prover has been tested with **GPT-5.2**,
-**GPT-5.6 Luna-Pro**, **DeepSeek-V4-Flash**, **DeepSeek-V4-Pro**, and
-**Qwen3.7-Max**. Prover, refiner, and planner-escalation roles are independently
-configurable, so a run may use one model throughout or combine models.
+The **113 additional problems** have locally Lean-verified proof exports but
+**have not yet been independently verified by the PutnamBench team**.
+This is a cumulative result across models, configurations, and budgets, not a
+controlled benchmark solve rate under one fixed setup.
+
+The prover has been tested with **GPT-5.2**, **GPT-5.6 Luna-Pro**, **Astra**,
+**Fable**, **DeepSeek-V4-Flash**, **deepseek-v4.1-flash**, **DeepSeek-V4-Pro**,
+**Opus**, and **Qwen3.7-Max**. Prover, refiner, and planner-escalation roles are
+independently configurable, so a run may use one model throughout or combine
+models.
 
 Ensemble Prover is an actively developed research-grade tool. It continues to
 solve Putnam problems and is now attempting frontier-mathematics problems.
-The 65 accepted proofs are a snapshot of this ongoing work.
+The 65 accepted proofs and 113 additional locally verified solves are a dated
+snapshot of this ongoing work.
 
 Every result reported as a solved proof by Mini Prover is checked by Lean.
 Research-ledger support is a separate assessment, not a proved theorem.
@@ -169,8 +147,9 @@ search and verification history.
 
 ## Putnam proofs accepted by PutnamBench
 
-The following **65 problem identifiers** make up the cumulative result reported
-above. Their Lean proof files were submitted privately to the PutnamBench
+The following **65 problem identifiers** are the independently accepted subset
+of the 178-problem cumulative result above. Their Lean proof files were submitted
+privately to the PutnamBench
 verification team for independent review on August 31, 2026; PutnamBench has
 since accepted all 65 proofs. Only the problem identifiers are published here;
 the proof files and answers are not.
