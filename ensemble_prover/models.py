@@ -43,6 +43,7 @@ from .provider_health import (
     bound_provider_lane_health_registry,
 )
 from .provider_response import publish_provider_response
+from .provider_identity import credential_hmac_sha256
 from .proof_dossier import (
     _prompt_safe_inline_text,
     prompt_safe_malformed_tool_arguments,
@@ -104,8 +105,8 @@ def provider_serving_fingerprint(client: Any) -> str:
 
     Roles and sampling controls are intentionally absent: prove, refine, and
     planner calls using the same endpoint/model/credential/routing lane share
-    capacity.  A credential contributes only a one-way digest, so the receipt
-    is safe to checkpoint and emit in diagnostics.
+    capacity. Credentials contribute an installation-keyed identifier, so
+    persisted receipts do not permit offline credential guessing.
     """
 
     explicit = str(getattr(client, "provider_defer_fingerprint", "") or "").strip()
@@ -124,11 +125,7 @@ def provider_serving_fingerprint(client: Any) -> str:
         return ""
 
     api_key = str(getattr(cfg, "api_key", "") or "").strip()
-    credential_digest = (
-        hashlib.sha256(api_key.encode("utf-8", errors="replace")).hexdigest()
-        if api_key
-        else ""
-    )
+    credential_digest = credential_hmac_sha256(api_key) if api_key else ""
     revision_fields = {}
     for key in (
         "model_revision",
@@ -157,10 +154,10 @@ def provider_serving_fingerprint(client: Any) -> str:
         if value not in (None, "", (), [], {}):
             routing_fields[key] = value
     payload = {
-        "schema": 1,
+        "schema": 2,
         "base_url": base_url,
         "model": model,
-        "credential_sha256": credential_digest,
+        "credential_hmac_sha256": credential_digest,
         "revision": revision_fields,
         "routing": routing_fields,
     }

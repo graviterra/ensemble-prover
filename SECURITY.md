@@ -3,10 +3,10 @@
 ## Supported versions
 
 Security fixes are maintained on the latest revision of `main`. The current
-public release series is **1.08**, covering Mini Prover, single-claim
+public release series is **1.14**, covering Mini Prover, single-claim
 natural-language input, and multi-file formalization campaigns.
 
-The `v1.08` tag is a fixed snapshot: subsequent fixes on `main` do not change
+The `v1.14` tag is a fixed snapshot: subsequent fixes on `main` do not change
 that tag or previously downloaded archives. Update to the latest `main`
 revision to receive those fixes, and include the exact commit when reporting
 a problem. Older releases are not separate security-maintenance branches.
@@ -43,6 +43,11 @@ There is no guaranteed response-time SLA.
   files, including `.env`, or using the prover user's network privileges.
   Keep keys out of source control and shared artifacts; restrict their scope
   and rotate any exposed credentials.
+- Provider cooldown identities use a keyed credential fingerprint. Its private
+  installation key lives under `${XDG_STATE_HOME:-~/.local/state}/ensemble-prover/`
+  with access restricted to the owner. Keep this key separate from shared run
+  artifacts. This protects against guessing credentials from fingerprints; it
+  does not protect against a process able to read the private key itself.
 - Configured providers may receive theorem statements, source passages,
   definitions, retrieved context, proof plans, attempts, and Lean diagnostics.
   Submit confidential material only when you are authorized to share it with

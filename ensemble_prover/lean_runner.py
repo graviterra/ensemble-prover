@@ -2559,7 +2559,16 @@ def _residual_failure_evidence(
         "residual_receipt_<id>",
         normalized,
     )
-    normalized = re.sub(r"(?:/[^\s:]+)+\.lean", "<lean-file>.lean", normalized)
+    def normalize_path_token(match: re.Match[str]) -> str:
+        token = match.group(0)
+        suffix = token.rfind(".lean")
+        if suffix <= 1:
+            return token
+        return "<lean-file>" + token[suffix:]
+
+    # Consume each token once, including paths without a Lean suffix. Retrying
+    # a variable-length path match at every slash can stall failure reporting.
+    normalized = re.sub(r"/[^\s:]*", normalize_path_token, normalized)
     normalized = re.sub(r"(?m)(?<=\.lean):\d+:\d+", ":<line>:<col>", normalized)
     normalized = re.sub(r"\?m\.\d+", "?m.<id>", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()

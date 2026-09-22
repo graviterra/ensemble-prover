@@ -54,12 +54,6 @@ _ONLINE_EMBED_WORKER_SLOTS = threading.BoundedSemaphore(2)
 _ONLINE_EMBED_BATCH_TIMEOUT_S = 12.0
 
 
-_DECL_RE = re.compile(
-    r"(?m)^\s*(?:@\[.*\]\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\s+)*"
-    r"(theorem|lemma|def|abbrev|instance)\s+([A-Za-z0-9_'.]+)\b"
-)
-
-
 def _online_embed_many_with_watchdog(
     embedder: Any,
     texts: List[str],

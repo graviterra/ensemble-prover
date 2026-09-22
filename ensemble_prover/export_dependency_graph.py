@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
+from ensemble_prover.lean_syntax import _lean_surface_lexical_skip_end
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SOLVED_DIR = PROJECT_ROOT / "runs" / "mini_prover" / "solved"
 
@@ -107,17 +109,36 @@ def _strip_comments(text: str) -> str:
     return _COMMENT_LINE_RE.sub("", _COMMENT_BLOCK_RE.sub("", text))
 
 
-# Trailing lines that belong to the NEXT declaration (its docstring or
-# attributes) or are pure noise: block/doc comments, line comments,
-# attribute lines, blanks. Stripped from a declaration's body slice so
-# proof_length/statement describe THIS declaration only.
-_TRAILING_NONCODE_RE = re.compile(
-    r"(?:\s*(?:/--?(?:[^-]|-(?!/))*-/|--[^\n]*|@\[[^\]]*\]))*\s*$"
-)
-
-
 def _trim_trailing_noncode(segment: str) -> str:
-    return _TRAILING_NONCODE_RE.sub("", segment)
+    """Trim trailing comments/attributes without reinterpreting literal text."""
+
+    cursor = 0
+    content_end = 0
+    attribute_depth = 0
+    while cursor < len(segment):
+        skip_to = _lean_surface_lexical_skip_end(segment, cursor)
+        if skip_to is not None:
+            if not attribute_depth and not segment.startswith(("--", "/-"), cursor):
+                content_end = skip_to
+            cursor = skip_to
+            continue
+        if not attribute_depth and segment.startswith("@[", cursor):
+            attribute_depth = 1
+            cursor += 2
+            continue
+        char = segment[cursor]
+        if attribute_depth:
+            if char == "[":
+                attribute_depth += 1
+            elif char == "]":
+                attribute_depth -= 1
+        elif not char.isspace():
+            content_end = cursor + 1
+        cursor += 1
+    if attribute_depth:
+        # Incomplete attributes are source, not removable trailing metadata.
+        return segment.rstrip()
+    return segment[:content_end]
 
 
 def _text_hash(text: str) -> str:
