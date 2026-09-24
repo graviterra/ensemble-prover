@@ -650,15 +650,24 @@ async def check_negation_proof_in_feedback_world(
 
 
 def _parse_axioms(output: str, theorem_name: str) -> tuple[str, ...] | None:
+    # Union every same-name report: the audited proof can print a forged clean
+    # report ahead of Lean's real one, which must never be hidden.
+    found = False
+    axioms: dict[str, None] = {}
     for match in _DEPENDS_RE.finditer(str(output or "")):
+        # A quote or report text inside a list means a forged, unclosed
+        # ``[`` swallowed a later real report: ambiguous, fail closed.
+        if re.search(r"'|\bdepend", match.group(2)):
+            return None
         if match.group(1).strip() == theorem_name:
-            return tuple(
-                item.strip() for item in match.group(2).split(",") if item.strip()
+            found = True
+            axioms.update(
+                (item.strip(), None) for item in match.group(2).split(",") if item.strip()
             )
     for match in _NONE_RE.finditer(str(output or "")):
         if match.group(1).strip() == theorem_name:
-            return ()
-    return None
+            found = True
+    return tuple(axioms) if found else None
 
 
 async def _axiom_audit(

@@ -1103,6 +1103,48 @@ def _export_root_replay_witness(
     return f"_root_.{witness}", guard
 
 
+# Session checks run with ``--lean-max-heartbeats`` (default 1600000), not
+# Lean's 200000 default. Exports must carry the same budget or a proof the
+# session verified can deterministically time out in the export self-check.
+_DEFAULT_EXPORT_MAX_HEARTBEATS = 1600000
+
+
+def _summary_max_heartbeats(summary: Dict[str, Any]) -> int:
+    raw = summary.get("lean_max_heartbeats") if isinstance(summary, dict) else None
+    value = raw if type(raw) is int else 0
+    return value if value > 0 else _DEFAULT_EXPORT_MAX_HEARTBEATS
+
+
+def _with_export_heartbeats(content: str, max_heartbeats: int) -> str:
+    """Insert ``set_option maxHeartbeats`` right after the last header command.
+
+    Comments are masked so an ``import`` inside a comment is ignored, and the
+    option goes directly after the last real ``prelude``/``module``/
+    ``import`` line: never between imports, inside a comment, or between a
+    ``/-- docstring -/`` and the declaration it documents.
+    """
+    if not isinstance(max_heartbeats, int) or max_heartbeats <= 0:
+        return content
+    from .theorem_project import _mask_noncode
+
+    lines = content.split("\n")
+    masked = _mask_noncode(content).split("\n")
+    insert_at = 0
+    for index, masked_line in enumerate(masked):
+        stripped = masked_line.strip()
+        if (
+            stripped == "prelude"
+            or stripped == "module"
+            or stripped.startswith("module ")
+            or re.fullmatch(r"(?:public\s+)?(?:meta\s+)?import\s+.+", stripped) is not None
+        ):
+            insert_at = index + 1
+        elif stripped:
+            break
+    lines.insert(insert_at, f"set_option maxHeartbeats {max_heartbeats}")
+    return "\n".join(lines)
+
+
 def _build_solved_file(
     problem_name: str,
     proof: str,
@@ -1113,6 +1155,7 @@ def _build_solved_file(
     official_answer_payload_present: Optional[bool] = None,
     extra_imports: Sequence[str] = (),
     extra_theory_sources: Sequence[str] = (),
+    max_heartbeats: int = _DEFAULT_EXPORT_MAX_HEARTBEATS,
 ) -> Optional[str]:
     """Reconstruct a standalone Lean source.
 
@@ -1215,6 +1258,12 @@ def _build_solved_file(
     if problem.docstring.strip():
         parts.append(problem.docstring.strip())
     proof_block = sanitize_lean_artifact_text(proof)
+    # Exported files are audited from Lean's text output, which elaboration-time
+    # code in the proof or helpers could shape. Never export such candidates.
+    from .lean_runner import _check_meta_escape_violation
+
+    if _check_meta_escape_violation(proof_block, *helpers):
+        return None
     replay = _export_root_replay_witness(
         "\n".join(parts), problem.theorem_name, problem.statement_type, proof_block,
     )
@@ -1240,7 +1289,7 @@ def _build_solved_file(
     if replay_guard:
         content = merge_imports(content, ("Lean.Elab.Command", "Lean.Util.CollectAxioms"))
         content += "\n" + replay_guard
-    return content
+    return _with_export_heartbeats(content, max_heartbeats)
 
 
 def _build_theorem_project_solved_file(
@@ -1250,6 +1299,7 @@ def _build_theorem_project_solved_file(
     *,
     extra_imports: Sequence[str] = (),
     extra_theory_sources: Sequence[str] = (),
+    max_heartbeats: int = _DEFAULT_EXPORT_MAX_HEARTBEATS,
 ) -> Optional[str]:
     """Reconstruct a solved source from the run's immutable input snapshot."""
 
@@ -1324,6 +1374,12 @@ def _build_theorem_project_solved_file(
         safe_description = description.replace("/-", "/ -").replace("-/", "- /")
         rendered_description = f"/-- {safe_description} -/"
     proof_block = sanitize_lean_artifact_text(proof)
+    # Exported files are audited from Lean's text output, which elaboration-time
+    # code in the proof or helpers could shape. Never export such candidates.
+    from .lean_runner import _check_meta_escape_violation
+
+    if _check_meta_escape_violation(proof_block, *helpers):
+        return None
     replay = _export_root_replay_witness(
         "\n".join(parts), theorem_name, statement_type, proof_block,
     )
@@ -1374,7 +1430,7 @@ def _build_theorem_project_solved_file(
     if replay_guard:
         content = merge_imports(content, ("Lean.Elab.Command", "Lean.Util.CollectAxioms"))
         content += "\n" + replay_guard
-    return content
+    return _with_export_heartbeats(content, max_heartbeats)
 
 
 # Lean exits 0 even when a declaration uses ``sorry``/``admit`` (it is a warning,
@@ -1448,6 +1504,7 @@ _PRINT_AXIOMS_DEPENDS_RE = re.compile(
 _PRINT_AXIOMS_NONE_RE = re.compile(
     r"'([^\r\n]+)'\s+does\s+not\s+depend\s+on\s+any\s+axioms"
 )
+_AXIOM_LIST_SWALLOW_RE = re.compile(r"'|\bdepend")
 
 
 def _parse_print_axioms(output: str, theorem_name: str) -> Optional[List[str]]:
@@ -1461,9 +1518,12 @@ def _parse_print_axioms(output: str, theorem_name: str) -> Optional[List[str]]:
     the fully-qualified name of the resolved declaration, and we always ask
     about the exact root name. Suffix matching would let a namespaced decoy
     (``Decoy.putnam_x``) whose clean report happens to appear in the same
-    stdout satisfy the audit for the real ``putnam_x``. The "depends on
-    axioms" form is scanned BEFORE the "no axioms" form so a dirty report can
-    never be masked by a clean same-name report (dirty wins).
+    stdout satisfy the audit for the real ``putnam_x``.
+
+    The audited proof can print arbitrary text (``trace``, ``logInfo``), so a
+    forged clean same-name report may precede the real one. Every same-name
+    report is therefore unioned: a forged line can only add axioms, never
+    hide the ones in Lean's real report (dirty wins).
     """
 
     text = str(output or "")
@@ -1471,15 +1531,23 @@ def _parse_print_axioms(output: str, theorem_name: str) -> Optional[List[str]]:
     if not want:
         return None
 
+    found = False
+    axioms: Dict[str, None] = {}
     for match in _PRINT_AXIOMS_DEPENDS_RE.finditer(text):
+        # A genuine axiom list holds only names, commas and whitespace (it may
+        # wrap). A quote or report text inside it means a forged, unclosed
+        # ``[`` swallowed a later real report: ambiguous, so fail closed.
+        if _AXIOM_LIST_SWALLOW_RE.search(match.group(2)):
+            return None
         if match.group(1).strip() == want:
-            return [
-                axiom.strip() for axiom in match.group(2).split(",") if axiom.strip()
-            ]
+            found = True
+            for axiom in match.group(2).split(","):
+                if axiom.strip():
+                    axioms[axiom.strip()] = None
     for match in _PRINT_AXIOMS_NONE_RE.finditer(text):
         if match.group(1).strip() == want:
-            return []
-    return None
+            found = True
+    return list(axioms) if found else None
 
 
 def _axiom_audit_verdict(
@@ -2180,12 +2248,16 @@ def _export_solved_files_locked(
                 (snapshot or {}).get("adapter_id") or PUTNAMBENCH_ADAPTER_ID
             )
             content = (
-                _build_theorem_project_solved_file(snapshot, proof, helpers)
+                _build_theorem_project_solved_file(
+                    snapshot, proof, helpers,
+                    max_heartbeats=_summary_max_heartbeats(s),
+                )
                 if snapshot is not None
                 else _build_solved_file(
                     name,
                     proof,
                     helpers,
+                    max_heartbeats=_summary_max_heartbeats(s),
                     answer_visibility=_summary_answer_visibility(s),
                     **_summary_visibility_flags(s),
                 )
@@ -2496,12 +2568,14 @@ def _export_solved_run_locked(
             helpers,
             extra_imports=tuple(dict.fromkeys(theory_source_imports)),
             extra_theory_sources=tuple(theory_sources),
+            max_heartbeats=_summary_max_heartbeats(summary),
         )
     else:
         content = _build_solved_file(
             problem_name,
             proof,
             helpers,
+            max_heartbeats=_summary_max_heartbeats(summary),
             answer_visibility=visibility,
             **visibility_flags,
             extra_imports=tuple(dict.fromkeys(theory_source_imports)),

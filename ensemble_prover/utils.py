@@ -182,7 +182,10 @@ def estimate_tokens(
                     else tiktoken.get_encoding("cl100k_base")
                 )
                 _TOKENIZER_CACHE[key] = enc
-            return len(enc.encode(s))
+            # Special-token text such as ``<|endoftext|>`` in prompt content
+            # is ordinary text to the provider. tiktoken raises on it by
+            # default, which silently fell back to a much lower estimate.
+            return len(enc.encode(s, disallowed_special=()))
         except Exception:
             pass
     return max(1, int(round(len(s) / _approx_chars_per_token(model))))

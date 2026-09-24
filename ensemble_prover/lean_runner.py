@@ -213,6 +213,100 @@ def _type_identity_probe_command(name: str, statement: str) -> str:
     )
 
 
+# Untrusted proof terms and helper streams are followed in the same file by
+# trusted audit commands (the scratch inventory ``run_cmd`` and
+# ``#print axioms``). Code that runs at elaboration time, or that registers an
+# elaborator, macro, or kernel/debug option, could change how those trusted
+# commands behave, so such constructs are rejected before Lean runs anything.
+_CHECK_META_ESCAPE_RE = re.compile(
+    r"(?<![\w.'])(?:run_tac|run_cmd|run_elab|run_meta|run_term_elab|by_elab|"
+    r"elab|elab_rules|macro|macro_rules|syntax|declare_syntax_cat|unsafe|"
+    r"initialize|builtin_initialize|#eval|#exit|eval%)(?![\w'])"
+)
+_CHECK_META_ATTRIBUTE_NAME_RE = re.compile(
+    r"(?<![\w.'])(?:command_elab|term_elab|tactic|macro|"
+    r"builtin_\w+|implemented_by|extern|init|export|env_extension|"
+    r"command_parser|term_parser|tactic_parser|norm_num|positivity|simproc|"
+    r"simproc_decl|delab|app_unexpander|app_delab|formatter|parenthesizer|"
+    r"code_action\w*|\w+_(?:parser|elab|delab|handler|unexpander))(?![\w'])"
+)
+_CHECK_META_OPTION_RE = re.compile(
+    r"set_option\s+(?:(?:debug|Elab|compiler|interpreter)\."
+    r"|(?:maxHeartbeats|maxRecDepth|synthInstance\.maxHeartbeats)\s+0+(?!\d))"
+)
+# Check kinds whose proof term is built by trusted internal code (never model
+# text) and whose result is non-authoritative evidence, not proof closure.
+# Their helper streams are still filtered.
+_TRUSTED_META_PROOF_CHECK_KINDS = frozenset({
+    "graph_native_formalization_parent_rewrite",
+})
+
+
+# Candidate code never needs Lean's own meta-level namespace; helpers that
+# declare instances for its types (``BEq Lean.Name``) could change how the
+# trusted inventory command behaves.
+_CHECK_META_NAMESPACE_RE = re.compile(
+    r"(?<![\w.'])(?:_root_\.)?Lean\.(?:Elab|Meta|Core|Environment|Kernel|Compiler|IR|"
+    r"Parser|Syntax|Macro|MacroM|Expr|Declaration|ConstantInfo|MessageData|Json|"
+    r"PersistentEnvExtension|EnvExtension|SimplePersistentEnvExtension|"
+    r"addDecl|addAndCompile|modifyEnv|setEnv|getEnv|evalExpr|mkConst|"
+    r"collectAxioms|logInfo|logError|throwError|ofReduceBool|trustCompiler|"
+    r"register\w*)(?![\w'])"
+    r"|(?<![\w.'])open(?:\s+(?:scoped\s+)?[\w.']+){0,40}?\s+(?:_root_\.)?Lean(?![\w'.])"
+    # Inside ``namespace Lean`` meta names resolve without the prefix.
+    r"|(?<![\w.'])namespace\s+(?:_root_\.)?Lean(?![\w'])"
+    # An instance for any Lean-namespace type could change how the trusted
+    # inventory command (which uses ``Lean.Name``/``Lean.Json``) behaves.
+    r"|(?:\binstance\b|@\[[^\]]*\binstance\b)[^=]{0,400}?(?<![\w.'])Lean\."
+)
+
+
+def _attribute_blocks(code: str) -> List[str]:
+    """Return the full text of every ``@[...]`` block, honoring nesting."""
+    blocks: List[str] = []
+    start = code.find("@[")
+    while start >= 0:
+        depth, index = 0, start + 1
+        while index < len(code):
+            if code[index] == "[":
+                depth += 1
+            elif code[index] == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+        blocks.append(code[start:index + 1])
+        start = code.find("@[", index + 1)
+    return blocks
+
+
+def _check_meta_escape_violation(*texts: str) -> str:
+    """Return the first forbidden meta-programming construct, or ``""``.
+
+    Patterns are matched on the raw text as well as on a comment/string-
+    stripped copy: the stripper does not model every lexical form (character
+    literals such as ``'"'``, raw strings, interpolation bodies), and a
+    desynchronized stripper must never hide code from the filter. A match
+    inside an honest comment or string only costs a rejection.
+    """
+    from .mini_theory.policy import _strip_comments_and_strings
+
+    for text in texts:
+        raw = str(text or "").replace("«", "").replace("»", "")
+        for code in (raw, _strip_comments_and_strings(raw)):
+            for pattern in (
+                _CHECK_META_ESCAPE_RE, _CHECK_META_OPTION_RE, _CHECK_META_NAMESPACE_RE,
+            ):
+                match = pattern.search(code)
+                if match:
+                    return match.group(0).strip()[:80]
+            for block in _attribute_blocks(code):
+                match = _CHECK_META_ATTRIBUTE_NAME_RE.search(block)
+                if match:
+                    return f"@[{match.group(0)}]"[:80]
+    return ""
+
+
 def _check_source_boundary_file(
     preamble: str, statement: str, proof: str, lemmas: str,
     *, goal_name: str, max_heartbeats: Optional[int] = None,
@@ -335,6 +429,43 @@ run_cmd do
     Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
 """
     return before, after
+
+
+def _check_goal_audit_block(goal_name: str) -> str:
+    """Trusted inventory for a helper-free check: the goal and its auxiliaries.
+
+    Unlike the delta blocks this needs no baseline literal of every preamble
+    constant (which overflows on large theorem-project preambles).
+    ``collectAxioms`` is transitive, so any axiom the proof introduced and
+    used is reached from the goal itself.
+    """
+    return f"""
+run_cmd do
+  let target := "{goal_name}"
+  let names := (← Lean.getEnv).constants.map₂.toList.map (·.1)
+    |>.filter fun name => name.components.any (·.toString == target)
+  if names.isEmpty then
+    Lean.throwError "scratch audit: goal declaration not found"
+  let allowed := [`propext, `Classical.choice, `Quot.sound]
+  let mut inventory : Array Lean.Json := #[]
+  let mut forbidden : Array Lean.Name := #[]
+  for name in names do
+    let axioms ← Lean.collectAxioms name
+    for axiomName in axioms do
+      unless allowed.contains axiomName do
+        if !forbidden.contains axiomName then forbidden := forbidden.push axiomName
+    inventory := inventory.push <| Lean.Json.mkObj [
+      ("name", Lean.toJson name.toString),
+      ("axioms", Lean.toJson (axioms.map Lean.Name.toString))]
+  Lean.logInfo ("ENSEMBLE_SCRATCH_AUDIT_ROOTS:" ++ (Lean.Json.arr inventory).compress)
+  unless forbidden.isEmpty do
+    Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
+"""
+
+
+# Some backends prefix info messages with ``file:line:col: info:``. Count the
+# marker anywhere: a forged extra copy then fails closed as a duplicate.
+_SCRATCH_AUDIT_MARKER_RE = re.compile(r"ENSEMBLE_SCRATCH_AUDIT_ROOTS:([^\r\n]*)")
 
 
 _PRINT_AXIOMS_DEPENDS_RE = re.compile(
@@ -1623,6 +1754,10 @@ class _BuiltLeanFile:
     goal_start_line: int
     lemma_block_start_line: int = 0
     axiom_audit_names: Tuple[str, ...] = ()
+    # True when the trusted ``ENSEMBLE_SCRATCH_AUDIT_ROOTS`` inventory is
+    # emitted. Text ``#print axioms`` reports can be forged by the audited
+    # proof itself, so every audited check must also carry the inventory.
+    audit_inventory: bool = False
 
 
 _ORACLE_FAMILY_SPECS: Tuple[Tuple[str, Tuple[_OracleTacticSpec, ...]], ...] = (
@@ -3037,6 +3172,10 @@ def _parse_complete_axiom_audit(
 
     reports: List[tuple[str, Tuple[str, ...]]] = []
     for match in _PRINT_AXIOMS_DEPENDS_RE.finditer(str(output or "")):
+        # A quote or report text inside a list means a forged, unclosed
+        # ``[`` swallowed a later real report: ambiguous, fail closed.
+        if re.search(r"'|\bdepend", str(match.group(2) or "")):
+            return {}, "ambiguous_axiom_report"
         reports.append(
             (
                 str(match.group(1) or "").strip(),
@@ -3058,23 +3197,41 @@ def _parse_complete_axiom_audit(
         for name in requested_names
         if str(name or "").strip()
     )
+    duplicated: List[str] = []
     for requested_name in requested:
-        matched_index = None
-        matched_axioms: Tuple[str, ...] = ()
-        for position, (reported, axioms) in enumerate(unused):
-            if _axiom_report_name_matches(reported, requested_name):
-                matched_index = position
-                matched_axioms = tuple(axioms)
-                break
-        if matched_index is None:
+        # A report naming a different requested declaration exactly belongs
+        # to that declaration, not to this one via namespace-suffix matching.
+        # A report naming (exactly or by namespace suffix) a different,
+        # more specific requested declaration belongs to that declaration.
+        more_specific = [
+            other for other in requested
+            if other != requested_name and other.endswith(f".{requested_name}")
+        ]
+        positions = [
+            position
+            for position, (reported, _axioms) in enumerate(unused)
+            if _axiom_report_name_matches(reported, requested_name)
+            and not (reported != requested_name and reported in requested)
+            and not any(
+                _axiom_report_name_matches(reported, other) for other in more_specific
+            )
+        ]
+        if not positions:
             missing.append(requested_name)
             continue
-        unused.pop(matched_index)
-        parsed[requested_name] = matched_axioms
+        if len(positions) > 1:
+            # The audited proof can print text (``trace``, ``logInfo``), so a
+            # second report for the same declaration may be a forged decoy
+            # placed before the real one. Never pick one; fail closed.
+            duplicated.append(requested_name)
+            continue
+        parsed[requested_name] = tuple(unused.pop(positions[0])[1])
+    if duplicated:
+        return parsed, "duplicate_axiom_report:" + ",".join(duplicated)
     if missing:
         return parsed, "missing_axiom_report:" + ",".join(missing)
     if require_inventory:
-        inventories = re.findall(r"(?m)^ENSEMBLE_SCRATCH_AUDIT_ROOTS:(.*)$", output)
+        inventories = _SCRATCH_AUDIT_MARKER_RE.findall(str(output or ""))
         if len(inventories) != 1:
             return parsed, "missing_or_duplicate_axiom_inventory"
         try:
@@ -3098,7 +3255,12 @@ def _parse_complete_axiom_audit(
         for expected in requested:
             if not any(_axiom_report_name_matches(actual, expected) for actual in dynamic):
                 return parsed, "incomplete_axiom_inventory:" + expected
-        parsed.update(dynamic)
+        # Union, never override: ``#print axioms`` is compiled code that user
+        # instances cannot influence, while the inventory ``run_cmd`` is
+        # elaborated in the candidate's environment. Neither may clear an
+        # axiom the other reports (dirty wins).
+        for name, inventory_axioms in dynamic.items():
+            parsed[name] = tuple(dict.fromkeys((*parsed.get(name, ()), *inventory_axioms)))
     return parsed, ""
 
 
@@ -5003,11 +5165,14 @@ class LeanRunner:
         # declared inside it is unavailable to the following example.
         audit_requested = axiom_audit_names is not None
         delta_before, delta_after = ("", "")
-        if audit_requested and lemma_block:
+        if audit_requested:
             preamble = _append_imports_to_preamble(preamble, ["Lean"])
-            delta_before, delta_after = _check_delta_audit_blocks(
-                hash_text(preamble + "\0" + lemma_block + "\0" + statement + "\0" + proof_code)
-            )
+            if lemma_block:
+                delta_before, delta_after = _check_delta_audit_blocks(
+                    hash_text(preamble + "\0" + lemma_block + "\0" + statement + "\0" + proof_code)
+                )
+            else:
+                delta_after = _check_goal_audit_block(goal_name)
         goal_line = (
             # ``check`` also supports constructive/non-Prop targets, so a
             # theorem declaration is not universally legal. ``opaque`` has
@@ -5093,6 +5258,7 @@ class LeanRunner:
             goal_start_line=goal_start_line,
             lemma_block_start_line=lemma_block_start_line,
             axiom_audit_names=complete_audit_names,
+            audit_inventory=bool(delta_after),
         )
 
     async def _run_via_persistent(
@@ -5791,7 +5957,28 @@ class LeanRunner:
         file_path = None
         execution = None
         write_error = None
-        if source_boundary_required:
+        meta_violation = (
+            _check_meta_escape_violation(
+                *(
+                    ()
+                    if check_kind in _TRUSTED_META_PROOF_CHECK_KINDS
+                    else (proof_code,)
+                ),
+                *(lemmas or ()),
+            )
+            if source_boundary_required
+            else ""
+        )
+        if meta_violation:
+            execution = _BackendExecutionResult(
+                returncode=1,
+                output=(
+                    f"{goal_name}.lean:1:0: error: scratch source boundary: forbidden "
+                    f"meta-programming construct in candidate: {meta_violation}"
+                ),
+                backend="source_policy",
+            )
+        elif source_boundary_required:
             boundary_content = _check_source_boundary_file(
                 self._resolve_preamble(preamble_override, proof_code=proof_code),
                 statement, proof_code, "\n".join(lemmas or ()),
@@ -5853,12 +6040,13 @@ class LeanRunner:
         unexpected_axioms: Tuple[str, ...] = ()
         axiom_audit_error = ""
         if returncode == 0 or (
-            lemma_block and re.search(r"(?m)^ENSEMBLE_SCRATCH_AUDIT_ROOTS:", out)
+            built.audit_inventory
+            and _SCRATCH_AUDIT_MARKER_RE.search(str(out or ""))
         ):
             axiom_audit, axiom_audit_error = _parse_complete_axiom_audit(
                 out,
                 built.axiom_audit_names,
-                require_inventory=bool(lemma_block),
+                require_inventory=built.audit_inventory,
             )
             all_axioms = tuple(
                 sorted(

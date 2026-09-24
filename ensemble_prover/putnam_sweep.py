@@ -402,6 +402,65 @@ def build_command(
     ]
 
 
+def build_resume_command(
+    checkpoint_dir: Path, output_dir: Path, mini_args: Sequence[str]
+) -> list[str]:
+    """Continue an interrupted attempt's checkpoint into a new output dir."""
+    base = build_command(Path("unused"), output_dir, mini_args)
+    return [
+        sys.executable,
+        "-m",
+        "ensemble_prover.mini_prover",
+        "--resume-from",
+        str(Path(checkpoint_dir).resolve()),
+        *base[base.index("--output-dir"):],
+    ]
+
+
+def _resumable_checkpoint_dir(
+    row: dict[str, Any], manifest_args: Sequence[str] | None = None,
+) -> Path | None:
+    """Return the last interrupted attempt dir when its checkpoint can resume.
+
+    Resume refuses a checkpoint written by different executor source unless
+    the operator explicitly approves that hash, so only an exact match is
+    resumed automatically; anything else starts a fresh attempt as before.
+    """
+    if not row["attempts"] or row["attempts"][-1].get("status") != "interrupted":
+        return None
+    attempt_dir = Path(row["attempts"][-1].get("output_dir") or "")
+    try:
+        record = json.loads((attempt_dir / "attempt_checkpoint.json").read_text())
+        saved_hash = record["identity"]["executor_source_hash"]
+        from .mini_checkpoint_cli import executor_source_fingerprint
+
+        current_hash = executor_source_fingerprint()
+    except Exception:
+        return None
+    if type(saved_hash) is not str or not saved_hash or saved_hash != current_hash:
+        return None
+    # Resume rejects explicit overrides that differ from the saved policy
+    # (answer preparation rewrites budgets to their remaining amounts). A
+    # rejected resume would end the row as terminal ``failed``, so only
+    # resume when the exact command the sweep will run is accepted.
+    if manifest_args is not None:
+        # Importing mini_prover loads ``.env`` into os.environ; keep the
+        # driver's environment unchanged so children read ``.env`` themselves.
+        saved_environ = dict(os.environ)
+        try:
+            from .mini_prover import _build_argparser
+            from .mini_checkpoint_cli import resolve_resume_args
+
+            command = build_resume_command(attempt_dir, attempt_dir, manifest_args)
+            resolve_resume_args(_build_argparser().parse_args(command[3:]))
+        except (Exception, SystemExit):
+            return None
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_environ)
+    return attempt_dir
+
+
 def build_manifest(
     *,
     source_dir: Path,
@@ -982,6 +1041,152 @@ def _manifest_lock(path: Path) -> Iterator[None]:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+def _current_boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _process_group_gone(pgid: Any) -> bool:
+    """True only when no process remains in the CLI's own process group."""
+    if type(pgid) is not int or pgid <= 1:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _flock_held(path: Path) -> bool:
+    """True when any process holds a flock on *path*.
+
+    Reads ``/proc/locks`` by inode so the probe never takes the lock itself
+    (a probing flock could make a starting writer fail its own non-blocking
+    acquisition). Falls back to a shared, non-blocking probe on a read-only
+    descriptor where ``/proc/locks`` is unavailable.
+    """
+    try:
+        info = path.stat()
+    except OSError:
+        return False
+    device = f"{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}:{info.st_ino}"
+    try:
+        for line in Path("/proc/locks").read_text().splitlines():
+            fields = line.split()
+            if "FLOCK" in fields and any(
+                field.lower() == device.lower() for field in fields
+            ):
+                return True
+        return False
+    except OSError:
+        pass
+    try:
+        with path.open("rb") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return True
+    return False
+
+
+def _attempt_dir_in_use(output_dir: Any) -> bool:
+    """True when a live process still owns or references the attempt.
+
+    Proof and answer-preparation workers run in their own sessions, so the
+    CLI's process group vanishing does not prove they were reaped. Two
+    checks: the attempt checkpoint's ``writer.lock`` must be free (an
+    orphaned proof worker holds it), and no readable process may reference
+    the attempt (or its ``.answer_preparation`` sibling) by command line,
+    working directory, or open file. Credential-bearing workers are made
+    non-dumpable, which hides their cwd/fds; the lock and command line still
+    cover them. Orphaned Lean children of a dead worker are not detected;
+    they only spend CPU and cannot write attempt state.
+    """
+    root = str(output_dir or "").rstrip("/")
+    if not root:
+        return True
+    try:
+        record = json.loads((Path(root) / "attempt_checkpoint.json").read_text())
+        lock_path = Path(record["registry_root"]) / "writer.lock"
+    except (OSError, ValueError, KeyError, TypeError):
+        lock_path = None
+    if lock_path is not None and lock_path.exists() and _flock_held(lock_path):
+        return True
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return True
+    own = os.getpid()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == own:
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace"
+            )
+            if root in cmdline:
+                return True
+            if os.readlink(entry / "cwd").startswith(root):
+                return True
+            for fd in (entry / "fd").iterdir():
+                try:
+                    if os.readlink(fd).startswith(root):
+                        return True
+                except OSError:
+                    continue
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            # Another user's process cannot be one of this sweep's workers.
+            continue
+        except OSError:
+            continue
+    return False
+
+
+def _reconcile_dead_running_attempts(manifest: dict[str, Any]) -> bool:
+    """Mark ``running`` rows whose owner provably died as ``interrupted``.
+
+    A host crash or SIGKILL of the driver leaves ``running`` behind. Cleanup
+    is provable when the host rebooted since the attempt started (every
+    process died), or when the CLI's process group, which it leads via
+    ``start_new_session``, has no members left. Anything else stays
+    unconfirmed so the caller keeps refusing new work.
+    """
+    boot_id = _current_boot_id()
+    changed = False
+    for row in manifest["queue"]:
+        if row["status"] != "running" or not row["attempts"]:
+            continue
+        attempt = row["attempts"][-1]
+        if attempt.get("status") != "running":
+            continue
+        started_boot = attempt.get("boot_id")
+        if boot_id and started_boot and started_boot != boot_id:
+            reason = "host_restarted"
+        elif not started_boot or started_boot == boot_id:
+            if not _process_group_gone(attempt.get("cli_pid")):
+                continue
+            if _attempt_dir_in_use(attempt.get("output_dir")):
+                continue
+            reason = "cli_process_group_gone"
+        else:
+            continue
+        attempt["status"] = "interrupted"
+        attempt["cleanup_confirmed"] = True
+        attempt["reconciled_reason"] = reason
+        attempt["reconciled_at"] = datetime.now(timezone.utc).isoformat()
+        row["status"] = "interrupted"
+        changed = True
+    return changed
+
+
 def run_sweep(
     manifest_path: Path,
     *,
@@ -992,6 +1197,8 @@ def run_sweep(
     manifest_path = Path(manifest_path).resolve()
     with _manifest_lock(manifest_path):
         manifest = load_manifest(manifest_path)
+        if _reconcile_dead_running_attempts(manifest):
+            save_manifest(manifest_path, manifest)
         if manifest.get("prewarm_cleanup_unconfirmed"):
             raise ValueError(
                 "previous Mathlib prewarm cleanup is unconfirmed; refusing to start new work"
@@ -1053,15 +1260,23 @@ def run_sweep(
                 / f"{index + 1:04d}_{row['problem_id']}"
                 / f"attempt_{len(row['attempts']) + 1:03d}"
             )
+            resume_dir = _resumable_checkpoint_dir(row, manifest["mini_args"])
             output_dir.mkdir(parents=True, exist_ok=False)
-            command = build_command(source, output_dir, manifest["mini_args"])
+            command = (
+                build_resume_command(resume_dir, output_dir, manifest["mini_args"])
+                if resume_dir is not None
+                else build_command(source, output_dir, manifest["mini_args"])
+            )
             attempt = {
                 "output_dir": str(output_dir),
                 "console_log": str(console_log_path(output_dir)),
                 "command": command,
                 "started_at": datetime.now(timezone.utc).isoformat(),
+                "boot_id": _current_boot_id(),
                 "status": "running",
             }
+            if resume_dir is not None:
+                attempt["resumed_from"] = str(resume_dir)
             row["attempts"].append(attempt)
             row["status"] = "running"
             save_manifest(manifest_path, manifest)

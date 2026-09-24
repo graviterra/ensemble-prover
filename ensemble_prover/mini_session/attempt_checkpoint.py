@@ -359,6 +359,18 @@ class AttemptCheckpointRegistry:
             self._publication_failed = True
             raise
         self._sequence = next_sequence
+        # Resume reads only the shared head, which now names this snapshot.
+        # Each snapshot is a full copy of the attempt state, so keeping every
+        # superseded one grows disk use quadratically over a long attempt.
+        # Only the snapshot this writer itself published last is removed; a
+        # failed unlink merely leaves a stale file behind.
+        previous = getattr(self, "_last_published_snapshot", None)
+        self._last_published_snapshot = snapshot_path
+        if previous is not None and previous != snapshot_path:
+            try:
+                previous.unlink()
+            except OSError:
+                pass
 
     @property
     def is_resume(self) -> bool:

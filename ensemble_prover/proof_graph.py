@@ -4305,6 +4305,35 @@ def _graph_applied_leading_identifier(type_text: str) -> str:
     return head if applied else ""
 
 
+_GRAPH_RELATION_TOKENS = ("≠", "≤", "≥", "∈", "∉", "⊆", "⊂", "⊇", "⊃", "∣", "↔", "<", ">", "=")
+
+
+def _graph_has_top_level_relation(text: str) -> bool:
+    depth = 0
+    body = str(text or "")
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char in "([{⟨":
+            depth += 1
+        elif char in ")]}⟩":
+            depth -= 1
+        elif depth == 0 and char in "≠≤≥∈∉⊆⊂⊇⊃∣↔<>=":
+            # Skip ``:=``, ``=>``, ``->``, ``<-``, ``↦`` style tokens.
+            previous = body[index - 1] if index else ""
+            following = body[index + 1] if index + 1 < len(body) else ""
+            if not (
+                # ``ℝ≥0`` / ``ℝ≥0∞`` (NNReal / ENNReal) are types, not relations.
+                (char == "≥" and previous in "ℝℚℤℕ" and following == "0")
+                or (char == "=" and (previous in ":=<>!" or following in "=>"))
+                or (char == ">" and previous in "-=")
+                or (char == "<" and following in "-=")
+            ):
+                return True
+        index += 1
+    return False
+
+
 def _graph_binder_type_sort_hint(
     type_text: str,
     *,
@@ -4357,6 +4386,10 @@ def _graph_binder_type_sort_hint(
         # ``p : Prop`` and ``α : Type`` declare objects in a sort; they are
         # not proofs of the sort expression itself.
         return "type"
+    # A relation at depth 0 (``Finset.card s = 3``, ``Set.Icc 0 1 ⊆ S``)
+    # makes the binder a proposition whatever its head symbol looks like.
+    if _graph_has_top_level_relation(body):
+        return "prop"
     head, applied = _graph_type_leading_identifier(body)
     if head and _graph_head_looks_like_non_prop_class(head):
         return "type"
@@ -4687,7 +4720,7 @@ def _graph_looks_like_proof_premise_type(
         r"^(?:Set|Finset|List|Multiset|Option|Array|Seq|Fin|ZMod|Polynomial|"
         r"Matrix|Vector|Subtype|ULift|PLift|WithTop|WithBot|OrderDual|"
         r"Additive|Multiplicative|Ideal|Submodule|Subgroup|Subsemiring|"
-        r"Subring|Subfield|Equiv|LinearEquiv|RingEquiv|OrderIso|Type|Sort)\b",
+        r"Subring|Subfield|Equiv|LinearEquiv|RingEquiv|OrderIso|Type|Sort)\b(?!\.)",
         compact,
     ):
         return False
@@ -4698,7 +4731,7 @@ def _graph_looks_like_proof_premise_type(
         r"Semiring|CommSemiring|Field|DivisionRing|LinearOrder|PartialOrder|"
         r"Preorder|Lattice|DistribLattice|LinearOrderedRing|"
         r"LinearOrderedField|OrderedRing|OrderedSemiring|TopologicalSpace|"
-        r"MetricSpace|NormedRing|NormedField|NormedSpace|Module|Algebra)\b",
+        r"MetricSpace|NormedRing|NormedField|NormedSpace|Module|Algebra)\b(?!\.)",
         compact,
     ):
         return False
@@ -4720,7 +4753,7 @@ def _graph_looks_like_proof_premise_type(
                 r"Polynomial|MvPolynomial|Matrix|Vector|Subtype|ULift|PLift|WithTop|WithBot|"
                 r"OrderDual|Additive|Multiplicative|Ideal|Submodule|Subgroup|"
                 r"Subsemiring|Subring|Subfield|Equiv|LinearEquiv|RingEquiv|"
-                r"OrderIso)\b",
+                r"OrderIso)\b(?!\.)",
                 codomain,
             )
             or re.fullmatch(r"(?:Type|Sort|Prop)(?:\s+\d+|\s+u)?", codomain)
@@ -4736,7 +4769,7 @@ def _graph_looks_like_proof_premise_type(
         return True
     if re.search(
         r"\b(?:Odd|Even|Prime|Nat\.Prime|Irreducible|Nonempty|Pairwise|"
-        r"Monotone|StrictMono|Injective|Surjective|Bijective|Continuous)\b",
+        r"Monotone|StrictMono|Injective|Surjective|Bijective|Continuous)\b(?!\.)",
         compact,
     ):
         return True
@@ -4890,6 +4923,61 @@ def graph_statement_leading_contract(
         )
     )
     return body, bound_names, binder_premises
+
+
+def graph_statement_keyed_contract(statement: str) -> Tuple[str, Tuple[str, ...]]:
+    """Contract text that keeps hypothesis binders, in telescope order.
+
+    Data binders before the first hypothesis are stripped (their names are
+    returned for alpha-normalization). From the first hypothesis on, the
+    telescope is rendered as Lean would read its arrow spelling:
+    ``(h : A)`` becomes ``A →``, a later data binder stays ``∀ y : T,``, and
+    a later relation binder ``∀ n ≥ 1`` becomes ``∀ n, n ≥ 1 →``. Nothing is
+    moved across an arrow, so no bound name can be captured, and
+    ``∀ n ≥ 1, ∀ k, P`` keys exactly like ``∀ n, n ≥ 1 → ∀ k, P``.
+    """
+
+    body, records = _graph_leading_binder_analysis(statement)
+    leading_names: List[str] = []
+    parts: List[str] = []
+    seen_hypothesis = False
+    for raw, names, type_text, is_proof, ambiguous in records:
+        # The classifier leaves many Prop hypotheses (``Irrational y``,
+        # ``Nat.Coprime a b``, user predicates) as non-proof. Keeping a binder
+        # as a premise only makes the key stricter, so treat ambiguous or
+        # hypothesis-named binders with a proposition-like type as premises.
+        if not is_proof and names and type_text and (
+            ambiguous or _graph_looks_like_proof_premise_type(type_text, names)
+        ):
+            is_proof = True
+        relation_binder = bool(
+            is_proof
+            and type_text
+            and _graph_top_level_colon_index(_graph_unwrap_binder_group(raw)) < 0
+        )
+        if not is_proof:
+            if not names:
+                continue  # anonymous instance binder: resolved by elaboration
+            if seen_hypothesis:
+                typed = f" : {type_text}" if type_text else ""
+                parts.append(f"∀ {' '.join(names)}{typed},")
+            else:
+                leading_names.extend(names)
+            continue
+        if relation_binder:
+            if seen_hypothesis:
+                parts.append(f"∀ {' '.join(names)}, {premise_as_arrow_operand(type_text)} →")
+            else:
+                leading_names.extend(names)
+                parts.append(f"{premise_as_arrow_operand(type_text)} →")
+        else:
+            leading_names.extend(names)
+            parts.append(f"{premise_as_arrow_operand(type_text)} →")
+        seen_hypothesis = True
+    if not parts:
+        return body, tuple(dict.fromkeys(leading_names))
+    keyed = " ".join((*parts, premise_arrow_body(body)))
+    return keyed, tuple(dict.fromkeys(leading_names))
 
 
 def graph_statement_forall_application_entries(
@@ -5660,9 +5748,7 @@ def _graph_support_candidates(
         statement_text: str,
         names: Sequence[str],
     ) -> None:
-        item_body, item_names = _graph_strip_leading_forall_binders_with_names(
-            statement_text
-        )
+        item_body, item_names = _graph_strip_keeping_premises(statement_text)
         item_bound_names = tuple(dict.fromkeys(tuple(names or ()) + item_names))
         add_candidate(item_body, item_bound_names)
         if (
@@ -5675,9 +5761,7 @@ def _graph_support_candidates(
         else:
             items = _graph_split_top_level_conjunctions(item_body)
         for item in items:
-            conjunct_body, conjunct_names = (
-                _graph_strip_leading_forall_binders_with_names(item)
-            )
+            conjunct_body, conjunct_names = _graph_strip_keeping_premises(item)
             add_candidate(
                 conjunct_body,
                 tuple(dict.fromkeys(item_bound_names + conjunct_names)),
@@ -5715,7 +5799,7 @@ def _graph_support_candidates(
                 if len(iff_implication_parts) >= 2:
                     for premise in iff_implication_parts[:-1]:
                         premise_body, premise_names = (
-                            _graph_strip_leading_forall_binders_with_names(premise)
+                            _graph_strip_keeping_premises(premise)
                         )
                         add_candidate(
                             premise_body,
@@ -5739,6 +5823,79 @@ def _graph_strip_leading_forall_binders(text: str) -> str:
     return body
 
 
+_PREMISE_LEADING_BINDER_RE = re.compile(r"(?:∀|∃!?|Π|fun\b|λ|forall\b|exists\b)")
+
+
+def premise_arrow_body(body: str) -> str:
+    """Render the conclusion that follows inserted ``premise →`` arrows.
+
+    ``↔`` binds looser than ``→`` in Lean, so a conclusion with a top-level
+    ``↔`` must be parenthesized: ``(h : A), P ↔ Q`` means ``A → (P ↔ Q)``.
+    """
+    text = str(body or "").strip()
+    depth = 0
+    for index, char in enumerate(text):
+        if char in "([{⟨":
+            depth += 1
+        elif char in ")]}⟩":
+            depth -= 1
+        elif depth == 0 and (char == "↔" or text.startswith("<->", index)):
+            return f"({text})"
+    return text
+
+
+def premise_as_arrow_operand(premise: str) -> str:
+    """Render a binder premise as the left operand of ``→``.
+
+    Redundant outer parentheses are removed, then parentheses are added only
+    where Lean needs them: a top-level ``→``/``↔`` or a leading binder
+    (``∀``, ``∃``, ``fun``) whose body would otherwise swallow the arrow.
+    This matches how an arrow spelling of the same statement is written.
+    """
+    text = str(premise or "").strip()
+    while True:
+        stripped = _graph_strip_balanced_outer_parens(text).strip()
+        if stripped == text:
+            break
+        text = stripped
+    depth = 0
+    needs_parens = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in "([{⟨":
+            depth += 1
+        elif char in ")]}⟩":
+            depth -= 1
+        elif depth == 0 and (
+            char in "→↔$"
+            or text.startswith("->", index)
+            or text.startswith("<->", index)
+            # Low-precedence application operators extend over a following
+            # arrow: ``f <| B → C`` reads ``f (B → C)``.
+            or text.startswith("<|", index)
+            or text.startswith("|>", index)
+            # A binder, ``if``, or ``let`` at depth 0 (leading, after ``¬``,
+            # or after ``∧``/``∨``) extends to the end and would swallow the
+            # following ``→``.
+            or (
+                (index == 0 or not (text[index - 1].isalnum() or text[index - 1] in "_'."))
+                and _PREMISE_LEADING_BINDER_RE.match(text, index)
+            )
+            or re.match(r"(?:if|let|have|show|match)\b", text[index:])
+            and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] in "_'."))
+        ):
+            needs_parens = True
+            break
+        index += 1
+    return f"({text})" if needs_parens else text
+
+
+def _graph_strip_keeping_premises(text: str) -> Tuple[str, Tuple[str, ...]]:
+    """Strip leading data binders, keeping hypothesis binders in order."""
+    return graph_statement_keyed_contract(text)
+
+
 def _graph_strip_leading_forall_binders_with_names(
     text: str,
 ) -> Tuple[str, Tuple[str, ...]]:
@@ -5758,7 +5915,7 @@ def _graph_strip_leading_forall_binders_with_names(
 
 
 def _graph_contract_norm(text: str) -> str:
-    stripped = _graph_strip_leading_forall_binders(text)
+    stripped, _names = _graph_strip_keeping_premises(text)
     stripped = _graph_normalize_numeric_casts_for_contract(stripped)
     stripped = re.sub(r"\((\d+)\s*:\s*[^()]+\)", r"\1", stripped)
     return re.sub(r"\s+", "", stripped)
@@ -5882,7 +6039,20 @@ def _graph_contract_alpha_replace_scoped(
                 binder = raw[tail_start : tail_start + comma]
                 body = raw[tail_start + comma + 1 :]
                 local_mapping = dict(mapping)
-                next_index = len(local_mapping)
+                # Allocate past every fresh name already in scope. ``len``
+                # repeats a name when an inner binder shadows an outer one,
+                # conflating ``P x z`` with ``P z z``.
+                next_index = 1 + max(
+                    (
+                        int(value[7:-2])
+                        for value in local_mapping.values()
+                        if isinstance(value, str)
+                        and value.startswith("__bound")
+                        and value.endswith("__")
+                        and value[7:-2].isdigit()
+                    ),
+                    default=-1,
+                )
                 for name in _graph_binder_names_from_chunk(binder):
                     local_mapping[name] = f"__bound{next_index}__"
                     next_index += 1
@@ -8960,9 +9130,7 @@ class ProofGraph:
             )
             entries: List[Dict[str, Any]] = []
             for premise in premises:
-                premise_text, premise_names = (
-                    _graph_strip_leading_forall_binders_with_names(premise)
-                )
+                premise_text, premise_names = _graph_strip_keeping_premises(premise)
                 premise_bound_names = tuple(
                     dict.fromkeys(tuple(bound_names) + tuple(premise_names))
                 )
@@ -13887,18 +14055,21 @@ class ProofGraph:
             norm = _graph_contract_norm(support)
             if norm:
                 support_keys.add(norm)
+            # Pre-strip keeping hypothesis premises; the alpha normalizer's
+            # own strip drops them (it is also a binder-analysis primitive).
+            support_body, support_names = _graph_strip_keeping_premises(support)
             alpha_norm = _graph_contract_alpha_norm(
-                support,
-                context_bound_names=support_bound_names,
+                support_body,
+                context_bound_names=tuple(
+                    dict.fromkeys(tuple(support_bound_names) + support_names)
+                ),
             )
             if alpha_norm:
                 support_alpha_norms.add(alpha_norm)
         open_premises: List[str] = []
         open_keys: List[str] = []
         for premise in premises:
-            premise_text, premise_names = _graph_strip_leading_forall_binders_with_names(
-                premise
-            )
+            premise_text, premise_names = _graph_strip_keeping_premises(premise)
             premise_bound_names = tuple(dict.fromkeys(bound_names + premise_names))
             key = graph_statement_key(premise_text)
             norm = _graph_contract_norm(premise_text)

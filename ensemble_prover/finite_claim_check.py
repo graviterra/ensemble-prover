@@ -1117,9 +1117,12 @@ async def _lean_check_negation(
             kwargs = {key: value for key, value in kwargs.items() if key in params}
     except (TypeError, ValueError):
         pass
+    # ``native_decide`` is deliberately absent: its proofs depend on
+    # ``Lean.ofReduceBool`` and always fail the axiom audit, and ``first``
+    # would commit to it and never try ``norm_num``.
     result = check(
         f"¬ ({statement})",
-        "by\n  first\n  | decide +kernel\n  | native_decide\n  | norm_num",
+        "by\n  first\n  | decide +kernel\n  | norm_num",
         list(lemmas),
         **kwargs,
     )

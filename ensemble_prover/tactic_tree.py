@@ -1623,7 +1623,9 @@ async def _evaluate_tactic_candidate(
             features=features,
             parse_result=parse_result,
             ok=is_complete,
-            completion_pending=bool(is_complete or not goals),
+            completion_pending=bool(
+                is_complete or (not goals and not semantic_prefix_failure())
+            ),
         )
         if not (
             not bool(getattr(parse_result, "ok", False))
@@ -1649,7 +1651,10 @@ async def _evaluate_tactic_candidate(
         return None, None
 
     # ---- completion check ------------------------------------------------
-    if is_complete or not goals:
+    # Lean prints no goals when a tactic aborts with an error (unknown
+    # identifier, parse error, ``exact`` mismatch), so an empty goal list is
+    # only a completion candidate when the prefix did not semantically fail.
+    if is_complete or (not goals and not semantic_prefix_failure()):
         proof = tactics_to_proof(child_tactics)
         if durable_candidate_fn is not None:
             await durable_candidate_fn(

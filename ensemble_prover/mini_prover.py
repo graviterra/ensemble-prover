@@ -16939,6 +16939,11 @@ async def _main_async(args: argparse.Namespace) -> int:
                     ),
                     "lean_project_dir": args.lean_project_dir,
                     "lean_timeout_s": int(args.lean_timeout_s),
+                    # The solved export must replay under the same budget the
+                    # session verified with, or a checked proof times out there.
+                    "lean_max_heartbeats": int(
+                        getattr(args, "lean_max_heartbeats", 1600000) or 1600000
+                    ),
                     "proof_dossier": (
                         proof_dossier.to_record() if proof_dossier else None
                     ),

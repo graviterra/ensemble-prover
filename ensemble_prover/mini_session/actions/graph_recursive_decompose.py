@@ -22,7 +22,7 @@ from ensemble_prover.mini_recursive_identity import (
 from dataclasses import asdict, fields as dataclass_fields
 from dataclasses import is_dataclass, replace as dataclass_replace
 from enum import Enum
-from typing import Any, Callable, ClassVar, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, FrozenSet, List, Optional, Sequence, Tuple
 
 from ..action import MiniOutcome
 from ..state_codec import StateSnapshotCompatibilityError
@@ -1227,7 +1227,25 @@ class GraphRecursiveDecomposeAction:
             count += 1
         return count
 
-    def _scale_sub_config(self, depth: int) -> Any:
+    def _inherited_ancestor_keys(self) -> tuple[str, ...]:
+        """Ancestor statement keys of enclosing graph passes in parent sessions.
+
+        A child session gets a fresh, empty ``graph_recursive_decompose_stack``,
+        so the parent's ancestors ride on the scaled config the child action is
+        registered with. The attribute is not a dataclass field, so config
+        fingerprints and checkpoint identities are unchanged.
+        """
+        keys = getattr(self.config, "_graph_recursive_ancestor_keys", ())
+        return tuple(str(key) for key in keys or () if str(key or "").strip())
+
+    def _graph_hop_depth(self, stack_depth: int) -> int:
+        # A child's config was already scaled once by its parent's pass, so
+        # the child's own sub-pass is one further hop, not depth 0 again.
+        return max(0, int(stack_depth)) + (1 if self._inherited_ancestor_keys() else 0)
+
+    def _scale_sub_config(
+        self, depth: int, ancestor_keys: Optional[Sequence[str]] = None,
+    ) -> Any:
         """Return a config for the recursive sub-pass with reduced budgets."""
         base = self.config
         if base is None:
@@ -1244,6 +1262,10 @@ class GraphRecursiveDecomposeAction:
             scaled = dataclass_replace(base, passes=1, max_claims=scaled_claims)
         except Exception:
             scaled = base
+        if ancestor_keys is not None and scaled is not base:
+            object.__setattr__(
+                scaled, "_graph_recursive_ancestor_keys", tuple(ancestor_keys)
+            )
         return scaled
 
     def _internal_turn_budget_exceeded(self, depth: int) -> bool:
@@ -1547,15 +1569,16 @@ class GraphRecursiveDecomposeAction:
                 session, "mini_session_graph_recursive_decompose_recursion_cap_hit"
             )
             return False
-        # Cycle suppression by graph_statement_key.
+        # Cycle suppression by graph_statement_key, including ancestors from
+        # enclosing passes in parent sessions.
         key = statement_key
-        if key and key in stack:
+        if key and (key in stack or key in self._inherited_ancestor_keys()):
             self._bump_metric(
                 session, "mini_session_graph_recursive_decompose_cycle_suppressed"
             )
             return False
         # Total-internal-turn cap (B-P3 context-window guard).
-        if self._internal_turn_budget_exceeded(len(stack)):
+        if self._internal_turn_budget_exceeded(self._graph_hop_depth(len(stack))):
             self._bump_metric(
                 session, "mini_session_graph_recursive_decompose_recursion_cap_hit"
             )
@@ -1771,7 +1794,14 @@ class GraphRecursiveDecomposeAction:
                 f"{int(getattr(session, 'iteration', 0) or 0)}"
             )
 
-        sub_config = self._scale_sub_config(depth_before)
+        sub_config = self._scale_sub_config(
+            self._graph_hop_depth(depth_before),
+            ancestor_keys=(
+                *self._inherited_ancestor_keys(),
+                *(str(item) for item in stack),
+                ancestor_key,
+            ),
+        )
         parent_problem_text = str(
             getattr(getattr(session, "problem", None), "docstring", "") or ""
         ).strip()

@@ -195,6 +195,66 @@ def _declared_names_from_binders(binders: Sequence[str]) -> set[str]:
     return declared
 
 
+# Lean prints inaccessible locals as ``h✝``, ``a✝¹``, ``inst✝²``. Neither
+# ``✝`` nor superscript digits are identifier syntax, so these names must be
+# renamed consistently in binders, hypothesis types, and the subgoal body.
+_HIDDEN_LOCAL_RE = re.compile(r"[^\s:()\[\]{},]*✝[⁰¹²³⁴⁵⁶⁷⁸⁹]*")
+_RELATION_TOKEN_RE = re.compile(r"[<>≤≥=≠∈∉∣⊆⊂→↔∧∨¬]")
+
+
+def _looks_like_class_type(type_text: str) -> bool:
+    text = str(type_text or "").strip()
+    return bool(text) and text[0].isupper() and not _RELATION_TOKEN_RE.search(text)
+
+
+def _hidden_local_renames(goal_state: Optional[LeanGoalState]) -> dict[str, str]:
+    hypotheses = [str(h or "") for h in getattr(goal_state, "hypotheses", None) or []]
+    taken = {
+        name
+        for hyp in hypotheses
+        for name in hyp.split(":", 1)[0].split()
+        if "✝" not in name
+    }
+    renames: dict[str, str] = {}
+    for hyp in hypotheses:
+        for name in hyp.split(":", 1)[0].split():
+            if not _HIDDEN_LOCAL_RE.fullmatch(name) or name in renames:
+                continue
+            base = re.sub(r"[✝⁰¹²³⁴⁵⁶⁷⁸⁹]", "", name)
+            base = re.sub(r"[^A-Za-z0-9_]+", "_", base).strip("_") or "h"
+            fresh, suffix = f"{base}_hidden", 2
+            while fresh in taken:
+                fresh, suffix = f"{base}_hidden_{suffix}", suffix + 1
+            taken.add(fresh)
+            renames[name] = fresh
+    return renames
+
+
+def _apply_hidden_renames(text: str, renames: dict[str, str]) -> str:
+    # Longest names first, and never inside a longer hidden name
+    # (``h✝`` must not rewrite the prefix of ``h✝¹``).
+    for hidden in sorted(renames, key=len, reverse=True):
+        text = re.sub(
+            rf"(?<![\w.'✝]){re.escape(hidden)}(?![\w'✝⁰¹²³⁴⁵⁶⁷⁸⁹])",
+            renames[hidden],
+            text,
+        )
+    return text
+
+
+def _instance_binder_type_key(binder: str) -> str:
+    """Normalized class type of an instance binder (``[inst : Mul (G)]``)."""
+    text = str(binder or "").strip()
+    if not (text.startswith("[") and text.endswith("]")):
+        return ""
+    inner = text[1:-1]
+    named = re.match(r"\s*[^\W\d][\w']*\s*:(?!=)", inner)
+    if named:
+        inner = inner[named.end():]
+    inner = re.sub(r"\(\s*([\w.']+)\s*\)", r"\1", inner)
+    return " ".join(inner.split())
+
+
 def _goal_hypothesis_binders(
     goal_state: Optional[LeanGoalState],
 ) -> tuple[list[str], set[str]]:
@@ -202,10 +262,38 @@ def _goal_hypothesis_binders(
         return [], set()
     out: list[str] = []
     blocked_assignment_names: set[str] = set()
+    renames = _hidden_local_renames(goal_state)
+    renamed_hypotheses = [
+        _apply_hidden_renames(str(hyp or "").strip(), renames)
+        for hyp in getattr(goal_state, "hypotheses", None) or []
+    ]
     for hyp in getattr(goal_state, "hypotheses", None) or []:
-        h = str(hyp or "").strip()
+        h = _apply_hidden_renames(str(hyp or "").strip(), renames)
         if not h:
             continue
+        if ":=" not in h and "✝" in str(hyp or "").split(":", 1)[0]:
+            names_part, _, type_part = str(hyp or "").strip().partition(":")
+            hidden_names = names_part.split()
+            type_text = _apply_hidden_renames(type_part.strip(), renames)
+            if not type_text or not hidden_names:
+                continue
+            if all(
+                _HIDDEN_LOCAL_RE.fullmatch(name) and name.startswith(("inst", "this"))
+                for name in hidden_names
+            ) and _looks_like_class_type(type_text):
+                # Anonymous unless another hypothesis names it, so it can be
+                # dropped as a duplicate of the root's ``[C]`` (a second copy
+                # is a distinct, non-defeq instance and makes the variant
+                # unprovable).
+                for name in hidden_names:
+                    fresh = renames[name]
+                    referenced = any(
+                        re.search(rf"(?<![\w.']){re.escape(fresh)}(?![\w'])", other)
+                        for other in renamed_hypotheses
+                        if not other.split(":", 1)[0].strip().split()[:1] == [fresh]
+                    )
+                    out.append(f"[{fresh} : {type_text}]" if referenced else f"[{type_text}]")
+                continue
         if ":=" in h:
             lhs, rhs = h.split(":=", 1)
             lhs = lhs.strip()
@@ -440,6 +528,9 @@ def build_subgoal_variants(
     max_variants: int = 4,
 ) -> List[SubgoalVariant]:
     """Generate context-closed variants for a candidate subgoal."""
+    raw_subgoal = _apply_hidden_renames(
+        str(raw_subgoal or ""), _hidden_local_renames(goal_state)
+    )
     base = normalize_nat_factorial_notation(
         _canonicalize_top_level_let_in(normalize_subgoal_statement(raw_subgoal))
     )
@@ -471,7 +562,27 @@ def build_subgoal_variants(
     )
     root_binders = expand_relation_forall_binders(root_statement or "")
     goal_binders, blocked_goal_assignment_names = _goal_hypothesis_binders(goal_state)
-    combined_binders = _merge_unique_segments(root_binders, goal_binders)
+    root_instance_types = {
+        key
+        for segment in root_binders
+        for key in (
+            _instance_binder_type_key(binder)
+            for binder in re.findall(r"\[[^\[\]]*\]", str(segment or ""))
+        )
+        if key
+    }
+    # A hidden goal instance that restates a root instance is that instance;
+    # drop it only where the root binders are also present.
+    goal_binders_beside_root = [
+        binder for binder in goal_binders
+        if not (
+            binder.startswith("[")
+            and ":" not in binder[1:-1].split(" ", 1)[0] + " "
+            and _instance_binder_type_key(binder) in root_instance_types
+            and not re.match(r"\[\s*[^\W\d][\w']*\s*:(?!=)", binder)
+        )
+    ]
+    combined_binders = _merge_unique_segments(root_binders, goal_binders_beside_root)
     context_declared = _declared_names_from_binders(combined_binders)
     blocked_goal_names_used = _identifier_tokens(base) & blocked_goal_assignment_names
     needed_context_names = _needed_context_names(

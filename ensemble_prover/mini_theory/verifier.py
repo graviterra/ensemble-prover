@@ -965,17 +965,26 @@ class TheoryBundleVerifier:
 
     @staticmethod
     def _parse_axioms(output: str, fq_name: str) -> Optional[list[str]]:
+        # Union every same-name report: audited source can print a forged
+        # clean report ahead of Lean's real one, which must never be hidden.
+        found = False
+        axioms: dict[str, None] = {}
         for match in _PRINT_AXIOMS_DEPENDS_RE.finditer(output):
+            # A quote or report text inside a list means a forged, unclosed
+            # ``[`` swallowed a later real report: ambiguous, fail closed.
+            if re.search(r"'|\bdepend", match.group(2)):
+                return None
             if match.group(1).strip() == fq_name:
-                return [
-                    item.strip()
+                found = True
+                axioms.update(
+                    (item.strip(), None)
                     for item in match.group(2).split(",")
                     if item.strip()
-                ]
+                )
         for match in _PRINT_AXIOMS_NONE_RE.finditer(output):
             if match.group(1).strip() == fq_name:
-                return []
-        return None
+                found = True
+        return list(axioms) if found else None
 
     def _lean_toolchain(self) -> str:
         path = self.lean_project_dir / "lean-toolchain"

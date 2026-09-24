@@ -8328,6 +8328,18 @@ def _strip_leading_forall_binders_with_names(text: str) -> tuple[str, tuple[str,
     return s, names
 
 
+def _strip_leading_forall_keeping_premises(text: str) -> tuple[str, tuple[str, ...]]:
+    """Strip leading data binders but keep hypothesis binders, in order.
+
+    ``∀ (x : ℝ) (hx : x ≠ 0), P`` must keep ``x ≠ 0 → P``: dropping ``hx``
+    would let a conditional lemma count as support for the unconditional
+    ``P``. See ``proof_graph.graph_statement_keyed_contract``.
+    """
+    from .proof_graph import graph_statement_keyed_contract
+
+    return graph_statement_keyed_contract(text)
+
+
 def _statement_premises_and_conclusion(
     statement: str,
 ) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
@@ -8606,7 +8618,9 @@ def _contract_norm(text: str) -> str:
 
 @lru_cache(maxsize=_CONTRACT_NORMALIZATION_CACHE_SIZE)
 def _cached_contract_norm(text: str) -> str:
-    stripped = _strip_leading_forall_binders(_strip_contract_comments(text))
+    stripped, _names = _strip_leading_forall_keeping_premises(
+        _strip_contract_comments(text)
+    )
     return _normalize_not_mem_contract_surface(_contract_compact_surface(stripped))
 
 
@@ -9098,7 +9112,7 @@ def _root_conclusion_candidates(
     conclusion = implication_parts[-1] if implication_parts else body
     conclusion_parts = _split_top_level_iffs(conclusion)
     for candidate in conclusion_parts or [conclusion]:
-        candidate, candidate_names = _strip_leading_forall_binders_with_names(candidate)
+        candidate, candidate_names = _strip_leading_forall_keeping_premises(candidate)
         all_names = tuple(dict.fromkeys(bound_names + candidate_names))
         add_candidate(candidate, all_names)
         candidate_implications = _split_top_level_implications(candidate)
@@ -9171,7 +9185,7 @@ def _contract_alpha_norm(
 def _cached_contract_alpha_norm(
     text: str, context_bound_names: tuple[str, ...],
 ) -> str:
-    stripped, leading_names = _strip_leading_forall_binders_with_names(
+    stripped, leading_names = _strip_leading_forall_keeping_premises(
         _strip_contract_comments(text)
     )
     bound_names = tuple(dict.fromkeys(context_bound_names + leading_names))
@@ -9255,7 +9269,20 @@ def _contract_alpha_replace_scoped(
                 binder = raw[tail_start : tail_start + comma]
                 body = raw[tail_start + comma + 1 :]
                 local_mapping = dict(mapping)
-                next_index = len(local_mapping)
+                # Allocate past every fresh name already in scope. ``len``
+                # repeats a name when an inner binder shadows an outer one,
+                # conflating ``P x z`` with ``P z z``.
+                next_index = 1 + max(
+                    (
+                        int(value[7:-2])
+                        for value in local_mapping.values()
+                        if isinstance(value, str)
+                        and value.startswith("__bound")
+                        and value.endswith("__")
+                        and value[7:-2].isdigit()
+                    ),
+                    default=-1,
+                )
                 for binder_group in _binder_group_chunks(binder):
                     for name in _binder_names_from_chunk(binder_group):
                         local_mapping[name] = f"__bound{next_index}__"
@@ -9329,7 +9356,9 @@ def _support_contract_candidates(
     def add_assumption_candidate(
         statement_text: str, bound_names: Sequence[str]
     ) -> None:
-        item_body, item_names = _strip_leading_forall_binders_with_names(statement_text)
+        # Hypothesis binders stay as arrow premises: a root assumption
+        # ``h : ∀ x (hx : x ≠ 0), P x`` supplies ``x ≠ 0 → P x``, not ``P x``.
+        item_body, item_names = _strip_leading_forall_keeping_premises(statement_text)
         item_bound_names = tuple(dict.fromkeys(tuple(bound_names or ()) + item_names))
         add_candidate(item_body, item_bound_names)
         if (
@@ -9342,7 +9371,7 @@ def _support_contract_candidates(
         else:
             items = _split_top_level_conjunctions(item_body)
         for item in items:
-            conjunct_body, conjunct_names = _strip_leading_forall_binders_with_names(
+            conjunct_body, conjunct_names = _strip_leading_forall_keeping_premises(
                 item
             )
             add_candidate(
@@ -9385,7 +9414,7 @@ def _support_contract_candidates(
                 if len(iff_implication_parts) >= 2:
                     for premise in iff_implication_parts[:-1]:
                         premise_body, premise_names = (
-                            _strip_leading_forall_binders_with_names(premise)
+                            _strip_leading_forall_keeping_premises(premise)
                         )
                         add_candidate(
                             premise_body,
@@ -9603,12 +9632,12 @@ def _branch_case_support_kind(
     leaving unsupported bridge premises rejected as before.
     """
 
-    premise_text, premise_names = _strip_leading_forall_binders_with_names(premise)
+    premise_text, premise_names = _strip_leading_forall_keeping_premises(premise)
     premise_names = tuple(dict.fromkeys(tuple(premise_bound_names) + premise_names))
     if not premise_text:
         return False
     for support, support_bound_names in support_candidates:
-        support_body, support_names = _strip_leading_forall_binders_with_names(support)
+        support_body, support_names = _strip_leading_forall_keeping_premises(support)
         disjuncts = _split_top_level_disjunctions(support_body)
         if len(disjuncts) < 2:
             continue
@@ -10734,7 +10763,7 @@ def _claim_dependency_contract_reasons(
         ):
             continue
         premise_complex = _is_complex_planner_premise(premise)
-        premise_text, premise_leading_names = _strip_leading_forall_binders_with_names(
+        premise_text, premise_leading_names = _strip_leading_forall_keeping_premises(
             premise
         )
         premise_norm = _contract_norm(premise_text)
@@ -11006,7 +11035,7 @@ def _claim_premise_dependency_names(
         )
     )
     for premise in premises:
-        premise_text, premise_leading_names = _strip_leading_forall_binders_with_names(
+        premise_text, premise_leading_names = _strip_leading_forall_keeping_premises(
             premise
         )
         if not premise_text:

@@ -136,7 +136,9 @@ _OPENROUTER_REQUEST_MODEL_ALIASES: dict[str, str] = {
 _OPENROUTER_VERIFIED_FALLBACK_PRICING: dict[str, PricingTuple] = {
     "deepseek/deepseek-v4-pro": (1.32, 0.044, 3.96),
     "deepseek/deepseek-v4-pro-0813": (1.32, 0.044, 3.96),
-    "~deepseek/deepseek-v4-flash-latest": (0.14, 0.028, 0.28),
+    # Component-wise ceiling of the older OpenRouter rate and the current
+    # direct V4.1 Flash rate (2026-09-21), so an outage never under-reserves.
+    "~deepseek/deepseek-v4-flash-latest": (0.30, 0.028, 1.20),
     "openai/gpt-5.6-luna": (0.2, 0.02, 1.2),
     "openai/gpt-5.6-luna-pro": (0.2, 0.02, 1.2),
 }

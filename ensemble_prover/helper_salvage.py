@@ -1439,6 +1439,11 @@ def order_helpers_for_incremental_validation(
     return [helper_list[index] for index in ordered_indices]
 
 
+_HELPER_SCOPE_BARRIER_RE = re.compile(
+    r"\s*(?:noncomputable\s+)?(?:namespace|section|end|variable|universe|include|omit)\b"
+)
+
+
 def dedupe_helpers_by_name_last_wins(helpers: Sequence[str]) -> List[str]:
     """Drop duplicate named helpers while preserving declaration dependencies.
 
@@ -1479,45 +1484,78 @@ def dedupe_helpers_by_name_last_wins(helpers: Sequence[str]) -> List[str]:
         for name in names_in_first_order
     }
 
-    emitted: Set[str] = set()
-    pending = list(names_in_first_order)
-    ordered_names: List[str] = []
-    while pending:
-        progressed = False
-        for name in list(pending):
-            if deps_by_name.get(name, set()) - emitted:
-                continue
-            ordered_names.append(name)
-            emitted.add(name)
-            pending.remove(name)
-            progressed = True
-        if not progressed:
-            # Cyclic helpers cannot be made valid by reordering. Preserve the
-            # stable first-occurrence order for the remaining cycle so Lean can
-            # produce the real diagnostic.
-            ordered_names.extend(pending)
-            break
+    # Unnamed blocks (``open``, anonymous ``instance``, ``notation``,
+    # ``set_option``, ``namespace``) are positional context: a named helper
+    # that originally followed one may rely on it, so it must stay after it.
+    # Order every block topologically, breaking ties by original position,
+    # so nothing moves unless a dependency forces it.
+    latest_index_by_name: Dict[str, int] = {}
+    for index, helper in enumerate(helper_list):
+        name = helper_decl_name(helper)
+        if name:
+            latest_index_by_name[name] = index
+    nodes: List[Tuple[int, str, str]] = [
+        (first_index_by_name[name], name, latest_helper_by_name[name])
+        for name in names_in_first_order
+    ] + [(index, "", helper) for index, helper in unnamed_helpers]
+    node_deps: List[Set[int]] = []
+    node_index_by_name = {name: position for position, name in enumerate(names_in_first_order)}
+    def is_scope_barrier(text: str) -> bool:
+        # Scope commands change the names of everything after them, so no
+        # named helper may cross one in either direction.
+        return bool(_HELPER_SCOPE_BARRIER_RE.match(str(text or "")))
 
-    named_helpers = [latest_helper_by_name[name] for name in ordered_names]
-    if not unnamed_helpers:
-        return named_helpers
+    for position, (index, name, text) in enumerate(nodes):
+        deps: Set[int] = set()
+        if name:
+            deps.update(node_index_by_name[dep] for dep in deps_by_name.get(name, set()))
+            # Soft context (``open``, instances, options) before the winning
+            # copy may be needed by it; scope barriers bind by first position.
+            anchor = latest_index_by_name[name]
+            first = first_index_by_name[name]
+            deps.update(
+                other for other, (other_index, other_name, other_text) in enumerate(nodes)
+                if not other_name and (
+                    other_index < first
+                    if is_scope_barrier(other_text)
+                    else other_index < anchor
+                )
+            )
+        elif is_scope_barrier(text):
+            deps.update(
+                other for other, (other_index, _other_name, _t) in enumerate(nodes)
+                if other_index < index
+            )
+        else:
+            deps.update(
+                node_index_by_name[dep]
+                for dep in _helper_referenced_names(text, names_in_first_order)
+                & selected_names
+                if first_index_by_name[dep] < index
+            )
+            deps.update(
+                other for other, (other_index, other_name, _t) in enumerate(nodes)
+                if not other_name and other_index < index
+            )
+        node_deps.append(deps)
 
-    if ordered_names == names_in_first_order:
-        emitted_names: Set[str] = set()
-        out: List[str] = []
-        for helper in helper_list:
-            name = helper_decl_name(helper)
-            if not name:
-                out.append(helper)
-            elif name not in emitted_names:
-                out.append(latest_helper_by_name[name])
-                emitted_names.add(name)
-        return out
-
-    first_named_index = min(first_index_by_name.values())
-    leading_unnamed = [h for i, h in unnamed_helpers if i < first_named_index]
-    trailing_unnamed = [h for i, h in unnamed_helpers if i >= first_named_index]
-    return leading_unnamed + named_helpers + trailing_unnamed
+    emitted_nodes: Set[int] = set()
+    order: List[int] = []
+    remaining = sorted(range(len(nodes)), key=lambda position: nodes[position][0])
+    while remaining:
+        ready = next(
+            (position for position in remaining if not node_deps[position] - emitted_nodes),
+            None,
+        )
+        if ready is None:
+            # A cycle cannot be made valid by reordering. Release only its
+            # earliest block and keep ordering the rest, so unrelated forward
+            # dependencies are still fixed and Lean reports the real error.
+            ready = remaining[0]
+        order.append(ready)
+        emitted_nodes.add(ready)
+        remaining.remove(ready)
+    return [nodes[position][2] for position in order]
 
 
 @dataclass
