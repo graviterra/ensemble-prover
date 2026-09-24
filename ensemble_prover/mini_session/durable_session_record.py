@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from ensemble_prover.proof_dossier import (
-    ProofDossier, helper_decl_statement, text_hash,
+    ProofDossier, helper_decl_name, helper_decl_statement, text_hash,
     verified_helper_has_typed_binder_evidence,
 )
 from ensemble_prover.verified_helper_contract import (
@@ -370,8 +370,33 @@ async def _prepare_dossier(
     if dossier.final_proof:
         if text_hash(dossier.final_proof) != data.get("final_proof_hash"):
             raise ValueError("checkpoint root proof hash mismatch")
+        # Export and root handoff consume the certificate, while replay uses
+        # the dossier artifact. They must identify the same ordered source
+        # before fresh checking can authorize either representation. Raw
+        # verifier provenance may differ after diagnostic sanitization; these
+        # artifact fields always describe the saved, sanitized Lean source.
+        replay_helpers = list(dossier.final_replay_helpers)
+        certificate = dossier.root_proof_certificate
+        artifact_fields = {
+            "theorem_name": dossier.theorem_name,
+            "root_statement": dossier.root_statement,
+            "root_statement_hash": text_hash(dossier.root_statement),
+            "proof": dossier.final_proof,
+            "proof_hash": text_hash(dossier.final_proof),
+            "replay_helpers": replay_helpers,
+            "replay_helper_names": [
+                name for block in replay_helpers if (name := helper_decl_name(block))
+            ],
+            "replay_helper_source_hashes": [text_hash(block) for block in replay_helpers],
+            "replay_helper_count": len(replay_helpers),
+        }
+        if not isinstance(certificate, dict) or any(
+            type(certificate.get(key)) is not type(value) or certificate.get(key) != value
+            for key, value in artifact_fields.items()
+        ):
+            raise ValueError("checkpoint root certificate artifact mismatch")
         await _verify(session.lean, statement=session.conv.goal_statement,
-                      proof=dossier.final_proof, helpers=checked,
+                      proof=dossier.final_proof, helpers=replay_helpers,
                       preamble=session.conv.lean_preamble)
         # Fresh checking above, not the JSON hash, establishes this receipt.
         dossier.record_root_proof_finalization_receipt()
