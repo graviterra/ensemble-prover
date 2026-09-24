@@ -7501,7 +7501,9 @@ class LeanRunner:
             decode_theorem_target_context(resolved_preamble)
         )
         candidate_name = f"miniSourceCandidate_{uuid.uuid4().hex}"
-        candidate_command = _type_identity_probe_command(
+        # Module-mode declarations are private by default. The comparison
+        # uses the stable root name, including from a separate fallback module.
+        candidate_command = "public " + _type_identity_probe_command(
             f"_root_.{candidate_name}", candidate
         )
         if target_omit_variables:

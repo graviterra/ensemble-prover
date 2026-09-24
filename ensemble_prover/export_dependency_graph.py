@@ -54,7 +54,7 @@ _DECL_RE = re.compile(
     r"^(?:\s*@\[[^\]]*\]\s*)*"
     rf"(?:\s*open\s+(?P<inline_open>[^\n]+?)\s+in\s+)?"
     r"(?:\s*@\[[^\]]*\]\s*)*"
-    r"(?P<kind>(?:private\s+|protected\s+|noncomputable\s+)*"
+    r"(?P<kind>(?:private\s+|protected\s+|noncomputable\s+|unsafe\s+)*"
     r"(?:theorem|lemma|def|abbrev|instance|structure|inductive|axiom))\s+"
     rf"(?P<name>{_LEAN_NAME_RE})(?![A-Za-z0-9_'.])",
     re.MULTILINE,
@@ -76,6 +76,17 @@ _SCOPE_CMD_RE = re.compile(
     rf"end(?:[ \t]+(?P<end>{_LEAN_NAME_RE}))?|"
     rf"open[ \t]+(?P<open>[^\n]+))\b"
 )
+_DECL_FOLLOWING_CMD_RE = re.compile(
+    r"(?m)^[ \t]*(?:namespace|section|end|open|"
+    r"set_option|run_cmd|example|variable|universe|universes|include|omit|"
+    r"attribute|export|notation|infixl?|infixr|prefix|postfix|syntax|macro|"
+    r"(?:local|scoped)[ \t]+(?:attribute|notation|infixl?|infixr|prefix|postfix|syntax|macro)|"
+    r"#[A-Za-z_][A-Za-z0-9_]*)\b"
+)
+_SCOPED_OPTION_PREFIX_RE = re.compile(r"set_option\s+\S+\s+(?:\S+\s+)?in\b")
+_DECL_HEAD_RE = re.compile(_DECL_RE.pattern.removeprefix("^"), _DECL_RE.flags)
+_FOLLOWING_CMD_HEAD_RE = re.compile(_DECL_FOLLOWING_CMD_RE.pattern.removeprefix("(?m)^"))
+_SCOPED_OPEN_PREFIX_RE = re.compile(r"open\b[^\r\n]*?(?<![\w.'])in\b")
 
 
 @dataclass
@@ -536,29 +547,69 @@ def _infer_root_name_for_decls(stem: str, decls: List[Declaration]) -> str:
     return root_name_for_export_stem(stem)
 
 
+def _starts_following_command(
+    clean_source: str, start: int, classifications: Dict[int, bool],
+) -> bool:
+    """Distinguish scoped commands from options/open expressions in a proof."""
+    cursor = start
+    visited: list[int] = []
+    result = False
+    while cursor < len(clean_source):
+        while cursor < len(clean_source) and clean_source[cursor].isspace():
+            cursor += 1
+        if cursor in classifications:
+            result = classifications[cursor]
+            break
+        visited.append(cursor)
+        if _DECL_HEAD_RE.match(clean_source, cursor):
+            result = True
+            break
+        option = _SCOPED_OPTION_PREFIX_RE.match(clean_source, cursor)
+        if option:
+            cursor = option.end()
+            continue
+        opening = _SCOPED_OPEN_PREFIX_RE.match(clean_source, cursor)
+        if opening:
+            cursor = opening.end()
+            continue
+        result = _FOLLOWING_CMD_HEAD_RE.match(clean_source, cursor) is not None
+        break
+    for position in visited:
+        classifications[position] = result
+    return result
+
+
 def _next_decl_boundary(clean_source: str, start: int, default_end: int) -> int:
-    end = int(default_end)
-    current_line_start = clean_source.rfind("\n", 0, start) + 1
-    cursor = max(0, start)
-    while cursor < len(clean_source) and clean_source[cursor].isspace():
-        if clean_source[cursor] == "\n":
-            current_line_start = cursor + 1
-        cursor += 1
-    for match in _SCOPE_CMD_RE.finditer(clean_source, max(0, start + 1), end):
-        if match.start() <= start:
+    # Begin after this declaration's name so its own scoped-open/attribute
+    # prefix cannot be mistaken for a later command.
+    declaration = _DECL_RE.match(clean_source, start)
+    cursor = declaration.end("name") if declaration is not None else start + 1
+    scanned = cursor
+    delimiters: list[str] = []
+    closing = {")": "(", "]": "[", "}": "{"}
+    classifications: Dict[int, bool] = {}
+    for match in _DECL_FOLLOWING_CMD_RE.finditer(clean_source, cursor, default_end):
+        # A command quotation is a term inside a declaration, not a neighboring
+        # command. Comments and string literals are already blanked here.
+        while scanned < match.start():
+            skip_to = _lean_surface_lexical_skip_end(clean_source, scanned)
+            if skip_to is not None:
+                scanned = skip_to
+                continue
+            character = clean_source[scanned]
+            if character in "([{":
+                delimiters.append(character)
+            elif delimiters and closing.get(character) == delimiters[-1]:
+                delimiters.pop()
+            scanned += 1
+        if delimiters or scanned > match.start():
             continue
-        if clean_source.rfind("\n", 0, match.start()) + 1 == current_line_start:
-            continue
-        stripped = match.group(0).lstrip()
-        if (
-            match.group("end") is not None
-            or stripped.startswith("end")
-            or stripped.startswith("open")
-            or stripped.startswith("namespace")
-            or stripped.startswith("section")
-        ):
+        # Lean permits arbitrary indentation for commands and even flush-left
+        # scoped option/open terms. Classify their wrapped syntax, not columns.
+        # Look past default_end when a wrapper precedes the next named theorem.
+        if _starts_following_command(clean_source, match.start(), classifications):
             return match.start()
-    return end
+    return default_end
 
 
 def _strip_comments_and_strings(text: str) -> str:

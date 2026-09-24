@@ -450,7 +450,9 @@ from .certify_counterexample_tool import (
 from .utils import display_line_count, format_exception, parse_tool_arguments
 from .llm_error_policy import (
     ProviderAccountUnavailable,
+    SubscriptionBackendError,
     is_provider_account_failure,
+    is_provider_infrastructure_failure,
     LLMErrorClassification,
     classify_llm_error_text,
     classify_llm_exception,
@@ -14359,6 +14361,17 @@ def _install_cooperative_stop_signal_handlers(
 
     return _uninstall
 
+
+def _mini_prover_exception_failure(exc: Exception) -> tuple[str, Optional[str]]:
+    """Keep typed provider outages machine-readable across CLI exception exits."""
+    detail = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, SubscriptionBackendError):
+        classification = classify_llm_exception(exc)
+        if is_provider_infrastructure_failure(classification.failure_reason):
+            return classification.failure_reason, detail
+    return detail, None
+
+
 def _mini_prover_unsolved_failure_reason(
     *,
     ok: bool,
@@ -14406,6 +14419,15 @@ def _mini_prover_unsolved_failure_reason(
         if llm_last_failure_reason:
             return llm_last_failure_reason
         return "llm_call_exception"
+    root_finalization_failure_reason = str(
+        recorder_metrics.get("mini_problem_last_action_root_finalization_failure_reason")
+        or ""
+    ).strip()
+    # Recursive failure counters retain earlier attempts even after a newer
+    # root proof reaches finalization. Prefer the current veto to that history,
+    # while preserving missing-usage and authoritative stop diagnostics.
+    if root_finalization_failure_reason and last_verdict != "llm_usage_missing":
+        return root_finalization_failure_reason
     mini_recursive_last_failure_reason = str(
         recorder_metrics.get("mini_recursive_last_failure_reason") or ""
     ).strip()
@@ -15860,7 +15882,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 worker_ready_callback=signal_worker_ready,
             )
         except Exception as exc:
-            failure_reason = f"{type(exc).__name__}: {exc}"
+            failure_reason, failure_reason_detail = _mini_prover_exception_failure(exc)
             infrastructure_aborted = True
             print(f"\nUNCAUGHT EXCEPTION: {failure_reason}", flush=True)
     except ProviderAccountUnavailable as exc:
@@ -15895,7 +15917,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         # Setup-side exception other than SystemExit (e.g. malformed URL in
         # OpenAICompatClient, lean project dir missing, etc.). Recorded as
         # the failure reason; we don't re-raise — the function returns 1.
-        failure_reason = f"{type(exc).__name__}: {exc}"
+        failure_reason, failure_reason_detail = _mini_prover_exception_failure(exc)
         infrastructure_aborted = True
         print(f"\nSETUP FAILED: {failure_reason}", flush=True)
     except BaseException as exc:
@@ -16212,7 +16234,10 @@ async def _main_async(args: argparse.Namespace) -> int:
                 )
                 infrastructure_aborted = bool(
                     infrastructure_aborted
-                    or (not ok and is_provider_account_failure(effective_failure_reason))
+                    or (
+                        not ok
+                        and is_provider_infrastructure_failure(effective_failure_reason)
+                    )
                 )
                 failure_reason_detail = _mini_prover_unsolved_failure_detail(
                     ok=bool(ok),
@@ -17098,6 +17123,8 @@ async def _main_async(args: argparse.Namespace) -> int:
                             print("Restore API account access or credits, then use --resume-from with this run directory.")
                         else:
                             print("Checkpointing was disabled. Restore API account access or credits, then start a new run.")
+                    elif effective_failure_reason == "provider_protocol_incompatible":
+                        print("Correct the provider CLI compatibility, then start a new run.")
                     print("=" * 64)
                 else:
                     print(f"NOT SOLVED: {problem.theorem_name}")

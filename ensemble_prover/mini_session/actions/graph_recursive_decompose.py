@@ -2731,7 +2731,10 @@ class GraphRecursiveDecomposeAction:
             stats_reason = str(
                 getattr(result_stats, reason_attr, "") or ""
             ).strip()
-            if llm_failure_scope(stats_reason) != "scoped":
+            stats_scope = llm_failure_scope(stats_reason)
+            if stats_scope != "scoped" and not (
+                stats_scope == "global" and stats_reason == terminal_failure_reason
+            ):
                 continue
             if not (
                 use_latest_scoped_failure

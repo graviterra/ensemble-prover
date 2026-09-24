@@ -60,7 +60,9 @@ from typing import (
 from ensemble_prover.root_finalization import (
     RootFinalizationCandidate,
     _RootProofFinalizationReceiptParticipant,
+    _verification_certificate_status,
     finalize_root_solution,
+    has_live_root_proof_finalization_receipt,
     root_verification_certificate,
 )
 from ensemble_prover.mini_deadline_transaction import (
@@ -25123,6 +25125,7 @@ class MiniSession:
         )
         if not replay_helpers and stored_replay_helpers:
             replay_helpers = stored_replay_helpers
+        raw_replay_helpers = replay_helpers
         try:
             from ensemble_prover.proof_dossier import helper_decl_name
         except Exception:
@@ -25195,18 +25198,41 @@ class MiniSession:
         # evidence. Bare ``mark_solved`` or an ``accepted: True`` stub without
         # a matching proof_hash must not be laundered into
         # ``root_finalization_accepted=True``.
-        def _accepted_certificate_matches_proof(
+        def _accepted_certificate_matches_artifact(
             certificate: Any,
         ) -> bool:
             if not isinstance(certificate, dict):
                 return False
             if certificate.get("accepted") is not True:
                 return False
-            cert_proof_hash = str(certificate.get("proof_hash") or "").strip()
-            return bool(cert_proof_hash and cert_proof_hash == hydrated_proof_hash)
+            # A matching proof hash alone cannot authorize changing the helper
+            # inventory. Legacy raw helpers may be sanitized only when their
+            # complete verifier receipt binds the exact source being cleaned.
+            if tuple(
+                sanitize_lean_artifact_text(block) for block in raw_replay_helpers
+            ) == replay_helpers and _verification_certificate_status(
+                certificate=certificate,
+                proof=hydrated_proof_text,
+                target_statement=str(getattr(dossier, "root_statement", "") or ""),
+                replay_helpers=raw_replay_helpers,
+                helper_names=helper_names,
+                require_certificate=True,
+            ).get("ready") is True:
+                return True
+            # Canonical finalization can already have sanitized the stored
+            # proof/helpers. Its live receipt binds both representations;
+            # no mutable certificate or changed replay context may substitute.
+            return bool(
+                has_live_root_proof_finalization_receipt(dossier)
+                and certificate == persisted_verification_certificate
+                and hydrated_proof_text == current_proof
+                and replay_helpers == stored_replay_helpers
+                and list(helper_names)
+                == list(root_proof_certificate.get("candidate_helper_names") or ())
+            )
 
         has_authoritative_finalization_evidence = bool(
-            _accepted_certificate_matches_proof(verification_certificate)
+            _accepted_certificate_matches_artifact(verification_certificate)
             or self._can_hydrate_direct_root_artifact_certificate(
                 candidate=candidate,
                 root_proof_certificate=root_proof_certificate,

@@ -9,6 +9,8 @@ import tempfile
 import time
 from typing import Mapping, Sequence
 
+from .subprocess_environment import sanitized_subprocess_environment
+
 
 # This program is elaborated in its own process, importing only trusted Lean
 # code. The candidate is loaded as environment data, without its elaborator
@@ -60,7 +62,8 @@ def audit_compiled_source(
             if remaining <= 0:
                 raise TimeoutError("compiled axiom audit deadline exhausted")
             return subprocess.run(
-                ["lake", "env", "lean", *arguments], cwd=project_dir, env=dict(env),
+                ["lake", "env", "lean", *arguments], cwd=project_dir,
+                env=sanitized_subprocess_environment(env),
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 timeout=remaining, check=False,
             )

@@ -49,7 +49,7 @@ class SubscriptionBackendError(RuntimeError):
         self, message: str, *, kind: str = "protocol",
         validation_stage: str = "", tool_index: int | None = None,
     ) -> None:
-        if kind not in {"auth", "quota", "rate_limit", "transport", "protocol", "response", "capability", "context"}:
+        if kind not in {"auth", "quota", "rate_limit", "transport", "protocol", "response", "capability", "compatibility", "context"}:
             raise ValueError(f"Unknown subscription error kind: {kind}")
         diagnostic = subscription_response_validation_record({
             "validation_stage": validation_stage, "tool_index": tool_index,
@@ -167,6 +167,7 @@ _TERMINAL_LLM_FAILURE_REASONS = {
     "llm_cost_budget_unknown_pricing",
     "llm_insufficient_quota",
     "provider_capability_conflict",
+    "provider_protocol_incompatible",
     "llm_required_prompt_context_overflow",
 }
 _SCOPED_LLM_FAILURE_REASONS = {
@@ -609,14 +610,16 @@ def classify_llm_exception(
             "auth": "llm_auth_error",
             "quota": "llm_insufficient_quota",
             "capability": "provider_capability_conflict",
+            "compatibility": "provider_protocol_incompatible",
             "context": "llm_required_prompt_context_overflow",
             "response": "provider_response_invalid",
         }.get(exc.backend_kind, "llm_network_error")
-        terminal = exc.backend_kind in {"auth", "quota", "capability", "context"}
+        terminal = exc.backend_kind in {"auth", "quota", "capability", "compatibility", "context"}
         return LLMErrorClassification(
             kind={
                 "auth": "auth", "quota": "insufficient_quota",
                 "capability": "provider_capability_conflict", "rate_limit": "rate_limit",
+                "compatibility": "provider_protocol_incompatible",
                 "transport": "transport", "protocol": "transient",
                 "response": "provider_response_invalid",
                 "context": "llm_required_prompt_context_overflow",
@@ -876,12 +879,20 @@ def classify_llm_error_text(error_text: str) -> LLMErrorClassification:
     """Classify a rendered LLM error after the original exception is gone."""
 
     text = _lower_text(error_text)
-    codex_error = re.search(r"(?:^|:\s*)\[(codex|claude-code):(auth|quota|rate_limit|capability|transport|protocol|response|context)\]", text)
+    codex_error = re.search(r"(?:^|:\s*)\[(codex|claude-code):(auth|quota|rate_limit|capability|compatibility|transport|protocol|response|context)\]", text)
     if codex_error:
         error_type = CodexBackendError if codex_error.group(1) == "codex" else ClaudeCodeBackendError
         return classify_llm_exception(error_type(text, kind=codex_error.group(2)))
     if not text:
         return LLMErrorClassification(kind="empty", retryable=False, terminal=False)
+    if text == "provider_protocol_incompatible":
+        return LLMErrorClassification(
+            kind=text,
+            retryable=False,
+            terminal=True,
+            failure_reason=text,
+            message=text,
+        )
     ownership_classification = _runtime_transport_ownership_classification(error_text)
     if ownership_classification is not None:
         return ownership_classification
@@ -1025,6 +1036,17 @@ def is_provider_account_failure(reason: str) -> bool:
     results and trust-boundary stops. Never use prose matching for reopening.
     """
     return reason in {"llm_auth_error", "llm_billing_error", "llm_insufficient_quota"}
+
+
+def is_provider_infrastructure_failure(reason: str) -> bool:
+    """Identify external setup failures that cannot evaluate the theorem.
+
+    A protocol mismatch needs an adapter or CLI change, not another proof
+    request. Ordinary route capability, prompt size and local cost limits do
+    not establish such an attempt-wide infrastructure failure.
+    """
+
+    return is_provider_account_failure(reason) or reason == "provider_protocol_incompatible"
 
 
 class ProviderAccountUnavailable(BaseException):

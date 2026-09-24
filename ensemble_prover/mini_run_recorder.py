@@ -875,6 +875,7 @@ class RunRecorder:
             "mini_recursive_exit_reason": "",
             "terminal_proof_search_reason": "",
             "terminal_proof_search_phase": "",
+            "mini_problem_last_action_root_finalization_failure_reason": "",
             "mini_apply_decl_tool_state_updates": 0,
             "mini_apply_decl_tool_state_closures": 0,
             "mini_compute_examples_calls": 0,
@@ -2414,6 +2415,27 @@ class RunRecorder:
         ):
             key = "mini_session_local_repair_turns_forced"
             self.metrics[key] = int(self.metrics.get(key, 0) or 0) + 1
+        if (
+            phase in {"session_action_selected", "session_action_outcome"}
+            and str(record.get("session_scope") or "").strip() in {"", "problem"}
+        ):
+            # A veto describes the last completed root attempt, not a terminal
+            # search failure. New top-level work supersedes it immediately.
+            finalization_failure_reason = ""
+            if (
+                phase == "session_action_outcome"
+                and record.get("root_finalization_vetoed_outcome") is True
+                and record.get("action_reported_solved") is True
+                and record.get("solved") is False
+                and record.get("root_finalization_accepted") is not True
+            ):
+                finalization_failure_reason = str(
+                    record.get("root_finalization_verdict") or ""
+                ).strip()
+            self._metric_snapshot(
+                "mini_problem_last_action_root_finalization_failure_reason",
+                finalization_failure_reason,
+            )
         if phase == "session_action_outcome":
             if bool(record.get("schedulable_decomposition_created")):
                 key = "mini_session_schedulable_decompositions_created"
@@ -2698,6 +2720,11 @@ class RunRecorder:
             scope = str(record.get("session_scope") or "").strip()
             problem_scope = scope in {"", "problem"}
             if problem_scope:
+                if accepted:
+                    self._metric_snapshot(
+                        "mini_problem_last_action_root_finalization_failure_reason",
+                        "",
+                    )
                 key = (
                     "mini_problem_root_finalization_accepted"
                     if accepted

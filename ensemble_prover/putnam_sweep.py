@@ -28,6 +28,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
 
+from .llm_error_policy import is_provider_infrastructure_failure
 from .solved_export_policy import effective_solved, export_boundary_present
 from .subprocess_environment import (
     sanitized_subprocess_environment,
@@ -53,6 +54,7 @@ _STATUSES = _TERMINAL | {
     "pending",
     "running",
     "interrupted",
+    "infrastructure_blocked",
     "cleanup_unconfirmed",
     "monitor_error",
 }
@@ -623,6 +625,24 @@ def _summary_solved(output_dir: Path, exit_code: int | None = None) -> bool:
     return export_boundary_present(data) or exit_code in (None, 0)
 
 
+def _summary_provider_infrastructure_reason(output_dir: Path) -> str:
+    """Read a terminal provider outage, not an earlier scoped route failure."""
+    try:
+        data = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if (
+        not isinstance(data, dict)
+        or data.get("solved") is not False
+        or data.get("infrastructure_aborted") is not True
+    ):
+        return ""
+    reason = data.get("failure_reason")
+    if isinstance(reason, str) and is_provider_infrastructure_failure(reason):
+        return reason
+    return ""
+
+
 def answer_preparation_dir(output_dir: Path) -> Path:
     resolved = Path(output_dir).resolve()
     return resolved.with_name(resolved.name + ".answer_preparation")
@@ -691,6 +711,7 @@ def summarize_manifest(manifest: Mapping[str, Any]) -> dict[str, int]:
         "answer_preparation_capability_outage": 0,
         "answer_preparation_no_admissible_answer": 0,
         "interrupted": 0,
+        "infrastructure_blocked": 0,
         "pending": 0,
         "skipped_solved": 0,
         "running": 0,
@@ -726,7 +747,8 @@ def _print_sweep_totals(manifest: Mapping[str, Any]) -> None:
         f"answer_preparation_failed={totals['answer_preparation_failed']} "
         f"(capability_outage={totals['answer_preparation_capability_outage']} "
         f"no_admissible_answer={totals['answer_preparation_no_admissible_answer']}) "
-        f"failed={totals['failed']}",
+        f"failed={totals['failed']} "
+        f"infrastructure_blocked={totals['infrastructure_blocked']}",
         flush=True,
     )
 
@@ -973,6 +995,15 @@ def run_attempt(
             status = "monitor_error"
         else:
             status = "cutoff" if cutoff else "failed"
+        failure_reason = (
+            _summary_provider_infrastructure_reason(output_dir)
+            if status in {"failed", "cutoff"} else ""
+        )
+        if failure_reason:
+            # Cleanup can cross the acceptance deadline after a provider has
+            # already stopped proof work. Preserve both causes, but never
+            # advance the theorem queue on a confirmed provider outage.
+            status = "infrastructure_blocked"
         prep_reason = ""
         if status in {"failed", "cutoff"}:
             try:
@@ -993,6 +1024,7 @@ def run_attempt(
             console.write(
                 f"\n[sweep] result={status}; cutoff_reason={cutoff or 'none'}; "
                 f"answer_preparation_reason={prep_reason or 'none'}; "
+                f"failure_reason={failure_reason or 'none'}; "
                 f"accepted={len(gate.accepted)}; cleanup_confirmed={cleaned}\n".encode()
             )
             console.flush()
@@ -1020,6 +1052,7 @@ def run_attempt(
         "exit_code": proc.returncode,
         "cutoff_reason": cutoff,
         "answer_preparation_reason": prep_reason,
+        "failure_reason": failure_reason,
         "accepted_identities": sorted(gate.accepted),
         "accepted_elapsed_s": gate.accepted,
         "cleanup_confirmed": cleaned,
@@ -1311,6 +1344,14 @@ def run_sweep(
                 flush=True,
             )
             if row["status"] in {"cleanup_unconfirmed", "monitor_error"}:
+                exit_code = 2
+                break
+            if row["status"] == "infrastructure_blocked":
+                print(
+                    f"Sweep paused: {result.get('failure_reason') or 'provider infrastructure unavailable'}. "
+                    "Repair the provider configuration, then explicitly resume the sweep.",
+                    flush=True,
+                )
                 exit_code = 2
                 break
             if row["status"] == "interrupted":

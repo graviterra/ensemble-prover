@@ -204,6 +204,15 @@ class DeadlineMutationTransaction:
                 ]
             self._participants.append(participant)
 
+    def has_pending_participant(self, predicate: Callable[[Any], bool]) -> bool:
+        """Inspect unpublished receipts only within their live commit boundary."""
+
+        if not self.can_mutate():
+            return False
+        if self._parent is not None:
+            return self._parent.has_pending_participant(predicate)
+        return any(predicate(participant) for participant in self._participants)
+
     def _capture_local_state(
         self,
         *,

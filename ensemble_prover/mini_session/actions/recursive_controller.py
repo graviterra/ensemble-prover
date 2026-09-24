@@ -17,7 +17,6 @@ from typing import Any, Callable, ClassVar, FrozenSet, Iterator, Optional
 import weakref
 
 from ensemble_prover.proof_dossier import (
-    helper_decl_name,
     strong_progress_for_accepted_helpers,
     verified_helper_is_premise_projection,
 )
@@ -32,7 +31,6 @@ from ensemble_prover.llm_error_policy import (
 from ensemble_prover.llm_usage import llm_usage_context_metadata
 from ensemble_prover.root_finalization import (
     RootFinalizationCandidate,
-    root_verification_certificate,
 )
 from ensemble_prover.mini_runtime_defaults import DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S
 from ensemble_prover.mini_recursive_identity import (
@@ -1427,6 +1425,23 @@ class RecursiveControllerAction:
             disproved or is_terminal_llm_failure_reason(failure_reason)
         )
         stats = getattr(result, "stats", None)
+        nested_terminal_failure_kind = ""
+        nested_terminal_failure_metadata: dict[str, Any] = {}
+        if terminal_failure and not disproved and stats is not None:
+            # A terminal planner result still owns its physical dispatch.
+            # Dropping it here turns a failed paid request into a synthetic
+            # zero-provider wait when the enclosing scheduler routes it.
+            # Stats are cumulative: only project the current result's cause.
+            for source in ("planner", "child"):
+                if str(getattr(stats, f"last_{source}_failure_reason", "") or "").strip() != failure_reason:
+                    continue
+                nested_terminal_failure_kind = str(
+                    getattr(stats, f"last_{source}_failure_kind", "") or ""
+                ).strip()
+                raw_metadata = getattr(stats, f"last_{source}_failure_metadata", {})
+                if isinstance(raw_metadata, dict):
+                    nested_terminal_failure_metadata = dict(raw_metadata)
+                break
         nested_scoped_failure_reason = ""
         nested_scoped_failure_kind = ""
         nested_scoped_failure_metadata: dict[str, Any] = {}
@@ -1529,18 +1544,6 @@ class RecursiveControllerAction:
             solved
             or strong_progress_for_accepted_helpers(session.dossier, helpers_added)
         )
-        replay_helpers = (
-            tuple(session.dossier.verified_helper_blocks())
-            if solved and getattr(result, "proof", None) and session.dossier is not None
-            else ()
-        )
-        helper_names = tuple(
-            name
-            for block in replay_helpers
-            for name in [helper_decl_name(block)]
-            if name
-        )
-
         cost = time.monotonic() - started
         return MiniOutcome(
             action_id=self.id,
@@ -1552,8 +1555,6 @@ class RecursiveControllerAction:
             root_candidate=(
                 RootFinalizationCandidate(
                     proof=str(getattr(result, "proof", "") or ""),
-                    replay_helpers=replay_helpers,
-                    helper_names=helper_names,
                     phase="mini_recursive_root_tactic",
                     turn_index=int(getattr(session, "iteration", 0) or 0),
                     source_action_id=self.id,
@@ -1562,24 +1563,10 @@ class RecursiveControllerAction:
                         or getattr(getattr(session, "problem", None), "statement_type", "")
                         or ""
                     ),
-                    verification_certificate=root_verification_certificate(
-                        accepted=True,
-                        proof=str(getattr(result, "proof", "") or ""),
-                        phase="mini_recursive_root_tactic",
-                        turn_index=int(getattr(session, "iteration", 0) or 0),
-                        target_statement=str(
-                            getattr(session.dossier, "root_statement", "")
-                            or getattr(
-                                getattr(session, "problem", None),
-                                "statement_type",
-                                "",
-                            )
-                            or ""
-                        ),
-                        replay_helpers=replay_helpers,
-                        helper_names=helper_names,
-                        source=self.id,
-                    ),
+                    # The driver already finalized the root. Let the session
+                    # hydrate that exact replay context and verifier receipt;
+                    # prompt-visible helpers can omit route-local declarations
+                    # or include declarations absent from the accepted check.
                     metadata={"root_finalization_already_applied": True},
                 )
                 if solved and getattr(result, "proof", None)
@@ -1640,8 +1627,6 @@ class RecursiveControllerAction:
                     if failure_reason == "recursive_search_impasse"
                     else ""
                 ),
-                "replay_helpers": list(replay_helpers),
-                "helper_names": list(helper_names),
                 "root_finalization_already_applied": bool(
                     solved and getattr(result, "proof", None)
                 ),
@@ -1652,13 +1637,14 @@ class RecursiveControllerAction:
                     else failure_reason if terminal_failure else ""
                 ),
                 "terminal_failure_kind": (
-                    "mathematical_disproof" if disproved else ""
+                    "mathematical_disproof" if disproved else nested_terminal_failure_kind
                 ),
                 "disproved": disproved,
+                **nested_terminal_failure_metadata,
                 **nested_scoped_failure_metadata,
                 "scoped_failure_reason": scoped_failure_reason,
                 "llm_failure_scope": failure_scope,
-                "llm_failure_kind": nested_scoped_failure_kind,
+                "llm_failure_kind": nested_scoped_failure_kind or nested_terminal_failure_kind,
                 # The nested call has already exhausted its in-call retry
                 # policy.  A typed transient remains retryable only as a
                 # later scheduler quantum, after other proof families run.

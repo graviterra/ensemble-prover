@@ -20,6 +20,7 @@ from urllib.parse import urlencode, urljoin, urlsplit
 
 import aiohttp
 
+from ..subprocess_environment import sanitized_subprocess_environment
 from .model import json_text, text, load_json
 
 MAX_BYTES = 16 * 1024 * 1024
@@ -168,7 +169,8 @@ def source_context(store: Any, artifact_id: str) -> Any:
 
 async def _process(argv: list[str], timeout: float) -> None:
     process = await asyncio.create_subprocess_exec(
-        *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        env=sanitized_subprocess_environment(),
     )
     try:
         await asyncio.wait_for(process.wait(), timeout=timeout)

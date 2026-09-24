@@ -1632,18 +1632,19 @@ def _accepted_scratch_can_finalize(
     candidate = _checked_code_body(code)
     if not candidate:
         return False
-    if re.match(r"^\s*(?:by|show|calc|exact|refine|fun)(?![\w'])", _strip_lean_comments(candidate)):
+    classification_source = _strip_lean_comments(candidate)
+    if re.match(r"^\s*(?:by|show|calc|exact|refine|fun)(?![\w'])", classification_source):
         # These forms were checked directly against the active tool goal.
         return True
     if require_declaration:
-        return helper_decl_kind(candidate) in {"lemma", "theorem"}
-    if _SCOPED_OPEN_DECL_PREFIX_RE.match(_strip_lean_comments(candidate)):
+        return helper_decl_kind(classification_source) in {"lemma", "theorem"}
+    if _SCOPED_OPEN_DECL_PREFIX_RE.match(classification_source):
         # Local notation/name resolution can change the meaning of a header
         # whose text matches the goal. Bank it as a helper, not root evidence.
         return False
     if not (
-        _PLAIN_EXAMPLE_DECL_RE.match(_strip_lean_comments(candidate))
-        or helper_decl_kind(candidate)
+        _PLAIN_EXAMPLE_DECL_RE.match(classification_source)
+        or helper_decl_kind(classification_source)
     ):
         # Legacy receipts can contain an unnormalized prelude. Do not search
         # through it for a matching header: imports/opens can change its type.

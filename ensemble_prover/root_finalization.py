@@ -17,7 +17,10 @@ from .lean_artifact_sanitize import (
     sanitize_lean_artifact_text,
     sanitize_lean_artifact_texts,
 )
-from .mini_deadline_transaction import DeadlineMutationTransaction
+from .mini_deadline_transaction import (
+    DeadlineMutationTransaction,
+    active_deadline_transaction,
+)
 from .proof_dossier import (
     _record_falsification_trust_boundary_conflict,
     active_root_disproof_certificate_is_valid,
@@ -104,6 +107,29 @@ class _RootProofFinalizationReceiptParticipant:
                 self._receipt_hash
             )
         self._promoted = False
+
+
+def has_live_root_proof_finalization_receipt(dossier: Any) -> bool:
+    """Check exact committed or pending authority without publishing a receipt."""
+
+    committed = getattr(dossier, "has_root_proof_finalization_receipt", None)
+    if callable(committed) and committed():
+        return True
+    transaction = active_deadline_transaction()
+    receipt_hash_getter = getattr(dossier, "root_proof_finalization_receipt_hash", None)
+    if transaction is None or not callable(receipt_hash_getter):
+        return False
+    receipt_hash = str(receipt_hash_getter() or "")
+    return bool(
+        receipt_hash
+        and transaction.has_pending_participant(
+            lambda participant: isinstance(
+                participant, _RootProofFinalizationReceiptParticipant
+            )
+            and participant._dossier is dossier
+            and participant._receipt_hash == receipt_hash
+        )
+    )
 
 
 def root_verification_certificate(

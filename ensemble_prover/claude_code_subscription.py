@@ -9,7 +9,9 @@ No private endpoints, extracted login tokens, or API-key fallback are used.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -41,6 +43,29 @@ from .subscription_cli import (
 from .subprocess_environment import sanitized_subprocess_environment
 
 CLAUDE_CODE_SUBSCRIPTION_BASE_URL = "claude-code://subscription"
+
+# Known names are useful diagnostics, not an event allowlist. Never echo an
+# arbitrary event tag: it can contain provider text or credentials.
+_DIAGNOSTIC_EVENT_NAMES = frozenset({
+    "system", "init", "commands_changed", "status", "compact_boundary",
+    "api_retry", "thinking_tokens", "hook_started", "hook_progress",
+    "hook_response", "task_started", "task_progress", "task_notification",
+    "task_updated", "task_summary", "background_tasks_changed",
+    "session_state_changed", "turn_starting", "turn_duration", "informational",
+    "notification", "model_fallback", "model_consent_fallback", "api_error",
+    "permission_denied", "assistant", "user", "result", "rate_limit_event",
+    "stream_event", "control_request", "control_response",
+})
+
+
+def _event_diagnostic_name(value: Any) -> str:
+    if not isinstance(value, str):
+        return "invalid"
+    if value in _DIAGNOSTIC_EVENT_NAMES:
+        return value
+    return "unknown_sha256_" + hashlib.sha256(
+        value.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[:16]
 
 _CLAUDE_INSTRUCTIONS = """You are the Lean theorem prover for the mathematical conversation supplied in the JSON request.
 Respond to that conversation by invoking StructuredOutput directly. Do not first compose or print a separate JSON response.
@@ -274,7 +299,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             if not binary:
                 raise ClaudeCodeBackendError(
                     "Claude Code executable not found; install it or set --claude-code-bin.",
-                    kind="capability",
+                    kind="compatibility",
                 )
             self._binary = str(Path(binary).absolute())
             with tempfile.TemporaryDirectory(
@@ -298,7 +323,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 if code or any(flag not in out for flag in flags):
                     raise ClaudeCodeBackendError(
                         "Claude Code CLI lacks required structured-output and isolation flags; update Claude Code.",
-                        kind="capability",
+                        kind="compatibility",
                     )
                 out, _, code = await self._process(
                     [self._binary, *self._isolation_args(), "auth", "status", "--json"],
@@ -319,7 +344,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 )
                 if code:
                     raise ClaudeCodeBackendError(
-                        "Cannot identify Claude Code CLI version", kind="capability"
+                        "Cannot identify Claude Code CLI version", kind="compatibility"
                     )
                 self.cli_version = out.decode("utf-8", errors="replace").strip()[:100]
             self._preflight_done = True
@@ -330,7 +355,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
         if effort not in {"", "low", "medium", "high", "xhigh", "max"}:
             raise ClaudeCodeBackendError(
                 "Claude Code supports efforts low/medium/high/xhigh/max; explicit reasoning-off and minimal are unavailable.",
-                kind="capability",
+                kind="compatibility",
             )
         return effort
 
@@ -496,6 +521,18 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
         }
         final_progress_status = "failed"
 
+        def incompatible_event(event: dict[str, Any]) -> ClaudeCodeBackendError:
+            version = re.match(r"[0-9]+\.[0-9]+\.[0-9]+", self.cli_version[:40])
+            return ClaudeCodeBackendError(
+                "Claude Code stream is incompatible with the isolated transport "
+                f"(event={_event_diagnostic_name(event.get('type'))}; "
+                f"subtype={_event_diagnostic_name(event.get('subtype'))}; "
+                f"initialized={str(initialized).lower()}; "
+                f"cli={version.group() if version else 'unknown'}). "
+                "Check CLI compatibility before resuming.",
+                kind="compatibility",
+            )
+
         def report_progress(status: str, event: dict[str, Any] | None = None) -> None:
             progress["status"] = status
             progress["elapsed_s"] = time.monotonic() - started
@@ -578,11 +615,21 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
         def on_event(event: dict[str, Any]) -> None:
             nonlocal completed, structured_answer, failure, failed_turn, thread_id, initialized
             kind = event.get("type")
-            if initialized and event.get("session_id", thread_id) != thread_id:
-                raise ClaudeCodeBackendError("Claude Code changed session identity")
+            if thread_id and event.get("session_id", thread_id) != thread_id:
+                raise incompatible_event(event)
             if kind == "system":
                 subtype = event.get("subtype")
-                if subtype == "init":
+                if subtype == "commands_changed":
+                    # CLI discovery can finish before or after init. With slash
+                    # commands disabled it may only report an empty inventory;
+                    # this is neither initialization nor permission to act.
+                    session_id = event.get("session_id")
+                    if (event.get("commands") != []
+                            or not isinstance(session_id, str) or not session_id):
+                        raise incompatible_event(event)
+                    thread_id = session_id
+                    report_progress(progress["status"], event)
+                elif subtype == "init":
                     if initialized:
                         raise ClaudeCodeBackendError(
                             "Claude Code returned duplicate initialization"
@@ -603,11 +650,11 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     ):
                         raise ClaudeCodeBackendError(
                             "Claude Code exposed unexpected native tools",
-                            kind="capability",
+                            kind="compatibility",
                         )
                     if event.get("mcp_servers") != []:
                         raise ClaudeCodeBackendError(
-                            "Claude Code exposed MCP servers", kind="capability"
+                            "Claude Code exposed MCP servers", kind="compatibility"
                         )
                     initialized = True
                     report_progress("initialized", event)
@@ -619,10 +666,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     # They are telemetry, not actions or usage receipts.
                     "thinking_tokens",
                 ):
-                    raise ClaudeCodeBackendError(
-                        "Claude Code emitted an unsupported system action",
-                        kind="capability",
-                    )
+                    raise incompatible_event(event)
                 elif subtype == "compact_boundary":
                     raise ClaudeCodeBackendError(
                         "Claude Code compacted the supplied conversation; required "
@@ -714,7 +758,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             if kind == "rate_limit_event":
                 return  # The final result establishes whether the request succeeded.
             if kind != "result":
-                raise ClaudeCodeBackendError("Claude Code emitted an unsupported event")
+                raise incompatible_event(event)
             if completed:
                 raise ClaudeCodeBackendError(
                     "Claude Code returned more than one result"

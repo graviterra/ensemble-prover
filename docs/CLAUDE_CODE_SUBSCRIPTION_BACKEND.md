@@ -70,6 +70,21 @@ adapter validates initialization, session identity, native tool names and tool
 result identities. Host tools such as `check_lean` must appear inside the JSON
 envelope; calling them directly as Claude-native tools is rejected.
 
+An empty `commands_changed` discovery event is accepted before or after
+initialization, but does not authorize tools or substitute for initialization.
+Nonempty command inventories, unexpected initialization capabilities and
+unsupported stream events fail with `provider_protocol_incompatible`. The
+attempt reports an infrastructure failure rather than retrying proof routes.
+Diagnostics include bounded event names (or fingerprints for unknown names),
+without copying event payloads.
+
+Putnam sweeps pause on terminal provider protocol or account failures after
+cleanup, record `infrastructure_blocked`, and leave the remaining queue pending.
+After repairing the provider setup, explicitly resume the sweep to retry the
+blocked problem. A protocol-blocked attempt starts fresh; it does not reuse the
+incompatible session's terminal checkpoint. Earlier attempts already recorded
+as ordinary `failed` are not automatically reclassified or retried.
+
 The adapter deliberately avoids `--bare`, which disables saved subscription
 OAuth. Environment credentials and provider overrides are removed. Installed
 Claude Code, saved authentication and administrator-managed policy remain

@@ -1169,12 +1169,20 @@ def _export_target_witness(
     from .lean_runner import _type_identity_probe_command, _check_target_identity_guard_definition
 
     name = "miniExportExpected_" + hashlib.sha256(statement.encode()).hexdigest()[:20]
-    command = "set_option autoImplicit true in\n" + _type_identity_probe_command(f"_root_.{name}", statement)
+    command = "set_option autoImplicit true in\npublic " + _type_identity_probe_command(f"_root_.{name}", statement)
     if omit_variables:
         command = f"omit {' '.join(omit_variables)} in\n{command}"
     if scoped_prefix:
         command = f"{scoped_prefix}\n{command}"
     return name, command + "\n" + _check_target_identity_guard_definition(name)
+
+
+@dataclass(frozen=True)
+class ExportSources:
+    """Proof source and its private checks, assembled from the same inputs."""
+
+    publication: str
+    verification: str
 
 
 def _build_solved_file(
@@ -1188,7 +1196,8 @@ def _build_solved_file(
     extra_imports: Sequence[str] = (),
     extra_theory_sources: Sequence[str] = (),
     max_heartbeats: int = _DEFAULT_EXPORT_MAX_HEARTBEATS,
-) -> Optional[str]:
+    separate_verification: bool = False,
+) -> Optional[str | ExportSources]:
     """Reconstruct a standalone Lean source.
 
     The mini-prover Lean-checked the proof against ``example : <statement_type>
@@ -1284,6 +1293,7 @@ def _build_solved_file(
         parts.append("\n\n".join(clean_theory_sources))
     artifact_helpers = list(sanitize_lean_artifact_texts(helpers))
     parts.append(f"set_option maxHeartbeats {max_heartbeats}")
+    publication_parts = list(parts)
     witness_name = ""
     helper_audit_after = ""
     if artifact_helpers:
@@ -1299,6 +1309,7 @@ def _build_solved_file(
     if artifact_helpers:
         parts.append("")
         parts.append("\n\n".join(artifact_helpers))
+        publication_parts.extend(("", "\n\n".join(artifact_helpers)))
     parts.append("")
     if problem.docstring.strip():
         parts.append(problem.docstring.strip())
@@ -1331,6 +1342,10 @@ def _build_solved_file(
     if proof_scoped_prefix:
         declaration_block = f"{proof_scoped_prefix}\n{declaration_block}"
     parts.append(declaration_block)
+    if not replay_name:
+        if problem.docstring.strip():
+            publication_parts.extend(("", problem.docstring.strip()))
+        publication_parts.extend(("", declaration_block))
     content = "\n".join(parts) + "\n"
     if witness_name:
         from .lean_runner import _check_target_identity_guard
@@ -1340,7 +1355,20 @@ def _build_solved_file(
     if replay_guard:
         content = merge_imports(content, ("Lean.Elab.Command", "Lean.Util.CollectAxioms"))
         content += "\n" + replay_guard
-    return _with_export_heartbeats(content, max_heartbeats)
+    verification = _with_export_heartbeats(content, max_heartbeats)
+    if separate_verification:
+        publication = "\n".join(publication_parts) + "\n"
+        # Imports are part of the elaboration environment, not private audit
+        # machinery. Helpers checked with Lean available may depend on it.
+        if witness_name:
+            publication = merge_imports(publication, ("Lean",))
+        if replay_guard:
+            publication = merge_imports(publication, ("Lean.Elab.Command", "Lean.Util.CollectAxioms"))
+        return ExportSources(
+            _with_export_heartbeats(publication, max_heartbeats),
+            verification,
+        )
+    return verification
 
 
 def _build_theorem_project_solved_file(
@@ -1351,7 +1379,8 @@ def _build_theorem_project_solved_file(
     extra_imports: Sequence[str] = (),
     extra_theory_sources: Sequence[str] = (),
     max_heartbeats: int = _DEFAULT_EXPORT_MAX_HEARTBEATS,
-) -> Optional[str]:
+    separate_verification: bool = False,
+) -> Optional[str | ExportSources]:
     """Reconstruct a solved source from the run's immutable input snapshot."""
 
     theorem_name = str(problem_record.get("theorem_name") or "").strip()
@@ -1416,6 +1445,7 @@ def _build_theorem_project_solved_file(
         parts.extend(("", scoped_preamble))
     artifact_helpers = list(sanitize_lean_artifact_texts(helpers))
     parts.append(f"set_option maxHeartbeats {max_heartbeats}")
+    publication_parts = list(parts)
     witness_name = ""
     helper_audit_after = ""
     if artifact_helpers:
@@ -1430,6 +1460,7 @@ def _build_theorem_project_solved_file(
         parts.append(helper_audit_before)
     if artifact_helpers:
         parts.extend(("", "\n\n".join(artifact_helpers)))
+        publication_parts.extend(("", "\n\n".join(artifact_helpers)))
     description = str(problem_record.get("docstring") or "").strip()
     rendered_description = ""
     if description:
@@ -1478,10 +1509,11 @@ def _build_theorem_project_solved_file(
     if target_scoped_prefix:
         declaration_block = f"{target_scoped_prefix}\n{declaration_block}"
     parts.extend(("", declaration_block))
+    if not replay_name:
+        publication_parts.extend(("", declaration_block))
     # A wrapper or active section include must never silently change the
-    # published signature after we render Lean's canonical type. Keep an
-    # executable exact ascription in the artifact so both installation and
-    # future recompilation fail if the named theorem acquires any extra binder.
+    # published signature after we render Lean's canonical type. Check the
+    # exact ascription privately before installing the proof-only artifact.
     signature_check = (
         "set_option autoImplicit true in\n"
         f"example : {statement_type} := by exact @_root_.{theorem_name}"
@@ -1500,7 +1532,18 @@ def _build_theorem_project_solved_file(
     if replay_guard:
         content = merge_imports(content, ("Lean.Elab.Command", "Lean.Util.CollectAxioms"))
         content += "\n" + replay_guard
-    return _with_export_heartbeats(content, max_heartbeats)
+    verification = _with_export_heartbeats(content, max_heartbeats)
+    if separate_verification:
+        publication = "\n".join(publication_parts) + "\n"
+        if witness_name:
+            publication = merge_imports(publication, ("Lean",))
+        if replay_guard:
+            publication = merge_imports(publication, ("Lean.Elab.Command", "Lean.Util.CollectAxioms"))
+        return ExportSources(
+            _with_export_heartbeats(publication, max_heartbeats),
+            verification,
+        )
+    return verification
 
 
 # Lean exits 0 even when a declaration uses ``sorry``/``admit`` (it is a warning,
@@ -1796,7 +1839,7 @@ def _build_export_support_projects(
 
 def _install_exported_lean(
     out_path: Path,
-    content: str,
+    content: str | ExportSources,
     *,
     verify_lean: bool,
     lean_project_dir: Optional[Path] = None,
@@ -1815,6 +1858,8 @@ def _install_exported_lean(
     ``native_decide``'s ``Lean.ofReduceBool``, or custom ``axiom`` decls.
     """
 
+    verification_content = content.verification if isinstance(content, ExportSources) else None
+    content = content.publication if isinstance(content, ExportSources) else content
     if not verify_lean:
         out_path.write_text(content, encoding="utf-8")
         note = ""
@@ -1858,6 +1903,28 @@ def _install_exported_lean(
             (),
         )
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if verification_content is not None and verification_content != content:
+        # Check the frozen pre-helper target, full helper inventory and saved
+        # root replay without installing any of the verification machinery.
+        with tempfile.TemporaryDirectory(prefix=".export-check-", dir=out_path.parent) as directory:
+            verification_path = Path(directory) / "Verification.lean"
+            verification_path.write_text(verification_content, encoding="utf-8")
+            checked, check_output = _verify_exported_lean(
+                verification_path, lean_project_dir=lean_project_dir,
+                timeout_s=lean_timeout_s, extra_lean_paths=extra_lean_paths,
+            )
+            if not checked:
+                return False, "lean_rejected", check_output, ()
+            audited, _, unexpected, audit_output = _audit_exported_axioms(
+                verification_content, theorem_name, scratch_dir=Path(directory),
+                lean_project_dir=lean_project_dir, timeout_s=lean_timeout_s,
+                extra_lean_paths=extra_lean_paths,
+            )
+            if not audited:
+                return (
+                    False, "axiom_rejected" if unexpected else "axiom_audit_failed",
+                    check_output + "\n" + audit_output, (),
+                )
     temp_fd, temp_name = tempfile.mkstemp(
         prefix=f".{out_path.stem}.verify.",
         suffix=".tmp.lean",
@@ -1933,6 +2000,20 @@ def _install_exported_lean(
             os.close(candidate_fd)
             candidate_path = Path(candidate_name)
             candidate_path.write_text(presentation.content, encoding="utf-8")
+            candidate_ok, candidate_output = _verify_exported_lean(
+                candidate_path, lean_project_dir=lean_project_dir,
+                timeout_s=lean_timeout_s, extra_lean_paths=extra_lean_paths,
+            )
+            if not candidate_ok:
+                raise ValueError(f"presentation did not compile: {candidate_output}")
+            candidate_ok, candidate_axioms, _, candidate_output = _audit_exported_axioms(
+                presentation.content, theorem_name, scratch_dir=out_path.parent,
+                lean_project_dir=lean_project_dir, timeout_s=lean_timeout_s,
+                extra_lean_paths=extra_lean_paths,
+            )
+            if not candidate_ok:
+                raise ValueError(f"presentation axiom audit failed: {candidate_output}")
+            presentation.axioms = list(candidate_axioms)
             archive_original(out_path, content, presentation)
             publish_path = candidate_path
     except Exception as exc:
@@ -2283,6 +2364,7 @@ def _export_solved_files_locked(
             content = (
                 _build_theorem_project_solved_file(
                     snapshot, proof, helpers,
+                    separate_verification=True,
                     max_heartbeats=_summary_max_heartbeats(s),
                 )
                 if snapshot is not None
@@ -2290,6 +2372,7 @@ def _export_solved_files_locked(
                     name,
                     proof,
                     helpers,
+                    separate_verification=True,
                     max_heartbeats=_summary_max_heartbeats(s),
                     answer_visibility=_summary_answer_visibility(s),
                     **_summary_visibility_flags(s),
@@ -2599,6 +2682,7 @@ def _export_solved_run_locked(
             project_snapshot,
             proof,
             helpers,
+            separate_verification=True,
             extra_imports=tuple(dict.fromkeys(theory_source_imports)),
             extra_theory_sources=tuple(theory_sources),
             max_heartbeats=_summary_max_heartbeats(summary),
@@ -2608,6 +2692,7 @@ def _export_solved_run_locked(
             problem_name,
             proof,
             helpers,
+            separate_verification=True,
             max_heartbeats=_summary_max_heartbeats(summary),
             answer_visibility=visibility,
             **visibility_flags,
