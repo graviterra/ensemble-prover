@@ -1183,6 +1183,8 @@ class ExportSources:
 
     publication: str
     verification: str
+    # Optional presentation candidate omitting only exporter-added imports.
+    import_cleanup: str | None = None
 
 
 def _build_solved_file(
@@ -1358,8 +1360,9 @@ def _build_solved_file(
     verification = _with_export_heartbeats(content, max_heartbeats)
     if separate_verification:
         publication = "\n".join(publication_parts) + "\n"
-        # Imports are part of the elaboration environment, not private audit
-        # machinery. Helpers checked with Lean available may depend on it.
+        import_cleanup = publication
+        # Keep the checked import environment as the verified fallback.
+        # Presentation may omit additions only after comparing declarations.
         if witness_name:
             publication = merge_imports(publication, ("Lean",))
         if replay_guard:
@@ -1367,6 +1370,8 @@ def _build_solved_file(
         return ExportSources(
             _with_export_heartbeats(publication, max_heartbeats),
             verification,
+            _with_export_heartbeats(import_cleanup, max_heartbeats)
+            if import_cleanup != publication else None,
         )
     return verification
 
@@ -1535,6 +1540,7 @@ def _build_theorem_project_solved_file(
     verification = _with_export_heartbeats(content, max_heartbeats)
     if separate_verification:
         publication = "\n".join(publication_parts) + "\n"
+        import_cleanup = publication
         if witness_name:
             publication = merge_imports(publication, ("Lean",))
         if replay_guard:
@@ -1542,6 +1548,8 @@ def _build_theorem_project_solved_file(
         return ExportSources(
             _with_export_heartbeats(publication, max_heartbeats),
             verification,
+            _with_export_heartbeats(import_cleanup, max_heartbeats)
+            if import_cleanup != publication else None,
         )
     return verification
 
@@ -1859,6 +1867,7 @@ def _install_exported_lean(
     """
 
     verification_content = content.verification if isinstance(content, ExportSources) else None
+    import_cleanup = content.import_cleanup if isinstance(content, ExportSources) else None
     content = content.publication if isinstance(content, ExportSources) else content
     if not verify_lean:
         out_path.write_text(content, encoding="utf-8")
@@ -1990,6 +1999,7 @@ def _install_exported_lean(
             project=Path(lean_project_dir) if lean_project_dir is not None
             else PROJECT_ROOT / "external" / "PutnamBench" / "lean4",
             timeout_s=lean_timeout_s, extra_lean_paths=extra_lean_paths,
+            import_cleanup=import_cleanup,
         )
         if presentation.status == "applied" and presentation.content != content:
             # Never rewrite the verified fallback, even on a partial write.

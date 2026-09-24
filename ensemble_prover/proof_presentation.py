@@ -22,7 +22,7 @@ from typing import Any, Sequence
 
 from .export_dependency_graph import _strip_comments_and_strings
 from .subprocess_environment import sanitized_subprocess_environment
-from .theorem_project import scan_lean_theorems
+from .theorem_project import scan_lean_theorems, split_lean_import_header
 
 MAX_PRESENTATION_SECONDS = 60.0
 MAX_SOURCE_BYTES = 4_000_000
@@ -389,7 +389,8 @@ def _probe(content: str, path: Path, *, project: Path, timeout_s: float,
 
 def present_export(content: str, root: str, *, scratch_dir: Path,
                    project: Path, timeout_s: float = MAX_PRESENTATION_SECONDS,
-                   extra_lean_paths: Sequence[Path] = ()) -> PresentationResult:
+                   extra_lean_paths: Sequence[Path] = (),
+                   import_cleanup: str | None = None) -> PresentationResult:
     """Propose, replay, compare, and audit; never turn cleanup failure into loss."""
     root = root.removeprefix("_root_.")
     fallback = PresentationResult(content)
@@ -406,9 +407,17 @@ def present_export(content: str, root: str, *, scratch_dir: Path,
             fallback.reason = "source_size_limit"
             return fallback
         remaining()
+        import_headers = None
+        if import_cleanup is not None and len(import_cleanup) < len(content):
+            old_header, old_body = split_lean_import_header(content)
+            clean_header, clean_body = split_lean_import_header(import_cleanup)
+            # This proposal may change only the header; declarations are
+            # handled by the existing independently checked cleanup below.
+            if old_body == clean_body and content.startswith(old_header):
+                import_headers = (old_header, clean_header)
         pruned, removed = _prune_unused(content, root, deadline=deadline)
         readable = any(_needs_readable_type(pruned, d) for d in _editable_declarations(pruned))
-        if not removed and not readable:
+        if not removed and not readable and import_headers is None:
             return fallback
         with tempfile.TemporaryDirectory(prefix=".presentation-check-", dir=scratch_dir) as tmp:
             # Both replays use the same module path: private declaration names
@@ -424,6 +433,15 @@ def present_export(content: str, root: str, *, scratch_dir: Path,
             choices = [(candidate, rewritten)]
             if rewritten and removed:
                 choices.append((pruned, []))
+            if import_headers is not None:
+                old_header, clean_header = import_headers
+                # Keep every original candidate as a fallback if an import
+                # is required or its omission changes a declaration's type.
+                choices = [
+                    (clean_header + candidate[len(old_header):], rewritten)
+                    for candidate, rewritten in choices
+                    if candidate.startswith(old_header)
+                ] + choices
             for candidate, rewritten in choices:
                 if candidate == content:
                     continue

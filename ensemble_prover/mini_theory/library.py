@@ -796,23 +796,49 @@ class MiniTheoryLibrary:
             {"area": "need", **issue} for issue in self.needs.integrity_issues()
         )
 
+    @_serialized_library_operation
     def reconcile_need_contexts(self) -> tuple[str, ...]:
         """Reopen needs whose consumer-validated bundle closure is unusable."""
 
         if self.mode == "off":
             return ()
         assert self.needs is not None
+        records = tuple(
+            record for record in self.needs.iter_records()
+            if record.status in {"resolved", "context_available"}
+        )
+        if not records:
+            return ()
+        # All consumers in this operation share one integrity-checked view.
+        # Do not retain it across calls: later reconciliations must observe
+        # changed artifacts and dependency environments.
+        environment_snapshot = None
+        snapshot_error = None
         invalidated: list[str] = []
-        for record in tuple(self.needs.iter_records()):
-            if record.status not in {"resolved", "context_available"}:
-                continue
+        for record in records:
             bundle_ids = tuple(record.validated_bundle_ids or ()) or (
                 (record.bundle_id,) if record.bundle_id else ()
             )
             try:
                 if not bundle_ids:
                     raise TheoryStoreError("need has no validated theory bundles")
-                self.snapshot(bundle_ids)
+                if environment_snapshot is None and snapshot_error is None:
+                    try:
+                        environment_snapshot = self._environment_bundle_snapshot()
+                        self._refresh_retriever_from_bundles(
+                            environment_snapshot[2].values()
+                        )
+                    except TheoryStoreError as exc:
+                        snapshot_error = exc
+                if snapshot_error is not None:
+                    raise snapshot_error
+                assert environment_snapshot is not None
+                self._require_environment_compatible(
+                    bundle_ids, snapshot=environment_snapshot,
+                )
+                self._provenance_snapshot(
+                    bundle_ids, environment_snapshot=environment_snapshot,
+                )
             except TheoryStoreError as exc:
                 _reopened, changed = self.needs.invalidate_context(
                     record.need.need_id,
