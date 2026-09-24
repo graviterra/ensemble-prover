@@ -9460,43 +9460,47 @@ def _support_contains_contract(
         graph_contract_weakening_tail,
     )
 
-    premise_norm = _contract_norm(premise)
-    if not premise_norm:
-        return True
-    premise_alpha_norm = _contract_alpha_norm(
-        premise,
-        context_bound_names=premise_bound_names,
-    )
-    _alpha_body, premise_mapping = _contract_alpha_source(premise, premise_bound_names)
-    for support, support_bound_names in support_candidates:
-        support_norm = _contract_norm(support)
-        # Preserve the exact surface fast path, but defer namespace aliasing to
-        # the alpha-normalized comparison below.  Otherwise an unqualified
-        # local binder named ``Icc`` could be confused with ``Set.Icc`` before
-        # its scoped binder identity has been made explicit.
-        if premise_norm == support_norm and graph_contract_domains_compatible(
-            premise, support, left_bound_names=premise_bound_names,
-        ):
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    while True:
+        state = (premise, tuple(premise_bound_names))
+        if state in seen:
+            return False
+        seen.add(state)
+        premise_norm = _contract_norm(premise)
+        if not premise_norm:
             return True
-        support_alpha_norm = _contract_alpha_norm(
-            support,
-            context_bound_names=support_bound_names,
+        premise_alpha_norm = _contract_alpha_norm(
+            premise,
+            context_bound_names=premise_bound_names,
         )
-        _alpha_body, support_mapping = _contract_alpha_source(support, support_bound_names)
-        if _contract_identity_matches(premise_alpha_norm, support_alpha_norm) and graph_contract_domains_compatible(
-            premise, support, left_mapping=premise_mapping, right_mapping=support_mapping,
-            left_bound_names=premise_bound_names,
-        ):
-            return True
-    # Weakening is sound in this direction: a proof of B also supplies A → B.
-    # Only discard assumptions from the requested contract, never its support.
-    weakened = graph_contract_weakening_tail(premise)
-    if weakened:
-        return _support_contains_contract(
-            weakened, support_candidates,
-            premise_bound_names=graph_contract_weakening_bound_names(premise, premise_bound_names),
-        )
-    return False
+        _alpha_body, premise_mapping = _contract_alpha_source(premise, premise_bound_names)
+        for support, support_bound_names in support_candidates:
+            support_norm = _contract_norm(support)
+            # Preserve the exact surface fast path, but defer namespace aliasing to
+            # the alpha-normalized comparison below. Otherwise an unqualified
+            # local binder named ``Icc`` could be confused with ``Set.Icc`` before
+            # its scoped binder identity has been made explicit.
+            if premise_norm == support_norm and graph_contract_domains_compatible(
+                premise, support, left_bound_names=premise_bound_names,
+            ):
+                return True
+            support_alpha_norm = _contract_alpha_norm(
+                support,
+                context_bound_names=support_bound_names,
+            )
+            _alpha_body, support_mapping = _contract_alpha_source(support, support_bound_names)
+            if _contract_identity_matches(premise_alpha_norm, support_alpha_norm) and graph_contract_domains_compatible(
+                premise, support, left_mapping=premise_mapping, right_mapping=support_mapping,
+                left_bound_names=premise_bound_names,
+            ):
+                return True
+        # Weakening is sound in this direction: a proof of B also supplies A → B.
+        # Only discard assumptions from the requested contract, never its support.
+        weakened = graph_contract_weakening_tail(premise)
+        if not weakened:
+            return False
+        premise_bound_names = graph_contract_weakening_bound_names(premise, premise_bound_names)
+        premise = weakened
 
 
 @dataclass(frozen=True)

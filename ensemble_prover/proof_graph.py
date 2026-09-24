@@ -5103,6 +5103,9 @@ def graph_contract_weakening_tail(statement: str) -> str:
 
     ``∀ h : A, P h`` is a dependent function, not merely ``A → P``. A
     surface matcher cannot erase ``h`` and then align it with unrelated data.
+    Closing over uncertain data domains may preserve the statement. Consumers
+    must track the complete statement and bound-name context to detect cycles;
+    a context change alone can still expose a valid alpha-equivalent match.
     """
     body, records = _graph_leading_binder_analysis(statement)
     for index, (_raw, names, type_text, is_proof, ambiguous) in enumerate(records):
@@ -5143,33 +5146,37 @@ def _graph_support_contains_contract(
     premise: str, supports: Sequence[Tuple[str, Tuple[str, ...]]],
     *, bound_names: Sequence[str] = (),
 ) -> bool:
-    body, names = graph_statement_keyed_contract(premise)
-    context = tuple(dict.fromkeys((*bound_names, *names)))
-    norm = _graph_contract_norm(premise)
-    alpha = _graph_contract_alpha_norm(body, context_bound_names=context)
-    _alpha_body, premise_mapping = _graph_contract_alpha_source(body, context)
-    for support, support_names in supports:
-        support_body, leading = graph_statement_keyed_contract(support)
-        if norm == _graph_contract_norm(support) and graph_contract_domains_compatible(
-            premise, support, left_bound_names=bound_names,
-        ):
-            return True
-        support_context = tuple(dict.fromkeys((*support_names, *leading)))
-        _alpha_body, support_mapping = _graph_contract_alpha_source(support_body, support_context)
-        if alpha == _graph_contract_alpha_norm(
-            support_body, context_bound_names=support_context,
-        ) and graph_contract_domains_compatible(
-            premise, support, left_mapping=premise_mapping, right_mapping=support_mapping,
-            left_bound_names=bound_names,
-        ):
-            return True
-    weakened = graph_contract_weakening_tail(premise)
-    if weakened:
-        return _graph_support_contains_contract(
-            weakened,
-            supports, bound_names=graph_contract_weakening_bound_names(premise, context),
-        )
-    return False
+    seen: Set[Tuple[str, Tuple[str, ...]]] = set()
+    while True:
+        state = (premise, tuple(bound_names))
+        if state in seen:
+            return False
+        seen.add(state)
+        body, names = graph_statement_keyed_contract(premise)
+        context = tuple(dict.fromkeys((*bound_names, *names)))
+        norm = _graph_contract_norm(premise)
+        alpha = _graph_contract_alpha_norm(body, context_bound_names=context)
+        _alpha_body, premise_mapping = _graph_contract_alpha_source(body, context)
+        for support, support_names in supports:
+            support_body, leading = graph_statement_keyed_contract(support)
+            if norm == _graph_contract_norm(support) and graph_contract_domains_compatible(
+                premise, support, left_bound_names=bound_names,
+            ):
+                return True
+            support_context = tuple(dict.fromkeys((*support_names, *leading)))
+            _alpha_body, support_mapping = _graph_contract_alpha_source(support_body, support_context)
+            if alpha == _graph_contract_alpha_norm(
+                support_body, context_bound_names=support_context,
+            ) and graph_contract_domains_compatible(
+                premise, support, left_mapping=premise_mapping, right_mapping=support_mapping,
+                left_bound_names=bound_names,
+            ):
+                return True
+        weakened = graph_contract_weakening_tail(premise)
+        if not weakened:
+            return False
+        bound_names = graph_contract_weakening_bound_names(premise, context)
+        premise = weakened
 
 
 def graph_statement_forall_application_entries(
