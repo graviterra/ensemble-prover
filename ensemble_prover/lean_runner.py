@@ -225,7 +225,7 @@ _CHECK_META_ESCAPE_RE = re.compile(
 )
 _CHECK_META_ATTRIBUTE_NAME_RE = re.compile(
     r"(?<![\w.'])(?:command_elab|term_elab|tactic|macro|"
-    r"builtin_\w+|implemented_by|extern|init|export|env_extension|"
+    r"builtin_\w+|implemented_by|extern|csimp|init|export|env_extension|"
     r"command_parser|term_parser|tactic_parser|norm_num|positivity|simproc|"
     r"simproc_decl|delab|app_unexpander|app_delab|formatter|parenthesizer|"
     r"code_action\w*|\w+_(?:parser|elab|delab|handler|unexpander))(?![\w'])"
@@ -252,21 +252,25 @@ _CHECK_META_NAMESPACE_RE = re.compile(
     r"addDecl|addAndCompile|modifyEnv|setEnv|getEnv|evalExpr|mkConst|"
     r"collectAxioms|logInfo|logError|throwError|ofReduceBool|trustCompiler|"
     r"register\w*)(?![\w'])"
-    r"|(?<![\w.'])open(?:\s+(?:scoped\s+)?[\w.']+){0,40}?\s+(?:_root_\.)?Lean(?![\w'.])"
     # Inside ``namespace Lean`` meta names resolve without the prefix.
     r"|(?<![\w.'])namespace\s+(?:_root_\.)?Lean(?![\w'])"
     # An instance for any Lean-namespace type could change how the trusted
     # inventory command (which uses ``Lean.Name``/``Lean.Json``) behaves.
     r"|(?:\binstance\b|@\[[^\]]*\binstance\b)[^=]{0,400}?(?<![\w.'])Lean\."
 )
+_CHECK_META_OPEN_RE = re.compile(r"(?<![\w.'])open((?:\s+[\w.']+)+)")
 
 
 def _attribute_blocks(code: str) -> List[str]:
-    """Return the full text of every ``@[...]`` block, honoring nesting."""
+    """Return declaration and command attribute blocks, honoring nesting."""
     blocks: List[str] = []
-    start = code.find("@[")
-    while start >= 0:
-        depth, index = 0, start + 1
+    starts = re.finditer(r"@\[|(?<![\w.'])attribute\s*\[", code)
+    consumed = 0
+    for match in starts:
+        start = match.start()
+        if start < consumed:
+            continue
+        depth, index = 0, match.end() - 1
         while index < len(code):
             if code[index] == "[":
                 depth += 1
@@ -276,7 +280,7 @@ def _attribute_blocks(code: str) -> List[str]:
                     break
             index += 1
         blocks.append(code[start:index + 1])
-        start = code.find("@[", index + 1)
+        consumed = index + 1
     return blocks
 
 
@@ -300,6 +304,12 @@ def _check_meta_escape_violation(*texts: str) -> str:
                 match = pattern.search(code)
                 if match:
                     return match.group(0).strip()[:80]
+            # Scan each identifier run once. Searching for a late Lean name
+            # separately from every preceding `open` is quadratic on a long
+            # helper stream made of ordinary open commands.
+            for match in _CHECK_META_OPEN_RE.finditer(code):
+                if any(name in {"Lean", "_root_.Lean"} for name in match.group(1).split()):
+                    return "open Lean"
             for block in _attribute_blocks(code):
                 match = _CHECK_META_ATTRIBUTE_NAME_RE.search(block)
                 if match:
@@ -428,7 +438,16 @@ run_cmd do
   unless forbidden.isEmpty do
     Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
 """
-    return before, after
+    # Elaborate the audit implementation in the trusted scope. Candidate
+    # instances (including aliases of Lean.Name) must not influence equality,
+    # JSON encoding or axiom membership tests used by the inventory.
+    audit_function = f"ensemble_scratch_inventory_{identity}"
+    audit_body = after.split("run_cmd do\n", 1)[1]
+    compiled_audit = (
+        f"\nunsafe def _root_.{audit_function} : Lean.Elab.Command.CommandElabM Unit := do\n"
+        + audit_body
+    )
+    return compiled_audit + before, f"\nrun_cmd _root_.{audit_function}\n"
 
 
 def _check_goal_audit_block(goal_name: str) -> str:
@@ -463,16 +482,44 @@ run_cmd do
 """
 
 
+def _check_target_identity_guard_definition(witness: str) -> str:
+    """Elaborate the type comparison before candidate instances are in scope."""
+    return f"""
+def _root_.{witness}_guard (goal : Lean.Name) : Lean.Elab.Command.CommandElabM Unit :=
+ Lean.Elab.Command.liftTermElabM do
+  let goalInfo ← Lean.getConstInfo goal
+  let .defnInfo witnessInfo ← Lean.getConstInfo (Lean.Name.mkSimple "{witness}")
+    | Lean.throwError "scratch target type witness missing"
+  let expected ← Lean.Meta.lambdaTelescope witnessInfo.value fun params body => do
+    unless params.size > 0 && body == params.back! do
+      Lean.throwError "scratch target type witness is not an identity"
+    Lean.Meta.mkForallFVars params.pop (← Lean.Meta.inferType body)
+  let expectedParams := (Lean.collectLevelParams {{}} expected).params.toList
+  let actualParams := (Lean.collectLevelParams {{}} goalInfo.type).params.toList
+  unless expectedParams.length == actualParams.length do
+    Lean.throwError "helpers changed the target universe arity"
+  let levels := expectedParams.map Lean.Level.param
+  let actual := goalInfo.type.instantiateLevelParams actualParams levels
+  unless ← Lean.Meta.isDefEq expected actual do
+    Lean.throwError "helpers changed the target statement"
+"""
+
+
+def _check_target_identity_guard(goal_name: str, witness: str) -> str:
+    """Invoke the already elaborated comparison for the checked target."""
+    return f"\nrun_cmd _root_.{witness}_guard ``{goal_name}\n"
+
+
 # Some backends prefix info messages with ``file:line:col: info:``. Count the
 # marker anywhere: a forged extra copy then fails closed as a duplicate.
 _SCRATCH_AUDIT_MARKER_RE = re.compile(r"ENSEMBLE_SCRATCH_AUDIT_ROOTS:([^\r\n]*)")
 
 
 _PRINT_AXIOMS_DEPENDS_RE = re.compile(
-    r"'([^']+)'\s+depends\s+on\s+axioms:\s*\[([^\]]*)\]"
+    r"'([^\r\n]+)'\s+depends\s+on\s+axioms:\s*\[([^\]]*)\]"
 )
 _PRINT_AXIOMS_NONE_RE = re.compile(
-    r"'([^']+)'\s+does\s+not\s+depend\s+on\s+any\s+axioms"
+    r"'([^\r\n]+)'\s+does\s+not\s+depend\s+on\s+any\s+axioms"
 )
 
 _SAFE_CHECK_COMPONENT = r"(?:«[^»\r\n]+»|(?:[^\W\d]|_)[\w']*)"
@@ -5219,10 +5266,22 @@ class LeanRunner:
             else ""
         )
         # `example` supports both Prop-valued theorems and constructive goals.
+        target_witness = ""
+        target_guard = ""
+        if audit_requested and lemma_block:
+            witness_name = f"ensemble_target_{hash_text(preamble + statement)}"
+            target_witness = _type_identity_probe_command(f"_root_.{witness_name}", statement)
+            if target_omit_variables:
+                target_witness = f"omit {' '.join(target_omit_variables)} in\n{target_witness}"
+            if target_scoped_prefix:
+                target_witness = f"{target_scoped_prefix}\n{target_witness}"
+            target_witness += "\n\n" + _check_target_identity_guard_definition(witness_name)
+            target_guard = _check_target_identity_guard(goal_name, witness_name)
         before_lemmas = (
             f"{preamble}\n\n"
             f"{head_universe_decl}"
             f"{heartbeat_option}"
+            f"{target_witness}"
             f"{delta_before}"
         )
         lemma_block_start_line = (
@@ -5246,7 +5305,7 @@ class LeanRunner:
             audit_block = "\n" + "\n".join(
                 f"#print axioms {name}" for name in complete_audit_names
             ) + "\n"
-        content = f"{prefix}{scoped_block}{delta_after}{audit_block}"
+        content = f"{prefix}{scoped_block}{target_guard}{delta_after}{audit_block}"
         # 1-indexed line where the scoped block (set_option wrappers + example)
         # begins. ``Try this:`` suggestions on lines below this are accepted
         # by the parser; suggestions above are rejected as off-block linter
@@ -5839,7 +5898,12 @@ class LeanRunner:
         warning_as_error: bool = False,
         dispatch_observer: Optional[Callable[[], None]] = None,
     ) -> LeanResult:
-        """Check submitted proof artifacts with mandatory source admission."""
+        """Check submitted proof artifacts with mandatory source admission.
+
+        The target must elaborate in the original preamble. Helpers may prove
+        it but cannot redefine its meaning; definitions needed to state the
+        target belong in the trusted preamble or installed theory context.
+        """
         return await self._check(
             statement, proof_code, lemmas,
             source_boundary_required=True,
@@ -5890,6 +5954,9 @@ class LeanRunner:
         warning_as_error: bool = False,
         dispatch_observer: Optional[Callable[[], None]] = None,
     ) -> LeanResult:
+        from .utils import normalize_classical_tactic_prefix
+
+        proof_code = normalize_classical_tactic_prefix(proof_code)
         # Stylistic warnings do not invalidate proofs by default. These include
         # suggestions to prefer simp over simpa, unused variables/arguments,
         # and deprecation notices. Errors and sorry/admit remain rejections.
@@ -5959,6 +6026,7 @@ class LeanRunner:
         write_error = None
         meta_violation = (
             _check_meta_escape_violation(
+                statement,
                 *(
                     ()
                     if check_kind in _TRUSTED_META_PROOF_CHECK_KINDS

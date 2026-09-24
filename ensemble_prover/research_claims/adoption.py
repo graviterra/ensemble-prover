@@ -123,6 +123,17 @@ def read_mini_run(directory: Path) -> dict[str, Any]:
         )
     )
     snapshot = json.loads(data)  # Data only: never deserialize checkpoint objects.
+    expanded_checkpoint = None
+    if snapshot.get("schema_version") == 2:
+        from ..mini_session.attempt_checkpoint import (
+            AttemptCheckpointRegistry, expand_completed_children,
+        )
+
+        manifest = AttemptCheckpointRegistry._load_manifest(directory)
+        if manifest != metadata:
+            raise ValueError("Mini checkpoint metadata changed during adoption")
+        snapshot = expand_completed_children(snapshot, Path(manifest["registry_root"]))
+        expanded_checkpoint = json_text(snapshot).encode()
     contracts = _saved_contracts(snapshot, head["snapshot_hash"])
     statements = {contract["statement"] for contract in contracts}
     # Retain the old convenience fields only where their statement-only key is
@@ -133,7 +144,7 @@ def read_mini_run(directory: Path) -> dict[str, Any]:
         if len(matching := [item for item in contracts if item["statement"] == statement]) == 1
         and matching[0]["context_coverage"] == "saved_conversation"
     }
-    return {
+    result = {
         "directory": str(directory),
         "problem": problem,
         "metadata": metadata_bytes,
@@ -144,6 +155,9 @@ def read_mini_run(directory: Path) -> dict[str, Any]:
         "previous_accounting": snapshot.get("cost_ledger", {}),
         "elapsed_s": snapshot.get("recorder", {}).get("elapsed_s"),
     }
+    if expanded_checkpoint is not None:
+        result["expanded_checkpoint"] = expanded_checkpoint
+    return result
 
 
 def import_artifacts(store: Any, adoption: dict[str, Any]) -> None:
@@ -157,6 +171,12 @@ def import_artifacts(store: Any, adoption: dict[str, Any]) -> None:
         checkpoint = store.put_artifact(
             adoption["checkpoint"], name="original-mini-checkpoint.json"
         )
+        expanded_checkpoint = None
+        if "expanded_checkpoint" in adoption:
+            expanded_checkpoint = store.put_artifact(
+                adoption["expanded_checkpoint"], name="expanded-mini-checkpoint.json"
+            )
+        inspection_checkpoint = expanded_checkpoint or checkpoint
         inventory = []
         contracts = adoption.get("contracts")
         if contracts is None:
@@ -182,6 +202,8 @@ def import_artifacts(store: Any, adoption: dict[str, Any]) -> None:
                         "context_coverage": contract["context_coverage"],
                         "session_ids": contract["session_ids"],
                         "checkpoint_artifact": checkpoint,
+                        **({"expanded_checkpoint_artifact": expanded_checkpoint}
+                           if expanded_checkpoint else {}),
                     }
                 ).encode(),
                 name="adopted-contract.json",
@@ -204,6 +226,8 @@ def import_artifacts(store: Any, adoption: dict[str, Any]) -> None:
             "mode": "new_research_with_revalidated_artifacts",
             "kernel_verified": False,
         }
+        if expanded_checkpoint:
+            record["expanded_checkpoint_artifact"] = expanded_checkpoint
         record["inventory_artifact"] = store.put_artifact(
             json_text(record).encode(), name="adoption-inventory.json"
         )
@@ -218,6 +242,6 @@ def import_artifacts(store: Any, adoption: dict[str, Any]) -> None:
             "Start with the named problem/source documents; use lookup_strategy_subject to locate an exact bottleneck. "
             f"There are {len(inventory)} imported contracts. Complete adoption inventory artifact: "
             + record["inventory_artifact"]
-            + ". Original checkpoint artifact for targeted inspection: " + checkpoint
+            + ". Checkpoint artifact for targeted inspection: " + inspection_checkpoint
         )
         store.save_job(job)

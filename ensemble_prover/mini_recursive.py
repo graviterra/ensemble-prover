@@ -495,6 +495,9 @@ PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S = 1800.0
 
 @dataclass(frozen=True)
 class MiniRecursiveConfig:
+    # Mathematical ancestry must survive config replacement and durable child
+    # reconstruction, not just the lifetime of the parent's Python object.
+    graph_recursive_ancestor_keys: tuple[str, ...] = ()
     passes: int = 1
     # 0 runs the complete recursive frontier in one invocation. A positive
     # value yields a durable partial result after this many committed passes,
@@ -9185,10 +9188,21 @@ def _contract_alpha_norm(
 def _cached_contract_alpha_norm(
     text: str, context_bound_names: tuple[str, ...],
 ) -> str:
+    stripped, mapping = _contract_alpha_source(text, context_bound_names)
+    normalized = _contract_alpha_replace_scoped(stripped, mapping)
+    return _normalize_not_mem_contract_surface(_contract_compact_surface(normalized))
+
+
+def _contract_alpha_source(
+    text: str, context_bound_names: Sequence[str],
+) -> tuple[str, dict[str, str]]:
+    """Return the exact source and binder renaming used by planner alpha keys."""
+    from .proof_graph import graph_contract_data_domains
+
     stripped, leading_names = _strip_leading_forall_keeping_premises(
         _strip_contract_comments(text)
     )
-    bound_names = tuple(dict.fromkeys(context_bound_names + leading_names))
+    bound_names = tuple(dict.fromkeys(tuple(context_bound_names) + leading_names))
 
     def proof_like_bound_name(name: str) -> bool:
         lowered = str(name or "").strip().lower()
@@ -9197,15 +9211,14 @@ def _cached_contract_alpha_norm(
         )
 
     stripped_identifier_set = set(_lean_identifier_tokens(stripped))
+    data_names = {name for name, _domain in graph_contract_data_domains(text)}
     alpha_names = tuple(
         name
         for name in bound_names
-        if name in stripped_identifier_set or not proof_like_bound_name(name)
+        if name in stripped_identifier_set or name in data_names or not proof_like_bound_name(name)
     )
     mapping = {name: f"__bound{idx}__" for idx, name in enumerate(alpha_names)}
-
-    normalized = _contract_alpha_replace_scoped(stripped, mapping)
-    return _normalize_not_mem_contract_surface(_contract_compact_surface(normalized))
+    return stripped, mapping
 
 
 def _matching_surface_group_index(text: str, start: int) -> int:
@@ -9343,12 +9356,14 @@ def _support_contract_candidates(
     premises_are_assumptions: bool = False,
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
     """Return top-level formulas that can actually supply a planner premise."""
+    from .proof_graph import graph_contract_with_data_domains
 
     candidates: list[tuple[str, tuple[str, ...]]] = []
     seen: set[tuple[str, tuple[str, ...]]] = set()
 
     def add_candidate(statement_text: str, bound_names: Sequence[str]) -> None:
-        candidate = (str(statement_text or "").strip(), tuple(bound_names or ()))
+        text = str(statement_text or "").strip()
+        candidate = (graph_contract_with_data_domains(statement, text) if text else "", tuple(bound_names or ()))
         if candidate[0] and candidate not in seen:
             seen.add(candidate)
             candidates.append(candidate)
@@ -9360,7 +9375,10 @@ def _support_contract_candidates(
         # ``h : ∀ x (hx : x ≠ 0), P x`` supplies ``x ≠ 0 → P x``, not ``P x``.
         item_body, item_names = _strip_leading_forall_keeping_premises(statement_text)
         item_bound_names = tuple(dict.fromkeys(tuple(bound_names or ()) + item_names))
-        add_candidate(item_body, item_bound_names)
+        # Keep the scoped assumption too: converting a referenced proof binder
+        # to an arrow and then restoring its type would duplicate its premise.
+        add_candidate(statement_text, item_bound_names)
+        add_candidate(graph_contract_with_data_domains(statement_text, item_body), item_bound_names)
         if (
             "→" in item_body
             or "->" in item_body
@@ -9375,7 +9393,7 @@ def _support_contract_candidates(
                 item
             )
             add_candidate(
-                conjunct_body,
+                graph_contract_with_data_domains(statement_text, conjunct_body),
                 tuple(dict.fromkeys(item_bound_names + conjunct_names)),
             )
 
@@ -9384,7 +9402,7 @@ def _support_contract_candidates(
     )
     if premises_are_assumptions:
         for premise in binder_premises:
-            add_assumption_candidate(premise, statement_names)
+            add_assumption_candidate(graph_contract_with_data_domains(statement, premise), statement_names)
     implication_parts = _split_top_level_implications(body)
     conclusion = implication_parts[-1] if implication_parts else body
     if (
@@ -9409,7 +9427,9 @@ def _support_contract_candidates(
                 )
                 iff_bound_names = tuple(dict.fromkeys(statement_names + iff_names))
                 for premise in iff_binder_premises:
-                    add_assumption_candidate(premise, iff_bound_names)
+                    add_assumption_candidate(
+                        graph_contract_with_data_domains(iff_part, premise), iff_bound_names,
+                    )
                 iff_implication_parts = _split_top_level_implications(iff_body)
                 if len(iff_implication_parts) >= 2:
                     for premise in iff_implication_parts[:-1]:
@@ -9417,12 +9437,14 @@ def _support_contract_candidates(
                             _strip_leading_forall_keeping_premises(premise)
                         )
                         add_candidate(
-                            premise_body,
+                            graph_contract_with_data_domains(
+                                iff_part, graph_contract_with_data_domains(premise, premise_body),
+                            ),
                             tuple(dict.fromkeys(iff_bound_names + premise_names)),
                         )
 
     for item in selected:
-        add_assumption_candidate(item, statement_names)
+        add_assumption_candidate(graph_contract_with_data_domains(statement, item), statement_names)
     return tuple(candidates)
 
 
@@ -9432,6 +9454,12 @@ def _support_contains_contract(
     *,
     premise_bound_names: Sequence[str] = (),
 ) -> bool:
+    from .proof_graph import (
+        graph_contract_domains_compatible,
+        graph_contract_weakening_bound_names,
+        graph_contract_weakening_tail,
+    )
+
     premise_norm = _contract_norm(premise)
     if not premise_norm:
         return True
@@ -9439,20 +9467,35 @@ def _support_contains_contract(
         premise,
         context_bound_names=premise_bound_names,
     )
+    _alpha_body, premise_mapping = _contract_alpha_source(premise, premise_bound_names)
     for support, support_bound_names in support_candidates:
         support_norm = _contract_norm(support)
         # Preserve the exact surface fast path, but defer namespace aliasing to
         # the alpha-normalized comparison below.  Otherwise an unqualified
         # local binder named ``Icc`` could be confused with ``Set.Icc`` before
         # its scoped binder identity has been made explicit.
-        if premise_norm == support_norm:
+        if premise_norm == support_norm and graph_contract_domains_compatible(
+            premise, support, left_bound_names=premise_bound_names,
+        ):
             return True
         support_alpha_norm = _contract_alpha_norm(
             support,
             context_bound_names=support_bound_names,
         )
-        if _contract_identity_matches(premise_alpha_norm, support_alpha_norm):
+        _alpha_body, support_mapping = _contract_alpha_source(support, support_bound_names)
+        if _contract_identity_matches(premise_alpha_norm, support_alpha_norm) and graph_contract_domains_compatible(
+            premise, support, left_mapping=premise_mapping, right_mapping=support_mapping,
+            left_bound_names=premise_bound_names,
+        ):
             return True
+    # Weakening is sound in this direction: a proof of B also supplies A → B.
+    # Only discard assumptions from the requested contract, never its support.
+    weakened = graph_contract_weakening_tail(premise)
+    if weakened:
+        return _support_contains_contract(
+            weakened, support_candidates,
+            premise_bound_names=graph_contract_weakening_bound_names(premise, premise_bound_names),
+        )
     return False
 
 
@@ -9473,14 +9516,17 @@ class _SupportContractSequent:
 
 
 def _support_contract_sequent(statement: str) -> _SupportContractSequent:
+    from .proof_graph import graph_contract_with_data_domains
+
     premises, conclusion, bound_names = _statement_premises_and_conclusion(
         str(statement or "")
     )
     return _SupportContractSequent(
         assumptions=tuple(
-            str(item or "").strip() for item in premises if str(item or "").strip()
+            graph_contract_with_data_domains(statement, str(item or "").strip())
+            for item in premises if str(item or "").strip()
         ),
-        conclusion=str(conclusion or "").strip(),
+        conclusion=graph_contract_with_data_domains(statement, str(conclusion or "").strip()),
         bound_names=tuple(bound_names or ()),
     )
 
@@ -10606,6 +10652,8 @@ def _claim_dependency_contract_reasons(
     support_structural_hashes: AbstractSet[str] = frozenset(),
     route_anchor_identities: Sequence[str] = (),
 ) -> tuple[str, ...]:
+    from .proof_graph import graph_contract_with_data_domains
+
     root_contract_statement = str(
         plan.root_contract_display_statement or plan.root_statement or ""
     )
@@ -10752,6 +10800,7 @@ def _claim_dependency_contract_reasons(
     branch_supported_assumption_norms: set[str] = set()
     branch_supported_handler_norms: set[str] = set()
     for premise_index, premise in enumerate(premises):
+        premise_contract = graph_contract_with_data_domains(analysis_claim.statement, premise)
         premise_structural_hash = str(
             premise_structural_hashes[premise_index]
             if premise_index < len(premise_structural_hashes)
@@ -10773,8 +10822,8 @@ def _claim_dependency_contract_reasons(
         root_contract_drift = False
         for root_premise in root_drift_premises:
             if _support_contains_contract(
-                premise_text,
-                ((root_premise, root_bound_names),),
+                premise_contract,
+                ((graph_contract_with_data_domains(root_contract_statement, root_premise), root_bound_names),),
                 premise_bound_names=premise_bound_names,
             ):
                 continue
@@ -10813,11 +10862,11 @@ def _claim_dependency_contract_reasons(
         ):
             continue
         if _support_contains_contract(
-            premise_text,
+            premise_contract,
             support_candidates,
             premise_bound_names=premise_bound_names,
         ):
-            support_candidates.append((premise_text, premise_bound_names))
+            support_candidates.append((premise_contract, premise_bound_names))
             support_candidates = list(
                 _close_contextual_support_contracts(
                     support_candidates,
@@ -11017,6 +11066,8 @@ def _claim_premise_dependency_names(
     support_candidates: Sequence[tuple[str, tuple[str, ...]]] = (),
     support_statements: Sequence[str] = (),
 ) -> tuple[str, ...]:
+    from .proof_graph import graph_contract_with_data_domains
+
     premises, _conclusion, _bound_names = _statement_premises_and_conclusion(
         str(claim.statement or "")
     )
@@ -11035,6 +11086,7 @@ def _claim_premise_dependency_names(
         )
     )
     for premise in premises:
+        premise_contract = graph_contract_with_data_domains(str(claim.statement or ""), premise)
         premise_text, premise_leading_names = _strip_leading_forall_keeping_premises(
             premise
         )
@@ -11042,11 +11094,11 @@ def _claim_premise_dependency_names(
             continue
         premise_bound_names = tuple(dict.fromkeys(_bound_names + premise_leading_names))
         if _support_contains_contract(
-            premise_text,
+            premise_contract,
             closed_support_candidates,
             premise_bound_names=premise_bound_names,
         ):
-            closed_support_candidates.append((premise_text, premise_bound_names))
+            closed_support_candidates.append((premise_contract, premise_bound_names))
             continue
         for prior in provider_claims:
             prior_name = str(prior.name or "").strip()
@@ -11065,14 +11117,14 @@ def _claim_premise_dependency_names(
                 candidate_support_statements,
             )
             if _support_contains_contract(
-                premise_text,
+                premise_contract,
                 prior_support_candidates,
                 premise_bound_names=premise_bound_names,
             ):
                 dependencies.append(prior_name)
                 contextual_support_statements.append(str(prior.statement or ""))
                 closed_support_candidates = list(prior_support_candidates)
-                closed_support_candidates.append((premise_text, premise_bound_names))
+                closed_support_candidates.append((premise_contract, premise_bound_names))
                 break
     return tuple(dependencies)
 

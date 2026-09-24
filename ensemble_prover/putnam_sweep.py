@@ -449,10 +449,11 @@ def _resumable_checkpoint_dir(
         saved_environ = dict(os.environ)
         try:
             from .mini_prover import _build_argparser
-            from .mini_checkpoint_cli import resolve_resume_args
+            from .mini_checkpoint_cli import resolve_resume_args, remaining_worker_timeout_s
 
             command = build_resume_command(attempt_dir, attempt_dir, manifest_args)
-            resolve_resume_args(_build_argparser().parse_args(command[3:]))
+            resolved = resolve_resume_args(_build_argparser().parse_args(command[3:]))
+            remaining_worker_timeout_s(resolved)
         except (Exception, SystemExit):
             return None
         finally:

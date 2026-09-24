@@ -38,6 +38,8 @@ class OpenRouterReasoningCapabilities:
 # Tuple order: (input, cached_input, output).
 _OPENAI_MODEL_PRICING: tuple[tuple[str, PricingTuple], ...] = (
     ("gpt-6-astra", (10.0, 1.0, 50.0)),
+    # https://developers.openai.com/api/docs/models/gpt-6-luna
+    ("gpt-6-luna", (0.10, 0.01, 0.50)),
     ("gpt-5.6-sol", (5.0, 0.5, 30.0)),
     ("gpt-5.6-terra", (2.0, 0.20, 12.00)),
     ("gpt-5.6-luna", (0.2, 0.02, 1.20)),
@@ -52,6 +54,7 @@ _OPENAI_GPT56_LONG_CONTEXT_INPUT_MULTIPLIER = 2.0
 _OPENAI_GPT56_LONG_CONTEXT_OUTPUT_MULTIPLIER = 1.5
 _OPENAI_LONG_CONTEXT_MODEL_PREFIXES = (
     "gpt-6-astra",
+    "gpt-6-luna",
     "gpt-5.4",
     "gpt-5.6",
     "gpt-5.6-sol",
@@ -67,7 +70,7 @@ _SOL_PROMOTION_VERIFIED_FROM = date(2026, 9, 8)
 _SOL_PROMOTION_GUARANTEED_THROUGH = date(2026, 11, 21)
 _SOL_PROMOTIONAL_PRICING: PricingTuple = (4.0, 0.4, 20.0)
 _OPENAI_CACHE_WRITE_MODELS = (
-    "gpt-6-astra", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-6-astra", "gpt-6-luna", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
 )
 
 
@@ -577,6 +580,8 @@ def lookup_known_token_pricing(
         for prefix, pricing in _OPENAI_MODEL_PRICING:
             for alias in _direct_provider_model_aliases(name):
                 if _model_matches_known_prefix(alias, prefix):
+                    if prefix == "gpt-6-luna" and _valuation_date(at_date) < date(2026, 9, 22):
+                        return None
                     if prefix in {"gpt-5.6", "gpt-5.6-sol"} and not conservative:
                         if (
                             _SOL_PROMOTION_VERIFIED_FROM <= _valuation_date(at_date)
@@ -778,10 +783,10 @@ def conservative_reservation_token_pricing(
     ):
         input_per_m, cached_per_m, output_per_m = pricing
         # No explicit tier is sent by this client, so the project default can
-        # select Fast. Reserve Astra's highest documented tier; settlement
+        # select Fast. Reserve the highest documented tier; settlement
         # still values the actual tier returned by the provider.
         tier_ceiling = 2.0 if _direct_openai_model_matches_any(
-            base_url, model, ("gpt-6-astra",),
+            base_url, model, ("gpt-6-astra", "gpt-6-luna"),
         ) else 1.0
         return (
             input_per_m * 1.25 * tier_ceiling,
@@ -838,9 +843,9 @@ def quote_model_pricing(
     effective_tier = tier or "default"
     multiplier = 1.0
     if provider == "openai" and effective_tier not in {"default", "standard"}:
-        # Only Astra's alternate-tier schedule was verified in this policy.
+        # Only Astra and Luna alternate-tier schedules were verified here.
         # Other concrete tiers remain unpriced rather than inheriting Standard.
-        if _direct_openai_model_matches_any(base_url, model, ("gpt-6-astra",)):
+        if _direct_openai_model_matches_any(base_url, model, ("gpt-6-astra", "gpt-6-luna")):
             multiplier = {"priority": 2.0, "fast": 2.0, "flex": 0.5, "batch": 0.5}.get(effective_tier, 0.0)
         else:
             multiplier = 0.0
@@ -849,6 +854,8 @@ def quote_model_pricing(
         at_date=at_date, conservative=conservative,
     )
     policy_version = _PRICING_POLICY_VERSION
+    if _direct_openai_model_matches_any(base_url, model, ("gpt-6-luna",)):
+        policy_version = "2026-09-23"
     rates_observed_at = None
     rate_source = "verified_static_policy"
     if (

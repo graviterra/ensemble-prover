@@ -3137,6 +3137,10 @@ def _read_json(path: Path) -> JSONDict:
 def load_turn_trace(run_dir: str | Path) -> TraceLoadResult:
     """Load ``turns.jsonl`` records with malformed-line diagnostics.
 
+    Large snapshots may be lossless deltas against an earlier row. Read the
+    trace from its beginning through this loader before inspecting snapshot
+    contents; copying an individual encoded row loses its predecessor.
+
     The recorder is append-only and live runs may end mid-write.  A replay
     harness should be robust to that instead of failing the entire analysis.
     """
@@ -3150,6 +3154,7 @@ def load_turn_trace(run_dir: str | Path) -> TraceLoadResult:
     except UnicodeDecodeError:
         return TraceLoadResult(events=[], malformed_line_count=1)
     malformed = 0
+    previous_snapshot = None
     for line in lines:
         if not line.strip():
             continue
@@ -3159,6 +3164,16 @@ def load_turn_trace(run_dir: str | Path) -> TraceLoadResult:
             malformed += 1
             continue
         if isinstance(record, dict):
+            if type(record.get("snapshot")) is dict:
+                from ..snapshot_codec import decode_trace_snapshot
+                try:
+                    snapshot = decode_trace_snapshot(record["snapshot"], previous_snapshot)
+                except (ValueError, RecursionError):
+                    malformed += 1
+                    previous_snapshot = None
+                    continue
+                record["snapshot"] = snapshot
+                previous_snapshot = snapshot
             events.append(record)
         else:
             malformed += 1

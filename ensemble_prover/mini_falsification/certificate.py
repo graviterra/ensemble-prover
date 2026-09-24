@@ -26,8 +26,8 @@ from .model import (
 from .policy import FalsificationPolicy
 
 
-_DEPENDS_RE = re.compile(r"'([^']+)'\s+depends\s+on\s+axioms:\s*\[([^\]]*)\]")
-_NONE_RE = re.compile(r"'([^']+)'\s+does\s+not\s+depend\s+on\s+any\s+axioms")
+_DEPENDS_RE = re.compile(r"'([^\r\n]+)'\s+depends\s+on\s+axioms:\s*\[([^\]]*)\]")
+_NONE_RE = re.compile(r"'([^\r\n]+)'\s+does\s+not\s+depend\s+on\s+any\s+axioms")
 
 # Process-local admission receipts. Serialized certificate fields are
 # deliberately forgeable data; only this module adds a content identity after

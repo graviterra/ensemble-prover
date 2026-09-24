@@ -1232,10 +1232,10 @@ class GraphRecursiveDecomposeAction:
 
         A child session gets a fresh, empty ``graph_recursive_decompose_stack``,
         so the parent's ancestors ride on the scaled config the child action is
-        registered with. The attribute is not a dataclass field, so config
-        fingerprints and checkpoint identities are unchanged.
+        registered with. This is a durable config field so dataclass copies
+        and checkpoint identities retain the same cycle boundary.
         """
-        keys = getattr(self.config, "_graph_recursive_ancestor_keys", ())
+        keys = getattr(self.config, "graph_recursive_ancestor_keys", ())
         return tuple(str(key) for key in keys or () if str(key or "").strip())
 
     def _graph_hop_depth(self, stack_depth: int) -> int:
@@ -1263,9 +1263,7 @@ class GraphRecursiveDecomposeAction:
         except Exception:
             scaled = base
         if ancestor_keys is not None and scaled is not base:
-            object.__setattr__(
-                scaled, "_graph_recursive_ancestor_keys", tuple(ancestor_keys)
-            )
+            scaled = dataclass_replace(scaled, graph_recursive_ancestor_keys=tuple(ancestor_keys))
         return scaled
 
     def _internal_turn_budget_exceeded(self, depth: int) -> bool:

@@ -405,8 +405,9 @@ def lean_relation_binder_equivalent(left: str, right: str) -> bool:
 def split_lean_top_level_implications(statement: str) -> list[str]:
     """Split outer Lean implications without entering quantifier scope.
 
-    This is intentionally syntactic, but it respects one important Lean
-    precedence rule: a top-level ``forall``/``exists`` scopes over the formula
+    This is intentionally syntactic, but it respects Lean's precedence
+    rules: an outer ``↔`` binds less tightly than ``→``, and a
+    top-level ``forall``/``exists`` scopes over the formula
     to its right. Arrows in an existential witness type, or in a quantified
     conclusion such as ``A -> forall x, B x -> C x``, are therefore not outer
     theorem premises.
@@ -441,6 +442,11 @@ def split_lean_top_level_implications(statement: str) -> list[str]:
                 continue
             if _top_level_quantifier_token_len(text, index):
                 break
+            if ch == "↔" or text.startswith("<->", index):
+                # Every arrow seen so far belongs to an operand of this iff,
+                # not to the outer formula. Quantifier/let bodies have already
+                # stopped this scan, so nested iffs do not reach this branch.
+                return [text.strip()] if text.strip() else []
             if ch == "→":
                 parts.append(text[start:index].strip())
                 start = index + 1

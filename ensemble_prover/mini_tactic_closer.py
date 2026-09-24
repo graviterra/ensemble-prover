@@ -1378,7 +1378,7 @@ def generate_tactic_candidates(
                     f"· solve_by_elim [{fact_list}]",
                 ),
                 tactic=(
-                    "classical; "
+                    "classical "
                     + "; ".join(projection_lines)
                     + f"; constructor <;> solve_by_elim [{fact_list}]"
                 ),
@@ -1421,7 +1421,7 @@ def generate_tactic_candidates(
             ),
             tactic=(
                 ("intros; " if intro_prefix else "")
-                + "classical; ext x; constructor <;> intro hx "
+                + "classical ext x; constructor <;> intro hx "
                 f"<;> solve_by_elim [{helper_list}]"
             ),
             source="helper_set_ext_stitch",
@@ -1439,7 +1439,7 @@ def generate_tactic_candidates(
             ),
             tactic=(
                 ("intros; " if intro_prefix else "")
-                + "classical; ext x; constructor <;> intro hx "
+                + "classical ext x; constructor <;> intro hx "
                 f"<;> aesop (add safe {helper_aesop_list})"
             ),
             source="helper_set_ext_stitch",
@@ -1453,7 +1453,7 @@ def generate_tactic_candidates(
         helper_aesop_list = _aesop_safe_rule_list(stitch_helpers[:8])
         add_lines(
             ("classical", f"solve_by_elim [{helper_list}]"),
-            tactic=f"classical; solve_by_elim [{helper_list}]",
+            tactic=f"classical solve_by_elim [{helper_list}]",
             source="helper_stitch_solve_by_elim",
         )
         add_lines(
@@ -1463,12 +1463,12 @@ def generate_tactic_candidates(
         )
         add_lines(
             ("classical", f"aesop (add safe {helper_aesop_list})"),
-            tactic=f"classical; aesop (add safe {helper_aesop_list})",
+            tactic=f"classical aesop (add safe {helper_aesop_list})",
             source="helper_stitch_aesop",
         )
         add_lines(
             ("classical", f"constructor <;> solve_by_elim [{helper_list}]"),
-            tactic=f"classical; constructor <;> solve_by_elim [{helper_list}]",
+            tactic=f"classical constructor <;> solve_by_elim [{helper_list}]",
             source="helper_stitch_constructor",
         )
         add_lines(

@@ -776,6 +776,7 @@ class RunRecorder:
         self._log_fp = log_path.open("w", encoding="utf-8")
         self._turns_fp = turns_path.open("w", encoding="utf-8")
         self._turns_hasher = hashlib.sha256()
+        self._trace_snapshot = None
         self._orig_stdout = None if task_local_console else sys.stdout
         self._orig_stderr = None if task_local_console else sys.stderr
         self._task_console_capture = (
@@ -3051,10 +3052,18 @@ class RunRecorder:
         self._formalization_banked_helper_metric_seen = set(prior_banked_seen)
         self._compute_receipt_metric_seen = set(prior_compute_seen)
         append_started = False
+        trace_snapshot = None
         try:
             self._record_policy_metrics(record)
             self._record_structural_metrics(record)
-            encoded_line = json.dumps(record, ensure_ascii=False) + "\n"
+            stored_record = record
+            if type(record.get("snapshot")) is dict:
+                from .snapshot_codec import encode_trace_snapshot
+                trace_snapshot = clone_json_value(record["snapshot"], label="trace snapshot")
+                stored_record = {**record, "snapshot": encode_trace_snapshot(
+                    trace_snapshot, self._trace_snapshot,
+                )}
+            encoded_line = json.dumps(stored_record, ensure_ascii=False) + "\n"
             append_started = True
             self._turns_fp.write(encoded_line)
             self._turns_fp.flush()
@@ -3083,6 +3092,8 @@ class RunRecorder:
         self.turn_count = next_turn_index
         self._last_elapsed_s = elapsed_s
         self._turns_hasher.update(encoded_line.encode("utf-8"))
+        if trace_snapshot is not None:
+            self._trace_snapshot = trace_snapshot
         if recovery_event_id:
             self._recovery_event_ids_seen.add(recovery_event_id)
         try:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Collection, List, Optional, Sequence
 
 from .lean_parser import LeanGoalState
 from .lean_syntax import normalize_nat_factorial_notation
@@ -207,7 +207,9 @@ def _looks_like_class_type(type_text: str) -> bool:
     return bool(text) and text[0].isupper() and not _RELATION_TOKEN_RE.search(text)
 
 
-def _hidden_local_renames(goal_state: Optional[LeanGoalState]) -> dict[str, str]:
+def _hidden_local_renames(
+    goal_state: Optional[LeanGoalState], reserved_names: Collection[str] = (),
+) -> dict[str, str]:
     hypotheses = [str(h or "") for h in getattr(goal_state, "hypotheses", None) or []]
     taken = {
         name
@@ -215,6 +217,7 @@ def _hidden_local_renames(goal_state: Optional[LeanGoalState]) -> dict[str, str]
         for name in hyp.split(":", 1)[0].split()
         if "✝" not in name
     }
+    taken.update(reserved_names)
     renames: dict[str, str] = {}
     for hyp in hypotheses:
         for name in hyp.split(":", 1)[0].split():
@@ -257,16 +260,21 @@ def _instance_binder_type_key(binder: str) -> str:
 
 def _goal_hypothesis_binders(
     goal_state: Optional[LeanGoalState],
+    *, renames: Optional[dict[str, str]] = None, target: str = "",
 ) -> tuple[list[str], set[str]]:
     if goal_state is None:
         return [], set()
     out: list[str] = []
     blocked_assignment_names: set[str] = set()
-    renames = _hidden_local_renames(goal_state)
+    if renames is None:
+        renames = _hidden_local_renames(goal_state)
     renamed_hypotheses = [
         _apply_hidden_renames(str(hyp or "").strip(), renames)
         for hyp in getattr(goal_state, "hypotheses", None) or []
     ]
+    renamed_hypotheses.append(_apply_hidden_renames(
+        target or str(getattr(goal_state, "target", "") or ""), renames,
+    ))
     for hyp in getattr(goal_state, "hypotheses", None) or []:
         h = _apply_hidden_renames(str(hyp or "").strip(), renames)
         if not h:
@@ -528,9 +536,9 @@ def build_subgoal_variants(
     max_variants: int = 4,
 ) -> List[SubgoalVariant]:
     """Generate context-closed variants for a candidate subgoal."""
-    raw_subgoal = _apply_hidden_renames(
-        str(raw_subgoal or ""), _hidden_local_renames(goal_state)
-    )
+    root_binders = expand_relation_forall_binders(root_statement or "")
+    renames = _hidden_local_renames(goal_state, _declared_names_from_binders(root_binders))
+    raw_subgoal = _apply_hidden_renames(str(raw_subgoal or ""), renames)
     base = normalize_nat_factorial_notation(
         _canonicalize_top_level_let_in(normalize_subgoal_statement(raw_subgoal))
     )
@@ -560,8 +568,9 @@ def build_subgoal_variants(
         and not re.match(r"^\s*let\b", base)
         and not re.match(r":=\s*(?:by|sorry|admit)\b", base[assign_idx:])
     )
-    root_binders = expand_relation_forall_binders(root_statement or "")
-    goal_binders, blocked_goal_assignment_names = _goal_hypothesis_binders(goal_state)
+    goal_binders, blocked_goal_assignment_names = _goal_hypothesis_binders(
+        goal_state, renames=renames, target=raw_subgoal,
+    )
     root_instance_types = {
         key
         for segment in root_binders

@@ -371,7 +371,7 @@ def finset_reindexing_scripts(
     if profile.has_filter:
         add(
             ("classical", "simp [Finset.sum_filter, Finset.prod_filter]"),
-            tactic="classical; simp [Finset.sum_filter, Finset.prod_filter]",
+            tactic="classical simp [Finset.sum_filter, Finset.prod_filter]",
             source="finset_reindexing_filter_simp",
         )
     if profile.has_filter or profile.has_attach:
@@ -381,7 +381,7 @@ def finset_reindexing_scripts(
                 "simp [Finset.sum_filter, Finset.prod_filter, Finset.sum_attach, Finset.prod_attach]",
             ),
             tactic=(
-                "classical; simp [Finset.sum_filter, Finset.prod_filter, "
+                "classical simp [Finset.sum_filter, Finset.prod_filter, "
                 "Finset.sum_attach, Finset.prod_attach]"
             ),
             source="finset_reindexing_support_simp",
@@ -449,12 +449,12 @@ def reindexing_materializable_goals(attempts: Sequence[Any]) -> tuple[dict[str, 
 def _add_sum_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
     add(
         ("classical", "refine Finset.sum_congr rfl ?_", "intro x hx", "ring_nf"),
-        tactic="classical; refine Finset.sum_congr rfl ?_; intro x hx; ring_nf",
+        tactic="classical refine Finset.sum_congr rfl ?_; intro x hx; ring_nf",
         source="finset_reindexing_sum_congr_ring",
     )
     add(
         ("classical", "refine Finset.sum_congr rfl ?_", "intro x hx", "simp_all"),
-        tactic="classical; refine Finset.sum_congr rfl ?_; intro x hx; simp_all",
+        tactic="classical refine Finset.sum_congr rfl ?_; intro x hx; simp_all",
         source="finset_reindexing_sum_congr_simp",
     )
     add(
@@ -473,7 +473,7 @@ def _add_sum_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
             "  ring_nf",
         ),
         tactic=(
-            "classical; refine Finset.sum_congr ?_ ?_; "
+            "classical refine Finset.sum_congr ?_ ?_; "
             "ext x; simp; omega; intro x hx; ring_nf"
         ),
         source="finset_reindexing_sum_ext_omega_ring",
@@ -488,7 +488,7 @@ def _add_sum_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
             "  simp_all",
         ),
         tactic=(
-            "classical; refine Finset.sum_congr ?_ ?_; "
+            "classical refine Finset.sum_congr ?_ ?_; "
             "ext x; simp; intro x hx; simp_all"
         ),
         source="finset_reindexing_sum_ext_simp",
@@ -496,64 +496,64 @@ def _add_sum_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
     if profile.has_nested_sum:
         add(
             ("classical", "rw [Finset.sum_comm]"),
-            tactic="classical; rw [Finset.sum_comm]",
+            tactic="classical rw [Finset.sum_comm]",
             source="finset_reindexing_sum_comm",
         )
     if profile.has_sigma:
         add(
             ("classical", "rw [Finset.sum_sigma]"),
-            tactic="classical; rw [Finset.sum_sigma]",
+            tactic="classical rw [Finset.sum_sigma]",
             source="finset_reindexing_sum_sigma",
         )
         add(
             ("classical", "rw [← Finset.sum_sigma]"),
-            tactic="classical; rw [← Finset.sum_sigma]",
+            tactic="classical rw [← Finset.sum_sigma]",
             source="finset_reindexing_sum_sigma_reverse",
         )
     if profile.has_range:
         add(
             ("classical", "rw [Finset.sum_range_succ]", "all_goals try omega"),
-            tactic="classical; rw [Finset.sum_range_succ]; all_goals try omega",
+            tactic="classical rw [Finset.sum_range_succ]; all_goals try omega",
             source="finset_reindexing_sum_range_succ",
         )
         add(
             ("classical", "rw [Finset.sum_range_succ']", "all_goals try omega"),
-            tactic="classical; rw [Finset.sum_range_succ']; all_goals try omega",
+            tactic="classical rw [Finset.sum_range_succ']; all_goals try omega",
             source="finset_reindexing_sum_range_succ_prime",
         )
     if profile.has_interval:
         add(
             ("classical", "rw [Finset.sum_Icc_succ_top]", "all_goals omega"),
-            tactic="classical; rw [Finset.sum_Icc_succ_top]; all_goals omega",
+            tactic="classical rw [Finset.sum_Icc_succ_top]; all_goals omega",
             source="finset_reindexing_sum_Icc_succ_top",
         )
     if profile.has_attach:
         add(
             ("classical", "rw [Finset.sum_attach]"),
-            tactic="classical; rw [Finset.sum_attach]",
+            tactic="classical rw [Finset.sum_attach]",
             source="finset_reindexing_sum_attach",
         )
         add(
             ("classical", "rw [← Finset.sum_attach]"),
-            tactic="classical; rw [← Finset.sum_attach]",
+            tactic="classical rw [← Finset.sum_attach]",
             source="finset_reindexing_sum_attach_reverse",
         )
     if profile.has_image_or_map:
         add(
             ("classical", "rw [Finset.sum_map]"),
-            tactic="classical; rw [Finset.sum_map]",
+            tactic="classical rw [Finset.sum_map]",
             source="finset_reindexing_sum_map",
         )
         add(
             ("classical", "rw [Finset.sum_image]", "all_goals aesop"),
-            tactic="classical; rw [Finset.sum_image]; all_goals aesop",
+            tactic="classical rw [Finset.sum_image]; all_goals aesop",
             source="finset_reindexing_sum_image",
         )
     if profile.has_antidiagonal:
         add(
             ("classical", "rw [Finset.Nat.sum_antidiagonal_eq_sum_range_succ]", "all_goals try omega"),
             tactic=(
-                "classical; rw [Finset.Nat.sum_antidiagonal_eq_sum_range_succ]; "
+                "classical rw [Finset.Nat.sum_antidiagonal_eq_sum_range_succ]; "
                 "all_goals try omega"
             ),
             source="finset_reindexing_sum_antidiagonal_range",
@@ -561,7 +561,7 @@ def _add_sum_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
         add(
             ("classical", "rw [← Finset.Nat.sum_antidiagonal_eq_sum_range_succ]", "all_goals try omega"),
             tactic=(
-                "classical; rw [← Finset.Nat.sum_antidiagonal_eq_sum_range_succ]; "
+                "classical rw [← Finset.Nat.sum_antidiagonal_eq_sum_range_succ]; "
                 "all_goals try omega"
             ),
             source="finset_reindexing_sum_antidiagonal_range_reverse",
@@ -571,12 +571,12 @@ def _add_sum_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
 def _add_product_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
     add(
         ("classical", "refine Finset.prod_congr rfl ?_", "intro x hx", "ring_nf"),
-        tactic="classical; refine Finset.prod_congr rfl ?_; intro x hx; ring_nf",
+        tactic="classical refine Finset.prod_congr rfl ?_; intro x hx; ring_nf",
         source="finset_reindexing_prod_congr_ring",
     )
     add(
         ("classical", "refine Finset.prod_congr rfl ?_", "intro x hx", "simp_all"),
-        tactic="classical; refine Finset.prod_congr rfl ?_; intro x hx; simp_all",
+        tactic="classical refine Finset.prod_congr rfl ?_; intro x hx; simp_all",
         source="finset_reindexing_prod_congr_simp",
     )
     add(
@@ -587,41 +587,41 @@ def _add_product_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
     if profile.has_nested_product:
         add(
             ("classical", "rw [Finset.prod_comm]"),
-            tactic="classical; rw [Finset.prod_comm]",
+            tactic="classical rw [Finset.prod_comm]",
             source="finset_reindexing_prod_comm",
         )
     if profile.has_range:
         add(
             ("classical", "rw [Finset.prod_range_succ]", "all_goals try omega"),
-            tactic="classical; rw [Finset.prod_range_succ]; all_goals try omega",
+            tactic="classical rw [Finset.prod_range_succ]; all_goals try omega",
             source="finset_reindexing_prod_range_succ",
         )
         add(
             ("classical", "rw [Finset.prod_range_succ']", "all_goals try omega"),
-            tactic="classical; rw [Finset.prod_range_succ']; all_goals try omega",
+            tactic="classical rw [Finset.prod_range_succ']; all_goals try omega",
             source="finset_reindexing_prod_range_succ_prime",
         )
     if profile.has_interval:
         add(
             ("classical", "rw [Finset.prod_Icc_succ_top]", "all_goals omega"),
-            tactic="classical; rw [Finset.prod_Icc_succ_top]; all_goals omega",
+            tactic="classical rw [Finset.prod_Icc_succ_top]; all_goals omega",
             source="finset_reindexing_prod_Icc_succ_top",
         )
     if profile.has_attach:
         add(
             ("classical", "rw [Finset.prod_attach]"),
-            tactic="classical; rw [Finset.prod_attach]",
+            tactic="classical rw [Finset.prod_attach]",
             source="finset_reindexing_prod_attach",
         )
         add(
             ("classical", "rw [← Finset.prod_attach]"),
-            tactic="classical; rw [← Finset.prod_attach]",
+            tactic="classical rw [← Finset.prod_attach]",
             source="finset_reindexing_prod_attach_reverse",
         )
     if profile.has_image_or_map:
         add(
             ("classical", "rw [Finset.prod_map]"),
-            tactic="classical; rw [Finset.prod_map]",
+            tactic="classical rw [Finset.prod_map]",
             source="finset_reindexing_prod_map",
         )
 

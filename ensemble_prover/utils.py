@@ -893,6 +893,15 @@ def extract_used_lemmas(proof: str, lemma_names: Sequence[str]) -> List[str]:
     return sorted(set(used))
 
 
+def normalize_classical_tactic_prefix(proof: str) -> str:
+    """Repair a leading legacy ``by classical;`` scoped-tactic spelling.
+
+    Restrict the rewrite to the beginning of a tactic proof; never rewrite
+    strings, helper declarations or a term-mode local named ``classical``.
+    """
+    return re.sub(r"^(\s*by\s+classical\s*);[ \t]*", r"\1 ", proof, count=1)
+
+
 def normalize_proof_expr(text: str) -> Optional[str]:
     """
     Convert model output into a Lean proof expression (`by` block or term mode).
@@ -958,7 +967,7 @@ def normalize_proof_expr(text: str) -> Optional[str]:
     # Detect where valid Lean tactic block likely ends.
     s = _strip_trailing_prose(s)
 
-    return s
+    return normalize_classical_tactic_prefix(s)
 
 
 def _strip_trailing_prose(proof: str) -> str:
@@ -5318,9 +5327,9 @@ def _prepend_declaration_binders(stmt: str, decl_binders: Sequence[str]) -> str:
 def normalize_subgoal_statement(
     stmt: str,
     *,
-    canonicalize_guarded_iff: bool = True,
+    canonicalize_guarded_iff: bool = False,
 ) -> str:
-    """Normalize common declaration-wrapped planner subgoals.
+    """Normalize declaration-wrapped subgoals without changing Lean precedence.
 
     Example:
       `theorem subgoal1 : ∀ n, p n ≤ q n := by sorry`

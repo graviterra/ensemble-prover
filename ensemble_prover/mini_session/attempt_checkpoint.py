@@ -45,6 +45,60 @@ def _write(path: Path, value: dict[str, Any]) -> None:
     write_checkpoint_record(path, value)
 
 
+def expand_completed_children(record: dict[str, Any], registry_root: Path) -> dict[str, Any]:
+    """Read archived child data without acquiring ownership or resuming execution.
+
+    The caller must validate the manifest and snapshot identity first. Archive
+    names are content hashes; their complete payloads remain inert JSON and
+    require the same session admission checks as an uncompressed snapshot.
+    """
+    from ..snapshot_codec import MAX_SNAPSHOT_BYTES, decompress_snapshot, snapshot_bytes
+
+    if (type(record) is not dict or type(record.get("schema_version")) is not int
+            or record["schema_version"] != 2):
+        return record
+    record = _json(record)
+    record["schema_version"] = _SCHEMA
+    archived = record.pop("archived_children", None)
+    if type(archived) is not dict:
+        raise ValueError("Invalid completed child archive map")
+    expanded_size = len(snapshot_bytes(record))
+    if expanded_size > MAX_SNAPSHOT_BYTES:
+        raise ValueError("expanded checkpoint exceeds snapshot size limit")
+    # The archive envelope is not part of the expanded checkpoint. Allow only
+    # this fixed overhead beyond the remaining space before decompressing.
+    envelope_size = len(snapshot_bytes({
+        "session": None, "child": None, "planner_receipts": None,
+    }))
+    for lane, digest in archived.items():
+        if (type(lane) is not str or not lane or type(digest) is not str
+                or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+            raise ValueError("Invalid completed child archive identity")
+        archive = _read(registry_root / "completed" / f"{digest}.json")
+        if (set(archive) != {"encoding", "sha256", "data"}
+                or archive["encoding"] != "json-zlib-v1" or archive["sha256"] != digest):
+            raise ValueError("Invalid completed child archive")
+        payload = decompress_snapshot(
+            archive["data"], max_bytes=MAX_SNAPSHOT_BYTES - expanded_size + envelope_size,
+        )
+        if (type(payload) is not dict or _digest(payload) != digest
+                or set(payload) != {"session", "child", "planner_receipts"}
+                or type(payload["child"]) is not dict
+                or payload["child"].get("result") is None):
+            raise ValueError("Completed child archive hash or shape mismatch")
+        for field, value in (("sessions", payload["session"]), ("children", payload["child"]),
+                             ("planner_receipts", payload["planner_receipts"])):
+            if type(record.get(field)) is not dict or lane in record[field]:
+                raise ValueError("Conflicting completed child archive lane")
+            if value is not None:
+                expanded_size += (len(snapshot_bytes(lane)) + 1 + len(snapshot_bytes(value))
+                                  + int(bool(record[field])))
+                if expanded_size > MAX_SNAPSHOT_BYTES:
+                    raise ValueError("expanded checkpoint exceeds snapshot size limit")
+                record[field][lane] = value
+    return record
+
+
 def _validated_execution_audit(value: Any, sessions: dict[str, Any]) -> dict[str, dict[str, int]]:
     """Observability only: no proof, budget, or scheduling keys are allowed."""
     if type(value) is not dict:
@@ -149,6 +203,7 @@ class AttemptCheckpointRegistry:
         self._children: dict[str, dict[str, Any]] = {}
         self._outer_state: dict[str, Any] = {}
         self._planner_receipts: dict[str, dict[str, Any]] = {}
+        self._durable_child_archives: set[str] = set()
         self._bound_sessions: dict[str, Any] = {}
         self._audit_ready_lanes: set[str] = set()
         self._execution_audit: dict[str, dict[str, int]] = {}
@@ -276,6 +331,7 @@ class AttemptCheckpointRegistry:
 
     def _restore_snapshot(self, record: dict[str, Any], *,
                           expected_identity: dict[str, Any] | None = None) -> None:
+        record = self._expand_completed_children(record)
         required = {"schema_version", "attempt_id", "identity", "sessions", "children", "outer_state", "planner_receipts", "cost_ledger", "recorder", "journal_watermark", "predecessor", "worker_active_elapsed_s", "worker_observed_epoch_s", "worker_generation_completed"}
         if type(record) is not dict or set(record) not in (required, required | {"execution_audit"}) or type(record["schema_version"]) is not int or record["schema_version"] != _SCHEMA:
             raise ValueError("Unsupported attempt checkpoint snapshot schema")
@@ -308,6 +364,48 @@ class AttemptCheckpointRegistry:
         self._restored_recorder_record = _json(record["recorder"])
         self._restored_journal_watermark = watermark
 
+    def _archive_completed_children(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Keep immutable child payloads out of every subsequent full snapshot.
+
+        Archives retain complete replay and revalidation inputs; they are not
+        proof receipts. Publish them durably before the head can reference them.
+        Earlier generations may still refer to them, so they are never pruned
+        by the ordinary snapshot writer.
+        """
+        from ..snapshot_codec import MAX_SNAPSHOT_BYTES, compress_snapshot, snapshot_bytes
+
+        if len(snapshot_bytes(record)) > MAX_SNAPSHOT_BYTES:
+            raise ValueError("checkpoint exceeds snapshot size limit")
+        archived: dict[str, str] = {}
+        sessions = dict(record["sessions"])
+        children = dict(record["children"])
+        receipts = dict(record["planner_receipts"])
+        for lane, frame in record["children"].items():
+            if frame.get("result") is None or lane not in sessions:
+                continue
+            payload = {"session": sessions[lane], "child": frame,
+                       "planner_receipts": receipts.get(lane)}
+            digest = _digest(payload)
+            path = self.registry_root / "completed" / f"{digest}.json"
+            # An existing file can be an orphan from a writer whose rename
+            # succeeded but directory fsync failed. Only this writer's own
+            # durability acknowledgements allow skipping publication.
+            if digest not in self._durable_child_archives:
+                _write(path, {"encoding": "json-zlib-v1", "sha256": digest,
+                              "data": compress_snapshot(payload)})
+                self._durable_child_archives.add(digest)
+            archived[lane] = digest
+            sessions.pop(lane)
+            children.pop(lane)
+            receipts.pop(lane, None)
+        if not archived:
+            return record
+        return {**record, "schema_version": 2, "sessions": sessions, "children": children,
+                "planner_receipts": receipts, "archived_children": archived}
+
+    def _expand_completed_children(self, record: dict[str, Any]) -> dict[str, Any]:
+        return expand_completed_children(record, self.registry_root)
+
     def _snapshot_payload(self) -> dict[str, Any]:
         observed_epoch_s = time.time()
         return {
@@ -339,15 +437,15 @@ class AttemptCheckpointRegistry:
         self._require_writable()
         next_sequence = self._sequence + 1
         snapshot_path = self.directory / "checkpoints" / f"{next_sequence:012d}.json"
-        snapshot = _json(record)
-        head = {"generation_id": self.generation_id, "snapshot_path": str(snapshot_path),
-                "snapshot_hash": _digest(snapshot)}
-        manifest = {"schema_version": _SCHEMA, "attempt_id": self.attempt_id,
-                    "registry_root": str(self.registry_root), "identity": self.identity,
-                    "head": head}
         # The shared head prevents a later restart from silently restoring an
         # older generation's cost capacity. Never fall back past this head.
         try:
+            snapshot = self._archive_completed_children(_json(record))
+            head = {"generation_id": self.generation_id, "snapshot_path": str(snapshot_path),
+                    "snapshot_hash": _digest(snapshot)}
+            manifest = {"schema_version": _SCHEMA, "attempt_id": self.attempt_id,
+                        "registry_root": str(self.registry_root), "identity": self.identity,
+                        "head": head}
             _write(snapshot_path, snapshot)
             _write(self.directory / _MANIFEST, manifest)
             _write(self.registry_root / "head.json", head)

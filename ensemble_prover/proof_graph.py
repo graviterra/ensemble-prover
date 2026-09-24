@@ -1023,7 +1023,7 @@ def graph_identity_text(text: str) -> str:
 def graph_formal_statement_text(
     text: str,
     *,
-    canonicalize_guarded_iff: bool = True,
+    canonicalize_guarded_iff: bool = False,
 ) -> str:
     """Compact, Lean-parseable formal statement text for graph-native nodes."""
 
@@ -1296,6 +1296,10 @@ _GRAPH_KNOWN_DATA_ATOM_TYPES = {
     "ℤ",
     "ℚ",
     "ℝ",
+    "NNReal",
+    "ENNReal",
+    "ℝ≥0",
+    "ℝ≥0∞",
 }
 _GRAPH_LET_IN_BINDER_OPERATORS = (
     "∀ᶠ",
@@ -4678,6 +4682,8 @@ def _graph_looks_like_proof_premise_type(
         ) >= 0:
             return False
     compact = " ".join(clean.split()).strip("{}[]")
+    if compact in _GRAPH_KNOWN_DATA_ATOM_TYPES:
+        return False
     lowered = compact.lower()
     def proof_like_binder_name(name: str) -> bool:
         clean_name = str(name or "").strip().lower()
@@ -4925,6 +4931,7 @@ def graph_statement_leading_contract(
     return body, bound_names, binder_premises
 
 
+@lru_cache(maxsize=512)
 def graph_statement_keyed_contract(statement: str) -> Tuple[str, Tuple[str, ...]]:
     """Contract text that keeps hypothesis binders, in telescope order.
 
@@ -4978,6 +4985,191 @@ def graph_statement_keyed_contract(statement: str) -> Tuple[str, Tuple[str, ...]
         return body, tuple(dict.fromkeys(leading_names))
     keyed = " ".join((*parts, premise_arrow_body(body)))
     return keyed, tuple(dict.fromkeys(leading_names))
+
+
+@lru_cache(maxsize=512)
+def graph_contract_data_domains(statement: str) -> Tuple[Tuple[str, str], ...]:
+    """Retain explicit data domains for the surface matcher's type guard."""
+    _body, records = _graph_leading_binder_analysis(statement)
+    domains: List[Tuple[str, str]] = []
+    for _raw, names, type_text, is_proof, ambiguous in records:
+        if (not is_proof and type_text and not ambiguous
+                and not _graph_looks_like_proof_premise_type(type_text, names)):
+            for name in names:
+                domains.append((name, type_text))
+    return tuple(domains)
+
+
+def graph_contract_with_data_domains(source: str, body: str) -> str:
+    """Close a projected contract over data and referenced proof parameters.
+
+    A proof name that survives projection is a typed local too. Dropping its
+    binder would let an unrelated data parameter with the same name supply it.
+    Retain proofs needed by the body or dependent binder types, in telescope
+    order, while omitting assumptions that the projection does not reference.
+    """
+    _body, records = _graph_leading_binder_analysis(body)
+    bound = {
+        (name, "" if _graph_binder_record_is_relation(record) else record[2])
+        for record in records
+        for name in record[1]
+    }
+    _source_body, source_records = _graph_leading_binder_analysis(source)
+    available = []
+    for record in source_records:
+        raw, names, type_text, is_proof, ambiguous = record
+        if _graph_binder_record_is_relation(record):
+            # A relation binder introduces data plus an anonymous proof. Its
+            # predicate is not the data's domain, and must not distinguish it
+            # from the untyped data binder retained by an earlier projection.
+            raw, type_text, is_proof, ambiguous = " ".join(names), "", False, False
+        # Equal names alone do not identify an already restored parameter:
+        # the projected body may bind a fresh variable in a different domain.
+        remaining = tuple(name for name in names if (name, type_text) not in bound)
+        if not remaining:
+            continue
+        if remaining != names:
+            typed = f" : {type_text}" if type_text else ""
+            raw = f"({' '.join(remaining)}{typed})"
+        available.append((raw, remaining, type_text, is_proof, ambiguous))
+    prefix = " ".join(_graph_projection_binder_groups(
+        available, cutoff=len(available), target_text=body,
+    ))
+    return f"∀ {prefix}, {body}" if prefix else body
+
+
+def graph_contract_domains_compatible(
+    left: str, right: str, *,
+    left_mapping: Optional[Mapping[str, str]] = None,
+    right_mapping: Optional[Mapping[str, str]] = None,
+    left_bound_names: Sequence[str] = (),
+) -> bool:
+    """Check that support parameters can be supplied by the requested contract.
+
+    The caller supplies the exact renaming used by its successful surface
+    comparison. An unrenamed surface match uses no mapping. Domain checks
+    must not independently reconstruct an incompatible binder ordering.
+    Extra requested parameters are harmless, but a support parameter cannot
+    be erased without a corresponding local: its type might be empty.
+    Unannotated local domains remain unspecified. This is a rejection guard,
+    not evidence that two Lean types are equal.
+    """
+    for statement in (left, right):
+        _body, records = _graph_leading_binder_analysis(statement)
+        names = [name for _raw, group, _type, _proof, _ambiguous in records for name in group]
+        if len(names) != len(set(names)):
+            # A name-indexed domain map cannot represent shadowed parameters.
+            # Require the complete scoped contract instead of dropping one.
+            return graph_statement_key(left) == graph_statement_key(right)
+
+    def domains(text: str, mapping: Mapping[str, str]) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        for name, domain in graph_contract_data_domains(text):
+            normalized = _graph_contract_alpha_replace_scoped(domain, mapping)
+            for spelling, canonical in (
+                ("ℝ≥0∞", "ENNReal"), ("ℝ≥0", "NNReal"),
+                ("ℕ", "Nat"), ("ℤ", "Int"), ("ℝ", "Real"), ("ℚ", "Rat"),
+            ):
+                normalized = normalized.replace(spelling, canonical)
+            result[mapping.get(name, name)] = re.sub(r"\s+", "", normalized)
+        return result
+
+    def parameters(text: str, context: Sequence[str], mapping: Mapping[str, str]) -> Set[str]:
+        _body, records = _graph_leading_binder_analysis(text)
+        # A projected context includes discarded proof binders too. Only an
+        # actual free occurrence can establish an otherwise untyped local;
+        # unused locals need their explicit data binder retained in the text.
+        markers = {name: f"\0contract-local:{index}\0" for index, name in enumerate(context)}
+        marked_body = _graph_contract_alpha_replace_scoped(_body, markers)
+        names = {name for name, marker in markers.items() if marker in marked_body}
+        for raw, group, type_text, is_proof, ambiguous in records:
+            proof = is_proof or ambiguous or _graph_looks_like_proof_premise_type(type_text, group)
+            relation = bool(proof and type_text and _graph_top_level_colon_index(_graph_unwrap_binder_group(raw)) < 0)
+            if proof and not relation:
+                names.difference_update(group)
+            else:
+                names.update(group)
+        return {mapping.get(name, name) for name in names}
+
+    left_mapping, right_mapping = left_mapping or {}, right_mapping or {}
+    if not parameters(right, (), right_mapping).issubset(parameters(left, left_bound_names, left_mapping)):
+        return False
+    lhs, rhs = domains(left, left_mapping), domains(right, right_mapping)
+    return all(lhs[key] == rhs[key] for key in lhs.keys() & rhs.keys())
+
+
+def graph_contract_weakening_tail(statement: str) -> str:
+    """Drop one requested assumption only when its proof is not a parameter.
+
+    ``∀ h : A, P h`` is a dependent function, not merely ``A → P``. A
+    surface matcher cannot erase ``h`` and then align it with unrelated data.
+    """
+    body, records = _graph_leading_binder_analysis(statement)
+    for index, (_raw, names, type_text, is_proof, ambiguous) in enumerate(records):
+        if not (is_proof or ambiguous or _graph_looks_like_proof_premise_type(type_text, names)):
+            continue
+        rest = " ".join([body, *(record[0] for record in records[index + 1:])])
+        if any(re.search(r"(?<![\w.'])" + re.escape(name) + r"(?![\w'])", rest) for name in names):
+            return ""
+    keyed, _names = graph_statement_keyed_contract(statement)
+    parts = _graph_split_top_level_implications(keyed)
+    if len(parts) < 2:
+        return ""
+    return graph_contract_with_data_domains(statement, " → ".join(parts[1:]))
+
+
+def graph_contract_weakening_bound_names(
+    statement: str, context: Sequence[str] = (),
+) -> Tuple[str, ...]:
+    """Retain data identities, but not erased proof parameters, after weakening.
+
+    Call only after ``graph_contract_weakening_tail`` succeeds: it has checked
+    that no erased proof name occurs in the remaining telescope or body.
+    Keeping such a name would shift the data-domain alignment even though the
+    corresponding premise is no longer part of the contract.
+    """
+    _body, records = _graph_leading_binder_analysis(statement)
+    erased = {
+        name
+        for _raw, names, type_text, is_proof, ambiguous in records
+        if is_proof or ambiguous or _graph_looks_like_proof_premise_type(type_text, names)
+        for name in names
+    }
+    _keyed, names = graph_statement_keyed_contract(statement)
+    return tuple(name for name in dict.fromkeys((*context, *names)) if name not in erased)
+
+
+def _graph_support_contains_contract(
+    premise: str, supports: Sequence[Tuple[str, Tuple[str, ...]]],
+    *, bound_names: Sequence[str] = (),
+) -> bool:
+    body, names = graph_statement_keyed_contract(premise)
+    context = tuple(dict.fromkeys((*bound_names, *names)))
+    norm = _graph_contract_norm(premise)
+    alpha = _graph_contract_alpha_norm(body, context_bound_names=context)
+    _alpha_body, premise_mapping = _graph_contract_alpha_source(body, context)
+    for support, support_names in supports:
+        support_body, leading = graph_statement_keyed_contract(support)
+        if norm == _graph_contract_norm(support) and graph_contract_domains_compatible(
+            premise, support, left_bound_names=bound_names,
+        ):
+            return True
+        support_context = tuple(dict.fromkeys((*support_names, *leading)))
+        _alpha_body, support_mapping = _graph_contract_alpha_source(support_body, support_context)
+        if alpha == _graph_contract_alpha_norm(
+            support_body, context_bound_names=support_context,
+        ) and graph_contract_domains_compatible(
+            premise, support, left_mapping=premise_mapping, right_mapping=support_mapping,
+            left_bound_names=bound_names,
+        ):
+            return True
+    weakened = graph_contract_weakening_tail(premise)
+    if weakened:
+        return _graph_support_contains_contract(
+            weakened,
+            supports, bound_names=graph_contract_weakening_bound_names(premise, context),
+        )
+    return False
 
 
 def graph_statement_forall_application_entries(
@@ -5739,7 +5931,8 @@ def _graph_support_candidates(
     seen: Set[Tuple[str, Tuple[str, ...]]] = set()
 
     def add_candidate(statement_text: str, names: Sequence[str]) -> None:
-        candidate = (str(statement_text or "").strip(), tuple(names or ()))
+        text = str(statement_text or "").strip()
+        candidate = (graph_contract_with_data_domains(statement, text) if text else "", tuple(names or ()))
         if candidate[0] and candidate not in seen:
             seen.add(candidate)
             candidates.append(candidate)
@@ -5750,7 +5943,9 @@ def _graph_support_candidates(
     ) -> None:
         item_body, item_names = _graph_strip_keeping_premises(statement_text)
         item_bound_names = tuple(dict.fromkeys(tuple(names or ()) + item_names))
-        add_candidate(item_body, item_bound_names)
+        # Retain named proof binders before arrow conversion loses their scope.
+        add_candidate(statement_text, item_bound_names)
+        add_candidate(graph_contract_with_data_domains(statement_text, item_body), item_bound_names)
         if (
             "→" in item_body
             or "->" in item_body
@@ -5763,13 +5958,13 @@ def _graph_support_candidates(
         for item in items:
             conjunct_body, conjunct_names = _graph_strip_keeping_premises(item)
             add_candidate(
-                conjunct_body,
+                graph_contract_with_data_domains(statement_text, conjunct_body),
                 tuple(dict.fromkeys(item_bound_names + conjunct_names)),
             )
 
     if premises_are_assumptions:
         for premise in binder_premises:
-            add_assumption_candidate(premise, base_names)
+            add_assumption_candidate(graph_contract_with_data_domains(statement, premise), base_names)
     parts = _graph_split_top_level_implications(body)
     conclusion = parts[-1] if parts else body
     if (
@@ -5794,7 +5989,9 @@ def _graph_support_candidates(
                 )
                 iff_bound_names = tuple(dict.fromkeys(base_names + tuple(iff_names)))
                 for premise in iff_binder_premises:
-                    add_assumption_candidate(premise, iff_bound_names)
+                    add_assumption_candidate(
+                        graph_contract_with_data_domains(iff_part, premise), iff_bound_names,
+                    )
                 iff_implication_parts = _graph_split_top_level_implications(iff_body)
                 if len(iff_implication_parts) >= 2:
                     for premise in iff_implication_parts[:-1]:
@@ -5802,11 +5999,13 @@ def _graph_support_candidates(
                             _graph_strip_keeping_premises(premise)
                         )
                         add_candidate(
-                            premise_body,
+                            graph_contract_with_data_domains(
+                                iff_part, graph_contract_with_data_domains(premise, premise_body),
+                            ),
                             tuple(dict.fromkeys(iff_bound_names + premise_names)),
                         )
     for item in selected:
-        add_assumption_candidate(item, base_names)
+        add_assumption_candidate(graph_contract_with_data_domains(statement, item), base_names)
     return candidates
 
 
@@ -5983,6 +6182,18 @@ def _cached_graph_contract_alpha_norm(
     context_bound_names: Tuple[str, ...],
     preserve_type_ascriptions: bool,
 ) -> str:
+    stripped, mapping = _graph_contract_alpha_source(text, context_bound_names)
+    if not preserve_type_ascriptions:
+        stripped = _graph_normalize_numeric_casts_for_contract(stripped)
+        stripped = re.sub(r"\((\d+)\s*:\s*[^()]+\)", r"\1", stripped)
+    normalized = _graph_contract_alpha_replace_scoped(stripped, mapping)
+    return re.sub(r"\s+", "", normalized)
+
+
+def _graph_contract_alpha_source(
+    text: str, context_bound_names: Sequence[str],
+) -> Tuple[str, Dict[str, str]]:
+    """Return the exact source and binder renaming used by graph alpha keys."""
     stripped, leading_names = _graph_strip_leading_forall_binders_with_names(text)
     bound_names = tuple(
         dict.fromkeys(
@@ -5995,12 +6206,7 @@ def _cached_graph_contract_alpha_norm(
         )
     )
     mapping = {name: f"__bound{idx}__" for idx, name in enumerate(bound_names)}
-
-    if not preserve_type_ascriptions:
-        stripped = _graph_normalize_numeric_casts_for_contract(stripped)
-        stripped = re.sub(r"\((\d+)\s*:\s*[^()]+\)", r"\1", stripped)
-    normalized = _graph_contract_alpha_replace_scoped(stripped, mapping)
-    return re.sub(r"\s+", "", normalized)
+    return stripped, mapping
 
 
 def _graph_contract_alpha_replace_scoped(
@@ -14043,29 +14249,9 @@ class ProofGraph:
             node.metadata.pop("graph_open_root_reducer_premise_keys", None)
             node.metadata.pop("graph_open_root_reducer_premises", None)
             return []
-        support_keys: Set[str] = set()
         support_candidates = self._root_reducer_support_statements(
             skip_node_id=node.node_id
         )
-        support_alpha_norms: Set[str] = set()
-        for support, support_bound_names in support_candidates:
-            key = graph_statement_key(support)
-            if key:
-                support_keys.add(key)
-            norm = _graph_contract_norm(support)
-            if norm:
-                support_keys.add(norm)
-            # Pre-strip keeping hypothesis premises; the alpha normalizer's
-            # own strip drops them (it is also a binder-analysis primitive).
-            support_body, support_names = _graph_strip_keeping_premises(support)
-            alpha_norm = _graph_contract_alpha_norm(
-                support_body,
-                context_bound_names=tuple(
-                    dict.fromkeys(tuple(support_bound_names) + support_names)
-                ),
-            )
-            if alpha_norm:
-                support_alpha_norms.add(alpha_norm)
         open_premises: List[str] = []
         open_keys: List[str] = []
         for premise in premises:
@@ -14079,10 +14265,9 @@ class ProofGraph:
             )
             if not (key or norm or alpha_norm):
                 continue
-            if (
-                key in support_keys
-                or norm in support_keys
-                or alpha_norm in support_alpha_norms
+            if _graph_support_contains_contract(
+                graph_contract_with_data_domains(statement, premise),
+                support_candidates, bound_names=bound_names,
             ):
                 continue
             open_key = key or norm

@@ -1125,24 +1125,56 @@ def _with_export_heartbeats(content: str, max_heartbeats: int) -> str:
     """
     if not isinstance(max_heartbeats, int) or max_heartbeats <= 0:
         return content
-    from .theorem_project import _mask_noncode
+    from .theorem_project import _DOTTED_IDENT, _mask_noncode
 
-    lines = content.split("\n")
-    masked = _mask_noncode(content).split("\n")
-    insert_at = 0
-    for index, masked_line in enumerate(masked):
-        stripped = masked_line.strip()
-        if (
-            stripped == "prelude"
-            or stripped == "module"
-            or stripped.startswith("module ")
-            or re.fullmatch(r"(?:public\s+)?(?:meta\s+)?import\s+.+", stripped) is not None
-        ):
-            insert_at = index + 1
-        elif stripped:
-            break
-    lines.insert(insert_at, f"set_option maxHeartbeats {max_heartbeats}")
-    return "\n".join(lines)
+    masked = _mask_noncode(content)
+    # Lean permits whitespace (including newlines) between import modifiers,
+    # the import keyword, and its module name. Match complete commands, not
+    # lines, so an option cannot land before a continued import.
+    header_command = re.compile(
+        rf"\s*(?:(?:public\s+)?(?:meta\s+)?import\s+(?:all\s+)?{_DOTTED_IDENT}(?=\s|$)"
+        r"|prelude\b|module\b[^\r\n]*)"
+    )
+    offset = 0
+    while match := header_command.match(masked, offset):
+        offset = match.end()
+    if offset:
+        line_end = masked.find("\n", offset)
+        line_end = len(masked) if line_end < 0 else line_end
+        if not masked[offset:line_end].strip():
+            offset = min(line_end + 1, len(content))
+    from .lean_syntax import _lean_surface_lexical_skip_end
+
+    index = 0
+    while index < offset:
+        end = _lean_surface_lexical_skip_end(content, index)
+        if end is not None:
+            if index < offset < end:
+                # A trailing multiline comment began on the import line.
+                # Insert before it, preserving doc comments with their target.
+                offset = index
+                break
+            index = end
+        else:
+            index += 1
+    prefix, suffix = content[:offset], content[offset:]
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return prefix + f"set_option maxHeartbeats {max_heartbeats}\n" + suffix
+
+
+def _export_target_witness(
+    statement: str, *, scoped_prefix: str = "", omit_variables: Sequence[str] = (),
+) -> tuple[str, str]:
+    from .lean_runner import _type_identity_probe_command, _check_target_identity_guard_definition
+
+    name = "miniExportExpected_" + hashlib.sha256(statement.encode()).hexdigest()[:20]
+    command = "set_option autoImplicit true in\n" + _type_identity_probe_command(f"_root_.{name}", statement)
+    if omit_variables:
+        command = f"omit {' '.join(omit_variables)} in\n{command}"
+    if scoped_prefix:
+        command = f"{scoped_prefix}\n{command}"
+    return name, command + "\n" + _check_target_identity_guard_definition(name)
 
 
 def _build_solved_file(
@@ -1251,18 +1283,32 @@ def _build_solved_file(
         parts.append("")
         parts.append("\n\n".join(clean_theory_sources))
     artifact_helpers = list(sanitize_lean_artifact_texts(helpers))
+    parts.append(f"set_option maxHeartbeats {max_heartbeats}")
+    witness_name = ""
+    helper_audit_after = ""
+    if artifact_helpers:
+        from .lean_runner import _check_delta_audit_blocks
+        witness_name, witness = _export_target_witness(
+            problem.statement_type,
+            scoped_prefix=theorem_proof_scoped_prefix(str(getattr(problem, "target_scoped_prefix", "") or "")),
+            omit_variables=tuple(getattr(problem, "target_omit_variables", ()) or ()),
+        )
+        parts.append(witness)
+        helper_audit_before, helper_audit_after = _check_delta_audit_blocks("export_" + witness_name)
+        parts.append(helper_audit_before)
     if artifact_helpers:
         parts.append("")
         parts.append("\n\n".join(artifact_helpers))
     parts.append("")
     if problem.docstring.strip():
         parts.append(problem.docstring.strip())
-    proof_block = sanitize_lean_artifact_text(proof)
+    from .utils import normalize_classical_tactic_prefix
+    proof_block = normalize_classical_tactic_prefix(sanitize_lean_artifact_text(proof))
     # Exported files are audited from Lean's text output, which elaboration-time
     # code in the proof or helpers could shape. Never export such candidates.
     from .lean_runner import _check_meta_escape_violation
 
-    if _check_meta_escape_violation(proof_block, *helpers):
+    if _check_meta_escape_violation(problem.statement_type, proof_block, *helpers):
         return None
     replay = _export_root_replay_witness(
         "\n".join(parts), problem.theorem_name, problem.statement_type, proof_block,
@@ -1286,6 +1332,11 @@ def _build_solved_file(
         declaration_block = f"{proof_scoped_prefix}\n{declaration_block}"
     parts.append(declaration_block)
     content = "\n".join(parts) + "\n"
+    if witness_name:
+        from .lean_runner import _check_target_identity_guard
+        content = merge_imports(content, ("Lean",))
+        content += _check_target_identity_guard(replay_name or f"_root_.{problem.theorem_name}", witness_name)
+        content += helper_audit_after
     if replay_guard:
         content = merge_imports(content, ("Lean.Elab.Command", "Lean.Util.CollectAxioms"))
         content += "\n" + replay_guard
@@ -1364,6 +1415,19 @@ def _build_theorem_project_solved_file(
     if scoped_preamble:
         parts.extend(("", scoped_preamble))
     artifact_helpers = list(sanitize_lean_artifact_texts(helpers))
+    parts.append(f"set_option maxHeartbeats {max_heartbeats}")
+    witness_name = ""
+    helper_audit_after = ""
+    if artifact_helpers:
+        from .lean_runner import _check_delta_audit_blocks
+        witness_name, witness = _export_target_witness(
+            statement_type,
+            scoped_prefix=theorem_proof_scoped_prefix(str(problem_record.get("target_scoped_prefix") or "")),
+            omit_variables=tuple(problem_record.get("target_omit_variables") or ()),
+        )
+        parts.extend(("", witness))
+        helper_audit_before, helper_audit_after = _check_delta_audit_blocks("export_" + witness_name)
+        parts.append(helper_audit_before)
     if artifact_helpers:
         parts.extend(("", "\n\n".join(artifact_helpers)))
     description = str(problem_record.get("docstring") or "").strip()
@@ -1373,12 +1437,13 @@ def _build_theorem_project_solved_file(
             description = description[3:-2].strip()
         safe_description = description.replace("/-", "/ -").replace("-/", "- /")
         rendered_description = f"/-- {safe_description} -/"
-    proof_block = sanitize_lean_artifact_text(proof)
+    from .utils import normalize_classical_tactic_prefix
+    proof_block = normalize_classical_tactic_prefix(sanitize_lean_artifact_text(proof))
     # Exported files are audited from Lean's text output, which elaboration-time
     # code in the proof or helpers could shape. Never export such candidates.
     from .lean_runner import _check_meta_escape_violation
 
-    if _check_meta_escape_violation(proof_block, *helpers):
+    if _check_meta_escape_violation(statement_type, proof_block, *helpers):
         return None
     replay = _export_root_replay_witness(
         "\n".join(parts), theorem_name, statement_type, proof_block,
@@ -1427,6 +1492,11 @@ def _build_theorem_project_solved_file(
         )
     parts.extend(("", signature_check))
     content = "\n".join(parts) + "\n"
+    if witness_name:
+        from .lean_runner import _check_target_identity_guard
+        content = merge_imports(content, ("Lean",))
+        content += _check_target_identity_guard(replay_name or f"_root_.{theorem_name}", witness_name)
+        content += helper_audit_after
     if replay_guard:
         content = merge_imports(content, ("Lean.Elab.Command", "Lean.Util.CollectAxioms"))
         content += "\n" + replay_guard
@@ -1589,7 +1659,7 @@ def _audit_exported_axioms(
     timeout_s: float = 180.0,
     extra_lean_paths: Sequence[Path] = (),
 ) -> Tuple[bool, List[str], List[str], str]:
-    """Run ``#print axioms`` on *content*'s root theorem.
+    """Audit the compiled root in a separate trusted Lean process.
 
     Returns ``(ok, axioms, unexpected, output)``. Any infrastructure failure
     (compile error of the audit file, timeout, missing report, unusable
@@ -1612,51 +1682,14 @@ def _audit_exported_axioms(
         if lean_project_dir is not None
         else PROJECT_ROOT / "external" / "PutnamBench" / "lean4"
     )
-    # Machine-generated unique name (NOT derived from theorem_name): keeps
-    # concurrent audits of the same theorem from racing on one shared path,
-    # and prevents an untrusted ``problem`` value (e.g. "../../evil") from
-    # steering the write/unlink outside scratch_dir.
-    scratch_dir.mkdir(parents=True, exist_ok=True)
-    fd, audit_name = tempfile.mkstemp(
-        prefix=".axiom_audit_", suffix=".tmp.lean", dir=str(scratch_dir)
+    from .lean_artifact_audit import audit_compiled_source
+
+    axioms, output = audit_compiled_source(
+        content, _export_name_parts(theorem_name), project_dir=project_dir,
+        scratch_dir=scratch_dir, timeout_s=float(timeout_s or 180.0),
+        env=sanitized_subprocess_environment(_export_lean_env(extra_lean_paths)),
     )
-    os.close(fd)
-    audit_path = Path(audit_name)
-    # Force resolution from the root namespace. The reconstructed source can
-    # intentionally leave its target namespace open, in which case an
-    # unqualified directive would look for ``Foo.Foo.target``.
-    audit_path.write_text(
-        f"{content}\n#print axioms _root_.{theorem_name}\n", encoding="utf-8"
-    )
-    try:
-        proc = subprocess.run(
-            ["lake", "env", "lean", str(audit_path.resolve())],
-            cwd=str(project_dir),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=max(1.0, float(timeout_s or 180.0)),
-            check=False,
-            env=sanitized_subprocess_environment(
-                _export_lean_env(extra_lean_paths)
-            ),
-        )
-        output = str(proc.stdout or "")
-        returncode = int(proc.returncode)
-    except Exception as exc:
-        return False, [], [], f"{type(exc).__name__}: {exc}"
-    finally:
-        try:
-            audit_path.unlink()
-        except Exception:
-            pass
-    axioms = _parse_print_axioms(output, theorem_name)
     ok, unexpected = _axiom_audit_verdict(axioms)
-    # The audit file is the verified content plus one directive, so a
-    # non-zero exit means the audit itself is unreliable — fail closed even
-    # if a parseable report happens to be present.
-    if returncode != 0:
-        return False, list(axioms or []), unexpected, output
     return ok, list(axioms or []), unexpected, output
 
 

@@ -48,10 +48,10 @@ _END_RE = re.compile(
     r"^\s*end(?:\s+(?P<name>[A-Za-z_][A-Za-z0-9_'.]*))?\s*$"
 )
 _PRINT_AXIOMS_DEPENDS_RE = re.compile(
-    r"'([^']+)'\s+depends\s+on\s+axioms:\s*\[([^\]]*)\]"
+    r"'([^\r\n]+)'\s+depends\s+on\s+axioms:\s*\[([^\]]*)\]"
 )
 _PRINT_AXIOMS_NONE_RE = re.compile(
-    r"'([^']+)'\s+does\s+not\s+depend\s+on\s+any\s+axioms"
+    r"'([^\r\n]+)'\s+does\s+not\s+depend\s+on\s+any\s+axioms"
 )
 _ALLOWED_AXIOMS = frozenset({"propext", "Classical.choice", "Quot.sound"})
 _CIRCULAR_PREMISE_MARKER_RE = re.compile(
