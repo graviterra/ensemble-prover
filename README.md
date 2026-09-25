@@ -1,183 +1,50 @@
 # Ensemble Prover
 
-Last updated: 2026-09-25.
+**Version 1.15 · Research preview** · Updated September 25, 2026
 
-This repository contains a research-grade autonomous theorem prover that
-combines language-model proof search with Lean verification. Given a formalized
-Lean target, it plans a proof, retrieves relevant declarations, decomposes hard
-goals into helper claims, tests and repairs candidate proofs, and finalizes a
-Lean-checked result without further user interaction. The maintained entry
-point for proof search is `ensemble_prover.mini_prover`.
+Ensemble Prover is an autonomous theorem prover combining language-model proof
+search with Lean 4 verification. Give it a formalized theorem and a compatible
+Lean project: it plans, retrieves relevant mathematics, proves helper lemmas,
+repairs failed attempts, and checks the final proof with Lean.
 
-> **Ongoing progress — September 2026:** Ensemble Prover has produced
-> Lean-verified proofs for **189 distinct Putnam problems** across research and
-> evaluation runs. **65 have been accepted by PutnamBench; the additional 124
+[Quick start](#quick-start) · [Workflows](#choose-a-workflow) ·
+[Results](#putnam-proofs-accepted-by-putnambench) ·
+[User Guide](docs/USER_GUIDE.md) · [Citation](#cite-this-work)
+
+> **Ongoing progress — September 25, 2026:** Ensemble Prover has produced
+> Lean-verified proofs for **226 distinct Putnam problems** across research and
+> evaluation runs. **65 have been accepted by PutnamBench; the additional 161
 > have not yet been independently verified by the PutnamBench team.** Development
 > and solving continue, with recent runs using **Astra**, **Fable**,
 > **deepseek-v4.1-flash**, and **Opus**. This cumulative count combines models,
 > configurations, and budgets; it is not a controlled benchmark solve rate.
 
-## Ensemble Prover in action
-
-An excerpt from a Putnam 2025 A4 run: declaration checks, a candidate proof,
-a yield to the scheduler at a completed tool boundary, and a Lean-accepted
-helper proof recorded for reuse.
-
-[![Terminal trace showing Lean tool calls, a scheduler yield, the proof, and helper acceptance](docs/assets/proof-search-mechanics.png)](docs/assets/proof-search-mechanics.png)
-
-Click the image to view it at full resolution. This excerpt shows a helper
-subgoal being accepted, not final verification of the entire problem. The
-screenshot is losslessly cropped; its retained code and logs are unchanged.
-
-## Recent updates
-
-September 2026 — highlights from the current source checkout:
-
-- **1.12 — automatic research during ordinary proof runs:** new Mini and Putnam runs
-  investigate stalled approaches and feed alternative strategies back into
-  proof search, using the existing run budget. Keep using your usual command;
-  add `--no-autonomous-research` to disable this behavior.
-  [How automatic recovery works](docs/USER_GUIDE.md#automatic-research-when-proof-search-stalls)
-- **1.11 — strategy recovery:** discovery tracks ancestor obligations, reviews
-  contrary evidence, and returns stalled proof routes to research within the
-  existing budget. Adopt stopped Mini work, inspect primary sources, and explore
-  alternative methods while preserving the exact original Lean target.
-  [Strategy recovery](ensemble_prover/research_claims/STRATEGY_RECOVERY.md)
-- **Unknown-answer questions — experimental:** Mini can propose and review
-  explicit terms for `answer(sorry)` slots, then try to prove the exact filled
-  theorem. The original question is preserved; a proposed answer is not a proof.
-  [Answer discovery](docs/USER_GUIDE.md#questions-with-an-unknown-answer)
-- **Codex and Claude Code integration:** use subscription-backed CLI transports
-  for Mini's prover and refiner, alongside the existing API providers. Codex
-  also supports every model role in the research-to-proof loop.
-  [Codex setup](docs/CODEX_SUBSCRIPTION_BACKEND.md) ·
-  [Claude Code setup](docs/CLAUDE_CODE_SUBSCRIPTION_BACKEND.md)
-- **Autonomous mathematical research — experimental:** explore proofs,
-  counterexamples, and alternative approaches with model workers, fresh reviews,
-  optional isolated experiments, and resumable request/time budgets. Supply a
-  built Lake project to include formalization, Mini proof search, checked export,
-  and feedback to research in the same run.
-  [Start a research run](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research)
-- **Coordinated research:** track exact claims, full arguments, review objections,
-  remaining gaps, and whether a helper actually advances the target problem.
-  [Use the research ledger](docs/USER_GUIDE.md#20-coordinate-mathematical-research)
-- **Natural-language formalization:** start from a single claim or longer notes,
-  develop supporting Lean definitions and lemmas, and resume multi-file work.
-  [Single claims](docs/USER_GUIDE.md#18-formalize-one-natural-language-claim) ·
-  [Formalization campaigns](docs/USER_GUIDE.md#19-run-a-multi-file-formalization-campaign)
-
-Research reviews are not Lean proof certificates. Research inside ordinary Mini
-runs uses the configured Mini provider. The separate autonomous-research CLI and
-its integrated formalization/proof roles support the OpenAI API and Codex
-subscriptions. The standalone NL and formalization CLIs remain API-backed.
-Claude Code serves Mini's prover/refiner roles and their automatic research.
-Older release snapshots may not include every feature above.
-
 ## Overview
 
-The primary input is a theorem, lemma, or conjecture in a user-supplied Lean
-file and Lake project. PutnamBench files are supported through a compatibility
-adapter, and callers may attach a natural-language problem description as
-additional model context. Release 1.14 also includes
-experimental natural-language entry points: `ensemble_prover.nl_input` for a
-single claim and `ensemble_prover.formalization` for resumable, multi-file
-projects. These translate text before proving; the resulting Lean statement
-and its project environment remain the authoritative proof contract, not a
-certificate of translation fidelity. Programmatic callers can submit the same generic
-theorem-project request used by the CLI.
+Proof search combines recursive helper planning, deterministic tactics,
+retrieval, falsification, and automatic research when an approach stalls.
+Checked helpers and structured run records support reuse and resumption.
+Prover, refiner, and planner roles can use one model or different models, with
+provider-call, wall-clock, and cost-budget controls.
 
-The current source checkout also includes experimental **mathematical research**
-workflows. `ensemble_prover.research_claims` records exact claims, complete
-arguments, independent reviews, remaining gaps, and whether a helper actually
-advances its parent problem. Its `discovery` command runs autonomous
-investigations: workers explore alternative approaches, seek proofs or
-counterexamples, share findings, and request fresh reviews within a durable
-request and time budget. Research can begin with a natural-language problem.
-With a built Lake project, the same run formalizes candidate arguments, searches
-for proofs, independently checks exports, and returns failures or results to
-research. Omitting the project keeps a standalone research-only run.
+Experimental workflows also translate natural-language mathematics, develop
+multi-file Lean projects, and investigate problems through autonomous research.
+**Lean checks the formal proof, not the fidelity of a natural-language
+translation. Research reviews and proposed answers are not proof certificates.**
 
-As of September 22, 2026, across research and evaluation runs, the system has
-produced Lean-verified proofs for **189 distinct Putnam problems**, counting
-repeated solves and configuration variants once. **PutnamBench has accepted the
-original 65 submitted proofs**, and Ensemble Prover is listed on the
-[PutnamBench leaderboard](https://trishullab.github.io/PutnamBench/leaderboard.html).
-The **124 additional problems** have locally Lean-verified proof exports but
-**have not yet been independently verified by the PutnamBench team**.
-This is a cumulative result across models, configurations, and budgets, not a
-controlled benchmark solve rate under one fixed setup.
+## Choose a workflow
 
-The prover has been tested with **GPT-5.2**, **GPT-5.6 Luna-Pro**, **Astra**,
-**Fable**, **DeepSeek-V4-Flash**, **deepseek-v4.1-flash**, **DeepSeek-V4-Pro**,
-**Opus**, and **Qwen3.7-Max**. Prover, refiner, and planner-escalation roles are
-independently configurable, so a run may use one model throughout or combine
-models.
+| You have | Start here | What it does |
+| --- | --- | --- |
+| A Lean theorem and a built Lake project | [Run the prover](#run-the-prover) | Search for and check a proof of the supplied target |
+| One natural-language or LaTeX-text claim | [Start from natural language](#start-from-natural-language) | Translate the claim, then try to prove it |
+| Longer mathematical notes | [Formalization campaigns](docs/USER_GUIDE.md#19-run-a-multi-file-formalization-campaign) | Build definitions and supporting lemmas across a resumable project |
+| A problem to investigate | [Mathematical research](#investigate-a-mathematical-problem) | Explore arguments and counterexamples; optionally formalize and prove candidates |
+| An existing Mini run | [Research from a saved run](#start-research-from-a-saved-run) | Start a research run using the saved model, provider, and project |
 
-Ensemble Prover is an actively developed research-grade tool. It continues to
-solve Putnam problems and is now attempting frontier-mathematics problems.
-The 65 accepted proofs and 124 additional locally verified solves are a dated
-snapshot of this ongoing work.
+## Quick start
 
-Every result reported as a solved proof by Mini Prover is checked by Lean.
-Research-ledger support is a separate assessment, not a proved theorem.
-Model responses, plans, retrieved material, speculative helper claims, and
-falsification results are treated as
-search evidence rather than proofs until they pass the relevant verification
-gates. Each run records a structured, replayable dossier containing the proof
-search and verification history.
-
-## Putnam proofs accepted by PutnamBench
-
-The following **65 problem identifiers** are the independently accepted subset
-of the 189-problem cumulative result above. Their Lean proof files were submitted
-privately to the PutnamBench
-verification team for independent review on August 31, 2026; PutnamBench has
-since accepted all 65 proofs. Only the problem identifiers are published here;
-the proof files and answers are not.
-
-| Period | Problems |
-| --- | --- |
-| 1960s | `1962 A6`, `1963 B1`, `1964 B1`, `1964 B2`, `1965 A4`, `1965 A6`, `1966 A1`, `1968 A1`, `1968 B2`, `1969 A1` |
-| 1970s | `1970 B3`, `1971 A1`, `1971 B1`, `1972 A1`, `1972 A2`, `1973 B2`, `1975 B1`, `1977 A2`, `1977 A3`, `1977 A5`, `1978 A1`, `1978 A4`, `1979 B6` |
-| 1980s | `1986 A1`, `1986 B1`, `1986 B6`, `1987 A1`, `1987 A2`, `1988 B1`, `1988 B2` |
-| 1990s | `1990 A1`, `1990 A5`, `1990 A6`, `1991 A2`, `1992 A1`, `1992 A2`, `1993 A2`, `1995 A1`, `1996 A3`, `1997 A4`, `1998 B1`, `1998 B2`, `1999 A1` |
-| 2000s | `2000 A1`, `2000 B2`, `2001 A1`, `2003 B1`, `2004 A1`, `2004 B2`, `2005 A1`, `2005 B1`, `2006 A1`, `2007 B1`, `2008 A1`, `2009 A1` |
-| 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
-| 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
-
-> **Release status:** 1.14 — research preview. Includes Mini Prover, experimental
-> single-claim NL input, and resumable multi-file formalization campaigns.
-> Optional Codex and Claude Code subscription backends serve Mini's prover and refiner,
-> alongside the existing API providers. Codex also serves autonomous research.
-> The current source also includes experimental coordinated and autonomous
-> research; older release snapshots may not contain these entry points.
-
-## Documentation
-
-Start with the **[User Guide](docs/USER_GUIDE.md)** for installation, theorem
-project preparation, [single-claim NL input](docs/USER_GUIDE.md#18-formalize-one-natural-language-claim),
-[long formalization projects](docs/USER_GUIDE.md#19-run-a-multi-file-formalization-campaign),
-[coordinated research](docs/USER_GUIDE.md#20-coordinate-mathematical-research),
-[autonomous research](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research),
-provider configuration, budgets, outputs, proof graphs, diagnostic replay,
-troubleshooting, and the public Mini CLI option map.
-
-## Highlights
-
-- Autonomous Lean-checked proof search
-- Recursive helper planning and root-proof assembly
-- Deterministic tactic, retrieval, and falsification lanes
-- Provider-call, wall-clock, and cost-budget controls
-- Persistent verified Mini theory and proof-state caches
-- Structured JSONL traces, summaries, and replay tooling
-- Natural-language/LaTeX-text translation with explicit Lean proof contracts
-- Resumable multi-file development with independent model review and checked exports
-- Complete required plan/context delivery, with explicit errors when model limits are exceeded
-- Research claims with separate correctness, verification, and contribution assessments
-- Autonomous research programs with fresh reviews, durable feedback, and fair research scheduling
-- Optional isolated Python experiments and complete research-to-formalization handoffs
-
-## Requirements
+### Requirements
 
 - Linux
 - Standard CPython 3.11 or 3.12
@@ -196,7 +63,7 @@ environment loading, and YAML parsing. Numerical acceleration, learned
 retrieval, provider-specific tokenization, and native SMT bindings are optional
 features and are not installed by default.
 
-## Setup
+### Setup
 
 Create the supported virtual environment and install the pinned dependencies:
 
@@ -277,7 +144,22 @@ Each attempt must commit one distinct accepted proof by 1,200 seconds and two by
 budgets apply. See the [sweep guide](ensemble_prover/PUTNAM_SWEEP.md) for a
 no-provider-call preview, resume commands, and counting/cleanup rules.
 
+## Ensemble Prover in action
+
+An excerpt from a Putnam 2025 A4 run: declaration checks, a candidate proof,
+a yield to the scheduler at a completed tool boundary, and a Lean-accepted
+helper proof recorded for reuse.
+
+[![Terminal trace showing Lean tool calls, a scheduler yield, the proof, and helper acceptance](docs/assets/proof-search-mechanics.png)](docs/assets/proof-search-mechanics.png)
+
+Click the image to view it at full resolution. This excerpt shows a helper
+subgoal being accepted, not final verification of the entire problem. The
+screenshot is losslessly cropped; its retained code and logs are unchanged.
+
 ## Start from natural language
+
+<details>
+<summary>Translate one claim or develop a multi-file formalization campaign</summary>
 
 For one claim, translate and prove using the OpenAI API:
 
@@ -326,7 +208,12 @@ success rates and FLT/million-line performance have not been established.
 Lean verification certifies the formal proof, not the accuracy of translation
 from natural language. Review the generated definitions and statements.
 
+</details>
+
 ## Investigate a mathematical problem
+
+<details>
+<summary>Initialize, run, and resume autonomous research</summary>
 
 For human- or externally coordinated work, the [research ledger
 guide](ensemble_prover/research_claims/README.md) walks through recording claims,
@@ -400,6 +287,8 @@ See the [research
 walkthrough](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research) and
 [full execution contract](ensemble_prover/research_claims/DISCOVERY.md).
 
+</details>
+
 ## Start research from a saved run
 
 From the repository directory, use one command:
@@ -418,6 +307,70 @@ to inspect progress. Resuming preserves the original budget. Add `--prepare` whe
 creating a run to save it without starting model work, or `--source finding.txt`
 to include an outside finding. Saved Codex and OpenAI providers are supported;
 other providers require an explicit supported selection.
+
+## Putnam proofs accepted by PutnamBench
+
+Ensemble Prover is listed on the
+[PutnamBench leaderboard](https://trishullab.github.io/PutnamBench/leaderboard.html).
+The cumulative solve count at the top of this page counts each problem once,
+including problems solved more than once or under different configurations.
+
+The following **65 problem identifiers** are the independently accepted subset.
+Their Lean proof files were submitted privately to the PutnamBench verification
+team on August 31, 2026; PutnamBench has since accepted all 65 proofs. Only the
+problem identifiers are published here; the proof files and answers are not.
+
+<details>
+<summary>View the 65 accepted problems</summary>
+
+| Period | Problems |
+| --- | --- |
+| 1960s | `1962 A6`, `1963 B1`, `1964 B1`, `1964 B2`, `1965 A4`, `1965 A6`, `1966 A1`, `1968 A1`, `1968 B2`, `1969 A1` |
+| 1970s | `1970 B3`, `1971 A1`, `1971 B1`, `1972 A1`, `1972 A2`, `1973 B2`, `1975 B1`, `1977 A2`, `1977 A3`, `1977 A5`, `1978 A1`, `1978 A4`, `1979 B6` |
+| 1980s | `1986 A1`, `1986 B1`, `1986 B6`, `1987 A1`, `1987 A2`, `1988 B1`, `1988 B2` |
+| 1990s | `1990 A1`, `1990 A5`, `1990 A6`, `1991 A2`, `1992 A1`, `1992 A2`, `1993 A2`, `1995 A1`, `1996 A3`, `1997 A4`, `1998 B1`, `1998 B2`, `1999 A1` |
+| 2000s | `2000 A1`, `2000 B2`, `2001 A1`, `2003 B1`, `2004 A1`, `2004 B2`, `2005 A1`, `2005 B1`, `2006 A1`, `2007 B1`, `2008 A1`, `2009 A1` |
+| 2010s | `2010 A2`, `2012 A2`, `2016 A1` |
+| 2020s | `2021 A1`, `2021 A2`, `2024 A1`, `2024 B3`, `2025 A1`, `2025 B2`, `2025 B3` |
+
+</details>
+
+## Recent updates
+
+**Version 1.15** improves continuity between proof-search steps and interrupted runs:
+
+- Recursive helper work survives scheduler yields and subscription interruptions.
+- Child proofs and root assembly retain their checked, dependency-complete helper context.
+- Progress tracking distinguishes new mathematics from equivalent helper and route aliases.
+- Provider failures retain their classifications; sustained transport outages pause work
+  without treating per-request response limits as account-wide outages.
+
+Automatic research during ordinary Mini runs uses the configured Mini provider
+and the existing run budget. Add `--no-autonomous-research` to disable it.
+See [automatic recovery](docs/USER_GUIDE.md#automatic-research-when-proof-search-stalls)
+and [strategy recovery](ensemble_prover/research_claims/STRATEGY_RECOVERY.md).
+
+Questions with unknown answers remain experimental: Mini can propose and review
+terms for `answer(sorry)` slots, then try to prove the exact filled theorem.
+See [answer discovery](docs/USER_GUIDE.md#questions-with-an-unknown-answer).
+
+## Documentation
+
+The **[User Guide](docs/USER_GUIDE.md)** covers installation, providers, budgets,
+outputs, proof exports, replay, and troubleshooting. Useful starting points:
+
+- [Codex subscription setup](docs/CODEX_SUBSCRIPTION_BACKEND.md)
+- [Claude Code subscription setup](docs/CLAUDE_CODE_SUBSCRIPTION_BACKEND.md)
+- [Provider, Lean, and wall-clock budgets](docs/USER_GUIDE.md#7-set-time-and-cost-boundaries)
+- [Determine whether a run succeeded](docs/USER_GUIDE.md#11-determine-whether-a-run-succeeded)
+- [Standalone exports and proof graphs](docs/USER_GUIDE.md#12-standalone-exports-and-proof-graphs)
+- [Interruption and replay](docs/USER_GUIDE.md#13-replay-and-interruption-behavior)
+
+Mini proof search and its automatic research support the configured Mini provider,
+including Codex and Claude Code subscription transports. The separate autonomous
+research CLI and its integrated formalization/proof roles support the OpenAI API
+and Codex subscriptions. Standalone NL and formalization CLIs remain API-backed.
+Older release snapshots may not include every feature described here.
 
 ## Verify a checkout
 
@@ -475,7 +428,7 @@ Python virtual environment is not a security boundary.
 
 If you use Ensemble Prover in your research, experiments, or software, please cite:
 
-> Reale, M. (2026). *Ensemble Prover* [Computer software]. Graviterra.
+> Reale, M. (2026). *Ensemble Prover* (Version 1.15) [Computer software]. Graviterra.
 > [GitHub repository](https://github.com/graviterra/ensemble-prover).
 
 ```bibtex
@@ -483,6 +436,7 @@ If you use Ensemble Prover in your research, experiments, or software, please ci
   author       = {Reale, M.},
   title        = {{Ensemble Prover}},
   year         = {2026},
+  version      = {1.15},
   organization = {Graviterra},
   url          = {https://github.com/graviterra/ensemble-prover}
 }
