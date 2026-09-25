@@ -19,6 +19,7 @@ from ensemble_prover.root_finalization import (
 from ..action import MiniOutcome
 from ..tactic_source_suppression import (
     excluded_tactic_source_prefixes_for_context,
+    tactic_rejected_proof_records_for_context,
     tactic_source_suppression_records,
 )
 
@@ -94,12 +95,16 @@ class RootTacticCloseAction:
             goal_statement=goal_statement,
             helper_blocks=helper_blocks,
         )
+        preamble = (
+            session.acceptance_preamble()
+            if hasattr(session, "acceptance_preamble") else _fallback_preamble(session)
+        )
         try:
             ok, proof = await _try_root_tactic_close(
                 phase=self.phase,
                 theorem_name=theorem_name,
                 goal_statement=goal_statement,
-                preamble=session.acceptance_preamble() if hasattr(session, "acceptance_preamble") else _fallback_preamble(session),
+                preamble=preamble,
                 lean=session.lean,
                 dossier=session.dossier,
                 recorder=session.recorder,
@@ -118,6 +123,10 @@ class RootTacticCloseAction:
                 },
                 finalize_root=False,
                 excluded_source_prefixes=excluded_source_prefixes,
+                suppressed_proof_records=tactic_rejected_proof_records_for_context(
+                    session, goal_statement=goal_statement,
+                    preamble=preamble, helper_blocks=helper_blocks,
+                ),
                 tactic_source_suppression_records=tactic_source_suppression_records(
                     session
                 ),

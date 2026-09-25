@@ -12924,6 +12924,9 @@ def _build_argparser() -> argparse.ArgumentParser:
             "kill switch. Each HTTP request retains the finite role/model "
             "watchdog unless --llm-request-timeout-s off (or a role-scoped "
             "equivalent) explicitly disables it.\n"
+            "  For Claude Code and Codex subscriptions, that watchdog is an "
+            "absolute CLI request deadline, including thinking. Progress "
+            "events do not extend it; a killed CLI generation cannot resume.\n"
             "  Use --llm-deadline-policy hard for fail-fast experiments that "
             "reject a late LLM/tool-loop operation at the role or phase "
             "deadline; it does not cap the overall MiniSession run.\n"
@@ -13014,7 +13017,9 @@ def _build_argparser() -> argparse.ArgumentParser:
             "model (bounded by planner_escalation_max_calls per attempt). "
             "'auto' (default) uses the OpenAI API when OPENAI_API_KEY is set "
             "and otherwise disables escalation with a warning; an explicit "
-            "provider fails loudly if its key is missing; 'off' disables."
+            "provider fails loudly if its key is missing; 'off' disables "
+            "escalation only. The base planner still uses the prover model "
+            "and may run alongside proof calls."
         ),
     )
     p.add_argument(
@@ -13111,9 +13116,10 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=_llm_request_timeout_arg,
         default=None,
         help=(
-            "HTTP response timeout for both roles. Use a finite number of "
-            "seconds to bound provider reads, or 'none'/'off'/'unbounded' to "
-            "wait indefinitely after connect. Default: the finite role/model "
+            "HTTP response timeout, or absolute CLI request deadline for "
+            "subscription providers, for both roles. Use a finite number of "
+            "seconds, or 'none'/'off'/'unbounded' to disable this clock. "
+            "Default: the finite role/model "
             "timeout in both soft and hard deadline modes."
         ),
     )
@@ -13121,13 +13127,13 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--prover-request-timeout-s",
         type=_llm_request_timeout_arg,
         default=None,
-        help="Override HTTP response timeout for the prover role only.",
+        help="Override HTTP response timeout / absolute subscription CLI deadline for the prover role only.",
     )
     p.add_argument(
         "--refiner-request-timeout-s",
         type=_llm_request_timeout_arg,
         default=None,
-        help="Override HTTP response timeout for the refiner role only.",
+        help="Override HTTP response timeout / absolute subscription CLI deadline for the refiner role only.",
     )
     p.add_argument(
         "--llm-deadline-policy",
@@ -15315,11 +15321,12 @@ async def _main_async(args: argparse.Namespace) -> int:
         print(
             "LLM deadline policy: "
             f"{_deadline_policy} "
-            f"({_policy_note} a per-HTTP-attempt wall clock, which a "
-            "transport retry may restart from full: "
+            f"({_policy_note} a per-request wall clock: "
             f"prover={_armed_attempt_wall(prover_cfg)}, "
             f"refiner={_armed_attempt_wall(refiner_cfg)}; "
-            "disable with --llm-request-timeout-s off)"
+            "disable with --llm-request-timeout-s off; HTTP transport retries "
+            "may restart this clock, but an expired subscription CLI "
+            "generation is not resumed or automatically retried)"
         )
         print(
             "Mini supervisor timeouts: "

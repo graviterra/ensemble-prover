@@ -3136,7 +3136,7 @@ async def _call_llm_with_tools_one_round_impl(
         _increment_tool_metric("mini_provider_call_quantum_yields", 1)
         primitives["trace"](
             trace_prefix,
-            "  provider-call quantum exhausted at a complete "
+            "  completed provider-call quantum at a settled "
             f"{boundary} boundary ({provider_calls_completed} calls, "
             f"{provider_call_elapsed_s:.3f}s); yielding to scheduler",
         )

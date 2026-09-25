@@ -52,6 +52,7 @@ _RUNTIME_FIELDS = frozenset({
     "_inflight_action_dispatch_id", "_apply_transition_active",
     "_mini_recursive_hard_timeout_lease",
     "_checkpoint_initial_theory_context_hash",
+    "_acceptance_receipt_flush_active",
 })
 # The recursive prove/refine handoff reuses its conversation, including this
 # parent-bound commit/rollback handle. Only the accompanying theory provenance
@@ -446,6 +447,8 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
     if _CONVERSATION_RUNTIME_FIELDS.intersection(conversation):
         raise ValueError("checkpoint conversation cannot restore runtime capabilities")
     values = {key: _decode(value) for key, value in data["session_values"].items()}
+    if values.get("_acceptance_receipt_flush_active") is False:
+        values.pop("_acceptance_receipt_flush_active")
     verifier_view = await _prepare_theory_checkpoint_context(session, data, values)
     if expected_identity != session_checkpoint_identity(verifier_view):
         raise ValueError("checkpoint identity differs from the fresh target, environment or policy")
@@ -526,6 +529,9 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
     await _prepare_dossier(
         verifier_view, data["dossier"], staged_dossier=staged.dossier,
     )
+    from ensemble_prover.mini_accepted_progress import validate_restored_acceptance_records
+
+    validate_restored_acceptance_records(staged, checkpoint_monotonic=clock["monotonic_s"])
     if not staged.dossier.final_proof:
         staged.dossier.clear_solved()
     if staged.proof_state is not None:

@@ -451,6 +451,22 @@ async def try_close_root_with_active_lift(
         require_no_hypotheses=False,
         include_hypotheses=True,
     )
+    if tactic_source_suppression_records:
+        from .mini_session.tactic_source_suppression import (
+            tactic_rejected_proof_records_from_records,
+        )
+        suppressed_proof_records = tuple(suppressed_proof_records) + tuple(
+            record
+            for target in dict.fromkeys((goal_statement, active_statement)) if target
+            for record in tactic_rejected_proof_records_from_records(
+                tactic_source_suppression_records, goal_statement=target,
+                preamble=preamble, helper_blocks=helper_context_blocks,
+                suppress_solution_placeholders=suppress_solution_placeholders,
+                opaque_mode=opaque_mode,
+                allow_official_answer_visibility=allow_official_answer_visibility,
+                official_answer_payload_present=official_answer_payload_present,
+            )
+        )
     requested_phase = str(candidate_portfolio_phase or "").strip()
     attempt_limit = max(0, int(candidate_attempt_limit or 0))
     if active_statement and active_statement != str(goal_statement or "").strip():

@@ -13,7 +13,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from .proof_state import lean_statement_conclusion
+from .proof_state import (
+    _find_top_level_operator,
+    _leading_identity_let_body,
+    _strip_balanced_outer_parens,
+    lean_statement_conclusion,
+)
 
 
 _FINITE_SUM_RE = re.compile(
@@ -296,7 +301,20 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
     analysis_text = raw.replace("∀ᶠ", "Filter.Eventually").replace(
         "∀ᵐ", "Filter.Eventually"
     )
-    compact = " ".join(lean_statement_conclusion(analysis_text).split())
+    conclusion = analysis_text
+    while True:
+        conclusion = _strip_balanced_outer_parens(
+            lean_statement_conclusion(conclusion)
+        )
+        binding_surface = (
+            "let" + conclusion[4:]
+            if re.match(r"^have\s", conclusion) else conclusion
+        )
+        _head, _value, body = _leading_identity_let_body(binding_surface)
+        if not body:
+            break
+        conclusion = body
+    compact = " ".join(conclusion.split())
     needs_witness = bool(re.match(r"^(?:∃|@?(?:Exists\b|Filter\.Eventually\b))", compact))
     full_statement = " ".join(_blank_shadowed_infinite_bigop_names(raw).split())
     finite_sum_count = len(_FINITE_SUM_RE.findall(compact))
@@ -306,7 +324,56 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
     # conservative across the complete statement: generated scripts begin
     # with ``intros`` and must not enter a mixed finite/infinite context.
     has_infinite_sum = bool(_INFINITE_BIGOP_RE.search(full_statement))
-    has_equality = bool(_EQUALITY_RE.search(compact))
+    equality_index = _find_top_level_operator(compact, "=")
+    has_equality = bool(
+        equality_index >= 0 and _EQUALITY_RE.match(compact, equality_index)
+    )
+    compound = any(
+        _find_top_level_operator(compact, token) >= 0
+        for token in ("∧", "∨", "↔", "→", "->")
+    )
+    equality_sides = (
+        (compact[:equality_index], compact[equality_index + 1 :])
+        if has_equality else ()
+    )
+    has_bigop_side = False
+    for side in equality_sides:
+        operand = _strip_balanced_outer_parens(side)
+        if not (_FINITE_SUM_RE.match(operand) or _FINITE_PRODUCT_RE.match(operand)):
+            continue
+        # Mathlib's binder notation takes a term:67 body: multiplication is
+        # inside it, but bare addition/subtraction is outside. Ignore binder
+        # domains and preserve lower-precedence bodies introduced by lambdas
+        # or scoped terms. Qualified applications have no binder precedence.
+        operators = ("+", "-", "*", "/", "^", "•")
+        operation_surface = operand
+        if operand.startswith(("∑", "∏")):
+            comma = _find_top_level_operator(operand, ",")
+            if comma < 0:
+                continue
+            operation_surface = operand[comma + 1:].lstrip()
+            operators = ("+", "-")
+            if re.match(r"^(?:if|match|let|have|do|by)\b", operation_surface):
+                has_bigop_side = True
+                break
+            operation_surface = operation_surface.lstrip("- ")
+        lambda_start = _find_top_level_operator(operation_surface, "fun ")
+        if lambda_start > 0 and (
+            operation_surface[lambda_start - 1].isalnum()
+            or operation_surface[lambda_start - 1] in "_'."
+        ):
+            lambda_start = -1
+        lambda_symbol = _find_top_level_operator(operation_surface, "λ")
+        if lambda_symbol >= 0 and (lambda_start < 0 or lambda_symbol < lambda_start):
+            lambda_start = lambda_symbol
+        if any(
+            (operator_index := _find_top_level_operator(operation_surface, token)) >= 0
+            and (lambda_start < 0 or operator_index < lambda_start)
+            for token in operators
+        ):
+            continue
+        has_bigop_side = True
+        break
     has_filter = " with " in compact or ".filter" in compact or "Finset.filter" in compact
     has_nested_sum = _has_syntactically_nested_bigop(compact, "∑")
     has_nested_product = _has_syntactically_nested_bigop(compact, "∏")
@@ -323,6 +390,8 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
     has_sigma = ".sigma" in compact or "Finset.sigma" in compact or "Sigma" in compact
     should_attempt = bool(
         has_equality
+        and has_bigop_side
+        and not compound
         and not needs_witness
         and not has_infinite_sum
         and (finite_sum_count > 0 or finite_product_count > 0)

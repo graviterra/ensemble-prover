@@ -15517,8 +15517,13 @@ class ConversationTurnAction:
             if not scoped_failure_reason and llm_failure_kind in {
                 "llm_network_error",
                 "llm_retry_deadline_exhausted",
+                "subscription_request_deadline_exhausted",
             }:
-                scoped_failure_reason = llm_failure_kind
+                scoped_failure_reason = (
+                    "llm_retry_deadline_exhausted"
+                    if llm_failure_kind == "subscription_request_deadline_exhausted"
+                    else llm_failure_kind
+                )
                 failure_scope = llm_failure_scope(scoped_failure_reason)
             if (
                 not scoped_failure_reason
@@ -15654,6 +15659,14 @@ class ConversationTurnAction:
             refundable_cooperative_provider_yield = bool(
                 cooperative_provider_yield and provider_calls_completed == 0
             )
+            completed_provider_quantum_yield = bool(
+                cooperative_provider_yield and provider_calls_completed > 0
+                and loop_result.llm_error == "llm_provider_quantum_exhausted"
+            )
+            provider_yield_reason = (
+                "completed_provider_call_quantum"
+                if completed_provider_quantum_yield else ""
+            )
             accounting_neutral_failure = bool(
                 refundable_zero_provider_failure
                 or selected_work_projection_zero_provider
@@ -15781,9 +15794,10 @@ class ConversationTurnAction:
                 "tool_state_updates": tool_state_updates,
                 "tool_state_closures": tool_state_closures,
                 "tool_state_update_statuses": list(tool_state_statuses),
-                "llm_error": loop_result.llm_error,
-                "llm_failure_kind": llm_failure_kind,
-                "llm_failure_reason": structured_failure_reason_text,
+                "llm_error": "" if completed_provider_quantum_yield else loop_result.llm_error,
+                "llm_failure_kind": "" if completed_provider_quantum_yield else llm_failure_kind,
+                "llm_failure_reason": "" if completed_provider_quantum_yield else structured_failure_reason_text,
+                "provider_yield_reason": provider_yield_reason,
                 "llm_retryable": llm_retryable,
                 "terminal_failure_reason": terminal_failure_reason,
                 "scoped_failure_reason": scoped_failure_reason,
@@ -15846,6 +15860,7 @@ class ConversationTurnAction:
                     "llm_error": loop_result.llm_error,
                     "llm_failure_kind": llm_failure_kind,
                     "llm_failure_reason": structured_failure_reason_text,
+                    "provider_yield_reason": provider_yield_reason,
                     "llm_retryable": llm_retryable,
                     "terminal_failure": bool(terminal_failure),
                     "terminal_failure_reason": terminal_failure_reason,

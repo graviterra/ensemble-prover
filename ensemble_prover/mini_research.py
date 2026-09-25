@@ -319,7 +319,7 @@ class NativeResearchCoordinator:
         return state
 
     def _account_proof_work(self, session: Any, state: dict[str, Any], outcome: Any) -> None:
-        """Count committed dispatches, including iteration-neutral resumptions.
+        """Count completed proof responses, including neutral resumptions.
 
         The scheduler's existing durable outcome ledger owns deduplication
         receipts. Reusing it avoids a second ever-growing dispatch-id ledger in
@@ -350,8 +350,21 @@ class NativeResearchCoordinator:
         if prior is not None and (not isinstance(prior, dict) or prior.get("binding") != self.binding):
             raise ValueError("native research work receipt target changed")
         requests = 0
-        for key in ("provider_request_count", "provider_calls", "provider_dispatches",
-                    "provider_calls_completed", "provider_dispatches_started"):
+        # A killed generation supplies no mathematics to investigate. Keep
+        # exposure accounting with the provider ledger; it must not itself
+        # trigger another mathematical request after an outage or deadline.
+        request_keys = ("provider_calls_completed",)
+        if "provider_calls_completed" not in metadata:
+            failed = any(metadata.get(key) for key in (
+                "llm_failure_kind", "llm_failure_reason", "scoped_llm_failure_reason",
+                "scoped_failure_reason", "recursive_failure_reason",
+                "terminal_failure_reason", "llm_error", "terminal_failure",
+            )) or bool(getattr(outcome, "exception", None))
+            request_keys = () if failed else (
+                "provider_request_count", "provider_calls", "provider_dispatches",
+                "provider_dispatches_started",
+            )
+        for key in request_keys:
             try:
                 count = int(metadata.get(key, 0) or 0)
             except (TypeError, ValueError, OverflowError):
@@ -419,8 +432,7 @@ class NativeResearchCoordinator:
                 "reported_obstacle" if objections else
                 "proof_frontier_exhausted" if frontier_exhausted and state["paid_actions"] else
                 "proof_interval_audit" if (state["paid_actions"] >= 3
-                                          or state["requests_since_audit"] >= 10
-                                          or self.dispatches - self.last_research_dispatches >= 10) else
+                                          or state["requests_since_audit"] >= 10) else
                 "stagnation" if state["paid_actions"] and int(getattr(session, "stagnation_counter", 0)) >= 3 else None
             )
             if reason is None:

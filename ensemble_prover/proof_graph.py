@@ -2050,6 +2050,77 @@ def _graph_let_body_is_plausibly_local_prop(
     return arg_count == prop_arity
 
 
+def _graph_conditional_structure(
+    text: str,
+) -> Tuple[bool, Optional[Tuple[str, str]]]:
+    """Distinguish Lean conditional keywords from a prose ``if`` suffix."""
+
+    if "if" not in text:
+        return False, None
+    pending: List[Tuple[int, str, int]] = []
+    root_conditional = _graph_keyword_at(text, 0, "if")
+    root_then = root_else = -1
+    depth = 0
+    index = 0
+    while index < len(text):
+        skip_to = _lean_lexical_skip_end(text, index)
+        if skip_to is not None:
+            index = skip_to
+            continue
+        char = text[index]
+        if char in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+            depth += 1
+        elif char in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE.values():
+            if pending and pending[-1][0] >= depth:
+                return True, None
+            depth -= 1
+        elif _graph_keyword_at(text, index, "if"):
+            pending.append((depth, "then", index))
+        elif pending and pending[-1][0] == depth:
+            expected = pending[-1][1]
+            if _graph_keyword_at(text, index, expected):
+                if expected == "then":
+                    if root_conditional and pending[-1][2] == 0:
+                        root_then = index + len("then")
+                    pending[-1] = (depth, "else", pending[-1][2])
+                else:
+                    if root_conditional and pending[-1][2] == 0:
+                        root_else = index
+                    pending.pop()
+        index += 1
+    branches = (
+        (text[root_then:root_else].strip(), text[root_else + len("else"):].strip())
+        if root_conditional and 0 <= root_then < root_else else None
+    )
+    return bool(pending), branches
+
+
+def _graph_conditional_leaf_statements(text: str) -> Optional[List[str]]:
+    """Flatten conditional branches without adding a Python frame per branch."""
+
+    pending = [("", text)]
+    leaves: List[str] = []
+    while pending:
+        prefix, fragment = pending.pop()
+        body = _graph_strip_balanced_outer_parens(fragment.strip())
+        local_prefix = ""
+        while (quantifier_len := _graph_proposition_quantifier_token_len(body)) > 0:
+            remainder = body[quantifier_len:].lstrip()
+            comma = _graph_find_top_level_comma(remainder)
+            if comma < 0:
+                return None
+            local_prefix += body[:quantifier_len] + " " + remainder[:comma] + ", "
+            body = _graph_strip_balanced_outer_parens(remainder[comma + 1:].strip())
+        if _graph_keyword_at(body, 0, "if"):
+            incomplete, branches = _graph_conditional_structure(body)
+            if incomplete or not branches or not all(branches):
+                return None
+            pending.extend((prefix + local_prefix, branch) for branch in branches)
+        else:
+            leaves.append(prefix + fragment)
+    return leaves
+
+
 def _graph_quantified_body_looks_like_prose(text: str) -> bool:
     compact = graph_identity_text(text)
     if not compact:
@@ -2057,9 +2128,11 @@ def _graph_quantified_body_looks_like_prose(text: str) -> bool:
     lowered = compact.lower()
     if _graph_statement_looks_like_prose_instruction(compact):
         return True
+    if _graph_conditional_structure(compact)[0]:
+        return True
     prose_tail_patterns = (
         r"\b(?:using|via|because|with)\b",
-        r"\b(?:assuming|under|when|if)\s+\S+",
+        r"\b(?:assuming|under|when)\s+\S+",
         r"\band\s+then\b",
         r"\b(?:in|inside|from|for|of|as)\s+"
         r"(?:the|a|this|that|supposed)\s+"
@@ -2520,6 +2593,13 @@ def _graph_quantified_statement_is_executable(text: str) -> bool:
     ) or _graph_quantified_body_has_proof_tail(body):
         return False
     binder_context = ", ".join(binder_contexts)
+    if _graph_keyword_at(body, 0, "if"):
+        # The condition is a proposition even when the whole conditional
+        # returns data. Classify each branch with the original binder scope.
+        branches = _graph_conditional_leaf_statements(text)
+        return bool(branches) and all(
+            graph_statement_is_executable(branch) for branch in branches
+        )
     bare_tail_atom = _graph_bare_prop_atom_name(body)
     if bare_tail_atom and _graph_context_declares_prop_atom_in_binder(
         bare_tail_atom,
@@ -2684,6 +2764,17 @@ def graph_statement_is_executable(text: str) -> bool:
         return False
     if compact.startswith(("fun ", "fun\n")):
         return False
+    if _graph_keyword_at(compact, 0, "if"):
+        branches = _graph_conditional_leaf_statements(compact)
+        return bool(branches) and all(
+            graph_statement_is_executable(branch) for branch in branches
+        )
+    if compact.startswith(("have ", "have\n")):
+        # Term-level `have name := value; proposition` has the same binding
+        # shape as a let. Inspect that shape without rewriting the statement
+        # stored in the graph or submitted to Lean.
+        stmt = "let" + stmt[4:]
+        compact = "let" + compact[4:]
     if compact.startswith(("let ", "let\n")):
         let_binding, let_body = _graph_top_level_let_parts(text)
         if not let_body:

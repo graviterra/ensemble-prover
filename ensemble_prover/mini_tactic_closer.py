@@ -2426,8 +2426,9 @@ class DeterministicTacticBackend:
             resumed_timeout_floor = 0.0
         if not math.isfinite(resumed_timeout_floor) or resumed_timeout_floor < 0:
             resumed_timeout_floor = 0.0
+        observed_timeout_floor_s = _observed_candidate_timeout_floor_s(lean)
         minimum_timeout_s = max(
-            _observed_candidate_timeout_floor_s(lean),
+            observed_timeout_floor_s,
             self._timing_cache.candidate_timeout_floor(timing_key),
             # Scheduling history belongs to the admitted finite generation.
             # It cannot enlarge this operation's deadline or prove anything.
@@ -2435,13 +2436,24 @@ class DeterministicTacticBackend:
         )
         if minimum_timeout_s:
             cache_metadata["candidate_timeout_floor_s"] = minimum_timeout_s
+        minimum_tail_budget_s = max(
+            observed_timeout_floor_s / 1.25,
+            self._timing_cache.candidate_timeout_floor(timing_key),
+            min(resumed_timeout_floor, maximum_opportunity_s),
+        )
 
         index = candidate_start
         timeout_retried = False
         while index < candidate_stop and (not attempt_limit or len(attempts) < attempt_limit):
             candidate = candidates[index]
             remaining = deadline - time.monotonic()
-            if remaining <= 0.0:
+            # Preserve the cursor when a portfolio tail cannot fund the
+            # observed backend latency. A fresh call still gets its first
+            # attempt even when the configured quantum is below that hint.
+            if remaining <= 0.0 or (
+                attempts
+                and remaining < min(minimum_tail_budget_s, maximum_opportunity_s)
+            ):
                 return TacticCloseResult(
                     ok=False,
                     proof=None,
@@ -2555,6 +2567,11 @@ class DeterministicTacticBackend:
                 asdict(attempt),
             )
             attempts.append(attempt)
+            observed_timeout_floor_s = _observed_candidate_timeout_floor_s(lean)
+            minimum_timeout_s = max(minimum_timeout_s, observed_timeout_floor_s)
+            minimum_tail_budget_s = max(
+                minimum_tail_budget_s, observed_timeout_floor_s / 1.25,
+            )
             if self.pattern_cache is not None:
                 add_cache_stats(
                     self.pattern_cache.record_attempt(
@@ -2597,6 +2614,7 @@ class DeterministicTacticBackend:
                 self._timing_cache.record_candidate_timeout_floor(
                     timing_key, learned_floor,
                 )
+                minimum_tail_budget_s = learned_floor
                 cache_metadata["candidate_timeout_floor_s"] = learned_floor
             if check_timed_out and not whole_quantum_timed_out and candidate_timeout_fully_funded:
                 # An expired check slice gives no semantic rejection. Fund

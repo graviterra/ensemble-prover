@@ -177,6 +177,7 @@ from .proof_dossier import (
 from .proof_graph import (
     graph_statement_contract_ambiguities,
     graph_statement_explicit_arity,
+    graph_statement_is_executable,
     graph_statement_leading_contract,
     graph_statement_is_root_bridge,
     graph_statement_premises_and_conclusion,
@@ -524,6 +525,7 @@ class MiniRecursiveConfig:
     recursive_child_max_tool_calls_per_turn: int = 10
     tactic_timeout_s: float = 20.0
     tactic_max_candidates: int = 48
+    tactic_source_suppression_records: tuple[Mapping[str, Any], ...] = ()
     planner_temperature: float = 0.1
     # After a degenerate (empty/unparseable) planning response, the NEXT
     # planner call may escalate to a stronger model (the driver's
@@ -7427,6 +7429,24 @@ def _self_refuting_sanity_reason(claim: MiniSubgoalClaim) -> str:
             else match.group(0)
         ),
         sanity,
+        flags=re.IGNORECASE,
+    )
+    # A labelled non-instance checks the boundary of the hypotheses, not the
+    # conclusion on an admitted input. Mask only that sentence, and retain it
+    # if it also makes a direct claim/conclusion judgment. Keep source offsets
+    # so a separate actual refutation still produces the correct excerpt.
+    classified_sanity = re.sub(
+        r"(?:^|(?<=[.;\n]))\s*non[- ]instance(?:\s+check)?\s*:[^.\n;]*",
+        lambda match: (
+            match.group(0)
+            if re.search(
+                r"\b(?:claim|formula|identity|statement|target|conclusion)\b",
+                match.group(0),
+                flags=re.IGNORECASE,
+            )
+            else " " * len(match.group(0))
+        ),
+        classified_sanity,
         flags=re.IGNORECASE,
     )
     match = _SELF_REFUTING_SANITY_RE.search(classified_sanity)
@@ -16681,7 +16701,10 @@ def _malformed_statement_surface_reason(statement: str) -> str:
         return "contains a declaration command instead of a proposition"
     if re.search(r"(?:^|;)\s*by\b", leading):
         return "contains a top-level proof term (`by`) instead of a proposition"
-    if re.search(r"(?:^|;)\s*have\b", leading):
+    if (
+        re.search(r"(?:^|;)\s*have\b", leading)
+        and not graph_statement_is_executable(text)
+    ):
         return "contains local proof-script residue (`have`) instead of a proposition"
     return ""
 
@@ -34325,6 +34348,34 @@ async def _request_plan(
     ] = None,
 ) -> Optional[MiniSubgoalPlan]:
     started = time.monotonic()
+    background_result = (
+        planner_job_broker.peek(
+            planner_job_identity.job_id, planner_job_identity.request_fingerprint,
+        )
+        if planner_job_broker is not None and planner_job_identity is not None
+        else None
+    )
+    background_elapsed_s = (
+        background_result.elapsed_s
+        if background_result is not None
+        and background_result.identity == planner_job_identity
+        else 0.0
+    )
+
+    def planner_timing_metadata() -> dict[str, Any]:
+        action_elapsed_s = max(0.0, time.monotonic() - started)
+        return {
+            "planner_elapsed_s": (
+                round(action_elapsed_s + background_elapsed_s, 3)
+                if background_elapsed_s is not None else None
+            ),
+            "planner_action_elapsed_s": round(action_elapsed_s, 3),
+            "planner_background_elapsed_s": (
+                round(background_elapsed_s, 3)
+                if background_elapsed_s is not None else None
+            ),
+        }
+
     if planner_job_broker is None or planner_job_identity is None:
         stats.planner_calls += 1
     planner_feedback_items = planner_feedback if planner_feedback is not None else []
@@ -34666,7 +34717,7 @@ async def _request_plan(
             {
                 "phase": "mini_recursive_plan",
                 "pass_index": pass_index,
-                "planner_elapsed_s": round(time.monotonic() - started, 3),
+                **planner_timing_metadata(),
                 "error": f"{type(exc).__name__}: {exc}",
                 "terminal_failure_reason": "mini_recursive_planner_prompt_error",
                 "verdict": "plan_prompt_failed",
@@ -35555,7 +35606,7 @@ async def _request_plan(
             {
                 "phase": "mini_recursive_plan",
                 "pass_index": pass_index,
-                "planner_elapsed_s": round(time.monotonic() - started, 3),
+                **planner_timing_metadata(),
                 "error": f"{type(exc).__name__}: {exc}",
                 "llm_failure_kind": classification.kind,
                 "llm_retryable": bool(classification.retryable),
@@ -36238,7 +36289,7 @@ async def _request_plan(
                 {
                     "phase": "mini_recursive_plan",
                     "pass_index": pass_index,
-                    "planner_elapsed_s": round(time.monotonic() - started, 3),
+                    **planner_timing_metadata(),
                     "finish_reason": planner_response.finish_reason,
                     "visibility_recovery_trigger": (visibility_recovery_trigger),
                     "visible_content_chars": len(planner_response.content),
@@ -36381,7 +36432,7 @@ async def _request_plan(
                         {
                             "phase": "mini_recursive_plan",
                             "pass_index": pass_index,
-                            "planner_elapsed_s": round(time.monotonic() - started, 3),
+                            **planner_timing_metadata(),
                             "error": f"{type(repair_exc).__name__}: {repair_exc}",
                             "llm_failure_kind": classification.kind,
                             "terminal_failure_reason": classification.failure_reason,
@@ -36400,7 +36451,7 @@ async def _request_plan(
                         {
                             "phase": "mini_recursive_plan",
                             "pass_index": pass_index,
-                            "planner_elapsed_s": round(time.monotonic() - started, 3),
+                            **planner_timing_metadata(),
                             "error": f"{type(repair_exc).__name__}: {repair_exc}",
                             "llm_failure_kind": classification.kind,
                             "llm_retryable": bool(classification.retryable),
@@ -36417,7 +36468,7 @@ async def _request_plan(
                     {
                         "phase": "mini_recursive_plan",
                         "pass_index": pass_index,
-                        "planner_elapsed_s": round(time.monotonic() - started, 3),
+                        **planner_timing_metadata(),
                         "error": f"{type(repair_exc).__name__}: {repair_exc}",
                         "llm_failure_kind": classification.kind,
                         "llm_retryable": bool(classification.retryable),
@@ -36438,7 +36489,7 @@ async def _request_plan(
                 {
                     "phase": "mini_recursive_plan",
                     "pass_index": pass_index,
-                    "planner_elapsed_s": round(time.monotonic() - started, 3),
+                    **planner_timing_metadata(),
                     "claims_compiled": len(repair_plan.claims),
                     "controller_synthesized_claim_names": [
                         str(claim.name or "")
@@ -36473,7 +36524,7 @@ async def _request_plan(
                 {
                     "phase": "mini_recursive_plan",
                     "pass_index": pass_index,
-                    "planner_elapsed_s": round(time.monotonic() - started, 3),
+                    **planner_timing_metadata(),
                     "error": f"{type(exc).__name__}: {exc}",
                     # Capture the raw planner output so parse failures are diagnosable.
                     "content_preview": str(content or "")[:280],
@@ -36611,7 +36662,7 @@ async def _request_plan(
         {
             "phase": "mini_recursive_plan",
             "pass_index": pass_index,
-            "planner_elapsed_s": round(time.monotonic() - started, 3),
+            **planner_timing_metadata(),
             "claims_compiled": len(plan.claims),
             "planner_response_source": planner_response_source or "content",
             "finish_reason": (
@@ -38060,6 +38111,7 @@ async def _try_root_close(
             timeout_s=direct_timeout_s,
             max_candidates=direct_max_candidates,
             pattern_cache=tactic_pattern_cache,
+            tactic_source_suppression_records=config.tactic_source_suppression_records,
             candidate_portfolio_phase=candidate_portfolio_phase,
             candidate_portfolio_offset=max(
                 0,

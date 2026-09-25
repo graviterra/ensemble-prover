@@ -10863,6 +10863,12 @@ class MiniSession:
         init=False,
         repr=False,
     )
+    _pending_acceptance_records: List[Dict[str, Any]] = field(
+        default_factory=list, init=False, repr=False,
+    )
+    _acceptance_receipt_flush_active: bool = field(
+        default=False, init=False, repr=False,
+    )
     _failed_action_dispatch_ids: Set[str] = field(
         default_factory=set,
         init=False,
@@ -21113,6 +21119,7 @@ class MiniSession:
             preserve_helper_continuations_during_selection,
         )
 
+        self._flush_pending_acceptance_records()
         with preserve_helper_continuations_during_selection(self):
             return self._select_next_action()
 
@@ -23554,6 +23561,7 @@ class MiniSession:
             # Nested MiniSessions share their parent's broker. Their return is
             # only a scheduler quantum boundary; the final live session owner
             # performs cleanup, including on startup and cancellation exits.
+            self._flush_pending_acceptance_records()
             if planner_broker is not None:
                 await planner_broker.release_session_owner(
                     self, preserve_ready=preserve_ready, retain_suspended=retain_suspended,
@@ -27316,6 +27324,7 @@ class MiniSession:
                 )
                 raise ledger_error
             effective = self._applied_action_dispatch_outcomes[action_dispatch_id]
+            self._flush_pending_acceptance_records()
             if (
                 action_dispatch_id
                 not in self._duplicate_action_dispatch_events_in_progress
@@ -27372,6 +27381,13 @@ class MiniSession:
         try:
             try:
                 effective = self._apply_outcome_once(outcome)
+                from ensemble_prover.mini_accepted_progress import (
+                    committed_acceptance_records,
+                )
+
+                acceptance_records = committed_acceptance_records(
+                    self, effective, prior_formal_evidence=prior_formal_evidence,
+                )
             except BaseException as exc:
                 self._mark_apply_transaction_failure(
                     outcome=outcome,
@@ -27416,6 +27432,11 @@ class MiniSession:
                         error=exc,
                     )
                     raise
+            acceptance_committed_at = time.monotonic()
+            for acceptance_record in acceptance_records:
+                acceptance_record["acceptance_monotonic_s"] = acceptance_committed_at
+            self._pending_acceptance_records.extend(acceptance_records)
+            if action_dispatch_id:
                 # Observe health only after the complete transition and its
                 # exactly-once receipt are committed. Duplicate/cancelled
                 # dispatches cannot advance this process-local streak.
@@ -27432,17 +27453,7 @@ class MiniSession:
             # Sweep milestones observe only the effective, committed outcome.
             # A rejected/rolled-back action or duplicate dispatch must never
             # unlock a problem's acceptance deadline.
-            try:
-                from ensemble_prover.mini_accepted_progress import (
-                    committed_acceptance_records,
-                )
-
-                for acceptance_record in committed_acceptance_records(
-                    self, effective, prior_formal_evidence=prior_formal_evidence
-                ):
-                    self._record_event(acceptance_record)
-            except Exception:
-                _LOGGER.debug("Accepted proof receipt publication failed", exc_info=True)
+            self._flush_pending_acceptance_records()
             reconcile_helpers = getattr(
                 self,
                 "theory_verified_helper_reconcile_callback",
@@ -40484,7 +40495,28 @@ class MiniSession:
                 return action
         return None
 
-    def _record_event(self, record: Dict[str, Any]) -> None:
+    def _flush_pending_acceptance_records(self) -> None:
+        """Retry committed receipts without reapplying their proof outcomes."""
+        if self._acceptance_receipt_flush_active:
+            return
+        self._acceptance_receipt_flush_active = True
+        try:
+            while self._pending_acceptance_records:
+                record = self._pending_acceptance_records[0]
+                try:
+                    delivered = self._record_event(record)
+                except Exception:
+                    _LOGGER.exception("Accepted proof receipt publication failed")
+                    break
+                if delivered is False:
+                    break
+                # Keep the original commit timestamp and dispatch identity on
+                # retries. Delayed delivery cannot create a later acceptance.
+                self._pending_acceptance_records.pop(0)
+        finally:
+            self._acceptance_receipt_flush_active = False
+
+    def _record_event(self, record: Dict[str, Any]) -> bool:
         """Centralized recorder write — adds session metadata + invokes hook."""
 
         record = dict(record)
@@ -40500,16 +40532,22 @@ class MiniSession:
         )
         if type(isolated_buffer) is list:
             isolated_buffer.append(record)
-            return
+            return True
         recorder = self.recorder
-        if recorder is not None and hasattr(recorder, "record_turn"):
+        has_recorder = recorder is not None and hasattr(recorder, "record_turn")
+        delivered = True
+        if has_recorder:
             try:
                 recorder.record_turn(record)
             except Exception:
+                delivered = False
                 _LOGGER.exception("MiniSession recorder.record_turn raised")
         on_event = self.on_event
         if on_event is not None:
             try:
                 on_event(record)
             except Exception:
+                if not has_recorder:
+                    delivered = False
                 _LOGGER.exception("MiniSession on_event raised")
+        return delivered

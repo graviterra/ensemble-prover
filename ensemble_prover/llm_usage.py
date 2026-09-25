@@ -3216,6 +3216,7 @@ class CostBudgetController:
                     "call_kind": reservation.call_kind,
                     "late_usage": True,
                     "usage_missing": True,
+                    "token_usage_status": "unknown",
                     "missing_provider_target_ids": [clean_target],
                     "reservation_dispatch_ordinal": max(
                         0,
@@ -4496,6 +4497,12 @@ class CostBudgetController:
                 ),
                 "pricing_known": pricing_known,
                 "usage_missing": usage_missing,
+                # Numeric counters remain additive observed totals. A zero
+                # with no receipt is unknown consumption, never a free call.
+                "token_usage_status": (
+                    "partial" if usage_missing and records else
+                    "unknown" if usage_missing else "reported"
+                ),
                 "missing_provider_target_ids": sorted(missing_target_costs),
                 "provider_exposed_target_counts": dict(exposed_target_counts),
                 "provider_observations": observation_details,
@@ -5690,6 +5697,7 @@ class CostBudgetController:
         )
         summary: Dict[str, Any] = {
             **self._valuation_summary(),
+            "token_totals_scope": "provider_reported_only",
             "input_tokens": int(self._input_tokens),
             "output_tokens": int(self._output_tokens),
             "cached_input_tokens": int(self._cached_input_tokens),
@@ -6088,6 +6096,7 @@ def usage_totals_from_clients(
     """Fallback summary for callers without request-scoped controller events."""
 
     totals: Dict[str, Any] = {
+        "token_totals_scope": "provider_reported_only",
         "input_tokens": 0,
         "output_tokens": 0,
         "cached_input_tokens": 0,

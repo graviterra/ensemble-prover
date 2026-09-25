@@ -40,6 +40,10 @@ def subscription_response_validation_record(value: Any) -> dict[str, Any]:
     return record
 
 
+class SubscriptionRequestDeadlineExceeded(TimeoutError):
+    """The host's absolute CLI clock expired; replay cannot resume that work."""
+
+
 class SubscriptionBackendError(RuntimeError):
     """A classified failure from the subscription CLI, without credential logs."""
 
@@ -606,6 +610,12 @@ def classify_llm_exception(
 ) -> LLMErrorClassification:
     """Classify one exception for mini-prover retry and termination policy."""
 
+    if isinstance(exc, SubscriptionRequestDeadlineExceeded):
+        return LLMErrorClassification(
+            kind="subscription_request_deadline_exhausted",
+            failure_reason="llm_retry_deadline_exhausted",
+            retryable=False, terminal=False, message=str(exc),
+        )
     if isinstance(exc, ProviderTransportUnavailable):
         return LLMErrorClassification(
             kind=exc.reason, failure_reason=exc.reason,
@@ -946,6 +956,12 @@ def classify_llm_error_text(error_text: str) -> LLMErrorClassification:
             terminal=False,
             message=text,
         )
+    if "subscriptionrequestdeadlineexceeded" in text:
+        return LLMErrorClassification(
+            kind="subscription_request_deadline_exhausted",
+            failure_reason="llm_retry_deadline_exhausted",
+            retryable=False, terminal=False, message=text,
+        )
     if (
         "llm retry would exceed deadline" in text
         or "llm deadline cannot admit a timed-request retry" in text
@@ -1173,6 +1189,10 @@ def projected_scoped_llm_failure_is_retryable(
 
     normalized_reason = str(reason or "").strip()
     if llm_failure_scope(normalized_reason) != "scoped":
+        return False
+    if str(kind or "").strip() == "subscription_request_deadline_exhausted":
+        # A later scheduler quantum cannot resume a killed CLI generation.
+        # Preserve this distinction through live and saved planner receipts.
         return False
     if normalized_reason in {
         "llm_retry_deadline_exhausted",

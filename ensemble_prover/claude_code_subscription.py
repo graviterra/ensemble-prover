@@ -19,7 +19,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .llm_error_policy import ClaudeCodeBackendError
+from .llm_error_policy import ClaudeCodeBackendError, SubscriptionRequestDeadlineExceeded
 from .llm_usage import (
     emit_usage_callback,
     mark_provider_dispatched,
@@ -38,6 +38,7 @@ from .sampling_controls import is_api_default_temperature_override
 from .subscription_cli import (
     bounded_subscription_transport,
     check_subscription_transport_admission,
+    subscription_request_timeout,
     SubscriptionCLIClient,
     _reject_json_constant,
     _response_schema,
@@ -420,7 +421,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             operation_timeout_override_s=operation_timeout_override_s,
         )
         if timeout is not None and timeout <= 0:
-            raise TimeoutError("Claude Code request deadline expired before dispatch")
+            raise SubscriptionRequestDeadlineExceeded("Claude Code request deadline expired before dispatch")
         self.last_truncated = False
         self.last_raw_response_data = {}
         max_tokens, effort = await self._resolve_request_output_envelope(
@@ -475,10 +476,11 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
         if timeout is None:
             await self.preflight()
         else:
-            await asyncio.wait_for(
-                self.preflight(),
-                timeout=max(0.0, timeout - (time.monotonic() - started)),
-            )
+            async with subscription_request_timeout(
+                max(0.0, timeout - (time.monotonic() - started)),
+                "Claude Code request deadline expired during preflight",
+            ):
+                await self.preflight()
         metadata = {
             "backend": "claude_code_subscription",
             "backend_protocol_version": 1,
@@ -855,24 +857,19 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 None if timeout is None else timeout - (time.monotonic() - started)
             )
             if remaining is not None and remaining <= 0:
-                raise TimeoutError(
+                raise SubscriptionRequestDeadlineExceeded(
                     "Claude Code request deadline expired before dispatch"
                 )
-            try:
-                async with asyncio.timeout(remaining):
-                    authority = await notify_provider_dispatch_observer(
-                        candidate_count=1
-                    )
-            except TimeoutError:
-                raise TimeoutError(
-                    "Claude Code request deadline expired during admission"
-                ) from None
+            async with subscription_request_timeout(
+                remaining, "Claude Code request deadline expired during admission",
+            ):
+                authority = await notify_provider_dispatch_observer(candidate_count=1)
             try:
                 remaining = (
                     None if timeout is None else timeout - (time.monotonic() - started)
                 )
                 if remaining is not None and remaining <= 0:
-                    raise TimeoutError(
+                    raise SubscriptionRequestDeadlineExceeded(
                         "Claude Code request deadline expired during admission"
                     )
                 if self._closed:

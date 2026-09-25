@@ -95,6 +95,8 @@ class AcceptanceGate:
 
     def observe(self, record: Mapping[str, Any], *, now: float) -> bool:
         """Consume only committed proof receipts belonging to this attempt."""
+        if record.get("acceptance_previous_boot"):
+            return False
         if (record.get("phase"), record.get("verdict")) != (
             "session_accepted_proof",
             "accepted_proof_committed",
@@ -649,6 +651,22 @@ def _summary_provider_infrastructure_reason(output_dir: Path) -> str:
     return ""
 
 
+def _record_cutoff_in_attempt_summary(output_dir: Path, cutoff_reason: str) -> None:
+    """Add the scheduler's stop cause after the attempt has finished cleanup."""
+    path = output_dir / "summary.json"
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    if not isinstance(summary, dict) or summary.get("solved") is not False:
+        return
+    summary["sweep_cutoff_reason"] = cutoff_reason
+    if summary.get("failure_reason") in {"user_interrupted", "run_cancelled", ""}:
+        summary["interruption_failure_reason"] = summary["failure_reason"]
+        summary["failure_reason"] = cutoff_reason
+    save_manifest(path, summary)
+
+
 def answer_preparation_dir(output_dir: Path) -> Path:
     resolved = Path(output_dir).resolve()
     return resolved.with_name(resolved.name + ".answer_preparation")
@@ -941,6 +959,18 @@ def run_attempt(
                     cutoff = "startup_liveness_deadline"
                 else:
                     cutoff = gate.cutoff_reason(now=now) or ""
+                if cutoff and not interrupted:
+                    # A committed receipt may arrive after the polling read
+                    # while the deadline is being evaluated. Drain once more
+                    # at the stop boundary and retain its original commit time.
+                    records = tail.read()
+                    now = time.monotonic()
+                    for record in records:
+                        gate.observe(record, now=now)
+                    if startup.expired(now=now, proof_alive=tail.alive):
+                        cutoff = "startup_liveness_deadline"
+                    else:
+                        cutoff = gate.cutoff_reason(now=now) or ""
                 if interrupted or (cutoff and not _summary_solved(output_dir)):
                     break
                 cutoff = ""
@@ -988,6 +1018,8 @@ def run_attempt(
                 now = time.monotonic()
                 for record in records:
                     gate.observe(record, now=now)
+                if cutoff and not interrupted:
+                    _record_cutoff_in_attempt_summary(output_dir, cutoff)
             except (OSError, ValueError) as exc:
                 monitor_error = f"{type(exc).__name__}: {exc}"
         monitor_error = monitor_error or relay.error

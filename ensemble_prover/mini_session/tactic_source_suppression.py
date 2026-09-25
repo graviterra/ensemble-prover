@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from ensemble_prover.mini_finset_reindexer import finset_reindexing_context_key
+from ensemble_prover.mini_tactic_closer import TacticPatternCache
 from ensemble_prover.proof_dossier import helper_decl_name, text_hash
 
 
@@ -67,9 +68,103 @@ def tactic_source_suppression_records(session: Any) -> tuple[dict[str, Any], ...
                     if str(value or "").strip()
                 ],
                 "reason": str(item.get("reason") or "exhausted").strip(),
+                **(
+                    {
+                        "proof": str(item["proof"]),
+                        "target_statement": str(item.get("target_statement") or ""),
+                    }
+                    if item.get("proof") else {}
+                ),
             }
         )
     return tuple(records)
+
+
+def _rejection_context_key(
+    goal_statement: str, preamble: str, helper_blocks: Sequence[str], *,
+    suppress_solution_placeholders: bool = True, opaque_mode: bool = True,
+    allow_official_answer_visibility: bool = False,
+    official_answer_payload_present: bool | None = None,
+) -> str:
+    context = (
+        goal_statement.strip(), preamble, tuple(helper_blocks),
+        suppress_solution_placeholders, opaque_mode,
+        allow_official_answer_visibility, official_answer_payload_present,
+    )
+    return "semantic_rejection:" + text_hash(repr(context))
+
+
+def _rejection_policy(session: Any) -> dict[str, Any]:
+    policy = getattr(session, "conv", None) or getattr(session, "dossier", None)
+    return {
+        "suppress_solution_placeholders": bool(getattr(policy, "suppress_solution_placeholders", True)),
+        "opaque_mode": bool(getattr(policy, "opaque_mode", True)),
+        "allow_official_answer_visibility": bool(getattr(policy, "allow_official_answer_visibility", False)),
+        "official_answer_payload_present": getattr(policy, "official_answer_payload_present", None),
+    }
+
+
+def remember_tactic_rejections(
+    session: Any, *, source_prefix: str, goal_statement: str, preamble: str,
+    helper_blocks: Sequence[str], attempts: Sequence[Mapping[str, Any]],
+) -> None:
+    """Share completed proof rejections without excluding untried tactics."""
+    context_key = _rejection_context_key(
+        goal_statement, preamble, helper_blocks, **_rejection_policy(session),
+    )
+    records = list(tactic_source_suppression_records(session))
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping) or attempt.get("ok"):
+            continue
+        proof = str(attempt.get("proof") or "").strip()
+        if not proof or not str(attempt.get("source") or "").startswith(source_prefix):
+            continue
+        if not TacticPatternCache._failure_cacheable(
+            error_type=str(attempt.get("error_type") or ""),
+            partial_stub_validated=bool(attempt.get("partial_stub_validated")),
+        ):
+            continue
+        if any(record.get("context_key") == context_key and record.get("proof") == proof
+               for record in records):
+            continue
+        records.append({
+            "source_prefix": source_prefix,
+            "context_key": context_key,
+            "proof": proof,
+            "target_statement": goal_statement.strip(),
+            "reason": "semantic_rejection",
+        })
+    setattr(session, SESSION_TACTIC_SOURCE_SUPPRESSION_ATTR, records)
+
+
+def tactic_rejected_proof_records_for_context(
+    session: Any, *, goal_statement: str, preamble: str, helper_blocks: Sequence[str],
+) -> tuple[dict[str, str], ...]:
+    return tactic_rejected_proof_records_from_records(
+        tactic_source_suppression_records(session), goal_statement=goal_statement,
+        preamble=preamble, helper_blocks=helper_blocks, **_rejection_policy(session),
+    )
+
+
+def tactic_rejected_proof_records_from_records(
+    records: Sequence[Mapping[str, Any]], *, goal_statement: str, preamble: str,
+    helper_blocks: Sequence[str], suppress_solution_placeholders: bool = True,
+    opaque_mode: bool = True, allow_official_answer_visibility: bool = False,
+    official_answer_payload_present: bool | None = None,
+) -> tuple[dict[str, str], ...]:
+    context_key = _rejection_context_key(
+        goal_statement, preamble, helper_blocks,
+        suppress_solution_placeholders=suppress_solution_placeholders,
+        opaque_mode=opaque_mode, allow_official_answer_visibility=allow_official_answer_visibility,
+        official_answer_payload_present=official_answer_payload_present,
+    )
+    return tuple(
+        {"proof": record["proof"], "target_statement": record["target_statement"]}
+        for record in records
+        if isinstance(record, Mapping)
+        if record.get("proof") and record.get("context_key") == context_key
+        and record.get("target_statement") == goal_statement.strip()
+    )
 
 
 def mark_tactic_source_prefix_exhausted(
@@ -154,6 +249,7 @@ def source_prefix_exhausted_in_records(
     return any(
         str(record.get("source_prefix") or "") == prefix
         and str(record.get("context_key") or "") == context_key
+        and not record.get("proof")
         for record in list(records or ())
         if isinstance(record, Mapping)
     )
@@ -206,8 +302,11 @@ __all__ = [
     "excluded_tactic_source_prefixes_from_records",
     "helper_fingerprints",
     "mark_tactic_source_prefix_exhausted",
+    "remember_tactic_rejections",
     "source_prefix_exhausted_in_records",
     "tactic_source_context_key",
+    "tactic_rejected_proof_records_for_context",
+    "tactic_rejected_proof_records_from_records",
     "tactic_source_prefix_exhausted_for_context",
     "tactic_source_suppression_records",
 ]

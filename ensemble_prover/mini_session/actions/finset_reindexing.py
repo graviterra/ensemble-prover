@@ -31,7 +31,11 @@ from ensemble_prover.tactic_attempt_telemetry import (
 )
 
 from ..action import MiniOutcome
-from ..tactic_source_suppression import tactic_source_context_key
+from ..tactic_source_suppression import (
+    remember_tactic_rejections,
+    tactic_rejected_proof_records_for_context,
+    tactic_source_context_key,
+)
 
 
 class FinsetReindexingAction:
@@ -210,6 +214,13 @@ class FinsetReindexingAction:
                     ),
                 },
                 source_prefixes=("finset_reindexing",),
+                suppressed_proofs=tuple(
+                    record["proof"]
+                    for record in tactic_rejected_proof_records_for_context(
+                        session, goal_statement=goal, preamble=residual_preamble,
+                        helper_blocks=residual_helpers,
+                    )
+                ),
                 suppress_solution_placeholders=bool(
                     getattr(session.conv, "suppress_solution_placeholders", True)
                 )
@@ -317,6 +328,11 @@ class FinsetReindexingAction:
             )
 
         attempts = list(getattr(result, "attempts", []) or [])
+        remember_tactic_rejections(
+            session, source_prefix=self.id, goal_statement=goal,
+            preamble=residual_preamble, helper_blocks=residual_helpers,
+            attempts=attempts,
+        )
         diagnostic_goal_count = sum(
             len(list(attempt.get("remaining_goals") or ()))
             for attempt in attempts

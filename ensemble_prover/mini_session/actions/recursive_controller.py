@@ -1014,6 +1014,15 @@ class RecursiveControllerAction:
                 persist_cutpoint()
 
         from ..durable_recursive_child import bind_controller_checkpoint_callback
+        from ..tactic_source_suppression import tactic_source_suppression_records
+
+        rejection_records = tactic_source_suppression_records(session)
+        if rejection_records:
+            from ensemble_prover.mini_recursive import MiniRecursiveConfig
+            cfg = replace(
+                cfg or MiniRecursiveConfig(),
+                tactic_source_suppression_records=rejection_records,
+            )
 
         attempt_coro = run_mini_recursive_attempt(
             theorem_name=session.problem.theorem_name,

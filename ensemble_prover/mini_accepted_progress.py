@@ -4,17 +4,28 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import math
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 from .proof_dossier import canonical_dossier_statement_key, helper_decl_statement, text_hash
 
 _RESTORED_HELPER_PHASE_TOKENS = ("cache", "seed", "import", "restore")
+_LOGGER = logging.getLogger(__name__)
 _SCOPED_PROPOSITION_SYNTAX = re.compile(
     r"[,;∀∃λ↦∑∏⨆⨅$→↔]|=>|->|<\||\|>|"
     r"\b(?:forall|exists|fun|let|match|if|then|else|do|by|show|have|suffices|from)\b"
 )
+
+
+def _acceptance_boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
 
 
 def helper_phase_is_restored(phase: str) -> bool:
@@ -130,7 +141,9 @@ def committed_acceptance_records(
     *,
     prior_formal_evidence: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    """Read effective proof authority only after the enclosing apply commits.
+    """Build receipts from effective proof authority before apply commits.
+
+    The caller publishes these staged records only after its success ledger.
 
     Helper additions must still exist in the accepted dossier. Cache and import
     actions restore previously known results and do not earn sweep milestones.
@@ -146,7 +159,7 @@ def committed_acceptance_records(
     records: dict[str, dict[str, Any]] = {}
     committed_at = time.monotonic()
 
-    def add(statement: str, kind: str, helper_name: str = "") -> None:
+    def add(statement: str, kind: str, source_hash: str, helper_name: str = "") -> None:
         identity = accepted_statement_identity(statement)
         if identity:
             records[identity] = {
@@ -154,7 +167,9 @@ def committed_acceptance_records(
                 "verdict": "accepted_proof_committed",
                 "acceptance_identity": identity,
                 "acceptance_monotonic_s": committed_at,
+                "acceptance_boot_id": _acceptance_boot_id(),
                 "acceptance_kind": kind,
+                "acceptance_source_hash": source_hash,
                 "helper_name": helper_name,
                 "action_id": outcome.action_id,
                 "action_dispatch_id": str(
@@ -181,7 +196,7 @@ def committed_acceptance_records(
         source = str(getattr(helper, "source", "") or "")
         if not source or getattr(helper, "source_hash", "") != text_hash(source):
             continue
-        add(helper_decl_statement(source), "helper", str(name))
+        add(helper_decl_statement(source), "helper", text_hash(source), str(name))
 
     metadata = outcome.metadata or {}
     certificate = getattr(dossier, "root_proof_certificate", None)
@@ -191,5 +206,82 @@ def committed_acceptance_records(
         and isinstance(certificate, dict)
         and not metadata.get("hydrated_from_existing_root_finalization")
     ):
-        add(str(certificate.get("root_statement") or dossier.root_statement), "root")
+        add(str(certificate.get("root_statement") or dossier.root_statement),
+            "root", str(certificate.get("proof_hash") or ""))
     return list(records.values())
+
+
+def validate_restored_acceptance_records(session: Any, *, checkpoint_monotonic: float) -> None:
+    """Bind queued delivery to the freshly checked dossier before publication."""
+    records = getattr(session, "_pending_acceptance_records", [])
+    if not isinstance(records, list):
+        raise ValueError("Invalid pending acceptance records")
+    retained = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Invalid pending acceptance record")
+        timestamp = record.get("acceptance_monotonic_s")
+        restored = record.get("acceptance_restored", False)
+        if not isinstance(restored, bool):
+            raise ValueError("Invalid acceptance receipt restoration flag")
+        boot_id = record.get("acceptance_boot_id", "")
+        if not isinstance(boot_id, str):
+            raise ValueError("Invalid acceptance receipt boot identity")
+        try:
+            invalid_timestamp = (
+                isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
+                or not math.isfinite(timestamp) or timestamp <= 0
+                or (not restored and timestamp > checkpoint_monotonic)
+            )
+        except OverflowError:
+            invalid_timestamp = True
+        if invalid_timestamp:
+            raise ValueError("Invalid acceptance receipt timestamp")
+        if (record.get("phase"), record.get("verdict")) != (
+                "session_accepted_proof", "accepted_proof_committed"):
+            raise ValueError("Invalid acceptance receipt event")
+        if any(not isinstance(record.get(key), str) for key in (
+                "helper_name", "action_dispatch_id", "action_id")):
+            raise ValueError("Invalid acceptance receipt identity fields")
+        if any(not isinstance(record.get(key), str)
+               or not re.fullmatch(pattern, record[key])
+               for key, pattern in (("acceptance_identity", r"[0-9a-f]{64}"),
+                                    ("acceptance_source_hash", r"[0-9a-f]{16}"))):
+            raise ValueError("Invalid acceptance receipt source identity")
+        kind = record.get("acceptance_kind")
+        if kind == "helper":
+            helper = session.dossier.verified_helpers.get(record.get("helper_name"))
+            source = str(getattr(helper, "source", "") or "")
+            if (source and getattr(helper, "source_hash", "") != text_hash(source)):
+                raise ValueError("Acceptance receipt has no checked helper")
+            if (not source or record["acceptance_source_hash"] != text_hash(source)
+                    or helper_restates_restored_knowledge(helper, session.dossier.verified_helpers)):
+                _LOGGER.warning("Retired pending acceptance receipt after helper source changed")
+                continue
+            statement, source_hash = helper_decl_statement(source), text_hash(source)
+        elif kind == "root":
+            source = str(session.dossier.final_proof or "")
+            if (not source or not session.dossier.root_proof_certificate
+                    or record["acceptance_source_hash"] != text_hash(source)):
+                _LOGGER.warning("Retired pending acceptance receipt after root proof changed")
+                continue
+            statement, source_hash = session.dossier.root_statement, text_hash(source)
+        else:
+            raise ValueError("Invalid acceptance receipt kind")
+        if (record.get("acceptance_identity") != accepted_statement_identity(statement)
+                or record.get("acceptance_source_hash") != source_hash):
+            raise ValueError("Acceptance receipt does not match checked proof source")
+        dispatch_id = record.get("action_dispatch_id")
+        action_id = record.get("action_id")
+        if dispatch_id:
+            outcome = session._applied_action_dispatch_outcomes.get(dispatch_id)
+            if (dispatch_id not in session._applied_action_dispatch_ids
+                    or getattr(outcome, "action_id", None) != action_id):
+                raise ValueError("Acceptance receipt has no committed action")
+        # A parent/child restore in this attempt keeps its original milestone.
+        # A different boot may reuse its monotonic timestamp, which cannot be
+        # credited in that new attempt. Missing clock identity fails closed.
+        record["acceptance_restored"] = True
+        record["acceptance_previous_boot"] = not boot_id or boot_id != _acceptance_boot_id()
+        retained.append(record)
+    session._pending_acceptance_records = retained

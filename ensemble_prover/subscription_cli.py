@@ -10,10 +10,14 @@ import math
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Callable
 
 from .config import RoleConfig
-from .llm_error_policy import SubscriptionBackendError, ProviderTransportUnavailable
+from .llm_error_policy import (
+    SubscriptionBackendError, ProviderTransportUnavailable,
+    SubscriptionRequestDeadlineExceeded,
+)
 from .models import OpenAICompatClient, provider_serving_fingerprint
 from .provider_health import ProviderLaneHealthRegistry
 from .subprocess_cleanup import (
@@ -51,6 +55,19 @@ string. The requested output token count is a target for your response.
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"Non-JSON numeric constant: {value}")
+
+
+@asynccontextmanager
+async def subscription_request_timeout(timeout: float | None, message: str):
+    """Distinguish our absolute clock from a transport's own TimeoutError."""
+    clock = asyncio.timeout(timeout)
+    try:
+        async with clock:
+            yield
+    except TimeoutError as exc:
+        if clock.expired():
+            raise SubscriptionRequestDeadlineExceeded(message) from exc
+        raise
 
 
 def bounded_subscription_transport(function):
@@ -207,7 +224,9 @@ class SubscriptionCLIClient:
                 f"{self.backend_name} client is closed", kind="capability"
             )
         stop_at = None if timeout is None else time.monotonic() + timeout
-        async with asyncio.timeout(timeout):
+        async with subscription_request_timeout(
+            timeout, f"{self.backend_name} request deadline expired during process startup",
+        ):
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=cwd,
@@ -277,7 +296,7 @@ class SubscriptionCLIClient:
                     f"{self.backend_name} client is closed", kind="capability"
                 )
             if stop_at is not None and time.monotonic() >= stop_at:
-                raise TimeoutError(
+                raise SubscriptionRequestDeadlineExceeded(
                     f"{self.backend_name} request deadline expired during process startup"
                 )
             if on_started is not None:
@@ -299,7 +318,9 @@ class SubscriptionCLIClient:
                     return_when=asyncio.FIRST_EXCEPTION,
                 )
                 if not done:
-                    raise TimeoutError(f"{self.backend_name} request timed out")
+                    raise SubscriptionRequestDeadlineExceeded(
+                        f"{self.backend_name} request deadline expired during generation"
+                    )
                 for task in done:
                     task.result()
             return tasks[1].result(), tasks[2].result(), tasks[3].result()

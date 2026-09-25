@@ -9,10 +9,12 @@ without allowing a late or replayed request to publish twice.
 from __future__ import annotations
 
 import asyncio
+import math
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Mapping
 
 from ensemble_prover.llm_error_policy import ProviderTransportUnavailable
@@ -103,6 +105,7 @@ class PlannerJobResult:
     identity: PlannerJobIdentity
     value: Any = None
     exception: BaseException | None = None
+    elapsed_s: float | None = None
 
 
 def planner_result_to_record(result: PlannerJobResult) -> dict[str, Any]:
@@ -115,16 +118,30 @@ def planner_result_to_record(result: PlannerJobResult) -> dict[str, Any]:
     for name in ("active_target_statement_keys", "helper_evidence_fingerprints"):
         identity[name] = list(identity[name])
     return clone_json_value({"schema_version": 1, "identity": identity,
-                             "value": result.value, "error": error})
+                             "value": result.value, "error": error,
+                             "elapsed_s": result.elapsed_s})
 
 
 def planner_result_from_record(record: dict[str, Any]) -> PlannerJobResult:
     from ensemble_prover.state_data import clone_json_value
     from dataclasses import fields
     data = clone_json_value(record)
-    if (type(data) is not dict or set(data) != {"schema_version", "identity", "value", "error"}
+    required = {"schema_version", "identity", "value", "error"}
+    if (type(data) is not dict or not required <= set(data)
+            or set(data) - required - {"elapsed_s"}
             or type(data["schema_version"]) is not int or data["schema_version"] != 1):
         raise ValueError("Invalid durable planner receipt")
+    elapsed_s = data.get("elapsed_s")
+    if elapsed_s is not None:
+        try:
+            valid_duration = (
+                type(elapsed_s) in (float, int)
+                and math.isfinite(elapsed_s) and elapsed_s >= 0
+            )
+        except OverflowError:
+            valid_duration = False
+        if not valid_duration:
+            raise ValueError("Invalid durable planner duration")
     identity = data["identity"]
     if type(identity) is not dict or set(identity) != {item.name for item in fields(PlannerJobIdentity)}:
         raise ValueError("Invalid durable planner identity")
@@ -145,7 +162,7 @@ def planner_result_from_record(record: dict[str, Any]) -> PlannerJobResult:
         error = decode_planner_error(data["error"])
         if data["value"] is not None:
             raise ValueError("Durable planner receipt has both value and error")
-    return PlannerJobResult(PlannerJobIdentity(**identity), data["value"], error)
+    return PlannerJobResult(PlannerJobIdentity(**identity), data["value"], error, elapsed_s)
 
 
 class PlannerJobYield(BaseException):
@@ -289,6 +306,7 @@ class PlannerJobBroker:
         launch: PlannerJobLaunch,
     ) -> None:
         owner_task = asyncio.current_task()
+        started = time.monotonic()
         exposure = ProviderDispatchExposureTracker()
         result: PlannerJobResult | None = None
         try:
@@ -329,6 +347,8 @@ class PlannerJobBroker:
                 value=value,
             )
         finally:
+            if result is not None:
+                result = replace(result, elapsed_s=max(0.0, time.monotonic() - started))
             if result is not None and result.exception is not None:
                 # The callback can finish after its action quantum, and a
                 # generic transport error need not carry dispatch metadata.

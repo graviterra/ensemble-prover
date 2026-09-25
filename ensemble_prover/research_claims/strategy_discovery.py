@@ -119,10 +119,13 @@ Check both exact contexts. Return applicable=false if uncertain. A held A can
 restrict B only in the B-implies-A direction. This is allocation advice, never
 a Lean implication certificate. Prove equivalence with two explicit directions.
 
-Complete an alternative by reporting actual work, including unsuccessful work:
+Complete an assigned investigation by reporting actual work, including unsuccessful work:
 {"action":"report_investigation","method":"distinct method","derivation":"complete argument or executed checks",
  "first_uncertain_inference":"exact next step","evidence_artifact_ids":[],"remaining_gap":"what is open"}
-An independent reviewer uses {"action":"alternative_review","substantive":true,"rationale":"..."}
+An ordinary research report is saved and returned as untrusted advice. It grants
+no proof authority or exploration credit. For an assigned alternative (with
+alternative_for in the job context), an independent reviewer uses
+{"action":"alternative_review","substantive":true,"rationale":"..."}
 only when the report actually investigates a different approach with a concrete
 derivation/check and precise gap. A promised plan or renamed method earns no
 renewal. This assessment grants exploration credit, not mathematical proof.
@@ -309,9 +312,9 @@ class StrategyIntegration:
         if kind == "research_reorientation":
             return self.research.apply_reorientation(job, action)
         if kind == "report_investigation":
-            if job["role"] != "research" or not job.get("alternative_for"):
+            if job["role"] != "research":
                 raise ValueError(
-                    "report this work from an assigned alternative investigation"
+                    "report this work from an assigned research investigation"
                 )
             report = {
                 key: text(action[key], key)
@@ -327,9 +330,28 @@ class StrategyIntegration:
             report["evidence_artifact_ids"] = action["evidence_artifact_ids"]
             aid = self.store.put_artifact(
                 json_text(report).encode(),
-                name="complete-alternative-investigation.json",
+                name="complete-investigation.json",
             )
             with self.store.atomic() if not self.store._applying else nullcontext():
+                if not job.get("alternative_for"):
+                    job.update(status="finished", investigation_artifact=aid)
+                    self.store.save_job(job)
+                    self.loop._notify(
+                        job["parent_job"],
+                        {"child_result": {
+                            "program_id": job["job_id"],
+                            "investigation_artifact": aid,
+                            "conclusion": report["remaining_gap"],
+                            "kernel_verified": False,
+                        }},
+                        requires_response=True,
+                    )
+                    return {
+                        "status": "program_finished",
+                        "investigation_artifact": aid,
+                        "kernel_verified": False,
+                        "root_proved": False,
+                    }
                 review = self.controller.request_review(
                     job["alternative_for"],
                     scope="allocation_exhausted",
