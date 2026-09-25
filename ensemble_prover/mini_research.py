@@ -80,6 +80,15 @@ def _hash(value: Any) -> str:
     return hashlib.sha256(_json(value).encode()).hexdigest()
 
 
+def research_advice_identity(guidance: Any) -> str:
+    """Substantive advice identity independent of delivery/job identifiers."""
+    if not isinstance(guidance, dict) or not isinstance(guidance.get("action"), dict):
+        return ""
+    return _hash({"target": guidance.get("target_statement"),
+                  "context": guidance.get("target_context_binding"),
+                  "action": guidance["action"]})
+
+
 def _event(session: Any, verdict: str, **details: Any) -> None:
     record = getattr(session, "_record_event", None)
     if callable(record):
@@ -169,6 +178,7 @@ class NativeResearchCoordinator:
         self.guidance_by_target: dict[str, dict[str, Any]] = {}
         self.pending_objections: list[dict[str, Any]] = []
         self._session = None
+        self._pending: dict[str, Any] | None = None
         self.pin = {
             "theorem_name": str(getattr(problem, "theorem_name", "")),
             "statement": str(getattr(problem, "statement_type", "")),
@@ -395,7 +405,8 @@ class NativeResearchCoordinator:
                    requests_since_audit=state["requests_since_audit"],
                    requests_since_verified_progress=state["requests_since_verified_progress"])
 
-    async def boundary(self, session: Any, outcome: Any = None, *, frontier_exhausted: bool = False) -> bool:
+    async def boundary(self, session: Any, outcome: Any = None, *, frontier_exhausted: bool = False,
+                       background: bool = False) -> bool:
         if not self.active or not _allowed(session):
             return False
         # A single run owner services explicit child requests at their own
@@ -403,7 +414,17 @@ class NativeResearchCoordinator:
         async with self.lock:
             if not _allowed(session):
                 return False
-            self._session = session
+            if self._pending is None:
+                self._session = session
+            settled = False
+            if self.has_pending(session):
+                try:
+                    settled = await self._settle_pending(session, wait=frontier_exhausted)
+                except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                    if self._pending is not None:
+                        self._pending["settlement_failed"] = True
+                    _event(session, "research_settlement_deferred", error_type=type(exc).__name__)
+                    return False
             try:
                 state = self._state(session)
             except ValueError as exc:
@@ -415,7 +436,7 @@ class NativeResearchCoordinator:
                 except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                     _event(session, "research_unavailable", error_type=type(exc).__name__)
                     return False
-            delivery_changed = self._deliver(session)
+            delivery_changed = self._deliver(session) or settled
             try:
                 self._account_proof_work(session, state, outcome)
             except ValueError as exc:
@@ -425,6 +446,10 @@ class NativeResearchCoordinator:
             objections = self._objections_for(getattr(session, "conv", None))
             if objections:
                 self.pending_objections.extend(item for item in objections if item not in self.pending_objections)
+            if self._pending is not None:
+                # One research ledger owns one funded round. Proof and child
+                # boundaries may account their work without stealing its owner.
+                return delivery_changed
             if getattr(session, "scope", "problem") == "subgoal" and not (objections or state.get("grant")):
                 return delivery_changed
             reason = (
@@ -443,7 +468,12 @@ class NativeResearchCoordinator:
             state["requests_since_audit"] = 0
             self.last_research_dispatches = self.dispatches
             try:
-                return await self._investigate(session, reason)
+                if background:
+                    changed = await self._investigate(session, reason, background=True)
+                    if frontier_exhausted and self.has_pending(session):
+                        changed = await self._settle_pending(session, wait=True) or changed
+                    return changed or delivery_changed
+                return await self._investigate(session, reason) or delivery_changed
             except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                 # A failed optional research capability is not terminal search
                 # authority. Keep the already paid grant for conservative resume.
@@ -579,8 +609,8 @@ class NativeResearchCoordinator:
             job["native_target_claim_id"] = claim_id
             self.store.save_job(job)
 
-    async def _investigate(self, session: Any, reason: str) -> bool:
-        from .mini_research_budget import select_donor, debit_donor, charge_elapsed
+    async def _investigate(self, session: Any, reason: str, *, background: bool = False) -> bool:
+        from .mini_research_budget import select_donor, debit_donor
         state = self._state(session)
         grant = state.get("grant")
         donor = select_donor(session)
@@ -644,6 +674,8 @@ class NativeResearchCoordinator:
         timeout = min(timeout, _native_quantum_seconds(donor))
         grant["expires_at"] = time.time() + timeout
         grant["seconds"] = timeout
+        grant["background"] = background
+        grant["governor_elapsed_at_start"] = float(getattr(session, "run_governor_elapsed_s", 0.0))
         state["grant"] = grant
         # The budget debit and unique grant id precede every external request.
         await _checkpoint(session)
@@ -674,37 +706,114 @@ class NativeResearchCoordinator:
         state["rounds"] += 1
         _event(session, "research_started", reason=reason, grant_id=grant["id"],
                requests=grant["requests"], timeout_s=timeout, ledger=str(self.store.directory))
-        start = time.monotonic()
-        token = _RESEARCH.set(True)
-        result: dict[str, Any] = {"reason": "parent_deadline_exhausted", "paid_dispatches": 0}
+        remaining = grant["expires_at"] - time.time()
+        parent_remaining = getattr(session, "_run_governor_remaining_s", lambda: None)()
+        if parent_remaining is not None:
+            remaining = min(remaining, parent_remaining)
+        permitted = _allowed(session)
+        pending: dict[str, Any] = {
+            "session": session, "donor": donor, "grant": grant, "elapsed": 0.0,
+        }
+
+        async def advance() -> dict[str, Any]:
+            start = time.monotonic()
+            token = _RESEARCH.set(True)
+            try:
+                if remaining > 0 and permitted:
+                    return await self.loop.advance_native(
+                        max_requests=grant["requests"], timeout_s=remaining,
+                        target_claim_id=claim_id,
+                    )
+                return {"reason": "parent_deadline_exhausted", "paid_dispatches": 0}
+            finally:
+                pending["elapsed"] = max(0.0, time.monotonic() - start)
+                _RESEARCH.reset(token)
+
+        pending["task"] = asyncio.create_task(advance(), name="native-research-" + grant["id"])
+        self._pending = pending
+        if background:
+            _event(session, "research_background_pending", grant_id=grant["id"])
+            return False
         try:
-            remaining = grant["expires_at"] - time.time()
-            parent_remaining = getattr(session, "_run_governor_remaining_s", lambda: None)()
-            if parent_remaining is not None:
-                remaining = min(remaining, parent_remaining)
-            if remaining > 0 and _allowed(session):
-                result = await self.loop.advance_native(
-                    max_requests=grant["requests"], timeout_s=remaining,
-                    target_claim_id=claim_id,
-                )
+            return await self._settle_pending(session, wait=True)
+        except asyncio.CancelledError:
+            # Direct/synchronous callers own this generation themselves.
+            # Preserve their historical cancellation accounting contract.
+            pending["task"].cancel()
+            await asyncio.gather(pending["task"], return_exceptions=True)
+            try:
+                await self._settle_pending(session, wait=True, deliver=False)
+            except asyncio.CancelledError:
+                pass
+            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                _event(session, "research_settlement_deferred", error_type=type(exc).__name__)
+            raise
+
+    def has_pending(self, session: Any) -> bool:
+        return self._pending is not None and self._pending["session"] is session
+
+    async def wait_for_change(self, session: Any, *, planner: Any = None) -> None:
+        """Wake for either funded worker without cancelling the other one."""
+        if not self.has_pending(session):
+            return
+        remaining = getattr(session, "_run_governor_remaining_s", lambda: None)()
+        if remaining is not None and remaining <= 0:
+            return
+        planner_wait = asyncio.create_task(planner.wait_for_change()) if planner is not None else None
+        tasks = [self._pending["task"]]
+        if planner_wait is not None:
+            tasks.append(planner_wait)
+        try:
+            await asyncio.wait(tasks, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            _RESEARCH.reset(token)
-            elapsed = time.monotonic() - start
-            charge_elapsed(session, donor, elapsed)
-            grant["elapsed_accounted"] = elapsed
-            self._reconcile(session, grant, elapsed_s=elapsed)
-            accrue = getattr(session, "_accrue_run_governor_elapsed", None)
-            if callable(accrue):
-                accrue()
-            state["grant"] = None
-            state["paid_actions"] = 0
-            self._settle_answered_objections(session, grant)
-            self._deliver(session)
-            await _checkpoint(session)
+            if planner_wait is not None:
+                planner_wait.cancel()
+                await asyncio.gather(planner_wait, return_exceptions=True)
+
+    async def _settle_pending(self, session: Any, *, wait: bool = False,
+                              deliver: bool = True) -> bool:
+        """Apply a completed ledger round only at its session's settled boundary."""
+        from .mini_research_budget import charge_elapsed
+
+        if not self.has_pending(session):
+            return False
+        pending = self._pending
+        task = pending["task"]
+        if not task.done() and not wait:
+            return False
+        result: dict[str, Any] = {"reason": "research_cancelled", "paid_dispatches": 0}
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done() or asyncio.current_task().cancelling():
+                raise
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            _event(session, "research_unavailable", error_type=type(exc).__name__)
+            result = {"reason": "research_unavailable", "paid_dispatches": 0}
+        finally:
+            if task.done():
+                # This is actual provider/ledger lifetime, not the time until a
+                # later proof action happens to yield a scheduler boundary.
+                elapsed = pending["elapsed"]
+                grant = pending["grant"]
+                state = self._state(session)
+                uncharged = max(0.0, elapsed - float(grant.get("elapsed_accounted", 0.0)))
+                charge_elapsed(session, pending["donor"], uncharged)
+                grant["elapsed_accounted"] = elapsed
+                self._reconcile(session, grant, elapsed_s=elapsed)
+                accrue = getattr(session, "_accrue_run_governor_elapsed", None)
+                if callable(accrue):
+                    accrue()
+                state["grant"] = None
+                self._settle_answered_objections(session, grant)
+                if deliver and _allowed(session):
+                    self._deliver(session)
+                self._pending = None
+                await _checkpoint(session)
         research_outcome = result.get("reason", "unknown")
         if research_outcome in {"quantum_timeout", "deadline_exhausted", "parent_deadline_exhausted"}:
             _event(session, "research_timed_out", reason=research_outcome,
-                   timeout_s=timeout, paid_dispatches=result.get("paid_dispatches", 0),
+                   timeout_s=grant["seconds"], paid_dispatches=result.get("paid_dispatches", 0),
                    guidance_available=bool(self.guidance))
         _event(session, "research_round_complete", reason=research_outcome,
                research_round=state["rounds"], research_elapsed_s=elapsed,
@@ -713,6 +822,22 @@ class NativeResearchCoordinator:
         _event(session, "proof_resumed", research_round=state["rounds"],
                research_outcome=research_outcome, guidance_available=bool(self.guidance))
         return self._guidance_for(session.conv) is not None
+
+    async def release_session(self, session: Any) -> None:
+        """Fence and reap this session's research before it leaves ownership."""
+        async with self.lock:
+            if not self.has_pending(session):
+                return
+            task = self._pending["task"]
+            if not task.done():
+                task.cancel()
+            try:
+                await self._settle_pending(session, wait=True, deliver=False)
+            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                # Its durable grant and paid research receipts remain the
+                # recovery source. Optional ledger storage cannot revoke a
+                # root already accepted by the proof session.
+                _event(session, "research_settlement_deferred", error_type=type(exc).__name__)
 
     async def _ensure_loop(self, session: Any, client: Any, role: str) -> None:
         from .mini_research_budget import clone_research_client
@@ -752,7 +877,12 @@ class NativeResearchCoordinator:
                     budget = session.budgets[grant["action_id"]]
                     budget.total_seconds += uncharged
                     budget.unproductive_seconds += uncharged
-                    session.run_governor_elapsed_s = float(getattr(session, "run_governor_elapsed_s", 0)) + uncharged
+                    current_elapsed = float(getattr(session, "run_governor_elapsed_s", 0))
+                    overlap = (
+                        max(0.0, current_elapsed - grant["governor_elapsed_at_start"])
+                        if grant.get("background") and "governor_elapsed_at_start" in grant else 0.0
+                    )
+                    session.run_governor_elapsed_s = current_elapsed + max(0.0, uncharged - overlap)
                     grant["elapsed_accounted"] = elapsed
                 saved.update(used=used, closed=True)
                 run.update(max_requests=run["requests_used"], status="paused")
@@ -766,7 +896,7 @@ class NativeResearchCoordinator:
             # Bind advice to the question at dispatch, including paid responses
             # replayed after restart under a different session boundary.
             run = self.store.run_record()
-            grant = self._state(self._session).get("grant")
+            grant = self._pending["grant"] if self._pending is not None else None
             target = grant.get("target_statement") if grant is not None else None
             context = grant.get("target_context_binding") if grant is not None else None
             run.setdefault("native_job_targets", {})[event["job_id"]] = target or self._target(self._session.conv)
@@ -830,6 +960,15 @@ class NativeResearchCoordinator:
             try:
                 self.prepare(conv, getattr(session, "dossier", None))
                 state = session.native_research_state
+                # Bind prompt novelty to substantive content and the exact
+                # target context, never to a newly assigned job/artifact id.
+                advice_key = research_advice_identity(guidance)
+                delivered = state.setdefault("proof_advice_delivered", [])
+                if advice_key and advice_key not in delivered:
+                    release = getattr(session, "_release_research_advice_defers", None)
+                    if callable(release):
+                        release(guidance)
+                    delivered.append(advice_key)
                 artifact = guidance["artifact_id"]
                 if state.get("replan_delivered") != artifact:
                     planner = next((a for a in getattr(session, "actions", [])
@@ -871,6 +1010,8 @@ class NativeResearchCoordinator:
         return NATIVE_TOOLS
 
     async def close(self) -> None:
+        if self._pending is not None:
+            await self.release_session(self._pending["session"])
         if self.loop is not None:
             await self.loop._retire_clients(set(), closing=True, preserve_failure=True)
         if self.store is not None:
@@ -881,7 +1022,14 @@ class NativeResearchCoordinator:
 
 async def maybe_research(session: Any, outcome: Any = None, *, frontier_exhausted: bool = False) -> bool:
     owner = current_native_research()
-    return await owner.boundary(session, outcome, frontier_exhausted=frontier_exhausted) if owner is not None else False
+    return await owner.boundary(session, outcome, frontier_exhausted=frontier_exhausted,
+                                background=True) if owner is not None else False
+
+
+def pending_native_research(session: Any) -> bool:
+    owner = current_native_research()
+    return bool(owner is not None and owner.has_pending(session)
+                and not owner._pending.get("settlement_failed"))
 
 
 def prepare_native_conversation(conv: Any, dossier: Any = None) -> list[dict[str, Any]]:

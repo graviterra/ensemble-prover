@@ -2363,7 +2363,7 @@ def _activated_recovered_finalizer_failure_metadata(
         payload.get("recovered_finalizer_provider_call_quantum_exhausted")
     )
     cooperative_provider_yield = bool(
-        kind == "llm_provider_quantum_exhausted"
+        kind in {"provider_call_quantum_yielded", "llm_provider_quantum_exhausted"}
         or (
             kind == "provider_dispatch_attempt_limit_exhausted"
             and authenticated_quantum_yield
@@ -11419,6 +11419,7 @@ class ConversationTurnAction:
         if bool(metadata.get("provider_call_quantum_exhausted")) and str(
             metadata.get("llm_failure_kind") or ""
         ).strip() in {
+            "provider_call_quantum_yielded",
             "llm_provider_quantum_exhausted",
             "provider_dispatch_attempt_limit_exhausted",
         }:
@@ -11647,7 +11648,7 @@ class ConversationTurnAction:
             if callable(formal_evidence_fn)
             else ()
         )
-        return {
+        portfolio = {
             "schema_version": 1,
             "role": self.role,
             "model_identity": model_identity,
@@ -11669,13 +11670,36 @@ class ConversationTurnAction:
                 ).encode("utf-8")
             ).hexdigest(),
         }
+        # Delivered advice changes the actual next prompt. It can admit a new
+        # attempt under existing budgets without claiming formal progress.
+        guidance = getattr(session, "native_research_state", {}).get("guidance")
+        if isinstance(guidance, dict) and guidance.get("artifact_id"):
+            from ...mini_research import research_advice_identity
+
+            target = str(getattr(session.conv, "goal_statement", "") or "").strip()
+            if str(guidance.get("target_statement") or "").strip() == target:
+                identity = research_advice_identity(guidance)
+                if identity:
+                    portfolio["native_research_advice"] = identity
+        return portfolio
 
     def is_applicable(self, session: Any) -> bool:
         if session.conv is None or session.lean is None:
             return False
+        from ...mini_research_budget import pending_research_reservation
+
+        reserved_dispatches, reserved_seconds = pending_research_reservation(session, self.id)
+        budget = getattr(session, "budgets", {}).get(self.id)
+        if budget is not None and reserved_seconds and (
+            (budget.max_total_seconds > 0
+             and budget.total_seconds + reserved_seconds >= budget.max_total_seconds)
+            or (budget.max_aggregate_seconds > 0
+                and budget.unproductive_seconds + reserved_seconds >= budget.max_aggregate_seconds)
+        ):
+            return False
         if (
             self.provider_dispatch_limit > 0
-            and max(
+            and reserved_dispatches + max(
                 int(
                     getattr(
                         session,
@@ -13232,6 +13256,9 @@ class ConversationTurnAction:
         )
         temperature_metadata = temperature_decision.metadata(client=client)
         if self.provider_dispatch_limit > 0:
+            from ...mini_research_budget import pending_research_reservation
+
+            reserved_dispatches, _ = pending_research_reservation(session, self.id)
             provider_dispatches_used = max(
                 int(
                     getattr(
@@ -13252,7 +13279,7 @@ class ConversationTurnAction:
             )
             remaining_provider_dispatches = max(
                 0,
-                self.provider_dispatch_limit - provider_dispatches_used,
+                self.provider_dispatch_limit - provider_dispatches_used - reserved_dispatches,
             )
             configured_dispatches = max(
                 0,
@@ -15651,6 +15678,7 @@ class ConversationTurnAction:
                 )
                 and llm_failure_kind
                 in {
+                    "provider_call_quantum_yielded",
                     "llm_provider_quantum_exhausted",
                     "provider_dispatch_attempt_limit_exhausted",
                 }
@@ -15661,7 +15689,9 @@ class ConversationTurnAction:
             )
             completed_provider_quantum_yield = bool(
                 cooperative_provider_yield and provider_calls_completed > 0
-                and loop_result.llm_error == "llm_provider_quantum_exhausted"
+                and loop_result.llm_error in {
+                    "provider_call_quantum_yielded", "llm_provider_quantum_exhausted",
+                }
             )
             provider_yield_reason = (
                 "completed_provider_call_quantum"

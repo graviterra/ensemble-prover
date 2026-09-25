@@ -248,6 +248,13 @@ def validate_restored_acceptance_records(session: Any, *, checkpoint_monotonic: 
                for key, pattern in (("acceptance_identity", r"[0-9a-f]{64}"),
                                     ("acceptance_source_hash", r"[0-9a-f]{16}"))):
             raise ValueError("Invalid acceptance receipt source identity")
+        if any(key in record for key in (
+                "acceptance_control_identity", "acceptance_control_transaction")):
+            for key, length in (("acceptance_control_identity", 64),
+                                ("acceptance_control_transaction", 32)):
+                if (not isinstance(record.get(key), str)
+                        or not re.fullmatch(rf"[0-9a-f]{{{length}}}", record[key])):
+                    raise ValueError("Invalid acceptance receipt control identity")
         kind = record.get("acceptance_kind")
         if kind == "helper":
             helper = session.dossier.verified_helpers.get(record.get("helper_name"))

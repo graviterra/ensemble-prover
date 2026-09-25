@@ -97,8 +97,15 @@ policy violation rather than undoing an action already performed by the CLI.
   setting. Support depends on the selected model. Explicit reasoning-off and
   `minimal` are rejected instead of silently changing the requested policy.
   Automatic bounded-output recovery uses `low`, which the transport supports.
-- Temperature and top-p are recorded as unsent. Output-token settings are
-  prompt targets, not server-enforced caps.
+- Temperature and top-p are recorded as unsent. Explicit temperature requirements
+  fail before generation because this CLI cannot apply them.
+- On Claude Code 2.1.282 or newer, output-token settings also set
+  `CLAUDE_CODE_MAX_OUTPUT_TOKENS` for the child process. This caps each internal
+  provider request; CLI recovery can make additional requests. Metadata records
+  `per_provider_request` enforcement.
+  Older or unrecognized versions retain prompt targets and report that limitation.
+  `--require-output-token-limit` rejects this transport because it cannot enforce
+  a total output-token cap across an entire CLI invocation.
 - Claude Code caps piped input at 10 MiB. Oversized requests fail before dispatch
   instead of dropping required context. Observed CLI compaction is rejected as a
   context failure because required transcript contents can no longer be verified.
@@ -115,19 +122,25 @@ policy violation rather than undoing an action already performed by the CLI.
 - `llm_provider_progress` events show request activity, current-block thinking
   estimates, retries, and completion or failure in the live trace. Repeated
   activity is throttled to one update per 30 seconds; status changes appear
-  immediately. These events contain no thinking text, do not count as verified
-  proof progress, and do not extend request deadlines. Completion is reported
-  only after the structured response passes validation.
+  immediately. These events contain no thinking text and do not count as verified
+  proof progress. Advancing generation renews the default inactivity watchdog;
+  repeated events and retry notices do not. Completion is reported only after
+  the structured response passes validation.
 - Usage is unpriced subscription usage. Claude Code's API-dollar estimate is
   not treated as an authoritative subscription charge. `--cost-budget-usd 0`
   is required; the account's applicable allowances and usage limits still apply.
-- Request deadlines cover preflight, admission, startup and stream processing.
-  Batch samples share an operation deadline. Cancellation reaps local process
+- With the default soft policy, requests have a 300-second inactivity watchdog.
+  Explicit role/request timeouts and hard-policy deadlines remain absolute,
+  including time spent thinking. Batch samples share any configured operation
+  deadline. Cancellation reaps local process
   groups; terminating a local process cannot guarantee remote generation stopped.
   A retry starts a fresh invocation with the retained Mini conversation; it
   cannot resume the interrupted invocation's unfinished reasoning. A per-request
   timeout therefore does not bound the whole problem. Use
   `--mini-worker-timeout-s` for an overall worker limit.
+- A confirmed subscription quota or sign-in failure stops sibling requests using
+  the same credential directory and blocks new requests for that account within
+  the run. Other accounts remain available.
 - Proven unsent requests return their exact dispatch ticket. Missing or uncertain
   provider receipts retain conservative accounting and durable recovery behavior.
 

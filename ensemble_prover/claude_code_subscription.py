@@ -266,9 +266,10 @@ def _cli_failure(diagnostic: str) -> ClaudeCodeBackendError:
 class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
     """API-shaped adapter backed exclusively by saved Claude.ai CLI sign-in.
 
-    Output limits are prompt targets, not server-enforced token limits. Usage
-    is recorded as unpriced subscription usage; dollar-budget admission must
-    reject this transport. Temperature/top_p are explicitly recorded as unsent.
+    Supported CLI versions cap each internal provider request. CLI recovery can
+    issue additional requests, so there is no total invocation token guarantee.
+    Usage is unpriced subscription usage; dollar-budget admission rejects this
+    transport. Required temperature/top_p controls are unsupported.
     """
 
     backend_name = "Claude Code"
@@ -351,6 +352,12 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     )
                 self.cli_version = out.decode("utf-8", errors="replace").strip()[:100]
             self._preflight_done = True
+
+    @property
+    def output_token_cap_supported(self) -> bool:
+        """Older or unrecognized CLIs retain prompt-target output limits."""
+        version = re.match(r"([0-9]+)\.([0-9]+)\.([0-9]+)(?:\s|$)", self.cli_version)
+        return bool(version and tuple(map(int, version.groups())) >= (2, 1, 282))
 
     @staticmethod
     def _resolve_effort(effort: str | None) -> str:
@@ -465,6 +472,9 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             if max_tokens is not None
             else self.cfg.max_tokens,
         }
+        output_cap = request["requested_output_tokens"]
+        if type(output_cap) is not int or output_cap <= 0:
+            output_cap = None
         payload = json.dumps(request, ensure_ascii=False, allow_nan=False).encode(
             "utf-8"
         )
@@ -481,13 +491,16 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 "Claude Code request deadline expired during preflight",
             ):
                 await self.preflight()
+        if not self.output_token_cap_supported:
+            output_cap = None
         metadata = {
             "backend": "claude_code_subscription",
             "backend_protocol_version": 1,
             "dispatch_unit": "claude_code_print",
             "claude_code_cli_version": self.cli_version,
             "authentication": "claude.ai",
-            "output_limit_enforcement": "prompt_target_only",
+            "output_limit_enforcement": "per_provider_request" if output_cap else "prompt_target_only",
+            "total_output_limit_enforced": False,
             "max_output_tokens_requested": request["requested_output_tokens"],
             "temperature_sent": None,
             "top_p_sent": None,
@@ -525,6 +538,28 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             "retry_event_count": 0, "assistant_event_count": 0,
         }
         final_progress_status = "failed"
+        last_thinking_estimate = 0
+        generation_messages: set[str] = set()
+
+        def generation_advanced(event: dict[str, Any]) -> bool:
+            nonlocal last_thinking_estimate
+            if event.get("type") == "system" and event.get("subtype") == "thinking_tokens":
+                estimate = event.get("estimated_tokens")
+                if type(estimate) is int and estimate > last_thinking_estimate:
+                    last_thinking_estimate = estimate
+                    return True
+            if event.get("type") == "assistant" and not event.get("error"):
+                message = event.get("message")
+                if isinstance(message, dict) and message.get("content"):
+                    identity = json.dumps(
+                        (message.get("id"), message["content"]),
+                        sort_keys=True, ensure_ascii=False,
+                    )
+                    if identity not in generation_messages:
+                        generation_messages.add(identity)
+                        last_thinking_estimate = 0
+                        return True
+            return False
 
         def incompatible_event(event: dict[str, Any]) -> ClaudeCodeBackendError:
             version = re.match(r"[0-9]+\.[0-9]+\.[0-9]+", self.cli_version[:40])
@@ -884,6 +919,14 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     timeout=remaining,
                     on_event=on_event,
                     on_started=on_started,
+                    inactivity_timeout=self._positive_finite_timeout(
+                        getattr(self.cfg, "subscription_inactivity_timeout_s", None)
+                    ),
+                    on_progress=generation_advanced,
+                    environment_overrides=(
+                        {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(output_cap)}
+                        if output_cap is not None else None
+                    ),
                 )
                 if completed and not failed_turn and code == 0:
                     final_progress_status = "finished"

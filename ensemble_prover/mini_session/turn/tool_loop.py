@@ -1059,6 +1059,21 @@ def _client_hard_turn_elapsed_budget_s(client: Any) -> float:
     )
 
 
+def _client_has_subscription_inactivity_default(client: Any) -> bool:
+    """The automatic subscription watchdog does not grant a wall-clock lease."""
+    cfg = getattr(client, "cfg", None)
+    return bool(
+        str(getattr(cfg, "base_url", "")) in {
+            "codex://chatgpt", "claude-code://subscription",
+        }
+        and str(getattr(cfg, "llm_deadline_policy", "hard")) == "soft"
+        and getattr(cfg, "request_timeout_disabled", False)
+        and _nonnegative_finite_float(
+            getattr(cfg, "subscription_inactivity_timeout_s", 0.0)
+        ) > 0.0
+    )
+
+
 def _nonnegative_int(value: Any, *, default: int = 0) -> int:
     """Parse replay counters without allowing corrupt state to abort a turn."""
 
@@ -2630,6 +2645,7 @@ async def _call_llm_with_tools_one_round_impl(
     provider_call_elapsed_s = 0.0
     provider_call_cumulative_elapsed_s = 0.0
     provider_call_cumulative_wall_exhausted = False
+    subscription_inactivity_default = _client_has_subscription_inactivity_default(client)
     provider_call_cumulative_wall_cap_s = (
         max(
             _CONVERSATION_PROVIDER_CUMULATIVE_WALL_FLOOR_S,
@@ -2650,8 +2666,10 @@ async def _call_llm_with_tools_one_round_impl(
         try:
             configured_request_timeout_s = float(
                 request_timeout_override_f
-                or getattr(client_cfg, "request_timeout_s", 0.0)
-                or getattr(client_cfg, "timeout_s", 0.0)
+                or (0.0 if subscription_inactivity_default else (
+                    getattr(client_cfg, "request_timeout_s", 0.0)
+                    or getattr(client_cfg, "timeout_s", 0.0)
+                ))
                 or 0.0
             )
         except (TypeError, ValueError):
@@ -3080,7 +3098,16 @@ async def _call_llm_with_tools_one_round_impl(
     if (
         provider_call_quantum_f <= 0.0
         and max_turn_elapsed_f <= 0.0
-        and not scheduler_call_quantum_enabled
+        and (
+            not scheduler_call_quantum_enabled
+            or (
+                subscription_inactivity_default
+                and request_timeout_override_f is None
+                and _nonnegative_finite_float(
+                    getattr(getattr(client, "cfg", None), "operation_timeout_s", 0.0)
+                ) <= 0.0
+            )
+        )
     ):
         # An older resume must not re-introduce a finite cap after the
         # production proving policy disabled both wall-clock limits. An
@@ -3128,8 +3155,8 @@ async def _call_llm_with_tools_one_round_impl(
         nonlocal llm_error, llm_failure_kind, llm_retryable, llm_terminal
         nonlocal llm_failure_reason
         provider_call_quantum_exhausted = True
-        llm_error = "llm_provider_quantum_exhausted"
-        llm_failure_kind = "llm_provider_quantum_exhausted"
+        llm_error = "provider_call_quantum_yielded"
+        llm_failure_kind = "provider_call_quantum_yielded"
         llm_retryable = True
         llm_terminal = False
         llm_failure_reason = llm_failure_kind
@@ -3297,7 +3324,7 @@ async def _call_llm_with_tools_one_round_impl(
                 configured_window_s = _nonnegative_finite_float(
                     getattr(client_cfg, "request_timeout_s", None)
                 )
-            if configured_window_s <= 0.0:
+            if configured_window_s <= 0.0 and not subscription_inactivity_default:
                 configured_window_s = _nonnegative_finite_float(
                     getattr(getattr(client, "cfg", None), "timeout_s", 0.0)
                 )

@@ -34,12 +34,14 @@ from .subprocess_environment import (
     sanitized_subprocess_environment,
     trusted_provider_worker_environment,
 )
+from .sweep_control import CONTROL_ENV, SweepControl
 
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_FIRST_ACCEPTED_BY_S = 1200.0
 DEFAULT_SECOND_ACCEPTED_BY_S = 1800.0
 DEFAULT_STARTUP_LIVENESS_S = 180.0
+DEFAULT_STARTUP_TIMEOUT_S = 1200.0
 _MATHLIB_PREWARM_SOURCE = "import Mathlib\nexample : True := by trivial\n"
 _PROBLEM = re.compile(r"putnam_\d{4}_[ab][1-6]")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -85,6 +87,7 @@ class AcceptanceGate:
     first_accepted_by_s: float = DEFAULT_FIRST_ACCEPTED_BY_S
     second_accepted_by_s: float = DEFAULT_SECOND_ACCEPTED_BY_S
     accepted: dict[str, float] = field(default_factory=dict)
+    earliest_acceptance_monotonic: float | None = None
 
     def __post_init__(self) -> None:
         self.first_accepted_by_s = _acceptance_seconds(self.first_accepted_by_s)
@@ -108,12 +111,16 @@ class AcceptanceGate:
             return False
         if isinstance(accepted_at, bool) or not isinstance(accepted_at, (int, float)):
             return False
-        if (
-            not math.isfinite(accepted_at)
-            or not self.start_monotonic <= accepted_at <= now
-        ):
+        earliest = (self.earliest_acceptance_monotonic
+                    if self.earliest_acceptance_monotonic is not None
+                    else self.start_monotonic)
+        try:
+            valid_timestamp = math.isfinite(accepted_at) and earliest <= accepted_at <= now
+        except OverflowError:
+            valid_timestamp = False
+        if not valid_timestamp:
             return False
-        elapsed = float(accepted_at) - self.start_monotonic
+        elapsed = max(0.0, float(accepted_at) - self.start_monotonic)
         previous = self.accepted.get(identity)
         self.accepted[identity] = (
             elapsed if previous is None else min(previous, elapsed)
@@ -198,7 +205,7 @@ class AttemptStartupLiveness:
                 self.proof_started_at = now
             else:
                 # Preparation readiness is liveness, never accepted proof.
-                # Its own worker watchdog and the original acceptance gate
+                # Its own worker watchdog and the absolute startup cap
                 # continue to bound this phase, including long provider calls.
                 self.preparation.read()
                 discovery = _load_answer_discovery(self.output_dir) or {}
@@ -222,7 +229,7 @@ def prewarm_shared_mathlib_runtime(
     """Import Mathlib once so attempt processes do not pay a cold lake start.
 
     Problem-specific ``proof_state_cache_seed`` still runs after attempt launch
-    and counts against the acceptance clock. Missing lake/project is a skip,
+    under the startup bound. Missing lake/project is a skip,
     not a sweep failure.
     """
     project = Path(project_dir or default_lean_project_dir()).expanduser()
@@ -476,6 +483,7 @@ def build_manifest(
     first_accepted_by_s: float = DEFAULT_FIRST_ACCEPTED_BY_S,
     second_accepted_by_s: float = DEFAULT_SECOND_ACCEPTED_BY_S,
     startup_liveness_s: float = DEFAULT_STARTUP_LIVENESS_S,
+    startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S,
     prewarm_shared_mathlib: bool = True,
 ) -> dict[str, Any]:
     source_dir = Path(source_dir).resolve()
@@ -519,6 +527,7 @@ def build_manifest(
         "first_accepted_by_s": gate.first_accepted_by_s,
         "second_accepted_by_s": gate.second_accepted_by_s,
         "startup_liveness_s": startup_liveness_s,
+        "startup_timeout_s": _seconds(startup_timeout_s),
         "prewarm_shared_mathlib": prewarm_shared_mathlib,
         "corpus_count": len(sources),
         "excluded_solved_count": len(sources) - len(queue),
@@ -584,6 +593,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         data["startup_liveness_s"] = _acceptance_seconds(data.get("startup_liveness_s"))
     else:
         data["startup_liveness_s"] = 0.0
+    data["startup_timeout_s"] = _seconds(data.get("startup_timeout_s", DEFAULT_STARTUP_TIMEOUT_S))
     if "prewarm_shared_mathlib" in data:
         if not isinstance(data.get("prewarm_shared_mathlib"), bool):
             raise ValueError("malformed prewarm_shared_mathlib")
@@ -903,6 +913,7 @@ def run_attempt(
     first_accepted_by_s: float = DEFAULT_FIRST_ACCEPTED_BY_S,
     second_accepted_by_s: float = DEFAULT_SECOND_ACCEPTED_BY_S,
     startup_liveness_s: float = 0,
+    startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S,
     poll_interval_s: float = 1,
     cleanup_timeout_s: float = 130,
     should_stop: Callable[[], bool] = lambda: False,
@@ -914,6 +925,7 @@ def run_attempt(
         _seconds(cleanup_timeout_s),
     )
     startup_liveness_s = _acceptance_seconds(startup_liveness_s)
+    startup_timeout_s = _seconds(startup_timeout_s)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     if any(
@@ -923,6 +935,9 @@ def run_attempt(
         raise ValueError("attempt output directory already contains run artifacts")
     start = time.monotonic()
     gate = AcceptanceGate(start, first_accepted_by_s, second_accepted_by_s)
+    gate.earliest_acceptance_monotonic = start
+    control = SweepControl.create(output_dir)
+    ready_at: float | None = None
     tail = AcceptanceEventTail(output_dir / "turns.jsonl")
     startup = AttemptStartupLiveness(output_dir, start=start, timeout_s=startup_liveness_s)
     cutoff = ""
@@ -931,6 +946,7 @@ def run_attempt(
     console_path = console_log_path(output_dir)
     worker_env = trusted_provider_worker_environment()
     worker_env["PYTHONUNBUFFERED"] = "1"
+    worker_env[CONTROL_ENV] = control.environment_value()
     # Exclusive creation also rejects existing or dangling symlink destinations.
     with console_path.open("xb") as console, console_path.open("rb") as reader:
         relay = _ConsoleRelay(reader)
@@ -950,30 +966,32 @@ def run_attempt(
                 if relay.error:
                     monitor_error = relay.error
                     break
-                records = tail.read()
-                now = time.monotonic()
-                for record in records:
-                    gate.observe(record, now=now)
+                tail.read()
                 interrupted = bool(should_stop())
-                if startup.expired(now=now, proof_alive=tail.alive):
-                    cutoff = "startup_liveness_deadline"
-                else:
-                    cutoff = gate.cutoff_reason(now=now) or ""
-                if cutoff and not interrupted:
-                    # A committed receipt may arrive after the polling read
-                    # while the deadline is being evaluated. Drain once more
-                    # at the stop boundary and retain its original commit time.
-                    records = tail.read()
+                with control.locked() as transaction:
                     now = time.monotonic()
-                    for record in records:
+                    ready_at = transaction.ready_at
+                    if ready_at is not None:
+                        gate.start_monotonic = ready_at
+                    for record in transaction.accepted_records():
                         gate.observe(record, now=now)
-                    if startup.expired(now=now, proof_alive=tail.alive):
-                        cutoff = "startup_liveness_deadline"
+                    if transaction.pending:
+                        raise RuntimeError("sweep_acceptance_authority_unavailable")
+                    if ready_at is None:
+                        if now - start >= startup_timeout_s:
+                            cutoff = "startup_deadline"
+                        elif startup.expired(now=now, proof_alive=tail.alive):
+                            cutoff = "startup_liveness_deadline"
+                        else:
+                            cutoff = ""
                     else:
                         cutoff = gate.cutoff_reason(now=now) or ""
-                if interrupted or (cutoff and not _summary_solved(output_dir)):
+                    if cutoff and not interrupted and not _summary_solved(output_dir):
+                        transaction.append({"event": "cutoff", "reason": cutoff, "monotonic_s": now})
+                    else:
+                        cutoff = ""
+                if interrupted or cutoff:
                     break
-                cutoff = ""
                 time.sleep(poll_interval_s)
         except BaseException as exc:
             monitor_error = f"{type(exc).__name__}: {exc}"
@@ -1014,10 +1032,15 @@ def run_attempt(
             cleaned = False
         if cleaned:
             try:
-                records = tail.read()
-                now = time.monotonic()
-                for record in records:
-                    gate.observe(record, now=now)
+                tail.read()
+                with control.locked() as transaction:
+                    ready_at = transaction.ready_at
+                    if ready_at is not None:
+                        gate.start_monotonic = ready_at
+                    for record in transaction.accepted_records():
+                        gate.observe(record, now=time.monotonic())
+                    if transaction.pending:
+                        monitor_error = monitor_error or "sweep_acceptance_authority_unavailable"
                 if cutoff and not interrupted:
                     _record_cutoff_in_attempt_summary(output_dir, cutoff)
             except (OSError, ValueError) as exc:
@@ -1095,6 +1118,7 @@ def run_attempt(
         "accepted_elapsed_s": gate.accepted,
         "cleanup_confirmed": cleaned,
         "wall_s": time.monotonic() - start,
+        "proof_ready_elapsed_s": ready_at - start if ready_at is not None else None,
         "monitor_error": monitor_error,
     }
 
@@ -1367,6 +1391,7 @@ def run_sweep(
                 first_accepted_by_s=manifest["first_accepted_by_s"],
                 second_accepted_by_s=manifest["second_accepted_by_s"],
                 startup_liveness_s=manifest.get("startup_liveness_s", 0),
+                startup_timeout_s=manifest.get("startup_timeout_s", DEFAULT_STARTUP_TIMEOUT_S),
                 poll_interval_s=poll_interval_s,
                 cleanup_timeout_s=cleanup_timeout_s,
                 should_stop=should_stop,
@@ -1416,7 +1441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--first-accepted-by-s",
         type=float,
         help=(
-            "First acceptance deadline from launch, including startup "
+            "First acceptance deadline from proof worker readiness "
             f"(default: {DEFAULT_FIRST_ACCEPTED_BY_S:g}; 0 disables)"
         ),
     )
@@ -1424,7 +1449,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--second-accepted-by-s",
         type=float,
         help=(
-            "Second acceptance deadline from launch, including startup "
+            "Second acceptance deadline from proof worker readiness "
             f"(default: {DEFAULT_SECOND_ACCEPTED_BY_S:g}; 0 disables)"
         ),
     )
@@ -1435,8 +1460,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=(
             "Cut a silent launch with no turns.jsonl events "
             f"(default: {DEFAULT_STARTUP_LIVENESS_S:g}; 0 disables). "
-            "Does not subtract Mathlib/runtime boot from the acceptance clock."
+            "Preparation and runtime startup have a separate absolute cap."
         ),
+    )
+    parser.add_argument(
+        "--startup-timeout-s", type=float,
+        help=f"Absolute preparation/runtime startup cap (default: {DEFAULT_STARTUP_TIMEOUT_S:g}s; must be positive)",
     )
     parser.add_argument(
         "--no-prewarm",
@@ -1471,6 +1500,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.first_accepted_by_s,
                         args.second_accepted_by_s,
                         args.startup_liveness_s,
+                        args.startup_timeout_s,
                     )
                 )
                 or mini_args or args.no_acceptance_cutoffs or args.no_prewarm
@@ -1515,6 +1545,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         if args.startup_liveness_s is not None
                         else DEFAULT_STARTUP_LIVENESS_S
                     ),
+                    startup_timeout_s=(args.startup_timeout_s if args.startup_timeout_s is not None
+                                       else DEFAULT_STARTUP_TIMEOUT_S),
                     prewarm_shared_mathlib=not args.no_prewarm,
                 )
                 save_manifest(manifest_path, manifest)
@@ -1527,12 +1559,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         first, second = manifest["first_accepted_by_s"], manifest["second_accepted_by_s"]
         policy = "disabled" if not first and not second else (
             f"first={str(first) + 's' if first else 'disabled'}, "
-            f"second={str(second) + 's' if second else 'disabled'} from attempt launch (includes startup)"
+            f"second={str(second) + 's' if second else 'disabled'} from proof worker readiness"
         )
         startup = manifest.get("startup_liveness_s", 0)
         startup_text = f"{startup:g}s" if startup else "disabled"
         print(
             f"Acceptance cutoffs: {policy}; startup_liveness={startup_text}; "
+            f"startup_timeout={manifest['startup_timeout_s']:g}s; "
             f"prewarm_shared_mathlib={bool(manifest.get('prewarm_shared_mathlib'))}",
             flush=True,
         )

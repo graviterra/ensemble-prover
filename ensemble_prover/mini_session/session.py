@@ -10511,6 +10511,13 @@ class MiniSession:
     ) -> None:
         """Wait without bypassing an explicitly configured run governor."""
 
+        from ..mini_research import current_native_research, pending_native_research
+
+        research = current_native_research()
+        if research is not None and pending_native_research(self):
+            await research.wait_for_change(self, planner=broker)
+            return
+
         remaining = self._run_governor_remaining_s()
         if remaining is None:
             await broker.wait_for_change()
@@ -23562,12 +23569,21 @@ class MiniSession:
             # only a scheduler quantum boundary; the final live session owner
             # performs cleanup, including on startup and cancellation exits.
             self._flush_pending_acceptance_records()
-            if planner_broker is not None:
-                await planner_broker.release_session_owner(
-                    self, preserve_ready=preserve_ready, retain_suspended=retain_suspended,
-                )
+            from ..mini_research import current_native_research
+
+            research_owner = current_native_research()
+            try:
+                if research_owner is not None:
+                    await research_owner.release_session(self)
+            finally:
+                if planner_broker is not None:
+                    await planner_broker.release_session_owner(
+                        self, preserve_ready=preserve_ready, retain_suspended=retain_suspended,
+                    )
 
     async def _run_scheduler(self) -> Tuple[bool, Optional[str]]:
+        from ..mini_research import pending_native_research
+
         planner_broker = self.planner_job_broker()
         self._retire_terminal_ready_planner_jobs()
         if self._operator_cancelled_dispatch_reuse_fenced:
@@ -23622,6 +23638,7 @@ class MiniSession:
                 )
             )
             or self._owned_missing_planner_recovery_action() is not None
+            or pending_native_research(self)
         ):
             from ..research_claims.strategy_runtime import check_strategy
 
@@ -23629,6 +23646,10 @@ class MiniSession:
             self._retire_terminal_ready_planner_jobs()
             if self._planner_terminal_authority_reason():
                 break
+            if pending_native_research(self):
+                # A background completion may have woken the idle scheduler.
+                # Settle it before choosing another request or waiting again.
+                await self._native_research_boundary()
             normal_continuation = self.should_continue()
             ready_planner_action = self._owned_planner_job_action("ready")
             admitted_ready_planner_action = (
@@ -23786,6 +23807,19 @@ class MiniSession:
                     self._capture_pre_select_snapshot()
                 except Exception:
                     pass
+                if pending_native_research(self):
+                    # A funded research round can complete while proof work
+                    # is unavailable. Waiting consumes no action or stagnation
+                    # quantum, and its advice enters only at this boundary.
+                    from ..mini_research import current_native_research
+
+                    research = current_native_research()
+                    await research.wait_for_change(
+                        self, planner=planner_broker if self._owned_planner_job_status("pending") else None,
+                    )
+                    await self._native_research_boundary()
+                    self._pre_select_snapshot_required = True
+                    continue
                 if self._owned_planner_job_status("pending"):
                     self._record_event(
                         {
@@ -24403,6 +24437,47 @@ class MiniSession:
             # A later dispatch recycle must restore the new committed state.
             self._pre_select_snapshot_required = True
         return changed
+
+    def _release_research_advice_defers(self, guidance: Mapping[str, Any]) -> None:
+        """New advice changes a paid proof prompt, without refunding its work."""
+        target = str(guidance.get("target_statement") or "").strip()
+
+        def matches(metadata: Mapping[str, Any]) -> bool:
+            record = metadata.get("selected_work_item_record") or {}
+            statement = str(record.get("exact_target_statement")
+                            or record.get("target_statement") or "").strip()
+            return bool(
+                target and statement == target
+                and str(metadata.get("action_id") or "").startswith("conversation_turn")
+                and metadata.get("llm_failure_kind") in {
+                    "final_no_tools_empty_output", "final_no_tools_token_exhausted",
+                    "final_no_tools_transcript_echo",
+                }
+                and _nonnegative_metadata_int(metadata, "provider_calls_completed") > 0
+                and not metadata.get("terminal_failure_reason")
+                and not metadata.get("scoped_failure_reason")
+            )
+
+        released = set()
+        for key, metadata in list(self.model_call_deferred_frontier_action_metadata.items()):
+            if not matches(metadata):
+                continue
+            self.model_call_deferred_frontier_action_metadata.pop(key, None)
+            self.model_call_deferred_frontier_action_keys.discard(key)
+            self.consumed_frontier_action_keys.discard(key)
+            self.skipped_frontier_action_keys.discard(key)
+            self.skipped_frontier_work_keys.discard(tuple(key[:5]))
+            released.add(str(metadata["action_id"]))
+        for action_id, metadata in list(self.model_call_deferred_static_action_metadata.items()):
+            if matches(metadata):
+                self.model_call_deferred_static_action_metadata.pop(action_id, None)
+                self.model_call_deferred_static_action_ids.discard(action_id)
+                released.add(action_id)
+        if released:
+            self._record_event({
+                "phase": "native_research", "verdict": "new_advice_proof_context_available",
+                "action_ids": sorted(released), "kernel_verified": False,
+            })
 
     async def _seed_same_problem_verified_helpers(self) -> None:
         """Import prior same-problem verified helpers before scheduling."""
@@ -27407,17 +27482,37 @@ class MiniSession:
                     emit_event=False,
                 )
                 raise invalidated_error
-            if action_dispatch_id:
-                # Publish both parts of the success ledger only after the
-                # complete central transition returns. An exception leaves a
-                # failed-id receipt and a poisoned session, never a success
-                # tombstone.
-                try:
-                    self._applied_action_dispatch_outcomes[action_dispatch_id] = (
-                        effective
-                    )
-                    self._applied_action_dispatch_ids.add(action_dispatch_id)
-                except BaseException as exc:
+            from ensemble_prover.sweep_control import (
+                acceptance_commit_transaction,
+                complete_acceptance_transaction,
+            )
+
+            acceptance_commit_published = False
+            try:
+                with acceptance_commit_transaction(acceptance_records) as transaction:
+                    if action_dispatch_id:
+                        self._applied_action_dispatch_outcomes[action_dispatch_id] = effective
+                        self._applied_action_dispatch_ids.add(action_dispatch_id)
+                    acceptance_committed_at = time.monotonic()
+                    for acceptance_record in acceptance_records:
+                        acceptance_record["acceptance_monotonic_s"] = acceptance_committed_at
+                    self._pending_acceptance_records.extend(acceptance_records)
+                    acceptance_commit_published = True
+                    if transaction is not None:
+                        try:
+                            complete_acceptance_transaction(transaction, acceptance_records)
+                        except OSError:
+                            # The durable intent makes unavailable authority
+                            # visible to the sweep. Keep committed proof and
+                            # its original receipt for checkpoint/retry.
+                            _LOGGER.exception("Sweep acceptance authority publication deferred")
+            except BaseException as exc:
+                if acceptance_commit_published:
+                    # A close/unlock failure after the commit must not erase
+                    # proof authority or its durable retry evidence.
+                    _LOGGER.exception("Sweep acceptance authority finalization failed")
+                    raise
+                if action_dispatch_id:
                     try:
                         self._applied_action_dispatch_outcomes.pop(
                             action_dispatch_id,
@@ -27426,16 +27521,12 @@ class MiniSession:
                         self._applied_action_dispatch_ids.discard(action_dispatch_id)
                     except BaseException:
                         pass
-                    self._mark_apply_transaction_failure(
-                        outcome=outcome,
-                        action_dispatch_id=action_dispatch_id,
-                        error=exc,
-                    )
-                    raise
-            acceptance_committed_at = time.monotonic()
-            for acceptance_record in acceptance_records:
-                acceptance_record["acceptance_monotonic_s"] = acceptance_committed_at
-            self._pending_acceptance_records.extend(acceptance_records)
+                self._mark_apply_transaction_failure(
+                    outcome=outcome,
+                    action_dispatch_id=action_dispatch_id,
+                    error=exc,
+                )
+                raise
             if action_dispatch_id:
                 # Observe health only after the complete transition and its
                 # exactly-once receipt are committed. Duplicate/cancelled
@@ -27571,6 +27662,7 @@ class MiniSession:
             metadata.get("provider_call_quantum_exhausted")
             and metadata.get("llm_failure_kind")
             in {
+                "provider_call_quantum_yielded",
                 "llm_provider_quantum_exhausted",
                 "provider_dispatch_attempt_limit_exhausted",
             }
@@ -36384,7 +36476,7 @@ class MiniSession:
             # action through the ordinary bounded recovery lane so other
             # mathematical routes receive a scheduler quantum first.
             return True
-        if kind == "llm_provider_quantum_exhausted" and retryable:
+        if kind in {"provider_call_quantum_yielded", "llm_provider_quantum_exhausted"} and retryable:
             return True
         if kind in _RETRYABLE_COMPLETED_RESPONSE_FAILURE_KINDS and retryable:
             # The provider completed a paid turn but returned no usable proof
@@ -36556,6 +36648,7 @@ class MiniSession:
             and metadata.get("provider_call_quantum_exhausted")
             and kind
             in {
+                "provider_call_quantum_yielded",
                 "llm_provider_quantum_exhausted",
                 "provider_dispatch_attempt_limit_exhausted",
             }
@@ -40504,6 +40597,13 @@ class MiniSession:
             while self._pending_acceptance_records:
                 record = self._pending_acceptance_records[0]
                 try:
+                    from ensemble_prover.sweep_control import retry_acceptance_publication
+
+                    retry_acceptance_publication([
+                        item for item in self._pending_acceptance_records
+                        if item.get("acceptance_control_transaction")
+                        == record.get("acceptance_control_transaction")
+                    ])
                     delivered = self._record_event(record)
                 except Exception:
                     _LOGGER.exception("Accepted proof receipt publication failed")

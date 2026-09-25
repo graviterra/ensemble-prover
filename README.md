@@ -140,7 +140,8 @@ To sweep all locally unsolved PutnamBench problems in random order:
 ```
 
 Each attempt must commit one distinct accepted proof by 1,200 seconds and two by
-1,800 seconds, both measured from launch. After two timely acceptances, normal
+1,800 seconds, both measured from proof worker readiness. Preparation and startup
+have a separate 1,200-second cap. After two timely acceptances, normal
 budgets apply. See the [sweep guide](ensemble_prover/PUTNAM_SWEEP.md) for a
 no-provider-call preview, resume commands, and counting/cleanup rules.
 

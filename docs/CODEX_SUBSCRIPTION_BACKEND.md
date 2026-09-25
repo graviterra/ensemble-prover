@@ -166,10 +166,12 @@ and the CLI's sandbox context markers.
   `xhigh`). Support for a chosen effort also depends on the selected model.
   Explicit reasoning-off is rejected by this transport.
 - Temperature and top-p are not exposed by this CLI interface. Requested
-  temperature is recorded as unsent. Parallel samples still make independent
-  requests, but temperature variation does not apply.
+  temperature is recorded as unsent. Explicit temperature requirements fail
+  before generation. Parallel samples still make independent requests.
 - Output-token settings are **prompt targets**, not server-enforced caps. This
   distinction and the CLI version are published in request metadata.
+  `--require-output-token-limit` rejects this transport because the CLI cannot
+  enforce a total output-token cap across an invocation.
 - CLI turn usage reports input, cached-input, output and available reasoning
   tokens. These are recorded as unpriced subscription usage. A numeric zero
   subtotal is not a claim of zero cost or unlimited access.
@@ -177,13 +179,17 @@ and the CLI's sandbox context markers.
   allowances cannot be valued or enforced using API per-token prices.
 - One dispatch means one `codex exec` invocation. Codex may reconnect internally;
   its underlying HTTP requests are not individually observable by Mini.
-- Existing request timeouts and hard deadlines cover admission, process startup
-  and each invocation. `chat_n` shares one operation deadline across samples.
+- With the default soft policy, requests have a 300-second inactivity watchdog.
+  Advancing reasoning or assistant output renews it; repeated events and retry
+  notices do not. Explicit role/request timeouts and hard-policy deadlines remain
+  absolute. `chat_n` shares any configured operation deadline across samples.
   Cancellation and shutdown kill and reap local process groups. Terminating a
   local process does not guarantee an already submitted remote generation stopped
   immediately.
-- Subscription usage-limit and sign-in failures stop with classified errors;
-  context overflow also stops rather than retrying the same oversized transcript.
+- Subscription usage-limit and sign-in failures stop sibling requests using the
+  same credential directory and block new requests for that account within the
+  run. Other accounts remain available. Context overflow also stops rather than
+  retrying the same oversized transcript.
   Transient transport failures use Mini's existing retry policy. Raw CLI stderr
   and authentication material are not copied into run artifacts.
 

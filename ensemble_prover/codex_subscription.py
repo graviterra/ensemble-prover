@@ -428,6 +428,22 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
         usage_observed = False
         dispatched = False
         authority: dict[str, Any] = {}
+        generation_items: dict[tuple[str, str], int] = {}
+
+        def generation_advanced(event: dict[str, Any]) -> bool:
+            item = event.get("item")
+            if event.get("type") not in {"item.started", "item.updated", "item.completed"}:
+                return False
+            if not isinstance(item, dict) or item.get("type") not in {"reasoning", "agent_message"}:
+                return False
+            text = item.get("text")
+            if not isinstance(text, str) or not text:
+                return False
+            key = (str(item.get("id") or ""), item["type"])
+            if len(text) <= generation_items.get(key, 0):
+                return False
+            generation_items[key] = len(text)
+            return True
 
         def on_event(event: dict[str, Any]) -> None:
             nonlocal completed, answer, failure, failed_turn
@@ -557,6 +573,10 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
                     timeout=remaining,
                     on_event=on_event,
                     on_started=on_started,
+                    inactivity_timeout=self._positive_finite_timeout(
+                        getattr(self.cfg, "subscription_inactivity_timeout_s", None)
+                    ),
+                    on_progress=generation_advanced,
                 )
             finally:
                 if not dispatched:

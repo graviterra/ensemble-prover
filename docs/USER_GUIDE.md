@@ -529,6 +529,12 @@ generation to cross phase and retry deadlines while retaining the configured
 HTTP-attempt watchdog. `hard` rejects a late model/tool-loop operation, but it
 does not replace `--mini-worker-timeout-s` as an overall run cap.
 
+Claude Code and Codex subscriptions default to a 300-second inactivity watchdog
+under soft policy. Advancing generation renews it. Explicit role/request timeouts
+remain absolute, including time spent thinking. `--require-output-token-limit`
+requires a total output-token cap per invocation and rejects subscription CLI
+transports that cannot provide it.
+
 Use `--lean-max-heartbeats` when a legitimate proof exceeds Lean's configured
 heartbeat budget. Raising heartbeats does not raise `--lean-timeout-s`.
 
@@ -562,8 +568,8 @@ obstacle, checks sources, and brings alternative strategies back to the same
 proof session. It can question an unsupported ancestor claim even while the
 current helper continues to produce apparent progress.
 
-Research becomes eligible after three paid, completed actions, ten provider
-attempts, paid work followed by stagnation or an exhausted proof frontier, or
+Research becomes eligible after three paid, completed actions, ten completed
+provider calls, paid work followed by stagnation or an exhausted proof frontier, or
 an explicit objection from the prover. These are investigation triggers;
 they do not establish that a mathematical claim is false. Source lookup and
 fresh research review can find an obstruction, but finding a particular
@@ -576,6 +582,11 @@ through checkpoints, and excludes research's own requests. The
 audit and requests since verified progress. Replaying a saved outcome does
 not create additional research work.
 
+Research runs in the background while proof search continues within its remaining
+budget. Results enter the proof conversation at a scheduler boundary. Finishing
+the proof cancels outstanding research. If proof work cannot proceed, the scheduler
+can wait for the funded research result.
+
 Each research phase borrows one remaining conversation invocation and one
 scheduler iteration, preserving capacity for another proof turn. It uses the
 same provider settings and cost budget, with at most six provider dispatches
@@ -583,7 +594,7 @@ per phase. Each phase receives 600 seconds, or the provider's larger configured
 time allowance, further limited by the parent's remaining time and applicable
 hard deadlines. The research request timeout uses that same funded allowance;
 there is no separate 120-second cutoff. Cancelled or failed research emits an
-explicit outcome before proof search resumes; `llm_usage_missing` describes
+explicit outcome; `llm_usage_missing` describes
 missing accounting information and does not by itself explain the failure. Research notes do not count as verified progress;
 Lean still decides whether the original theorem is proved.
 
@@ -608,7 +619,8 @@ processes do not acquire the feature from a source update.
 
 The outer Putnam sweep prints its acceptance policy at startup. Its default
 deadlines are 1200 seconds for the first accepted proof/helper and 1800 seconds
-for the second, measured from attempt launch **including startup**. Research
+for the second, measured from proof worker readiness. Preparation and startup
+have a separate absolute cap of 1200 seconds (`--startup-timeout-s`). Research
 does not reset those clocks or count as an accepted proof. To let each problem
 run under MiniProver's own limits, pass `--no-acceptance-cutoffs` to the sweep
 launcher **before** the `--` separating MiniProver arguments. Alternatively,
@@ -616,7 +628,8 @@ set either `--first-accepted-by-s 0` or `--second-accepted-by-s 0` to disable
 that individual gate. These settings persist in the sweep manifest; resume
 uses the saved policy without overrides. Sweep stop notices and final result
 lines in the per-attempt console identify the cutoff that requested SIGINT,
-even if the worker describes the received signal as `user_interrupted`.
+and the final attempt summary preserves that cause separately from the worker's
+received interruption signal.
 Isolated experiments
 are disabled in automatic recovery; the separate `./research` workflow remains
 available for a dedicated investigation.

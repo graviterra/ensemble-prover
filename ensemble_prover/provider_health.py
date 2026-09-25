@@ -122,8 +122,46 @@ class ProviderLaneHealthRegistry:
         self._jitter_fraction = max(0.0, min(1.0, float(jitter_fraction)))
         self._states: dict[str, _LaneState] = {}
         self._transport_states: dict[str, _TransportState] = {}
+        self._subscription_terminal: dict[str, str] = {}
+        self._subscription_requests: dict[str, dict[int, Callable[[str], None]]] = {}
         self._next_token = 1
         self._lock = threading.Lock()
+
+    def register_subscription_request(
+        self, account: str, stop: Callable[[str], None],
+    ) -> tuple[int, str]:
+        """Register cancellable work only while this run's account is usable."""
+        with self._lock:
+            reason = self._subscription_terminal.get(account, "")
+            if reason:
+                return 0, reason
+            token = self._next_token
+            self._next_token += 1
+            self._subscription_requests.setdefault(account, {})[token] = stop
+            return token, ""
+
+    def subscription_terminal_reason(self, account: str) -> str:
+        with self._lock:
+            return self._subscription_terminal.get(account, "")
+
+    def unregister_subscription_request(self, account: str, token: int) -> None:
+        with self._lock:
+            requests = self._subscription_requests.get(account)
+            if requests is not None:
+                requests.pop(token, None)
+                if not requests:
+                    self._subscription_requests.pop(account, None)
+
+    def retire_subscription_account(self, account: str, reason: str, *, origin: int) -> None:
+        """Close admission and stop siblings after confirmed quota/auth failure."""
+        if reason not in {"quota", "auth"}:
+            raise ValueError("Only terminal account failures retire subscription work")
+        with self._lock:
+            reason = self._subscription_terminal.setdefault(account, reason)
+            stops = [stop for token, stop in self._subscription_requests.get(account, {}).items()
+                     if token != origin]
+        for stop in stops:
+            stop(reason)
 
     def begin_transport_request(self, fingerprint: str) -> int:
         """Admit a subscription request, or retain a run-local outage pause."""

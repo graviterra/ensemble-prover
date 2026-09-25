@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import functools
+import hashlib
 import json
 import math
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Callable
 
 from .config import RoleConfig
@@ -74,19 +76,56 @@ def bounded_subscription_transport(function):
     """Share sustained transport failures across roles, not across runs."""
     @functools.wraps(function)
     async def wrapped(self, *args, **kwargs):
+        self.validate_requested_controls()
         registry = self._provider_lane_health_registry_for_dispatch()
         fingerprint = self.provider_defer_fingerprint
-        epoch = registry.begin_transport_request(fingerprint)
+        account = self._subscription_account_key()
+        owner = asyncio.current_task()
+        stopped_reason = ""
+        active = True
+
+        def stopped_error(reason: str) -> SubscriptionBackendError:
+            return self.backend_error(
+                f"{self.backend_name} account unavailable in this run; "
+                "resume after resolving the account failure.", kind=reason,
+            )
+
+        def stop(reason: str) -> None:
+            def cancel() -> None:
+                nonlocal stopped_reason
+                if (active and not stopped_reason and owner is not None
+                        and not owner.done() and not owner.cancelling()):
+                    stopped_reason = reason
+                    owner.cancel()
+            if owner is not None and not owner.done() and not owner.get_loop().is_closed():
+                owner.get_loop().call_soon_threadsafe(cancel)
+
+        request_token, reason = registry.register_subscription_request(account, stop)
+        if reason:
+            raise stopped_error(reason)
+        epoch = 0
 
         def recheck() -> None:
             nonlocal epoch
+            reason = registry.subscription_terminal_reason(account)
+            if reason:
+                raise stopped_error(reason)
             epoch = registry.begin_transport_request(fingerprint)
 
         token = _TRANSPORT_ADMISSION.set(recheck)
         try:
+            recheck()
             result = await function(self, *args, **kwargs)
+        except asyncio.CancelledError:
+            if stopped_reason:
+                if owner is not None and owner.uncancel():
+                    raise
+                raise stopped_error(stopped_reason) from None
+            raise
         except SubscriptionBackendError as exc:
-            if exc.provider_response_completed:
+            if exc.backend_kind in {"quota", "auth"}:
+                registry.retire_subscription_account(account, exc.backend_kind, origin=request_token)
+            elif exc.provider_response_completed:
                 registry.record_transport_response(fingerprint)
             elif exc.backend_kind == "transport" and registry.record_transport_failure(fingerprint, epoch):
                 raise ProviderTransportUnavailable() from exc
@@ -95,7 +134,9 @@ def bounded_subscription_transport(function):
             registry.record_transport_response(fingerprint)
             return result
         finally:
+            active = False
             _TRANSPORT_ADMISSION.reset(token)
+            registry.unregister_subscription_request(account, request_token)
     return wrapped
 
 
@@ -144,6 +185,29 @@ class SubscriptionCLIClient:
 
     def _process_environment(self) -> dict[str, str]:
         raise NotImplementedError
+
+    def validate_requested_controls(self) -> None:
+        """Reject required controls that these CLI protocols cannot enforce."""
+        for marker, control in (
+            ("temperature_control_required", "temperature"),
+            ("top_p_control_required", "top_p"),
+            ("output_limit_required", "a hard total output-token limit per invocation"),
+        ):
+            if getattr(self.cfg, marker, False):
+                raise self.backend_error(
+                    f"{self.backend_name} does not support {control}. "
+                    "Use an API provider that supports this required control, "
+                    "or remove the explicit requirement.", kind="capability",
+                )
+
+    def _subscription_account_key(self) -> str:
+        """Identify the CLI credential location without reading credentials."""
+        env = self._process_environment()
+        codex = self.subscription_base_url.startswith("codex:")
+        directory = env.get("CODEX_HOME" if codex else "CLAUDE_CONFIG_DIR")
+        path = Path(directory) if directory else Path.home() / (".codex" if codex else ".claude")
+        identity = self.subscription_base_url + "\n" + str(path.expanduser().resolve())
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     def __init__(self, cfg: RoleConfig, *, provider_lane_health_registry: ProviderLaneHealthRegistry | None = None) -> None:
         if cfg.base_url != self.subscription_base_url or cfg.api_key:
@@ -218,19 +282,25 @@ class SubscriptionCLIClient:
         timeout: float | None,
         on_event: Any = None,
         on_started: Any = None,
+        inactivity_timeout: float | None = None,
+        on_progress: Callable[[dict[str, Any]], bool] | None = None,
+        environment_overrides: dict[str, str] | None = None,
     ) -> tuple[bytes, bytes, int]:
         if self._closed:
             raise self.backend_error(
                 f"{self.backend_name} client is closed", kind="capability"
             )
-        stop_at = None if timeout is None else time.monotonic() + timeout
+        last_progress_at = time.monotonic()
+        stop_at = None if timeout is None else last_progress_at + timeout
+        startup_limits = [value for value in (timeout, inactivity_timeout) if value is not None]
         async with subscription_request_timeout(
-            timeout, f"{self.backend_name} request deadline expired during process startup",
+            min(startup_limits) if startup_limits else None,
+            f"{self.backend_name} request deadline expired during process startup",
         ):
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=cwd,
-                env=self._process_environment(),
+                env={**self._process_environment(), **(environment_overrides or {})},
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -252,6 +322,7 @@ class SubscriptionCLIClient:
                 proc.stdin.close()
 
         async def read_stdout() -> bytes:
+            nonlocal last_progress_at
             assert proc.stdout is not None
             data = bytearray()
             while True:
@@ -268,7 +339,7 @@ class SubscriptionCLIClient:
                     raise self.backend_error(
                         f"{self.backend_name} response exceeds transport size limit"
                     )
-                if on_event is not None:
+                if on_event is not None or on_progress is not None:
                     try:
                         event = json.loads(line, parse_constant=_reject_json_constant)
                     except (ValueError, UnicodeDecodeError, RecursionError):
@@ -279,7 +350,10 @@ class SubscriptionCLIClient:
                         raise self.backend_error(
                             f"{self.backend_name} emitted a non-object event"
                         )
-                    on_event(event)
+                    if on_event is not None:
+                        on_event(event)
+                    if on_progress is not None and on_progress(event) is True:
+                        last_progress_at = time.monotonic()
             return bytes(data)
 
         async def read_stderr() -> bytes:
@@ -309,15 +383,24 @@ class SubscriptionCLIClient:
             ]
             pending = set(tasks)
             while pending:
-                remaining = (
-                    None if stop_at is None else max(0.0, stop_at - time.monotonic())
-                )
+                deadlines = [value for value in (
+                    stop_at,
+                    last_progress_at + inactivity_timeout if inactivity_timeout is not None else None,
+                ) if value is not None]
+                remaining = max(0.0, min(deadlines) - time.monotonic()) if deadlines else None
                 done, pending = await asyncio.wait(
                     pending,
                     timeout=remaining,
                     return_when=asyncio.FIRST_EXCEPTION,
                 )
                 if not done:
+                    now = time.monotonic()
+                    if stop_at is None or now < stop_at:
+                        if inactivity_timeout is None or now < last_progress_at + inactivity_timeout:
+                            continue
+                        raise SubscriptionRequestDeadlineExceeded(
+                            f"{self.backend_name} generation inactivity timeout expired"
+                        )
                     raise SubscriptionRequestDeadlineExceeded(
                         f"{self.backend_name} request deadline expired during generation"
                     )

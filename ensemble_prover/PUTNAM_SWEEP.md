@@ -50,9 +50,9 @@ settings. Use `./scripts/sweep_putnam_unsolved.sh --help` for sweep controls and
 
 ## Acceptance deadlines
 
-Each problem gets one clock, starting before its MiniProver process launches:
+Each problem's acceptance clock starts when the proof worker is ready:
 
-| Time from launch | Requirement to continue |
+| Time from proof worker readiness | Requirement to continue |
 | --- | --- |
 | 1,200 seconds | At least one distinct, newly accepted proof |
 | 1,800 seconds | At least two distinct, newly accepted proofs |
@@ -62,6 +62,11 @@ proofs. Samples and recursive children share these milestones. Repeated proofs
 of the same canonical proposition, formatting changes, cache/import restoration,
 failed checks, and proposed plans do not earn extra milestones. A completed
 problem finishes normally.
+
+Preparation and startup have a separate absolute cap of 1,200 seconds, set with
+`--startup-timeout-s`. Startup liveness checks still detect silent workers.
+Worker recycling does not restart the acceptance clock. A proof accepted during
+startup counts toward the milestones.
 
 These are **absolute deadlines**, not rolling inactivity timers. For example,
 a first acceptance at 1,190 seconds leaves until 1,800 seconds for the second.
@@ -75,6 +80,11 @@ The default polling interval is one second. When a deadline is missed, the sweep
 signals the CLI and its supervisor, then waits for cleanup before advancing.
 Cleanup may take another two minutes. If cleanup cannot be confirmed, the sweep
 stops instead of launching another attempt.
+
+Proof commits and cutoff decisions share a locked authority journal beside each
+attempt directory. A completed commit retains its original acceptance time even
+if delivery to `turns.jsonl` is delayed. An unresolved journal write stops the
+monitor with an infrastructure error rather than recording a missing-proof cutoff.
 
 An abrupt CLI/supervisor death also stops the sweep. Some signal-related worker
 crashes share those exit codes, so the sweep conservatively stops in those cases

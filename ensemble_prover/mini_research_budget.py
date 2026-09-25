@@ -28,6 +28,19 @@ class Donor:
     initial_invocations: int
 
 
+def pending_research_reservation(session: Any, action_id: str) -> tuple[int, float]:
+    """Read the funded grant's outstanding capacity, separate from usage."""
+    state = getattr(session, "native_research_state", None)
+    grant = state.get("grant") if isinstance(state, dict) else None
+    if not isinstance(grant, dict) or not grant.get("background"):
+        return 0, 0.0
+    requests = max(0, int(grant["requests"]) - int(grant.get("accounted", 0)))
+    seconds = float(grant["seconds"]) if grant["action_id"] == action_id else 0.0
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("invalid pending research time reservation")
+    return requests, seconds
+
+
 def _supported_client(client: Any) -> bool:
     from .claude_code_subscription import ClaudeCodeSubscriptionClient
     from .codex_subscription import CodexSubscriptionClient
@@ -57,7 +70,10 @@ def clone_research_client(client: Any) -> Any:
         raise ValueError("native research cannot clone a closed transport")
     config = copy.deepcopy(client.cfg)
     if type(client) is not OpenAICompatClient:
-        return type(client)(config)
+        return type(client)(
+            config,
+            provider_lane_health_registry=client._provider_lane_health_registry_for_dispatch(),
+        )
     clone = OpenAICompatClient(
         config,
         provider_lane_health_registry=client._provider_lane_health_registry_for_dispatch(),

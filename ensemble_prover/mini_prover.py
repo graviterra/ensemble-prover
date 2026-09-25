@@ -12557,6 +12557,7 @@ def _make_role_cfg(
     request_timeout_disabled: Optional[bool] = None,
 ) -> RoleConfig:
     provider = provider.lower()
+    role_timeout_explicit = timeout_s is not None
     if provider not in _DEFAULT_MODELS:
         raise SystemExit(f"Unknown provider: {provider}")
     api_key = (
@@ -12606,6 +12607,17 @@ def _make_role_cfg(
                 f"{role_name} request timeout must be a finite number > 0, "
                 f"got {request_timeout_f}"
             )
+    subscription_inactivity_timeout_s = (
+        timeout_f
+        if provider in {"codex", "claude-code"}
+        and clean_deadline_policy == "soft"
+        and not role_timeout_explicit
+        and request_timeout_s is None
+        and request_timeout_disabled is None
+        else 0.0
+    )
+    if subscription_inactivity_timeout_s:
+        request_timeout_disabled = True
     if request_timeout_disabled is None:
         # Search lifetime and one provider operation are different budgets.
         # Soft policy may ignore a phase deadline, but an individual HTTP
@@ -12632,6 +12644,7 @@ def _make_role_cfg(
     setattr(cfg, "llm_deadline_policy", clean_deadline_policy)
     setattr(cfg, "request_timeout_s", request_timeout_f)
     setattr(cfg, "request_timeout_disabled", bool(request_timeout_disabled))
+    setattr(cfg, "subscription_inactivity_timeout_s", subscription_inactivity_timeout_s)
     return cfg
 
 
@@ -12645,6 +12658,28 @@ def _make_mini_role_client(
     return OpenAICompatClient(
         cfg, provider_lane_health_registry=provider_lane_health_registry,
     )
+
+
+def _apply_subscription_control_requirements(args: Any, cfg: RoleConfig, *, role_name: str) -> None:
+    """Carry explicit user controls to the CLI transport capability check."""
+    if cfg.base_url not in {CODEX_SUBSCRIPTION_BASE_URL, CLAUDE_CODE_SUBSCRIPTION_BASE_URL}:
+        return
+    explicit = set(getattr(args, "_explicit_cli_destinations", ()) or ())
+    phase_controls = {
+        "mini_temperature_formalization_helper", "mini_temperature_lean_repair",
+        "mini_temperature_route_assembly", "mini_temperature_stagnation_escape",
+    }
+    phase_controls.update(
+        {"mini_temperature_planner", "mini_temperature_initial_proof"}
+        if role_name == "prover" else {"mini_temperature_refine"}
+    )
+    phase_enabled = bool(getattr(args, "mini_phase_temperatures", True))
+    temperature_required = bool(
+        (phase_enabled and (phase_controls & explicit or "mini_phase_temperatures" in explicit))
+        or ("parallel_temps" in explicit and getattr(args, "parallel_temps", ""))
+    )
+    setattr(cfg, "temperature_control_required", temperature_required)
+    setattr(cfg, "output_limit_required", bool(getattr(args, "require_output_token_limit", False)))
 
 
 def _normalize_reasoning_cli_mode(mode: Optional[str]) -> str:
@@ -12812,6 +12847,9 @@ def _llm_deadline_cli_summary(cfg: Optional[RoleConfig]) -> Optional[Dict[str, A
             else None
         ),
         "request_timeout_disabled": request_timeout_disabled,
+        "subscription_inactivity_timeout_s": float(
+            getattr(cfg, "subscription_inactivity_timeout_s", 0.0) or 0.0
+        ),
         "operation_timeout_s": (
             float(getattr(cfg, "operation_timeout_s"))
             if getattr(cfg, "operation_timeout_s", None) is not None
@@ -12924,9 +12962,11 @@ def _build_argparser() -> argparse.ArgumentParser:
             "kill switch. Each HTTP request retains the finite role/model "
             "watchdog unless --llm-request-timeout-s off (or a role-scoped "
             "equivalent) explicitly disables it.\n"
-            "  For Claude Code and Codex subscriptions, that watchdog is an "
-            "absolute CLI request deadline, including thinking. Progress "
-            "events do not extend it; a killed CLI generation cannot resume.\n"
+            "  Claude Code and Codex subscriptions default to a 300s inactivity "
+            "watchdog in soft mode. Genuine generation progress renews it; "
+            "status and retry messages do not. Explicit role/request timeouts "
+            "and hard mode use absolute deadlines, including thinking. "
+            "A killed CLI generation cannot resume.\n"
             "  Use --llm-deadline-policy hard for fail-fast experiments that "
             "reject a late LLM/tool-loop operation at the role or phase "
             "deadline; it does not cap the overall MiniSession run.\n"
@@ -13094,22 +13134,24 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=_positive_finite_float_arg,
         default=None,
         help=(
-            "Default per-request HTTP watchdog for both roles. "
+            "Per-request HTTP watchdog or absolute subscription CLI deadline "
+            "for both roles when explicitly supplied. "
             "Defaults are model/provider-specific (OpenRouter or Qwen: "
-            "1200s; DeepSeek-V4: 600s; others: 300s)."
+            "1200s; DeepSeek-V4: 600s; others: 300s). Default soft-policy "
+            "subscription requests use a 300s inactivity watchdog."
         ),
     )
     p.add_argument(
         "--prover-timeout-s",
         type=_positive_finite_float_arg,
         default=None,
-        help="Override per-request LLM HTTP patience for the prover role only.",
+        help="Override the HTTP watchdog / absolute subscription CLI deadline for the prover role only.",
     )
     p.add_argument(
         "--refiner-timeout-s",
         type=_positive_finite_float_arg,
         default=None,
-        help="Override per-request LLM HTTP patience for the refiner role only.",
+        help="Override the HTTP watchdog / absolute subscription CLI deadline for the refiner role only.",
     )
     p.add_argument(
         "--llm-request-timeout-s",
@@ -13119,8 +13161,8 @@ def _build_argparser() -> argparse.ArgumentParser:
             "HTTP response timeout, or absolute CLI request deadline for "
             "subscription providers, for both roles. Use a finite number of "
             "seconds, or 'none'/'off'/'unbounded' to disable this clock. "
-            "Default: the finite role/model "
-            "timeout in both soft and hard deadline modes."
+            "Default: the role/model watchdog for HTTP; a progress-renewed "
+            "300s inactivity watchdog for soft-policy subscriptions."
         ),
     )
     p.add_argument(
@@ -13134,6 +13176,15 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=_llm_request_timeout_arg,
         default=None,
         help="Override HTTP response timeout / absolute subscription CLI deadline for the refiner role only.",
+    )
+    p.add_argument(
+        "--require-output-token-limit",
+        action="store_true",
+        help=(
+            "Require a hard total output-token limit for each provider invocation. "
+            "Subscription CLIs that cannot enforce this fail before generation; "
+            "per-request caps inside CLI retries do not satisfy this requirement."
+        ),
     )
     p.add_argument(
         "--llm-deadline-policy",
@@ -15146,6 +15197,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             request_timeout_s=prover_request_timeout_s,
             request_timeout_disabled=prover_request_timeout_disabled,
         )
+        _apply_subscription_control_requirements(args, prover_cfg, role_name="prover")
         prover_reasoning_mode, prover_reasoning_effort = _reasoning_role_cli_settings(
             args,
             "prover",
@@ -15171,6 +15223,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 request_timeout_s=refiner_request_timeout_s,
                 request_timeout_disabled=refiner_request_timeout_disabled,
             )
+            _apply_subscription_control_requirements(args, refiner_cfg, role_name="refiner")
             refiner_reasoning_mode, refiner_reasoning_effort = (
                 _reasoning_role_cli_settings(
                     args,
@@ -15190,10 +15243,17 @@ async def _main_async(args: argparse.Namespace) -> int:
             )
         for role_client in (prover_client, refiner_client):
             if isinstance(role_client, (CodexSubscriptionClient, ClaudeCodeSubscriptionClient)):
+                role_client.validate_requested_controls()
                 await role_client.preflight()
+                output_control = (
+                    "output-token caps apply per internal provider request, not to the whole CLI invocation"
+                    if (isinstance(role_client, ClaudeCodeSubscriptionClient)
+                        and role_client.output_token_cap_supported)
+                    else "output-token limits are prompt targets"
+                )
                 print(
                     f"[mini_prover] {role_client.cfg.name}: {role_client.backend_name} subscription "
-                    f"({role_client.cli_version}); output-token limits are prompt targets; "
+                    f"({role_client.cli_version}); {output_control}; "
                     "temperature/top_p are not sent.",
                     flush=True,
                 )
@@ -15298,18 +15358,20 @@ async def _main_async(args: argparse.Namespace) -> int:
                 # an unbounded watchdog for a role that does not exist is the
                 # same kind of misreport this message replaced.
                 return "n/a"
+            inactivity_s = float(getattr(role_cfg, "subscription_inactivity_timeout_s", 0.0) or 0.0)
+            if inactivity_s > 0.0:
+                return f"{inactivity_s:g}s inactivity"
             configured = getattr(role_cfg, "request_timeout_s", None)
             if configured is None:
                 return "unbounded"
-            return f"{float(configured):g}s"
+            return f"{float(configured):g}s absolute"
 
         # Report what is actually armed rather than asserting a watchdog
         # exists. The old text ("each provider operation retains its finite
         # role watchdog") hid that soft policy removes the operation-level
         # deadline entirely, and cost real time diagnosing a silent stall.
-        # What survives is a whole-attempt wall clock -- httpx applies the
-        # value to connect/read/write/pool and it is wrapped in an outer
-        # asyncio.wait -- not merely a read watchdog.
+        # HTTP clocks bound whole attempts; default subscription clocks bound
+        # inactivity. Explicit subscription deadlines retain absolute limits.
         _deadline_policy = str(
             getattr(args, "llm_deadline_policy", "soft") or "soft"
         )
@@ -15321,7 +15383,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         print(
             "LLM deadline policy: "
             f"{_deadline_policy} "
-            f"({_policy_note} a per-request wall clock: "
+            f"({_policy_note} per-request watchdogs: "
             f"prover={_armed_attempt_wall(prover_cfg)}, "
             f"refiner={_armed_attempt_wall(refiner_cfg)}; "
             "disable with --llm-request-timeout-s off; HTTP transport retries "
@@ -15510,6 +15572,13 @@ async def _main_async(args: argparse.Namespace) -> int:
             # Python reached ``main``. MiniSession fires the callback only
             # after premise retrieval and session construction.
             from .mini_session.process_watchdog import signal_worker_ready
+
+            def signal_proof_worker_ready() -> None:
+                from .sweep_control import signal_sweep_worker_ready
+
+                signal_sweep_worker_ready()
+                signal_worker_ready()
+
             ok, proof = await prove_problem(
                 problem=problem,
                 prover_client=prover_client,
@@ -15898,7 +15967,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 theory_promote_verified_helpers=bool(
                     getattr(args, "mini_theory_promote_verified_helpers", False)
                 ),
-                worker_ready_callback=signal_worker_ready,
+                worker_ready_callback=signal_proof_worker_ready,
             )
         except Exception as exc:
             failure_reason, failure_reason_detail = _mini_prover_exception_failure(exc)
