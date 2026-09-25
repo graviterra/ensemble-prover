@@ -35230,6 +35230,14 @@ class MiniSession:
 
     def _frontier_candidate_ids_for_work_type(self, work_type: str) -> List[str]:
         work_type = str(work_type or "")
+        # Optional refinement must inherit the same scoped work as proving.
+        # Only advertise a configured refiner: a phantom later candidate can
+        # otherwise keep exhausted obligations open in prover-only sessions.
+        refiner_ids = (
+            ["conversation_turn_refine"]
+            if self.registered_action("conversation_turn_refine") is not None
+            else []
+        )
         if work_type == "root_replan":
             return ["graph_root_replan"]
         if work_type == "assembly":
@@ -35276,18 +35284,23 @@ class MiniSession:
                 *dict.fromkeys(recursive_ids),
                 "graph_native_shortcut",
                 "conversation_turn_prove",
+                *refiner_ids,
             ]
         if work_type == "target_integrity_adjudication":
-            return ["conversation_turn_prove"]
+            return ["conversation_turn_prove", *refiner_ids]
         if work_type in {
             "formalize_claim",
             "prove_claim_variant",
         }:
-            return ["graph_native_shortcut", "conversation_turn_prove"]
+            return [
+                "graph_native_shortcut",
+                "conversation_turn_prove",
+                *refiner_ids,
+            ]
         if work_type == "materialize_replay_source":
-            return ["conversation_turn_prove"]
+            return ["conversation_turn_prove", *refiner_ids]
         if work_type == "formalize_missing_obligation":
-            return ["conversation_turn_prove"]
+            return ["conversation_turn_prove", *refiner_ids]
         if work_type == "root_repair":
             # Root-repair is itself a formal-state bottleneck.  Keeping formal
             # search exclusive to ``formal_state_expand`` made the feature

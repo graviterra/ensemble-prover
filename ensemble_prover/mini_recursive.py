@@ -17453,6 +17453,12 @@ async def run_mini_recursive_attempt(
         )
         if _callable_accepts_keyword(run_conversation_fn, key)
     }
+    if recursive_helper_refine and _callable_accepts_keyword(
+        run_conversation_fn, "refiner_client"
+    ):
+        # Nested helper refinement needs the configured client as well as the
+        # enabled flag; the current turn's client may belong to either role.
+        child_planner_kwargs["refiner_client"] = refiner_client
     # These values also configure nested conversation construction, whose
     # historical defaults are 40/64.  Keep omission distinct from an explicit
     # override so the recursive driver's own config remains authoritative for
@@ -18763,15 +18769,9 @@ async def run_mini_recursive_attempt(
                 variant_index,
                 planner_handoff=planner_handoff,
             )
-        if not ok or not proof_text:
-            # Snapshot the parent helper state BEFORE banking the child's helpers.
-            # The merge must precede failed_child_result so negation certification
-            # sees the child's helpers, but a child that DISPROVES its obligation
-            # must not leave its side lemmas in the parent (that poisons the
-            # frontier / evidence fingerprint for later planning).  The durable
-            # invalidation is stored in separate structures and survives this
-            # restore, which only rewinds the helper caches.
-            pre_merge_helper_state = snapshot_parent_helper_state()
+        async def failed_child_handoff_result() -> Optional[ClaimProofResult]:
+            """Settle a prover result before granting another role's work."""
+
             merge_subgoal_verified_helpers()
             terminal_result = terminal_child_result()
             if terminal_result.terminal_failure_reason:
@@ -18802,6 +18802,17 @@ async def run_mini_recursive_attempt(
                     # helpers so a falsified route cannot seed the parent.
                     rewind_parent_helper_state(pre_merge_helper_state)
                 return failure_result
+            return None
+
+        if not ok or not proof_text:
+            # Snapshot before either prover pass banks side helpers. A later
+            # authoritative negation must rewind the whole failed obligation,
+            # while its separate durable invalidation remains recorded.
+            pre_merge_helper_state = snapshot_parent_helper_state()
+            handoff_failure = await failed_child_handoff_result()
+            if handoff_failure is not None:
+                return handoff_failure
+
         async def run_role_handoff_conversation(
             *,
             handoff_client: Any,
@@ -19051,6 +19062,9 @@ async def run_mini_recursive_attempt(
                     0,
                     remaining_claim_turns - owned_turns_used,
                 )
+                handoff_failure = await failed_child_handoff_result()
+                if handoff_failure is not None:
+                    return handoff_failure
                 post_drain_handoff = (
                     _retire_ordinary_provider_state_for_role_handoff(
                         subgoal_conv

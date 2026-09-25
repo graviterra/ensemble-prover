@@ -1437,18 +1437,40 @@ class Conversation:
             if keep_recent_tool_rounds
             else ()
         )
+        retained_tool_ids: Dict[str, str] = {}
 
         def bounded_recent_tool_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             role = str(msg.get("role", "") or "")
             if role == "assistant" and msg.get("tool_calls"):
-                return _provider_safe_chat_message(
+                safe = _provider_safe_chat_message(
                     msg,
                     redact_solution_refs=_conversation_should_redact_solution_refs(
                         self
                     ),
                 )
+                # Persist the same ID rewrite on both sides of an exchange.
+                # Retry compaction and orphan recovery inspect history before
+                # provider serialization can normalize the result IDs. Signed
+                # continuation messages retain their original IDs here.
+                retained_tool_ids.clear()
+                used_ids: Set[str] = set()
+                for raw_call, safe_call in zip(
+                    msg["tool_calls"], safe["tool_calls"]
+                ):
+                    base = str(safe_call["id"])
+                    candidate = base
+                    suffix = 2
+                    while candidate in used_ids:
+                        candidate = f"{base}__{suffix}"
+                        suffix += 1
+                    used_ids.add(candidate)
+                    safe_call["id"] = candidate
+                    retained_tool_ids[str(raw_call["id"])] = candidate
+                return safe
             if role == "tool":
                 safe = dict(msg)
+                raw_tool_id = str(msg.get("tool_call_id", "") or "")
+                safe["tool_call_id"] = retained_tool_ids.get(raw_tool_id, raw_tool_id)
                 raw_content = str(msg.get("content", "") or "")
                 redact = _conversation_should_redact_solution_refs(self)
                 try:
@@ -1512,6 +1534,7 @@ class Conversation:
                         strip_comments=False,
                     )
                 return safe
+            retained_tool_ids.clear()
             return msg
 
         evidence_boundary_content = (

@@ -10211,7 +10211,7 @@ class ConversationTurnAction:
         cls,
         state: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        """Retain one lane's wall lease without transcript-bound protocol state."""
+        """Retain spent lane budgets without transcript-bound protocol state."""
 
         sanitized: Dict[str, Any] = {
             key: False for key in cls._PROVIDER_QUANTUM_BOOL_STATE_KEYS
@@ -10243,6 +10243,12 @@ class ConversationTurnAction:
         sanitized["provider_turn_lane_identity"] = str(
             state.get("provider_turn_lane_identity") or ""
         )
+        for key in (
+            "tool_calls_used",
+            "repair_discovery_tool_calls_used",
+            "repair_verification_tool_calls_used",
+        ):
+            sanitized[key] = int(state.get(key, 0) or 0)
         for key in (
             "provider_call_cumulative_elapsed_s",
             "provider_call_cumulative_wall_cap_s",
@@ -10503,7 +10509,7 @@ class ConversationTurnAction:
             else:
                 # Sibling roles can append mutually divergent transcripts.
                 # Preserve the live mathematical evidence and the exact
-                # non-refundable wall lease, but reset every tool/finalizer
+                # non-refundable wall and tool budgets, but reset tool/finalizer
                 # cursor whose meaning depends on the parked transcript.
                 state = self._provider_quantum_timing_only_state(state)
                 merged_history = live_history
@@ -12408,13 +12414,20 @@ class ConversationTurnAction:
             )
             searcher = None
 
+        # A parked provider continuation can restore the role before this
+        # point. Its prompt budget still belongs to this action, even when a
+        # sibling most recently owned the shared conversation.
+        if conv is not None:
+            conv.turn_budget = self.max_turns_for_budget or int(
+                getattr(session, "max_iterations", 0) or 0
+            )
+
         # Legacy refiner handoff is role-driven: when the refiner action
         # first takes over it switches the conversation role and appends the
         # explicit recovery instruction before the next LLM call.
         if conv is not None and str(getattr(conv, "role", "") or "") != self.role:
             try:
                 conv.role = self.role
-                conv.turn_budget = self.max_turns_for_budget or getattr(conv, "turn_budget", 0)
                 if self.role == "refine":
                     summarize = getattr(
                         conv,
