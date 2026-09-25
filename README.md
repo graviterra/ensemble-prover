@@ -152,25 +152,6 @@ the proof files and answers are not.
 > The current source also includes experimental coordinated and autonomous
 > research; older release snapshots may not contain these entry points.
 
-## Start research from a saved run
-
-From the repository directory, use one command:
-
-```bash
-./research runs/mini_prover/YOUR_RUN
-```
-
-This creates and starts integrated research, independent reviews and Lean proof
-search using the saved Mini model, provider and project. It prints the new research
-directory. New runs default to 4 hours and 200 model calls across all roles;
-use `--hours 8 --requests 600` to choose a larger initial budget.
-
-Pass the printed research directory to the same command to resume. Add `--status`
-to inspect progress. Resuming preserves the original budget. Add `--prepare` when
-creating a run to save it without starting model work, or `--source finding.txt`
-to include an outside finding. Saved Codex and OpenAI providers are supported;
-other providers require an explicit supported selection.
-
 ## Documentation
 
 Start with the **[User Guide](docs/USER_GUIDE.md)** for installation, theorem
@@ -418,6 +399,25 @@ these tools do not provide comprehensive literature coverage.
 See the [research
 walkthrough](docs/USER_GUIDE.md#21-run-autonomous-mathematical-research) and
 [full execution contract](ensemble_prover/research_claims/DISCOVERY.md).
+
+## Start research from a saved run
+
+From the repository directory, use one command:
+
+```bash
+./research runs/mini_prover/YOUR_RUN
+```
+
+This creates and starts integrated research, independent reviews and Lean proof
+search using the saved Mini model, provider and project. It prints the new research
+directory. New runs default to 4 hours and 200 model calls across all roles;
+use `--hours 8 --requests 600` to choose a larger initial budget.
+
+Pass the printed research directory to the same command to resume. Add `--status`
+to inspect progress. Resuming preserves the original budget. Add `--prepare` when
+creating a run to save it without starting model work, or `--source finding.txt`
+to include an outside finding. Saved Codex and OpenAI providers are supported;
+other providers require an explicit supported selection.
 
 ## Verify a checkout
 
