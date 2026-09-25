@@ -1,6 +1,6 @@
 # Ensemble Prover
 
-Last updated: 2026-09-22.
+Last updated: 2026-09-25.
 
 This repository contains a research-grade autonomous theorem prover that
 combines language-model proof search with Lean verification. Given a formalized
@@ -470,6 +470,26 @@ processes are also marked non-dumpable on Linux to block descendant `/proc`
 inspection. Untrusted Lean code still runs with the prover user's filesystem
 and network privileges, so operating-system isolation may still be required. A
 Python virtual environment is not a security boundary.
+
+## Cite this work
+
+If you use Ensemble Prover in your research, experiments, or software, please cite:
+
+> Reale, M. (2026). *Ensemble Prover* [Computer software]. Graviterra.
+> [GitHub repository](https://github.com/graviterra/ensemble-prover).
+
+```bibtex
+@software{reale2026ensembleprover,
+  author       = {Reale, M.},
+  title        = {{Ensemble Prover}},
+  year         = {2026},
+  organization = {Graviterra},
+  url          = {https://github.com/graviterra/ensemble-prover}
+}
+```
+
+For reproducibility, please also identify the release or commit used.
+Machine-readable citation metadata is available in [CITATION.cff](CITATION.cff).
 
 ## Contributing and licensing
 

@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: >-
+  If you use Ensemble Prover in your research, experiments, or software,
+  please cite it as below. For reproducibility, please also identify the
+  release or commit used.
+type: software
+title: Ensemble Prover
+authors:
+  - family-names: Reale
+    given-names: M.
+    affiliation: Graviterra
+url: https://github.com/graviterra/ensemble-prover
+repository-code: https://github.com/graviterra/ensemble-prover
+license: MIT
+preferred-citation:
+  type: software
+  title: Ensemble Prover
+  authors:
+    - family-names: Reale
+      given-names: M.
+      affiliation: Graviterra
+  year: 2026
+  publisher:
+    name: Graviterra
+  url: https://github.com/graviterra/ensemble-prover
