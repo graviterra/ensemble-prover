@@ -627,8 +627,14 @@ def _summary_solved(output_dir: Path, exit_code: int | None = None) -> bool:
 
 def _summary_provider_infrastructure_reason(output_dir: Path) -> str:
     """Read a terminal provider outage, not an earlier scoped route failure."""
+    summary_path = output_dir / "summary.json"
+    if not summary_path.is_file() and not (output_dir / "turns.jsonl").exists():
+        # Preparation has a separate supervised generation so proof startup
+        # can still require an empty directory. Only consult it before proof
+        # work starts; a later proof result takes precedence over old setup.
+        summary_path = answer_preparation_dir(output_dir) / "summary.json"
     try:
-        data = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ""
     if (

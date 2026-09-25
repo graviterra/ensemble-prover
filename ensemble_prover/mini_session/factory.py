@@ -1383,6 +1383,7 @@ def _clone_dossier_for_session(supplied: ProofDossier) -> ProofDossier:
         proof_cache_publish_enabled=bool(
             getattr(supplied, "proof_cache_publish_enabled", True)
         ),
+        forced_context_helper_blocks=tuple(supplied.forced_context_helper_blocks),
         suppress_solution_placeholders=bool(
             getattr(supplied, "suppress_solution_placeholders", True)
         ),
@@ -5456,7 +5457,9 @@ async def prove_problem_via_session(
                 failed_sample_indices.add(sample_index)
                 sample_failures.append(record_parallel_sample_failure(
                     attempt_dossier, sample_index=sample_index,
-                    error_kind=type(exc).__name__, error=exc.reason, stage="provider_account_pause",
+                    error_kind=type(exc).__name__, error=exc.reason,
+                    stage=("provider_transport_pause" if exc.reason == "provider_transport_unavailable"
+                           else "provider_account_pause"),
                 ))
         late_sample_grace_s = max(
             0.0,

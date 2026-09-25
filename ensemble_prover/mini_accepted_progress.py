@@ -164,11 +164,13 @@ def committed_acceptance_records(
 
     helper_names = dict.fromkeys(outcome.helpers_added)
     if prior_formal_evidence is not None:
+        from .mini_session.progress_identity import helper_progress_keys
+        helper_keys = helper_progress_keys(dossier)
         prior = set(prior_formal_evidence)
         # An auxiliary proof can survive rejection of its dispatch's target,
         # even when that outcome deliberately reports no target progress.
         for name, helper in helpers.items():
-            if f"helper:{name}:{helper.source_hash}" not in prior:
+            if f"helper:{helper_keys[name]}" not in prior:
                 helper_names[name] = None
     for name in helper_names:
         helper = helpers.get(name)

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import json
 import math
 import os
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from .config import RoleConfig
-from .llm_error_policy import SubscriptionBackendError
+from .llm_error_policy import SubscriptionBackendError, ProviderTransportUnavailable
 from .models import OpenAICompatClient, provider_serving_fingerprint
+from .provider_health import ProviderLaneHealthRegistry
 from .subprocess_cleanup import (
     request_process_termination_nowait,
     terminate_and_reap_process,
@@ -20,6 +23,16 @@ from .subprocess_cleanup import (
 
 _MAX_STREAM_BYTES = 16 * 1024 * 1024
 _MAX_STDERR_BYTES = 32 * 1024
+_TRANSPORT_ADMISSION: contextvars.ContextVar[Callable[[], None] | None] = contextvars.ContextVar(
+    "subscription_transport_admission", default=None,
+)
+
+
+def check_subscription_transport_admission() -> None:
+    """Recheck the owning request after admission/process-start awaits."""
+    check = _TRANSPORT_ADMISSION.get()
+    if check is not None:
+        check()
 
 _INSTRUCTIONS = """You are the language-model backend for an automated Lean theorem prover.
 Produce exactly ONE assistant response to the supplied conversation, obeying its
@@ -38,6 +51,35 @@ string. The requested output token count is a target for your response.
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"Non-JSON numeric constant: {value}")
+
+
+def bounded_subscription_transport(function):
+    """Share sustained transport failures across roles, not across runs."""
+    @functools.wraps(function)
+    async def wrapped(self, *args, **kwargs):
+        registry = self._provider_lane_health_registry_for_dispatch()
+        fingerprint = self.provider_defer_fingerprint
+        epoch = registry.begin_transport_request(fingerprint)
+
+        def recheck() -> None:
+            nonlocal epoch
+            epoch = registry.begin_transport_request(fingerprint)
+
+        token = _TRANSPORT_ADMISSION.set(recheck)
+        try:
+            result = await function(self, *args, **kwargs)
+        except SubscriptionBackendError as exc:
+            if exc.provider_response_completed:
+                registry.record_transport_response(fingerprint)
+            elif exc.backend_kind == "transport" and registry.record_transport_failure(fingerprint, epoch):
+                raise ProviderTransportUnavailable() from exc
+            raise
+        else:
+            registry.record_transport_response(fingerprint)
+            return result
+        finally:
+            _TRANSPORT_ADMISSION.reset(token)
+    return wrapped
 
 
 def _response_schema(names: list[str]) -> dict[str, Any]:
@@ -81,11 +123,12 @@ class SubscriptionCLIClient:
     )
     _positive_finite_timeout = OpenAICompatClient._positive_finite_timeout
     _configured_request_timeout_s = OpenAICompatClient._configured_request_timeout_s
+    _provider_lane_health_registry_for_dispatch = OpenAICompatClient._provider_lane_health_registry_for_dispatch
 
     def _process_environment(self) -> dict[str, str]:
         raise NotImplementedError
 
-    def __init__(self, cfg: RoleConfig) -> None:
+    def __init__(self, cfg: RoleConfig, *, provider_lane_health_registry: ProviderLaneHealthRegistry | None = None) -> None:
         if cfg.base_url != self.subscription_base_url or cfg.api_key:
             raise ValueError(
                 f"{self.backend_name} requires {self.subscription_base_url} and no API key"
@@ -93,6 +136,8 @@ class SubscriptionCLIClient:
         if not cfg.model.strip():
             raise ValueError(f"{self.backend_name} requires an explicit model")
         self.cfg = cfg
+        self._configured_provider_lane_health_registry = provider_lane_health_registry
+        self._provider_lane_health_registry = provider_lane_health_registry or ProviderLaneHealthRegistry()
         self.base_url = self.subscription_base_url
         self.provider_defer_fingerprint = provider_serving_fingerprint(cfg)
         if not str(getattr(cfg, "provider_defer_fingerprint", "") or "").strip():

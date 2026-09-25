@@ -36,6 +36,8 @@ from .provider_response import publish_provider_response
 from .provider_progress import PROGRESS_KEY, progress_snapshot
 from .sampling_controls import is_api_default_temperature_override
 from .subscription_cli import (
+    bounded_subscription_transport,
+    check_subscription_transport_admission,
     SubscriptionCLIClient,
     _reject_json_constant,
     _response_schema,
@@ -390,6 +392,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             argv.extend(["--effort", effort])
         return argv
 
+    @bounded_subscription_transport
     async def chat_raw(
         self,
         messages: list[dict[str, Any]],
@@ -504,7 +507,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
         )
         completed = False
         structured_answer: dict[str, Any] | None = None
-        failure = ""
+        observed_failures: dict[str, ClaudeCodeBackendError] = {}
         failed_turn = False
         thread_id = ""
         usage_payload: dict[str, Any] | None = None
@@ -612,8 +615,22 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 usage_observed = True
             emit_usage_callback(usage_callback, record)
 
+        def observe_failure(value: Any, depth: int = 0) -> None:
+            # Raw CLI diagnostics are used locally only. Retain bounded,
+            # classified exceptions, never provider text or credentials.
+            if isinstance(value, str):
+                classified = _cli_failure(value)
+                observed_failures[classified.backend_kind] = classified
+            elif depth < 4 and isinstance(value, list):
+                for item in value:
+                    observe_failure(item, depth + 1)
+            elif depth < 4 and isinstance(value, dict):
+                for key in ("type", "code", "message", "error"):
+                    if key in value:
+                        observe_failure(value[key], depth + 1)
+
         def on_event(event: dict[str, Any]) -> None:
-            nonlocal completed, structured_answer, failure, failed_turn, thread_id, initialized
+            nonlocal completed, structured_answer, failed_turn, thread_id, initialized
             kind = event.get("type")
             if thread_id and event.get("session_id", thread_id) != thread_id:
                 raise incompatible_event(event)
@@ -706,6 +723,11 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     raise ClaudeCodeBackendError(
                         "Claude Code emitted an invalid message"
                     )
+                if kind == "assistant" and event.get("error"):
+                    observe_failure(event["error"])
+                    for block in blocks:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            observe_failure(block.get("text", ""))
                 for block in blocks:
                     if not isinstance(block, dict):
                         raise ClaudeCodeBackendError(
@@ -756,7 +778,14 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     report_progress("responding", event)
                 return
             if kind == "rate_limit_event":
-                return  # The final result establishes whether the request succeeded.
+                info = event.get("rate_limit_info")
+                if isinstance(info, dict) and info.get("status") == "rejected":
+                    known_window = info.get("rateLimitType") in (
+                        "five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
+                        "seven_day_overage_included", "overage",
+                    )
+                    observe_failure("usage limit" if known_window else "rate limit")
+                return  # A later successful result still wins over retry telemetry.
             if kind != "result":
                 raise incompatible_event(event)
             if completed:
@@ -785,12 +814,18 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 event.get("subtype") != "success" or event.get("is_error") is not False
             )
             if failed_turn:
-                failure = str(
-                    event.get("errors")
-                    or event.get("result")
-                    or event.get("subtype")
-                    or "Claude Code failed"
-                )
+                for key in ("errors", "result", "subtype"):
+                    if event.get(key):
+                        observe_failure(event[key])
+                if initialized and event.get("subtype") in {
+                    "error_max_structured_output_retries", "error_max_turns", "error_max_budget_usd",
+                }:
+                    # The CLI completed a bounded response attempt, not a
+                    # broken transport. Explicit account errors still win.
+                    observed_failures["response"] = ClaudeCodeBackendError(
+                        "Claude Code exhausted its per-request response limit",
+                        kind="response", validation_stage="missing_response",
+                    )
             else:
                 if not initialized:
                     raise ClaudeCodeBackendError(
@@ -802,6 +837,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
 
         def on_started() -> None:
             nonlocal dispatched
+            check_subscription_transport_admission()
             dispatched = True
             mark_provider_dispatched(**authority)
             report_progress("requesting")
@@ -843,6 +879,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     raise ClaudeCodeBackendError(
                         "Claude Code client is closed", kind="capability"
                     )
+                check_subscription_transport_admission()
                 _, stderr, code = await self._process(
                     argv,
                     cwd=cwd,
@@ -893,9 +930,10 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 if dispatched and final_progress_status != "finished":
                     report_progress(final_progress_status)
         if code or not completed or failed_turn:
-            raise _cli_failure(
-                failure + "\n" + stderr.decode("utf-8", errors="replace")
-            )
+            observe_failure(stderr.decode("utf-8", errors="replace"))
+            for kind in ("context", "quota", "auth", "capability", "rate_limit", "response", "transport"):
+                if kind in observed_failures:
+                    raise observed_failures[kind]
         # Completion includes the full wire stream and a successful process exit.
         # Keep native actions and transport failures authoritative until then.
         try:

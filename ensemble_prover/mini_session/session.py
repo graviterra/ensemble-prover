@@ -10716,6 +10716,7 @@ class MiniSession:
     )
     _action_start_frontier_formal_signature: str = ""
     _action_start_frontier_formal_evidence: Tuple[str, ...] = ()
+    _action_start_proved_graph_node_ids: Set[str] = field(default_factory=set)
     _action_start_frontier_action_key: Optional[Tuple[str, str, str, str, str, str]] = (
         None
     )
@@ -16974,13 +16975,12 @@ class MiniSession:
         ).strip()
         if canonical_dossier_statement_key(target) != canonical_dossier_statement_key(root):
             return False
+        from .progress_identity import helper_progress_keys
+        helper_keys = helper_progress_keys(self.dossier)
         fresh_helpers = [
             str(name)
             for name in tuple(outcome.helpers_added or ())
-            if any(
-                item.startswith(f"helper:{name}:")
-                for item in fresh_formal_evidence
-            )
+            if name in helper_keys and f"helper:{helper_keys[name]}" in fresh_formal_evidence
         ]
         if not fresh_helpers:
             return False
@@ -28262,6 +28262,8 @@ class MiniSession:
             graph, "_proved_node_has_durable_certificate", None
         )
         if self._action_start_frontier_formal_signature and callable(graph_certificate):
+            from .progress_identity import graph_progress_projection
+            _, _, graph_keys = graph_progress_projection(self.dossier, self._progress_node_record)
             for node_id, target in dict(getattr(graph, "nodes", {}) or {}).items():
                 if (
                     getattr(target, "kind", "")
@@ -28269,16 +28271,10 @@ class MiniSession:
                     or getattr(target, "status", "") != "proved"
                 ):
                     continue
-                prefix = f"proof_graph:{node_id}:"
                 if (
-                    any(
-                        item.startswith(prefix)
-                        for item in fresh_action_formal_evidence
-                    )
-                    and not any(
-                        item.startswith(prefix)
-                        for item in action_start_formal_evidence
-                    )
+                    node_id not in self._action_start_proved_graph_node_ids
+                    and node_id in graph_keys
+                    and f"proof_graph:{graph_keys[node_id]}" in fresh_action_formal_evidence
                     and graph_certificate(target)
                 ):
                     newly_proved_graph_targets.append(node_id)
@@ -28661,6 +28657,7 @@ class MiniSession:
             self._action_start_durable_progress_signature = ""
             self._action_start_frontier_formal_signature = ""
             self._action_start_frontier_formal_evidence = ()
+            self._action_start_proved_graph_node_ids.clear()
             self._action_start_frontier_action_key = None
         conversation_attempt_identity = str(
             self._action_start_proof_work_semantic_identity or ""
@@ -28755,6 +28752,7 @@ class MiniSession:
         if str(outcome.action_id or "").startswith("conversation_turn"):
             self._action_start_frontier_formal_signature = ""
             self._action_start_frontier_formal_evidence = ()
+            self._action_start_proved_graph_node_ids.clear()
             self._action_start_frontier_action_key = None
         if outcome.progress or root_strong_progress:
             if final_strong_progress:
@@ -30520,45 +30518,18 @@ class MiniSession:
             ]
 
         dossier = getattr(self, "dossier", None)
-        verified_helpers: List[Dict[str, str]] = []
-        raw_helpers = getattr(dossier, "verified_helpers", None)
-        if isinstance(raw_helpers, dict):
-            for name, helper in sorted(
-                raw_helpers.items(), key=lambda item: str(item[0])
-            ):
-                verified_helpers.append(
-                    {
-                        "name": str(name or ""),
-                        "source_hash": str(
-                            getattr(helper, "source_hash", "")
-                            or text_hash(str(getattr(helper, "source", "") or ""))
-                        ),
-                    }
-                )
-
-        graph = getattr(dossier, "proof_graph", None)
-        graph_nodes: List[Dict[str, Any]] = []
-        raw_graph_nodes = getattr(graph, "nodes", None)
-        if isinstance(raw_graph_nodes, dict):
-            graph_nodes = [
-                self._progress_node_record(node, fallback_id=str(node_id or ""))
-                for node_id, node in sorted(
-                    raw_graph_nodes.items(), key=lambda item: str(item[0])
-                )
-            ]
-        graph_edges = sorted(
-            (
-                str(getattr(edge, "source", "") or ""),
-                str(getattr(edge, "target", "") or ""),
-                str(getattr(edge, "kind", "") or ""),
-            )
-            for edge in list(getattr(graph, "edges", ()) or ())
+        from .progress_identity import graph_progress_projection, helper_progress_keys
+        helper_keys = helper_progress_keys(dossier)
+        verified_helpers = sorted(set(helper_keys.values()))
+        graph_nodes, graph_edges, _ = graph_progress_projection(
+            dossier, self._progress_node_record, helper_keys=helper_keys,
         )
         payload = {
             "proof_state_nodes": proof_state_nodes,
             "verified_helpers": verified_helpers,
             "graph_nodes": graph_nodes,
             "graph_edges": graph_edges,
+            "environment": str(getattr(dossier, "current_lean_environment_hash", "") or ""),
             "theory_bundle_ids": sorted(
                 str(item or "")
                 for item in tuple(self.theory_imported_bundle_ids or ())
@@ -30839,6 +30810,13 @@ class MiniSession:
         self._action_start_frontier_formal_signature = ""
         formal_evidence = self._durable_formal_progress_evidence()
         self._action_start_frontier_formal_evidence = formal_evidence
+        # Exact lifecycle observation is separate from semantic evidence:
+        # changing a certificate on an already-proved node is not new work.
+        self._action_start_proved_graph_node_ids = {
+            node_id for node_id, node in dict(
+                getattr(getattr(self.dossier, "proof_graph", None), "nodes", {}) or {}
+            ).items() if getattr(node, "status", "") == "proved"
+        }
         self._action_start_frontier_formal_signature = text_hash(
             json.dumps(formal_evidence, separators=(",", ":"))
         )
@@ -30894,16 +30872,10 @@ class MiniSession:
 
         evidence: Set[str] = set()
         dossier = getattr(self, "dossier", None)
-        helpers = getattr(dossier, "verified_helpers", None)
-        if isinstance(helpers, dict):
-            for name, helper in helpers.items():
-                source = str(getattr(helper, "source", "") or "")
-                source_hash = str(
-                    getattr(helper, "source_hash", "")
-                    or (text_hash(source) if source.strip() else "")
-                ).strip()
-                if source_hash:
-                    evidence.add(f"helper:{name}:{source_hash}")
+        from .progress_identity import graph_progress_projection, helper_progress_keys
+        helper_keys = helper_progress_keys(dossier)
+        evidence.update(f"helper:{key}" for key in helper_keys.values())
+        _, _, graph_keys = graph_progress_projection(dossier, self._progress_node_record, helper_keys=helper_keys)
 
         for namespace, nodes in (
             ("proof_state", getattr(getattr(self, "proof_state", None), "nodes", None)),
@@ -30924,6 +30896,10 @@ class MiniSession:
                     or getattr(node, "proof", "")
                 ).strip()
                 if not proof_identity:
+                    continue
+                if namespace == "proof_graph":
+                    if node_id in graph_keys:
+                        evidence.add(f"proof_graph:{graph_keys[node_id]}")
                     continue
                 evidence.add(f"{namespace}:{node_id}:{proof_identity}")
         for bundle_id in tuple(self.theory_imported_bundle_ids or ()):
@@ -30963,6 +30939,7 @@ class MiniSession:
         action_key = self._action_start_frontier_action_key
         self._action_start_frontier_formal_signature = ""
         self._action_start_frontier_formal_evidence = ()
+        self._action_start_proved_graph_node_ids.clear()
         self._action_start_frontier_action_key = None
         if (
             action_key is None

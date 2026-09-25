@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from ..state_data import clone_json_value
-from ..llm_error_policy import classify_llm_exception, is_provider_account_failure
+from ..llm_error_policy import classify_llm_exception, is_resumable_provider_failure
 from ..tactic_attempt_telemetry import MONOTONIC_LEAN_ATTEMPT_METRICS
 
 _MANIFEST = "attempt_checkpoint.json"
@@ -265,18 +265,29 @@ class AttemptCheckpointRegistry:
                 if _digest(snapshot) != head["snapshot_hash"]:
                     raise ValueError("Attempt checkpoint snapshot hash mismatch")
                 self._restore_snapshot(snapshot, expected_identity=manifest["identity"])
-                # A globally account-stopped lane must not immediately replay
-                # its stale quota error as the result of a fresh recovery.
+                # A provider-stopped lane must not immediately replay its
+                # stale outage as the result of an explicit fresh recovery.
                 # Successful plans and every other error receipt remain exact.
                 from .planner_jobs import planner_result_from_record
                 for lane, receipts in self._planner_receipts.items():
                     saved = self._sessions.get(lane, {}).get("scheduler", {}).get("session_state", {})
-                    if not is_provider_account_failure(saved.get("terminal_failure_reason", "")):
-                        continue
+                    terminal_reason = saved.get("terminal_failure_reason", "")
                     for key, raw in tuple(receipts.items()):
                         result = planner_result_from_record(raw)
-                        if (result.exception is not None and is_provider_account_failure(
-                                classify_llm_exception(result.exception).failure_reason)):
+                        reason = (classify_llm_exception(result.exception).failure_reason
+                                  if result.exception is not None else "")
+                        # A live background transport pause unwinds like
+                        # cancellation, preserving the reserved pass without
+                        # setting a session terminal latch. Its typed receipt
+                        # is itself evidence of the run-wide provider pause.
+                        unlatched_transport_pause = (
+                            reason == "provider_transport_unavailable"
+                            and not terminal_reason
+                            and saved.get("root_finalized") is False
+                        )
+                        if (is_resumable_provider_failure(reason) and (
+                                is_resumable_provider_failure(terminal_reason)
+                                or unlatched_transport_pause)):
                             receipts.pop(key)
                             self._account_failure_planner_retries[lane] = self._account_failure_planner_retries.get(lane, 0) + 1
                 # A failed provider call is not a completed mathematical child
@@ -285,7 +296,7 @@ class AttemptCheckpointRegistry:
                 for lane, frame in self._children.items():
                     saved = self._sessions.get(lane, {}).get("scheduler", {}).get("session_state", {})
                     result = frame.get("result")
-                    if (is_provider_account_failure(saved.get("terminal_failure_reason", ""))
+                    if (is_resumable_provider_failure(saved.get("terminal_failure_reason", ""))
                             and saved.get("root_finalized") is False
                             and type(result) is dict and set(result) == {"ok", "proof", "timed_out"}
                             and result["ok"] is False and result["proof"] is None
@@ -566,7 +577,7 @@ class AttemptCheckpointRegistry:
             # Child preparation may restore the parent a second time. Release
             # only generation-local account latches after every such restore.
             reason = getattr(session, "terminal_failure_reason", "")
-            if self.is_resume and record is not None and is_provider_account_failure(reason):
+            if self.is_resume and record is not None and is_resumable_provider_failure(reason):
                 session.terminal_failure_reason = ""
                 session.terminal_failure_kind = ""
                 if getattr(session, "last_failure_reason", "") == reason:
@@ -575,7 +586,7 @@ class AttemptCheckpointRegistry:
                     (session.conv, "_last_llm_failure_reason", "_last_llm_failure_kind"),
                     (session.dossier, "session_failure_reason", "session_failure_kind"),
                 ):
-                    if is_provider_account_failure(getattr(owner, reason_field, "")):
+                    if is_resumable_provider_failure(getattr(owner, reason_field, "")):
                         setattr(owner, reason_field, "")
                         setattr(owner, kind_field, "")
                 session._record_event({

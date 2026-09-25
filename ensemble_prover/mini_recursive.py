@@ -17,6 +17,7 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import re
 import secrets
 import sys
@@ -109,7 +110,8 @@ from .mini_temperature import (
 )
 from .llm_error_policy import (
     ProviderAccountUnavailable,
-    is_provider_account_failure,
+    ProviderTransportUnavailable,
+    is_resumable_provider_failure,
     classify_llm_exception,
     is_terminal_llm_failure_reason,
     llm_failure_scope,
@@ -11732,12 +11734,15 @@ def _recursive_lean_library_hash(project_roots: Sequence[str] | str) -> str:
         ]
         if project.is_dir():
             try:
-                candidates.extend(
-                    path
-                    for pattern in ("*.lean", "*.olean")
-                    for path in project.rglob(pattern)
-                    if ".lake" not in path.relative_to(project).parts
-                )
+                # Dependency/build trees are excluded from this identity.
+                # Prune them before traversal rather than scanning every
+                # dependency twice and filtering the paths afterward.
+                for directory, subdirectories, filenames in os.walk(project):
+                    subdirectories[:] = [name for name in subdirectories if name != ".lake"]
+                    candidates.extend(
+                        Path(directory) / name for name in filenames
+                        if name.endswith((".lean", ".olean"))
+                    )
             except (OSError, ValueError):
                 pass
         for path in sorted(set(candidates)):
@@ -17757,6 +17762,15 @@ async def run_mini_recursive_attempt(
 
     expired_child_deadline_retry_generations: dict[tuple[int, int, int], int] = {}
 
+    inherited_replay_blocks = tuple(attempt_dossier.forced_context_helper_blocks)
+    route_local_replay_blocks = inherited_replay_blocks
+
+    def set_route_local_replay_blocks(blocks: Sequence[str]) -> None:
+        nonlocal route_local_replay_blocks
+        route_local_replay_blocks = tuple(ProofDossier._merge_replay_helper_blocks(
+            inherited_replay_blocks, blocks,
+        ))
+
     async def prove_claim(
         claim: MiniSubgoalClaim,
         variant: SubgoalVariant,
@@ -17892,6 +17906,9 @@ async def run_mini_recursive_attempt(
         except Exception:
             pass
         seed_verified_helpers(subgoal_dossier, attempt_dossier)
+        # This invocation's exact reused dependencies are available to its
+        # children, without changing the parent's global helper policy.
+        subgoal_dossier.forced_context_helper_blocks = route_local_replay_blocks
         selected_binding = getattr(
             proof_idea_resolution,
             "primary_binding",
@@ -18341,12 +18358,14 @@ async def run_mini_recursive_attempt(
 
             parent_helper_sources = {
                 helper_decl_name(block): str(block or "").strip()
-                for block in attempt_dossier.verified_helper_blocks()
+                for block in attempt_dossier.execution_helper_blocks(
+                    additional_context=route_local_replay_blocks,
+                )
                 if helper_decl_name(block)
             }
             child_delta_blocks = tuple(
                 str(block or "").strip()
-                for block in subgoal_dossier.verified_helper_blocks()
+                for block in subgoal_dossier.execution_helper_blocks()
                 if str(block or "").strip()
                 and parent_helper_sources.get(helper_decl_name(block))
                 != str(block or "").strip()
@@ -19460,12 +19479,14 @@ async def run_mini_recursive_attempt(
             proof = str(proof_text)
             parent_helper_sources = {
                 helper_decl_name(block): str(block or "").strip()
-                for block in attempt_dossier.verified_helper_blocks()
+                for block in attempt_dossier.execution_helper_blocks(
+                    additional_context=helper_context_blocks,
+                )
                 if helper_decl_name(block)
             }
             child_delta_blocks = tuple(
                 str(block or "").strip()
-                for block in close_dossier.verified_helper_blocks()
+                for block in close_dossier.execution_helper_blocks()
                 if str(block or "").strip()
                 and parent_helper_sources.get(helper_decl_name(block))
                 != str(block or "").strip()
@@ -19609,7 +19630,7 @@ async def run_mini_recursive_attempt(
     # changes.  Recursive child conversations can consume refiner/model
     # configuration and newly populated proof-cache entries even when the
     # verified-helper set and Lean preamble are unchanged.
-    def current_attempt_proof_environment_fingerprint() -> str:
+    def current_attempt_proof_environment_fingerprint(*, include_cache: bool = True) -> str:
         # Theory promotion mutates the active search snapshot, Lean
         # environment, and possibly the proof cache.  Compute this identity at
         # every checkpoint boundary so a post-promotion frame validates after
@@ -19618,7 +19639,7 @@ async def run_mini_recursive_attempt(
             str(item or "")
             for item in set(getattr(proof_cache, "_source_hashes", set()) or ())
             if str(item or "")
-        )
+        ) if include_cache else []
         return hashlib.sha256(
             json.dumps(
                 {
@@ -20313,7 +20334,8 @@ async def run_mini_recursive_attempt(
             promote_claim_environment=promote_claim_environment,
             rollback_claim_environment=rollback_claim_environment,
             finalize_claim_environment=finalize_claim_environment,
-            get_helpers=attempt_dossier.verified_helper_blocks,
+            get_helpers=attempt_dossier.execution_helper_blocks,
+            route_local_replay_callback=set_route_local_replay_blocks,
             get_proposed_helpers=get_proposed_helpers,
             dossier=attempt_dossier,
             accept_helper=accept_helper,
@@ -20351,6 +20373,9 @@ async def run_mini_recursive_attempt(
             proof_environment_fingerprint=proof_environment_fingerprint,
             get_proof_environment_fingerprint=(
                 current_attempt_proof_environment_fingerprint
+            ),
+            get_route_environment_fingerprint=(
+                lambda: current_attempt_proof_environment_fingerprint(include_cache=False)
             ),
             root_tactic_environment_fingerprint=(
                 current_attempt_root_tactic_environment_fingerprint()
@@ -20692,6 +20717,7 @@ def _recursive_continuation_frame_is_admissible(
     route_environment_hash: str,
     proof_idea_cognition_hash: str,
     legacy_cognition_is_empty: bool,
+    helper_receipt_is_current: bool = False,
 ) -> bool:
     """Admit exact cursors and pending planner receipts awaiting revalidation."""
 
@@ -20706,7 +20732,10 @@ def _recursive_continuation_frame_is_admissible(
         str(frame.get("route_environment_hash") or "")
         == str(route_environment_hash or "")
         and (
-            persisted_cognition_hash == str(proof_idea_cognition_hash or "")
+            (
+                persisted_cognition_hash == str(proof_idea_cognition_hash or "")
+                or (frame.get("phase") == "helper_accepted" and helper_receipt_is_current)
+            )
             if persisted_cognition_hash
             else legacy_cognition_is_empty
         )
@@ -20727,6 +20756,38 @@ def _recursive_continuation_frame_is_admissible(
     # active targets, owner lane, and monotone helper evidence. Observation-only
     # lifecycle growth must not discard it before that stronger gate runs.
     return bool(exact_context or pending_planner_receipt)
+
+
+def _recursive_helper_continuation_sources(dossier: Any) -> dict[str, str]:
+    """Bind retained helper authority by declaration, including hidden helpers."""
+    sources = {}
+    for name, helper in dict(getattr(dossier, "verified_helpers", {}) or {}).items():
+        source = str(getattr(helper, "source", "") or "")
+        digest = text_hash(source)
+        if source.strip() and str(getattr(helper, "source_hash", "") or "") == digest:
+            sources[str(name)] = digest
+    return sources
+
+
+def _recursive_helper_continuation_is_current(frame: Mapping[str, Any], dossier: Any) -> bool:
+    """Allow advisory history growth, never removal or replacement of support."""
+    saved = frame.get("helper_continuation_sources")
+    name = str(frame.get("accepted_helper_name") or "")
+    statement = str(frame.get("accepted_helper_statement") or "")
+    proof = str(frame.get("accepted_helper_proof") or "")
+    if frame.get("phase") != "helper_accepted" or not isinstance(saved, dict):
+        return False
+    if not name or not statement or not proof:
+        return False
+    receipt_hash = text_hash(helper_decl_from_proof(name, statement, proof))
+    current = _recursive_helper_continuation_sources(dossier)
+    return bool(
+        saved.get(name) == receipt_hash
+        and all(
+            isinstance(digest, str) and digest and current.get(key) == digest
+            for key, digest in saved.items()
+        )
+    )
 
 
 def _recursive_controller_accounting_frame(
@@ -20839,6 +20900,8 @@ async def run_mini_recursive_driver(
     root_tactic_portfolio_state: Optional[Mapping[str, Any]] = None,
     proof_environment_fingerprint: str = "",
     get_proof_environment_fingerprint: Optional[GetPreambleFn] = None,
+    get_route_environment_fingerprint: Optional[GetPreambleFn] = None,
+    route_local_replay_callback: Optional[Callable[[Sequence[str]], None]] = None,
     root_tactic_environment_fingerprint: str = "",
     get_root_tactic_environment_fingerprint: Optional[GetPreambleFn] = None,
     planner_job_broker: Optional[PlannerJobBroker] = None,
@@ -20928,6 +20991,27 @@ async def run_mini_recursive_driver(
             root_tactic_environment_fingerprint or proof_environment_fingerprint or ""
         )
 
+    base_get_helpers = get_helpers
+    reused_route_local_sources: dict[str, str] = {}
+    route_local_blocks: list[str] = []
+
+    def get_helpers() -> Sequence[Any]:
+        visible = list(base_get_helpers())
+        if route_local_blocks:
+            return dossier.execution_helper_blocks(
+                visible_helpers=visible, additional_context=route_local_blocks,
+            )
+        return visible
+
+    def activate_route_local_replay(blocks: Sequence[str]) -> None:
+        for block in blocks:
+            name = helper_decl_name(block)
+            if name and name not in reused_route_local_sources:
+                reused_route_local_sources[name] = text_hash(block)
+                route_local_blocks.append(block)
+        if route_local_replay_callback is not None:
+            route_local_replay_callback(tuple(route_local_blocks))
+
     def current_helper_evidence_records() -> Sequence[Any]:
         """Prefer durable helpers carrying receipt-bound Lean identities.
 
@@ -20953,6 +21037,75 @@ async def run_mini_recursive_driver(
         if callable(unique_by_fact):
             return tuple(unique_by_fact())
         return tuple(get_helpers() or ())
+
+    async def reusable_route_local_match(
+        statements: Sequence[str], identities: Sequence[str],
+    ) -> tuple[str, str, int]:
+        """Replay an exact hidden certificate without changing global visibility."""
+        closure = getattr(dossier, "root_replay_helper_closure", None)
+        if not callable(closure):
+            return "", "", -1
+        for helper in tuple(getattr(dossier, "verified_helpers", {}).values()):
+            if getattr(helper, "render_policy", "") != "advisory_negative_evidence":
+                continue
+            source = str(getattr(helper, "source", "") or "")
+            if text_hash(source) != str(getattr(helper, "source_hash", "") or ""):
+                continue
+            match = _reusable_verified_helper_match_with_candidate(
+                [source], statements,
+                rendered_helper_identities=[verified_helper_bound_contract_identity(helper)],
+                candidate_identities=identities,
+            )
+            if not match[0]:
+                # Surface equality is only a replay candidate, never authority.
+                match = _reusable_verified_helper_match_with_candidate([source], statements)
+            name, statement, _index = match
+            if not name or active_invalidated_statement_reason(statement)[1]:
+                continue
+            blocks = closure(replay_helpers=[source], support_helper_names=[name])
+            if source.strip() not in blocks or any(
+                is_answer_unsafe_helper_source(
+                    block, suppress_solution_placeholders=suppress_solution_placeholders,
+                    opaque_mode=opaque_mode,
+                    allow_official_answer_visibility=allow_official_answer_visibility,
+                    official_answer_payload_present=official_answer_payload_present,
+                ) for block in blocks
+            ):
+                continue
+            current_lean = _live_lean_capability_for_new_work(lean)
+            timeout_s = _recursive_lean_operation_timeout_s(current_lean, config.tactic_timeout_s)
+
+            async def replay() -> Any:
+                return await current_lean.check(
+                    statement, f"by\n  exact {name}", blocks,
+                    preamble_override=current_lean_check_preamble(), timeout_s=timeout_s,
+                )
+
+            from .mini_formal_state_search import (
+                _LEAN_LOCK_ADMISSION_TIMEOUT_S, _run_serialized_lean_operation,
+            )
+            try:
+                result = await _run_serialized_lean_operation(
+                    current_lean, replay, operation_timeout_s=float(timeout_s or 30.0),
+                    admission_timeout_s=_LEAN_LOCK_ADMISSION_TIMEOUT_S,
+                )
+            except Exception as exc:
+                _record(record_event, {
+                    "phase": "mini_recursive_route_local_reuse",
+                    "helper_name": name, "statement": statement,
+                    "error_type": type(exc).__name__,
+                    "verdict": "certificate_replay_failed",
+                })
+                continue
+            _record(record_event, {
+                "phase": "mini_recursive_route_local_reuse",
+                "helper_name": name, "statement": statement,
+                "verdict": "certificate_replayed" if result.ok else "certificate_replay_rejected",
+            })
+            if result.ok:
+                activate_route_local_replay(blocks)
+                return match
+        return "", "", -1
 
     def current_planner_proof_idea_lifecycle_context() -> str:
         """Project every durable strategy lifecycle at the current revision."""
@@ -21020,7 +21173,15 @@ async def run_mini_recursive_driver(
             answer_safe_preamble=current_answer_safe_preamble(),
             client=client,
             config=config,
-            proof_environment_fingerprint=current_proof_environment_fingerprint(),
+            # Cache growth is fresh retry evidence, not a change to the Lean
+            # environment of an already admitted plan. Keep it in failed-route
+            # fingerprints, but do not let our own post-checkpoint cache write
+            # discard an unfinished execution cursor.
+            proof_environment_fingerprint=(
+                str(get_route_environment_fingerprint() or "")
+                if get_route_environment_fingerprint is not None
+                else current_proof_environment_fingerprint()
+            ),
             selected_parent_proof_idea_context=selected_parent_proof_idea_context,
             proof_idea_lifecycle_context=lifecycle,
             suppress_solution_placeholders=suppress_solution_placeholders,
@@ -21070,16 +21231,32 @@ async def run_mini_recursive_driver(
             str(selected_parent_proof_idea_context or "").strip()
             or current_planner_proof_idea_lifecycle_context().strip()
         )
-        if _recursive_continuation_frame_is_admissible(
+        saved_local_sources = candidate_resume_frame.get("reused_route_local_sources", {})
+        verified = getattr(dossier, "verified_helpers", {})
+        saved_local_scope_is_current = isinstance(saved_local_sources, dict) and all(
+            name in verified and text_hash(verified[name].source) == digest
+            and verified[name].source_hash == digest
+            for name, digest in saved_local_sources.items()
+        )
+        if saved_local_scope_is_current and saved_local_sources:
+            try:
+                dossier.validate_helper_context([verified[name].source for name in saved_local_sources])
+            except ValueError:
+                saved_local_scope_is_current = False
+        if saved_local_scope_is_current and _recursive_continuation_frame_is_admissible(
             candidate_resume_frame,
             root_statement_hash=text_hash(root_statement),
             # The plan's entry lifecycle and the later checkpoint lifecycle
             # are different observations. Recompute static/material policy
-            # using the saved entry context, and independently require exact
-            # current cognition below; never trust a saved environment hash.
+            # using the saved entry context. A committed helper may survive
+            # advisory history growth if all its support is still retained;
+            # other execution cursors require exact current cognition.
             route_environment_hash=candidate_route_hash,
             proof_idea_cognition_hash=current_cognition_hash,
             legacy_cognition_is_empty=legacy_cognition_is_empty,
+            helper_receipt_is_current=_recursive_helper_continuation_is_current(
+                candidate_resume_frame, dossier,
+            ),
         ):
             resume_frame = candidate_resume_frame
             route_environment_hash = candidate_route_hash
@@ -21097,6 +21274,22 @@ async def run_mini_recursive_driver(
                 str(item or "")
                 for item in list(candidate_resume_frame.get("planner_feedback") or [])
             ]
+            if saved_local_sources:
+                activate_route_local_replay([verified[name].source for name in saved_local_sources])
+        if candidate_resume_frame:
+            _record(record_event, {
+                "phase": "mini_recursive_continuation",
+                "checkpoint_phase": str(candidate_resume_frame.get("phase") or ""),
+                "route_environment_matches": (
+                    candidate_resume_frame.get("route_environment_hash") == candidate_route_hash
+                ),
+                "cognition_matches": (
+                    candidate_resume_frame.get("proof_idea_cognition_hash") == current_cognition_hash
+                ),
+                "verdict": (
+                    "continuation_resumed" if resume_frame else "continuation_context_changed"
+                ),
+            })
     if not resume_frame and controller_accounting_frame:
         # Keep only allocation counters: old failure reasons, speculative
         # assembly limits, plans and proof receipts still belong to the old
@@ -21933,6 +22126,11 @@ async def run_mini_recursive_driver(
             "accepted_helper_name": str(accepted_helper_name or ""),
             "accepted_helper_statement": str(accepted_helper_statement or ""),
             "accepted_helper_proof": str(accepted_helper_proof or ""),
+            "reused_route_local_sources": dict(reused_route_local_sources),
+            "helper_continuation_sources": (
+                _recursive_helper_continuation_sources(dossier)
+                if phase == "helper_accepted" else {}
+            ),
             "active_variant_key": (
                 text_hash(
                     json.dumps(
@@ -28526,6 +28724,10 @@ async def run_mini_recursive_driver(
                     rendered_helper_identities=(prepriority_helper_identities),
                     candidate_identities=reusable_identities,
                 )
+                if not reuse_helper_name:
+                    reuse_helper_name, reuse_statement, reuse_candidate_index = await reusable_route_local_match(
+                        reusable_statements, reusable_identities,
+                    )
                 if reuse_helper_name:
                     # Semantic retirement is a scheduler input, not an action
                     # performed after selection. Bind the planner label to the
@@ -30448,6 +30650,10 @@ async def run_mini_recursive_driver(
                 rendered_helper_identities=reusable_helper_identities,
                 candidate_identities=reusable_candidate_identities,
             )
+            if not reuse_helper_name:
+                reuse_helper_name, reuse_statement, reuse_candidate_index = await reusable_route_local_match(
+                    reusable_candidate_statements, reusable_candidate_identities,
+                )
             if reuse_helper_name:
                 remember_proved_claim_helper(claim, reuse_helper_name)
                 # Mirror the normal accept path so same-pass suspended-claim
@@ -30469,16 +30675,10 @@ async def run_mini_recursive_driver(
                         "verdict": "claim_reused_existing_verified_helper",
                     },
                 )
-                accepted_result = await finish_accepted_helper(
-                    accepted=reuse_helper_name,
-                    statement=reuse_statement,
-                    claim_name=claim.name,
-                    next_claim_index=claim_cursor,
-                    publish_acceptance=True,
-                )
-                if accepted_result is not None:
-                    pass_finished = True
-                    return accepted_result
+                # Reuse retires work but adds no new fact. Like pre-priority
+                # reuse, continue the plan instead of yielding an empty
+                # helper-accept receipt and retrying speculative root tactics.
+                await schedule_ready_suspended_claims(reuse_helper_name, claim_cursor)
                 continue
             for skipped in skipped_variants:
                 _record(
@@ -31118,10 +31318,12 @@ async def run_mini_recursive_driver(
                             },
                         )
                     if (provider_account_pause_enabled
-                            and is_provider_account_failure(claim_proof_result.terminal_failure_reason)):
+                            and is_resumable_provider_failure(claim_proof_result.terminal_failure_reason)):
                         # Keep the exact child_pending cursor and its reserved
                         # allocation. Account unavailability is not a completed
                         # child result or a reason to discard a paid plan.
+                        if claim_proof_result.terminal_failure_reason == "provider_transport_unavailable":
+                            raise ProviderTransportUnavailable()
                         raise ProviderAccountUnavailable(claim_proof_result.terminal_failure_reason)
                     if not (
                         claim_proof_result.controller_projection_invalidated
@@ -31451,30 +31653,8 @@ async def run_mini_recursive_driver(
                             continue
                         claim_environment_promoted = True
                         route_identity_lifecycle_context = current_planner_proof_idea_lifecycle_context()
-                        route_environment_hash = _recursive_route_environment_hash(
-                            theorem_name=theorem_name,
-                            root_statement=root_statement,
-                            lean_signature=lean_signature,
-                            answer_safe_preamble=current_answer_safe_preamble(),
-                            client=client,
-                            config=config,
-                            proof_environment_fingerprint=(
-                                current_proof_environment_fingerprint()
-                            ),
-                            selected_parent_proof_idea_context=(
-                                selected_parent_proof_idea_context
-                            ),
-                            proof_idea_lifecycle_context=route_identity_lifecycle_context,
-                            suppress_solution_placeholders=(
-                                suppress_solution_placeholders
-                            ),
-                            opaque_mode=opaque_mode,
-                            allow_official_answer_visibility=(
-                                allow_official_answer_visibility
-                            ),
-                            official_answer_payload_present=(
-                                official_answer_payload_present
-                            ),
+                        route_environment_hash = route_hash_for_lifecycle(
+                            route_identity_lifecycle_context
                         )
                         claim_replay_helpers = list(get_helpers())
                     support_names = _support_names_for_proof(

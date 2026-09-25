@@ -47,6 +47,13 @@ class _LaneState:
     permanently_retired: bool = False
 
 
+@dataclass
+class _TransportState:
+    success_epoch: int = 0
+    failures: int = 0
+    paused: bool = False
+
+
 # Keep the concrete exception type identical to a provider 429.  The central
 # error classifier intentionally recognizes exact httpx status errors by their
 # defining module/name so a local subclass would silently become a non-retryable
@@ -114,8 +121,37 @@ class ProviderLaneHealthRegistry:
         self._half_open_poll_s = max(0.01, float(half_open_poll_s))
         self._jitter_fraction = max(0.0, min(1.0, float(jitter_fraction)))
         self._states: dict[str, _LaneState] = {}
+        self._transport_states: dict[str, _TransportState] = {}
         self._next_token = 1
         self._lock = threading.Lock()
+
+    def begin_transport_request(self, fingerprint: str) -> int:
+        """Admit a subscription request, or retain a run-local outage pause."""
+        from .llm_error_policy import ProviderTransportUnavailable
+
+        with self._lock:
+            state = self._transport_states.setdefault(fingerprint, _TransportState())
+            if state.paused:
+                raise ProviderTransportUnavailable()
+            return state.success_epoch
+
+    def record_transport_response(self, fingerprint: str) -> None:
+        """A complete response breaks the failure streak, even if malformed."""
+        with self._lock:
+            state = self._transport_states.setdefault(fingerprint, _TransportState())
+            state.success_epoch += 1
+            state.failures = 0
+            # A confirmed pause is sticky for this run. Explicit resume owns
+            # a fresh registry; late sibling completion cannot authorize calls.
+
+    def record_transport_failure(self, fingerprint: str, epoch: int) -> bool:
+        """Infer unavailability after three failures without a newer response."""
+        with self._lock:
+            state = self._transport_states.setdefault(fingerprint, _TransportState())
+            if epoch == state.success_epoch and not state.paused:
+                state.failures += 1
+                state.paused = state.failures >= 3
+            return state.paused
 
     def _now(self) -> float:
         now = float(self._clock())

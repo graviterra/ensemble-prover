@@ -228,17 +228,9 @@ class FormalStateSearchAction:
         refresh_quality: bool = True,
     ) -> Tuple[str, ...]:
         dossier = session.dossier
-        if refresh_quality:
-            blocks = list(dossier.verified_helper_blocks())
-        else:
-            snapshot = getattr(dossier, "verified_helper_blocks_snapshot", None)
-            blocks = list(snapshot() if callable(snapshot) else ())
-        blocks.extend(
-            str(item or "").strip()
-            for item in list(getattr(dossier, "forced_context_helper_blocks", ()) or ())
-            if str(item or "").strip()
+        return tuple(
+            dossier.execution_helper_blocks(refresh_quality=refresh_quality)
         )
-        return tuple(dict.fromkeys(blocks))
 
     def _candidate_nodes(
         self,

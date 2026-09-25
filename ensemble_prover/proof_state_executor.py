@@ -625,20 +625,7 @@ def _proof_state_verified_helper_blocks(
 ) -> List[str]:
     if dossier is None:
         return []
-    helpers = list(
-        dossier.verified_helper_blocks(refresh_quality=refresh_quality)
-    )
-    forced_context_helpers = [
-        str(block or "").strip()
-        for block in list(getattr(dossier, "forced_context_helper_blocks", ()) or ())
-        if str(block or "").strip()
-    ]
-    if forced_context_helpers:
-        return ProofDossier._merge_replay_helper_blocks(
-            helpers,
-            forced_context_helpers,
-        )
-    return helpers
+    return list(dossier.execution_helper_blocks(refresh_quality=refresh_quality))
 
 
 def _proof_state_active_root_targets_for_frame(dossier: ProofDossier) -> Tuple[Mapping[str, Any], ...]:

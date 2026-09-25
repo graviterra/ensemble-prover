@@ -25,6 +25,10 @@ from .answer_input import (
 from .config import LeanConfig
 from .lean_runner import LeanRunner
 from .lean_parser import has_infra_failure, has_timeout
+from .llm_error_policy import (
+    ProviderAccountUnavailable, classify_llm_exception,
+    is_provider_infrastructure_failure,
+)
 from .llm_usage import (
     CostBudgetController,
     call_with_optional_usage_callback,
@@ -642,6 +646,23 @@ async def _prepare(
             detail = f"run budget exhausted during capability preparation ({phase})"
             record_capability(phase, "budget_exhausted", attempt, detail)
             raise TimeoutError(detail) from exc
+    except BaseException as exc:
+        reason = (
+            exc.reason if isinstance(exc, ProviderAccountUnavailable)
+            else classify_llm_exception(exc).failure_reason
+        )
+        if is_provider_infrastructure_failure(reason):
+            # Publish before cleanup: a stuck provider close must not erase
+            # the typed outage or turn it into a failed mathematical search.
+            summary = {
+                "theorem": request.theorem_name, "problem": request.theorem_name,
+                "solved": False, "infrastructure_aborted": True,
+                "failure_reason": reason, "phase": "answer_preparation",
+            }
+            pending = directory / "provider_failure_summary.json.tmp"
+            pending.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+            pending.replace(directory / "summary.json")
+        raise
     finally:
         _arm_shutdown_deadline(args)
         try:
@@ -819,7 +840,7 @@ def preparation_worker_main(argv: Sequence[str] | None = None) -> int:
         return 0
     except (KeyboardInterrupt, asyncio.CancelledError):
         return 130
-    except Exception as exc:
+    except (Exception, ProviderAccountUnavailable) as exc:
         print(f"Answer preparation failed: {exc}", file=sys.stderr)
         return 2
 

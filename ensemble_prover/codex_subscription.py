@@ -36,6 +36,8 @@ from .models import (
 from .provider_response import publish_provider_response
 from .sampling_controls import is_api_default_temperature_override
 from .subscription_cli import (
+    bounded_subscription_transport,
+    check_subscription_transport_admission,
     SubscriptionCLIClient,
     _INSTRUCTIONS,
     _reject_json_constant,
@@ -310,6 +312,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
             argv.extend(["--disable", feature])
         return [*argv, "--enable", "skip_host_skill_discovery", "-"]
 
+    @bounded_subscription_transport
     async def chat_raw(
         self,
         messages: list[dict[str, Any]],
@@ -509,6 +512,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
 
         def on_started() -> None:
             nonlocal dispatched
+            check_subscription_transport_admission()
             dispatched = True
             mark_provider_dispatched(**authority)
 
@@ -549,6 +553,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
                     )
                 if self._closed:
                     raise CodexBackendError("Codex client is closed", kind="capability")
+                check_subscription_transport_admission()
                 _, stderr, code = await self._process(
                     argv,
                     cwd=cwd,

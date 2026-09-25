@@ -168,6 +168,7 @@ _TERMINAL_LLM_FAILURE_REASONS = {
     "llm_insufficient_quota",
     "provider_capability_conflict",
     "provider_protocol_incompatible",
+    "provider_transport_unavailable",
     "llm_required_prompt_context_overflow",
 }
 _SCOPED_LLM_FAILURE_REASONS = {
@@ -605,6 +606,11 @@ def classify_llm_exception(
 ) -> LLMErrorClassification:
     """Classify one exception for mini-prover retry and termination policy."""
 
+    if isinstance(exc, ProviderTransportUnavailable):
+        return LLMErrorClassification(
+            kind=exc.reason, failure_reason=exc.reason,
+            retryable=False, terminal=True, message=str(exc),
+        )
     if isinstance(exc, SubscriptionBackendError):
         reason = {
             "auth": "llm_auth_error",
@@ -885,7 +891,7 @@ def classify_llm_error_text(error_text: str) -> LLMErrorClassification:
         return classify_llm_exception(error_type(text, kind=codex_error.group(2)))
     if not text:
         return LLMErrorClassification(kind="empty", retryable=False, terminal=False)
-    if text == "provider_protocol_incompatible":
+    if text in {"provider_protocol_incompatible", "provider_transport_unavailable"}:
         return LLMErrorClassification(
             kind=text,
             retryable=False,
@@ -1046,7 +1052,12 @@ def is_provider_infrastructure_failure(reason: str) -> bool:
     not establish such an attempt-wide infrastructure failure.
     """
 
-    return is_provider_account_failure(reason) or reason == "provider_protocol_incompatible"
+    return is_resumable_provider_failure(reason) or reason == "provider_protocol_incompatible"
+
+
+def is_resumable_provider_failure(reason: str) -> bool:
+    """External account or transport state may recover in a fresh run."""
+    return is_provider_account_failure(reason) or reason == "provider_transport_unavailable"
 
 
 class ProviderAccountUnavailable(BaseException):
@@ -1061,6 +1072,17 @@ class ProviderAccountUnavailable(BaseException):
             raise ValueError("Not an external provider account failure")
         self.reason = reason
         super().__init__(reason)
+
+
+class ProviderTransportUnavailable(ProviderAccountUnavailable):
+    """Pause after repeated incomplete responses, without inferring quota/auth."""
+
+    def __init__(self) -> None:
+        self.reason = "provider_transport_unavailable"
+        BaseException.__init__(self, self.reason)
+
+    def __reduce__(self):
+        return (type(self), (), self.__dict__)
 
 
 def is_terminal_session_failure_reason(reason: str) -> bool:

@@ -2222,7 +2222,8 @@ async def _call_llm_with_tools_one_round_impl(
     # Freeze both ordinary and controller-authorized route availability. The
     # same scope feeds prompts, retrieval, tools, and the final proof replay.
     if helper_context_override is None and dossier is not None:
-        helper_context_override = tuple(dossier.verified_helper_blocks())
+        scoped_blocks = getattr(dossier, "execution_helper_blocks", dossier.verified_helper_blocks)
+        helper_context_override = tuple(scoped_blocks())
     if helper_context_override is not None:
         helper_context_override = tuple(helper_context_override)
         if dossier is None:
@@ -2246,13 +2247,40 @@ async def _call_llm_with_tools_one_round_impl(
             return visible
         blocks = list(helper_context_override)
         names = {helper_decl_name(block) for block in blocks}
+        # The frozen scope is authoritative here. Reopening the session's
+        # whole execution scope would revalidate withheld, possibly stale facts.
+        # Ordinary new lemmas may depend on a scoped certificate and therefore
+        # be absent from the global rendering.
+        context_visible = getattr(dossier, "is_verified_helper_context_visible", None)
+        if callable(context_visible):
+            visible.extend(
+                helper.source
+                for name, helper in dossier.verified_helpers.items()
+                if name not in initial_helper_names and context_visible(helper)
+            )
         # Only helpers verified after dispatch may extend the explicit scope.
         # In particular, an empty override must not restore existing globals.
-        for block in visible:
-            name = helper_decl_name(block)
-            if name and name not in names and name not in initial_helper_names:
+        pending = {
+            helper_decl_name(block): block for block in visible
+            if helper_decl_name(block) not in names | initial_helper_names
+            and helper_decl_name(block)
+        }
+        while pending:
+            progressed = False
+            for name, block in list(pending.items()):
+                try:
+                    validate_tool_scope((*blocks, block))
+                except ValueError:
+                    # A new fact may depend on old helpers withheld by this
+                    # explicit scope. It becomes available only with its full
+                    # authorized support, never by reopening those helpers.
+                    continue
                 blocks.append(block)
                 names.add(name)
+                pending.pop(name)
+                progressed = True
+            if not progressed:
+                break
         if dossier is not None:
             validate_tool_scope(blocks)
         return blocks

@@ -5703,18 +5703,7 @@ async def run_conversation(
     def _current_verified_helper_blocks() -> List[str]:
         if dossier is None:
             return []
-        visible_helpers = list(dossier.verified_helper_blocks())
-        forced_context_helpers = [
-            str(block or "").strip()
-            for block in list(getattr(dossier, "forced_context_helper_blocks", ()) or ())
-            if str(block or "").strip()
-        ]
-        if forced_context_helpers:
-            return ProofDossier._merge_replay_helper_blocks(
-                visible_helpers,
-                forced_context_helpers,
-            )
-        return visible_helpers
+        return list(dossier.execution_helper_blocks())
 
     def _current_active_root_frame_helper_blocks() -> List[str]:
         if dossier is None:
@@ -12627,9 +12616,9 @@ def _make_mini_role_client(
     cfg: RoleConfig, *, provider_lane_health_registry: Any = None,
 ) -> Any:
     if getattr(cfg, "base_url", "") == CODEX_SUBSCRIPTION_BASE_URL:
-        return CodexSubscriptionClient(cfg)
+        return CodexSubscriptionClient(cfg, provider_lane_health_registry=provider_lane_health_registry)
     if getattr(cfg, "base_url", "") == CLAUDE_CODE_SUBSCRIPTION_BASE_URL:
-        return ClaudeCodeSubscriptionClient(cfg)
+        return ClaudeCodeSubscriptionClient(cfg, provider_lane_health_registry=provider_lane_health_registry)
     return OpenAICompatClient(
         cfg, provider_lane_health_registry=provider_lane_health_registry,
     )
@@ -15888,7 +15877,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     except ProviderAccountUnavailable as exc:
         failure_reason = exc.reason
         infrastructure_aborted = True
-        print(f"\nPROVIDER ACCOUNT UNAVAILABLE: {failure_reason}", flush=True)
+        print(f"\nPROVIDER UNAVAILABLE: {failure_reason}", flush=True)
     except SystemExit as exc:
         # Setup-side SystemExit (most commonly missing API key from
         # ``_make_role_cfg``). Capture it so the finally block can finalize
@@ -17125,6 +17114,10 @@ async def _main_async(args: argparse.Namespace) -> int:
                             print("Checkpointing was disabled. Restore API account access or credits, then start a new run.")
                     elif effective_failure_reason == "provider_protocol_incompatible":
                         print("Correct the provider CLI compatibility, then start a new run.")
+                    elif effective_failure_reason == "provider_transport_unavailable":
+                        print("Repeated incomplete provider responses paused this run; no quota or account cause was confirmed.")
+                        print("After checking provider availability, resume from this run directory." if checkpoint_registry is not None
+                              else "After checking provider availability, start a new run.")
                     print("=" * 64)
                 else:
                     print(f"NOT SOLVED: {problem.theorem_name}")

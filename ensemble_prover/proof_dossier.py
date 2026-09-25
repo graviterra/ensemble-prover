@@ -8055,6 +8055,9 @@ class ProofDossier:
     # adapter owns this policy instead of the identifier spelling.
     suppress_solution_placeholders: bool = True
     verified_helpers: Dict[str, VerifiedHelper] = field(default_factory=dict)
+    # Explicit replay scope for this child/session only. It never changes a
+    # helper's global visibility or proof authority and is checked before use.
+    forced_context_helper_blocks: Tuple[str, ...] = ()
     superseded_verified_helper_hashes: Dict[str, List[str]] = field(
         default_factory=dict
     )
@@ -20429,7 +20432,9 @@ class ProofDossier:
             return 0.6
         return 0.5
 
-    def validate_helper_context(self, blocks: Sequence[str]) -> Tuple[str, ...]:
+    def validate_helper_context(
+        self, blocks: Sequence[str], *, refresh_quality: bool = True,
+    ) -> Tuple[str, ...]:
         """Freeze an explicit helper scope after checking its current evidence."""
         sources = tuple(blocks)
         names = [helper_decl_name(block) for block in sources]
@@ -20438,12 +20443,79 @@ class ProofDossier:
             or len(set(names)) != len(names)
         ):
             raise ValueError("helper context must contain unique registered declarations")
-        integrity = self.root_replay_integrity_status(replay_helpers=sources)
+        integrity = self.root_replay_integrity_status(
+            replay_helpers=sources, refresh_quality=refresh_quality,
+        )
         if not integrity.get("ready"):
             raise ValueError("helper context contains stale or mismatched source evidence")
         if not set(integrity.get("checked_helper_names", ())).issubset(names):
             raise ValueError("helper context omits required replay dependencies")
+        safety = self._answer_safety_kwargs()
+        if any(is_answer_unsafe_helper_source(block, **safety)
+               or is_answer_unsafe_statement_text(helper_decl_statement(block), **safety)
+               for block in sources):
+            raise ValueError("scoped helper context violates answer visibility")
         return sources
+
+    def execution_helper_blocks(
+        self, *, refresh_quality: bool = True,
+        additional_context: Sequence[str] = (),
+        visible_helpers: Optional[Sequence[str]] = None,
+    ) -> List[str]:
+        """Render dependency-complete facts within the authorized replay scope.
+
+        Ordinary descendants of scoped certificates are usable in that scope,
+        without changing their global visibility. Explicit base helpers replace
+        the ordinary rendering, not the independently validated scoped evidence.
+        """
+        visible = (list(visible_helpers) if visible_helpers is not None
+                   else self.verified_helper_blocks(refresh_quality=refresh_quality))
+        if not self.forced_context_helper_blocks and not additional_context:
+            return visible
+        # Validate separately: a same-name replacement must not conceal a stale
+        # retained scope during merging.
+        scoped = self._merge_replay_helper_blocks(
+            self.validate_helper_context(self.forced_context_helper_blocks,
+                                         refresh_quality=refresh_quality),
+            self.validate_helper_context(additional_context,
+                                         refresh_quality=refresh_quality),
+        )
+        safety = self._answer_safety_kwargs()
+        sources = {helper_decl_name(block): block for block in visible}
+        sources.update({helper_decl_name(block): block for block in scoped})
+        initial_names = set(sources)
+        local_names = {helper_decl_name(block) for block in scoped}
+        for name, helper in self.verified_helpers.items():
+            if (name not in sources and self._verified_helper_context_visible(helper)
+                    and not is_answer_unsafe_helper_source(helper.source, **safety)
+                    and not is_answer_unsafe_statement_text(helper_decl_statement(helper.source), **safety)):
+                sources[name] = helper.source
+        emitted: Set[str] = set()
+        ordered: List[str] = []
+        pending = dict(sources)
+        while pending:
+            progressed = False
+            for name, source in list(pending.items()):
+                helper = self.verified_helpers.get(name)
+                if helper is None:
+                    raise ValueError("execution context contains an unregistered helper")
+                deps = set(self._verified_helper_generated_dependencies(helper))
+                deps.update(self._referenced_verified_helper_names(source, skip=name))
+                if not deps.issubset(emitted):
+                    continue
+                if name not in initial_names and not deps.intersection(local_names):
+                    continue
+                ordered.append(source)
+                emitted.add(name)
+                if name not in initial_names:
+                    local_names.add(name)
+                pending.pop(name)
+                progressed = True
+            if not progressed:
+                break
+        if not initial_names.issubset(emitted):
+            raise ValueError("execution context omits required replay dependencies")
+        return list(self.validate_helper_context(ordered, refresh_quality=refresh_quality))
 
     def render_context(
         self,
@@ -20465,6 +20537,8 @@ class ProofDossier:
         """
         self._refresh_verified_helper_quality()
         answer_safety_kwargs = self._answer_safety_kwargs()
+        if helper_context_override is None and self.forced_context_helper_blocks:
+            helper_context_override = self.execution_helper_blocks()
         if helper_context_override is not None:
             helper_context_override = self.validate_helper_context(helper_context_override)
         authorized_context_names = (
@@ -21070,6 +21144,7 @@ class ProofDossier:
             "verified_helpers": [
                 asdict(item) for item in self.verified_helpers.values()
             ],
+            "forced_context_helper_blocks": list(self.forced_context_helper_blocks),
             "superseded_verified_helper_hashes": {
                 str(name): [str(value) for value in list(values or [])]
                 for name, values in self.superseded_verified_helper_hashes.items()
@@ -21783,6 +21858,9 @@ class ProofDossier:
                 data.get("proof_cache_publish_enabled", True)
             ),
             verified_helpers=verified_helpers,
+            forced_context_helper_blocks=tuple(
+                str(block) for block in data.get("forced_context_helper_blocks", ())
+            ),
             superseded_verified_helper_hashes=superseded_verified_helper_hashes,
             verified_helper_source_hash_history=verified_helper_source_hash_history,
             # rehydrate the alias map from

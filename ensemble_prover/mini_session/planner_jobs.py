@@ -15,6 +15,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
+from ensemble_prover.llm_error_policy import ProviderTransportUnavailable
 from ensemble_prover.llm_usage import (
     ProviderDispatchExposureTracker,
     bind_llm_usage_context,
@@ -316,7 +317,7 @@ class PlannerJobBroker:
                 )
             else:
                 raise
-        except Exception as exc:
+        except (Exception, ProviderTransportUnavailable) as exc:
             result = PlannerJobResult(
                 identity=launch.identity,
                 exception=exc.with_traceback(None),
