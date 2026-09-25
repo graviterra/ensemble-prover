@@ -291,7 +291,22 @@ def _strip_lean_comments_and_strings(text: str) -> tuple[str, bool]:
     return "".join(out), ok
 
 
-_LEAN_NONCODE_DELIMITER = re.compile(r"[/\-\'\"!]")
+_LEAN_NONCODE_DELIMITER = re.compile(r'r#*"|[/\-\'"!«]')
+
+
+def _raw_string_end(text: str, start: int) -> tuple[int, bool] | None:
+    if start >= len(text) or text[start] != "r":
+        return None
+    if start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_'»"):
+        return None
+    quote = start + 1
+    while quote < len(text) and text[quote] == "#":
+        quote += 1
+    if quote >= len(text) or text[quote] != '"':
+        return None
+    terminator = '"' + text[start + 1 : quote]
+    end = text.find(terminator, quote + 1)
+    return (len(text), False) if end == -1 else (end + len(terminator), True)
 
 
 def _scan_lean_code(text: str, start: int, out: List[str]) -> tuple[int, bool]:
@@ -305,17 +320,28 @@ def _scan_lean_code(text: str, start: int, out: List[str]) -> tuple[int, bool]:
             out.append(text[i:])
             return n, True
         special = marker.start()
-        if text[special:special + 2] == '!"':
+        if text[special : special + 2] == '!"':
             # Interpolation starts at its identifier, before the delimiter.
             # Numeric prefixes are ordinary code (e.g. 123s!"{value}").
             prefix = special
-            while prefix > i and (text[prefix - 1].isalnum() or text[prefix - 1] == "_"):
+            while prefix > i and (
+                text[prefix - 1].isalnum() or text[prefix - 1] == "_"
+            ):
                 prefix -= 1
-            while prefix < special and not (text[prefix].isalpha() or text[prefix] == "_"):
+            while prefix < special and not (
+                text[prefix].isalpha() or text[prefix] == "_"
+            ):
                 prefix += 1
             special = prefix
         out.append(text[i:special])
         i = special
+        raw_string = _raw_string_end(text, i)
+        if raw_string is not None:
+            out.append(" ")
+            i, ok = raw_string
+            if not ok:
+                return i, False
+            continue
         interp_prefix = _interpolated_string_prefix_len(text, i)
         if interp_prefix > 0:
             i, ok = _scan_interpolated_string(text, i + interp_prefix, out)
@@ -325,6 +351,13 @@ def _scan_lean_code(text: str, start: int, out: List[str]) -> tuple[int, bool]:
 
         ch = text[i]
         nxt = text[i + 1] if i + 1 < n else ""
+        if ch == "«":
+            end = text.find("»", i + 1)
+            if end == -1:
+                return n, False
+            out.append(text[i : end + 1])
+            i = end + 1
+            continue
         if ch == "/" and nxt == "-":
             i, ok = _skip_block_comment(text, i, out)
             if not ok:
@@ -335,9 +368,11 @@ def _scan_lean_code(text: str, start: int, out: List[str]) -> tuple[int, bool]:
             continue
         char_end = _char_literal_end(text, i)
         if char_end > i:
+            out.append(" ")
             i = char_end
             continue
         if ch == '"':
+            out.append(" ")
             i, ok = _skip_plain_string(text, i + 1)
             if not ok:
                 return i, False
@@ -381,6 +416,13 @@ def _scan_interpolation_expr(text: str, start: int, out: List[str]) -> tuple[int
     n = len(text)
     depth = 0
     while i < n:
+        raw_string = _raw_string_end(text, i)
+        if raw_string is not None:
+            out.append(" ")
+            i, ok = raw_string
+            if not ok:
+                return i, False
+            continue
         interp_prefix = _interpolated_string_prefix_len(text, i)
         if interp_prefix > 0:
             i, ok = _scan_interpolated_string(text, i + interp_prefix, out)
@@ -390,6 +432,13 @@ def _scan_interpolation_expr(text: str, start: int, out: List[str]) -> tuple[int
 
         ch = text[i]
         nxt = text[i + 1] if i + 1 < n else ""
+        if ch == "«":
+            end = text.find("»", i + 1)
+            if end == -1:
+                return n, False
+            out.append(text[i : end + 1])
+            i = end + 1
+            continue
         if ch == "/" and nxt == "-":
             i, ok = _skip_block_comment(text, i, out)
             if not ok:
@@ -400,9 +449,11 @@ def _scan_interpolation_expr(text: str, start: int, out: List[str]) -> tuple[int
             continue
         char_end = _char_literal_end(text, i)
         if char_end > i:
+            out.append(" ")
             i = char_end
             continue
         if ch == '"':
+            out.append(" ")
             i, ok = _skip_plain_string(text, i + 1)
             if not ok:
                 return i, False
@@ -425,6 +476,7 @@ def _scan_interpolation_expr(text: str, start: int, out: List[str]) -> tuple[int
 
 
 def _skip_block_comment(text: str, start: int, out: List[str]) -> tuple[int, bool]:
+    out.append(" ")
     i = start
     n = len(text)
     depth = 0
@@ -473,6 +525,8 @@ def _skip_plain_string(text: str, start: int) -> tuple[int, bool]:
 
 def _char_literal_end(text: str, start: int) -> int:
     if start >= len(text) or text[start] != "'":
+        return start
+    if start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_'»"):
         return start
     if start + 2 < len(text) and text[start + 2] == "'":
         return start + 3

@@ -14,6 +14,7 @@ from typing import Collection, List, Optional, Sequence
 from .lean_parser import LeanGoalState
 from .lean_syntax import normalize_nat_factorial_notation
 from .utils import (
+    _binder_identifier_tokens as _identifier_tokens,
     _canonicalize_top_level_let_in,
     _first_top_level_assign,
     _split_leading_forall_statement,
@@ -27,41 +28,8 @@ from .utils import (
     select_contextual_binders,
 )
 
-# Unicode-aware identifier regex (Lean allows identifiers like `γ`, `hγ0`).
-# Keep this aligned with the binder tokenizer in utils.py.
-_IDENT_RE = re.compile(r"(?:[^\W\d_]|_)[\w']*", re.UNICODE)
 _INSTANCE_ASSIGN_NAME_RE = re.compile(
     r"^(?:_+|inst[A-Za-z0-9_']*|_inst[A-Za-z0-9_']*)$"
-)
-_LEAN_KEYWORDS = frozenset(
-    {
-        "by",
-        "fun",
-        "match",
-        "let",
-        "have",
-        "show",
-        "theorem",
-        "lemma",
-        "example",
-        "def",
-        "abbrev",
-        "forall",
-        "exists",
-        "True",
-        "False",
-        "Prop",
-        "Type",
-        "Nat",
-        "Int",
-        "Real",
-        "Set",
-        "Finset",
-        "And",
-        "Or",
-        "Not",
-        "Iff",
-    },
 )
 _RELATION_SHORTHAND_TOKENS = (
     "∉",
@@ -92,12 +60,6 @@ class SubgoalVariant:
     contract_proof_binder_structural_hashes: tuple[str, ...] = ()
     contract_conclusion_structural_hash: str = ""
     contract_telescope_evidence_receipt: str = ""
-
-
-def _identifier_tokens(text: str) -> set[str]:
-    if not text:
-        return set()
-    return {tok for tok in _IDENT_RE.findall(text) if tok and tok not in _LEAN_KEYWORDS}
 
 
 def _merge_unique_segments(*parts: Sequence[str]) -> list[str]:

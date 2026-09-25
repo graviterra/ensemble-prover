@@ -4307,7 +4307,7 @@ def canonical_lean_identifier(name: str) -> str:
     for segment in segments:
         if segment.startswith("«") and segment.endswith("»"):
             inner = segment[1:-1]
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_']*", inner):
+            if inner and _consume_lean_identifier_prefix(inner) == inner:
                 segment = inner
         normalized.append(segment)
     return ".".join(normalized)
@@ -4841,7 +4841,7 @@ def _strip_leading_decl_attributes(text: str) -> str:
             break
         raw = _strip_leading_lean_comments(raw[end:].lstrip())
     return raw
-_BINDER_IDENT_RE = re.compile(r"(?:[^\W\d_]|_)[\w']*", re.UNICODE)
+_BINDER_IDENT_RE = re.compile(r"«[^»\n]+»|(?:[^\W\d_]|_)[\w']*", re.UNICODE)
 _BINDER_KEYWORDS = frozenset(
     {
         "by",
@@ -5438,7 +5438,7 @@ def _split_relation_forall_binder_segment(
     """
 
     raw = str(segment or "").strip()
-    if not raw or raw[0] in "({[⦃" or ":" in raw:
+    if not raw or raw[0] in "({[⦃" or _first_top_level_colon(raw) != -1:
         return None
     depth = 0
     i = 0
@@ -5591,42 +5591,176 @@ def _extract_leading_quantifier_binders(statement: str) -> list[str]:
 
 
 def _telescope_quantifier_bound_names(statement: str) -> set[str]:
-    """Names bound by leading ∀/∃ and nested quantifiers after a top-level →."""
+    """Telescope-bound names with no free occurrences outside their scope.
+
+    A conclusion's quantifiers can follow several implications. Their names
+    must not be supplied again by the root context, but they cannot capture
+    occurrences in earlier premises or binder types. Premise-local binders
+    have their own scope and are not part of the conclusion's telescope.
+    Unknown term syntax is treated conservatively as identifier uses.
+    """
     names: set[str] = set()
-    rest = str(statement or "").strip()
-    while rest:
-        if rest.startswith("∀ᶠ"):
-            break
-        if rest.startswith(("∀", "∃")):
-            binders = _extract_leading_quantifier_binders(rest)
-            names |= _declared_names_from_binder_segments(
-                _split_binder_segments(binders)
+    free: set[str] = set()
+    pending: list[tuple[str, set[str], bool]] = [
+        (
+            strip_lean_comments_and_string_literals(str(statement or "")).strip(),
+            set(),
+            True,
+        )
+    ]
+    while pending:
+        rest, bound, in_telescope = pending.pop()
+        while rest:
+            if rest.startswith("(") and _scan_group(rest, 0) == len(rest):
+                rest = rest[1:-1].strip()
+                continue
+            lambda_head = re.match(r"(?:fun|λ)(?=\s|[({⦃])", rest)
+            is_quantifier = rest.startswith(("∀", "∃")) and not rest.startswith("∀ᶠ")
+            if is_quantifier or lambda_head:
+                tail = rest[lambda_head.end() if lambda_head else 1 :].lstrip()
+                if lambda_head:
+                    delimiters = _top_level_token_positions(tail, ("=>", "↦"))
+                    if delimiters:
+                        index, delimiter = delimiters[0]
+                        split = tail[:index], tail[index + len(delimiter) :]
+                    else:
+                        split = None
+                    in_telescope = False
+                else:
+                    comma = _first_top_level_comma(tail)
+                    split = (tail[:comma], tail[comma + 1 :]) if comma != -1 else None
+                if split is None:
+                    free.update(_binder_identifier_tokens(rest) - bound)
+                    break
+                head, body = (part.strip() for part in split)
+                if lambda_head and (
+                    _top_level_token_positions(head, ("|",))
+                    or any(
+                        opener
+                        and _first_top_level_colon(inner) == -1
+                        and _BINDER_IDENT_RE.fullmatch(inner) is None
+                        for opener, inner, _closer in (
+                            _binder_segment_parts(segment)
+                            for segment in _split_binder_segments([head])
+                        )
+                    )
+                ):
+                    free.update(_binder_identifier_tokens(rest) - bound)
+                    break
+                relation = (
+                    _split_relation_forall_binder_segment(head)
+                    if is_quantifier
+                    else None
+                )
+                if relation is not None:
+                    name, _op, _label, annotation = relation
+                    declared = {canonical_lean_identifier(name)}
+                    bound.update(declared)
+                    # Bounded quantifiers expand to a variable followed by a
+                    # predicate, so their RHS already sees the new variable.
+                    pending.append((annotation, set(bound), False))
+                    if in_telescope:
+                        names.update(declared)
+                else:
+                    for segment in _split_binder_segments([head]):
+                        declared = _declared_names_from_binder_segments([segment])
+                        annotation = _binder_segment_annotation(segment)
+                        if not declared and not annotation:
+                            _opener, annotation, _closer = _binder_segment_parts(
+                                segment
+                            )
+                        if annotation:
+                            pending.append((annotation, set(bound), False))
+                        bound.update(declared)
+                        if in_telescope:
+                            names.update(declared)
+                rest = body
+                continue
+            if rest.startswith("let "):
+                let_split = _split_top_level_let_body(rest)
+                assign = _first_top_level_assign(rest)
+                head = rest[4:assign].strip() if assign != -1 else ""
+                match = _BINDER_IDENT_RE.match(head)
+                simple_head = bool(
+                    match
+                    and (
+                        not head[match.end() :].strip()
+                        or head[match.end() :].lstrip().startswith(":")
+                    )
+                )
+                if let_split and simple_head:
+                    prefix, body = let_split
+                    rhs = prefix[assign + 2 :].rstrip()
+                    rhs = rhs[:-1].rstrip() if rhs.endswith(";") else rhs[:-2].rstrip()
+                    # Pattern, recursive and unparenthesized nested bindings
+                    # need a full term parser; keep those conservative.
+                    if _first_top_level_keyword(rhs, "let") == -1 and match:
+                        annotation = _binder_segment_annotation(head)
+                        pending.append((annotation, set(bound), False))
+                        pending.append((rhs, set(bound), False))
+                        bound.add(canonical_lean_identifier(match.group()))
+                        rest, in_telescope = body, False
+                        continue
+            operators = _top_level_token_positions(
+                rest, ("<->", "↔", "→", "->", "∨", "∧", "∀", "∃")
             )
-            if rest.startswith("∃"):
-                # `_split_leading_forall_statement` does not consume ∃.
+            # A quantifier owns the remainder of this group. Do not split an
+            # implication in its body away from the binder that scopes it.
+            quantifier_start = next(
+                (idx for idx, op in operators if op in {"∀", "∃"}), len(rest)
+            )
+            separators = [(idx, op) for idx, op in operators if idx < quantifier_start]
+            precedence = {"<->": 0, "↔": 0, "→": 1, "->": 1, "∨": 2, "∧": 3}
+            if not separators:
+                if rest.startswith("¬"):
+                    rest, in_telescope = rest[1:].lstrip(), False
+                    continue
+                # Ordinary term arguments can themselves contain quantified
+                # propositions (e.g. Not (∃ n, P n)). Descend into balanced
+                # groups without letting their bindings escape to siblings.
+                # Quoted Lean syntax is not an ordinary term scope.
+                if "`" in rest:
+                    free.update(_binder_identifier_tokens(rest) - bound)
+                    break
+                start = index = 0
+                while index < len(rest):
+                    skip = _lean_lexical_skip_end(rest, index)
+                    if skip is not None:
+                        index = skip
+                        continue
+                    if rest[index] in _GROUP_OPEN_TO_CLOSE:
+                        end = _scan_group(rest, index)
+                        if end is not None:
+                            free.update(
+                                _binder_identifier_tokens(rest[start:index]) - bound
+                            )
+                            pending.append(
+                                (rest[index + 1 : end - 1].strip(), set(bound), False)
+                            )
+                            start = index = end
+                            continue
+                    index += 1
+                free.update(_binder_identifier_tokens(rest[start:]) - bound)
                 break
-            _, after = _split_leading_forall_statement(rest)
-            if after == rest:
-                break
-            rest = after
-            continue
-        split = _split_top_level(rest, "→") or _split_top_level(rest, "->")
-        if split is None:
-            break
-        _premise, conclusion = split
-        conclusion = conclusion.strip()
-        if not conclusion.startswith(("∀", "∃")):
-            break
-        rest = conclusion
-    return names
+            index, operator = min(
+                separators, key=lambda pair: (precedence[pair[1]], pair[0])
+            )
+            premise, conclusion = rest[:index], rest[index + len(operator) :]
+            pending.append((premise.strip(), set(bound), False))
+            if operator not in {"→", "->"}:
+                in_telescope = False
+            rest = conclusion.strip()
+    return names - free
 
 
 def _binder_identifier_tokens(text: str) -> set[str]:
     if not text:
         return set()
     return {
-        tok
-        for tok in _BINDER_IDENT_RE.findall(text)
+        canonical_lean_identifier(tok)
+        for tok in _BINDER_IDENT_RE.findall(
+            strip_lean_comments_and_string_literals(text)
+        )
         if tok and tok not in _BINDER_KEYWORDS
     }
 
@@ -5915,8 +6049,8 @@ def _binder_segment_declared_names(segment: str) -> list[str]:
     head = content[:colon_idx].strip() if colon_idx != -1 else content.strip()
     out: list[str] = []
     seen: set[str] = set()
-    for tok in re.split(r"\s+", head):
-        name = str(tok or "").strip().strip(",")
+    for tok in _BINDER_IDENT_RE.findall(strip_lean_comments_and_string_literals(head)):
+        name = canonical_lean_identifier(tok)
         if not name or name == "_" or name in seen:
             continue
         if name in _BINDER_KEYWORDS:
@@ -5947,8 +6081,9 @@ def _binder_segment_referenced_names(segment: str) -> set[str]:
         return set()
     opener, inner, _closer = _binder_segment_parts(raw)
     content = inner if opener else raw
-    if ":=" in content:
-        content = content.split(":=", 1)[0].strip()
+    assign_idx = _first_top_level_assign(content)
+    if assign_idx != -1:
+        content = content[:assign_idx].strip()
     colon_idx = _first_top_level_colon(content)
     # Membership binders (x ∈ s) use ∈ as a delimiter analogous to :.
     if colon_idx == -1:
@@ -5958,9 +6093,7 @@ def _binder_segment_referenced_names(segment: str) -> set[str]:
     body = content[colon_idx + 1 :].strip() if colon_idx != -1 else content.strip()
     if not body:
         return set()
-    nested_declared = _declared_names_from_binder_segments(
-        _extract_leading_quantifier_binders(body)
-    )
+    nested_declared = _telescope_quantifier_bound_names(body)
     return (
         _binder_identifier_tokens(body)
         - nested_declared
@@ -5974,8 +6107,9 @@ def _binder_segment_annotation(segment: str) -> str:
         return ""
     opener, inner, _closer = _binder_segment_parts(raw)
     content = inner if opener else raw
-    if ":=" in content:
-        content = content.split(":=", 1)[0].strip()
+    assign_idx = _first_top_level_assign(content)
+    if assign_idx != -1:
+        content = content[:assign_idx].strip()
     colon_idx = _first_top_level_colon(content)
     if colon_idx == -1:
         return ""
@@ -6117,6 +6251,41 @@ def select_contextual_binders(
     if not flattened or not needed:
         return []
 
+    # A later local binder may shadow a root name that is nevertheless needed
+    # in an earlier, free context variable's type (e.g. f : Fin n → Nat).
+    # Include supporting hypotheses connecting a needed variable to other
+    # root variables, but not unrelated hypotheses restated locally.
+    # Close those dependencies before pruning shadowed context binders.
+    required_context = set(needed)
+    context_names = _declared_names_from_binder_segments(flattened)
+    context_annotations = _declared_name_annotations_from_binder_segments(flattened)
+    dependencies = []
+    for seg in flattened:
+        referenced = _binder_segment_referenced_names(seg) & context_names
+        supporting = (
+            include_supporting_assumptions
+            and _binder_segment_looks_supporting_assumption(
+                seg,
+                dependency_names=referenced,
+                dependency_annotations=context_annotations,
+            )
+        )
+        dependencies.append(
+            (set(_binder_segment_declared_names(seg)), referenced, supporting)
+        )
+    changed = True
+    while changed:
+        before = len(required_context)
+        for declared, referenced, supporting in dependencies:
+            if declared & required_context or (
+                supporting and referenced & required_context
+            ):
+                required_context.update(referenced)
+        changed = len(required_context) != before
+    required_outer = required_context & nested_declared
+    local_declared -= required_outer
+    nested_declared -= required_outer
+
     items: list[tuple[str, set[str], set[str], str]] = []
     seen_keys: set[str] = set()
     for seg in flattened:
@@ -6150,7 +6319,7 @@ def select_contextual_binders(
 
     selected_indices: set[int] = set()
     selected_keys: set[str] = set()
-    required_names = set(needed)
+    required_names = set(required_context)
     for idx in range(len(items) - 1, -1, -1):
         segment, declared_names, referenced_names, normalized_key = items[idx]
         include = False
