@@ -2350,7 +2350,7 @@ def _dossier_looks_like_parameter_type_part(text: str) -> bool:
 def _dossier_strip_leading_forall_binders(text: str) -> str:
     s = _dossier_strip_balanced_outer_parens(text)
     while True:
-        quantifier_match = re.match(r"^(?:∀|forall\b)\s*", s)
+        quantifier_match = re.match(r"^(?:∀(?![ᶠᵐ∞])|forall\b)\s*", s)
         if quantifier_match is None:
             break
         comma = _dossier_find_top_level_comma(s)
@@ -2479,15 +2479,16 @@ def _dossier_split_top_level_conjunctions(text: str) -> List[str]:
 
 
 def _dossier_contract_norm(text: str) -> str:
+    from .contract_normalization import compact_contract_surface
+
     stripped = _dossier_strip_leading_forall_binders(text)
     stripped = _dossier_normalize_numeric_casts_for_contract(stripped)
-    stripped = re.sub(r"\((\d+)\s*:\s*[^()]+\)", r"\1", stripped)
-    return re.sub(r"\s+", "", stripped)
+    return compact_contract_surface(stripped)
 
 
 def _dossier_quantifier_bound_names(text: str) -> Tuple[str, ...]:
     names: List[str] = []
-    for match in re.finditer(r"(?:[∀∃]|forall|exists)\s*([^,]+),", str(text or "")):
+    for match in re.finditer(r"(?:[∀∃](?![ᶠᵐ∞])|forall|exists)\s*([^,]+),", str(text or "")):
         names.extend(_dossier_binder_names_from_chunk(match.group(1)))
     return tuple(dict.fromkeys(names))
 
@@ -2499,7 +2500,7 @@ def _dossier_ident_char(ch: str) -> bool:
 def _dossier_top_level_quantifier_token_len(text: str, index: int) -> int:
     raw = str(text or "")
     ch = raw[index] if 0 <= index < len(raw) else ""
-    if ch in {"∀", "∃"}:
+    if ch in {"∀", "∃"} and raw[index + 1:index + 2] not in {"ᶠ", "ᵐ", "∞"}:
         return 1
     for token in ("forall", "exists"):
         end = index + len(token)
@@ -2570,6 +2571,8 @@ def _cached_dossier_contract_alpha_norm(
     *,
     context_bound_names: Tuple[str, ...],
 ) -> str:
+    from .contract_normalization import compact_contract_surface
+
     stripped, leading_names = _dossier_strip_leading_forall_binders_with_names(text)
     bound_names = tuple(
         dict.fromkeys(
@@ -2584,102 +2587,24 @@ def _cached_dossier_contract_alpha_norm(
     mapping = {name: f"__bound{idx}__" for idx, name in enumerate(bound_names)}
 
     stripped = _dossier_normalize_numeric_casts_for_contract(stripped)
-    stripped = re.sub(r"\((\d+)\s*:\s*[^()]+\)", r"\1", stripped)
     normalized = _dossier_contract_alpha_replace_scoped(stripped, mapping)
-    return re.sub(r"\s+", "", normalized)
+    return compact_contract_surface(normalized)
 
 
 def _dossier_contract_alpha_replace_scoped(
     text: str,
     mapping: Mapping[str, str],
 ) -> str:
-    raw = str(text or "")
-    out: List[str] = []
-    index = 0
-    while index < len(raw):
-        skip_to = _lean_lexical_skip_end(raw, index)
-        if skip_to is not None:
-            token = raw[index:skip_to]
-            out.append(mapping.get(token, token) if raw.startswith("«", index) else token)
-            index = skip_to
-            continue
-        ch = raw[index]
-        if ch in _DOSSIER_LEAN_GROUP_OPEN_TO_CLOSE:
-            end = _dossier_matching_group_index(raw, index)
-            if end >= 0:
-                out.append(ch)
-                out.append(
-                    _dossier_contract_alpha_replace_scoped(
-                        raw[index + 1 : end],
-                        mapping,
-                    )
-                )
-                out.append(raw[end])
-                index = end + 1
-                continue
-        quantifier_len = _dossier_top_level_quantifier_token_len(raw, index)
-        if quantifier_len:
-            tail_start = index + quantifier_len
-            comma = _dossier_find_top_level_comma(raw[tail_start:])
-            if comma >= 0:
-                binder = raw[tail_start : tail_start + comma]
-                body = raw[tail_start + comma + 1 :]
-                local_mapping = dict(mapping)
-                next_index = 1 + max(
-                    (int(value[len("__bound"):-2]) for value in mapping.values()
-                     if _DOSSIER_ALPHA_BOUND_PLACEHOLDER_RE.fullmatch(value)),
-                    default=-1,
-                )
-                normalized_groups: List[str] = []
-                for binder_group in _dossier_binder_group_chunks(binder):
-                    group = binder_group.strip()
-                    unwrapped = _dossier_unwrap_binder_group(group)
-                    colon = _dossier_top_level_colon_index(unwrapped)
-                    names = _dossier_binder_names_from_chunk(binder_group)
-                    # A binder's annotation is outside its own scope. This is
-                    # material for ∃ n : Nat, ∃ n : Fin n, ...: the Fin argument
-                    # refers to the outer n, not the newly introduced witness.
-                    annotation = (
-                        _dossier_contract_alpha_replace_scoped(
-                            unwrapped[colon + 1:], local_mapping,
-                        ) if colon >= 0 else ""
-                    )
-                    for name in names:
-                        local_mapping[name] = f"__bound{next_index}__"
-                        next_index += 1
-                    if colon >= 0 and names:
-                        opener = group[0] if group[0] in "[{⦃" else "("
-                        closer = _DOSSIER_LEAN_GROUP_OPEN_TO_CLOSE[opener]
-                        normalized_groups.append(
-                            opener + " ".join(local_mapping[name] for name in names)
-                            + ":" + annotation + closer
-                        )
-                    else:
-                        normalized_groups.append(
-                            _dossier_contract_alpha_replace_scoped(group, local_mapping)
-                        )
-                out.append(raw[index : index + quantifier_len])
-                out.append(" ".join(normalized_groups))
-                out.append(",")
-                out.append(
-                    _dossier_contract_alpha_replace_scoped(body, local_mapping)
-                )
-                return "".join(out)
-        match = re.match(r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*", raw[index:])
-        if match is not None:
-            token = match.group(0)
-            head, separator, tail = token.partition(".")
-            # Namespace-qualified suffixes are constants, not occurrences of
-            # same-spelled local binders. Preserve a genuinely local projection
-            # head (n.val), without rewriting constants such as Namespace.n.
-            out.append(_dossier_contract_alpha_identifier_token(head, mapping))
-            if separator:
-                out.append(separator + tail)
-            index += len(token)
-            continue
-        out.append(raw[index])
-        index += 1
-    return "".join(out)
+    from .contract_normalization import replace_scoped_contract_identifiers
+
+    return replace_scoped_contract_identifiers(
+        str(text or ""), mapping,
+        binder_groups=_dossier_binder_group_chunks,
+        binder_names=_dossier_binder_names_from_chunk,
+        comma_index=_dossier_find_top_level_comma,
+        colon_index=_dossier_top_level_colon_index,
+        unwrap_group=_dossier_unwrap_binder_group,
+    )
 
 
 def _dossier_matching_paren_index(text: str, start: int) -> int:
@@ -2698,39 +2623,12 @@ def _dossier_matching_paren_index(text: str, start: int) -> int:
 
 
 def _dossier_normalize_numeric_casts_for_contract(text: str) -> str:
-    numeric_type_re = re.compile(r"(?:ℚ|Rat|ℝ|Real|ℤ|Int|ℕ|Nat)")
+    from .contract_normalization import normalize_numeric_contract_casts
 
-    def normalize(value: str) -> str:
-        out: List[str] = []
-        index = 0
-        while index < len(value):
-            if value[index] != "(":
-                out.append(value[index])
-                index += 1
-                continue
-            end = _dossier_matching_paren_index(value, index)
-            if end < 0:
-                out.append(value[index])
-                index += 1
-                continue
-            body = normalize(value[index + 1 : end])
-            colon = _dossier_top_level_colon_index(body)
-            if colon >= 0:
-                expr = body[:colon].strip()
-                type_text = _dossier_strip_balanced_outer_parens(
-                    body[colon + 1 :].strip()
-                )
-                if expr and re.search(r"\d", expr) and numeric_type_re.fullmatch(type_text):
-                    out.append(_dossier_strip_balanced_outer_parens(expr))
-                    index = end + 1
-                    continue
-            out.append("(")
-            out.append(body)
-            out.append(")")
-            index = end + 1
-        return "".join(out)
-
-    return normalize(str(text or ""))
+    return normalize_numeric_contract_casts(
+        str(text or ""), colon_index=_dossier_top_level_colon_index,
+        strip_parens=_dossier_strip_balanced_outer_parens,
+    )
 
 
 def _dossier_split_top_level_equality(text: str) -> Tuple[str, str]:
@@ -3793,24 +3691,13 @@ def _dossier_support_contains(
     *,
     premise_bound_names: Sequence[str] = (),
 ) -> bool:
-    premise_key = canonical_dossier_statement_key(premise)
-    premise_norm = _dossier_contract_norm(premise)
-    premise_alpha_norm = _dossier_contract_alpha_norm(
-        premise,
-        context_bound_names=premise_bound_names,
+    from .proof_graph import _graph_support_contains_contract
+
+    if not _dossier_contract_norm(premise):
+        return False
+    return _graph_support_contains_contract(
+        premise, tuple(support_candidates), bound_names=premise_bound_names,
     )
-    for support, support_bound_names in support_candidates:
-        if premise_key and premise_key == canonical_dossier_statement_key(support):
-            return True
-        if premise_norm and premise_norm == _dossier_contract_norm(support):
-            return True
-        support_alpha_norm = _dossier_contract_alpha_norm(
-            support,
-            context_bound_names=support_bound_names,
-        )
-        if premise_alpha_norm and premise_alpha_norm == support_alpha_norm:
-            return True
-    return False
 
 
 def normalize_scratch_code_for_registry(code: str) -> str:
@@ -7628,6 +7515,86 @@ class VerifiedHelper:
     contract_binder_sorts: List[str] = field(default_factory=list)
     contract_proof_binder_types: List[str] = field(default_factory=list)
     contract_binder_evidence_receipt: str = ""
+    # Scheduling-only anchor: stronger elaboration metadata must not turn an
+    # already checked fact into new mathematical progress. It is never proof
+    # authority, and a different spelling requires the bound Expr identity.
+    progress_statement: str = ""
+    progress_statement_identity: str = ""
+    progress_discriminator: str = ""
+
+
+def verified_helper_progress_statement(helper: Any) -> str:
+    """Return the stable scheduling spelling, retaining current proof authority."""
+
+    statement = helper_decl_statement(str(getattr(helper, "source", "") or ""))
+    anchor = str(getattr(helper, "progress_statement", "") or "").strip()
+    if anchor == statement.strip():
+        return anchor
+    identity = verified_helper_bound_contract_identity(helper)
+    parsed = parse_lean_contract_identity(identity)
+    anchor_identity = parse_lean_contract_identity(str(
+        getattr(helper, "progress_statement_identity", "") or ""
+    ))
+    if anchor and parsed and anchor_identity and parsed[0] == anchor_identity[0]:
+        return anchor
+    return statement
+
+
+def verified_helper_progress_discriminators(helpers: Iterable[Any]) -> Dict[int, str]:
+    """Read stable conflict identities without rekeying surviving helpers."""
+
+    result: Dict[int, str] = {}
+    for helper in helpers:
+        discriminator = str(getattr(helper, "progress_discriminator", "") or "")
+        parsed = parse_lean_contract_identity(verified_helper_bound_contract_identity(helper))
+        if parsed and discriminator == parsed[0]:
+            result[id(helper)] = discriminator
+    return result
+
+
+def _bind_verified_helper_progress_anchor(
+    helper: VerifiedHelper, previous_helpers: Iterable[VerifiedHelper],
+) -> None:
+    """Assign progress identity when evidence enters the registry, once per fact."""
+
+    identity = verified_helper_bound_contract_identity(helper)
+    parsed = parse_lean_contract_identity(identity)
+    previous = [
+        item for item in previous_helpers
+        if item is not helper
+    ]
+    statement = helper_decl_statement(helper.source)
+    if not helper.progress_statement:
+        helper.progress_statement = statement
+    equivalent = None
+    same_surface = None
+    for item in previous:
+        item_identity = parse_lean_contract_identity(verified_helper_bound_contract_identity(item))
+        if parsed and item_identity and parsed[0] == item_identity[0]:
+            equivalent = item
+            break
+        if (same_surface is None
+                and item.verification_environment_hash == helper.verification_environment_hash
+                and helper_decl_statement(item.source) == statement):
+            same_surface = item
+    if equivalent is not None:
+        helper.progress_statement = verified_helper_progress_statement(equivalent)
+        helper.progress_statement_identity = identity
+        helper.progress_discriminator = verified_helper_progress_discriminators(
+            (equivalent,)
+        ).get(id(equivalent), "")
+        return
+    if same_surface is not None:
+        helper.progress_statement = verified_helper_progress_statement(same_surface)
+        helper.progress_statement_identity = identity
+    if parsed:
+        key = canonical_dossier_statement_key(verified_helper_progress_statement(helper))
+        for item in previous:
+            item_identity = parse_lean_contract_identity(verified_helper_bound_contract_identity(item))
+            if (item_identity and item_identity[0] != parsed[0]
+                    and canonical_dossier_statement_key(verified_helper_progress_statement(item)) == key):
+                helper.progress_discriminator = parsed[0]
+                break
 
 
 def verified_helper_bound_contract_identity(helper: Any) -> str:
@@ -16350,6 +16317,7 @@ class ProofDossier:
                 helper_decl_statement(source) if contract_identity else ""
             ),
             _verification_environment_hash=evidence_environment_hash,
+            _progress_anchor_from=helper,
         )
         if recorded is None:
             return None
@@ -16658,6 +16626,7 @@ class ProofDossier:
             existing.contract_identity_evidence_receipt = str(
                 getattr(incoming, "contract_identity_evidence_receipt", "") or ""
             ).strip()
+            _bind_verified_helper_progress_anchor(existing, self.verified_helpers.values())
             changed = True
             if existing.contract_display_statement != incoming_display:
                 existing.contract_display_statement = incoming_display
@@ -16801,6 +16770,7 @@ class ProofDossier:
         contract_proof_binder_types: Optional[Iterable[str]] = None,
         _contract_identity_statement: str = "",
         _verification_environment_hash: Optional[str] = None,
+        _progress_anchor_from: Optional[VerifiedHelper] = None,
         replace_existing_same_name: bool = False,
         _defer_global_derived_refresh: bool = False,
     ) -> Optional[VerifiedHelper]:
@@ -16968,6 +16938,18 @@ class ProofDossier:
             tuple(item.contract_binder_sorts),
             tuple(item.contract_proof_binder_types),
         )
+        if (
+            _progress_anchor_from is not None
+            and helper_decl_statement(_progress_anchor_from.source) == incoming_statement
+            and _progress_anchor_from.verification_environment_hash == verification_environment_hash
+            and verified_helper_bound_contract_identity(_progress_anchor_from) == bound_contract_identity
+        ):
+            item.progress_statement = verified_helper_progress_statement(_progress_anchor_from)
+            item.progress_statement_identity = bound_contract_identity
+            item.progress_discriminator = verified_helper_progress_discriminators(
+                (_progress_anchor_from,)
+            ).get(id(_progress_anchor_from), "")
+        _bind_verified_helper_progress_anchor(item, self.verified_helpers.values())
         self._classify_verified_helper_quality(item)
         if str(getattr(item, "render_policy", "") or "") == "advisory_root_equivalent":
             self.increment_tool_metric(
@@ -17038,6 +17020,7 @@ class ProofDossier:
                 contract_proof_binder_types=contract_proof_binder_types,
                 _contract_identity_statement=_contract_identity_statement,
                 _verification_environment_hash=verification_environment_hash,
+                _progress_anchor_from=_progress_anchor_from,
                 _defer_global_derived_refresh=_defer_global_derived_refresh,
             )
         if (
@@ -21608,6 +21591,9 @@ class ProofDossier:
                 ],
                 render_policy=str(raw.get("render_policy") or ""),
                 contract_identity=str(raw.get("contract_identity") or ""),
+                progress_statement=str(raw.get("progress_statement") or ""),
+                progress_statement_identity=str(raw.get("progress_statement_identity") or ""),
+                progress_discriminator=str(raw.get("progress_discriminator") or ""),
                 contract_identity_statement_key=str(
                     raw.get("contract_identity_statement_key") or ""
                 ),
@@ -21764,6 +21750,15 @@ class ProofDossier:
                     item.contract_binder_sorts = []
                     item.contract_proof_binder_types = []
                     restored_contract_evidence_rejected += 1
+                if not any(key in raw for key in (
+                    "progress_statement", "progress_statement_identity", "progress_discriminator",
+                )):
+                    # Older records predate scheduling anchors. Assign them
+                    # after proof admission, in persisted helper order, so
+                    # aliases stay aliases and distinct Exprs stay distinct.
+                    # Explicit newer anchors keep their ordinary bound-identity
+                    # validation and are never overwritten during restore.
+                    _bind_verified_helper_progress_anchor(item, verified_helpers.values())
                 verified_helpers[item.name] = item
             else:
                 rejected_name = str(raw.get("name") or "").strip()

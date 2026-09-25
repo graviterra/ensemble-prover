@@ -2483,6 +2483,15 @@ def _graph_quantified_predicate_body_is_formal(
     return _graph_application_args_are_bound(compact, head, bound_names)
 
 
+def _graph_proposition_quantifier_token_len(text: str) -> int:
+    """Recognize quantifier scope for syntactic proposition classification."""
+
+    for marker in ("∀ᶠ", "∃ᶠ", "∀ᵐ"):
+        if text.startswith(marker):
+            return len(marker)
+    return _graph_top_level_quantifier_token_len(text, 0)
+
+
 def _graph_quantified_statement_is_executable(text: str) -> bool:
     body = graph_identity_text(text)
     if not body:
@@ -2490,7 +2499,7 @@ def _graph_quantified_statement_is_executable(text: str) -> bool:
     saw_quantifier = False
     binder_contexts: List[str] = []
     while body:
-        quantifier_len = _graph_top_level_quantifier_token_len(body, 0)
+        quantifier_len = _graph_proposition_quantifier_token_len(body)
         if quantifier_len <= 0:
             break
         saw_quantifier = True
@@ -2723,7 +2732,7 @@ def graph_statement_is_executable(text: str) -> bool:
         return False
     if _graph_statement_looks_like_prose_instruction(compact):
         return False
-    if _graph_top_level_quantifier_token_len(compact, 0) > 0:
+    if _graph_proposition_quantifier_token_len(compact) > 0:
         # Quantified bodies need the let-aware proof-tail parser. The generic
         # detector treats every top-level semicolon as tactic syntax, including
         # the delimiters in a valid quantified let-chain.
@@ -4158,7 +4167,7 @@ def _graph_leading_telescope_step(
     """
 
     body = str(statement_body or "").strip()
-    quantifier_match = re.match(r"^(?:∀|forall\b)\s*", body)
+    quantifier_match = re.match(r"^(?:∀(?![ᶠᵐ∞])|forall\b)\s*", body)
     if quantifier_match is not None:
         comma = _graph_find_top_level_comma(body)
         if comma < 0:
@@ -4232,7 +4241,7 @@ def _graph_type_returns_prop(type_text: str) -> bool:
         return is_prop_sort(parts[-1])
     body = clean
     while True:
-        match = re.match(r"^(?:∀|forall\b)\s*", body)
+        match = re.match(r"^(?:∀(?![ᶠᵐ∞])|forall\b)\s*", body)
         if match is None:
             break
         comma = _graph_find_top_level_comma(body)
@@ -4251,7 +4260,7 @@ def _graph_type_returns_type(type_text: str) -> bool:
     parts = _graph_split_top_level_implications(clean)
     body = parts[-1] if len(parts) >= 2 else clean
     while True:
-        match = re.match(r"^(?:∀|forall\b)\s*", body)
+        match = re.match(r"^(?:∀(?![ᶠᵐ∞])|forall\b)\s*", body)
         if match is None:
             break
         comma = _graph_find_top_level_comma(body)
@@ -4366,7 +4375,7 @@ def _graph_binder_type_sort_hint(
         )
     body = clean
     while True:
-        match = re.match(r"^(?:∀|forall\b)\s*", body)
+        match = re.match(r"^(?:∀(?![ᶠᵐ∞])|forall\b)\s*", body)
         if match is None:
             break
         comma = _graph_find_top_level_comma(body)
@@ -4423,7 +4432,7 @@ def _graph_binder_type_needs_ambiguity_signal(type_text: str) -> bool:
         return True
     body = clean
     while True:
-        match = re.match(r"^(?:∀|forall\b)\s*", body)
+        match = re.match(r"^(?:∀(?![ᶠᵐ∞])|forall\b)\s*", body)
         if match is None:
             break
         comma = _graph_find_top_level_comma(body)
@@ -5054,24 +5063,53 @@ def graph_contract_domains_compatible(
     Unannotated local domains remain unspecified. This is a rejection guard,
     not evidence that two Lean types are equal.
     """
+    from .contract_normalization import (
+        canonicalize_contract_type_aliases, compact_contract_surface,
+    )
+
+    def instances(text: str, mapping: Mapping[str, str]) -> Set[str]:
+        _body, records = _graph_leading_binder_analysis(text)
+        return {
+            compact_contract_surface(canonicalize_contract_type_aliases(
+                _graph_contract_alpha_replace_scoped(type_text, mapping),
+            ))
+            for raw, _names, type_text, _proof, _ambiguous in records
+            if raw.startswith("[") and raw.endswith("]")
+        }
+
+    left_mapping, right_mapping = left_mapping or {}, right_mapping or {}
+    # An anonymous instance is still an argument to the support theorem. Its
+    # class may have no inhabitants; typeclass synthesis is not proof evidence
+    # that an omitted or differently typed argument exists in this context.
+    if not instances(right, right_mapping).issubset(instances(left, left_mapping)):
+        return False
+
+    def scoped_telescope_key(text: str) -> str:
+        body, records = _graph_leading_binder_analysis(text)
+        prefix = " ".join(
+            _graph_projection_render_binder_group(record[0]) for record in records
+        )
+        return graph_statement_key(f"∀ {prefix}, {body}" if prefix else body)
+
     for statement in (left, right):
         _body, records = _graph_leading_binder_analysis(statement)
         names = [name for _raw, group, _type, _proof, _ambiguous in records for name in group]
         if len(names) != len(set(names)):
             # A name-indexed domain map cannot represent shadowed parameters.
-            # Require the complete scoped contract instead of dropping one.
-            return graph_statement_key(left) == graph_statement_key(right)
+            # Compare complete telescopes, allowing adjacent forall groups to
+            # share one spelling without moving anything across a body arrow.
+            return scoped_telescope_key(left) == scoped_telescope_key(right)
 
     def domains(text: str, mapping: Mapping[str, str]) -> Dict[str, str]:
+        from .contract_normalization import (
+            canonicalize_contract_type_aliases, compact_contract_surface,
+        )
+
         result: Dict[str, str] = {}
         for name, domain in graph_contract_data_domains(text):
             normalized = _graph_contract_alpha_replace_scoped(domain, mapping)
-            for spelling, canonical in (
-                ("ℝ≥0∞", "ENNReal"), ("ℝ≥0", "NNReal"),
-                ("ℕ", "Nat"), ("ℤ", "Int"), ("ℝ", "Real"), ("ℚ", "Rat"),
-            ):
-                normalized = normalized.replace(spelling, canonical)
-            result[mapping.get(name, name)] = re.sub(r"\s+", "", normalized)
+            normalized = canonicalize_contract_type_aliases(normalized)
+            result[mapping.get(name, name)] = compact_contract_surface(normalized)
         return result
 
     def parameters(text: str, context: Sequence[str], mapping: Mapping[str, str]) -> Set[str]:
@@ -5091,54 +5129,73 @@ def graph_contract_domains_compatible(
                 names.update(group)
         return {mapping.get(name, name) for name in names}
 
-    left_mapping, right_mapping = left_mapping or {}, right_mapping or {}
     if not parameters(right, (), right_mapping).issubset(parameters(left, left_bound_names, left_mapping)):
         return False
     lhs, rhs = domains(left, left_mapping), domains(right, right_mapping)
+    _body, left_records = _graph_leading_binder_analysis(left)
+    inferred_relation_names = {
+        left_mapping.get(name, name)
+        for record in left_records if _graph_binder_record_is_relation(record)
+        for name in record[1]
+    }
+    # Relation shorthand carries an inferred data domain, not an untyped local
+    # whose domain a support theorem may freely choose. Keep that uncertainty
+    # from aligning the request with a vacuous theorem over an empty type.
+    if inferred_relation_names.intersection(rhs).difference(lhs):
+        return False
     return all(lhs[key] == rhs[key] for key in lhs.keys() & rhs.keys())
 
 
 def graph_contract_weakening_tail(statement: str) -> str:
-    """Drop one requested assumption only when its proof is not a parameter.
+    """Remove an independent assumption from the original scoped telescope.
 
-    ``∀ h : A, P h`` is a dependent function, not merely ``A → P``. A
-    surface matcher cannot erase ``h`` and then align it with unrelated data.
-    Closing over uncertain data domains may preserve the statement. Consumers
-    must track the complete statement and bound-name context to detect cycles;
-    a context change alone can still expose a valid alpha-equivalent match.
+    Comparison keys deliberately treat uncertain domains as possible premises;
+    they are not source syntax and must never be used to construct a weaker
+    contract. Every successful step removes a real proof binder or body arrow
+    while preserving all other binders in order, so repeated steps terminate.
     """
     body, records = _graph_leading_binder_analysis(statement)
-    for index, (_raw, names, type_text, is_proof, ambiguous) in enumerate(records):
-        if not (is_proof or ambiguous or _graph_looks_like_proof_premise_type(type_text, names)):
+    groups = [record[0] for record in records]
+    for index, record in enumerate(records):
+        _raw, names, _type_text, is_proof, ambiguous = record
+        if not is_proof or ambiguous:
             continue
-        rest = " ".join([body, *(record[0] for record in records[index + 1:])])
-        if any(re.search(r"(?<![\w.'])" + re.escape(name) + r"(?![\w'])", rest) for name in names):
+        if _graph_binder_record_is_relation(record):
+            # The relation supplies the introduced data's inferred type too.
+            # Removing it would permit support over an unrelated data domain.
+            # Explicitly typed data followed by an arrow premise remains safe.
+            continue
+        rest = " ".join([body, *(item[0] for item in records[index + 1:])])
+        if set(names).intersection(_graph_lean_identifier_tokens(rest)):
+            continue
+        del groups[index]
+        break
+    else:
+        parts = _graph_split_top_level_implications(body)
+        if len(parts) < 2:
             return ""
-    keyed, _names = graph_statement_keyed_contract(statement)
-    parts = _graph_split_top_level_implications(keyed)
-    if len(parts) < 2:
-        return ""
-    return graph_contract_with_data_domains(statement, " → ".join(parts[1:]))
+        body = " → ".join(parts[1:])
+    prefix = " ".join(
+        _graph_projection_render_binder_group(group) for group in groups if group
+    )
+    return f"∀ {prefix}, {body}" if prefix else body
 
 
 def graph_contract_weakening_bound_names(
     statement: str, context: Sequence[str] = (),
 ) -> Tuple[str, ...]:
-    """Retain data identities, but not erased proof parameters, after weakening.
-
-    Call only after ``graph_contract_weakening_tail`` succeeds: it has checked
-    that no erased proof name occurs in the remaining telescope or body.
-    Keeping such a name would shift the data-domain alignment even though the
-    corresponding premise is no longer part of the contract.
-    """
+    """Retain the context of the actual weakened telescope, not its projection."""
     _body, records = _graph_leading_binder_analysis(statement)
+    weakened = graph_contract_weakening_tail(statement)
+    if not weakened:
+        return tuple(context)
+    _body, remaining = _graph_leading_binder_analysis(weakened)
+    retained = {name for record in remaining for name in record[1]}
     erased = {
         name
-        for _raw, names, type_text, is_proof, ambiguous in records
-        if is_proof or ambiguous or _graph_looks_like_proof_premise_type(type_text, names)
-        for name in names
+        for record in records for name in record[1] if name not in retained
     }
-    _keyed, names = graph_statement_keyed_contract(statement)
+    _keyed, names = graph_statement_keyed_contract(weakened)
     return tuple(name for name in dict.fromkeys((*context, *names)) if name not in erased)
 
 
@@ -5146,6 +5203,21 @@ def _graph_support_contains_contract(
     premise: str, supports: Sequence[Tuple[str, Tuple[str, ...]]],
     *, bound_names: Sequence[str] = (),
 ) -> bool:
+    from .contract_normalization import numeric_contract_domains_compatible
+
+    def comparison_context(statement: str, body: str, names: Sequence[str]) -> Tuple[str, ...]:
+        # The keyed body erases independent proof names, not data parameters.
+        # Do not let an outer copy of an erased proof shift the data mapping.
+        _body, records = _graph_leading_binder_analysis(statement)
+        data = {name for record in records if not record[3] or record[4]
+                or _graph_binder_record_is_relation(record) for name in record[1]}
+        proofs = {name for record in records if record[3] and not record[4]
+                  and not _graph_binder_record_is_relation(record) for name in record[1]}
+        erased = proofs - data - set(_graph_lean_identifier_tokens(body))
+        leading = tuple(name for record in records for name in record[1])
+        ordered = (*[name for name in names if name not in leading], *leading)
+        return tuple(name for name in dict.fromkeys(ordered) if name not in erased)
+
     seen: Set[Tuple[str, Tuple[str, ...]]] = set()
     while True:
         state = (premise, tuple(bound_names))
@@ -5153,20 +5225,26 @@ def _graph_support_contains_contract(
             return False
         seen.add(state)
         body, names = graph_statement_keyed_contract(premise)
-        context = tuple(dict.fromkeys((*bound_names, *names)))
+        context = comparison_context(premise, body, (*bound_names, *names))
         norm = _graph_contract_norm(premise)
         alpha = _graph_contract_alpha_norm(body, context_bound_names=context)
         _alpha_body, premise_mapping = _graph_contract_alpha_source(body, context)
         for support, support_names in supports:
             support_body, leading = graph_statement_keyed_contract(support)
-            if norm == _graph_contract_norm(support) and graph_contract_domains_compatible(
+            if norm == _graph_contract_norm(support) and numeric_contract_domains_compatible(
+                body, support_body,
+            ) and graph_contract_domains_compatible(
                 premise, support, left_bound_names=bound_names,
             ):
                 return True
-            support_context = tuple(dict.fromkeys((*support_names, *leading)))
+            support_context = comparison_context(support, support_body, (*support_names, *leading))
             _alpha_body, support_mapping = _graph_contract_alpha_source(support_body, support_context)
             if alpha == _graph_contract_alpha_norm(
                 support_body, context_bound_names=support_context,
+            ) and numeric_contract_domains_compatible(
+                _graph_contract_alpha_norm(body, context_bound_names=context, preserve_type_ascriptions=True),
+                _graph_contract_alpha_norm(support_body, context_bound_names=support_context,
+                                           preserve_type_ascriptions=True),
             ) and graph_contract_domains_compatible(
                 premise, support, left_mapping=premise_mapping, right_mapping=support_mapping,
                 left_bound_names=bound_names,
@@ -6019,7 +6097,7 @@ def _graph_support_candidates(
 def _graph_strip_leading_forall_binders(text: str) -> str:
     body = _graph_strip_balanced_outer_parens(text)
     while True:
-        quantifier_match = re.match(r"^(?:∀|forall\b)\s*", body)
+        quantifier_match = re.match(r"^(?:∀(?![ᶠᵐ∞])|forall\b)\s*", body)
         if quantifier_match is None:
             break
         comma = _graph_find_top_level_comma(body)
@@ -6108,7 +6186,7 @@ def _graph_strip_leading_forall_binders_with_names(
     body = _graph_strip_balanced_outer_parens(text)
     names: List[str] = []
     while True:
-        quantifier_match = re.match(r"^(?:∀|forall\b)\s*", body)
+        quantifier_match = re.match(r"^(?:∀(?![ᶠᵐ∞])|forall\b)\s*", body)
         if quantifier_match is None:
             break
         comma = _graph_find_top_level_comma(body)
@@ -6121,15 +6199,16 @@ def _graph_strip_leading_forall_binders_with_names(
 
 
 def _graph_contract_norm(text: str) -> str:
+    from .contract_normalization import compact_contract_surface
+
     stripped, _names = _graph_strip_keeping_premises(text)
     stripped = _graph_normalize_numeric_casts_for_contract(stripped)
-    stripped = re.sub(r"\((\d+)\s*:\s*[^()]+\)", r"\1", stripped)
-    return re.sub(r"\s+", "", stripped)
+    return compact_contract_surface(stripped)
 
 
 def _graph_quantifier_bound_names(text: str) -> Tuple[str, ...]:
     names: List[str] = []
-    for match in re.finditer(r"(?:[∀∃]|forall|exists)\s*([^,]+),", str(text or "")):
+    for match in re.finditer(r"(?:[∀∃](?![ᶠᵐ∞])|forall|exists)\s*([^,]+),", str(text or "")):
         names.extend(_graph_binder_names_from_chunk(match.group(1)))
     return tuple(dict.fromkeys(names))
 
@@ -6141,7 +6220,7 @@ def _graph_ident_char(ch: str) -> bool:
 def _graph_top_level_quantifier_token_len(text: str, index: int) -> int:
     raw = str(text or "")
     ch = raw[index] if 0 <= index < len(raw) else ""
-    if ch in {"∀", "∃"}:
+    if ch in {"∀", "∃"} and raw[index + 1:index + 2] not in {"ᶠ", "ᵐ", "∞"}:
         return 1
     for token in ("forall", "exists"):
         end = index + len(token)
@@ -6189,12 +6268,13 @@ def _cached_graph_contract_alpha_norm(
     context_bound_names: Tuple[str, ...],
     preserve_type_ascriptions: bool,
 ) -> str:
+    from .contract_normalization import compact_contract_surface
+
     stripped, mapping = _graph_contract_alpha_source(text, context_bound_names)
     if not preserve_type_ascriptions:
         stripped = _graph_normalize_numeric_casts_for_contract(stripped)
-        stripped = re.sub(r"\((\d+)\s*:\s*[^()]+\)", r"\1", stripped)
     normalized = _graph_contract_alpha_replace_scoped(stripped, mapping)
-    return re.sub(r"\s+", "", normalized)
+    return compact_contract_surface(normalized)
 
 
 def _graph_contract_alpha_source(
@@ -6220,69 +6300,16 @@ def _graph_contract_alpha_replace_scoped(
     text: str,
     mapping: Mapping[str, str],
 ) -> str:
-    raw = str(text or "")
-    out: List[str] = []
-    index = 0
-    while index < len(raw):
-        skip_to = _lean_lexical_skip_end(raw, index)
-        if skip_to is not None:
-            token = raw[index:skip_to]
-            out.append(mapping.get(token, token) if raw.startswith("«", index) else token)
-            index = skip_to
-            continue
-        ch = raw[index]
-        if ch in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
-            end = _graph_matching_group_index(raw, index)
-            if end >= 0:
-                out.append(ch)
-                out.append(
-                    _graph_contract_alpha_replace_scoped(
-                        raw[index + 1 : end],
-                        mapping,
-                    )
-                )
-                out.append(raw[end])
-                index = end + 1
-                continue
-        quantifier_len = _graph_top_level_quantifier_token_len(raw, index)
-        if quantifier_len:
-            tail_start = index + quantifier_len
-            comma = _graph_find_top_level_comma(raw[tail_start:])
-            if comma >= 0:
-                binder = raw[tail_start : tail_start + comma]
-                body = raw[tail_start + comma + 1 :]
-                local_mapping = dict(mapping)
-                # Allocate past every fresh name already in scope. ``len``
-                # repeats a name when an inner binder shadows an outer one,
-                # conflating ``P x z`` with ``P z z``.
-                next_index = 1 + max(
-                    (
-                        int(value[7:-2])
-                        for value in local_mapping.values()
-                        if isinstance(value, str)
-                        and value.startswith("__bound")
-                        and value.endswith("__")
-                        and value[7:-2].isdigit()
-                    ),
-                    default=-1,
-                )
-                for name in _graph_binder_names_from_chunk(binder):
-                    local_mapping[name] = f"__bound{next_index}__"
-                    next_index += 1
-                out.append(raw[index : index + quantifier_len])
-                out.append(_graph_contract_alpha_replace_scoped(binder, local_mapping))
-                out.append(",")
-                out.append(_graph_contract_alpha_replace_scoped(body, local_mapping))
-                return "".join(out)
-        match = re.match(r"[^\W\d][\w']*", raw[index:], flags=re.UNICODE)
-        if match is not None:
-            token = match.group(0)
-            out.append(_graph_contract_alpha_identifier_token(token, mapping))
-            index += len(token)
-            continue
-        out.append(raw[index])
-        index += 1
-    return "".join(out)
+    from .contract_normalization import replace_scoped_contract_identifiers
+
+    return replace_scoped_contract_identifiers(
+        str(text or ""), mapping,
+        binder_groups=_graph_binder_group_chunks,
+        binder_names=_graph_binder_names_from_chunk,
+        comma_index=_graph_find_top_level_comma,
+        colon_index=_graph_top_level_colon_index,
+        unwrap_group=_graph_unwrap_binder_group,
+    )
 
 
 def _graph_matching_paren_index(text: str, start: int) -> int:
@@ -6301,39 +6328,12 @@ def _graph_matching_paren_index(text: str, start: int) -> int:
 
 
 def _graph_normalize_numeric_casts_for_contract(text: str) -> str:
-    numeric_type_re = re.compile(r"(?:ℚ|Rat|ℝ|Real|ℤ|Int|ℕ|Nat)")
+    from .contract_normalization import normalize_numeric_contract_casts
 
-    def normalize(value: str) -> str:
-        out: List[str] = []
-        index = 0
-        while index < len(value):
-            if value[index] != "(":
-                out.append(value[index])
-                index += 1
-                continue
-            end = _graph_matching_paren_index(value, index)
-            if end < 0:
-                out.append(value[index])
-                index += 1
-                continue
-            body = normalize(value[index + 1 : end])
-            colon = _graph_top_level_colon_index(body)
-            if colon >= 0:
-                expr = body[:colon].strip()
-                type_text = _graph_strip_balanced_outer_parens(
-                    body[colon + 1 :].strip()
-                )
-                if expr and re.search(r"\d", expr) and numeric_type_re.fullmatch(type_text):
-                    out.append(_graph_strip_balanced_outer_parens(expr))
-                    index = end + 1
-                    continue
-            out.append("(")
-            out.append(body)
-            out.append(")")
-            index = end + 1
-        return "".join(out)
-
-    return normalize(str(text or ""))
+    return normalize_numeric_contract_casts(
+        str(text or ""), colon_index=_graph_top_level_colon_index,
+        strip_parens=_graph_strip_balanced_outer_parens,
+    )
 
 
 def _graph_root_conclusion_candidates(

@@ -42,7 +42,7 @@ import time
 import types
 import uuid
 import weakref
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import (
     Any,
     Callable,
@@ -82,6 +82,10 @@ from ensemble_prover.deadline_guard import (
 from ensemble_prover.contract_identity import (
     has_lean_contract_identity,
     lean_contract_evidence_receipt_matches,
+)
+from ensemble_prover.contract_normalization import (
+    compact_contract_surface,
+    matching_group,
 )
 from ensemble_prover.lean_artifact_sanitize import (
     sanitize_lean_artifact_text,
@@ -10300,7 +10304,9 @@ class MiniSession:
             "branch",
         }
 
-    def _owned_planner_job_action(self, expected: str) -> Optional[Action]:
+    def _owned_planner_job_action(
+        self, expected: str, *, include_suspended: bool = False,
+    ) -> Optional[Action]:
         """Return the local action owning a planner job in this state."""
 
         broker = self.planner_job_broker(create=False)
@@ -10325,6 +10331,9 @@ class MiniSession:
                 job_id,
                 request_fingerprint,
             ) == expected:
+                if (not include_suspended and expected in {"ready", "missing"}
+                        and self._deterministic_dispatch_blocked(action, {})):
+                    continue
                 return action
         return None
 
@@ -10385,7 +10394,7 @@ class MiniSession:
         retired = 0
         visited_action_ids: set[int] = set()
         while True:
-            action = self._owned_planner_job_action("ready")
+            action = self._owned_planner_job_action("ready", include_suspended=True)
             if action is None or id(action) in visited_action_ids:
                 break
             visited_action_ids.add(id(action))
@@ -10678,6 +10687,9 @@ class MiniSession:
     # this monotone: an action cannot spin by oscillating between or repeatedly
     # reporting the same state as progress.
     durable_progress_signatures_seen: Set[str] = field(default_factory=set)
+    # Availability may regress after helper eviction. Remember credited facts
+    # independently so restoring the same evidence cannot earn another epoch.
+    formal_progress_evidence_seen: Set[str] = field(default_factory=set)
     # A root-repair frontier may deliberately yield one dispatcher slot to a
     # recursive/retrieval prepass.  Persist the exact executable frontier that
     # earned that slot so an unchanged fixed point cannot move the iteration
@@ -10759,6 +10771,13 @@ class MiniSession:
         repr=False,
     )
     _dispatch_generation_action_failure_counts: Dict[str, int] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    # Local failures are negative execution receipts, not proof verdicts.
+    # Keep them across worker recycling and disk resume; changed inputs or
+    # executor contents naturally select another receipt.
+    deterministic_dispatch_failures: Dict[str, Dict[str, Any]] = field(
         default_factory=dict,
         repr=False,
     )
@@ -17938,6 +17957,7 @@ class MiniSession:
         self._durabilize_inflight_provider_exposure()
         reason = str(self._dispatch_generation_recycle_reason or "").strip()
         snapshot = copy.deepcopy(self._dispatch_generation_resume_snapshot)
+        failure_receipts = copy.deepcopy(self.deterministic_dispatch_failures)
         charged_governor_elapsed = float(self.run_governor_elapsed_s or 0.0)
         charged_governor_actions = int(
             self.run_governor_actions_since_strong_progress or 0
@@ -17972,6 +17992,7 @@ class MiniSession:
                 except Exception:
                     pass
                 raise
+        self.deterministic_dispatch_failures.update(failure_receipts)
         self.run_governor_elapsed_s = max(
             float(self.run_governor_elapsed_s or 0.0),
             charged_governor_elapsed,
@@ -18062,6 +18083,7 @@ class MiniSession:
         action_dispatch_id: str,
         error: BaseException,
         deadline_detached: bool,
+        input_identity: str = "",
     ) -> None:
         """Fence a failed live dispatch and request an isolated generation."""
 
@@ -18073,6 +18095,38 @@ class MiniSession:
             error_message = str(error)
         except BaseException:
             error_message = "<message unavailable>"
+        # Only a repeated local recursion failure has this automatic recovery
+        # rule. Other builtin errors may depend on an external response or
+        # capability absent from the saved replay inputs.
+        if input_identity and type(error) is RecursionError:
+            trace = error.__traceback__
+            while trace is not None and trace.tb_next is not None:
+                trace = trace.tb_next
+            origin = (
+                [trace.tb_frame.f_code.co_filename,
+                 trace.tb_frame.f_code.co_qualname, trace.tb_lineno]
+                if trace is not None else []
+            )
+            error_identity = hashlib.sha256(json.dumps(
+                [error_type, origin, error_message]
+            ).encode()).hexdigest()
+            prior = self.deterministic_dispatch_failures.get(input_identity, {})
+            # Python may exhaust its stack in different leaf frames as caches
+            # warm. The unchanged inputs and local RecursionError establish
+            # recurrence; retain the last origin for diagnostics only.
+            count = min(2, int(prior.get("count", 0)) + 1)
+            self.deterministic_dispatch_failures[input_identity] = {
+                "action_id": str(action.id), "count": count,
+                "error_identity": error_identity,
+            }
+            if count == 2:
+                self._record_event({
+                    "phase": "session_action_mutation_transaction",
+                    "action_id": str(action.id),
+                    "input_identity": input_identity,
+                    "error_type": error_type,
+                    "verdict": "unchanged_local_failure_suspended",
+                })
         self._request_dispatch_generation_recycle("mini_dispatch_primary_failure")
         self._record_event(
             {
@@ -18090,6 +18144,101 @@ class MiniSession:
                 "verdict": "dispatch_primary_failure_generation_recycle",
             }
         )
+
+    @staticmethod
+    @functools.lru_cache(maxsize=1)
+    def _dispatch_executor_identity() -> str:
+        from ..mini_checkpoint_cli import executor_source_fingerprint
+
+        return executor_source_fingerprint()
+
+    def _dispatch_input_identity(
+        self, action: Action, record: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        """Observe replay inputs without calling mathematical normalization.
+
+        Controller cursors retain the saved plan and phase. Raw prompt,
+        helper-evidence, and graph records conservatively reopen work when
+        its context changes; unsupported runtime objects cannot suspend it.
+        """
+
+        dossier = self.dossier
+        conv = self.conv
+        work = record if record is not None else (
+            self.selected_work_item_record
+            if self.selected_work_item_action_id == action.id else {}
+        )
+        export = getattr(action, "scheduler_runtime_state", None)
+        if not callable(export):
+            return ""
+
+        def raw_record(value: Any) -> dict[str, Any]:
+            if value is None:
+                return {}
+            if isinstance(value, Mapping):
+                return dict(value)
+            if is_dataclass(value) and not isinstance(value, type):
+                return {item.name: getattr(value, item.name) for item in fields(value)}
+            return vars(value)
+
+        def encode_inert_record(value: Any) -> Any:
+            if is_dataclass(value) and not isinstance(value, type):
+                return raw_record(value)
+            if isinstance(value, (set, frozenset)):
+                return sorted(value)
+            raise TypeError("unsupported dispatch input record")
+
+        helpers = getattr(dossier, "verified_helpers", {}) or {}
+        graph = getattr(dossier, "proof_graph", None)
+        payload = {
+            "executor": self._dispatch_executor_identity(),
+            "action": str(action.id),
+            "statement": str(getattr(dossier, "root_statement", "") or ""),
+            "problem_statement": str(getattr(self.problem, "statement_type", "") or ""),
+            "goal": str(getattr(conv, "goal_statement", "") or ""),
+            "preamble": str(getattr(conv, "lean_preamble", "") or ""),
+            "prompt": {key: getattr(conv, key, None) for key in (
+                "preamble", "problem_text", "lean_signature", "history", "messages",
+                "known_premise_names", "rejected_code_fragments", "transient_goal_targets",
+                "repair_self_check_active", "opaque_mode", "allow_official_answer_visibility",
+                "official_answer_payload_present", "suppress_solution_placeholders",
+                "allow_helper_decomposition",
+            )},
+            "environment": str(getattr(dossier, "current_lean_environment_hash", "") or ""),
+            "helpers": sorted(
+                (str(name), raw_record(helper))
+                for name, helper in helpers.items()
+            ),
+            "proof_state_nodes": {
+                str(key): raw_record(node)
+                for key, node in (getattr(self.proof_state, "nodes", {}) or {}).items()
+            },
+            "graph_nodes": {
+                str(key): raw_record(node)
+                for key, node in (getattr(graph, "nodes", {}) or {}).items()
+            },
+            "graph_edges": list(getattr(graph, "edges", ()) or ()),
+            "work": dict(work),
+            "cursor": export(),
+        }
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, ensure_ascii=True, default=encode_inert_record,
+        ).encode()).hexdigest()
+
+    def _deterministic_dispatch_blocked(
+        self, action: Action, record: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
+        if not any(
+            receipt.get("action_id") == action.id and receipt.get("count") == 2
+            for receipt in self.deterministic_dispatch_failures.values()
+        ):
+            return False
+        try:
+            identity = self._dispatch_input_identity(action, record)
+        except Exception:
+            # An incomplete observation cannot establish unchanged inputs.
+            return False
+        return self.deterministic_dispatch_failures.get(identity, {}).get("count") == 2
 
     async def _run_outcome_applied_hook(
         self,
@@ -21726,6 +21875,9 @@ class MiniSession:
                                     self._frontier_action_key(work_item, action.id)
                                 )
                             break
+                        if self._deterministic_dispatch_blocked(action):
+                            self._clear_selected_work_item()
+                            continue
                         self._activate_selected_graph_ready_work_item(work_item)
                         if not self._safe_is_applicable(action, context="frontier"):
                             tried_frontier_action = True
@@ -23369,16 +23521,43 @@ class MiniSession:
 
     async def _run_with_planner_owner(self) -> Tuple[bool, Optional[str]]:
         planner_broker = self.planner_job_broker()
+        preserve_ready = ()
+        retain_suspended = False
         if planner_broker is not None:
             planner_broker.bind_session_owner(self, asyncio.current_task())
         try:
-            return await self._run_scheduler()
+            result = await self._run_scheduler()
+            if planner_broker is not None and not self._planner_terminal_authority_reason():
+                retain_suspended = True
+                # A suspended parser still owns its paid raw result. Keep
+                # that receipt available to a repaired in-process resume;
+                # pending requests and unrelated results retain normal cleanup.
+                retained = []
+                for action in self.actions:
+                    driver = getattr(action, "_recursive_driver_state", {})
+                    if (not isinstance(driver, Mapping)
+                            or driver.get("phase") != "planner_job_pending"
+                            or not self._deterministic_dispatch_blocked(action, {})):
+                        continue
+                    identity = driver.get("planner_job_identity")
+                    if not isinstance(identity, Mapping):
+                        continue
+                    receipt = planner_broker.peek(
+                        str(identity.get("job_id") or ""),
+                        str(identity.get("request_fingerprint") or ""),
+                    )
+                    if receipt is not None:
+                        retained.append(receipt.identity)
+                preserve_ready = tuple(retained)
+            return result
         finally:
             # Nested MiniSessions share their parent's broker. Their return is
             # only a scheduler quantum boundary; the final live session owner
             # performs cleanup, including on startup and cancellation exits.
             if planner_broker is not None:
-                await planner_broker.release_session_owner(self)
+                await planner_broker.release_session_owner(
+                    self, preserve_ready=preserve_ready, retain_suspended=retain_suspended,
+                )
 
     async def _run_scheduler(self) -> Tuple[bool, Optional[str]]:
         planner_broker = self.planner_job_broker()
@@ -23527,6 +23706,13 @@ class MiniSession:
                     from .durable_recursive_child import select_prepared_controller_action
 
                     prepared_controller_action = select_prepared_controller_action(self)
+                    if (prepared_controller_action is not None
+                            and self._deterministic_dispatch_blocked(
+                                prepared_controller_action
+                            )):
+                        prepared_controller_action = None
+                        prepared_controller_pending = False
+                        self._clear_selected_work_item()
                 action = (
                     admitted_ready_planner_action
                     or dispatchable_missing_planner_action
@@ -23771,7 +23957,15 @@ class MiniSession:
                 return True
 
             started = time.monotonic()
+            try:
+                dispatch_input_identity = self._dispatch_input_identity(action)
+            except Exception:
+                # Live child capabilities and unsupported embedding cursors
+                # are not negative evidence. Preserve their ordinary dispatch
+                # behavior rather than turning an observation into a failure.
+                dispatch_input_identity = ""
             dispatch_exception: Optional[BaseException] = None
+            dispatch_had_provider_exposure = False
             task_tracker = _OperationChildTaskTracker()
             session_provider_exposure_tracker = (
                 dispatch_session._inflight_provider_exposure_tracker
@@ -23885,6 +24079,9 @@ class MiniSession:
                 )
             except Exception as exc:  # noqa: BLE001 — every action exception is captured
                 dispatch_exception = exc
+                dispatch_had_provider_exposure = bool(
+                    inflight_provider_exposure_tracker.provider_dispatches_started
+                )
                 cost = time.monotonic() - started
                 if isinstance(exc, asyncio.TimeoutError):
                     recover_reservation = getattr(
@@ -23975,9 +24172,18 @@ class MiniSession:
                         dispatch_exception,
                         DispatchScopeDetached,
                     ),
+                    input_identity=(
+                        "" if dispatch_had_provider_exposure else dispatch_input_identity
+                    ),
                 )
                 self._inflight_action_dispatch_id = ""
                 self._resume_dispatch_generation(failed_action_id=action.id)
+                if self.checkpoint_registry is not None:
+                    if not self.checkpoint_lane_key:
+                        raise ValueError("durable checkpoint lane is not registered")
+                    await self.checkpoint_registry.commit_session(
+                        self.checkpoint_lane_key, self
+                    )
                 continue
             if self._dispatch_worker_poisoned:
                 self._inflight_action_dispatch_id = ""
@@ -28228,6 +28434,7 @@ class MiniSession:
         action_end_formal_evidence = set(self._durable_formal_progress_evidence())
         fresh_action_formal_evidence = sorted(
             action_end_formal_evidence - action_start_formal_evidence
+            - self.formal_progress_evidence_seen
         )
         # A helper can repeat known mathematics while closing genuinely open
         # work. Require an action-start observation and a new proved node;
@@ -28292,8 +28499,9 @@ class MiniSession:
         if non_helper_parent_progress:
             metadata["parent_progress"] = True
         ledger_parent_progress = bool(
-            helper_progress_metadata.get("parent_progress")
-            or helper_progress_metadata.get("strong_progress")
+            fresh_action_formal_evidence
+            and (helper_progress_metadata.get("parent_progress")
+                 or helper_progress_metadata.get("strong_progress"))
         )
         final_strong_progress = bool(
             root_strong_progress
@@ -28481,9 +28689,7 @@ class MiniSession:
         )
         conversation_fresh_formal_evidence: Set[str] = set()
         if str(outcome.action_id or "").startswith("conversation_turn"):
-            conversation_fresh_formal_evidence = set(
-                self._durable_formal_progress_evidence()
-            ) - set(self._action_start_frontier_formal_evidence or ())
+            conversation_fresh_formal_evidence = set(fresh_action_formal_evidence)
         if final_strong_progress:
             self.identical_no_progress_actions = 0
             self.identical_no_progress_search_signature = ""
@@ -29974,6 +30180,7 @@ class MiniSession:
         if not bool(metadata.get("preserve_frontier_work")):
             self._clear_policy_repair_redirect_selected_work()
             self._clear_selected_work_item()
+        self.formal_progress_evidence_seen.update(action_end_formal_evidence)
         return replace(
             outcome,
             solved=effective_solved,
@@ -30537,13 +30744,10 @@ class MiniSession:
             ),
             "root_finalized": bool(self.root_finalized),
             "final_proof_hash": str(getattr(dossier, "final_proof_hash", "") or ""),
-            # Helper eviction moves the durable state BACKWARDS onto a
-            # configuration this session has already seen.  Without a monotone
-            # marker the two histories hash identically, the continuation guard
-            # reads the post-repair state as "already visited", and the session
-            # permanently forfeits its progress grant.  Supersession only ever
-            # grows, so it distinguishes "reached this set by regression" from
-            # "never left it" without weakening the repeat-state guard.
+            # Eviction invalidates failed-work observations even when the
+            # remaining helper set appeared earlier. Formal evidence has its
+            # own novelty ledger; this availability change cannot by itself
+            # earn another progress grant.
             "helper_eviction_generation": int(
                 getattr(dossier, "verified_helper_eviction_generation", 0) or 0
             ),
@@ -30810,6 +31014,7 @@ class MiniSession:
         self._action_start_frontier_formal_signature = ""
         formal_evidence = self._durable_formal_progress_evidence()
         self._action_start_frontier_formal_evidence = formal_evidence
+        self.formal_progress_evidence_seen.update(formal_evidence)
         # Exact lifecycle observation is separate from semantic evidence:
         # changing a certificate on an already-proved node is not new work.
         self._action_start_proved_graph_node_ids = {
@@ -30901,7 +31106,20 @@ class MiniSession:
                     if node_id in graph_keys:
                         evidence.add(f"proof_graph:{graph_keys[node_id]}")
                     continue
-                evidence.add(f"{namespace}:{node_id}:{proof_identity}")
+                target = compact_contract_surface(str(
+                    getattr(node, "target", "") or getattr(node, "statement", "") or ""
+                ))
+                while target.startswith("(") and matching_group(target, 0) == len(target) - 1:
+                    target = target[1:-1].strip()
+                contract_key = text_hash(json.dumps(
+                    [target, str(getattr(node, "statement_environment_hash", "") or "")],
+                    separators=(",", ":"),
+                ))
+                # Accepted proof spellings and helper aliases can change
+                # without establishing another proposition in this context.
+                # The node's stamp binds its target; changing the dossier's
+                # ambient environment does not recheck an old proved node.
+                evidence.add(f"{namespace}:{node_id}:{contract_key}")
         for bundle_id in tuple(self.theory_imported_bundle_ids or ()):
             clean = str(bundle_id or "").strip()
             if clean:
@@ -30961,7 +31179,10 @@ class MiniSession:
             return False
 
         after_formal_evidence = set(self._durable_formal_progress_evidence())
-        fresh_formal_evidence = sorted(after_formal_evidence - start_formal_evidence)
+        fresh_formal_evidence = sorted(
+            after_formal_evidence - start_formal_evidence
+            - self.formal_progress_evidence_seen
+        )
         after_formal = text_hash(
             json.dumps(
                 sorted(after_formal_evidence),
@@ -31398,6 +31619,8 @@ class MiniSession:
 
         action_id = str(getattr(action, "id", "") or "").strip()
         if action_id in self._scheduler_transient_suppressed_action_ids:
+            return False
+        if self._deterministic_dispatch_blocked(action):
             return False
         if action_id in self._dispatch_generation_deferred_action_ids:
             ready_at = float(

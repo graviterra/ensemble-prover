@@ -162,6 +162,8 @@ from .proof_dossier import (
     helper_prompt_signature,
     propagate_invalidated_statements,
     verified_helper_bound_contract_identity,
+    verified_helper_progress_statement,
+    verified_helper_progress_discriminators,
     verified_helper_is_premise_projection,
     _prompt_safe_helper_name,
     _prompt_safe_inline_text,
@@ -3990,24 +3992,21 @@ def _canonical_nonproof_parameter_profile(statement: str) -> tuple[str, ...]:
     statement = _strip_lean_comments(statement)
 
     def canonicalize(marker: str) -> str:
-        numeric_sort = re.fullmatch(r"Sort(\d+)", marker)
-        if numeric_sort is not None:
-            level = int(numeric_sort.group(1))
-            if level == 0:
-                return "Prop"
-            return "Type" if level == 1 else f"Type{level - 1}"
-        numeric_type = re.fullmatch(r"Type(\d+)", marker)
-        if numeric_type is not None and int(numeric_type.group(1)) == 0:
-            return "Type"
-        parenthesized_type = re.fullmatch(r"Type\((.+)\)", marker)
-        if parenthesized_type is not None:
-            level = _strip_balanced_outer_parens(parenthesized_type.group(1))
-            return canonicalize(f"Type{level}")
-        successor_sort = re.fullmatch(r"Sort\((.+)\+1\)", marker)
-        if successor_sort is not None:
-            level = _strip_balanced_outer_parens(successor_sort.group(1))
-            return canonicalize(f"Type{level}")
-        return marker
+        sort = re.fullmatch(r"(Type|Sort)(?:\s+(.+)|\((.+)\))", marker)
+        if sort is None:
+            return marker
+        head = sort.group(1)
+        level = _strip_balanced_outer_parens(sort.group(2) or sort.group(3))
+        if head == "Sort":
+            if level.isdecimal():
+                if int(level) == 0:
+                    return "Prop"
+                level = str(int(level) - 1)
+                head = "Type"
+            elif successor := re.fullmatch(r"(.+)\+1", level):
+                level = _strip_balanced_outer_parens(successor.group(1))
+                head = "Type"
+        return "Type" if head == "Type" and level == "0" else f"{head}({level})"
 
     return tuple(
         canonicalize(marker)
@@ -6692,6 +6691,7 @@ def planner_job_identity_is_compatible(
     current_answer_visibility_policy_hash: str,
     current_active_target_statement_keys: Sequence[str],
     current_helper_evidence_fingerprints: Optional[Sequence[str]] = None,
+    current_helpers: Optional[Sequence[Any]] = None,
     environment_is_compatible: Callable[[str, str], bool],
     current_owner_lane_id: Optional[str] = None,
     root_already_solved: bool = False,
@@ -6727,6 +6727,15 @@ def planner_job_identity_is_compatible(
             for item in current_helper_evidence_fingerprints
             if str(item or "")
         }
+        # A saved planner request may predate elaboration of an unchanged
+        # helper. Keep the old surface receipt admissible only alongside its
+        # current checked declaration; never treat aliases as extra progress.
+        if current_helpers is not None:
+            current_helper_evidence.update(
+                _recursive_helper_authority_fingerprints(
+                    current_helpers, include_surface=True,
+                )
+            )
         if not set(saved.helper_evidence_fingerprints).issubset(
             current_helper_evidence
         ):
@@ -7846,6 +7855,8 @@ def _lean_identifier_tokens(text: str) -> tuple[str, ...]:
 def _top_level_quantifier_token_len(text: str, index: int) -> int:
     raw = str(text or "")
     ch = raw[index] if 0 <= index < len(raw) else ""
+    # Filter and measure quantifiers also extend over the following body.
+    # This helper protects connective splitting, not ordinary binder parsing.
     if ch in {"∀", "∃"}:
         return 1
     for token in ("forall", "exists"):
@@ -8353,7 +8364,7 @@ def _statement_premises_and_conclusion(
 
 def _quantifier_bound_names(text: str) -> tuple[str, ...]:
     names: list[str] = []
-    for match in re.finditer(r"(?:[∀∃]|forall|exists)\s*([^,]+),", str(text or "")):
+    for match in re.finditer(r"(?:[∀∃](?![ᶠᵐ∞])|forall|exists)\s*([^,]+),", str(text or "")):
         names.extend(_binder_names_from_chunk(match.group(1)))
     return tuple(dict.fromkeys(names))
 
@@ -8531,7 +8542,7 @@ def _is_complex_planner_premise(text: str) -> bool:
 
     stripped = _strip_balanced_outer_parens(text)
     while True:
-        quantifier_match = re.match(r"^(?:∀|forall\b)\s*", stripped)
+        quantifier_match = re.match(r"^(?:∀(?![ᶠᵐ∞])|forall\b)\s*", stripped)
         if quantifier_match is None:
             break
         comma = _find_top_level_comma(stripped)
@@ -8646,21 +8657,9 @@ def _contract_identity_matches(left: str, right: str) -> bool:
     # surfaces do not assert conflicting numeric types. This preserves legacy
     # matching of `7 / 4` against `(7 / 4 : ℚ)` while preventing Nat evidence
     # from satisfying an explicitly Int/Rat/Real obligation.
-    numeric_type_pattern = re.compile(
-        # Lean's pretty printer emits "(0 : ℕ)" with spaces around the colon;
-        # the guard must catch both compact and pp-formatted casts or it is
-        # dead for production display statements.
-        r":\s*(?:ℚ|Rat|ℝ|Real|ℤ|Int|ℕ|Nat)(?=[\s)}\],→=<>≤≥+*/\-]|$)"
-    )
-    left_types = frozenset(
-        match.replace(" ", "").replace("\t", "")
-        for match in numeric_type_pattern.findall(left)
-    )
-    right_types = frozenset(
-        match.replace(" ", "").replace("\t", "")
-        for match in numeric_type_pattern.findall(right)
-    )
-    if left_types and right_types and left_types != right_types:
+    from .contract_normalization import numeric_contract_domains_compatible
+
+    if not numeric_contract_domains_compatible(left, right):
         return False
     return _normalize_numeric_casts_for_contract(
         left
@@ -8711,46 +8710,12 @@ def _matching_paren_index(text: str, start: int) -> int:
 
 
 def _normalize_numeric_casts_for_contract(text: str) -> str:
-    numeric_type_re = re.compile(r"(?:ℚ|Rat|ℝ|Real|ℤ|Int|ℕ|Nat)")
+    from .contract_normalization import normalize_numeric_contract_casts
 
-    def normalize(value: str) -> str:
-        out: list[str] = []
-        index = 0
-        while index < len(value):
-            skip_to = _lean_surface_lexical_skip_end(value, index)
-            if skip_to is not None:
-                out.append(value[index:skip_to])
-                index = skip_to
-                continue
-            if value[index] != "(":
-                out.append(value[index])
-                index += 1
-                continue
-            end = _matching_paren_index(value, index)
-            if end < 0:
-                out.append(value[index])
-                index += 1
-                continue
-            body = normalize(value[index + 1 : end])
-            colon = _top_level_colon_index(body)
-            if colon >= 0:
-                expr = body[:colon].strip()
-                type_text = _strip_balanced_outer_parens(body[colon + 1 :].strip())
-                if (
-                    expr
-                    and re.search(r"\d", expr)
-                    and numeric_type_re.fullmatch(type_text)
-                ):
-                    out.append(_strip_balanced_outer_parens(expr))
-                    index = end + 1
-                    continue
-            out.append("(")
-            out.append(body)
-            out.append(")")
-            index = end + 1
-        return "".join(out)
-
-    return normalize(str(text or ""))
+    return normalize_numeric_contract_casts(
+        str(text or ""), colon_index=_top_level_colon_index,
+        strip_parens=_strip_balanced_outer_parens,
+    )
 
 
 def _split_top_level_equality(text: str) -> tuple[str, str]:
@@ -9253,69 +9218,17 @@ def _contract_alpha_replace_scoped(
     text: str,
     mapping: Mapping[str, str],
 ) -> str:
-    raw = str(text or "")
-    out: list[str] = []
-    index = 0
-    while index < len(raw):
-        skip_to = _lean_surface_lexical_skip_end(raw, index)
-        if skip_to is not None:
-            token = raw[index:skip_to]
-            out.append(
-                mapping.get(token, token) if raw.startswith("«", index) else token
-            )
-            index = skip_to
-            continue
-        ch = raw[index]
-        if ch in _LEAN_SURFACE_GROUP_OPEN_TO_CLOSE:
-            end = _matching_surface_group_index(raw, index)
-            if end >= 0:
-                out.append(ch)
-                out.append(
-                    _contract_alpha_replace_scoped(raw[index + 1 : end], mapping)
-                )
-                out.append(raw[end])
-                index = end + 1
-                continue
-        quantifier_len = _top_level_quantifier_token_len(raw, index)
-        if quantifier_len:
-            tail_start = index + quantifier_len
-            comma = _find_top_level_comma(raw[tail_start:])
-            if comma >= 0:
-                binder = raw[tail_start : tail_start + comma]
-                body = raw[tail_start + comma + 1 :]
-                local_mapping = dict(mapping)
-                # Allocate past every fresh name already in scope. ``len``
-                # repeats a name when an inner binder shadows an outer one,
-                # conflating ``P x z`` with ``P z z``.
-                next_index = 1 + max(
-                    (
-                        int(value[7:-2])
-                        for value in local_mapping.values()
-                        if isinstance(value, str)
-                        and value.startswith("__bound")
-                        and value.endswith("__")
-                        and value[7:-2].isdigit()
-                    ),
-                    default=-1,
-                )
-                for binder_group in _binder_group_chunks(binder):
-                    for name in _binder_names_from_chunk(binder_group):
-                        local_mapping[name] = f"__bound{next_index}__"
-                        next_index += 1
-                out.append(raw[index : index + quantifier_len])
-                out.append(_contract_alpha_replace_scoped(binder, local_mapping))
-                out.append(",")
-                out.append(_contract_alpha_replace_scoped(body, local_mapping))
-                return "".join(out)
-        match = _LEAN_IDENTIFIER_PATTERN.match(raw, index)
-        if match is not None:
-            token = match.group(0)
-            out.append(_contract_alpha_identifier_token(token, mapping))
-            index = match.end()
-            continue
-        out.append(ch)
-        index += 1
-    return "".join(out)
+    from .contract_normalization import replace_scoped_contract_identifiers
+    from .proof_graph import _graph_unwrap_binder_group
+
+    return replace_scoped_contract_identifiers(
+        str(text or ""), mapping,
+        binder_groups=_binder_group_chunks,
+        binder_names=_binder_names_from_chunk,
+        comma_index=_find_top_level_comma,
+        colon_index=_top_level_colon_index,
+        unwrap_group=_graph_unwrap_binder_group,
+    )
 
 
 def _split_top_level_conjunctions(text: str) -> list[str]:
@@ -11220,16 +11133,14 @@ def _recursive_helper_evidence_fingerprints(
     """
 
     fingerprints: set[str] = set()
-    for helper in list(helpers or ()):
+    helper_records = list(helpers or ())
+    discriminators = verified_helper_progress_discriminators(helper_records)
+    for helper in helper_records:
         # A self-premise projection remains available to Lean replay, but its
         # proof assumes exactly the proposition it returns.  Treating it as a
         # fresh evidence fingerprint would reopen empty/helper-only recovery
         # and buy continuation passes without any mathematical frontier change.
         if verified_helper_is_premise_projection(helper):
-            continue
-        structural_identity = verified_helper_bound_contract_identity(helper)
-        if structural_identity:
-            fingerprints.add(f"structural:{structural_identity}")
             continue
         source = (
             str(
@@ -11241,7 +11152,9 @@ def _recursive_helper_evidence_fingerprints(
             if isinstance(helper, Mapping)
             else _helper_source_text(helper)
         )
-        statement = helper_decl_statement(source) if source else ""
+        statement = verified_helper_progress_statement(helper)
+        if not statement:
+            statement = helper_decl_statement(source) if source else ""
         if not statement:
             raw_statement = (
                 helper.get("statement", "")
@@ -11256,7 +11169,10 @@ def _recursive_helper_evidence_fingerprints(
                 continue
         statement_key = canonical_dossier_statement_key(statement)
         if statement_key:
-            fingerprints.add(f"statement:{statement_key}")
+            discriminator = discriminators.get(id(helper), "")
+            fingerprints.add(
+                f"structural:{discriminator}" if discriminator else f"statement:{statement_key}"
+            )
             continue
         fallback = source or str(helper or "").strip()
         if fallback:
@@ -11264,6 +11180,27 @@ def _recursive_helper_evidence_fingerprints(
                 "source:"
                 + hashlib.sha256(fallback.encode("utf-8", errors="replace")).hexdigest()
             )
+    return fingerprints
+
+
+def _recursive_helper_authority_fingerprints(
+    helpers: Sequence[Any], *, include_surface: bool = False,
+) -> set[str]:
+    """Bind planner receipts to current evidence, not scheduling anchors."""
+
+    fingerprints: set[str] = set()
+    for helper in helpers:
+        identity = verified_helper_bound_contract_identity(helper)
+        if identity:
+            fingerprints.add(f"structural:{identity}")
+            if not include_surface:
+                continue
+        source = _helper_source_text(helper)
+        statement = helper_decl_statement(source)
+        if statement:
+            fingerprints.add(f"statement:{canonical_dossier_statement_key(statement)}")
+        else:
+            fingerprints.update(_recursive_helper_evidence_fingerprints((helper,)))
     return fingerprints
 
 
@@ -11280,10 +11217,14 @@ def _root_tactic_helper_environment_fingerprints(
     """
 
     fingerprints: set[str] = set()
-    for helper in list(helpers or ()):
+    helper_records = list(helpers or ())
+    discriminators = verified_helper_progress_discriminators(helper_records)
+    for helper in helper_records:
         evidence = _recursive_helper_evidence_fingerprints((helper,))
         if not evidence:
             continue
+        if discriminator := discriminators.get(id(helper), ""):
+            evidence = {f"structural:{discriminator}"}
         source = (
             str(
                 helper.get("source")
@@ -11328,11 +11269,16 @@ def _verified_helper_dependency_identities(
     helpers: Sequence[Any],
     *,
     structural_identities_by_statement_key: Optional[Mapping[str, str]] = None,
+    for_progress: bool = False,
 ) -> dict[str, str]:
     """Resolve helper declaration names to name-independent proposition keys."""
 
     identities_by_name: dict[str, set[str]] = {}
-    for helper in list(helpers or ()):
+    helper_records = list(helpers or ())
+    discriminators = (
+        verified_helper_progress_discriminators(helper_records) if for_progress else {}
+    )
+    for helper in helper_records:
         source = (
             str(
                 helper.get("source")
@@ -11354,15 +11300,20 @@ def _verified_helper_dependency_identities(
         ).strip()
         if not name:
             continue
-        structural_identity = verified_helper_bound_contract_identity(helper)
-        statement = helper_decl_statement(source) if source else ""
+        structural_identity = (
+            discriminators.get(id(helper), "")
+            if for_progress else verified_helper_bound_contract_identity(helper)
+        )
+        statement = verified_helper_progress_statement(helper) if for_progress else ""
+        if not statement:
+            statement = helper_decl_statement(source) if source else ""
         if not statement:
             statement = str(
                 helper.get("statement", "")
                 if isinstance(helper, Mapping)
                 else getattr(helper, "statement", "") or ""
             ).strip()
-        if not structural_identity and statement:
+        if not for_progress and not structural_identity and statement:
             structural_identity = str(
                 (structural_identities_by_statement_key or {}).get(
                     canonical_dossier_statement_key(statement),
@@ -21875,9 +21826,11 @@ async def run_mini_recursive_driver(
             if str(getattr(claim, "name", "") or "").strip()
         }
         external_route_by_name = _verified_helper_dependency_identities(
-            current_helper_evidence_records()
+            current_helper_evidence_records(), for_progress=True,
         )
-        external_route_by_name.update(dependency_identities or {})
+        external_route_by_name = {
+            **dict(dependency_identities or {}), **external_route_by_name,
+        }
         route_records = []
         for claim in claims:
             route_records.append(
@@ -22792,17 +22745,20 @@ async def run_mini_recursive_driver(
         claim_identity = parse_lean_contract_identity(
             _bound_claim_contract_identity(claim)
         )
-        relevant_helper_identities = sorted(
-            {
-                identity
-                for helper in current_helpers
-                if (identity := verified_helper_bound_contract_identity(helper))
-                and claim_identity is not None
-                and (helper_identity := parse_lean_contract_identity(identity))
-                is not None
+        claim_statement_key = canonical_dossier_statement_key(claim.statement)
+        relevant_helper_identities = sorted(_recursive_helper_evidence_fingerprints([
+            helper for helper in current_helpers
+            if canonical_dossier_statement_key(
+                verified_helper_progress_statement(helper)
+            ) == claim_statement_key
+            or (
+                claim_identity is not None
+                and (helper_identity := parse_lean_contract_identity(
+                    verified_helper_bound_contract_identity(helper)
+                )) is not None
                 and helper_identity[0] == claim_identity[0]
-            }
-        )
+            )
+        ]))
         context_hash = hashlib.sha256(
             "\n".join(
                 (
@@ -22814,8 +22770,11 @@ async def run_mini_recursive_driver(
         ).hexdigest()[:16]
         resolved_dependencies = dict(
             helper_dependency_identities
-            or _verified_helper_dependency_identities(current_helpers)
+            or {}
         )
+        resolved_dependencies.update(_verified_helper_dependency_identities(
+            current_helpers, for_progress=True,
+        ))
         # Internal planner labels are not durable identities. Prefer their
         # recursively computed statement/dependency DAG so renaming bridge_a
         # to bridge_b cannot reopen an exhausted mathematical route.
@@ -24810,6 +24769,7 @@ async def run_mini_recursive_driver(
                             current_helper_evidence_records()
                         )
                     ),
+                    current_helpers=current_helper_evidence_records(),
                     environment_is_compatible=planner_environment_compatible,
                     current_owner_lane_id=planner_owner_lane_id,
                     root_already_solved=bool(
@@ -25250,7 +25210,7 @@ async def run_mini_recursive_driver(
                     active_target_statement_keys=(current_planner_active_target_keys),
                     helper_evidence_fingerprints=tuple(
                         sorted(
-                            _recursive_helper_evidence_fingerprints(
+                            _recursive_helper_authority_fingerprints(
                                 current_helper_evidence_records()
                             )
                         )
@@ -27175,7 +27135,7 @@ async def run_mini_recursive_driver(
                     )
                     contract_helper_fingerprints = tuple(
                         sorted(
-                            _recursive_helper_evidence_fingerprints(
+                            _recursive_helper_authority_fingerprints(
                                 current_helper_evidence_records()
                             )
                         )
@@ -27215,6 +27175,7 @@ async def run_mini_recursive_driver(
                             current_helper_evidence_fingerprints=(
                                 contract_helper_fingerprints
                             ),
+                            current_helpers=current_helper_evidence_records(),
                             environment_is_compatible=(contract_environment_compatible),
                             current_owner_lane_id=planner_owner_lane_id,
                             root_already_solved=bool(

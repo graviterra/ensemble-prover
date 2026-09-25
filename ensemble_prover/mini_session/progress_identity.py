@@ -6,7 +6,10 @@ import json
 from typing import Any, Callable
 
 from ..contract_identity import parse_lean_contract_identity
-from ..proof_dossier import helper_decl_statement, text_hash, verified_helper_bound_contract_identity
+from ..proof_dossier import (
+    helper_decl_statement, text_hash, verified_helper_bound_contract_identity,
+    verified_helper_progress_statement, verified_helper_progress_discriminators,
+)
 from ..proof_graph import graph_node_bound_contract_identity, graph_statement_key
 
 
@@ -27,7 +30,9 @@ def _statement(statement: str, identity: str, environment: str) -> tuple:
 
 def helper_progress_keys(dossier: Any) -> dict[str, str]:
     result = {}
-    for name, helper in dict(getattr(dossier, "verified_helpers", {}) or {}).items():
+    helpers = dict(getattr(dossier, "verified_helpers", {}) or {})
+    discriminators = verified_helper_progress_discriminators(helpers.values())
+    for name, helper in helpers.items():
         source = str(getattr(helper, "source", "") or "")
         source_hash = str(getattr(helper, "source_hash", "") or text_hash(source))
         statement = helper_decl_statement(source)
@@ -35,10 +40,11 @@ def helper_progress_keys(dossier: Any) -> dict[str, str]:
             result[name] = _key((name, source_hash, source))
             continue
         result[name] = _key((
-            _statement(statement, verified_helper_bound_contract_identity(helper),
+            _statement(verified_helper_progress_statement(helper), "",
                        str(getattr(helper, "verification_environment_hash", "") or "")),
             str(getattr(helper, "visibility_policy", "") or ""),
             str(getattr(helper, "render_policy", "") or ""),
+            discriminators.get(id(helper), ""),
         ))
     return result
 

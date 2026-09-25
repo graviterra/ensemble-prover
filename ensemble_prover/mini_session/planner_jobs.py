@@ -216,6 +216,7 @@ class PlannerJobBroker:
         self._durable_failure: BaseException | None = None
         self.durable_binding: tuple[int, str] | None = None
         self._acknowledged: dict[tuple[str, str], PlannerJobIdentity] = {}
+        self._suspended_ready: set[PlannerJobIdentity] = set()
         for record in restored_receipts:
             result = planner_result_from_record(record)
             key = self._key(result.identity.job_id, result.identity.request_fingerprint)
@@ -462,18 +463,34 @@ class PlannerJobBroker:
 
         task.add_done_callback(session_task_done)
 
-    async def release_session_owner(self, owner: Any) -> None:
+    async def release_session_owner(
+        self, owner: Any, *, preserve_ready: tuple[PlannerJobIdentity, ...] = (),
+        retain_suspended: bool = False,
+    ) -> None:
         """Release one session lease and clean up after the final owner."""
 
+        self._suspended_ready.update(preserve_ready)
         self._session_owners.pop(id(owner), None)
         if self._session_owners or self._owner_tasks:
             return
-        await self.cancel_all()
+        await self.cancel_all(
+            preserve_ready=tuple(self._suspended_ready) if retain_suspended else (),
+        )
 
-    def cancel_all_nowait(self) -> tuple[asyncio.Task[None], ...]:
-        keyed_entries = tuple(self._jobs.items())
+    def cancel_all_nowait(
+        self, *, preserve_ready: tuple[PlannerJobIdentity, ...] = (),
+    ) -> tuple[asyncio.Task[None], ...]:
+        retained = set(preserve_ready)
+        keyed_entries = tuple(
+            (key, entry) for key, entry in self._jobs.items()
+            if entry.result is None or entry.identity not in retained
+        )
         entries = tuple(entry for _key, entry in keyed_entries if entry.task is not None)
-        self._jobs.clear()
+        for key, _entry in keyed_entries:
+            del self._jobs[key]
+        self._suspended_ready.intersection_update(
+            entry.identity for entry in self._jobs.values()
+        )
         for key, entry in keyed_entries:
             if entry.task is None:
                 self._launched.discard(entry.identity)
@@ -513,6 +530,7 @@ class PlannerJobBroker:
         if entry is None or entry.result is None:
             return None
         del self._jobs[key]
+        self._suspended_ready.discard(entry.identity)
         if self._durable_result_sink is not None:
             self._acknowledged[key] = entry.identity
         return entry.result
@@ -543,6 +561,7 @@ class PlannerJobBroker:
         ):
             return False
         del self._jobs[key]
+        self._suspended_ready.discard(entry.identity)
         # Publication is now durable. A later scheduler-authorized retry of
         # the same mathematical request is a new operation, not a replay of
         # this receipt; release its launch fence only at this commit boundary.
@@ -552,7 +571,10 @@ class PlannerJobBroker:
             self._launched.discard(entry.identity)
         return True
 
-    async def cancel_all(self, *, drain_timeout_s: float = 1.0) -> None:
+    async def cancel_all(
+        self, *, drain_timeout_s: float = 1.0,
+        preserve_ready: tuple[PlannerJobIdentity, ...] = (),
+    ) -> None:
         """Cancel jobs with a finite drain and forbid late publication."""
 
         def observe_terminal(task: asyncio.Task[None]) -> None:
@@ -563,7 +585,7 @@ class PlannerJobBroker:
             except BaseException:
                 return
 
-        tasks = self.cancel_all_nowait()
+        tasks = self.cancel_all_nowait(preserve_ready=preserve_ready)
         if not tasks:
             return
         done, pending = await asyncio.wait(

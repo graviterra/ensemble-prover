@@ -393,6 +393,7 @@ def validate_durable_session_scalar_state(state: Mapping[str, Any]) -> None:
             )
 
 _SESSION_MAPPING_STATE_KEYS: tuple[str, ...] = (
+    "deterministic_dispatch_failures",
     "_conversation_role_turn_counts",
     "local_repair_quota_used_by_signature",
     "local_repair_quota_selected_work_record",
@@ -1182,6 +1183,7 @@ _SESSION_STRING_SET_KEYS = frozenset(
     {
         "theory_context_hit_need_ids",
         "durable_progress_signatures_seen",
+        "formal_progress_evidence_seen",
         "static_prepass_headroom_signatures_seen",
         "model_call_deferred_static_action_ids",
         "provider_turn_retired_lane_identities",
@@ -1372,6 +1374,21 @@ def validate_durable_session_state_shapes(
             )
         if key == "durable_progress_tool_continuation":
             _validate_durable_progress_tool_continuation_snapshot(value)
+        if key == "deterministic_dispatch_failures" and any(
+            len(identity) != 64
+            or not isinstance(receipt, dict)
+            or set(receipt) != {"action_id", "error_identity", "count"}
+            or not isinstance(receipt["action_id"], str)
+            or not receipt["action_id"]
+            or not isinstance(receipt["error_identity"], str)
+            or len(receipt["error_identity"]) != 64
+            or type(receipt["count"]) is not int
+            or receipt["count"] not in {1, 2}
+            for identity, receipt in value.items()
+        ):
+            raise InvalidSessionStateShape(
+                "session state deterministic_dispatch_failures has malformed receipts"
+            )
         if key in _SESSION_STRING_COUNTER_MAPPING_KEYS:
             if key in {
                 "no_progress_semantic_signature_counts",
@@ -2082,6 +2099,9 @@ def scheduler_snapshot(
     session_state["durable_progress_signatures_seen"] = _jsonable_string_set(
         getattr(session, "durable_progress_signatures_seen", set())
     )
+    session_state["formal_progress_evidence_seen"] = _jsonable_string_set(
+        getattr(session, "formal_progress_evidence_seen", set())
+    )
     session_state["static_prepass_headroom_signatures_seen"] = (
         _jsonable_string_set(
             getattr(session, "static_prepass_headroom_signatures_seen", set())
@@ -2454,6 +2474,7 @@ def apply_scheduler_snapshot(session: Any, snapshot: Mapping[str, Any]) -> None:
             _restore_tuple_set(state.get(key) if key in state else [])
         _restore_string_set(state.get("theory_context_hit_need_ids", []))
         _restore_string_set(state.get("durable_progress_signatures_seen", []))
+        _restore_string_set(state.get("formal_progress_evidence_seen", []))
         _restore_string_set(state.get("static_prepass_headroom_signatures_seen", []))
         _restore_string_set(state.get("model_call_deferred_static_action_ids", []))
         prepared_provider_turn_retired_lane_identities = _restore_string_set(
@@ -2705,6 +2726,9 @@ def apply_scheduler_snapshot(session: Any, snapshot: Mapping[str, Any]) -> None:
     )
     session.durable_progress_signatures_seen = _restore_string_set(
         state.get("durable_progress_signatures_seen", [])
+    )
+    session.formal_progress_evidence_seen = _restore_string_set(
+        state.get("formal_progress_evidence_seen", [])
     )
     session.static_prepass_headroom_signatures_seen = _restore_string_set(
         state.get("static_prepass_headroom_signatures_seen", [])
