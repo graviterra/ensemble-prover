@@ -353,12 +353,6 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 self.cli_version = out.decode("utf-8", errors="replace").strip()[:100]
             self._preflight_done = True
 
-    @property
-    def output_token_cap_supported(self) -> bool:
-        """Older or unrecognized CLIs retain prompt-target output limits."""
-        version = re.match(r"([0-9]+)\.([0-9]+)\.([0-9]+)(?:\s|$)", self.cli_version)
-        return bool(version and tuple(map(int, version.groups())) >= (2, 1, 282))
-
     @staticmethod
     def _resolve_effort(effort: str | None) -> str:
         effort = str(effort or "").lower()
@@ -472,9 +466,6 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             if max_tokens is not None
             else self.cfg.max_tokens,
         }
-        output_cap = request["requested_output_tokens"]
-        if type(output_cap) is not int or output_cap <= 0:
-            output_cap = None
         payload = json.dumps(request, ensure_ascii=False, allow_nan=False).encode(
             "utf-8"
         )
@@ -491,15 +482,13 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 "Claude Code request deadline expired during preflight",
             ):
                 await self.preflight()
-        if not self.output_token_cap_supported:
-            output_cap = None
         metadata = {
             "backend": "claude_code_subscription",
             "backend_protocol_version": 1,
             "dispatch_unit": "claude_code_print",
             "claude_code_cli_version": self.cli_version,
             "authentication": "claude.ai",
-            "output_limit_enforcement": "per_provider_request" if output_cap else "prompt_target_only",
+            "output_limit_enforcement": "prompt_target_only",
             "total_output_limit_enforced": False,
             "max_output_tokens_requested": request["requested_output_tokens"],
             "temperature_sent": None,
@@ -532,6 +521,8 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
         structured_ids: set[str] = set()
         message_usage: dict[str, dict[str, int]] = {}
         initialized = False
+        last_assistant_output_limited = False
+        completed_output_limit = False
         progress: dict[str, Any] = {
             "backend": "claude_code_subscription", "status": "requesting",
             "event_count": 0, "thinking_event_count": 0,
@@ -668,6 +659,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
 
         def on_event(event: dict[str, Any]) -> None:
             nonlocal completed, structured_answer, failed_turn, thread_id, initialized
+            nonlocal last_assistant_output_limited, completed_output_limit
             kind = event.get("type")
             if thread_id and event.get("session_id", thread_id) != thread_id:
                 raise incompatible_event(event)
@@ -743,6 +735,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     raise ClaudeCodeBackendError("Claude Code omitted initialization")
                 message = event.get("message")
                 if kind == "assistant" and isinstance(message, dict):
+                    last_assistant_output_limited = event.get("error") == "max_output_tokens"
                     message_id = message.get("id")
                     counts = _usage_counts(message.get("usage"))
                     if (
@@ -850,6 +843,14 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             failed_turn = (
                 event.get("subtype") != "success" or event.get("is_error") is not False
             )
+            completed_output_limit = bool(
+                initialized
+                and failed_turn
+                and event.get("subtype") in {"success", "error_during_execution"}
+                and event.get("stop_reason") == "max_tokens"
+                and event.get("terminal_reason") == "api_error"
+                and last_assistant_output_limited
+            )
             if failed_turn:
                 for key in ("errors", "result", "subtype"):
                     if event.get(key):
@@ -923,10 +924,6 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                         getattr(self.cfg, "subscription_inactivity_timeout_s", None)
                     ),
                     on_progress=generation_advanced,
-                    environment_overrides=(
-                        {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(output_cap)}
-                        if output_cap is not None else None
-                    ),
                 )
                 if completed and not failed_turn and code == 0:
                     final_progress_status = "finished"
@@ -970,6 +967,15 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 if dispatched and final_progress_status != "finished":
                     report_progress(final_progress_status)
         if code or not completed or failed_turn:
+            if completed_output_limit and code in {0, 1}:
+                # Native recovery can exhaust several model outputs and finish
+                # with an error result. Only that settled result is response
+                # authority; earlier output-limit telemetry is not enough.
+                observed_failures["response"] = ClaudeCodeBackendError(
+                    "Claude Code exhausted its output-token recovery allowance "
+                    "before producing a host response",
+                    kind="response", validation_stage="output_limit",
+                )
             observe_failure(stderr.decode("utf-8", errors="replace"))
             for kind in ("context", "quota", "auth", "capability", "rate_limit", "response", "transport"):
                 if kind in observed_failures:

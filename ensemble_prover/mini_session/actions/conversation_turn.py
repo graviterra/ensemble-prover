@@ -1995,6 +1995,7 @@ _TURN_BUDGET_METADATA_KEYS: tuple[str, ...] = (
     "recovered_finalizer_provider_call_quantum_exhausted",
     "recovered_finalizer_terminal",
     "recovered_finalizer_failure_reason",
+    "recovered_finalizer_argument_repair_notice",
     "recovered_finalizer_retry_deadline",
     "recovered_finalizer_provider_attempts",
     "recovered_finalizer_provider_defer",
@@ -2339,6 +2340,21 @@ def _turn_budget_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: payload[key] for key in _TURN_BUDGET_METADATA_KEYS if key in payload}
 
 
+def install_activated_argument_repair_notice(
+    conv: Any, metadata: Dict[str, Any],
+) -> None:
+    """Show a banked argument-repair note once its provider failure is restored."""
+
+    text = metadata.pop("recovered_finalizer_argument_repair_notice", None)
+    if str(metadata.get("llm_failure_kind") or "") != "provider_response_invalid":
+        return
+    from ensemble_prover.mini_session.turn.tool_loop import (
+        record_tool_argument_repair_notice_text,
+    )
+
+    record_tool_argument_repair_notice_text(conv, text)
+
+
 def _activated_recovered_finalizer_failure_metadata(
     payload: Mapping[str, Any],
 ) -> Dict[str, Any]:
@@ -2410,7 +2426,7 @@ def _activated_recovered_finalizer_failure_metadata(
         failure_scope = "scoped"
     elif (
         not terminal
-        and retryable
+        and (retryable or kind == "provider_response_invalid")
         and llm_failure_scope(failure_reason) == "scoped"
     ):
         scoped_reason = failure_reason
@@ -8691,6 +8707,7 @@ class ConversationTurnAction:
             "recovered_finalizer_provider_call_quantum_exhausted",
             "recovered_finalizer_terminal",
             "recovered_finalizer_failure_reason",
+            "recovered_finalizer_argument_repair_notice",
             "recovered_finalizer_retry_deadline",
             "recovered_finalizer_provider_attempts",
             "recovered_finalizer_provider_defer",
@@ -9107,6 +9124,7 @@ class ConversationTurnAction:
             "recovered_finalizer_error",
             "recovered_finalizer_failure_kind",
             "recovered_finalizer_failure_reason",
+            "recovered_finalizer_argument_repair_notice",
         ):
             if key in recovered_receipt and not isinstance(
                 recovered_receipt.get(key),
@@ -11963,6 +11981,9 @@ class ConversationTurnAction:
                 )
                 if recovered_failure_metadata:
                     metadata.update(recovered_failure_metadata)
+                    install_activated_argument_repair_notice(
+                        getattr(session, "conv", None), metadata,
+                    )
                     outcome = replace(outcome, metadata=metadata)
             pending_residual_requests_at_end = (
                 _pending_residual_request_snapshot(
@@ -14504,6 +14525,14 @@ class ConversationTurnAction:
                     )
                     or ""
                 ),
+                "recovered_finalizer_argument_repair_notice": str(
+                    getattr(
+                        loop_result,
+                        "recovered_finalizer_argument_repair_notice",
+                        "",
+                    )
+                    or ""
+                ),
                 "recovered_finalizer_retry_deadline": dict(
                     getattr(
                         loop_result,
@@ -15554,7 +15583,7 @@ class ConversationTurnAction:
                 failure_scope = llm_failure_scope(scoped_failure_reason)
             if (
                 not scoped_failure_reason
-                and llm_retryable
+                and (llm_retryable or llm_failure_kind == "provider_response_invalid")
                 and structured_failure_kind
                 and llm_failure_scope(structured_failure_reason_text) == "scoped"
             ):

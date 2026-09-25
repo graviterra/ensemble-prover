@@ -15,10 +15,9 @@ from .model import content_hash
 DEFAULT_FALSIFICATION_OPERATION_TIMEOUT_S = 30.0
 DEFAULT_FALSIFICATION_ENGINE_TIMEOUT_S = 90.0
 DEFAULT_FALSIFICATION_AGGREGATE_TIMEOUT_S = 90.0
-# Instance probes are a cheap filter, not a prover.  Certification still
-# uses ``operation_timeout_s``.  A 5s cap is enough for ``norm_num`` /
-# ``decide`` / ``omega`` to close an obvious counterexample; hanging
-# tactics used to burn the full 30s and then poison the campaign.
+# Compatibility value for callers explicitly selecting a short probe budget.
+# It is not an implicit ceiling: Lean startup and helper elaboration share
+# the configured operation allowance with the concrete-instance tactics.
 DEFAULT_FALSIFICATION_PROBE_TIMEOUT_S = 5.0
 
 
@@ -70,10 +69,9 @@ class FalsificationPolicy:
     max_numeric_examples: int = 64
     random_seed: int = 0
     # Execution settings (NOT part of the semantic campaign identity):
-    # ``operation_timeout_s`` is the certification/elaboration budget.
-    # Instance probes are separately capped at
-    # ``DEFAULT_FALSIFICATION_PROBE_TIMEOUT_S`` so a true statement cannot
-    # turn one engine into a 90s no-op.
+    # Each instance probe and certificate check uses this operation allowance.
+    # The engine and aggregate deadlines also bound instance probes, including
+    # Lean startup and helper elaboration before the tactic can execute.
     operation_timeout_s: float = DEFAULT_FALSIFICATION_OPERATION_TIMEOUT_S
     engine_timeout_s: float = DEFAULT_FALSIFICATION_ENGINE_TIMEOUT_S
     # One service invocation owns one wall-clock quantum.  Engine watchdogs
@@ -147,15 +145,6 @@ class FalsificationPolicy:
 
 
 def instance_probe_timeout_s(policy: FalsificationPolicy) -> float:
-    """Return the cheap instance-check budget, never the certification budget.
+    """Return the configured operation allowance before outer deadline clipping."""
 
-    ``operation_timeout_s`` remains the full-negation/axiom-audit window.
-    Instance probes that inherit it turn a true statement into a 30s Lean
-    hang and then a ``TRANSIENT_FAILURE`` retry. Clip to the probe cap so a
-    miss stays a miss.
-    """
-
-    return min(
-        float(policy.operation_timeout_s),
-        DEFAULT_FALSIFICATION_PROBE_TIMEOUT_S,
-    )
+    return float(policy.operation_timeout_s)

@@ -59,6 +59,79 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"Non-JSON numeric constant: {value}")
 
 
+_SAFE_ARGUMENT_JSON_ERRORS = frozenset({
+    "Expecting value",
+    "Expecting ',' delimiter",
+    "Expecting ':' delimiter",
+    "Expecting property name enclosed in double quotes",
+    "Unterminated string starting at",
+    "Invalid control character at",
+    "Invalid \\escape",
+    "Invalid \\uXXXX escape",
+    "Illegal trailing comma before end of object",
+    "Illegal trailing comma before end of array",
+})
+_SAFE_NON_JSON_CONSTANTS = frozenset({
+    "Non-JSON numeric constant: NaN",
+    "Non-JSON numeric constant: Infinity",
+    "Non-JSON numeric constant: -Infinity",
+})
+_PARSED_ARGUMENT_KINDS = {
+    list: "array",
+    str: "string",
+    int: "number",
+    float: "number",
+    bool: "boolean",
+    type(None): "null",
+}
+
+
+def _safe_tool_name(name: Any) -> str:
+    if (
+        type(name) is not str
+        or not name.isascii()
+        or not name.isidentifier()
+        or len(name) > 64
+    ):
+        return ""
+    return name
+
+
+def _tool_argument_repair(
+    stage: str, name: Any, raw: Any, detail: Any,
+) -> dict[str, Any]:
+    """Bounded argument-shape facts for a later repair prompt.
+
+    The raw argument text stays out of the exception. It can carry proof text
+    or other sensitive material, and the durable error record is not a place
+    to echo it.
+    """
+
+    repair: dict[str, Any] = {"validation_stage": stage}
+    tool_name = _safe_tool_name(name)
+    if tool_name:
+        repair["tool_name"] = tool_name
+    if type(raw) is str:
+        repair["argument_chars"] = min(len(raw), 1_000_000)
+    if stage == "arguments_json":
+        message = "invalid JSON"
+        column: int | None = None
+        if isinstance(detail, json.JSONDecodeError) and detail.msg in _SAFE_ARGUMENT_JSON_ERRORS:
+            message = detail.msg
+            if type(detail.colno) is int and 1 <= detail.colno <= 10000:
+                column = detail.colno
+        elif type(detail) is ValueError and str(detail) in _SAFE_NON_JSON_CONSTANTS:
+            message = str(detail)
+        repair["json_error"] = message
+        if column is not None:
+            repair["column"] = column
+    else:
+        kind = _PARSED_ARGUMENT_KINDS.get(type(detail))
+        if kind:
+            repair["parsed_kind"] = kind
+    return repair
+
+
 @asynccontextmanager
 async def subscription_request_timeout(timeout: float | None, message: str):
     """Distinguish our absolute clock from a transport's own TimeoutError."""
@@ -496,10 +569,18 @@ class SubscriptionCLIClient:
                 arguments = json.loads(
                     request["arguments"], parse_constant=_reject_json_constant
                 )
-            except (ValueError, TypeError, RecursionError):
-                raise cls._response_validation_error("arguments_json", index) from None
+            except (ValueError, TypeError, RecursionError) as exc:
+                error = cls._response_validation_error("arguments_json", index)
+                error.tool_argument_repair = _tool_argument_repair(
+                    "arguments_json", request.get("name"), request.get("arguments"), exc,
+                )
+                raise error from None
             if not isinstance(arguments, dict):
-                raise cls._response_validation_error("arguments_object", index) from None
+                error = cls._response_validation_error("arguments_object", index)
+                error.tool_argument_repair = _tool_argument_repair(
+                    "arguments_object", request.get("name"), request.get("arguments"), arguments,
+                )
+                raise error from None
             calls.append({
                 "id": f"call_{uuid.uuid4().hex}",
                 "type": "function",

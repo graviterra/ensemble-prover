@@ -22,7 +22,7 @@ _SUBSCRIPTION_RESPONSE_VALIDATION_STAGES = frozenset({
     "envelope_json", "envelope_shape", "content_type", "tool_calls_type",
     "tool_request_shape", "tool_name", "arguments_type", "arguments_json",
     "arguments_object", "required_tool", "missing_response", "json_content",
-    "json_content_object",
+    "json_content_object", "output_limit",
 })
 
 
@@ -640,7 +640,9 @@ def classify_llm_exception(
                 "response": "provider_response_invalid",
                 "context": "llm_required_prompt_context_overflow",
             }[exc.backend_kind],
-            retryable=not terminal,
+            retryable=not terminal and not (
+                exc.backend_kind == "response" and exc.validation_stage == "output_limit"
+            ),
             terminal=terminal,
             failure_reason=reason,
             message=str(exc),
@@ -898,7 +900,15 @@ def classify_llm_error_text(error_text: str) -> LLMErrorClassification:
     codex_error = re.search(r"(?:^|:\s*)\[(codex|claude-code):(auth|quota|rate_limit|capability|compatibility|transport|protocol|response|context)\]", text)
     if codex_error:
         error_type = CodexBackendError if codex_error.group(1) == "codex" else ClaudeCodeBackendError
-        return classify_llm_exception(error_type(text, kind=codex_error.group(2)))
+        stage = (
+            "output_limit"
+            if codex_error.group(2) == "response"
+            and re.search(r"\bvalidation_stage=output_limit(?:[;)\]]|$)", text)
+            else ""
+        )
+        return classify_llm_exception(error_type(
+            text, kind=codex_error.group(2), validation_stage=stage,
+        ))
     if not text:
         return LLMErrorClassification(kind="empty", retryable=False, terminal=False)
     if text in {"provider_protocol_incompatible", "provider_transport_unavailable"}:

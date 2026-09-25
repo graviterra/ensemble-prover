@@ -15245,15 +15245,9 @@ async def _main_async(args: argparse.Namespace) -> int:
             if isinstance(role_client, (CodexSubscriptionClient, ClaudeCodeSubscriptionClient)):
                 role_client.validate_requested_controls()
                 await role_client.preflight()
-                output_control = (
-                    "output-token caps apply per internal provider request, not to the whole CLI invocation"
-                    if (isinstance(role_client, ClaudeCodeSubscriptionClient)
-                        and role_client.output_token_cap_supported)
-                    else "output-token limits are prompt targets"
-                )
                 print(
                     f"[mini_prover] {role_client.cfg.name}: {role_client.backend_name} subscription "
-                    f"({role_client.cli_version}); {output_control}; "
+                    f"({role_client.cli_version}); output-token limits are prompt targets; "
                     "temperature/top_p are not sent.",
                     flush=True,
                 )

@@ -7415,6 +7415,54 @@ def _claim_sanity_requirement(claim: MiniSubgoalClaim) -> _SanityRequirement:
     )
 
 
+def _mask_excluded_sanity_clauses(text: str) -> str:
+    """Mask only a judgment immediately qualified by impossible premises.
+
+    This is a prose diagnostic, not a mathematical checker. Keep unrelated
+    clauses and negated/hypothetical exclusions available to the detector.
+    """
+
+    parts = re.split(
+        r"((?<=[.!?])\s+|[;\n,]|\b(?:but|however|yet|and|while|whereas)\b)",
+        text, flags=re.IGNORECASE,
+    )
+    previous_clause: Optional[int] = None
+    contrast = False
+    for index, part in enumerate(parts):
+        if index % 2:
+            if part.lower() in {"but", "however", "yet"}:
+                contrast = True
+            elif part != ",":
+                previous_clause = None
+                contrast = False
+            continue
+        if not part.strip():
+            continue
+        if contrast and previous_clause is not None:
+            exclusion = re.search(
+                r"\b(?:cannot|can\s+not|does\s+not|do\s+not|fails?\s+to)\s+satisfy\b"
+                r"|\bno\b[^,;\n]{0,120}\bcan\s+satisfy\b",
+                part, flags=re.IGNORECASE,
+            )
+            if exclusion and not re.search(
+                r"\b(?:not|no)\b",
+                part[:exclusion.start()], flags=re.IGNORECASE,
+            ) and not re.search(
+                r"\b(?:if|unless|suppose|assuming)\b",
+                part, flags=re.IGNORECASE,
+            ) and not re.search(
+                r"\b(?:conclusion|claim|formula|identity|target)\b",
+                part[exclusion.end():], flags=re.IGNORECASE,
+            ) and re.search(
+                r"\b(?:premises?|hypothesis|hypotheses|assumptions?)\b|[=<>≤≥≠]",
+                part[exclusion.end():], flags=re.IGNORECASE,
+            ):
+                parts[previous_clause] = " " * len(parts[previous_clause])
+        previous_clause = index
+        contrast = False
+    return "".join(parts)
+
+
 def _self_refuting_sanity_reason(claim: MiniSubgoalClaim) -> str:
     sanity = str(getattr(claim, "sanity_check", "") or "").strip()
     if not sanity:
@@ -7449,6 +7497,7 @@ def _self_refuting_sanity_reason(claim: MiniSubgoalClaim) -> str:
         classified_sanity,
         flags=re.IGNORECASE,
     )
+    classified_sanity = _mask_excluded_sanity_clauses(classified_sanity)
     match = _SELF_REFUTING_SANITY_RE.search(classified_sanity)
     return _compact_text(sanity[match.start():match.end()], 220) if match else ""
 
@@ -15203,12 +15252,17 @@ def _quantified_equality_sanity_is_adversarial(
         or _split_top_level_relation(conclusion)[1] != "="
     ):
         return True
+    left, _, right = _split_top_level_relation(conclusion)
     conclusion_names = [
-        name
-        for name in bound_names
-        if re.search(rf"(?<![\w']){re.escape(name)}(?![\w'])", conclusion)
+        _strip_balanced_outer_parens(side.strip()) for side in (left, right)
     ]
-    if len(conclusion_names) < 2:
+    # Comparing two quantified inputs needs distinct-input guidance. An
+    # equality to a constructed expression may mention other parameters
+    # without comparing their values (for example q = polynomial_from p).
+    if (
+        len(set(conclusion_names)) != 2
+        or any(name not in bound_names for name in conclusion_names)
+    ):
         return True
     sanity = str(getattr(claim, "sanity_check", "") or "")
     assigned_values: list[tuple[Decimal, ...]] = []
@@ -19343,11 +19397,25 @@ async def run_mini_recursive_attempt(
             official_answer_payload_present=official_answer_payload_present,
             allow_helper_decomposition=False,
         )
-        close_conv.append_user(
+        root_close_request = (
             f"Close the root theorem `{theorem_name}` stated above. "
             + certificate_note
             + " Submit exactly one Lean proof body."
         )
+        if speculative_operational_probe:
+            root_close_request += (
+                " This probe has one model response. Submit the complete root "
+                "proof in that response"
+                + (
+                    ", either in a Lean code block or in a try_lean call "
+                    "containing the full proof"
+                    if try_lean_tool_enabled
+                    else " in a Lean code block"
+                )
+                + ". Tool results are checked, but there is no later model "
+                "response to read lookup results or repair a rejected proof."
+            )
+        close_conv.append_user(root_close_request)
         if helper_context_blocks:
             close_conv.append_user(
                 "The following verified helper declarations are available in "
@@ -22276,70 +22344,96 @@ async def run_mini_recursive_driver(
     proved_claim_helper_names: dict[str, str] = {}
     proved_claim_dependencies: dict[str, tuple[str, ...]] = {}
     proved_claim_binding_keys: dict[str, set[str]] = {}
+    active_claim_binding_keys: set[str] = set()
     proved_claim_obligation_ids: set[str] = set()
     proved_claim_obligation_origins: dict[str, str] = {}
     proved_claim_statement_keys: set[str] = set()
-    candidate_bindings_by_name: dict[str, list[tuple[str, dict[str, Any]]]] = {}
-    for raw_binding_key, raw_binding in list(durable_claim_helper_bindings.items()):
-        if not isinstance(raw_binding, dict):
-            continue
-        binding_key = str(raw_binding_key or "").strip()
-        claim_name = str(raw_binding.get("claim_name") or "").strip()
-        helper_name = str(raw_binding.get("helper_name") or "").strip()
-        expected_hash = str(raw_binding.get("source_hash") or "").strip()
-        binding_environment_hash = str(
-            raw_binding.get("route_environment_hash") or ""
-        ).strip()
-        claim_key = str(raw_binding.get("claim_key") or "").strip()
-        statement_key = str(raw_binding.get("statement_key") or "").strip()
-        obligation_id = str(raw_binding.get("obligation_id") or claim_key).strip()
-        helper = getattr(dossier, "verified_helpers", {}).get(helper_name)
-        current_hash = str(getattr(helper, "source_hash", "") or "").strip()
-        if not all(
-            (
-                binding_key,
-                claim_name,
-                helper_name,
-                expected_hash,
-                binding_environment_hash,
-                claim_key,
-                statement_key,
-            )
-        ):
-            continue
-        if helper is None or current_hash != expected_hash:
-            continue
-        if binding_environment_hash != route_environment_hash:
-            continue
-        candidate_bindings_by_name.setdefault(claim_name, []).append(
-            (binding_key, raw_binding)
-        )
-        if obligation_id:
-            proved_claim_obligation_ids.add(obligation_id)
-            proved_claim_obligation_origins[obligation_id] = str(
-                raw_binding.get("origin_plan_fingerprint") or ""
+    def load_proved_claim_bindings(
+        allowed_binding_keys: Optional[set[str]] = None,
+    ) -> None:
+        proved_claim_names.clear()
+        proved_claim_helper_names.clear()
+        proved_claim_dependencies.clear()
+        proved_claim_binding_keys.clear()
+        active_claim_binding_keys.clear()
+        proved_claim_obligation_ids.clear()
+        proved_claim_obligation_origins.clear()
+        proved_claim_statement_keys.clear()
+        replay_sources = {
+            (helper_decl_name(block), text_hash(block)) for block in get_helpers()
+        }
+        candidate_bindings_by_name: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for raw_binding_key, raw_binding in list(durable_claim_helper_bindings.items()):
+            if not isinstance(raw_binding, dict):
+                continue
+            binding_key = str(raw_binding_key or "").strip()
+            if allowed_binding_keys is not None and binding_key not in allowed_binding_keys:
+                continue
+            claim_name = str(raw_binding.get("claim_name") or "").strip()
+            helper_name = str(raw_binding.get("helper_name") or "").strip()
+            expected_hash = str(raw_binding.get("source_hash") or "").strip()
+            binding_environment_hash = str(
+                raw_binding.get("route_environment_hash") or ""
             ).strip()
-        if statement_key:
-            proved_claim_statement_keys.add(statement_key)
-    _extend_proved_dependency_obligation_aliases(
-        proved_claim_obligation_origins, tuple(planner_plan_receipts.values()),
-    )
-    for claim_name, candidates in candidate_bindings_by_name.items():
-        # Branch merges may retain two same-label obligations.  A bare planner
-        # dependency cannot disambiguate those, so fail closed instead of
-        # selecting authority by insertion order.
-        if len(candidates) != 1:
-            continue
-        binding_key, raw_binding = candidates[0]
-        helper_name = str(raw_binding.get("helper_name") or "").strip()
-        proved_claim_names.add(claim_name)
-        proved_claim_helper_names[claim_name] = helper_name
-        proved_claim_dependencies[claim_name] = tuple(
-            str(dependency or "").strip()
-            for dependency in list(raw_binding.get("dependencies") or [])
-            if str(dependency or "").strip()
+            claim_key = str(raw_binding.get("claim_key") or "").strip()
+            statement_key = str(raw_binding.get("statement_key") or "").strip()
+            obligation_id = str(raw_binding.get("obligation_id") or claim_key).strip()
+            helper = getattr(dossier, "verified_helpers", {}).get(helper_name)
+            current_hash = str(getattr(helper, "source_hash", "") or "").strip()
+            if not all(
+                (
+                    binding_key,
+                    claim_name,
+                    helper_name,
+                    expected_hash,
+                    binding_environment_hash,
+                    claim_key,
+                    statement_key,
+                )
+            ):
+                continue
+            if (
+                (
+                    dossier is not None
+                    and (helper is None or current_hash != expected_hash)
+                )
+                or (helper_name, expected_hash) not in replay_sources
+            ):
+                continue
+            if binding_environment_hash != route_environment_hash:
+                continue
+            active_claim_binding_keys.add(binding_key)
+            candidate_bindings_by_name.setdefault(claim_name, []).append(
+                (binding_key, raw_binding)
+            )
+            if obligation_id:
+                proved_claim_obligation_ids.add(obligation_id)
+                proved_claim_obligation_origins[obligation_id] = str(
+                    raw_binding.get("origin_plan_fingerprint") or ""
+                ).strip()
+            if statement_key:
+                proved_claim_statement_keys.add(statement_key)
+        _extend_proved_dependency_obligation_aliases(
+            proved_claim_obligation_origins, tuple(planner_plan_receipts.values()),
         )
-        proved_claim_binding_keys[claim_name] = {binding_key}
+        for claim_name, candidates in candidate_bindings_by_name.items():
+            # Branch merges may retain two same-label obligations. A bare planner
+            # dependency cannot disambiguate those, so fail closed instead of
+            # selecting authority by insertion order.
+            if len(candidates) != 1:
+                continue
+            binding_key, raw_binding = candidates[0]
+            helper_name = str(raw_binding.get("helper_name") or "").strip()
+            proved_claim_names.add(claim_name)
+            proved_claim_helper_names[claim_name] = helper_name
+            proved_claim_dependencies[claim_name] = tuple(
+                str(dependency or "").strip()
+                for dependency in list(raw_binding.get("dependencies") or [])
+                if str(dependency or "").strip()
+            )
+            proved_claim_binding_keys[claim_name] = {binding_key}
+
+    load_proved_claim_bindings()
 
     def forget_proved_claim_binding(claim_name: str) -> None:
         normalized_name = str(claim_name or "").strip()
@@ -22347,6 +22441,7 @@ async def run_mini_recursive_driver(
         proved_claim_helper_names.pop(normalized_name, None)
         proved_claim_dependencies.pop(normalized_name, None)
         for binding_key in proved_claim_binding_keys.pop(normalized_name, set()):
+            active_claim_binding_keys.discard(binding_key)
             durable_claim_helper_bindings.pop(binding_key, None)
 
     def binding_matches_claim(claim: MiniSubgoalClaim) -> bool:
@@ -22416,6 +22511,7 @@ async def run_mini_recursive_driver(
                 and str(binding.get("route_environment_hash") or "").strip()
                 == route_environment_hash
             ):
+                active_claim_binding_keys.discard(binding_key)
                 durable_claim_helper_bindings.pop(binding_key, None)
         obligation_payload = {
             "route_environment_hash": route_environment_hash,
@@ -22442,6 +22538,7 @@ async def run_mini_recursive_driver(
             "source_hash": source_hash,
             **obligation_payload,
         }
+        active_claim_binding_keys.add(binding_key)
         proved_claim_binding_keys[claim_name] = {binding_key}
         proved_claim_obligation_ids.add(obligation_id)
         proved_claim_obligation_origins[obligation_id] = str(
@@ -22450,6 +22547,67 @@ async def run_mini_recursive_driver(
         statement_key = canonical_dossier_statement_key(claim.statement)
         if statement_key:
             proved_claim_statement_keys.add(statement_key)
+
+    def retain_promoted_claim_bindings(
+        previous_route_hash: str,
+        previous_helpers: Sequence[str],
+        promoted_helpers: Sequence[str],
+    ) -> None:
+        """Carry checked dependencies across an admitted promotion transaction.
+
+        Selected plans omit reused claims, so resume cannot rediscover their
+        original obligation bindings. Only bindings active before promotion and
+        backed by the same verified source in both replay contexts can acquire
+        the new scope. Keep old records for rollback and older continuations.
+        """
+
+        retained_sources = {
+            (helper_decl_name(block), text_hash(block)) for block in previous_helpers
+        } & {
+            (helper_decl_name(block), text_hash(block)) for block in promoted_helpers
+        }
+        retained_binding_keys: set[str] = set()
+        for binding_key in tuple(active_claim_binding_keys):
+            binding = durable_claim_helper_bindings.get(binding_key)
+            if not isinstance(binding, dict) or binding.get(
+                "route_environment_hash"
+            ) != previous_route_hash:
+                continue
+            helper_name = str(binding.get("helper_name") or "")
+            source_hash = str(binding.get("source_hash") or "")
+            helper = getattr(dossier, "verified_helpers", {}).get(helper_name)
+            if (
+                (helper_name, source_hash) not in retained_sources
+                or (
+                    dossier is not None
+                    and (
+                        helper is None
+                        or str(getattr(helper, "source_hash", "") or "") != source_hash
+                    )
+                )
+            ):
+                continue
+            if previous_route_hash == route_environment_hash:
+                retained_binding_keys.add(binding_key)
+                continue
+            promoted_binding = {**binding, "route_environment_hash": route_environment_hash}
+            obligation_payload = {
+                key: value for key, value in promoted_binding.items()
+                if key not in {"claim_name", "helper_name", "source_hash"}
+            }
+            promoted_key = hashlib.sha256(
+                json.dumps(
+                    obligation_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+            durable_claim_helper_bindings[promoted_key] = promoted_binding
+            retained_binding_keys.add(promoted_key)
+        # Immediate continuation must lose the same stale obligation authority
+        # as checkpoint resume, including aliases reconstructed from plan receipts.
+        load_proved_claim_bindings(retained_binding_keys)
 
     def accept_helper_with_replay(
         suggested_name: str,
@@ -31584,6 +31742,7 @@ async def run_mini_recursive_driver(
                 )
                 if proof:
                     claim_replay_helpers = list(get_helpers())
+                    claim_replay_helpers_before_promotion = tuple(claim_replay_helpers)
                     route_environment_hash_before_promotion = route_environment_hash
                     route_lifecycle_before_promotion = route_identity_lifecycle_context
                     claim_environment_promoted = False
@@ -31698,6 +31857,12 @@ async def run_mini_recursive_driver(
                         route_environment_hash = route_environment_hash_before_promotion
                         route_identity_lifecycle_context = route_lifecycle_before_promotion
                     if accepted:
+                        if claim_environment_promoted:
+                            retain_promoted_claim_bindings(
+                                route_environment_hash_before_promotion,
+                                claim_replay_helpers_before_promotion,
+                                claim_replay_helpers,
+                            )
                         stats.claim_llm_solved += 1
                         stats.helpers_accepted += 1
                         solved_this_claim = True
@@ -34416,6 +34581,7 @@ async def _request_plan(
             "llm_retryable": projected_scoped_llm_failure_is_retryable(
                 reason=classification.failure_reason,
                 kind=classification.kind,
+                metadata={"llm_retryable": bool(classification.retryable)},
             ),
             "llm_failure_kind": str(classification.kind or ""),
             "llm_failure_scope": failure_scope,

@@ -899,6 +899,7 @@ class ToolLoopResult:
     recovered_finalizer_provider_call_quantum_exhausted: bool = False
     recovered_finalizer_terminal: bool = False
     recovered_finalizer_failure_reason: str = ""
+    recovered_finalizer_argument_repair_notice: str = ""
     recovered_finalizer_retry_deadline: dict = field(default_factory=dict)
     recovered_finalizer_provider_attempts: List[dict] = field(default_factory=list)
     recovered_finalizer_provider_defer: dict = field(default_factory=dict)
@@ -2152,6 +2153,7 @@ def _legacy_imports():
 
 
 _ATTEMPT_TOOL_DIRECTIVE_KEY = "_tool_loop_attempt_directive"
+_TOOL_ARGUMENT_REPAIR_KEY = "_tool_argument_repair_notice"
 
 
 def _attempt_tool_directive(
@@ -2169,6 +2171,101 @@ def _attempt_tool_directive(
     )
     message[_ATTEMPT_TOOL_DIRECTIVE_KEY] = True
     return message
+
+
+def _tool_argument_repair_notice_text(exc: BaseException) -> str:
+    """Prompt text for one retry after a rejected tool-argument payload.
+
+    Uses only the adapter's bounded repair facts. The raw argument string is
+    not available here and must not be reconstructed.
+    """
+
+    repair = getattr(exc, "tool_argument_repair", None)
+    if not isinstance(repair, dict):
+        return ""
+    stage = repair.get("validation_stage")
+    if stage not in {"arguments_json", "arguments_object"}:
+        return ""
+    name = repair.get("tool_name")
+    if (
+        type(name) is not str
+        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name)
+    ):
+        name = "the requested tool"
+    chars = repair.get("argument_chars")
+    char_text = (
+        f"{chars} characters"
+        if type(chars) is int and 0 <= chars <= 1_000_000
+        else "the submitted text"
+    )
+    if stage == "arguments_json":
+        detail = repair.get("json_error")
+        if type(detail) is not str or not detail or len(detail) > 120:
+            detail = "invalid JSON"
+        column = repair.get("column")
+        column_text = (
+            f" at column {column}"
+            if type(column) is int and 1 <= column <= 10000
+            else ""
+        )
+        problem = f"was not valid JSON ({detail}{column_text})"
+    else:
+        kind = repair.get("parsed_kind")
+        if kind not in {"array", "string", "number", "boolean", "null"}:
+            kind = "non-object"
+        problem = f"decoded as a JSON {kind}, not an object"
+    return (
+        "The previous tool call was not executed. "
+        f"{name} arguments must be one JSON object. "
+        f"The argument text ({char_text}) {problem}. "
+        "Call the tool again with arguments as a single JSON object. "
+        "Do not repeat the previous argument text."
+    )
+
+
+def _clear_tool_argument_repair_notices(conv: Any) -> None:
+    history = getattr(conv, "history", None)
+    if not isinstance(history, list):
+        return
+    conv.history[:] = [
+        message
+        for message in history
+        if not (
+            isinstance(message, dict)
+            and message.get(_TOOL_ARGUMENT_REPAIR_KEY) is True
+        )
+    ]
+
+
+def record_tool_argument_repair_notice_text(conv: Any, text: str) -> None:
+    """Append one bounded argument-repair notice, replacing any older one."""
+
+    if (
+        type(text) is not str
+        or not text.startswith("The previous tool call was not executed. ")
+        or len(text) > 800
+    ):
+        return
+    history = getattr(conv, "history", None)
+    if not isinstance(history, list):
+        return
+    ensure_bootstrap = getattr(conv, "ensure_bootstrap", None)
+    if callable(ensure_bootstrap):
+        ensure_bootstrap()
+    _clear_tool_argument_repair_notices(conv)
+    notice = _user_history_message(text, repair_semantics=_REPAIR_CONTINUATION)
+    notice[_TOOL_ARGUMENT_REPAIR_KEY] = True
+    conv.history.append(notice)
+
+
+def _record_tool_argument_repair_notice(conv: Any, exc: BaseException) -> None:
+    text = _tool_argument_repair_notice_text(exc)
+    if not text:
+        return
+    history = getattr(conv, "history", None)
+    if not isinstance(history, list):
+        return
+    record_tool_argument_repair_notice_text(conv, text)
 
 
 async def _call_llm_with_tools_one_round_impl(
@@ -2513,6 +2610,7 @@ async def _call_llm_with_tools_one_round_impl(
     llm_retry_deadline: dict = {}
     llm_transport_failure: dict = {}
     llm_response_validation: dict = {}
+    argument_repair_exc: Optional[BaseException] = None
     provider_attempts: List[dict] = []
     tool_state_updates = 0
     tool_state_closures = 0
@@ -2583,6 +2681,7 @@ async def _call_llm_with_tools_one_round_impl(
     recovered_finalizer_provider_call_quantum_exhausted = False
     recovered_finalizer_terminal = False
     recovered_finalizer_failure_reason = ""
+    recovered_finalizer_argument_repair_notice = ""
     recovered_finalizer_retry_deadline: dict[str, Any] = {}
     recovered_finalizer_provider_attempts: list[dict] = []
     recovered_finalizer_provider_defer: dict[str, Any] = {}
@@ -4152,7 +4251,10 @@ async def _call_llm_with_tools_one_round_impl(
                 provider_dispatch_lease.annotate_exception(exc)
             try:
                 same_turn_retry_blocked = (
-                    classify_llm_exception(exc).kind == "http_400_tool_transcript"
+                    classify_llm_exception(exc).kind in {
+                        "http_400_tool_transcript",
+                        "provider_response_invalid",
+                    }
                     or bool(provider_defer_record_from_exception(client, exc))
                     or bool(
                         provider_dispatch_lease is not None
@@ -4532,6 +4634,7 @@ async def _call_llm_with_tools_one_round_impl(
             sent_messages = list(actual_messages or [])
             if not replaying_persisted_tool:
                 provider_calls_completed += 1
+                _clear_tool_argument_repair_notices(conv)
             if finalizer_ignored_none_budget_exhausted:
                 # Settle telemetry before terminating this bounded finalizer.
                 # The recursive lane ledger must see every provider call that
@@ -7629,6 +7732,7 @@ async def _call_llm_with_tools_one_round_impl(
             if llm_error_metadata
             else safe_llm_error
         )
+        argument_repair_exc = exc
         primitives["trace"](trace_prefix, f"  LLM call failed: {llm_error}")
 
     def _finalizer_recovery_authority_current() -> bool:
@@ -7669,6 +7773,18 @@ async def _call_llm_with_tools_one_round_impl(
         recovered_finalizer_provider_attempts = list(provider_attempts or [])
         recovered_finalizer_provider_defer = dict(provider_defer or {})
 
+    def _remember_recovered_argument_repair_notice() -> None:
+        nonlocal recovered_finalizer_argument_repair_notice
+        if (
+            recovered_finalizer_argument_repair_notice
+            or llm_failure_kind != "provider_response_invalid"
+            or argument_repair_exc is None
+        ):
+            return
+        recovered_finalizer_argument_repair_notice = (
+            _tool_argument_repair_notice_text(argument_repair_exc)
+        )
+
     accepted_fallback_code = next(
         (
             str(code or "")
@@ -7693,6 +7809,7 @@ async def _call_llm_with_tools_one_round_impl(
         # submission of an unrelated statement.
         # Cancellation and runtime-capability revocation are re-raised above.
         _retain_recovered_finalizer_failure_receipt()
+        _remember_recovered_argument_repair_notice()
         content = _accepted_lean_artifact_content(accepted_fallback_code)
         llm_error = None
         llm_failure_kind = ""
@@ -7739,6 +7856,7 @@ async def _call_llm_with_tools_one_round_impl(
             and _bankable_final_proof_content(banked_resolution.content)
         ):
             _retain_recovered_finalizer_failure_receipt()
+            _remember_recovered_argument_repair_notice()
             content = banked_resolution.content
             banked_mixed_final_content = ""
             banked_mixed_finalizer_pending = False
@@ -7762,6 +7880,17 @@ async def _call_llm_with_tools_one_round_impl(
                 banked_resolution.reasoning_content_chars or 0
             )
             final_no_tools_used_accepted_proof = False
+
+    if (
+        llm_error
+        and llm_failure_kind == "provider_response_invalid"
+        and argument_repair_exc is not None
+    ):
+        # Recovered accepted-proof and banked-finalizer fallbacks clear the
+        # failure above. Only a turn that is still an invalid response gets a
+        # notice, and it is recorded after those fallbacks so a recovered
+        # artifact does not carry a stale repair instruction.
+        _record_tool_argument_repair_notice(conv, argument_repair_exc)
 
     if (
         provider_dispatch_quantum_yield_metric_pending
@@ -8085,6 +8214,9 @@ async def _call_llm_with_tools_one_round_impl(
         recovered_finalizer_terminal=bool(recovered_finalizer_terminal),
         recovered_finalizer_failure_reason=str(
             recovered_finalizer_failure_reason or ""
+        ),
+        recovered_finalizer_argument_repair_notice=str(
+            recovered_finalizer_argument_repair_notice or ""
         ),
         recovered_finalizer_retry_deadline=dict(
             recovered_finalizer_retry_deadline or {}

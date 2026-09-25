@@ -1782,24 +1782,31 @@ def _client_llm_turn_elapsed_budget_s(client: Any) -> float:
 
 
 def _mini_recursive_planner_deadline_kwargs(client: Any) -> Dict[str, Any]:
-    """Give background planning the same finite lane lease as conversation."""
+    """Give background planning the same provider timeout policy as conversation."""
 
     cfg = getattr(client, "cfg", None)
+    subscription_request_timeout_disabled = bool(
+        str(getattr(cfg, "base_url", "")) in {
+            "codex://chatgpt", "claude-code://subscription",
+        }
+        and str(getattr(cfg, "llm_deadline_policy", "hard")) == "soft"
+        and getattr(cfg, "request_timeout_disabled", False)
+    )
     try:
         request_timeout_s = float(
-            getattr(cfg, "request_timeout_s", 0.0)
-            or getattr(cfg, "timeout_s", 0.0)
+            (0.0 if subscription_request_timeout_disabled else (
+                getattr(cfg, "request_timeout_s", 0.0)
+                or getattr(cfg, "timeout_s", 0.0)
+            ))
             or 0.0
         )
     except (TypeError, ValueError):
         request_timeout_s = 0.0
     operation_timeout_s = _client_hard_provider_operation_budget_s(client)
     if operation_timeout_s <= 0.0:
-        # Soft policy deliberately does not turn one provider response into a
-        # local abort. It still needs a finite cumulative scheduler lease,
-        # otherwise a background planner can retain its reservation forever.
-        # Match the conversation tool loop: prefer an explicit operation
-        # window, then allow one request plus one retry window.
+        # Honor explicit operation bounds. Otherwise only an absolute request
+        # timeout grants a cumulative lease; a subscription inactivity clock
+        # must keep renewing while generation advances.
         try:
             configured_operation_timeout_s = float(
                 getattr(cfg, "operation_timeout_s", 0.0) or 0.0

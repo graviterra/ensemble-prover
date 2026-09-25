@@ -24989,9 +24989,11 @@ class MiniSession:
             # success-shaped receipt. Unmarked nested recovery is unchanged.
             from .actions.conversation_turn import (
                 _activated_recovered_finalizer_failure_metadata,
+                install_activated_argument_repair_notice,
             )
 
             metadata.update(_activated_recovered_finalizer_failure_metadata(metadata))
+            install_activated_argument_repair_notice(self.conv, metadata)
             _normalize_provider_blocked_failure_metadata(
                 metadata, terminal_provider_blocks=True
             )
@@ -27761,11 +27763,13 @@ class MiniSession:
             # root retain their independent provider scheduling receipt.
             from .actions.conversation_turn import (
                 _activated_recovered_finalizer_failure_metadata,
+                install_activated_argument_repair_notice,
             )
 
             metadata.update(
                 _activated_recovered_finalizer_failure_metadata(metadata)
             )
+            install_activated_argument_repair_notice(self.conv, metadata)
         if (
             not effective_solved
             and metadata.get("answer_safe_recheck_verifier_only_retry")

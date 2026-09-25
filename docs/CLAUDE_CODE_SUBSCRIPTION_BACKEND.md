@@ -99,11 +99,11 @@ policy violation rather than undoing an action already performed by the CLI.
   Automatic bounded-output recovery uses `low`, which the transport supports.
 - Temperature and top-p are recorded as unsent. Explicit temperature requirements
   fail before generation because this CLI cannot apply them.
-- On Claude Code 2.1.282 or newer, output-token settings also set
-  `CLAUDE_CODE_MAX_OUTPUT_TOKENS` for the child process. This caps each internal
-  provider request; CLI recovery can make additional requests. Metadata records
-  `per_provider_request` enforcement.
-  Older or unrecognized versions retain prompt targets and report that limitation.
+- Output-token settings are prompt targets. Claude Code retains its model's
+  native total output allowance, which covers both thinking and response text.
+  Converting a small response target into `CLAUDE_CODE_MAX_OUTPUT_TOKENS` can
+  exhaust the allowance during thinking and prevent a structured answer.
+  Metadata records `prompt_target_only` enforcement.
   `--require-output-token-limit` rejects this transport because it cannot enforce
   a total output-token cap across an entire CLI invocation.
 - Claude Code caps piped input at 10 MiB. Oversized requests fail before dispatch

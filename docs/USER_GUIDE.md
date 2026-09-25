@@ -1324,6 +1324,10 @@ CLI.
 `--mini-falsification-engine-timeout-s`, `--proof-state-cache`,
 `--no-proof-state-cache`, `--proof-state-cache-path`
 
+The falsification operation timeout applies to each concrete-instance check,
+including Lean startup and helper elaboration, and to certificate verification.
+Instance checks also fit within the remaining engine and aggregate deadlines.
+
 ### Putnam answer visibility
 
 `--opaque-mode`, `--no-opaque-mode`, `--allow-official-answer-visibility`,
