@@ -1,6 +1,6 @@
 # Ensemble Prover User Guide
 
-Last updated: 2026-09-25.
+Last updated: 2026-09-26.
 
 Start with a Lean theorem, a natural-language claim, or mathematical notes for
 a longer project. Mini Prover searches for proofs and checks them with Lean.
@@ -16,7 +16,7 @@ gap. Supply a built Lake project to let the same discovery run formalize candida
 arguments, search for proofs with Mini, independently check exports, and return
 feedback to research. A research assessment is not a Lean proof certificate.
 
-This guide covers release 1.15, including both experimental NL frontends,
+This guide covers version 1.16, including the local browser workspace, both experimental NL frontends,
 Codex and Claude Code subscription backends for Mini, and the OpenAI API or
 Codex subscription backend for autonomous research. Older
 release snapshots may not include the research modules; Mini-only releases also lack the NL
@@ -37,7 +37,8 @@ authority for the options available in your checkout:
 
 Use the [local browser interface](../interface/README.md) to launch English or
 Lean attempts, follow progress and sequential sweeps, and filter recorded
-results. The interface runs on Linux with standard CPython 3.11 or 3.12; building
+results. Select a helper to inspect its recorded Lean statement and available
+proof source. The interface runs on Linux with standard CPython 3.11 or 3.12; building
 the included source also requires Node.js 22.20+ (22.x), 24.12+ (24.x), or 26+.
 Follow its setup commands
 from the repository root, then open `http://127.0.0.1:8765`.
