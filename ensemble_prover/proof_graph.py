@@ -14,8 +14,10 @@ import hmac
 import json
 import re
 import unicodedata
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
+from threading import Lock
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .lean_decl_parser import find_decl_header_end
@@ -42,6 +44,10 @@ from .utils import (
     normalize_subgoal_statement,
     _lean_lexical_skip_end,
 )
+
+
+_GRAPH_LEXICAL_CACHE_MAX_ENTRIES = 128
+_GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS = 16384
 
 
 def graph_text_hash(text: str) -> str:
@@ -849,6 +855,18 @@ _GRAPH_SOLUTION_REFERENCE_RE = re.compile(
 
 
 def _helper_source_solution_references(src: str) -> Set[str]:
+    source = str(src or "")
+    if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+        return _uncached_helper_source_solution_references(source)
+    return set(_cached_helper_source_solution_references(source))
+
+
+@lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
+def _cached_helper_source_solution_references(src: str) -> frozenset[str]:
+    return frozenset(_uncached_helper_source_solution_references(src))
+
+
+def _uncached_helper_source_solution_references(src: str) -> Set[str]:
     text = _graph_answer_safety_skeleton(str(src or ""))
     return {
         str(match.group(0) or "").strip().removeprefix("«").removesuffix("»")
@@ -6096,7 +6114,60 @@ def graph_statement_is_root_bridge(statement: str, root_statement: str) -> bool:
     )
 
 
+_GRAPH_SUPPORT_CACHE_MAX_OUTPUT_CHARS = 65536
+_GRAPH_SUPPORT_CANDIDATE_CACHE: OrderedDict[
+    Tuple[str, bool, bool], Tuple[Tuple[str, Tuple[str, ...]], ...]
+] = OrderedDict()
+_GRAPH_SUPPORT_CANDIDATE_CACHE_LOCK = Lock()
+
+
 def _graph_support_candidates(
+    statement: str,
+    *,
+    include_implication_premises: bool = False,
+    premises_are_assumptions: bool = False,
+) -> List[Tuple[str, Tuple[str, ...]]]:
+    source = str(statement or "")
+    if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+        return _uncached_graph_support_candidates(
+            source,
+            include_implication_premises=include_implication_premises,
+            premises_are_assumptions=premises_are_assumptions,
+        )
+    # Only immutable lexical results are shared; callers own their result list.
+    return list(_cached_graph_support_candidates(
+        source, include_implication_premises, premises_are_assumptions,
+    ))
+
+
+def _cached_graph_support_candidates(
+    statement: str,
+    include_implication_premises: bool,
+    premises_are_assumptions: bool,
+) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+    key = (statement, include_implication_premises, premises_are_assumptions)
+    with _GRAPH_SUPPORT_CANDIDATE_CACHE_LOCK:
+        cached = _GRAPH_SUPPORT_CANDIDATE_CACHE.get(key)
+        if cached is not None:
+            _GRAPH_SUPPORT_CANDIDATE_CACHE.move_to_end(key)
+            return cached
+    result = tuple(_uncached_graph_support_candidates(
+        statement,
+        include_implication_premises=include_implication_premises,
+        premises_are_assumptions=premises_are_assumptions,
+    ))
+    # Projection can repeat binder text, so bound output as well as input size.
+    output_chars = sum(len(text) + sum(map(len, names)) for text, names in result)
+    if output_chars <= _GRAPH_SUPPORT_CACHE_MAX_OUTPUT_CHARS:
+        with _GRAPH_SUPPORT_CANDIDATE_CACHE_LOCK:
+            _GRAPH_SUPPORT_CANDIDATE_CACHE[key] = result
+            _GRAPH_SUPPORT_CANDIDATE_CACHE.move_to_end(key)
+            if len(_GRAPH_SUPPORT_CANDIDATE_CACHE) > _GRAPH_LEXICAL_CACHE_MAX_ENTRIES:
+                _GRAPH_SUPPORT_CANDIDATE_CACHE.popitem(last=False)
+    return result
+
+
+def _uncached_graph_support_candidates(
     statement: str,
     *,
     include_implication_premises: bool = False,
@@ -6524,6 +6595,19 @@ def _helper_decl_header(src: str) -> Optional[Tuple[str, str, str]]:
 def helper_decl_statement(src: str) -> str:
     """Extract a helper type with the local scope that gives it meaning."""
 
+    source = str(src or "")
+    if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+        return _uncached_helper_decl_statement(source)
+    return _cached_helper_decl_statement(source)
+
+
+@lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
+def _cached_helper_decl_statement(src: str) -> str:
+    return _uncached_helper_decl_statement(src)
+
+
+def _uncached_helper_decl_statement(src: str) -> str:
+    # Parsing is keyed by the complete source, never by graph proof status.
     header = _helper_decl_header(src)
     if header is None:
         return ""
@@ -6573,6 +6657,18 @@ def helper_decl_name(src: str) -> str:
 def helper_decl_body(src: str) -> str:
     """Best-effort body extraction from a Lean helper declaration."""
 
+    source = str(src or "")
+    if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+        return _uncached_helper_decl_body(source)
+    return _cached_helper_decl_body(source)
+
+
+@lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
+def _cached_helper_decl_body(src: str) -> str:
+    return _uncached_helper_decl_body(src)
+
+
+def _uncached_helper_decl_body(src: str) -> str:
     header = _helper_decl_header(src)
     if header is None:
         return ""
