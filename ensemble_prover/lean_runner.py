@@ -1972,7 +1972,7 @@ _SORRY_PATTERN = re.compile(r"\bsorry\b")
 _UNIVERSE_VAR_STOPLIST: frozenset[str] = frozenset(
     {"max", "imax", "of", "Type", "Sort", "Prop", "in", "let", "fun", "do"}
 )
-_UNIVERSE_IDENT_COMPONENT = r"(?:«[^»\r\n]+»|(?:[^\W\d]|_)[\w'?!]*)"
+_UNIVERSE_IDENT_COMPONENT = r"(?:«[^»]+»|(?:[^\W\d]|_)[\w'?!]*)"
 _UNIVERSE_DOTTED_IDENT = (
     rf"(?:_root_\.)?{_UNIVERSE_IDENT_COMPONENT}(?:\.{_UNIVERSE_IDENT_COMPONENT})*"
 )
@@ -2122,7 +2122,9 @@ def _declared_universe_names(source: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def _free_universe_decl(statement: str, *, declared_in: str = "") -> str:
+def _free_universe_decl(
+    statement: str, *, declared_in: str = "", quote_names: bool = False,
+) -> str:
     """Return a `universe ...` declaration line for free universe vars.
 
     Lean's PutnamBench project uses `autoImplicit: false`, so a stray
@@ -2137,6 +2139,20 @@ def _free_universe_decl(statement: str, *, declared_in: str = "") -> str:
         name for name in _free_universe_names(statement)
         if _universe_name_key(name) not in declared
     ]
+    if quote_names:
+        # A malformed level such as Type end must remain a term error; it
+        # must never become a command that changes another probe's scope.
+        quoted_names = []
+        for name in names:
+            if re.fullmatch(_UNIVERSE_DOTTED_IDENT, name) is None:
+                continue
+            prefix = "_root_." if name.startswith("_root_.") else ""
+            components = re.findall(_UNIVERSE_IDENT_COMPONENT, name[len(prefix):])
+            quoted_names.append(prefix + ".".join(
+                component if component.startswith("«") else f"«{component}»"
+                for component in components
+            ))
+        names = quoted_names
     if not names:
         return ""
     return "universe " + " ".join(names)
@@ -8876,10 +8892,20 @@ private def {serializer_prefix}_contractDefeq
             for index, statement in enumerate(raw_statements)
             if statement
         ]
+        # Elaborated targets can contain named universe parameters even when
+        # the source preamble never declared them (for example Type u_1).
+        # Declare the whole batch together, preserving independent levels and
+        # respecting parameters that remain in scope at the end of the preamble.
+        universe_decl = _free_universe_decl(
+            "\n".join(raw_statements),
+            declared_in=preamble,
+            quote_names=True,
+        )
         content_parts = [
             part
             for part in (
                 preamble.strip(),
+                universe_decl,
                 "open Lean Elab Command Meta",
                 serializer,
                 *(

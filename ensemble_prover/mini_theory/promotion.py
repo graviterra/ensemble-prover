@@ -306,30 +306,21 @@ class VerifiedHelperPromoter:
 
     @staticmethod
     def _verification_is_retryable(verification: Any) -> bool:
-        diagnostic = str(verification.receipt.diagnostic or "").lower()
-        output = "\n".join(
-            (
-                str(getattr(verification, "compile_output", "") or ""),
-                str(getattr(verification, "audit_output", "") or ""),
-            )
-        ).lower()
-        if diagnostic in {
+        # Process status is supplied by the verifier; output may contain arbitrary
+        # theorem names or diagnostics and cannot establish an infrastructure error.
+        if bool(getattr(verification, "retryable", False)):
+            return True
+        reason = str(verification.receipt.diagnostic or "").partition(":")[0]
+        return reason.strip().lower() in {
             "lean_executable_unavailable",
             "lean_path_unavailable",
-        }:
-            return True
-        return any(
-            marker in output
-            for marker in (
-                "cancelled",
-                "timeout after",
-                "timeoutexpired",
-                "filenotfounderror",
-                "permissionerror",
-                "oserror",
-                "no such file or directory",
-            )
-        )
+            "lean_project_missing",
+            "verification_environment_fingerprint_unavailable",
+            "theory_library_environment_unresolved_at_initialization",
+            "theory_library_environment_changed_since_initialization",
+            "missing_dependency_bundles",
+            "missing_dependency_bundle_artifact",
+        }
 
     @staticmethod
     def _extract_declaration(source: str, helper_name: str) -> Optional[str]:

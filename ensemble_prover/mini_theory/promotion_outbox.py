@@ -1438,25 +1438,33 @@ class PromotionOutbox:
 
     @staticmethod
     def _retryable_diagnostic(diagnostic: str) -> bool:
-        normalized = str(diagnostic or "").strip().lower()
-        return any(
-            marker in normalized
-            for marker in (
-                "cancel",
-                "timeout",
-                "timed_out",
-                "executable",
-                "environment",
-                "infrastructure",
-                "missing_artifact",
-                "artifact_missing",
-                "path_not_found",
-                "no_such_file",
-                "permission_denied",
-                "lean_project_missing",
-                "missing_dependency_bundle",
-            )
-        )
+        # Diagnostic details contain generated declaration names and Lean output.
+        # Only the reason code may determine whether rejection is transient.
+        reason = str(diagnostic or "").partition(":")[0].strip().lower()
+        return reason in {
+            "cancel",
+            "canceled",
+            "cancelled",
+            "timeout",
+            "timed_out",
+            "lean_executable_unavailable",
+            "lean_path_unavailable",
+            "environment_unavailable",
+            "infrastructure_error",
+            "infrastructure_failure",
+            "missing_artifact",
+            "artifact_missing",
+            "path_not_found",
+            "no_such_file",
+            "permission_denied",
+            "lean_project_missing",
+            "verification_environment_fingerprint_unavailable",
+            "theory_library_environment_unresolved_at_initialization",
+            "theory_library_environment_changed_since_initialization",
+            "missing_dependency_bundle",
+            "missing_dependency_bundles",
+            "missing_dependency_bundle_artifact",
+        }
 
     def _entry_for_helper(
         self,

@@ -74,6 +74,8 @@ class TheoryVerificationResult:
     # Filled only by the independent verifier. Publication validates this
     # seal again at the persistence boundary.
     publication_seal: str = ""
+    # Set from process status, never from generated declarations or Lean output.
+    retryable: bool = False
 
     @property
     def accepted(self) -> bool:
@@ -192,6 +194,10 @@ class TheoryBundleVerifier:
                     candidate,
                     "lean_compile_failed",
                     compile_output=compile_output,
+                    retryable=(
+                        compile_run.returncode in {124, 127, 130}
+                        or compile_run.returncode < 0
+                    ),
                 )
 
             fq_declarations = declarations
@@ -215,6 +221,10 @@ class TheoryBundleVerifier:
                     "lean_audit_failed",
                     compile_output=compile_output,
                     audit_output=audit_output,
+                    retryable=(
+                        audit_run.returncode in {124, 127, 130}
+                        or audit_run.returncode < 0
+                    ),
                 )
             circular_declarations = tuple(
                 dict.fromkeys(
@@ -1008,6 +1018,7 @@ class TheoryBundleVerifier:
         *,
         compile_output: str = "",
         audit_output: str = "",
+        retryable: bool = False,
     ) -> TheoryVerificationResult:
         combined = f"{compile_output}\n{audit_output}".strip()
         return TheoryVerificationResult(
@@ -1021,4 +1032,5 @@ class TheoryBundleVerifier:
             ),
             compile_output=compile_output,
             audit_output=audit_output,
+            retryable=retryable,
         )

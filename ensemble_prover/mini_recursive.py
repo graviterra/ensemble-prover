@@ -728,6 +728,7 @@ class MiniRecursiveStats:
     llm_root_assembly_attempts: int = 0
     llm_root_speculative_assembly_attempts: int = 0
     llm_root_assembly_solved: int = 0
+    campaign_id: str = ""
 
     def to_record(self) -> dict[str, Any]:
         return asdict(self)
@@ -741,6 +742,10 @@ def _restore_mini_recursive_stats(
 
     values = dict(raw_stats or {})
     for stat_name, stat_value in values.items():
+        if stat_name == "campaign_id":
+            if isinstance(stat_value, str) and re.fullmatch(r"[0-9a-f]{32}", stat_value):
+                stats.campaign_id = stat_value
+            continue
         if hasattr(stats, stat_name):
             try:
                 setattr(stats, stat_name, stat_value)
@@ -13407,7 +13412,12 @@ async def _canonicalize_dependency_contract_inputs(
         definitionally_checked_indices = tuple(() for _ in rendered_items)
         contract_definitionally_checked_indices = tuple(() for _ in rendered_items)
         elaborated_items = tuple(bool(item) for item in rendered_items)
-    if len(rendered_items) != len(statements) or not elaborated_items[0]:
+    if len(rendered_items) != len(statements):
+        # Positional evidence cannot be bound safely after a malformed batch.
+        infrastructure_error = (
+            f"contract identity analyzer returned {len(rendered_items)} results; "
+            f"expected {len(statements)}"
+        )
         _record(
             record_event,
             {
@@ -13419,7 +13429,8 @@ async def _canonicalize_dependency_contract_inputs(
                 "canonicalized": sum(bool(item) for item in rendered_items),
                 "requested": len(statements),
                 "diagnostic_preview": _compact_text(str(output or ""), 360),
-                "verdict": "contract_identity_root_unavailable_surface_strict",
+                "error": infrastructure_error,
+                "verdict": "contract_identity_response_misaligned",
             },
         )
         return (
@@ -13427,8 +13438,21 @@ async def _canonicalize_dependency_contract_inputs(
             tuple(support_statements),
             _ContractIdentityCoverage(
                 service_available=True,
+                infrastructure_error=infrastructure_error,
                 returncode=int(returncode or 0),
             ),
+        )
+    root_elaborated = bool(elaborated_items[0])
+    root_context_error = ""
+    if not root_elaborated:
+        # A root-context failure says nothing about independently elaborated
+        # claims. Keep their bound evidence, but route the pass through the
+        # bounded analyzer-failure path before mathematical filtering/replanning.
+        root_diagnostic = _contract_identity_diagnostics_by_statement(
+            str(output or "")
+        ).get(0, "") or _compact_lean_elaboration_diagnostics(str(output or ""))
+        root_context_error = "contract identity root context unavailable: " + (
+            root_diagnostic or "root statement did not elaborate"
         )
     claim_end = 1 + len(plan.claims)
     claim_elaborated = tuple(elaborated_items[index] for index in range(1, claim_end))
@@ -13581,12 +13605,16 @@ async def _canonicalize_dependency_contract_inputs(
                 index for index, ok in enumerate(support_elaborated) if not ok
             ],
             "diagnostic_preview": (
-                _compact_text(str(output or ""), 360)
+                _compact_text(root_context_error, 360)
+                if root_context_error
+                else _compact_lean_elaboration_diagnostics(str(output or ""), limit=360)
                 if not all(claim_elaborated) or not all(support_elaborated)
                 else ""
             ),
             "verdict": (
-                "contract_identity_elaborated"
+                "contract_identity_root_context_unavailable"
+                if root_context_error
+                else "contract_identity_elaborated"
                 if all(claim_elaborated) and all(support_elaborated)
                 else "contract_identity_partially_elaborated"
             ),
@@ -13597,7 +13625,8 @@ async def _canonicalize_dependency_contract_inputs(
         canonical_support,
         _ContractIdentityCoverage(
             service_available=True,
-            root_elaborated=True,
+            root_elaborated=root_elaborated,
+            infrastructure_error=root_context_error,
             claim_elaborated=claim_elaborated,
             claim_analysis_statements=claim_analysis_statements,
             support_elaborated=support_elaborated,
@@ -13620,7 +13649,11 @@ async def _canonicalize_dependency_contract_inputs(
             returncode=int(returncode or 0),
             elaboration_diagnostics=(
                 _compact_lean_elaboration_diagnostics(str(output or ""))
-                if not (all(claim_elaborated) and all(support_elaborated))
+                if not (
+                    root_elaborated
+                    and all(claim_elaborated)
+                    and all(support_elaborated)
+                )
                 else ""
             ),
             per_claim_diagnostics=(
@@ -13758,8 +13791,8 @@ def _compact_lean_elaboration_diagnostics(output: str, *, limit: int = 500) -> s
     return _compact_text(joined, limit)
 
 
-def _contract_identity_diagnostics_by_claim(output: str) -> dict[int, str]:
-    """Extract claim-local diagnostics from one batched identity probe."""
+def _contract_identity_diagnostics_by_statement(output: str) -> dict[int, str]:
+    """Extract diagnostics keyed by the original batch index, including root."""
 
     by_statement: dict[int, list[str]] = {}
     legacy_header_re = re.compile(
@@ -13771,13 +13804,13 @@ def _contract_identity_diagnostics_by_claim(output: str) -> dict[int, str]:
 
     def flush() -> None:
         nonlocal active_index, active_lines
-        if active_index is not None and active_index > 0:
+        if active_index is not None:
             diagnostic = _compact_lean_elaboration_diagnostics(
                 "\n".join(active_lines),
                 limit=320,
             )
             if diagnostic:
-                by_statement.setdefault(active_index - 1, []).append(diagnostic)
+                by_statement.setdefault(active_index, []).append(diagnostic)
         active_index = None
         active_lines = []
 
@@ -13808,6 +13841,15 @@ def _contract_identity_diagnostics_by_claim(output: str) -> dict[int, str]:
         index: _compact_text("; ".join(dict.fromkeys(items)), 320)
         for index, items in by_statement.items()
         if items
+    }
+
+
+def _contract_identity_diagnostics_by_claim(output: str) -> dict[int, str]:
+    """Extract claim-local diagnostics from one batched identity probe."""
+    return {
+        index - 1: diagnostic
+        for index, diagnostic in _contract_identity_diagnostics_by_statement(output).items()
+        if index > 0
     }
 
 
@@ -20710,6 +20752,7 @@ async def run_mini_recursive_attempt(
             )
         pending_root_close_promotion = None
     run_record = {
+        "recursive_campaign_id": final_result.stats.campaign_id,
         "branch_label": branch_label,
         "adaptive_fallback": bool(adaptive_fallback),
         "budget_kind": str(
@@ -20976,6 +21019,17 @@ async def run_mini_recursive_driver(
     Lean checking.
     """
 
+    stats = MiniRecursiveStats(campaign_id=secrets.token_hex(16))
+    if record_event is not None:
+        campaign_record_event = record_event
+
+        def record_event(event: dict[str, Any]) -> Any:
+            # Child campaigns retain their own identity when callbacks nest.
+            return campaign_record_event({
+                "recursive_campaign_id": stats.campaign_id,
+                **event,
+            })
+
     if planner_escalation_client is not None and _planner_clients_are_provider_aliases(
         client, planner_escalation_client
     ):
@@ -21183,7 +21237,6 @@ async def run_mini_recursive_driver(
             dossier, config, selected_parent_proof_idea_context,
         )
 
-    stats = MiniRecursiveStats()
     falsification_service = FalsificationService(
         policy=FalsificationPolicy(
             enabled=bool(getattr(config, "falsification_enabled", True)),
@@ -21351,6 +21404,11 @@ async def run_mini_recursive_driver(
         # assembly limits, plans and proof receipts still belong to the old
         # semantic environment and must not constrain the new search.
         _restore_mini_recursive_stats(stats, controller_accounting_frame["stats"])
+    _record(record_event, {
+        "phase": "mini_recursive_campaign",
+        "verdict": "campaign_resumed" if resume_frame else "campaign_started",
+        "stats": stats.to_record(),
+    })
     accounting_frame = controller_accounting_frame or resume_frame
     accounting_pass_already_started = bool(
         not resume_frame
@@ -23973,6 +24031,10 @@ async def run_mini_recursive_driver(
                 official_answer_payload_present=(official_answer_payload_present),
             ),
         )
+        if coverage.infrastructure_error:
+            # An unavailable root context cannot certify suspended-claim
+            # readiness. Retain the durable suspension for a later batch.
+            return []
         rehydrate_active_statements = _current_active_root_target_statements()
         (
             original_probe_plan,

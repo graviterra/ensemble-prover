@@ -1800,13 +1800,31 @@ class RunRecorder:
         ):
             key = "mini_recursive_proposed_helpers_invalidated_suppressed"
             self.metrics[key] = int(self.metrics.get(key, 0) or 0) + 1
+        recursive_campaign_id = str(record.get("recursive_campaign_id") or "")
         if (
-            phase == "mini_recursive_plan"
+            not recursive_campaign_id
+            and phase == "mini_recursive_plan"
             and verdict == "plan_started"
             and int(record.get("pass_index") or 1) <= 1
         ):
-            self._mini_recursive_incremental_since_complete = {}
-            self._last_mini_recursive_complete_totals = {}
+            # Legacy callers have no durable campaign identity. Their reset
+            # must not erase accounting for tagged, interleaved campaigns.
+            self._mini_recursive_incremental_since_complete = {
+                key: value
+                for key, value in self._mini_recursive_incremental_since_complete.items()
+                if key.startswith("campaign:")
+            }
+            self._last_mini_recursive_complete_totals = {
+                key: value
+                for key, value in self._last_mini_recursive_complete_totals.items()
+                if key.startswith("campaign:")
+            }
+
+        def recursive_stat_key(stat_key: str) -> str:
+            return (
+                f"campaign:{recursive_campaign_id}:{stat_key}"
+                if recursive_campaign_id else stat_key
+            )
         if (
             phase == "mini_recursive_route_contract"
             and verdict == "claims_deferred_by_cap"
@@ -1886,6 +1904,17 @@ class RunRecorder:
             "bottleneck_obligations_pending_adjudication": "mini_recursive_bottleneck_obligations_pending_adjudication",
         }
 
+        if phase == "mini_recursive_campaign" and recursive_campaign_id:
+            baseline = record.get("stats") or {}
+            if isinstance(baseline, dict):
+                # A new semantic campaign may inherit allocation counters.
+                # Existing campaigns already own their pending event deltas.
+                for stat_key in mini_recursive_stat_mapping:
+                    self._last_mini_recursive_complete_totals.setdefault(
+                        recursive_stat_key(stat_key),
+                        max(0, int(baseline.get(stat_key, 0) or 0)),
+                    )
+
         def add_mini_recursive_stat(stat_key: str, amount: int) -> None:
             metric_key = mini_recursive_stat_mapping.get(stat_key)
             if not metric_key:
@@ -1894,9 +1923,10 @@ class RunRecorder:
             if value <= 0:
                 return
             self.metrics[metric_key] = int(self.metrics.get(metric_key, 0) or 0) + value
-            self._mini_recursive_incremental_since_complete[stat_key] = (
+            accounting_key = recursive_stat_key(stat_key)
+            self._mini_recursive_incremental_since_complete[accounting_key] = (
                 int(
-                    self._mini_recursive_incremental_since_complete.get(stat_key, 0)
+                    self._mini_recursive_incremental_since_complete.get(accounting_key, 0)
                     or 0
                 )
                 + value
@@ -2176,11 +2206,12 @@ class RunRecorder:
                     for stat_key in mini_recursive_stat_mapping
                 }
                 for stat_key, metric_key in mini_recursive_stat_mapping.items():
+                    accounting_key = recursive_stat_key(stat_key)
                     prior_total = max(
                         0,
                         int(
                             self._last_mini_recursive_complete_totals.get(
-                                stat_key,
+                                accounting_key,
                                 0,
                             )
                             or 0
@@ -2194,7 +2225,7 @@ class RunRecorder:
                         0,
                         int(
                             self._mini_recursive_incremental_since_complete.get(
-                                stat_key,
+                                accounting_key,
                                 0,
                             )
                             or 0
@@ -2203,8 +2234,14 @@ class RunRecorder:
                     self.metrics[metric_key] = int(
                         self.metrics.get(metric_key, 0) or 0
                     ) + max(0, cumulative_delta - already_counted)
-                self._mini_recursive_incremental_since_complete = {}
-                self._last_mini_recursive_complete_totals = complete_totals
+                    # A duplicate or older completion cannot consume newer
+                    # incremental work or lower this campaign's watermark.
+                    self._mini_recursive_incremental_since_complete[accounting_key] = (
+                        max(0, already_counted - cumulative_delta)
+                    )
+                    self._last_mini_recursive_complete_totals[accounting_key] = max(
+                        prior_total, complete_totals[stat_key],
+                    )
         if (
             str(record.get("phase") or "") == "session_terminal_failure"
             and str(record.get("session_scope") or "problem") == "problem"
