@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from .math_utils import _interpolated_string_prefix_len, _scan_interpolated_string
+
 
 # These term forms all introduce a local assignment before the declaration's
 # own body separator. Match whole keywords: ``letI`` is not the word ``let``.
@@ -224,6 +226,7 @@ def find_decl_header_end(
         n = min(len(text), i + int(max_scan))
     else:
         n = len(text)
+    scan_text = text[:n]
 
     depth = 0
     line_start = text.rfind("\n", 0, i) + 1
@@ -242,6 +245,12 @@ def find_decl_header_end(
         ch = text[i]
         if not ch.isspace():
             last_code_position = i
+        interpolation_prefix = _interpolated_string_prefix_len(scan_text, i)
+        if interpolation_prefix:
+            i, closed = _scan_interpolated_string(scan_text, i + interpolation_prefix, [])
+            if not closed:
+                return None
+            continue
         if ch == "«":
             i = _skip_quoted_identifier(text, i, n)
             continue
@@ -422,8 +431,15 @@ def _next_top_level_body_token(
 
     i = max(0, int(start))
     n = min(len(text), int(end))
+    scan_text = text[:n]
     depth = 0
     while i < n:
+        interpolation_prefix = _interpolated_string_prefix_len(scan_text, i)
+        if interpolation_prefix:
+            i, closed = _scan_interpolated_string(scan_text, i + interpolation_prefix, [])
+            if not closed:
+                return None
+            continue
         if text[i] == "«":
             i = _skip_quoted_identifier(text, i, n)
             continue

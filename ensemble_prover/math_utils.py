@@ -293,6 +293,21 @@ def _strip_lean_comments_and_strings(text: str) -> tuple[str, bool]:
 
 _LEAN_NONCODE_DELIMITER = re.compile(r'r#*"|[/\-\'"!«]')
 
+# Lean's explicit identifier ranges include letter-like symbols that Python's
+# Unicode alphanumeric predicates do not recognize.
+_LEAN_ID_FIRST_CHARS = (
+    "A-Za-z_"
+    "\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u017f"
+    "\u0391-\u039f\u03a1-\u03a2\u03a4-\u03a9"
+    "\u03b1-\u03ba\u03bc-\u03fb"
+    "\u1f00-\u1ffe\u2100-\u214f\U0001d49c-\U0001d59f"
+)
+_LEAN_ID_REST_CHARS = (
+    _LEAN_ID_FIRST_CHARS
+    + "0-9'!?\u2080-\u2089\u2090-\u209c\u1d62-\u1d6a\u2c7c"
+)
+_LEAN_ID_REST_RE = re.compile(rf"[{_LEAN_ID_REST_CHARS}]")
+
 
 def _raw_string_end(text: str, start: int) -> tuple[int, bool] | None:
     if start >= len(text) or text[start] != "r":
@@ -320,9 +335,9 @@ def _scan_lean_code(text: str, start: int, out: List[str]) -> tuple[int, bool]:
             out.append(text[i:])
             return n, True
         special = marker.start()
-        if text[special : special + 2] == '!"':
-            # Interpolation starts at its identifier, before the delimiter.
-            # Numeric prefixes are ordinary code (e.g. 123s!"{value}").
+        if text[special] == "!":
+            # Interpolation starts at its identifier; Lean permits whitespace
+            # and comments between the bang token and its opening quote.
             prefix = special
             while prefix > i and (
                 text[prefix - 1].isalnum() or text[prefix - 1] == "_"
@@ -332,7 +347,8 @@ def _scan_lean_code(text: str, start: int, out: List[str]) -> tuple[int, bool]:
                 text[prefix].isalpha() or text[prefix] == "_"
             ):
                 prefix += 1
-            special = prefix
+            if _interpolated_string_prefix_len(text, prefix):
+                special = prefix
         out.append(text[i:special])
         i = special
         raw_string = _raw_string_end(text, i)
@@ -539,12 +555,30 @@ def _interpolated_string_prefix_len(text: str, start: int) -> int:
     n = len(text)
     if start >= n or not (text[start].isalpha() or text[start] == "_"):
         return 0
+    if start and (
+        _LEAN_ID_REST_RE.fullmatch(text[start - 1]) or text[start - 1] in ".»"
+    ):
+        return 0
     i = start + 1
     while i < n and (text[i].isalnum() or text[i] == "_"):
         i += 1
-    if i + 1 < n and text[i] == "!" and text[i + 1] == '"':
-        return i + 2 - start
-    return 0
+    # These are Lean's core bang-prefixed interpolation forms. An ordinary
+    # function such as lookup! consumes a plain string, whose braces are data.
+    if text[start:i] not in {"s", "m", "f", "println"} or i >= n or text[i] != "!":
+        return 0
+    i += 1
+    while i < n:
+        if text[i].isspace():
+            i += 1
+        elif text.startswith("--", i):
+            i = _skip_line_comment(text, i, [])
+        elif text.startswith("/-", i):
+            i, closed = _skip_block_comment(text, i, [])
+            if not closed:
+                return 0
+        else:
+            break
+    return i + 1 - start if i < n and text[i] == '"' else 0
 
 
 # ------------------------------------------------------------------

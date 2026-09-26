@@ -21,6 +21,13 @@ from threading import Lock
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .lean_decl_parser import find_decl_header_end
+from .math_utils import (
+    _LEAN_ID_FIRST_CHARS as _GRAPH_LEAN_ID_FIRST_CHARS,
+    _LEAN_ID_REST_CHARS as _GRAPH_LEAN_ID_REST_CHARS,
+    _interpolated_string_prefix_len,
+    _scan_interpolated_string,
+    _strip_lean_comments_and_strings,
+)
 from .lean_syntax import (
     lean_relation_binder_bound_names,
     lean_relation_binder_equivalent,
@@ -848,10 +855,17 @@ _REPLAY_MATERIALIZATION_METADATA_KEYS = {
 }
 
 
-_GRAPH_SOLUTION_REFERENCE_RE = re.compile(
-    r"(?:«[^»]*_solution[^»]*»|"
-    r"[A-Za-z_][A-Za-z0-9_'.]*_solution[A-Za-z0-9_'.]*)"
+_GRAPH_LEAN_PLAIN_IDENTIFIER_RE = re.compile(
+    rf"[{_GRAPH_LEAN_ID_FIRST_CHARS}][{_GRAPH_LEAN_ID_REST_CHARS}]*"
 )
+_GRAPH_LEAN_IDENTIFIER_COMPONENT_RE = re.compile(
+    rf"(?:«[^»]*»|{_GRAPH_LEAN_PLAIN_IDENTIFIER_RE.pattern})"
+)
+_GRAPH_LEAN_QUALIFIED_IDENTIFIER_RE = re.compile(
+    rf"{_GRAPH_LEAN_IDENTIFIER_COMPONENT_RE.pattern}"
+    rf"(?:\.{_GRAPH_LEAN_IDENTIFIER_COMPONENT_RE.pattern})*"
+)
+_GRAPH_NAMESPACED_SOLUTION_MARKER_RE = re.compile(r"putnam_[^\s]*\.\s*solution")
 
 
 def _helper_source_solution_references(src: str) -> Set[str]:
@@ -867,12 +881,215 @@ def _cached_helper_source_solution_references(src: str) -> frozenset[str]:
 
 
 def _uncached_helper_source_solution_references(src: str) -> Set[str]:
-    text = _graph_answer_safety_skeleton(str(src or ""))
-    return {
-        str(match.group(0) or "").strip().removeprefix("«").removesuffix("»")
-        for match in _GRAPH_SOLUTION_REFERENCE_RE.finditer(text)
-        if str(match.group(0) or "").strip()
+    references: Set[str] = set()
+    # Scan original source, including comments and strings, as the conservative
+    # admission guard does elsewhere. Normalization detects obfuscated markers;
+    # it must never identify distinct Lean names as the same declaration.
+    for match in _GRAPH_LEAN_QUALIFIED_IDENTIFIER_RE.finditer(str(src or "")):
+        components = [
+            component.group(0)
+            for component in _GRAPH_LEAN_IDENTIFIER_COMPONENT_RE.finditer(match.group(0))
+        ]
+        skeleton = _graph_answer_safety_skeleton(
+            ".".join(
+                component[1:-1] if component.startswith("«") else component
+                for component in components
+            )
+        )
+        if (
+            "_solution" not in skeleton
+            and _GRAPH_NAMESPACED_SOLUTION_MARKER_RE.search(skeleton) is None
+        ):
+            continue
+        components = [
+            component[1:-1]
+            if component.startswith("«")
+            and _GRAPH_LEAN_PLAIN_IDENTIFIER_RE.fullmatch(component[1:-1])
+            else component
+            for component in components
+        ]
+        # Quotes can disappear only around an ordinary single component.
+        # Thus Foo.«bar_solution» equals Foo.bar_solution, while the single
+        # component «Foo.bar_solution» keeps its distinct Lean Name identity.
+        references.add(".".join(components))
+    return references
+
+
+def _helper_statement_solution_references(statement: str) -> Set[str]:
+    """Return code references that can authorize the same names in a proof."""
+
+    code, lexically_closed = _strip_lean_comments_and_strings(str(statement or ""))
+    if not lexically_closed:
+        return set()
+    pieces: List[str] = []
+    index = 0
+    segment_start = 0
+    while index < len(code):
+        end = _lean_lexical_skip_end(code, index)
+        if end is not None:
+            index = end
+            continue
+        if code[index] == "`":
+            name_start = index + (2 if code.startswith("``", index) else 1)
+            name = _GRAPH_LEAN_QUALIFIED_IDENTIFIER_RE.match(code, name_start)
+            if name is None:
+                # Unclassified syntax quotations grant no reference authority.
+                return set()
+            pieces.extend((code[segment_start:index], " "))
+            index = name.end()
+            segment_start = index
+            continue
+        index += 1
+    pieces.append(code[segment_start:])
+    # Literal/comment contents grant no authority. Quoted identifiers and
+    # executable interpolation expressions remain in the code surface.
+    return _helper_free_solution_references("".join(pieces))
+
+
+def _helper_free_solution_references(code: str) -> Set[str]:
+    """Use scoped alpha-renaming to retain only original free reference paths."""
+
+    from .lean_decl_parser import _HAVE_KEYWORDS, _LET_KEYWORDS, _matches_word
+    from .proof_state import canonicalize_lean_statement_for_identity
+
+    # Surrogates preserve exact component identity through the existing
+    # normalizer and make quoted/plain local aliases refer to the same binder.
+    occupied = set(re.findall(r"__reference_component_(\d+)_", code))
+    nonce = 0
+    while str(nonce) in occupied:
+        nonce += 1
+    prefix = f"__reference_component_{nonce}_"
+    components: Dict[str, str] = {}
+    originals: Dict[str, str] = {}
+    keywords = {
+        "fun", "forall", "exists", "let", "in", "if", "then", "else",
+        "match", "with", "by", "do", "have", "suffices", "obtain", "rec",
+        "letI", "letI'", "let_delayed", "where", "return",
     }
+    unsupported_keywords = (set(_LET_KEYWORDS) - {"let"}) | set(_HAVE_KEYWORDS) | {"PiType"}
+    keywords.update(unsupported_keywords)
+    unsupported_binding = re.compile(
+        r"(?<![\w.])(?:"
+        + "|".join(re.escape(word) for word in sorted(unsupported_keywords))
+        + r")(?![\w.])"
+    )
+
+    def encode(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if token in keywords or any(
+            _matches_word(match.string, match.start(), keyword)
+            for keyword in unsupported_keywords
+        ):
+            return token
+        encoded: List[str] = []
+        for part in _GRAPH_LEAN_IDENTIFIER_COMPONENT_RE.finditer(token):
+            raw = part.group(0)
+            value = raw[1:-1] if raw.startswith("«") else raw
+            if value not in components:
+                surrogate = f"{prefix}{len(components)}"
+                components[value] = surrogate
+                originals[surrogate] = (
+                    value if _GRAPH_LEAN_PLAIN_IDENTIFIER_RE.fullmatch(value)
+                    else f"«{value}»"
+                )
+            encoded.append(components[value])
+        return ".".join(encoded)
+
+    encoded = _GRAPH_LEAN_QUALIFIED_IDENTIFIER_RE.sub(encode, code)
+
+    def normalize_scope(raw: str, depth: int = 0) -> str:
+        if depth >= 64:
+            return ""
+        pieces: List[str] = []
+        index = 0
+        while index < len(raw):
+            if raw[index] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+                end = _graph_matching_group_index(raw, index)
+                if end < 0:
+                    return ""
+                inner = raw[index + 1 : end]
+                # Subtype/set-builder syntax has binders outside the shared
+                # alpha-normalizer's supported telescope grammar.
+                if raw[index] == "{" and ("//" in inner or "|" in inner):
+                    inner = ""
+                else:
+                    inner = normalize_scope(inner, depth + 1)
+                pieces.extend((raw[index], inner, raw[end]))
+                index = end + 1
+            else:
+                pieces.append(raw[index])
+                index += 1
+        grouped = "".join(pieces)
+        if unsupported_binding.search(grouped) or re.search(
+            r"\b(?:match|by|do|have|suffices|obtain|letI|let_delayed)\b"
+            r"|\bfun\s*\||\blet\s+(?:rec\b|[⟨(])"
+            rf"|\bif\s+{re.escape(prefix)}\d+\s*:"
+            r"|[∀∃](?=[^\s_({\[⦃])|[ΣΠ⨁⨂∫-∳⨋-⨖]",
+            grouped,
+        ):
+            return ""
+        normalized = canonicalize_lean_statement_for_identity(grouped)
+        # An embedded ungrouped let that the shared parser could not scope
+        # must not turn its declaration name into a global reference.
+        if re.search(rf"\blet\s+{re.escape(prefix)}\d+\b", normalized):
+            return ""
+        return normalized
+
+    try:
+        normalized = normalize_scope(encoded)
+    except RecursionError:
+        return set()
+    references: Set[str] = set()
+    for match in _GRAPH_LEAN_QUALIFIED_IDENTIFIER_RE.finditer(normalized):
+        path = match.group(0).split(".")
+        # Bound roots (including field paths) are generated _bN names and do
+        # not occur in the original-component table.
+        if all(component in originals for component in path):
+            references.update(_helper_source_solution_references(
+                ".".join(originals[component] for component in path)
+            ))
+    return references
+
+
+def _helper_decl_statement_solution_references(src: str) -> Set[str]:
+    source = str(src or "")
+    if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+        return _uncached_helper_decl_statement_solution_references(source)
+    return set(_cached_helper_decl_statement_solution_references(source))
+
+
+@lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
+def _cached_helper_decl_statement_solution_references(src: str) -> frozenset[str]:
+    return frozenset(_uncached_helper_decl_statement_solution_references(src))
+
+
+def _uncached_helper_decl_statement_solution_references(src: str) -> Set[str]:
+    """Read reference authority from original binder/type text, not display text."""
+
+    header = _helper_decl_header(src)
+    if header is None:
+        return set()
+    tail = header[2]
+    colon = _declaration_type_colon(tail)
+    if colon is None:
+        return set()
+    marker = _declaration_body_marker(tail, start=colon + 1)
+    if marker is None:
+        return set()
+    binders, lexically_closed = _strip_lean_comments_and_strings(tail[:colon])
+    if not lexically_closed:
+        return set()
+    groups: List[str] = []
+    for binder in _graph_binder_group_chunks(binders):
+        inner = _graph_unwrap_binder_group(binder)
+        inner = _strip_default_assignments_in_binder(inner)
+        opener = binder[:1]
+        closer = _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE.get(opener)
+        groups.append(f"{opener}{inner}{closer}" if closer else inner)
+    statement = tail[colon + 1 : marker[0]]
+    if groups:
+        statement = f"∀ {' '.join(groups)}, {statement}"
+    return _helper_statement_solution_references(statement)
 
 
 def _helper_source_mentions_solution(src: str) -> bool:
@@ -1038,6 +1255,21 @@ def graph_identity_text(text: str) -> str:
     return " ".join(str(text or "").split()).strip()
 
 
+def _graph_lexical_island_end(text: str, index: int) -> Optional[int]:
+    """Skip a complete literal, including nested interpolation expressions."""
+
+    end = _lean_lexical_skip_end(text, index)
+    if end is not None:
+        return end
+    if index and re.fullmatch(rf"[{_GRAPH_LEAN_ID_REST_CHARS}]", text[index - 1]):
+        return None
+    prefix = _interpolated_string_prefix_len(text, index)
+    if not prefix:
+        return None
+    end, closed = _scan_interpolated_string(text, index + prefix, [])
+    return end if closed else len(text)
+
+
 def graph_formal_statement_text(
     text: str,
     *,
@@ -1045,24 +1277,70 @@ def graph_formal_statement_text(
 ) -> str:
     """Compact, Lean-parseable formal statement text for graph-native nodes."""
 
-    normalized = normalize_subgoal_statement(
+    return _graph_compact_lean_whitespace(
         str(text or "").strip(),
+        preserve_layout=True,
         canonicalize_guarded_iff=canonicalize_guarded_iff,
     )
-    if "\n" not in normalized:
-        return graph_identity_text(normalized)
-    lines: List[str] = []
-    for line_index, line in enumerate(normalized.splitlines()):
-        if not line.strip():
-            lines.append("")
+
+
+def _graph_compact_lean_whitespace(
+    text: str,
+    *,
+    preserve_layout: bool = False,
+    canonicalize_guarded_iff: Optional[bool] = None,
+) -> str:
+    """Compact code whitespace while retaining the exact contents of literals."""
+
+    normalized = str(text or "")
+    # Formatting inside lexical islands is part of the Lean proposition.
+    # Select an absent prefix in one source scan, even for adversarial names.
+    occupied = {
+        match.group(1)
+        for match in re.finditer(r"__graph_lexical_island_([0-9]+)_", normalized)
+    }
+    prefix_index = 0
+    while str(prefix_index) in occupied:
+        prefix_index += 1
+    prefix = f"__graph_lexical_island_{prefix_index}_"
+    literals: List[str] = []
+    pieces: List[str] = []
+    index = 0
+    while index < len(normalized):
+        end = _graph_lexical_island_end(normalized, index)
+        if end is None:
+            pieces.append(normalized[index])
+            index += 1
             continue
-        body = " ".join(line.strip().split())
-        if line_index == 0:
-            lines.append(body)
-            continue
-        leading = re.match(r"\s*", line).group(0)
-        lines.append(f"{leading or '  '}{body}")
-    return "\n".join(lines).strip()
+        token = f"{prefix}{len(literals)}__"
+        literals.append(normalized[index:end])
+        pieces.append(token)
+        index = end
+    protected = "".join(pieces)
+    if canonicalize_guarded_iff is not None:
+        protected = normalize_subgoal_statement(
+            protected, canonicalize_guarded_iff=canonicalize_guarded_iff,
+        )
+    if not preserve_layout or "\n" not in protected:
+        compact = graph_identity_text(protected)
+    else:
+        lines: List[str] = []
+        for line_index, line in enumerate(protected.splitlines()):
+            if not line.strip():
+                lines.append("")
+                continue
+            body = " ".join(line.strip().split())
+            if line_index == 0:
+                lines.append(body)
+                continue
+            leading = re.match(r"\s*", line).group(0)
+            lines.append(f"{leading or '  '}{body}")
+        compact = "\n".join(lines).strip()
+    return re.sub(
+        re.escape(prefix) + r"([0-9]+)__",
+        lambda match: literals[int(match.group(1))],
+        compact,
+    )
 
 
 def _graph_statement_looks_like_prose_instruction(text: str) -> bool:
@@ -2014,7 +2292,7 @@ def _graph_matching_group_index(text: str, start: int) -> int:
     stack = [expected]
     index = start + 1
     while index < len(raw):
-        skip_to = _lean_lexical_skip_end(raw, index)
+        skip_to = _graph_lexical_island_end(raw, index)
         if skip_to is not None:
             index = skip_to
             continue
@@ -3000,7 +3278,9 @@ def graph_node_frontier_promoted_to_proof_state(node: Any) -> bool:
     )
 
 
-def _shield_lean_quotes_for_identity(text: str) -> str:
+def _shield_lean_quotes_for_identity(
+    text: str, *, interpolations_only: bool = False,
+) -> str:
     """Replace Lean lexical literals with stable identifier-shaped tokens.
 
     NUL-delimited internal tokens cannot occur in valid Lean source, while the
@@ -3021,12 +3301,16 @@ def _shield_lean_quotes_for_identity(text: str) -> str:
     out: List[str] = []
     index = 0
     while index < len(raw):
-        lexical_end = _lean_lexical_skip_end(raw, index)
+        lexical_end = _graph_lexical_island_end(raw, index)
         if lexical_end is None:
             out.append(raw[index])
             index += 1
             continue
         lexical = raw[index:lexical_end]
+        if interpolations_only and not _interpolated_string_prefix_len(raw, index):
+            out.append(lexical)
+            index = lexical_end
+            continue
         digest = hashlib.sha256(lexical.encode("utf-8")).hexdigest()[:20]
         token_kind = "Q" if raw.startswith("«", index) else "L"
         out.append(f"\x00{token_kind}{digest}\x00")
@@ -3407,7 +3691,11 @@ def graph_statement_key(text: str) -> str:
     """Small graph-local equivalence key for matching proved helper statements."""
 
     normalized = normalize_statement(
-        _shield_lean_quotes_for_identity(_scoped_statement_identity_text(text))
+        _shield_lean_quotes_for_identity(
+            _scoped_statement_identity_text(
+                _shield_lean_quotes_for_identity(text, interpolations_only=True)
+            )
+        )
     )
     # Capture guard: rewriting Nat→ℕ in a statement that
     # ALSO contains ℕ merges a binder named Nat with the real ℕ — skip the
@@ -6624,7 +6912,7 @@ def _uncached_helper_decl_statement(src: str) -> str:
         canonicalize_guarded_iff=False,
     )
     binders = _strip_declaration_binder_defaults(
-        " ".join(_strip_lean_decl_comments_preserving_strings(tail[:colon]).split())
+        _strip_lean_decl_comments_preserving_strings(tail[:colon])
     )
     if kind in {"theorem", "lemma"} and binders:
         statement = f"∀ {binders}, {statement}"
@@ -6743,7 +7031,7 @@ def _strip_lean_decl_comments_preserving_strings(text: str) -> str:
             index = _skip_lean_block_comment(s, index)
             out.append(" ")
             continue
-        end = _lean_lexical_skip_end(s, index)
+        end = _graph_lexical_island_end(s, index)
         if end is not None:
             out.append(s[index:end])
             index = end
@@ -6814,31 +7102,23 @@ def _strip_declaration_binder_defaults(text: str) -> str:
             out.append(ch)
             index += 1
             continue
-        depth = 0
-        end = index
-        while end < len(source):
-            if source[end] == ch:
-                depth += 1
-            elif source[end] == close:
-                depth -= 1
-                if depth == 0:
-                    break
-            end += 1
-        if end >= len(source):
+        end = _graph_matching_group_index(source, index)
+        if end < 0:
             out.append(source[index:])
             break
         inner = source[index + 1 : end]
         out.append(ch + _strip_default_assignments_in_binder(inner) + close)
         index = end + 1
-    return " ".join("".join(out).split())
+    return _graph_compact_lean_whitespace("".join(out))
 
 
 def _strip_default_assignments_in_binder(inner: str) -> str:
     text = str(inner or "")
-    assign = text.find(":=")
-    if assign < 0:
-        return text
-    return text[:assign].rstrip()
+    colon = _declaration_type_colon(text)
+    marker = _declaration_body_marker(
+        text, start=colon + 1 if colon is not None else 0,
+    )
+    return text[:marker[0]].rstrip() if marker is not None else text
 
 
 def _starts_token(text: str, index: int, token: str) -> bool:
@@ -6860,7 +7140,7 @@ def _declaration_type_colon(tail: str) -> Optional[int]:
     text = str(tail or "")
     index = 0
     while index < len(text):
-        end = _lean_lexical_skip_end(text, index)
+        end = _graph_lexical_island_end(text, index)
         if end is not None:
             index = end
             continue
@@ -11513,11 +11793,13 @@ class ProofGraph:
             # body. A visible-answer proof may legitimately unfold the exact
             # target constant already present in its statement,
             # but the receipt cannot launder any additional answer reference.
-            statement_solution_refs = _helper_source_solution_references(
-                source_statement
+            statement_solution_refs = _helper_decl_statement_solution_references(
+                source
             )
             if _helper_source_solution_references(declared_name or ""):
                 return False
+            # Body text stays conservative: tactics may clear or shadow local
+            # binders, so a matching local name alone grants no answer access.
             if not _helper_source_solution_references(source_body).issubset(
                 statement_solution_refs
             ):

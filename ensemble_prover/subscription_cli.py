@@ -357,7 +357,6 @@ class SubscriptionCLIClient:
         on_started: Any = None,
         inactivity_timeout: float | None = None,
         on_progress: Callable[[dict[str, Any]], bool] | None = None,
-        environment_overrides: dict[str, str] | None = None,
     ) -> tuple[bytes, bytes, int]:
         if self._closed:
             raise self.backend_error(
@@ -373,7 +372,7 @@ class SubscriptionCLIClient:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=cwd,
-                env={**self._process_environment(), **(environment_overrides or {})},
+                env=self._process_environment(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
