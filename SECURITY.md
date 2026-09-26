@@ -2,16 +2,13 @@
 
 ## Supported versions
 
-Security fixes are maintained on the latest revision of `main`. The current
-public release series is **1.14**, covering Mini Prover, single-claim
-natural-language input, and multi-file formalization campaigns.
-
-The `v1.14` tag is a fixed snapshot: subsequent fixes on `main` do not change
-that tag or previously downloaded archives. Update to the latest `main`
-revision to receive those fixes, and include the exact commit when reporting
-a problem. Older releases are not separate security-maintenance branches.
-Generated proofs, run dossiers, and campaign exports are artifacts, not
-supported software release lines.
+Security fixes are maintained on the latest revision of `main`, covering Mini
+Prover, natural-language input, formalization campaigns, and the local browser
+interface. Tags are fixed snapshots: subsequent fixes on `main` do not change
+previously downloaded archives. Update to the latest `main` revision to receive
+fixes, and include the exact commit when reporting a problem. Older releases
+are not separate security-maintenance branches. Generated proofs, run dossiers,
+and campaign exports are artifacts, not supported software release lines.
 
 ## Reporting a vulnerability
 
@@ -72,3 +69,17 @@ boundary.
 
 See the [User Guide](docs/USER_GUIDE.md#15-security-privacy-and-operational-safety)
 for operational details and the workflow-specific completion checks.
+
+## Local browser service
+
+The optional browser service binds only to `127.0.0.1`. It assumes a trusted
+local user and trusted run and service-state directories. Read-only operation
+is the default; `--control` enables launches and cooperative stop requests for
+owned processes. Host, origin, and fetch-metadata checks restrict browser
+requests, and mutations require a per-service capability.
+
+These controls do not provide remote user authentication or isolate local
+accounts. Do not expose the service through a network proxy, forward its port,
+or deploy it as a shared internet service. A provider-enabled launch can spend
+money and execute code from the selected Lean project. Supply credentials in
+the service environment and keep private sources and recorded output local.

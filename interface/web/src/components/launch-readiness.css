@@ -1,0 +1,7 @@
+.launch-readiness .readiness-summary { margin: 0 0 10px; font-weight: 600; }
+.readiness-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+.readiness-list li { display: grid; gap: 2px; font-size: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.readiness-list li:first-child { padding-top: 0; border-top: 0; }
+.readiness-list .text-button { justify-self: start; }
+.launch-readiness > .meta:last-child { margin-bottom: 0; }
+.launch-options-group { display: grid; gap: 20px; min-width: 0; }

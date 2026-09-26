@@ -1,13 +1,14 @@
 # Ensemble Prover
 
-**Version 1.15 · Research preview** · Updated September 25, 2026
+**Version 1.16 · Research preview** · Updated September 26, 2026
 
 Ensemble Prover is an autonomous theorem prover combining language-model proof
 search with Lean 4 verification. Give it a formalized theorem and a compatible
 Lean project: it plans, retrieves relevant mathematics, proves helper lemmas,
 repairs failed attempts, and checks the final proof with Lean.
 
-[Quick start](#quick-start) · [Workflows](#choose-a-workflow) ·
+[Quick start](#quick-start) · [Browser interface](#local-browser-interface) ·
+[Workflows](#choose-a-workflow) ·
 [Results](#putnam-proofs-accepted-by-putnambench) ·
 [User Guide](docs/USER_GUIDE.md) · [Citation](#cite-this-work)
 
@@ -36,6 +37,7 @@ translation. Research reviews and proposed answers are not proof certificates.**
 
 | You have | Start here | What it does |
 | --- | --- | --- |
+| A browser workspace for launching and reviewing attempts | [Local browser interface](#local-browser-interface) | Configure English or Lean input, follow progress, and inspect recorded results |
 | A Lean theorem and a built Lake project | [Run the prover](#run-the-prover) | Search for and check a proof of the supplied target |
 | One natural-language or LaTeX-text claim | [Start from natural language](#start-from-natural-language) | Translate the claim, then try to prove it |
 | Longer mathematical notes | [Formalization campaigns](docs/USER_GUIDE.md#19-run-a-multi-file-formalization-campaign) | Build definitions and supporting lemmas across a resumable project |
@@ -85,6 +87,34 @@ cp .env.example .env
 
 `.env` is ignored by Git. Never commit provider credentials or generated run
 artifacts.
+
+## Local browser interface
+
+The optional browser interface runs locally on Linux. It provides a guided
+English or Lean launcher, proof progress and graph views, sweep following,
+and searchable results. It requires standard CPython 3.11 or 3.12 and Node.js
+22.20+ (22.x), 24.12+ (24.x), or 26+ to build the included browser source.
+
+From the repository root (use `python3.12` if preferred):
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r requirements-interface.txt
+.venv/bin/python -m pip check
+npm --prefix interface/web ci
+npm --prefix interface/web run build
+.venv/bin/python -m interface.service
+```
+
+Open `http://127.0.0.1:8765`. To enable launch and cooperative stop, start with
+`--control`. Export the selected provider's credentials in the service shell,
+or use an existing subscription CLI sign-in. Starting proof work still requires
+a compatible built Lake project and Lean/Lake on PATH.
+
+The service assumes trusted local users, projects, and state directories. Keep
+it on localhost; do not expose it through a network proxy. Closing the page does
+not stop a running attempt. See the [browser interface guide](interface/README.md)
+for setup, storage locations, controls, and limitations.
 
 ## Run the prover
 
@@ -338,6 +368,13 @@ problem identifiers are published here; the proof files and answers are not.
 
 ## Recent updates
 
+**Version 1.16** adds a local browser workspace:
+
+- Launch English or Lean attempts with project, theorem, model, and budget controls.
+- Follow proof progress and sequential sweeps, inspect recorded helper statements and Lean source, and review saved results.
+- Filter results by outcome and sweep, and pause or refresh recorded activity.
+- Build the included browser source locally; launch and cooperative stop remain opt-in.
+
 **Version 1.15** improves continuity between proof-search steps and interrupted runs:
 
 - Recursive helper work survives scheduler yields and subscription interruptions.
@@ -429,7 +466,7 @@ Python virtual environment is not a security boundary.
 
 If you use Ensemble Prover in your research, experiments, or software, please cite:
 
-> Reale, M. (2026). *Ensemble Prover* (Version 1.15) [Computer software]. Graviterra.
+> Reale, M. (2026). *Ensemble Prover* (Version 1.16) [Computer software]. Graviterra.
 > [GitHub repository](https://github.com/graviterra/ensemble-prover).
 
 ```bibtex

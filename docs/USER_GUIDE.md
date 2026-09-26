@@ -33,6 +33,20 @@ authority for the options available in your checkout:
 .venv/bin/python -m ensemble_prover.research_claims discovery --help
 ```
 
+## Optional browser workspace
+
+Use the [local browser interface](../interface/README.md) to launch English or
+Lean attempts, follow progress and sequential sweeps, and filter recorded
+results. The interface runs on Linux with standard CPython 3.11 or 3.12; building
+the included source also requires Node.js 22.20+ (22.x), 24.12+ (24.x), or 26+.
+Follow its setup commands
+from the repository root, then open `http://127.0.0.1:8765`.
+
+The service starts read-only. Add `--control` to enable launch and cooperative
+stop for owned attempts. Export provider credentials in its shell or use the
+selected subscription CLI's sign-in. Keep the service on localhost with trusted
+run and state directories; it is not a shared network service.
+
 ## 1. What you supply
 
 Choose the entry point that matches your input:

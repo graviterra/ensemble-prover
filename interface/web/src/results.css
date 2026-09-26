@@ -1,0 +1,7 @@
+.results-filters { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr); gap: 16px; margin-bottom: 12px; }
+.results-filters .field { min-width: 0; margin: 0; }
+.results-filters select { max-width: 100%; }
+.results-scope { margin-bottom: 20px; }
+@media (max-width: 720px) {
+  .results-filters { grid-template-columns: 1fr; gap: 12px; }
+}

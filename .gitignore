@@ -12,6 +12,10 @@ runs/
 __pycache__/
 *.py[cod]
 
+# Product interface build
+interface/web/node_modules/
+interface/web/dist/
+
 # Development worktree only (not needed by the public runtime)
 Temp/
 logs/
