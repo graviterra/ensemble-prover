@@ -10278,7 +10278,12 @@ class ConversationTurnAction:
         )
         return sanitized
 
-    def prepare_scheduler_runtime_state(self, session: Any) -> None:
+    def prepare_scheduler_runtime_state(
+        self,
+        session: Any,
+        *,
+        dispatched_binding: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         """Capture the bounded live conversation continuation for checkpoint."""
 
         conv = getattr(session, "conv", None)
@@ -10302,7 +10307,20 @@ class ConversationTurnAction:
             return
         retained_binding: Dict[str, Any] = {}
         retained_state = self._provider_quantum_checkpoint.get("state")
-        if (
+        if dispatched_binding is not None:
+            # The tool round may publish formal evidence before its first
+            # checkpoint. Authenticate its state against the invocation's
+            # pre-tool binding before deciding whether that lane is stale.
+            authenticated = self._validated_provider_quantum_checkpoint(
+                {
+                    "state": copy.deepcopy(dict(raw_state)),
+                    "history": copy.deepcopy(list(getattr(conv, "history", []) or [])),
+                    "binding": copy.deepcopy(dict(dispatched_binding)),
+                },
+                conv=conv,
+            )
+            retained_binding = dict(authenticated["binding"])
+        elif (
             isinstance(retained_state, Mapping)
             and retained_state.get("provider_turn_lane_identity")
             == raw_state.get("provider_turn_lane_identity")
@@ -13254,6 +13272,23 @@ class ConversationTurnAction:
             conv,
             llm_goal_statement_override,
         )
+        # Keep dispatch authority local to this invocation. A helper accepted
+        # by the tool loop can change the current repair cycle before the
+        # first continuation is captured; raw state cannot supply its own
+        # prior authority or be restamped with the new cycle.
+        provider_quantum_dispatched_binding = {
+            "role": self.role,
+            "target": str(
+                llm_goal_statement_override
+                if llm_goal_statement_override is not None
+                else conv.goal_statement
+            ).strip(),
+            "repair_cycle": str(conv._provider_turn_repair_cycle_identity),
+            "selected_work_record": copy.deepcopy(dict(selected_record_for_temperature)),
+            "selected_context_digest": str(
+                getattr(session, "_selected_proof_idea_context_digest", "") or ""
+            ).strip(),
+        }
         temperature_decision = resolve_mini_temperature(
             self.mini_phase_temperatures,
             MiniTemperatureContext(
@@ -14180,7 +14215,9 @@ class ConversationTurnAction:
         # the next pre-select snapshot. This covers every persisted raw
         # continuation, not only cooperative provider-quantum yields.
         try:
-            self.prepare_scheduler_runtime_state(session)
+            self.prepare_scheduler_runtime_state(
+                session, dispatched_binding=provider_quantum_dispatched_binding,
+            )
         except StateSnapshotCompatibilityError:
             # Keep the live state fail-closed. A direct scheduler snapshot
             # will expose the incompatibility instead of silently rebinding

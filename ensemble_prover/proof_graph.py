@@ -17,7 +17,7 @@ import unicodedata
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
-from threading import Lock
+from threading import Lock, local
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .lean_decl_parser import find_decl_header_end
@@ -536,6 +536,57 @@ def _graph_normalize_ascii_quantifier_tokens(text: str) -> str:
     return "".join(out)
 
 
+def _graph_fragment_has_no_term_token(text: str) -> bool:
+    """Return whether text is only whitespace, comments, and empty groups.
+
+    Nested groups are scanned with an explicit stack. A deep empty literal
+    stays data and does not grow the Python call stack.
+    """
+
+    pending = [str(text or "")]
+    while pending:
+        raw = pending.pop()
+        index = 0
+        while index < len(raw):
+            if raw[index].isspace():
+                index += 1
+                continue
+            if raw.startswith(("--", "/-"), index):
+                skip_to = _lean_lexical_skip_end(raw, index)
+                if skip_to is None or skip_to <= index:
+                    return False
+                index = skip_to
+                continue
+            if raw[index] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+                end = _graph_matching_group_index(raw, index)
+                if end < 0:
+                    return False
+                interior = raw[index + 1 : end]
+                if interior.strip():
+                    pending.append(interior)
+                index = end + 1
+                continue
+            return False
+    return True
+
+
+def _graph_statement_is_empty_data(text: str) -> bool:
+    """Return whether a statement is only an empty data literal.
+
+    ``()``, ``[]``, ``{}``, ``#[]``, and the same forms wrapped in comments
+    or extra groups are Unit, list, or set data. They are not propositions.
+    A string or any other token is not empty.
+    """
+
+    raw = graph_identity_text(text).strip()
+    if not raw:
+        return False
+    if raw.startswith("#"):
+        rest = raw[1:].lstrip()
+        return bool(rest) and _graph_fragment_has_no_term_token(rest)
+    return _graph_fragment_has_no_term_token(raw)
+
+
 def graph_statement_non_theorem_reason(text: str) -> str:
     """Return why a Lean-like graph statement cannot be a theorem target.
 
@@ -544,7 +595,22 @@ def graph_statement_non_theorem_reason(text: str) -> str:
     it catches statements that look like standalone Lean expressions, but whose
     type is itself data/sort-valued rather than ``Prop``.  Those must never be
     materialized as ``theorem name : <statement> := ...`` declarations.
+    A statement that exceeds the safe parse bound returns ``parse_bound``
+    instead of raising or reporting that no reason was found. That includes
+    the lexical-closure scan. An unclosed comment, string, or quotation
+    returns ``unclosed_lexical``.
     """
+
+    try:
+        if not _graph_lexical_islands_closed(text):
+            return "unclosed_lexical"
+        return _graph_statement_non_theorem_reason_body(text)
+    except RecursionError:
+        return "parse_bound"
+
+
+def _graph_statement_non_theorem_reason_body(text: str) -> str:
+    """Classify one statement; the public wrapper bounds recursion."""
 
     compact = graph_identity_text(text)
     if not compact:
@@ -595,6 +661,13 @@ def graph_statement_non_theorem_reason(text: str) -> str:
 
     compact_unwrapped = _graph_strip_balanced_outer_parens(compact)
     compact_shape = _graph_normalize_ascii_quantifier_tokens(compact_unwrapped)
+    # ``()``, ``#[]``, and a comment-only group are data, not missing tokens.
+    if (
+        not compact_unwrapped
+        or _graph_statement_is_empty_data(compact)
+        or _graph_statement_is_empty_data(compact_unwrapped)
+    ):
+        return "data_term"
 
     if compact_unwrapped.startswith("¬"):
         return direct_non_theorem_reason(compact_unwrapped[1:].strip())
@@ -2162,11 +2235,27 @@ def _graph_prop_annotation_arity(type_text: str) -> int | None:
         clean = clean[1:].strip()
     if not clean:
         return None
+    parameters = 0
+    while _graph_proposition_quantifier_token_len(clean) > 0:
+        # A function binder keeps its domain names local to the result type.
+        # Only universal telescopes can describe a predicate function.
+        quantifier = _graph_top_level_quantifier_token_len(clean, 0)
+        if not quantifier or not clean.startswith(("∀", "forall")):
+            return None
+        remainder = clean[quantifier:].lstrip()
+        comma = _graph_find_top_level_comma(remainder)
+        if comma < 0:
+            return None
+        parameters += sum(
+            len(_graph_binder_names_from_chunk(chunk))
+            for chunk in _graph_binder_group_chunks(remainder[:comma])
+        )
+        clean = _graph_strip_balanced_outer_parens(remainder[comma + 1 :])
     parts = split_lean_top_level_implications(clean)
     if len(parts) == 1 and graph_identity_text(parts[0]) == "Prop":
-        return 0
+        return parameters
     if len(parts) >= 2 and graph_identity_text(parts[-1]) == "Prop":
-        return len(parts) - 1
+        return parameters + len(parts) - 1
     return None
 
 
@@ -2209,15 +2298,14 @@ def _graph_fun_rhs_prop_arity(rhs: str) -> int | None:
     parts = split_lean_top_level_implications(clean)
     if len(parts) >= 2 and graph_identity_text(parts[-1]) == "Prop":
         return None
-    match = re.match(r"^fun\s+(.+?)\s*=>\s*(.+)$", clean)
-    if match is None:
+    lambda_parts = _graph_leading_lambda_parts(clean)
+    if lambda_parts is None:
         if clean in {"True", "False"} or _graph_contains_top_level_proposition_marker(
             clean
         ):
             return 0
         return None
-    args_text = str(match.group(1) or "").strip()
-    body = str(match.group(2) or "").strip()
+    args_text, body = lambda_parts
     if not body or not (
         body in {"True", "False"} or _graph_contains_top_level_proposition_marker(body)
     ):
@@ -2391,37 +2479,11 @@ def _graph_conditional_structure(
     return bool(pending), branches
 
 
-def _graph_conditional_leaf_statements(text: str) -> Optional[List[str]]:
-    """Flatten conditional branches without adding a Python frame per branch."""
-
-    pending = [("", text)]
-    leaves: List[str] = []
-    while pending:
-        prefix, fragment = pending.pop()
-        body = _graph_strip_balanced_outer_parens(fragment.strip())
-        local_prefix = ""
-        while (quantifier_len := _graph_proposition_quantifier_token_len(body)) > 0:
-            remainder = body[quantifier_len:].lstrip()
-            comma = _graph_find_top_level_comma(remainder)
-            if comma < 0:
-                return None
-            local_prefix += body[:quantifier_len] + " " + remainder[:comma] + ", "
-            body = _graph_strip_balanced_outer_parens(remainder[comma + 1:].strip())
-        if _graph_keyword_at(body, 0, "if"):
-            incomplete, branches = _graph_conditional_structure(body)
-            if incomplete or not branches or not all(branches):
-                return None
-            pending.extend((prefix + local_prefix, branch) for branch in branches)
-        else:
-            leaves.append(prefix + fragment)
-    return leaves
-
-
 def _graph_quantified_body_looks_like_prose(text: str) -> bool:
     compact = graph_identity_text(text)
     if not compact:
         return True
-    lowered = compact.lower()
+    lowered = _graph_mask_match_terms(compact).lower()
     if _graph_statement_looks_like_prose_instruction(compact):
         return True
     if _graph_conditional_structure(compact)[0]:
@@ -2472,6 +2534,2271 @@ def _graph_quantified_statement_has_prose_or_proof_tail(text: str) -> bool:
     )
 
 
+def _graph_skip_lexical_or_group(text: str, index: int) -> Optional[int]:
+    """Return the index after a literal or balanced group, if one starts here."""
+
+    if index >= len(text):
+        return None
+    skip_to = _lean_lexical_skip_end(text, index)
+    if skip_to is not None:
+        return skip_to
+    if text[index] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+        end = _graph_matching_group_index(text, index)
+        if end < 0:
+            return None
+        return end + 1
+    return None
+
+
+def _graph_find_top_level_keyword(text: str, keyword: str, start: int) -> int:
+    index = max(0, start)
+    while index < len(text):
+        skipped = _graph_skip_lexical_or_group(text, index)
+        if skipped is not None:
+            index = skipped
+            continue
+        if _graph_keyword_at(text, index, keyword):
+            return index
+        index += 1
+    return -1
+
+
+def _graph_find_top_level_symbol(text: str, symbol: str, start: int) -> int:
+    index = max(0, start)
+    while index < len(text):
+        skipped = _graph_skip_lexical_or_group(text, index)
+        if skipped is not None:
+            index = skipped
+            continue
+        if text.startswith(symbol, index):
+            return index
+        index += 1
+    return -1
+
+
+_GRAPH_MATCH_PARSE_LIMIT = 16
+
+
+class _GraphSurfaceBudget:
+    """Match-parse budget for one invocation chain.
+
+    Ordinary bindings are not counted. Only nested ``match`` parsing consumes
+    the budget, and the counters belong to the calling thread so one deep
+    statement cannot reject another statement running beside it.
+    """
+
+    __slots__ = ("active", "exhausted", "match_depth")
+
+    def __init__(self) -> None:
+        self.active = False
+        self.exhausted = False
+        self.match_depth = 0
+
+
+_graph_surface_budgets = local()
+
+
+def _graph_surface_budget() -> _GraphSurfaceBudget:
+    budget = getattr(_graph_surface_budgets, "budget", None)
+    if budget is None:
+        budget = _GraphSurfaceBudget()
+        _graph_surface_budgets.budget = budget
+    return budget
+
+
+def _graph_parse_match_term(
+    text: str, start: int
+) -> Optional[Tuple[int, List[str], str, List[str]]]:
+    """Parse one term-level match, bounding nested match recursion.
+
+    The result is the end index, arm bodies, scrutinee, and patterns. A nest
+    deeper than the surface budget is not a proposition and does not raise.
+    """
+
+    budget = _graph_surface_budget()
+    if budget.match_depth >= _GRAPH_MATCH_PARSE_LIMIT:
+        budget.exhausted = True
+        return None
+    budget.match_depth += 1
+    try:
+        return _graph_parse_match_term_body(text, start)
+    finally:
+        budget.match_depth -= 1
+
+
+def _graph_parse_match_term_body(
+    text: str, start: int
+) -> Optional[Tuple[int, List[str], str, List[str]]]:
+    """Parse one term-level ``match`` and return its end, arms, and parts.
+
+    ``with`` closes the scrutinee. It is not proof syntax, and ``|`` inside a
+    following arm starts the next arm only outside nested groups and matches.
+    """
+
+    index = start
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if not _graph_keyword_at(text, index, "match"):
+        return None
+    match_at = index
+    with_at = _graph_find_top_level_keyword(text, "with", index + len("match"))
+    if with_at < 0:
+        return None
+    scrutinee = text[match_at + len("match") : with_at].strip()
+    index = with_at + len("with")
+    arms: List[str] = []
+    patterns: List[str] = []
+    while True:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        if text[index] == "|":
+            index += 1
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text):
+                return None
+        pattern_at = index
+        arrow = _graph_find_top_level_symbol(text, "=>", index)
+        if arrow < 0:
+            return None
+        patterns.append(text[pattern_at:arrow].strip())
+        index = arrow + 2
+        body_end = _graph_match_arm_body_end(text, index)
+        body = text[index:body_end].strip()
+        if not body:
+            return None
+        arms.append(body)
+        index = body_end
+        look = body_end
+        while look < len(text) and text[look].isspace():
+            look += 1
+        if look < len(text) and text[look] == "|":
+            continue
+        break
+    if not arms:
+        return None
+    return index, arms, scrutinee, patterns
+
+
+def _graph_match_arm_body_end(text: str, start: int) -> int:
+    """End an arm at the next top-level bar or an unmatched group closer.
+
+    A parenthesis opened before the match is not part of the arm. Nested
+    groups and nested matches stay inside the arm.
+    """
+
+    index = start
+    depth = 0
+    while index < len(text):
+        skipped = _lean_lexical_skip_end(text, index)
+        if skipped is not None:
+            index = skipped
+            continue
+        if depth == 0 and _graph_keyword_at(text, index, "match"):
+            parsed = _graph_parse_match_term(text, index)
+            if parsed is not None and parsed[0] > index:
+                index = parsed[0]
+                continue
+        character = text[index]
+        if character in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+            depth += 1
+        elif character in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE.values():
+            if depth == 0:
+                return index
+            depth -= 1
+        elif depth == 0 and character == "|":
+            return index
+        index += 1
+    return len(text)
+
+
+def _graph_mask_match_terms(text: str) -> str:
+    """Blank literals and match-separator ``with`` without hiding arm text.
+
+    Prose detection must not treat a match separator as English, and it must
+    not treat words inside comments or strings as syntax. Arm bodies stay in
+    the surface so a later check can still reject data, proof, and commands.
+    """
+
+    raw = str(text or "")
+    chars = list(raw)
+
+    def blank(start: int, end: int) -> None:
+        for offset in range(start, min(end, len(chars))):
+            chars[offset] = " "
+
+    index = 0
+    while index < len(raw):
+        skip_to = _lean_lexical_skip_end(raw, index)
+        if skip_to is not None:
+            blank(index, skip_to)
+            index = skip_to
+            continue
+        index += 1
+    index = 0
+    while index < len(raw):
+        skip_to = _lean_lexical_skip_end(raw, index)
+        if skip_to is not None:
+            index = skip_to
+            continue
+        if _graph_keyword_at(raw, index, "match"):
+            parsed = _graph_parse_match_term(raw, index)
+            if parsed is not None and parsed[0] > index:
+                with_at = _graph_find_top_level_keyword(
+                    raw, "with", index + len("match")
+                )
+                if with_at >= 0:
+                    blank(with_at, with_at + len("with"))
+                index += len("match")
+                continue
+        index += 1
+    return "".join(chars)
+
+
+_GRAPH_ARM_DECLARATIONS = (
+    "theorem",
+    "lemma",
+    "def",
+    "abbrev",
+    "example",
+    "axiom",
+    "opaque",
+    "inductive",
+    "structure",
+    "class",
+    "instance",
+)
+
+
+def _graph_contains_match_keyword(text: str) -> bool:
+    """Return whether ``match`` occurs as a keyword outside comments and strings."""
+
+    raw = str(text or "")
+    index = 0
+    while index < len(raw):
+        skip_to = _lean_lexical_skip_end(raw, index)
+        if skip_to is not None:
+            index = skip_to
+            continue
+        if _graph_keyword_at(raw, index, "match"):
+            return True
+        index += 1
+    return False
+
+
+def _graph_starts_with_declaration(text: str) -> bool:
+    for word in _GRAPH_ARM_DECLARATIONS:
+        if _graph_keyword_at(text, 0, word):
+            return True
+    return False
+
+
+def _graph_scoped_prop_atom(text: str, binder_context: str) -> bool:
+    if not binder_context:
+        return False
+    compact = graph_identity_text(text)
+    name = _graph_unicode_identifier_name(compact)
+    if not name or name != compact:
+        return False
+    return _graph_binder_prop_signatures(binder_context).get(name) == 0
+
+
+def _graph_arm_proof_tail(text: str) -> bool:
+    """Return whether an arm contains proof syntax after local lets are peeled."""
+
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    if not raw:
+        return False
+    if raw.startswith(("have ", "have\n")):
+        raw = "let" + raw[4:]
+    if raw.startswith(("let ", "let\n")):
+        _binding, body = _graph_top_level_let_parts(raw)
+        if not body:
+            return True
+        return _graph_arm_proof_tail(body)
+    return _graph_has_top_level_proof_tail(raw)
+
+
+def _graph_whole_group_inner(text: str) -> str:
+    """Return the inside of a fragment that is one balanced group."""
+
+    raw = graph_identity_text(text).strip()
+    if not raw or raw[0] not in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+        return ""
+    end = _graph_matching_group_index(raw, 0)
+    if end != len(raw) - 1:
+        return ""
+    return raw[1:-1].strip()
+
+
+def _graph_term_tokens_ok(fragment: str, *, tactic: bool = False) -> bool:
+    """Return whether a term contains no command or stray proof marker.
+
+    Parentheses, brackets, and anonymous constructors are entered, so a
+    declaration stays a declaration inside a group. A complete empty group
+    such as ``()``, ``[]``, ``{}``, or ``#[]`` is a finished term. A missing
+    scrutinee, pattern, or arm is still empty text and fails. A ``let``/``have``
+    semicolon and a ``by`` term are part of the term. ``exact`` is allowed
+    only inside that ``by`` term.
+    """
+
+    raw = graph_identity_text(fragment).strip()
+    if not raw:
+        return False
+    if not _graph_text_has_balanced_groups(raw):
+        return False
+    # (), [], {}, and the other closers are complete when the group is empty.
+    # A missing scrutinee or arm is the empty string, which stays invalid.
+    if raw[0] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+        end = _graph_matching_group_index(raw, 0)
+        if end == len(raw) - 1:
+            interior = raw[1:-1]
+            if not interior.strip():
+                return True
+            return _graph_term_tokens_ok(interior, tactic=tactic)
+    if not tactic and raw.startswith(("by ", "by\n")):
+        return _graph_term_tokens_ok(raw, tactic=True)
+    if not tactic and raw.startswith(("have ", "have\n")):
+        raw = "let" + raw[4:]
+    if not tactic and raw.startswith(("let ", "let\n")):
+        binding, body = _graph_top_level_let_parts(raw)
+        if not binding or not body:
+            return False
+        assign = _graph_top_level_token_index(binding, ":=")
+        if assign >= 0:
+            value = binding[assign + 2 :].strip()
+            if not value or not _graph_term_tokens_ok(value):
+                return False
+        elif not _graph_let_binding_is_syntactically_complete(binding):
+            return False
+        return _graph_term_tokens_ok(body)
+    index = 0
+    while index < len(raw):
+        if raw[index].isspace():
+            index += 1
+            continue
+        lexical = _lean_lexical_skip_end(raw, index)
+        if lexical is not None:
+            index = lexical
+            continue
+        if raw[index] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+            end = _graph_matching_group_index(raw, index)
+            if end < 0:
+                return False
+            interior = raw[index + 1 : end]
+            if interior.strip() and not _graph_term_tokens_ok(interior, tactic=tactic):
+                return False
+            index = end + 1
+            continue
+        if not tactic and raw[index] == ";":
+            return False
+        if any(_graph_keyword_at(raw, index, word) for word in _GRAPH_ARM_DECLARATIONS):
+            return False
+        if any(_graph_keyword_at(raw, index, word) for word in ("sorry", "admit")):
+            return False
+        if not tactic and (
+            _graph_keyword_at(raw, index, "exact") or _graph_keyword_at(raw, index, "with")
+        ):
+            return False
+        if not tactic and _graph_keyword_at(raw, index, "by"):
+            return _graph_term_tokens_ok(raw[index:], tactic=True)
+        if not tactic and _graph_keyword_at(raw, index, "match"):
+            parsed = _graph_parse_match_term(raw, index)
+            if parsed is None or parsed[0] <= index:
+                return False
+            _end, arms, scrutinee, patterns = parsed
+            if not scrutinee.strip() or any(not pattern.strip() for pattern in patterns):
+                return False
+            if not _graph_term_tokens_ok(scrutinee):
+                return False
+            if any(not _graph_term_tokens_ok(pattern) for pattern in patterns):
+                return False
+            if any(not _graph_term_tokens_ok(arm) for arm in arms):
+                return False
+            index = parsed[0]
+            continue
+        index += 1
+    return True
+
+
+def _graph_fragment_has_syntax_residue(fragment: str) -> bool:
+    """Return whether a scrutinee, pattern, or initializer contains proof syntax.
+
+    Comments and strings are data. A grouped declaration is still a declaration.
+    A binder semicolon and a term-level ``by`` are not residue.
+    """
+
+    raw = graph_identity_text(fragment)
+    if not raw:
+        return False
+    return not _graph_term_tokens_ok(raw)
+
+
+def _graph_let_value_has_residue(binding: str) -> bool:
+    text = graph_identity_text(binding)
+    assign = _graph_top_level_token_index(text, ":=")
+    if assign < 0:
+        # Equation-style ``let rec`` is complete without ``:=``.
+        return not _graph_let_binding_is_syntactically_complete(text)
+    value = text[assign + 2 :].strip()
+    if not value:
+        return True
+    return _graph_fragment_has_syntax_residue(value)
+
+
+def _graph_binder_context_after_let(
+    binder_context: str, binding: str, *, is_have: bool = False
+) -> str:
+    """Hide an outer name with a local let or a destructuring pattern."""
+
+    name, arity = _graph_let_binding_prop_signature(binding)
+    if not name:
+        additions = _graph_let_destructuring_additions(binding, binder_context)
+        if not additions:
+            return binder_context
+        return ", ".join(
+            [binder_context, *additions] if binder_context else additions
+        )
+    assignment = _graph_top_level_token_index(binding, ":=")
+    colon = _graph_top_level_token_index(binding, ":")
+    annotation = (
+        binding[colon + 1 : assignment].strip()
+        if 0 <= colon < assignment else ""
+    )
+    annotation_end = colon if annotation else assignment
+    if not annotation and assignment >= 0:
+        # An ascribed initializer supplies the type even without a binder
+        # annotation, including the dependency of an inferred have proof.
+        value = _graph_strip_balanced_outer_parens(binding[assignment + 2 :])
+        owns_colon = value.startswith("λ") or _graph_proposition_quantifier_token_len(value) > 0 or any(
+            _graph_keyword_at(value, 0, keyword)
+            for keyword in ("fun", "let", "have", "if", "match", "by")
+        )
+        if not owns_colon:
+            _subject, annotation = _graph_top_level_ascription(value)
+    if annotation:
+        # Retain the annotation and its parameter scope even when a later
+        # local shadows the name. Have hypotheses can be generalized later.
+        prefix = re.sub(r"^let\s+(?:rec\s+)?", "", binding[:annotation_end]).strip()
+        parameters = prefix[len(name) :].strip()
+        if parameters:
+            annotation = f"∀ {parameters}, {annotation}"
+        addition = f"({name} : {annotation})"
+    elif arity is None:
+        bool_type = _graph_let_bool_type_text(binding)
+        addition = f"({name} : {bool_type})" if bool_type else f"({name} : Type)"
+    elif arity == 0:
+        addition = f"({name} : Prop)"
+    else:
+        addition = "(" + name + " : " + " → ".join(["Nat"] * arity + ["Prop"]) + ")"
+    if not is_have:
+        # The context is a surface scope record, not submitted Lean source.
+        # Let definitions are not reverted as hypotheses by dependent matches.
+        addition = "(let " + addition[1:]
+    return ", ".join(part for part in (binder_context, addition) if part)
+
+
+def _graph_split_top_level_symbol(text: str, symbol: str) -> List[str]:
+    parts: List[str] = []
+    start = 0
+    index = 0
+    while index < len(text):
+        skipped = _graph_skip_lexical_or_group(text, index)
+        if skipped is not None:
+            index = skipped
+            continue
+        if text.startswith(symbol, index):
+            parts.append(text[start:index].strip())
+            index += len(symbol)
+            start = index
+            continue
+        index += 1
+    parts.append(text[start:].strip())
+    return parts
+
+
+_GRAPH_OBVIOUS_DATA_SORTS = frozenset(
+    {"Nat", "ℕ", "Int", "ℤ", "String", "Unit", "Float", "Char"}
+)
+
+
+def _graph_obvious_data_sort(type_text: str) -> bool:
+    """Return whether a type is an obvious non-condition data sort."""
+
+    return graph_identity_text(type_text) in _GRAPH_OBVIOUS_DATA_SORTS
+
+
+def _graph_pattern_binder_annotation(type_text: str) -> str:
+    """Keep Prop and Bool pattern payloads, and obvious data sorts."""
+
+    clean = graph_identity_text(type_text)
+    if clean in {"Prop", "Bool"} or clean in _GRAPH_OBVIOUS_DATA_SORTS:
+        return clean
+    return "Type"
+
+
+def _graph_strip_surrounding_comments(text: str) -> str:
+    """Drop comments that only wrap a term."""
+
+    raw = str(text or "").strip()
+    while raw.startswith(("--", "/-")):
+        end = _lean_lexical_skip_end(raw, 0)
+        if end is None or end <= 0:
+            break
+        raw = raw[end:].strip()
+    return raw
+
+
+def _graph_top_level_ascription(text: str) -> Tuple[str, str]:
+    """Return ``subject, sort`` for one top-level ``:`` ascription."""
+
+    index = 0
+    while index < len(text):
+        skipped = _graph_skip_lexical_or_group(text, index)
+        if skipped is not None:
+            index = skipped
+            continue
+        if text.startswith((":=", "=>"), index):
+            index += 2
+            continue
+        if text[index] == ":":
+            subject = text[:index].strip()
+            sort = text[index + 1 :].strip()
+            if subject and sort:
+                return subject, sort
+            return "", ""
+        index += 1
+    return "", ""
+
+
+def _graph_scrutinee_type_text(scrutinee: str, binder_context: str) -> str:
+    compact = _graph_strip_balanced_outer_parens(graph_identity_text(scrutinee))
+    name = _graph_unicode_identifier_name(compact)
+    if name and name == compact:
+        return _graph_binder_type_signatures(binder_context).get(name, "")
+    subject, sort = _graph_top_level_ascription(compact)
+    if subject and sort:
+        return graph_identity_text(sort)
+    if compact.startswith("some ") or compact.startswith("some("):
+        payload = _graph_strip_balanced_outer_parens(compact[5:].strip())
+        if payload in {"True", "False"}:
+            return "Option Prop"
+        if payload in {"true", "false"}:
+            return "Option Bool"
+    return ""
+
+
+_GRAPH_PATTERN_WALK_LIMIT = 64
+_GRAPH_PATTERN_NULLARY_CONSTANTS = frozenset({"_", "true", "false", "none"})
+
+
+def _graph_pattern_head(text: str) -> Tuple[str, str]:
+    """Return a pattern head, including a leading dot, and the unparsed tail."""
+
+    raw = str(text or "").lstrip()
+    if not raw:
+        return "", ""
+    if raw.startswith("."):
+        name = _graph_leading_identifier(raw[1:])
+        if not name or name.startswith("«"):
+            return "", raw
+        return "." + name, raw[1 + len(name) :]
+    name = _graph_leading_identifier(raw)
+    if not name:
+        return "", raw
+    return name, raw[len(name) :]
+
+
+def _graph_pattern_is_constructor_head(head: str) -> bool:
+    """Qualified and dot-notation heads are constructors, not bound names."""
+
+    if not head or head.startswith("«"):
+        return False
+    return head.startswith(".") or "." in head
+
+
+def _graph_option_payload_type(type_text: str) -> str:
+    clean = _graph_strip_balanced_outer_parens(graph_identity_text(type_text))
+    if clean.startswith("Option "):
+        return clean[len("Option ") :].strip()
+    return ""
+
+
+def _graph_product_component_types(type_text: str, count: int) -> List[str]:
+    """Split a known product type when it has one part per pattern field."""
+
+    clean = _graph_strip_balanced_outer_parens(graph_identity_text(type_text))
+    if count <= 1 or "×" not in clean:
+        return []
+    parts = _graph_split_top_level_symbol(clean, "×")
+    if len(parts) == count and all(parts):
+        return parts
+    return []
+
+
+def _graph_pattern_fallback_names(text: str) -> List[str]:
+    """Collect bare names when a pattern is too deep to walk structurally.
+
+    A quoted identifier is a binder. Comments and strings stay lexical
+    islands, so a name written only inside one of them is not bound.
+    """
+
+    raw = graph_identity_text(text)
+    names: List[str] = []
+    index = 0
+    while index < len(raw):
+        if raw.startswith("«", index):
+            name = _graph_leading_identifier(raw[index:])
+            if not name:
+                index += 1
+                continue
+            index += len(name)
+            if (
+                name not in names
+                and name not in _GRAPH_PATTERN_NULLARY_CONSTANTS
+            ):
+                names.append(name)
+            continue
+        skip_to = _lean_lexical_skip_end(raw, index)
+        if skip_to is not None:
+            index = skip_to
+            continue
+        if raw.startswith(".", index):
+            name = _graph_leading_identifier(raw[index + 1 :])
+            index += 1 + len(name)
+            continue
+        name = _graph_leading_identifier(raw[index:])
+        if not name:
+            index += 1
+            continue
+        index += len(name)
+        if name in _GRAPH_PATTERN_NULLARY_CONSTANTS or name in names:
+            continue
+        if not name.startswith("«") and "." in name:
+            continue
+        names.append(name)
+    return names
+
+
+def _graph_pattern_arguments(tail: str) -> Tuple[List[str], str]:
+    """Split juxtaposed pattern arguments from any unparsed tail."""
+
+    args: List[str] = []
+    rest = str(tail or "")
+    while True:
+        stripped = rest.lstrip()
+        if not stripped:
+            return args, ""
+        if stripped.startswith("::"):
+            return args, stripped
+        if stripped[0] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+            end = _graph_matching_group_index(stripped, 0)
+            if end < 0:
+                return args, stripped
+            args.append(stripped[: end + 1])
+            rest = stripped[end + 1 :]
+            continue
+        head, new_tail = _graph_pattern_head(stripped)
+        if not head:
+            return args, stripped
+        args.append(head)
+        rest = new_tail
+
+
+def _graph_pattern_bindings(
+    pattern: str, type_text: str, depth: int = 0
+) -> List[Tuple[str, str]]:
+    """Return names bound by one pattern and the type text recorded for each.
+
+    Every introduced name is recorded, even when its type is unknown. A dotted
+    or leading-dot constructor is not itself a binder. ``some`` / ``.some`` /
+    ``Option.some`` over ``Option T`` bind the payload at ``T``. A product
+    pattern uses a matching ``×`` split. Other constructor arguments stay
+    unknown rather than inheriting an outer proposition.
+    """
+
+    raw = _graph_strip_surrounding_comments(graph_identity_text(pattern))
+    if not raw:
+        return []
+    if depth >= _GRAPH_PATTERN_WALK_LIMIT:
+        return [(name, "Type") for name in _graph_pattern_fallback_names(raw)]
+    alias_at = _graph_find_top_level_symbol(raw, "@", 0)
+    if alias_at > 0:
+        left = raw[:alias_at].strip()
+        right = raw[alias_at + 1 :].strip()
+        left_name = _graph_unicode_identifier_name(left)
+        if left_name and left_name == left:
+            found: List[Tuple[str, str]] = []
+            if (
+                left_name not in _GRAPH_PATTERN_NULLARY_CONSTANTS
+                and not _graph_pattern_is_constructor_head(left_name)
+            ):
+                found.append(
+                    (left_name, _graph_pattern_binder_annotation(type_text))
+                )
+            found.extend(_graph_pattern_bindings(right, type_text, depth + 1))
+            return found
+    subject, sort = _graph_top_level_ascription(raw)
+    if subject and sort:
+        return _graph_pattern_bindings(
+            subject, graph_identity_text(sort), depth + 1
+        )
+    cons_parts = _graph_split_top_level_symbol(raw, "::")
+    if len(cons_parts) > 1:
+        found = []
+        for part in cons_parts:
+            found.extend(_graph_pattern_bindings(part, "", depth + 1))
+        return found
+    if raw[0] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+        end = _graph_matching_group_index(raw, 0)
+        if end == len(raw) - 1:
+            inner = raw[1:-1].strip()
+            if not inner:
+                return []
+            parts = _graph_split_top_level_symbol(inner, ",")
+            if len(parts) > 1:
+                components = _graph_product_component_types(type_text, len(parts))
+                found = []
+                for index, part in enumerate(parts):
+                    component = components[index] if index < len(components) else ""
+                    found.extend(
+                        _graph_pattern_bindings(part, component, depth + 1)
+                    )
+                return found
+            return _graph_pattern_bindings(inner, type_text, depth + 1)
+    head, tail = _graph_pattern_head(raw)
+    if not head:
+        return [(name, "Type") for name in _graph_pattern_fallback_names(raw)]
+    args, leftover = _graph_pattern_arguments(tail)
+    if not args and not leftover.strip():
+        if (
+            _graph_pattern_is_constructor_head(head)
+            or head in _GRAPH_PATTERN_NULLARY_CONSTANTS
+        ):
+            return []
+        return [(head, _graph_pattern_binder_annotation(type_text))]
+    base = _graph_head_base_name(head[1:] if head.startswith(".") else head)
+    payload = _graph_option_payload_type(type_text) if base == "some" else ""
+    if payload and len(args) == 1 and not leftover.strip():
+        return _graph_pattern_bindings(args[0], payload, depth + 1)
+    components = (
+        _graph_product_component_types(type_text, len(args))
+        if args and not leftover.strip()
+        else []
+    )
+    found = []
+    for index, arg in enumerate(args):
+        component = components[index] if index < len(components) else ""
+        found.extend(_graph_pattern_bindings(arg, component, depth + 1))
+    if leftover.strip():
+        found.extend(_graph_pattern_bindings(leftover, "", depth + 1))
+    return found
+
+
+def _graph_pattern_value(
+    pattern: str, type_text: str = "", depth: int = 0
+) -> Tuple[str, List[str]]:
+    """Separate a pattern's value from its ordered alias dependencies.
+
+    Alias declarations are not term syntax. A generalized outer local still
+    depends on their names, while an explicit match equation uses just the
+    matched value. Dotted Boolean constructors need a known Boolean type.
+    """
+
+    raw = _graph_strip_surrounding_comments(graph_identity_text(pattern))
+    if depth >= _GRAPH_PATTERN_WALK_LIMIT:
+        # Keep the existing bounded pattern-binding fallback independent of
+        # optional value normalization. Unknown values retain their syntax.
+        return raw, []
+    if not raw:
+        return "", []
+    alias_at = _graph_find_top_level_symbol(raw, "@", 0)
+    if alias_at > 0:
+        alias = _graph_unicode_identifier_name(raw[:alias_at].strip())
+        if alias and not _graph_pattern_is_constructor_head(alias):
+            value, aliases = _graph_pattern_value(raw[alias_at + 1 :], type_text, depth + 1)
+            return value, [alias, *aliases]
+    cons = _graph_split_top_level_symbol(raw, "::")
+    if len(cons) > 1:
+        values, aliases = [], []
+        for piece in cons:
+            value, nested = _graph_pattern_value(piece, "", depth + 1)
+            values.append(value)
+            aliases.extend(nested)
+        return " :: ".join(values), aliases
+    subject, annotation = _graph_top_level_ascription(raw)
+    if subject:
+        return _graph_pattern_value(subject, annotation, depth + 1)
+    if raw[0] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+        end = _graph_matching_group_index(raw, 0)
+        if end == len(raw) - 1:
+            inner = raw[1:-1].strip()
+            if not inner:
+                return raw, []
+            pieces = _graph_split_top_level_symbol(inner, ",")
+            if len(pieces) == 1 and raw[0] == "(":
+                return _graph_pattern_value(inner, type_text, depth + 1)
+            components = _graph_product_component_types(type_text, len(pieces))
+            values, aliases = [], []
+            for index, piece in enumerate(pieces):
+                component = components[index] if index < len(components) else ""
+                value, nested = _graph_pattern_value(piece, component, depth + 1)
+                values.append(value)
+                aliases.extend(nested)
+            return raw[0] + ", ".join(values) + raw[-1], aliases
+    if _graph_strip_balanced_outer_parens(type_text) == "Bool" and raw in {
+        "true", "false", "Bool.true", "Bool.false", ".true", ".false",
+    }:
+        return "Bool." + _graph_head_base_name(raw), []
+    head, tail = _graph_pattern_head(raw)
+    arguments, leftover = _graph_pattern_arguments(tail) if head else ([], raw)
+    if arguments and not leftover:
+        payload = _graph_option_payload_type(type_text) if _graph_head_base_name(head) == "some" else ""
+        components = _graph_product_component_types(type_text, len(arguments))
+        values, aliases = [], []
+        for index, argument in enumerate(arguments):
+            component = payload if len(arguments) == 1 else components[index] if index < len(components) else ""
+            value, nested = _graph_pattern_value(argument, component, depth + 1)
+            values.append("(" + value + ")")
+            aliases.extend(nested)
+        return head + " " + " ".join(values), aliases
+    # Preserve unrecognized notation, but still normalize grouped operands.
+    values, aliases = [], []
+    index = 0
+    while index < len(raw):
+        skipped = _lean_lexical_skip_end(raw, index)
+        if skipped is not None:
+            values.append(raw[index:skipped])
+            index = skipped
+            continue
+        if raw[index] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+            end = _graph_matching_group_index(raw, index)
+            if end >= 0:
+                value, nested = _graph_pattern_value(raw[index : end + 1], "", depth + 1)
+                values.append("(" + value + ")" if raw[index] == "(" else value)
+                aliases.extend(nested)
+                index = end + 1
+                continue
+        values.append(raw[index])
+        index += 1
+    return "".join(values), aliases
+
+
+def _graph_let_destructuring_additions(
+    binding: str, binder_context: str
+) -> List[str]:
+    """Record names bound by a tuple or anonymous ``let``/``have`` pattern."""
+
+    text = graph_identity_text(binding)
+    if text.startswith("have"):
+        text = "let" + text[4:]
+    if not text.startswith("let"):
+        return []
+    assign = _graph_top_level_token_index(text, ":=")
+    if assign < 0:
+        return []
+    rest = text[3:assign].strip()
+    if rest.startswith("rec"):
+        return []
+    value = text[assign + 2 :].strip()
+    subject, sort = _graph_top_level_ascription(rest)
+    if subject and sort:
+        pattern = subject.strip()
+        type_text = graph_identity_text(sort)
+    else:
+        pattern = rest
+        type_text = _graph_scrutinee_type_text(value, binder_context)
+    if (
+        not pattern
+        or pattern[0] not in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE
+        or _graph_matching_group_index(pattern, 0) != len(pattern) - 1
+    ):
+        return []
+    return [
+        f"({name} : {annotation})"
+        for name, annotation in _graph_pattern_bindings(pattern, type_text)
+    ]
+
+
+def _graph_named_discriminant(piece: str) -> Tuple[str, str]:
+    """Split ``h : expr`` into a proof name and the discriminant expression.
+
+    A grouped term such as ``(h : Nat)`` is a type ascription, not a proof
+    name. The expression keeps the surrounding binder scope.
+    """
+
+    raw = graph_identity_text(piece).strip()
+    if not raw or raw[0] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+        return "", ""
+    name = _graph_leading_identifier(raw)
+    if (
+        not name
+        or name in _GRAPH_PATTERN_NULLARY_CONSTANTS
+        or _graph_pattern_is_constructor_head(name)
+    ):
+        return "", ""
+    rest = raw[len(name) :].lstrip()
+    if not rest.startswith(":") or rest.startswith((":=", "=>")):
+        return "", ""
+    expr = rest[1:].strip()
+    if not expr:
+        return "", ""
+    return name, expr
+
+
+def _graph_match_scrutinee_bindings(scrutinee: str) -> Tuple[List[str], str]:
+    """Return equality-proof names and the discriminants they describe."""
+
+    pieces = _graph_split_top_level_symbol(graph_identity_text(scrutinee), ",")
+    names: List[str] = []
+    expressions: List[str] = []
+    for piece in pieces:
+        name, expr = _graph_named_discriminant(piece)
+        if name:
+            if name not in names:
+                names.append(name)
+            expressions.append(expr)
+        else:
+            expressions.append(piece)
+    return names, ", ".join(part for part in expressions if part)
+
+
+def _graph_local_name_key(name: str) -> str:
+    """Quoted and plain spellings denote the same local Lean name."""
+
+    if name.startswith("«") and name.endswith("»"):
+        inner = name[1:-1]
+        if _GRAPH_LEAN_PLAIN_IDENTIFIER_RE.fullmatch(inner):
+            return inner
+    return name
+
+
+def _graph_local_name_spellings(name: str) -> Tuple[str, ...]:
+    key = _graph_local_name_key(name)
+    if _GRAPH_LEAN_PLAIN_IDENTIFIER_RE.fullmatch(key):
+        return key, f"«{key}»"
+    return (name,)
+
+
+def _graph_leading_lambda_parts(text: str) -> Tuple[str, str] | None:
+    """Split the binder and body of either ordinary Lean lambda spelling."""
+
+    raw = graph_identity_text(text)
+    prefix = 3 if _graph_keyword_at(raw, 0, "fun") else 1 if raw.startswith("λ") else 0
+    if not prefix:
+        return None
+    tail = raw[prefix:].lstrip()
+    if tail.startswith("|"):
+        return None
+    arrows = [
+        (index, token) for token in ("=>", "↦")
+        if (index := _graph_find_top_level_symbol(tail, token, 0)) >= 0
+    ]
+    if not arrows:
+        return None
+    index, token = min(arrows)
+    binder, body = tail[:index].strip(), tail[index + len(token) :].strip()
+    return (binder, body) if binder and body else None
+
+
+def _graph_annotation_local_references(
+    text: str, replacements: Mapping[str, str]
+) -> Tuple[str, set[str]]:
+    """Rewrite free local references in a scope-only annotation.
+
+    Binding types see preceding binders; lambda, quantifier, local binding,
+    and match bodies see their own names. Literal content is irrelevant to dependencies,
+    but executable interpolation bodies and quoted identifiers remain code.
+    Work items avoid a frame per nested group.
+    """
+
+    code, _closed = _strip_lean_comments_and_strings(text)
+    found: set[str] = set()
+    out: List[str] = []
+    # Local recursive declarations elaborate through metavariables over the
+    # ambient context, including names hidden by later lexical binders. Keep
+    # those implicit dependencies once, without exposing generated text.
+    has_local_rec = False
+    index = 0
+    while index < len(code):
+        skipped = _lean_lexical_skip_end(code, index)
+        if skipped is not None:
+            index = skipped
+            continue
+        if _graph_keyword_at(code, index, "let"):
+            tail = code[index + 3 :].lstrip()
+            if _graph_keyword_at(tail, 0, "rec"):
+                has_local_rec = True
+                found.update(replacements)
+                out.append("(")
+                out.extend(f"let _ := {value}; " for value in replacements.values())
+                break
+        index += 1
+    pending: List[Tuple[str, Mapping[str, str] | None]] = [(code, replacements)]
+    while pending:
+        raw, visible = pending.pop()
+        if not visible:
+            out.append(raw)
+            continue
+        index = 0
+        while index < len(raw):
+            if raw[index].isspace():
+                out.append(raw[index])
+                index += 1
+                continue
+            quantifier = _graph_proposition_quantifier_token_len(raw[index:])
+            lambda_parts = _graph_leading_lambda_parts(raw[index:])
+            if quantifier or lambda_parts is not None:
+                tail = raw[index + quantifier :]
+                comma = _graph_find_top_level_symbol(tail, ",", 0) if quantifier else -1
+                if lambda_parts is not None or comma >= 0:
+                    binders, result = (
+                        lambda_parts if lambda_parts is not None
+                        else (tail[:comma], tail[comma + 1 :])
+                    )
+                    local = dict(visible)
+                    work: List[Tuple[str, Mapping[str, str] | None]] = []
+                    for chunk in _graph_binder_group_chunks(binders):
+                        body = _graph_unwrap_binder_group(chunk)
+                        colon = _graph_top_level_token_index(body, ":")
+                        if colon >= 0:
+                            work.extend([
+                                (" (" + body[:colon] + " : ", None),
+                                (body[colon + 1 :], dict(local)),
+                                (")", None),
+                            ])
+                        else:
+                            work.append((" " + chunk, None))
+                        for name in _graph_binder_names_from_chunk(chunk):
+                            local.pop(_graph_local_name_key(name), None)
+                    out.append("fun" if lambda_parts is not None else raw[index : index + quantifier])
+                    work.extend([("=>" if lambda_parts is not None else ",", None), (result, local)])
+                    pending.extend(reversed(work))
+                    break
+            if _graph_keyword_at(raw, index, "if"):
+                conditional = raw[index:]
+                incomplete, branches = _graph_conditional_structure(conditional)
+                if not incomplete and branches is not None:
+                    name, condition = _graph_split_named_if_condition(
+                        _graph_leading_conditional_condition(conditional)
+                    )
+                    local = dict(visible)
+                    local.pop(_graph_local_name_key(name), None)
+                    work = [
+                        ("if " + (name + " : " if name else ""), None),
+                        (condition, visible), (" then ", None), (branches[0], local),
+                        (" else ", None), (branches[1], local),
+                    ]
+                    pending.extend(reversed(work))
+                    break
+            local_keyword = next(
+                (word for word in ("let", "have") if _graph_keyword_at(raw, index, word)),
+                "",
+            )
+            if local_keyword:
+                binding, body = _graph_top_level_let_parts(
+                    "let" + raw[index + len(local_keyword) :]
+                )
+                assignment = _graph_top_level_token_index(binding, ":=")
+                if body and assignment >= 0:
+                    declaration = binding[3:assignment].strip()
+                    colon = _graph_top_level_token_index(declaration, ":")
+                    header = declaration[:colon].strip() if colon >= 0 else declaration
+                    recursive = _graph_keyword_at(header, 0, "rec")
+                    function_header = header[3:].lstrip() if recursive else header
+                    function_name = _graph_leading_identifier(function_header)
+                    parameters = function_header[len(function_name) :].strip() if function_name else ""
+                    if function_name and parameters:
+                        # Function parameters bind only their initializer and
+                        # result annotation; only the function binds the tail.
+                        value = binding[assignment + 2 :].strip()
+                        if colon >= 0:
+                            value = f"({value} : {declaration[colon + 1 :]})"
+                        initializer = f"fun {parameters} => {value}"
+                        local = dict(visible)
+                        local.pop(_graph_local_name_key(function_name), None)
+                        pending.extend(reversed([
+                            (local_keyword + " " + ("rec " if recursive else "") + function_name + " := ", None),
+                            (initializer, local if recursive else visible),
+                            ("; ", None), (body, local),
+                        ]))
+                        break
+                    work = []
+                    if colon >= 0:
+                        work.extend([
+                            (local_keyword + " " + declaration[:colon] + " : ", None),
+                            (declaration[colon + 1 :], visible),
+                        ])
+                    else:
+                        work.append((local_keyword + " " + declaration, None))
+                    local = dict(visible)
+                    for name in _graph_binder_names_from_chunk(declaration):
+                        local.pop(_graph_local_name_key(name), None)
+                    work.extend([
+                        (" := ", None), (binding[assignment + 2 :], visible),
+                        ("; ", None), (body, local),
+                    ])
+                    pending.extend(reversed(work))
+                    break
+            if _graph_keyword_at(raw, index, "match"):
+                parsed = _graph_parse_match_term(raw, index)
+                if parsed is not None:
+                    end, arms, scrutinee, patterns = parsed
+                    proof_names, _expressions = _graph_match_scrutinee_bindings(scrutinee)
+                    work = [("match ", None)]
+                    for offset, piece in enumerate(_graph_split_top_level_symbol(scrutinee, ",")):
+                        if offset:
+                            work.append((", ", None))
+                        proof_name, expression = _graph_named_discriminant(piece)
+                        if proof_name:
+                            work.extend([
+                                (proof_name + " : ", None), (expression, visible),
+                            ])
+                        else:
+                            work.append((piece, visible))
+                    work.append((" with", None))
+                    for pattern, arm in zip(patterns, arms):
+                        local = dict(visible)
+                        bound_names = proof_names + [
+                            name for name, _kind in _graph_pattern_bindings(pattern, "")
+                        ]
+                        for name in bound_names:
+                            local.pop(_graph_local_name_key(name), None)
+                        work.extend([
+                            (" | " + pattern + " => ", None), (arm, local),
+                        ])
+                    work.append((raw[end:], visible))
+                    pending.extend(reversed(work))
+                    break
+            name = _graph_leading_identifier(raw[index:])
+            if name:
+                key = _graph_local_name_key(name)
+                suffix = ""
+                if key not in visible:
+                    component = _GRAPH_LEAN_IDENTIFIER_COMPONENT_RE.match(name)
+                    if component is not None:
+                        key = _graph_local_name_key(component.group(0))
+                        suffix = name[component.end() :]
+                if key in visible and (index == 0 or raw[index - 1] != "."):
+                    found.add(key)
+                    out.append(visible[key] + suffix)
+                else:
+                    out.append(name)
+                index += len(name)
+                continue
+            if raw[index] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+                end = _graph_matching_group_index(raw, index)
+                if end >= 0:
+                    out.append(raw[index])
+                    pending.extend([
+                        (raw[end + 1 :], visible), (raw[end], None),
+                        (raw[index + 1 : end], visible),
+                    ])
+                    break
+            out.append(raw[index])
+            index += 1
+    if has_local_rec:
+        out.append(")")
+    return "".join(out), found
+
+
+def _graph_text_local_names(text: str, local_names: set[str]) -> set[str]:
+    return _graph_annotation_local_references(
+        text, {name: name for name in local_names}
+    )[1]
+
+
+def _graph_unwrap_type_ascriptions(text: str) -> str:
+    """Keep the term under any number of grouping/type-ascription layers."""
+
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    while raw:
+        subject, _annotation = _graph_top_level_ascription(raw)
+        if not subject:
+            break
+        raw = _graph_strip_balanced_outer_parens(subject)
+    return raw
+
+
+def _graph_annotation_literal_result(text: str) -> str:
+    """Read a literal through anonymous dependency-preserving local wrappers."""
+
+    raw = _graph_unwrap_type_ascriptions(text)
+    for _depth in range(_GRAPH_PATTERN_WALK_LIMIT):
+        if not _graph_keyword_at(raw, 0, "let"):
+            return raw
+        binding, body = _graph_top_level_let_parts(raw)
+        assignment = _graph_top_level_token_index(binding, ":=")
+        if not body or assignment < 0 or binding[3:assignment].strip() != "_":
+            return raw
+        raw = _graph_unwrap_type_ascriptions(body)
+    return ""
+
+
+def _graph_annotation_reduces_to_prop(text: str, depth: int = 0) -> bool:
+    """Recognize explicit Prop results without evaluating arbitrary Lean terms."""
+
+    if depth >= 32:
+        return False
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    if raw == "Prop":
+        return True
+    if _graph_keyword_at(raw, 0, "if"):
+        incomplete, branches = _graph_conditional_structure(raw)
+        if incomplete or branches is None:
+            return False
+        _name, condition = _graph_split_named_if_condition(
+            _graph_leading_conditional_condition(raw)
+        )
+        condition = _graph_annotation_literal_result(condition)
+        # A match may make a dependent conditional's condition concrete.
+        # Its selected branch determines the local type in this arm.
+        if condition in {"true", "Bool.true", "True", "false", "Bool.false", "False"}:
+            branch = branches[0 if condition in {"true", "Bool.true", "True"} else 1]
+            return _graph_annotation_reduces_to_prop(branch, depth + 1)
+        return all(
+            _graph_annotation_reduces_to_prop(branch, depth + 1)
+            for branch in branches
+        )
+    if _graph_keyword_at(raw, 0, "have"):
+        raw = "let" + raw[4:]
+    if _graph_keyword_at(raw, 0, "let"):
+        binding, body = _graph_top_level_let_parts(raw)
+        return bool(binding and body) and _graph_annotation_reduces_to_prop(
+            body, depth + 1
+        )
+    if raw.startswith("("):
+        end = _graph_matching_group_index(raw, 0)
+        if 0 < end < len(raw) - 1:
+            function = _graph_strip_balanced_outer_parens(raw[1:end])
+            lambda_parts = _graph_leading_lambda_parts(function)
+            if lambda_parts is not None:
+                binders, body = lambda_parts
+                arguments = _graph_application_arg_texts(raw, raw[: end + 1])
+                arity = _graph_fun_arg_arity(binders)
+                if arguments is None or not arguments or arity != len(arguments):
+                    return False
+                return _graph_annotation_reduces_to_prop(body, depth + 1)
+    return False
+
+
+def _graph_match_generalized_context(
+    scrutinee: str, pattern: str, binder_context: str, arm_text: str = ""
+) -> Tuple[str, List[Tuple[str, str]], Dict[str, str]]:
+    """Return dependent locals a match reintroduces over later shadowing.
+
+    Only a discriminant that is the same local variable triggers this rule.
+    Matching an expression or a let alias does not generalize its operands.
+    Each declaration gets an identity before later names can hide it, and
+    dependencies refer to those identities rather than identifier spelling.
+    """
+
+    visible: Dict[str, int] = {}
+    declarations: List[Tuple[str, str, Dict[str, int], bool]] = []
+    chunks: List[Tuple[str, int | None]] = []
+    for part in _graph_binder_context_parts(binder_context):
+        for chunk in _graph_binder_group_chunks(part):
+            body = _graph_unwrap_binder_group(str(chunk or "").strip())
+            colon = _graph_top_level_token_index(body, ":")
+            if colon < 0:
+                chunks.append((chunk, None))
+                continue
+            annotation = body[colon + 1 :].strip()
+            references = {
+                name: visible[name]
+                for name in _graph_text_local_names(annotation, set(visible))
+            }
+            is_definition = _graph_keyword_at(body, 0, "let")
+            for name in _graph_binder_names_from_chunk(body[:colon]):
+                visible[_graph_local_name_key(name)] = len(declarations)
+                prefix = "let " if is_definition else ""
+                chunks.append((f"({prefix}{name} : {annotation})", len(declarations)))
+                declarations.append((
+                    name, annotation, references, not is_definition,
+                ))
+    # Pattern names may hide an original discriminant. Preserve its identity
+    # for equation proofs and unspecialized annotation references. The fresh
+    # spelling is absent even from later binders in this arm, quoted or plain.
+    renamed: Dict[int, str] = {}
+    reserved = " ".join((binder_context, scrutinee, pattern, arm_text))
+    for name, _annotation in _graph_pattern_bindings(pattern, ""):
+        identity = visible.get(_graph_local_name_key(name))
+        if identity is None or identity in renamed:
+            continue
+        suffix = len(renamed)
+        fresh = f"__graph_outer_scope_{suffix}"
+        while fresh in reserved:
+            suffix += 1
+            fresh = f"__graph_outer_scope_{suffix}"
+        renamed[identity] = fresh
+        reserved += " " + fresh
+    outer_names = {name: renamed[identity] for name, identity in visible.items() if identity in renamed}
+    matched: set[int] = set()
+    specializations: Dict[int, str] = {}
+    patterns = _graph_split_top_level_symbol(pattern, ",")
+    for index, piece in enumerate(_graph_split_top_level_symbol(scrutinee, ",")):
+        discriminant = _graph_unwrap_type_ascriptions(piece)
+        name = _graph_unicode_identifier_name(discriminant)
+        identity = visible.get(_graph_local_name_key(name))
+        if name and identity is not None:
+            matched.add(identity)
+            if index < len(patterns):
+                value, aliases = _graph_pattern_value(
+                    patterns[index], _graph_scrutinee_type_text(piece, binder_context)
+                )
+                # Named patterns retain erased syntactic dependencies in an
+                # outer local's specialized type. Keep them in internal lets
+                # while leaving the known matched value available to classify.
+                for alias in reversed(aliases):
+                    value = f"(let _ := {alias}; {value})"
+                specializations[identity] = value
+    generalized: List[Tuple[str, str]] = []
+    retired: set[int] = set()
+    for identity, (name, annotation, references, generalizable) in enumerate(declarations):
+        if generalizable and set(references.values()) & matched:
+            matched.add(identity)
+            retired.add(identity)
+            replacements = {
+                ref: f"({specializations[dependency]})" if dependency in specializations else renamed[dependency]
+                for ref, dependency in references.items()
+                if dependency in specializations or dependency in renamed
+            }
+            if replacements:
+                annotation, _names = _graph_annotation_local_references(
+                    annotation, replacements
+                )
+            generalized.append((name, annotation))
+    # Generalization replaces the old local. Retaining its unspecialized
+    # type would resurrect a dependency on the original discriminant later.
+    retained = []
+    for chunk, identity in chunks:
+        if identity in retired:
+            continue
+        if identity is not None and renamed:
+            name, annotation, references, generalizable = declarations[identity]
+            replacements = {ref: renamed[dependency] for ref, dependency in references.items() if dependency in renamed}
+            if replacements:
+                annotation, _names = _graph_annotation_local_references(annotation, replacements)
+            prefix = "" if generalizable else "let "
+            chunk = f"({prefix}{renamed.get(identity, name)} : {annotation})"
+        retained.append(chunk)
+    return ", ".join(retained), generalized, outer_names
+
+
+def _graph_named_condition_context(
+    binder_context: str, name: str, condition: str
+) -> str:
+    """Record a named condition proof without treating the name as Prop."""
+
+    condition_text = graph_identity_text(condition)
+    if not name or not condition_text:
+        return binder_context
+    return ", ".join(
+        part for part in (binder_context, f"({name} : {condition_text})") if part
+    )
+
+
+def _graph_pattern_binder_context(
+    pattern: str, scrutinee: str, binder_context: str, arm_text: str = ""
+) -> str:
+    """Extend binders with every name a match pattern introduces.
+
+    A name introduced here hides an outer binding of the same spelling, even
+    when the new type is unknown. ``Option.some`` and ``.some`` carry the same
+    payload type as ``some``. A product pattern keeps a known ``Prop`` field.
+    Pattern names are recorded first. Dependent locals are specialized to
+    the arm pattern and restored over intervening shadowing. ``match h :
+    expr`` adds an equation between the outer expression and that pattern.
+    """
+
+    _proof_names, scrutinee_text = _graph_match_scrutinee_bindings(scrutinee)
+    compact = graph_identity_text(pattern)
+    pieces = _graph_split_top_level_symbol(compact, ",")
+    scrutinees = _graph_split_top_level_symbol(scrutinee_text, ",")
+    bindings: List[Tuple[str, str]] = []
+    if len(pieces) > 1:
+        for index, piece in enumerate(pieces):
+            component = scrutinees[index] if index < len(scrutinees) else ""
+            component_type = (
+                _graph_scrutinee_type_text(component, binder_context)
+                if component
+                else ""
+            )
+            bindings.extend(_graph_pattern_bindings(piece, component_type))
+    else:
+        bindings.extend(
+            _graph_pattern_bindings(
+                compact,
+                _graph_scrutinee_type_text(scrutinee_text, binder_context),
+            )
+        )
+    context, generalized, outer_names = _graph_match_generalized_context(
+        scrutinee_text, compact, binder_context, arm_text
+    )
+    if bindings:
+        additions = [f"({name} : {annotation})" for name, annotation in bindings]
+        context = ", ".join([context, *additions] if context else additions)
+    for name, annotation in generalized:
+        context = ", ".join(
+            part for part in (context, f"({name} : {annotation})") if part
+        )
+    for index, piece in enumerate(_graph_split_top_level_symbol(scrutinee, ",")):
+        name, expression = _graph_named_discriminant(piece)
+        if not name:
+            continue
+        # Both sides matter: a nested match may scrutinize a constructor
+        # payload introduced by this pattern rather than the original local.
+        matched_pattern, _aliases = _graph_pattern_value(
+            pieces[index] if index < len(pieces) else compact,
+            _graph_scrutinee_type_text(expression, binder_context),
+        )
+        if outer_names:
+            expression, _references = _graph_annotation_local_references(expression, outer_names)
+        context = ", ".join(
+            part for part in (
+                context, f"({name} : ({expression}) = ({matched_pattern}))"
+            ) if part
+        )
+    return context
+
+
+# Longer tokens precede their prefixes so ``<=`` is one relation, not ``<``
+# followed by ``=``.
+_GRAPH_SURFACE_RELATION_TOKENS = (
+    "<=",
+    ">=",
+    "≠",
+    "≤",
+    "≥",
+    "∈",
+    "∉",
+    "⊆",
+    "⊂",
+    "⊇",
+    "⊃",
+    "∣",
+    "↔",
+    "≈",
+    "<",
+    "=",
+    ">",
+)
+
+
+def _graph_split_top_level_relation(text: str) -> List[str]:
+    """Split a chain of relations, leaving ``=>``, ``:=``, and ``==`` intact."""
+
+    parts: List[str] = []
+    start = 0
+    index = 0
+    found = False
+    while index < len(text):
+        skipped = _graph_skip_lexical_or_group(text, index)
+        if skipped is not None:
+            index = skipped
+            continue
+        if text.startswith(("=>", ":=", "=="), index):
+            index += 2
+            continue
+        matched = ""
+        for token in _GRAPH_SURFACE_RELATION_TOKENS:
+            if text.startswith(token, index):
+                matched = token
+                break
+        if matched:
+            parts.append(text[start:index].strip())
+            index += len(matched)
+            start = index
+            found = True
+            continue
+        index += 1
+    if not found:
+        return [text.strip()] if text.strip() else []
+    parts.append(text[start:].strip())
+    return [part for part in parts if part]
+
+
+def _graph_prop_ascription_subject(text: str) -> str:
+    """Return the subject of a top-level ``: Prop`` ascription, if that is the form."""
+
+    index = 0
+    while index < len(text):
+        skipped = _graph_skip_lexical_or_group(text, index)
+        if skipped is not None:
+            index = skipped
+            continue
+        if text.startswith((":=", "=>"), index):
+            index += 2
+            continue
+        if text[index] == ":":
+            subject = text[:index].strip()
+            ascribed = graph_identity_text(text[index + 1 :])
+            if subject and ascribed == "Prop":
+                return subject
+            return ""
+        index += 1
+    return ""
+
+
+def _graph_prop_match_surface_ok(
+    scrutinee: str,
+    patterns: List[str],
+    arms: List[str],
+    binder_context: str,
+) -> bool:
+    if not arms or len(patterns) != len(arms):
+        return False
+    if not graph_identity_text(scrutinee).strip():
+        return False
+    if any(not graph_identity_text(pattern).strip() for pattern in patterns):
+        return False
+    if _graph_fragment_has_syntax_residue(scrutinee):
+        return False
+    if any(_graph_fragment_has_syntax_residue(pattern) for pattern in patterns):
+        return False
+    return all(
+        _graph_arm_is_proposition(
+            arm,
+            _graph_pattern_binder_context(pattern, scrutinee, binder_context, arm),
+        )
+        for pattern, arm in zip(patterns, arms)
+    )
+
+
+def _graph_arm_is_proposition(text: str, binder_context: str = "") -> bool:
+    """Classify one match arm in the binders that are in scope around it."""
+
+    if _graph_surface_budget().exhausted:
+        return False
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    if not raw or _graph_starts_with_declaration(raw):
+        return False
+    is_have = raw.startswith(("have ", "have\n"))
+    if is_have:
+        raw = "let" + raw[4:]
+    if raw.startswith(("let ", "let\n")):
+        binding, body = _graph_top_level_let_parts(raw)
+        if not body or not binding or _graph_let_value_has_residue(binding):
+            return False
+        return _graph_arm_is_proposition(
+            body, _graph_binder_context_after_let(
+                binder_context, binding, is_have=is_have
+            )
+        )
+    if _graph_arm_proof_tail(raw):
+        return False
+    parsed = _graph_parse_match_term(raw, 0)
+    if parsed is not None and not raw[parsed[0] :].strip():
+        _end, arms, scrutinee, patterns = parsed
+        return _graph_prop_match_surface_ok(
+            scrutinee, patterns, arms, binder_context
+        )
+    if _graph_scoped_prop_atom(raw, binder_context):
+        return True
+    if binder_context and _graph_quantified_predicate_body_is_formal(
+        raw, binder_context
+    ):
+        return True
+    return graph_statement_is_executable(raw, binder_context=binder_context)
+
+
+def _graph_type_bool_arity(type_text: str) -> int | None:
+    """Return how many arguments a type ending in ``Bool`` expects."""
+
+    parts = [
+        graph_identity_text(part)
+        for part in split_lean_top_level_implications(graph_identity_text(type_text))
+        if graph_identity_text(part)
+    ]
+    if not parts or parts[-1] != "Bool":
+        return None
+    return len(parts) - 1
+
+
+def _graph_application_arg_texts(text: str, head: str) -> List[str] | None:
+    raw = graph_identity_text(text)
+    if not head or not raw.startswith(head):
+        return None
+    tail = raw[len(head) :]
+    if tail and not tail[0].isspace() and tail[0] != "(":
+        return None
+    args: List[str] = []
+    index = 0
+    while index < len(tail):
+        if tail[index].isspace():
+            index += 1
+            continue
+        if tail[index] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+            end = _graph_matching_group_index(tail, index)
+            if end < 0:
+                return None
+            args.append(tail[index : end + 1])
+            index = end + 1
+            continue
+        start = index
+        while index < len(tail) and not tail[index].isspace():
+            skip_to = _lean_lexical_skip_end(tail, index)
+            if skip_to is not None:
+                index = skip_to
+                continue
+            if tail[index] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+                break
+            index += 1
+        if index == start:
+            return None
+        args.append(tail[start:index])
+    return args
+
+
+def _graph_take_explicit_binder(text: str) -> Tuple[str, str, str] | None:
+    """Split one ``name : type`` or ``(name : type)`` binder from the front."""
+
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("("):
+        end = _graph_matching_group_index(raw, 0)
+        if end < 0:
+            return None
+        inner = raw[1:end].strip()
+        colon = _graph_top_level_token_index(inner, ":")
+        if colon < 0:
+            return None
+        name = _graph_leading_identifier(inner[:colon].strip())
+        type_text = inner[colon + 1 :].strip()
+        if not name or inner[:colon].strip() != name or not type_text:
+            return None
+        return name, type_text, raw[end + 1 :]
+    name = _graph_leading_identifier(raw)
+    if not name:
+        return None
+    rest = raw[len(name) :].strip()
+    if not rest.startswith(":"):
+        return None
+    rest = rest[1:].strip()
+    if rest.startswith("("):
+        end = _graph_matching_group_index(rest, 0)
+        if end < 0:
+            return None
+        return name, rest[: end + 1], rest[end + 1 :]
+    type_name = _graph_leading_identifier(rest)
+    if not type_name:
+        return None
+    return name, type_name, rest[len(type_name) :]
+
+
+def _graph_bool_term_ok(text: str, binder_context: str = "") -> bool:
+    """Return whether a term is explicitly ``Bool``-valued.
+
+    Literals, ``Bool`` names, and applications of an explicit ``Bool`` codomain
+    count. Comments around a literal stay part of that literal. A ``Nat`` arm
+    or an untyped application does not.
+    """
+
+    raw = _graph_strip_surrounding_comments(graph_identity_text(text))
+    raw = _graph_strip_balanced_outer_parens(raw)
+    raw = _graph_strip_surrounding_comments(raw)
+    if not raw or not _graph_text_has_balanced_groups(raw):
+        return False
+    if not _graph_term_tokens_ok(raw):
+        return False
+    if _graph_starts_with_declaration(raw) or _graph_arm_proof_tail(raw):
+        return False
+    if raw in {"true", "false"}:
+        return True
+    if raw.startswith("!") and not raw.startswith("!="):
+        return _graph_bool_term_ok(raw[1:], binder_context)
+    for symbol in ("||", "&&"):
+        parts = _graph_split_top_level_symbol(raw, symbol)
+        if len(parts) > 1:
+            return all(_graph_bool_term_ok(part, binder_context) for part in parts)
+    parsed = _graph_parse_match_term(raw, 0)
+    if parsed is not None and not raw[parsed[0] :].strip():
+        _end, arms, scrutinee, patterns = parsed
+        if not scrutinee.strip() or any(not pattern.strip() for pattern in patterns):
+            return False
+        if _graph_fragment_has_syntax_residue(scrutinee):
+            return False
+        if any(_graph_fragment_has_syntax_residue(pattern) for pattern in patterns):
+            return False
+        return all(
+            _graph_bool_term_ok(
+                arm,
+                _graph_pattern_binder_context(pattern, scrutinee, binder_context, arm),
+            )
+            for pattern, arm in zip(patterns, arms)
+        )
+    name = _graph_unicode_identifier_name(raw)
+    if name and name == raw:
+        declared = _graph_binder_type_signatures(binder_context).get(name, "")
+        return _graph_type_bool_arity(declared) == 0
+    head = _graph_leading_identifier(raw)
+    if not head:
+        return False
+    declared = _graph_binder_type_signatures(binder_context).get(head, "")
+    arity = _graph_type_bool_arity(declared)
+    args = _graph_application_arg_texts(raw, head)
+    if arity is None or args is None or len(args) != arity:
+        return False
+    domains = [
+        graph_identity_text(part)
+        for part in split_lean_top_level_implications(declared)[:-1]
+    ]
+    for domain, arg in zip(domains, args):
+        if graph_identity_text(domain) == "Bool":
+            if not _graph_bool_term_ok(arg, binder_context):
+                return False
+        elif not _graph_term_tokens_ok(arg):
+            return False
+    return True
+
+
+def _graph_fun_bool_arrow(value: str, binder_context: str = "") -> str:
+    """Return ``… → Bool`` for a fun whose binders and body are explicit."""
+
+    raw = graph_identity_text(value).strip()
+    inner = _graph_whole_group_inner(raw)
+    if inner:
+        raw = inner
+    if not _graph_keyword_at(raw, 0, "fun"):
+        return ""
+    arrow = _graph_find_top_level_symbol(raw, "=>", 0)
+    if arrow < 0:
+        return ""
+    binders = raw[len("fun") : arrow].strip()
+    body = raw[arrow + 2 :].strip()
+    domains: List[str] = []
+    local = binder_context
+    while binders.strip():
+        parsed = _graph_take_explicit_binder(binders)
+        if parsed is None:
+            return ""
+        name, type_text, binders = parsed
+        type_text = graph_identity_text(type_text)
+        domains.append(type_text)
+        local = ", ".join(
+            part for part in (local, f"({name} : {type_text})") if part
+        )
+    if not domains or not _graph_bool_term_ok(body, local):
+        return ""
+    return " → ".join([*domains, "Bool"])
+
+
+def _graph_let_bool_type_text(binding: str) -> str:
+    """Return an explicit Bool type recorded by a local let, if it has one."""
+
+    text = graph_identity_text(binding)
+    assign = _graph_top_level_token_index(text, ":=")
+    annotation_end = assign if assign >= 0 else len(text)
+    colon = _graph_top_level_token_index(text, ":")
+    if 0 <= colon < annotation_end:
+        annotation = graph_identity_text(text[colon + 1 : annotation_end])
+        if (
+            _graph_type_bool_arity(annotation) is not None
+            or _graph_obvious_data_sort(annotation)
+        ):
+            return annotation
+        return ""
+    if assign < 0:
+        return ""
+    value = text[assign + 2 :].strip()
+    if _graph_bool_term_ok(value):
+        return "Bool"
+    return _graph_fun_bool_arrow(value, "")
+
+
+def _graph_leading_qualified_name(text: str) -> str:
+    """Return a dotted name at the start of a term, such as ``Bool.not``."""
+
+    raw = graph_identity_text(text).strip()
+    name = _graph_leading_identifier(raw)
+    if not name:
+        return ""
+    index = len(name)
+    while index < len(raw) and raw[index] == ".":
+        part = _graph_leading_identifier(raw[index + 1 :])
+        if not part:
+            break
+        index += 1 + len(part)
+    return raw[:index]
+
+
+def _graph_obvious_noncondition_term(text: str, binder_context: str = "") -> bool:
+    """Return whether a term is obviously not a Prop or Bool condition.
+
+    Numerals, data sorts, and names of those sorts are rejected. Unknown
+    applications stay open so Lean can type them.
+    """
+
+    raw = _graph_strip_surrounding_comments(graph_identity_text(text))
+    raw = _graph_strip_balanced_outer_parens(raw)
+    raw = _graph_strip_surrounding_comments(raw)
+    if not raw:
+        return False
+    if re.fullmatch(r"\d+", raw):
+        return True
+    name = _graph_unicode_identifier_name(raw)
+    if name and name == raw:
+        if _graph_obvious_data_sort(name):
+            return True
+        declared = _graph_binder_type_signatures(binder_context).get(name, "")
+        return _graph_obvious_data_sort(declared)
+    subject, sort = _graph_top_level_ascription(raw)
+    return bool(subject and _graph_obvious_data_sort(sort))
+
+
+def _graph_condition_value_ok(text: str, binder_context: str = "") -> bool:
+    """Accept a condition result that is Prop, Bool, or an unknown term.
+
+    A comment, group, local binding, conditional, or ``Bool`` ascription keeps
+    that result. A match nested here is the result, so its arms use the same
+    rule. Obvious ``Nat`` results stay rejected.
+    """
+
+    raw = _graph_strip_surrounding_comments(graph_identity_text(text))
+    raw = _graph_strip_balanced_outer_parens(raw)
+    raw = _graph_strip_surrounding_comments(raw)
+    if not raw or not _graph_text_has_balanced_groups(raw):
+        return False
+    if not _graph_term_tokens_ok(raw):
+        return False
+    if (
+        _graph_starts_with_declaration(raw)
+        or _graph_arm_proof_tail(raw)
+        or has_sorry_or_admit(raw)
+        or contains_metavariable_placeholder(raw)
+    ):
+        return False
+    if _graph_obvious_noncondition_term(raw, binder_context):
+        return False
+    if _graph_arm_is_proposition(raw, binder_context) or _graph_bool_term_ok(
+        raw, binder_context
+    ):
+        return True
+    subject, sort = _graph_top_level_ascription(raw)
+    if subject:
+        sort_name = graph_identity_text(sort)
+        if sort_name == "Bool":
+            return _graph_condition_value_ok(subject, binder_context)
+        if _graph_obvious_data_sort(sort_name):
+            return False
+    is_have = raw.startswith(("have ", "have\n"))
+    if is_have:
+        raw = "let" + raw[4:]
+    if raw.startswith(("let ", "let\n")):
+        binding, body = _graph_top_level_let_parts(raw)
+        if not binding or not body or _graph_let_value_has_residue(binding):
+            return False
+        return _graph_condition_value_ok(
+            body, _graph_binder_context_after_let(
+                binder_context, binding, is_have=is_have
+            )
+        )
+    if _graph_keyword_at(raw, 0, "if"):
+        incomplete, branches = _graph_conditional_structure(raw)
+        full_condition = _graph_leading_conditional_condition(raw)
+        binder_name, condition = _graph_split_named_if_condition(full_condition)
+        branch_context = _graph_named_condition_context(
+            binder_context, binder_name, condition
+        )
+        if (
+            incomplete
+            or not branches
+            or not all(branches)
+            or not condition
+            or not _graph_condition_fragment_ok(condition, binder_context)
+        ):
+            return False
+        return all(
+            _graph_condition_value_ok(branch, branch_context) for branch in branches
+        )
+    parsed = _graph_parse_match_term(raw, 0)
+    if parsed is not None and not raw[parsed[0] :].strip():
+        _end, arms, scrutinee, patterns = parsed
+        return _graph_condition_match_ok(
+            scrutinee, patterns, arms, binder_context
+        )
+    return True
+
+
+def _graph_condition_match_ok(
+    scrutinee: str,
+    patterns: List[str],
+    arms: List[str],
+    binder_context: str,
+) -> bool:
+    """Accept a condition match whose arms are plausible condition results."""
+
+    if not arms or len(patterns) != len(arms):
+        return False
+    if not graph_identity_text(scrutinee).strip():
+        return False
+    if any(not graph_identity_text(pattern).strip() for pattern in patterns):
+        return False
+    if _graph_fragment_has_syntax_residue(scrutinee):
+        return False
+    if any(_graph_fragment_has_syntax_residue(pattern) for pattern in patterns):
+        return False
+    for pattern, arm in zip(patterns, arms):
+        scope = _graph_pattern_binder_context(pattern, scrutinee, binder_context, arm)
+        if not _graph_condition_value_ok(arm, scope):
+            return False
+    return True
+
+
+def _graph_split_named_if_condition(condition: str) -> Tuple[str, str]:
+    """Split ``h : condition`` from a bare condition.
+
+    The name is a proof of the condition in the then branch and of its
+    negation in the else branch. It is not the condition itself.
+    """
+
+    raw = graph_identity_text(condition).strip()
+    name = _graph_leading_identifier(raw)
+    if not name:
+        return "", raw
+    rest = raw[len(name) :].strip()
+    if not rest.startswith(":"):
+        return "", raw
+    body = rest[1:].strip()
+    if not body:
+        return "", raw
+    return name, body
+
+
+def _graph_condition_fragment_ok(text: str, binder_context: str = "") -> bool:
+    """Classify an ``if`` condition without requiring every match arm to be Prop."""
+
+    return _graph_fragment_role_ok(text, "cond", binder_context)
+
+
+def _graph_leading_conditional_condition(text: str) -> str:
+    """Return the condition of a fragment that begins with ``if``.
+
+    The condition ends at the ``then`` that closes the opening ``if``. An
+    unparenthesized conditional, ``let``, ``have``, or match inside the
+    condition has its own ``then`` and does not end the outer condition.
+    """
+
+    raw = graph_identity_text(text).strip()
+    if not _graph_keyword_at(raw, 0, "if"):
+        return ""
+    pending: List[Tuple[int, str, int]] = []
+    root_then = -1
+    depth = 0
+    index = 0
+    while index < len(raw):
+        skip_to = _lean_lexical_skip_end(raw, index)
+        if skip_to is not None:
+            index = skip_to
+            continue
+        char = raw[index]
+        if char in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+            depth += 1
+        elif char in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE.values():
+            if pending and pending[-1][0] >= depth:
+                return ""
+            depth -= 1
+        elif _graph_keyword_at(raw, index, "if"):
+            pending.append((depth, "then", index))
+        elif pending and pending[-1][0] == depth:
+            expected = pending[-1][1]
+            if _graph_keyword_at(raw, index, expected):
+                if expected == "then":
+                    if pending[-1][2] == 0:
+                        root_then = index
+                    pending[-1] = (depth, "else", pending[-1][2])
+                else:
+                    pending.pop()
+        index += 1
+    if root_then < 0:
+        return ""
+    return raw[len("if") : root_then].strip()
+
+
+def _graph_block_comment_end(text: str, index: int) -> Optional[int]:
+    """Return the index after a closed nested block comment, if it closes."""
+
+    raw = str(text or "")
+    if not raw.startswith("/-", index):
+        return None
+    depth = 1
+    cursor = index + 2
+    limit = len(raw)
+    while cursor < limit:
+        if raw.startswith("/-", cursor):
+            depth += 1
+            cursor += 2
+            continue
+        if raw.startswith("-/", cursor):
+            depth -= 1
+            cursor += 2
+            if depth == 0:
+                return cursor
+            continue
+        cursor += 1
+    return None
+
+
+def _graph_lexical_islands_closed(text: str) -> bool:
+    """Return whether comments, strings, and quotations in text all close.
+
+    An unfinished block comment is not a closed island, including an outer
+    comment whose inner comment already closed. Line comments run to the
+    next newline or the end of the text.
+    """
+
+    _code, closed = _strip_lean_comments_and_strings(str(text or ""))
+    return closed
+
+
+def _graph_blank_lexical_comments(text: str) -> str:
+    """Replace closed comments with spaces without entering strings or quotations.
+
+    A leading comment does not change the role of the fragment it precedes.
+    An unfinished block comment is left in place so it cannot become a
+    shorter valid term. Quoted identifiers and string literals keep their
+    characters, including comment-like text written inside them.
+    """
+
+    raw = str(text or "")
+    if "--" not in raw and "/-" not in raw:
+        return raw
+    chars = list(raw)
+    index = 0
+    while index < len(raw):
+        if raw.startswith("«", index):
+            skip_to = _lean_lexical_skip_end(raw, index)
+            index = skip_to if skip_to is not None and skip_to > index else index + 1
+            continue
+        if raw.startswith("/-", index):
+            skip_to = _graph_block_comment_end(raw, index)
+            if skip_to is None:
+                return raw
+            for pos in range(index, skip_to):
+                if chars[pos] != "\n":
+                    chars[pos] = " "
+            index = skip_to
+            continue
+        if raw.startswith("--", index):
+            skip_to = _lean_lexical_skip_end(raw, index)
+            if skip_to is None or skip_to <= index:
+                index += 1
+                continue
+            for pos in range(index, skip_to):
+                if chars[pos] != "\n":
+                    chars[pos] = " "
+            index = skip_to
+            continue
+        skip_to = _lean_lexical_skip_end(raw, index)
+        if skip_to is not None and skip_to > index:
+            index = skip_to
+            continue
+        index += 1
+    return "".join(chars)
+
+
+def _graph_fragment_role_ok(
+    text: str, role: str, binder_context: str = ""
+) -> bool:
+    """Walk one fragment, keeping its proposition, sort, or data role.
+
+    Parentheses keep the enclosing role. ``∧``, ``∨``, ``↔``, and ``¬``
+    operands are propositions. An implication domain is a sort and its
+    codomain keeps the enclosing role. A quantifier keeps the role of its
+    body and adds its binders. ``if`` keeps that role on both results. Its
+    condition may be Prop or Bool, and a named condition binder hides an
+    outer variable of the same name in both branches. Relations and other
+    term operands are data. A match passes that role to its arms. An empty
+    group is a complete data term, not a proposition. Leading comments are
+    trivia and do not select a different role.
+    """
+
+    if _graph_surface_budget().exhausted:
+        return False
+    if not _graph_lexical_islands_closed(text):
+        return False
+    raw = graph_identity_text(_graph_blank_lexical_comments(text)).strip()
+    if not raw or not _graph_text_has_balanced_groups(raw):
+        return False
+    if raw.startswith("("):
+        inner = _graph_whole_group_inner(raw)
+        if inner:
+            return _graph_fragment_role_ok(inner, role, binder_context)
+    if role not in {"prop", "cond"}:
+        return _graph_term_tokens_ok(raw)
+    if (
+        raw[0] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE
+        and _graph_matching_group_index(raw, 0) == len(raw) - 1
+        and not raw[1:-1].strip()
+    ):
+        return False
+    is_have = raw.startswith(("have ", "have\n"))
+    if is_have:
+        raw = "let" + raw[4:]
+    if raw.startswith(("let ", "let\n")):
+        binding, body = _graph_top_level_let_parts(raw)
+        if not binding or not body or _graph_let_value_has_residue(binding):
+            return False
+        return _graph_fragment_role_ok(
+            body,
+            role,
+            _graph_binder_context_after_let(binder_context, binding, is_have=is_have),
+        )
+    quantifier_len = _graph_proposition_quantifier_token_len(raw)
+    if quantifier_len > 0:
+        remainder = raw[quantifier_len:].lstrip()
+        comma = _graph_find_top_level_comma(remainder)
+        if comma < 0:
+            return False
+        binder = remainder[:comma].strip()
+        body = remainder[comma + 1 :].strip()
+        if not binder or not body or not _graph_term_tokens_ok(binder):
+            return False
+        extended = ", ".join(part for part in (binder_context, binder) if part)
+        return _graph_fragment_role_ok(body, role, extended)
+    if _graph_keyword_at(raw, 0, "if"):
+        incomplete, branches = _graph_conditional_structure(raw)
+        full_condition = _graph_leading_conditional_condition(raw)
+        binder_name, condition = _graph_split_named_if_condition(full_condition)
+        # The local name is a proof of the condition, not a Prop variable.
+        branch_context = _graph_named_condition_context(
+            binder_context, binder_name, condition
+        )
+        if (
+            incomplete
+            or not branches
+            or not all(branches)
+            or not condition
+            or not _graph_condition_fragment_ok(condition, binder_context)
+        ):
+            return False
+        return all(
+            _graph_fragment_role_ok(branch, role, branch_context)
+            for branch in branches
+        )
+    if _graph_keyword_at(raw, 0, "match"):
+        parsed = _graph_parse_match_term(raw, 0)
+        if parsed is not None and not raw[parsed[0] :].strip():
+            _end, arms, scrutinee, patterns = parsed
+            if role == "cond":
+                return _graph_condition_match_ok(
+                    scrutinee, patterns, arms, binder_context
+                )
+            return _graph_prop_match_surface_ok(
+                scrutinee, patterns, arms, binder_context
+            )
+    iff_parts = _graph_split_top_level_symbol(raw, "↔")
+    if len(iff_parts) > 1:
+        return all(
+            _graph_fragment_role_ok(part, role, binder_context) for part in iff_parts
+        )
+    implications = split_lean_top_level_implications(raw)
+    if len(implications) > 1:
+        if any(
+            not _graph_fragment_role_ok(part, "sort", binder_context)
+            for part in implications[:-1]
+        ):
+            return False
+        return _graph_fragment_role_ok(implications[-1], role, binder_context)
+    for symbol in ("∨", "∧"):
+        parts = _graph_split_top_level_symbol(raw, symbol)
+        if len(parts) > 1:
+            return all(
+                _graph_fragment_role_ok(part, role, binder_context) for part in parts
+            )
+    if raw.startswith("¬"):
+        return _graph_fragment_role_ok(raw[1:].strip(), role, binder_context)
+    if raw.startswith(("not ", "not\n")):
+        return _graph_fragment_role_ok(raw[4:].strip(), role, binder_context)
+    if role == "cond":
+        if raw.startswith("!") and not raw.startswith("!="):
+            return _graph_fragment_role_ok(raw[1:].strip(), "cond", binder_context)
+        for symbol in ("||", "&&"):
+            parts = _graph_split_top_level_symbol(raw, symbol)
+            if len(parts) > 1:
+                return all(
+                    _graph_fragment_role_ok(part, "cond", binder_context)
+                    for part in parts
+                )
+        # ``==`` is Boolean equality. Its operands are data, including a match
+        # that returns ``Nat``. The comparison itself is the condition.
+        beq_parts = _graph_split_top_level_symbol(raw, "==")
+        if len(beq_parts) > 1:
+            return all(_graph_term_tokens_ok(part) for part in beq_parts)
+    relations = _graph_split_top_level_relation(raw)
+    if len(relations) > 1:
+        return all(_graph_term_tokens_ok(part) for part in relations)
+    ascribed = _graph_prop_ascription_subject(raw)
+    if ascribed:
+        return _graph_fragment_role_ok(ascribed, "prop", binder_context)
+    if role == "cond":
+        subject, sort = _graph_top_level_ascription(raw)
+        if subject:
+            sort_name = graph_identity_text(sort)
+            if sort_name == "Bool":
+                return _graph_fragment_role_ok(subject, "cond", binder_context)
+            if _graph_obvious_data_sort(sort_name):
+                return False
+        # An application such as ``Bool.not`` or ``decide`` is an unknown
+        # condition. A match inside an argument is an operand, not the result.
+        qualified = _graph_leading_qualified_name(raw)
+        if qualified and not _graph_keyword_at(raw, 0, "match"):
+            arguments = _graph_application_arg_texts(raw, qualified)
+            if arguments:
+                return all(_graph_term_tokens_ok(argument) for argument in arguments)
+    if _graph_contains_match_keyword(raw):
+        if role == "cond":
+            return _graph_term_tokens_ok(raw) and not _graph_obvious_noncondition_term(
+                raw, binder_context
+            )
+        return _graph_term_tokens_ok(raw)
+    if role == "cond" and _graph_obvious_noncondition_term(raw, binder_context):
+        return False
+    return True
+
+
+def _graph_matches_are_propositions(text: str, binder_context: str = "") -> bool:
+    """Require a proposition only where a match itself supplies the proposition.
+
+    A match used as a data operand of a relation or application may return
+    data. Its scrutinee, patterns, and arms still cannot hide declarations
+    or proof syntax. A match that is the proposition keeps proposition arms.
+    """
+
+    if _graph_surface_budget().exhausted:
+        return False
+    raw = graph_identity_text(text)
+    if not raw or not _graph_contains_match_keyword(raw):
+        return True
+    return _graph_fragment_role_ok(raw, "prop", binder_context)
+
+
+def _graph_complete_match_executable(
+    text: str, binder_context: str = ""
+) -> Optional[bool]:
+    """Classify a statement that is exactly one match term.
+
+    ``None`` means the text is not a complete match. Each arm is a proposition
+    in the surrounding binder scope, including tuple patterns and nested
+    matches. A data-valued, proof, or declaration arm rejects the match.
+    Scrutinees and patterns are checked for declarations and proof syntax.
+    """
+
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    parsed = _graph_parse_match_term(raw, 0)
+    if parsed is None:
+        return None
+    end, _arms, scrutinee, patterns = parsed
+    if raw[end:].strip():
+        return None
+    return _graph_prop_match_surface_ok(
+        scrutinee, patterns, parsed[1], binder_context
+    )
+
+
 def _graph_has_top_level_proof_tail(text: str) -> bool:
     raw = graph_identity_text(text)
     if not raw:
@@ -2481,6 +4808,13 @@ def _graph_has_top_level_proof_tail(text: str) -> bool:
         return _graph_has_top_level_proof_tail(stripped)
     index = 0
     while index < len(raw):
+        if _graph_keyword_at(raw, index, "match"):
+            parsed = _graph_parse_match_term(raw, index)
+            if parsed is not None and parsed[0] > index:
+                if any(_graph_arm_proof_tail(arm) for arm in parsed[1]):
+                    return True
+                index = parsed[0]
+                continue
         skip_to = _lean_lexical_skip_end(raw, index)
         if skip_to is not None:
             index = skip_to
@@ -2489,6 +4823,8 @@ def _graph_has_top_level_proof_tail(text: str) -> bool:
         if ch in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
             end = _graph_matching_group_index(raw, index)
             if end >= 0:
+                # The group keeps the role of the surrounding term. Re-checking
+                # its text alone would treat a data operand as a proposition.
                 index = end + 1
                 continue
         if ch == ";":
@@ -2530,7 +4866,11 @@ def _graph_quantified_body_has_proof_tail(text: str) -> bool:
         implication_parts = split_lean_top_level_implications(body)
         if len(implication_parts) > 1:
             return any(fragment_has_proof_tail(part) for part in implication_parts)
-        while body.startswith(("let ", "let\n")):
+        while body.startswith(("let ", "let\n", "have ", "have\n")):
+            # A complete ``have`` is the same local binding as ``let``.
+            # A dangling binding, with or without ``match``, still fails closed.
+            if body.startswith(("have ", "have\n")):
+                body = "let" + body[4:]
             binding, remainder = _graph_top_level_let_parts(body)
             if (
                 not binding
@@ -2602,10 +4942,16 @@ def _graph_binder_prop_signatures(binder_text: str) -> Dict[str, int | None]:
         if not names:
             continue
         arity = _graph_prop_annotation_arity(body[colon:])
-        if arity is None:
-            continue
+        if arity is None and _graph_annotation_reduces_to_prop(body[colon + 1 :]):
+            arity = 0
         for name in names:
-            signatures[name] = arity
+            # A later binder of the same name hides the outer annotation.
+            # A non-proposition annotation removes the name from Prop scope.
+            for spelling in _graph_local_name_spellings(name):
+                if arity is None:
+                    signatures.pop(spelling, None)
+                else:
+                    signatures[spelling] = arity
     return signatures
 
 
@@ -2629,7 +4975,8 @@ def _graph_binder_type_signatures(binder_text: str) -> Dict[str, str]:
         if not type_text:
             continue
         for name in names:
-            signatures[name] = type_text
+            for spelling in _graph_local_name_spellings(name):
+                signatures[spelling] = type_text
     return signatures
 
 
@@ -2838,6 +5185,11 @@ def _graph_quantified_predicate_body_is_formal(
     head = str(app_match.group(1) or "").strip()
     if not head:
         return False
+    declared = _graph_binder_type_signatures(binder_context).get(head, "")
+    if declared and _graph_prop_annotation_arity(":" + declared) is None:
+        # A local binding whose type is not a proposition hides an outer
+        # predicate of the same name.
+        return False
     arg_count = _graph_application_arg_count(compact, head)
     if arg_count is None or arg_count <= 0:
         return False
@@ -2861,7 +5213,51 @@ def _graph_proposition_quantifier_token_len(text: str) -> int:
     return _graph_top_level_quantifier_token_len(text, 0)
 
 
-def _graph_quantified_statement_is_executable(text: str) -> bool:
+def _graph_iterative_conditional_proposition(
+    text: str, binder_context: str = ""
+) -> bool:
+    """Classify nested conditionals without a Python frame per branch.
+
+    The condition is read in the surrounding scope and may be Prop or Bool,
+    including a match in condition role. A named proof binder hides that name
+    in both branches. A branch that is not itself a conditional uses the same
+    proposition walk as any other fragment.
+    """
+
+    pending: List[Tuple[str, str]] = [(text, binder_context)]
+    while pending:
+        fragment, context = pending.pop()
+        raw = _graph_strip_balanced_outer_parens(graph_identity_text(fragment))
+        if not raw:
+            return False
+        if not _graph_keyword_at(raw, 0, "if"):
+            # Classify the parenthesis-stripped leaf. A grouped quantifier,
+            # predicate, let, or open is the same proposition as the text
+            # inside the group. The stored statement is left unchanged.
+            if not graph_statement_is_executable(raw, binder_context=context):
+                return False
+            continue
+        incomplete, branches = _graph_conditional_structure(raw)
+        full_condition = _graph_leading_conditional_condition(raw)
+        binder_name, condition = _graph_split_named_if_condition(full_condition)
+        if (
+            incomplete
+            or not branches
+            or not all(branches)
+            or not condition
+            or not _graph_condition_fragment_ok(condition, context)
+        ):
+            return False
+        branch_context = _graph_named_condition_context(
+            context, binder_name, condition
+        )
+        pending.extend((branch, branch_context) for branch in branches)
+    return True
+
+
+def _graph_quantified_statement_is_executable(
+    text: str, *, outer_binder: str = ""
+) -> bool:
     body = graph_identity_text(text)
     if not body:
         return False
@@ -2888,14 +5284,11 @@ def _graph_quantified_statement_is_executable(text: str) -> bool:
         body
     ) or _graph_quantified_body_has_proof_tail(body):
         return False
-    binder_context = ", ".join(binder_contexts)
+    binder_context = ", ".join(
+        part for part in (outer_binder, *binder_contexts) if part
+    )
     if _graph_keyword_at(body, 0, "if"):
-        # The condition is a proposition even when the whole conditional
-        # returns data. Classify each branch with the original binder scope.
-        branches = _graph_conditional_leaf_statements(text)
-        return bool(branches) and all(
-            graph_statement_is_executable(branch) for branch in branches
-        )
+        return _graph_iterative_conditional_proposition(body, binder_context)
     bare_tail_atom = _graph_bare_prop_atom_name(body)
     if bare_tail_atom and _graph_context_declares_prop_atom_in_binder(
         bare_tail_atom,
@@ -2909,7 +5302,7 @@ def _graph_quantified_statement_is_executable(text: str) -> bool:
         # proposition. Delegate the complete let-chain to the same guarded
         # parser used for a top-level let instead of treating its local value
         # head as the quantified codomain.
-        return graph_statement_is_executable(body)
+        return graph_statement_is_executable(body, binder_context=binder_context)
     if _graph_quantified_non_prop_codomain(body, binder_context):
         return False
     if graph_statement_non_theorem_reason(body):
@@ -2922,14 +5315,50 @@ def _graph_quantified_statement_is_executable(text: str) -> bool:
         # The whole-statement codomain guard above establishes that the arrow
         # ends in Prop; the proof-tail and balance guards establish that its
         # premises are complete terms.
-        return graph_statement_is_executable(implication_parts[-1])
+        return graph_statement_is_executable(
+            implication_parts[-1], binder_context=binder_context
+        )
     return bool(
-        graph_statement_is_executable(body)
+        graph_statement_is_executable(body, binder_context=binder_context)
         or _graph_quantified_predicate_body_is_formal(body, binder_context)
     )
 
 
-def graph_statement_is_executable(text: str) -> bool:
+def graph_statement_is_executable(text: str, *, binder_context: str = "") -> bool:
+    """Return whether text is plausibly an executable Lean proposition.
+
+    Nested match parsing is bounded on this thread. Ordinary bindings are not
+    counted. A match nest that would overflow the interpreter is not executable.
+    """
+
+    budget = _graph_surface_budget()
+    outermost = not budget.active
+    if outermost:
+        budget.active = True
+        budget.exhausted = False
+        budget.match_depth = 0
+    exhausted = False
+    try:
+        if budget.exhausted:
+            result = False
+        else:
+            result = _graph_statement_is_executable_body(
+                text, binder_context=binder_context
+            )
+    except RecursionError:
+        result = False
+    finally:
+        if outermost:
+            exhausted = budget.exhausted
+            budget.exhausted = False
+            budget.match_depth = 0
+            budget.active = False
+    if exhausted:
+        return False
+    return result
+
+
+def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") -> bool:
     """Return whether text is plausibly an executable Lean proposition.
 
     Graph labels such as ``pf_decomposition`` or natural-language failure
@@ -2939,6 +5368,9 @@ def graph_statement_is_executable(text: str) -> bool:
     ``goal_statement_override`` or recursive sub-goals.
     """
 
+    if not _graph_lexical_islands_closed(text):
+        return False
+    text = _graph_blank_lexical_comments(text)
     raw_compact = graph_identity_text(text)
     if not raw_compact:
         return False
@@ -2955,7 +5387,9 @@ def graph_statement_is_executable(text: str) -> bool:
     # complete prefix, and Lean still checks the original scoped proposition.
     scoped_open = _SCOPED_OPEN_DECL_PREFIX_RE.match(raw_compact)
     if scoped_open is not None:
-        return graph_statement_is_executable(raw_compact[scoped_open.end() :])
+        return graph_statement_is_executable(
+            raw_compact[scoped_open.end() :], binder_context=binder_context
+        )
 
     stmt = graph_formal_statement_text(text)
     compact = graph_identity_text(stmt)
@@ -2969,6 +5403,8 @@ def graph_statement_is_executable(text: str) -> bool:
         return True
     if has_sorry_or_admit(compact) or contains_metavariable_placeholder(compact):
         return False
+    if _graph_scoped_prop_atom(compact, binder_context):
+        return True
     bare_ident = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_'.]*", compact)
     if bare_ident:
         return False
@@ -3060,12 +5496,22 @@ def graph_statement_is_executable(text: str) -> bool:
         return False
     if compact.startswith(("fun ", "fun\n")):
         return False
-    if _graph_keyword_at(compact, 0, "if"):
-        branches = _graph_conditional_leaf_statements(compact)
-        return bool(branches) and all(
-            graph_statement_is_executable(branch) for branch in branches
+    unwrapped = _graph_strip_balanced_outer_parens(compact)
+    if (
+        unwrapped
+        and unwrapped != compact
+        and unwrapped.startswith(("have ", "have\n", "let ", "let\n"))
+    ):
+        # A parenthesized term-level binder is still the binder, not a proof
+        # script. The semicolon that ends the binder is handled by the let
+        # splitter below.
+        return graph_statement_is_executable(
+            unwrapped, binder_context=binder_context
         )
-    if compact.startswith(("have ", "have\n")):
+    if _graph_keyword_at(compact, 0, "if"):
+        return _graph_iterative_conditional_proposition(compact, binder_context)
+    is_have = compact.startswith(("have ", "have\n"))
+    if is_have:
         # Term-level `have name := value; proposition` has the same binding
         # shape as a let. Inspect that shape without rewriting the statement
         # stored in the graph or submitted to Lean.
@@ -3075,6 +5521,11 @@ def graph_statement_is_executable(text: str) -> bool:
         let_binding, let_body = _graph_top_level_let_parts(text)
         if not let_body:
             let_binding, let_body = _graph_top_level_let_parts(stmt)
+        if _graph_let_value_has_residue(let_binding):
+            return False
+        extended = _graph_binder_context_after_let(
+            binder_context, let_binding, is_have=is_have
+        )
         local_head, _local_arity = _graph_let_binding_prop_signature(let_binding)
         if (
             local_head
@@ -3088,7 +5539,9 @@ def graph_statement_is_executable(text: str) -> bool:
         return bool(
             let_body
             and (
-                graph_statement_is_executable(let_body)
+                graph_statement_is_executable(
+                    let_body, binder_context=extended
+                )
                 or _graph_let_body_is_plausibly_local_prop(
                     let_body,
                     binding=let_binding,
@@ -3123,15 +5576,28 @@ def graph_statement_is_executable(text: str) -> bool:
         # Quantified bodies need the let-aware proof-tail parser. The generic
         # detector treats every top-level semicolon as tactic syntax, including
         # the delimiters in a valid quantified let-chain.
-        return _graph_quantified_statement_is_executable(compact)
+        return _graph_quantified_statement_is_executable(
+            compact, outer_binder=binder_context
+        )
+    match_executable = _graph_complete_match_executable(compact, binder_context)
+    if match_executable is not None:
+        return match_executable
     if _graph_has_top_level_proof_tail(compact):
+        return False
+    if not _graph_matches_are_propositions(compact, binder_context):
         return False
     if compact.startswith("¬"):
         return True
     if compact.startswith("not "):
-        return graph_statement_is_executable(compact[4:].strip())
+        return graph_statement_is_executable(
+            compact[4:].strip(), binder_context=binder_context
+        )
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_'.]*\s*:\s*[^,()]+", compact):
         return False
+    if binder_context and _graph_quantified_predicate_body_is_formal(
+        compact, binder_context
+    ):
+        return True
     if _graph_contains_proposition_marker(compact):
         return True
     structural_markers = (
@@ -3153,6 +5619,9 @@ def graph_statement_is_executable(text: str) -> bool:
     if predicate_match:
         pred = str(predicate_match.group("pred") or "").strip()
         args = str(predicate_match.group("args") or "").strip()
+        declared = _graph_binder_type_signatures(binder_context).get(pred, "")
+        if declared and _graph_prop_annotation_arity(":" + declared) is None:
+            return False
         if "." not in pred and not _graph_identifier_starts_upper(pred):
             return False
         if args.startswith("(") and args.endswith(")"):

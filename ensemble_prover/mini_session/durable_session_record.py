@@ -50,6 +50,7 @@ _RUNTIME_FIELDS = frozenset({
     "_dispatch_generation_late_rollback_snapshot", "_run_governor_last_tick_monotonic",
     "_applying_action_dispatch_ids", "_duplicate_action_dispatch_events_in_progress",
     "_inflight_action_dispatch_id", "_apply_transition_active",
+    "_inflight_provider_exposure_tracker",
     "_mini_recursive_hard_timeout_lease",
     "_checkpoint_initial_theory_context_hash",
     "_acceptance_receipt_flush_active",
@@ -267,6 +268,11 @@ def _require_settled(session: Any) -> None:
             or getattr(session, "_applying_action_dispatch_ids", set())
             or getattr(session, "_pending_isolated_dispatch_tails", set())):
         raise ValueError("checkpoint requires a settled committed action boundary")
+    tracker = getattr(session, "_inflight_provider_exposure_tracker", None)
+    if getattr(tracker, "provider_dispatches_started", 0):
+        # Recovery must charge live exposure into durable scheduler totals
+        # before this runtime-only tracker can be omitted from the record.
+        raise ValueError("checkpoint requires settled provider exposure")
 
 
 def capture_session_record(session: Any) -> dict[str, Any]:
@@ -449,6 +455,10 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
     values = {key: _decode(value) for key, value in data["session_values"].items()}
     if values.get("_acceptance_receipt_flush_active") is False:
         values.pop("_acceptance_receipt_flush_active")
+    # Older settled records could contain the inactive None default. It is
+    # data-free and must not overwrite the fresh runtime tracker on restore.
+    if values.get("_inflight_provider_exposure_tracker") is None:
+        values.pop("_inflight_provider_exposure_tracker", None)
     verifier_view = await _prepare_theory_checkpoint_context(session, data, values)
     if expected_identity != session_checkpoint_identity(verifier_view):
         raise ValueError("checkpoint identity differs from the fresh target, environment or policy")

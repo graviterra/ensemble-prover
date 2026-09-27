@@ -970,16 +970,35 @@ class NativeResearchCoordinator:
                         release(guidance)
                     delivered.append(advice_key)
                 artifact = guidance["artifact_id"]
-                if state.get("replan_delivered") != artifact:
-                    planner = next((a for a in getattr(session, "actions", [])
-                                    if getattr(a, "id", "") == "graph_root_replan"), None)
-                    request = getattr(planner, "request_research_replan", None)
-                    if callable(request) and self.store is not None:
-                        from .research_claims.context_window import window
-                        advice = {"artifact_id": artifact, "kernel_verified": False,
-                                  "advice": window(self.store, guidance, limit=12000)}
-                        if request(session, advice):
+                # Offer advice until the planner accepts it or reports that
+                # this exact semantic advice and helper context is already
+                # covered. Any other refusal stays deferred, including a
+                # temporary pool, budget, or ownership block.
+                planner = next((a for a in getattr(session, "actions", [])
+                                if getattr(a, "id", "") == "graph_root_replan"), None)
+                request = getattr(planner, "request_research_replan", None)
+                if callable(request) and self.store is not None:
+                    from .research_claims.context_window import window
+                    advice = {"artifact_id": artifact, "kernel_verified": False,
+                              "advice": window(self.store, guidance, limit=12000)}
+                    binder = getattr(planner, "research_delivery_binding", None)
+                    if callable(binder):
+                        kind, key, evidence = binder(session, advice)
+                        binding = [kind, key, list(evidence)]
+                    else:
+                        binding = ["artifact", artifact, None]
+                    if state.get("replan_delivery_binding") != binding:
+                        accepted = bool(request(session, advice))
+                        disposition = (
+                            "accepted" if accepted
+                            else str(getattr(
+                                planner, "_last_research_replan_disposition", "deferred"
+                            ) or "deferred")
+                        )
+                        if disposition in {"accepted", "covered"}:
+                            state["replan_delivery_binding"] = binding
                             state["replan_delivered"] = artifact
+                        if accepted:
                             _event(session, "research_replan_queued", artifact_id=artifact)
                             return True
             except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:

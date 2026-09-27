@@ -8178,7 +8178,10 @@ private def {serializer_prefix}_elabType
                 "      goalId.withContext do",
                 "        let target ← Lean.instantiateMVars (← goalId.getType)",
                 "        let fvars := (← Lean.getLCtx).getFVarIds.map Lean.mkFVar",
+                # Scan the same closure the residual target keeps. A hole
+                # inside a local have or let value is unresolved context.
                 "        let closed ← Lean.Meta.mkForallFVars fvars target",
+                "          (usedOnly := false) (usedLetOnly := false) (generalizeNondepLet := false)",
                 "        let closed ← Lean.instantiateMVars closed",
                 "        for hole in (← Lean.Meta.getMVarsNoDelayed closed) do",
                 "          unless ← Lean.Elab.Term.isLetRecAuxMVar hole do",
@@ -8196,7 +8199,10 @@ private def {serializer_prefix}_elabType
                 "    let fvars := lctx.getFVarIds.map Lean.mkFVar",
                 "    let closed ← Lean.Meta.mkForallFVars fvars target",
                 "      (usedOnly := false) (usedLetOnly := false) (generalizeNondepLet := false)",
-                "    let args := fvars.filter fun fvar => !(lctx.get! fvar.fvarId!).isLet",
+                # Local values, including nondependent `have` facts, stay lets
+                # in this closed target. They are not residual arguments.
+                # Ordinary hypotheses still are.
+                "    let args := fvars.filter fun fvar => !((lctx.get! fvar.fvarId!).isLet (allowNondep := true))",
                 "    let fresh ← Lean.Meta.withLCtx {} #[] <|",
                 "      Lean.Meta.mkFreshExprSyntheticOpaqueMVar closed",
                 "    let replacement := Lean.mkAppN fresh args",

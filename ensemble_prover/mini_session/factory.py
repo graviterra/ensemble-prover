@@ -6630,6 +6630,9 @@ def _register_child_graph_recursive_decompose_action(
     graph_action = session.registered_action("graph_recursive_decompose")
     graph_action._budget_remaining(session)
     session.register(GraphRootReplanAction(source_action=graph_action))
+    session.registered_action("graph_root_replan").inherit_research_replan_ancestry(
+        session
+    )
     session.set_budget(
         "graph_root_replan",
         ActionBudget(max_invocations=-1, max_total_seconds=0.0),
