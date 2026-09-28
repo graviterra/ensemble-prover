@@ -671,10 +671,40 @@ async def _run_try_lean_tool_impl(
                 "executable statement and a complete proof body."
             )
         if not graph_statement_is_executable(statement):
-            return record_preflight_error(
-                "try_lean error: formalization declarations must state an "
-                "executable Lean proposition, not data or prose."
+            # An exact graph target already confirmed in these checker inputs
+            # can submit a declaration. Arbitrary helper declarations retain
+            # the conservative context-free guard.
+            from .mini_recursive import _live_lean_capability_for_new_work
+
+            graph = getattr(dossier, "proof_graph", None)
+            context_getter = getattr(graph, "current_prop_check_context", None)
+            receipt_getter = getattr(graph, "checked_prop_admission", None)
+            context = (
+                context_getter()
+                if callable(context_getter) and callable(receipt_getter)
+                else None
             )
+            checker_identity = _live_lean_capability_for_new_work(lean)
+            exact_checked_target = False
+            if (
+                graph is not None
+                and callable(receipt_getter)
+                and statement == goal_statement
+                and context is not None
+                and context.checker_identity is checker_identity
+                and context.preamble == preamble
+                and context.helper_blocks == tuple(context_lemmas or ())
+            ):
+                exact_checked_target = any(
+                    node.statement == statement
+                    and receipt_getter(node.node_id, statement=statement) is not None
+                    for node in graph.nodes.values()
+                )
+            if not exact_checked_target:
+                return record_preflight_error(
+                    "try_lean error: formalization declarations must state an "
+                    "executable Lean proposition, not data or prose."
+                )
         if has_sorry_or_admit(body):
             return record_preflight_error(
                 "try_lean error: formalization declarations must be fully proved; "

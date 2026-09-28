@@ -45,6 +45,7 @@ from .lean_syntax import split_lean_top_level_implications
 from .proof_graph import (
     ProofGraph,
     _ROUTE_DEPENDENCY_EDGE_KINDS,
+    _graph_bare_prop_atom_name,
     _graph_binder_group_chunks,
     _helper_decl_header as graph_helper_decl_header,
     _graph_metadata_raw_lean_identities,
@@ -5211,7 +5212,7 @@ def _preserve_authoritative_reformulation_candidates(
         if (
             own_statement
             and canonical_dossier_statement_key(own_statement) != key
-            and graph_statement_is_executable(own_statement)
+            and graph.statement_is_executable(own_statement, node_id=node.node_id)
             and str(
                 node_metadata.get("formalization_rejected_bridge_reason") or ""
             ).strip()
@@ -5793,8 +5794,8 @@ def _reject_graph_native_proposals_for_statement_key(
         # candidate itself as false.
         terminalize_node = bool(
             direct_match
-            or not graph_statement_is_executable(
-                str(getattr(node, "statement", "") or "")
+            or not graph.statement_is_executable(
+                str(getattr(node, "statement", "") or ""), node_id=node.node_id
             )
         )
         if terminalize_node:
@@ -7278,7 +7279,7 @@ def _mini_recursive_dependency_statement(
             saw_invalidated = True
             continue
         statement = str(getattr(node, "statement", "") or "").strip()
-        if not graph_statement_is_executable(statement):
+        if not graph.statement_is_executable(statement, node_id=node.node_id):
             continue
         kind_rank = 0 if str(getattr(node, "kind", "") or "") == "formal_variant" else 1
         candidates.append((pass_penalty + kind_rank, node))
@@ -7450,6 +7451,7 @@ def _record_or_reuse_proposed_helper_graph_nodes(
             claim_node_id=claim.node_id,
             claim_name=name,
             statement=statement,
+            checked_admission=graph.checked_prop_admission(claim.node_id, statement=statement),
             variant_name=name,
             source=source,
             phase=phase,
@@ -15674,8 +15676,16 @@ class ProofDossier:
                 1,
             )
             return None
-        if not graph_statement_is_executable(
-            statement
+        if not (
+            graph_statement_is_executable(statement)
+            or (
+                self.proof_graph is not None
+                and self.proof_graph.may_schedule_prop_check("", statement=statement)
+                and (
+                    not _graph_bare_prop_atom_name(statement)
+                    or self.proof_graph.current_prop_check_context() is not None
+                )
+            )
         ) and not _graph_statement_is_context_bare_prop_atom(
             statement,
             root_statement=self.root_statement,
@@ -19999,6 +20009,7 @@ class ProofDossier:
                 claim_node_id=claim.node_id,
                 claim_name=claim.name,
                 statement=statement,
+                checked_admission=self.proof_graph.checked_prop_admission(claim.node_id, statement=statement),
                 variant_name=helper_name or claim.name,
                 variant_key=variant_key,
                 variant_index=variant_index,
@@ -20079,7 +20090,7 @@ class ProofDossier:
             if (
                 claim is not None
                 and (
-                    not graph_statement_is_executable(statement)
+                    not self.proof_graph.statement_is_executable(statement, node_id=claim.node_id)
                     or verdict
                     in {
                         "variant_skipped_context_free_raw",
@@ -20142,10 +20153,13 @@ class ProofDossier:
             }
 
         obligation = None
+        failure_target = variant or claim
         create_failure_obligation = bool(
             failure_reason
             and verdict != "claim_dependency_blocked"
-            and graph_statement_is_executable(statement)
+            and self.proof_graph.statement_is_executable(
+                statement, node_id=failure_target.node_id if failure_target is not None else "",
+            )
         )
         if create_failure_obligation:
             source_id = (

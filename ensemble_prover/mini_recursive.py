@@ -175,6 +175,16 @@ from .proof_dossier import (
     text_hash,
 )
 from .proof_graph import (
+    _graph_binder_context_after_let,
+    _graph_binder_context_names,
+    _graph_lean_identifier_tokens,
+    _graph_local_name_key,
+    _graph_pattern_bindings,
+    _graph_quantified_non_prop_codomain,
+    _graph_parse_match_term,
+    _graph_statement_may_check_prop,
+    _graph_strip_balanced_outer_parens,
+    _graph_top_level_let_parts,
     graph_statement_contract_ambiguities,
     graph_statement_explicit_arity,
     graph_statement_is_executable,
@@ -182,6 +192,7 @@ from .proof_graph import (
     graph_statement_is_root_bridge,
     graph_statement_premises_and_conclusion,
     graph_statement_nonproof_parameter_profile,
+    graph_statement_non_theorem_reason,
     graph_statement_root_equivalent,
     graph_statement_key,
 )
@@ -11736,8 +11747,10 @@ def _plan_root_route_identity_set(
     )
 
 
-def _recursive_lean_library_hash(project_roots: Sequence[str] | str) -> str:
-    """Hash the Lean project inputs that can change theorem availability."""
+def _recursive_lean_library_hash(
+    project_roots: Sequence[str] | str, *, scratch_roots: Sequence[str] = (),
+) -> str:
+    """Hash library inputs without including transient verifier artifacts."""
 
     raw_roots = (
         [project_roots] if isinstance(project_roots, str) else list(project_roots or ())
@@ -11745,6 +11758,23 @@ def _recursive_lean_library_hash(project_roots: Sequence[str] | str) -> str:
     roots = [Path(str(item)).expanduser() for item in raw_roots if str(item).strip()]
     if not roots:
         return ""
+    managed_scratch_roots: set[Path] = set()
+    scratch_candidates: list[str | Path] = [
+        *(root / "Temp" for root in roots), *scratch_roots,
+    ]
+    for scratch in scratch_candidates:
+        try:
+            managed_scratch_roots.add(Path(scratch).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+    # LeanRunner reserves these randomized filenames for one check. Other
+    # workers may create/remove them between checkpoint capture and resume.
+    # Keep ordinary modules in Temp, and identically named files elsewhere,
+    # in the library identity; the directory alone grants no exclusion.
+    generated_source = re.compile(
+        r"(?:.+_[0-9a-f]{32}|MiniSourceEquiv[0-9a-f]{32}(?:Probe)?)"
+    )
+    generated_compiled_module = re.compile(r"MiniSourceEquiv[0-9a-f]{32}")
     hasher = hashlib.sha256()
     found = False
     for root_index, project in enumerate(dict.fromkeys(roots)):
@@ -11773,6 +11803,17 @@ def _recursive_lean_library_hash(project_roots: Sequence[str] | str) -> str:
         for path in sorted(set(candidates)):
             try:
                 if not path.is_file():
+                    continue
+                if (
+                    (
+                        (path.suffix == ".lean" and generated_source.fullmatch(path.stem))
+                        or (
+                            path.suffix == ".olean"
+                            and generated_compiled_module.fullmatch(path.stem)
+                        )
+                    )
+                    and path.parent.resolve() in managed_scratch_roots
+                ):
                     continue
                 relative = path.relative_to(project)
                 content = path.read_bytes()
@@ -11864,6 +11905,13 @@ def _recursive_runtime_component_identity(component: Any) -> dict[str, Any]:
     )
     support_builds = dict(getattr(cfg_obj, "support_project_builds", {}) or {})
     library_roots.extend(str(item) for item in support_builds)
+    scratch_roots: list[str] = []
+    configured_scratch = getattr(cfg_obj, "scratch_dir", "")
+    if type(configured_scratch) is str and configured_scratch.strip():
+        scratch_roots.append(configured_scratch.strip())
+    runtime_scratch = getattr(component, "temp_dir", None)
+    if isinstance(runtime_scratch, (str, Path)) and str(runtime_scratch).strip():
+        scratch_roots.append(str(runtime_scratch))
     return {
         "class": (
             f"{type(component).__module__}.{type(component).__qualname__}"
@@ -11873,7 +11921,9 @@ def _recursive_runtime_component_identity(component: Any) -> dict[str, Any]:
         "configured": configured,
         "configured_chain": configured_chain,
         "executable_chain": executable_chain,
-        "library_hash": _recursive_lean_library_hash(library_roots),
+        "library_hash": _recursive_lean_library_hash(
+            library_roots, scratch_roots=scratch_roots,
+        ),
         "retrieval_snapshot_id": str(
             getattr(component, "compatibility_snapshot_id", "")
             or getattr(component, "index_snapshot_id", "")
@@ -16801,7 +16851,48 @@ def _malformed_statement_surface_reason(statement: str) -> str:
         re.search(r"(?:^|;)\s*have\b", leading)
         and not graph_statement_is_executable(text)
     ):
-        return "contains local proof-script residue (`have`) instead of a proposition"
+        # A complete have term may need Lean elaboration even when the pure
+        # classifier cannot establish its result sort. Bound its surface before
+        # inspecting the existing local-binding and final-codomain classifiers.
+        residue_reason = "contains local proof-script residue (`have`) instead of a proposition"
+        if not _graph_statement_may_check_prop(text):
+            return residue_reason
+        tail = _graph_strip_balanced_outer_parens(leading)
+        binder_context = ""
+        for _ in range(32):
+            is_have = tail.startswith(("have ", "have\n"))
+            if not is_have and not tail.startswith(("let ", "let\n")):
+                break
+            binding, body = _graph_top_level_let_parts("let" + tail[4:] if is_have else tail)
+            if not binding or not body:
+                break
+            binder_context = _graph_binder_context_after_let(
+                binder_context, binding, is_have=is_have,
+            )
+            tail = _graph_strip_balanced_outer_parens(body)
+        match = _graph_parse_match_term(tail, 0)
+        local_names = {
+            _graph_local_name_key(name)
+            for name in _graph_binder_context_names(binder_context)
+        }
+        # Only context-free data arms are certainly non-propositions here.
+        # Pattern payloads hide outer names even when their types are unknown;
+        # dependent or locally bound arms must reach the trusted Lean check.
+        known_data_match = bool(
+            match is not None and not tail[match[0]:].strip()
+            and match[1] and len(match[1]) == len(match[3])
+            and all(
+                not _graph_pattern_bindings(pattern, "")
+                and not local_names.intersection(
+                    _graph_local_name_key(name)
+                    for name in _graph_lean_identifier_tokens(arm)
+                )
+                and graph_statement_non_theorem_reason(arm)
+                for pattern, arm in zip(match[3], match[1])
+            )
+        )
+        if _graph_quantified_non_prop_codomain(tail, binder_context) or known_data_match:
+            return residue_reason
     return ""
 
 
@@ -30997,12 +31088,14 @@ async def run_mini_recursive_driver(
                         type_ok,
                         type_inconclusive,
                         type_output,
-                    ) = await _typecheck_claim_statement(
-                        lean=lean,
-                        statement=variant.statement,
-                        preamble=current_lean_check_preamble(),
-                        helpers=get_helpers(),
-                        timeout_s=float(config.tactic_timeout_s),
+                    ) = await _typecheck_recursive_statement_with_admission(
+                        lean=lean, statement=variant.statement,
+                        preamble=current_lean_check_preamble(), helpers=get_helpers(),
+                        timeout_s=float(config.tactic_timeout_s), dossier=dossier,
+                        record_event=record_event,
+                        claim_record={"pass_index": pass_index, "claim_index": claim_index,
+                                      "variant_index": variant_index, "claim_name": claim.name,
+                                      "helper_name": helper_name, "variant_mode": variant.mode},
                     )
                     stats.claim_type_checks += 1
                 if type_inconclusive:
@@ -31056,12 +31149,15 @@ async def run_mini_recursive_driver(
                             repaired_ok,
                             repaired_inconclusive,
                             repaired_output,
-                        ) = await _typecheck_claim_statement(
-                            lean=lean,
-                            statement=repaired_statement,
-                            preamble=current_lean_check_preamble(),
-                            helpers=get_helpers(),
-                            timeout_s=float(config.tactic_timeout_s),
+                        ) = await _typecheck_recursive_statement_with_admission(
+                            lean=lean, statement=repaired_statement,
+                            preamble=current_lean_check_preamble(), helpers=get_helpers(),
+                            timeout_s=float(config.tactic_timeout_s), dossier=dossier,
+                            record_event=record_event,
+                            claim_record={"pass_index": pass_index, "claim_index": claim_index,
+                                          "variant_index": variant_index, "claim_name": claim.name,
+                                          "helper_name": helper_name,
+                                          "variant_mode": f"{variant.mode}_statement_repair"},
                         )
                         last_repaired_output = repaired_output
                         last_repair_inconclusive = repaired_inconclusive
@@ -36918,6 +37014,54 @@ async def _request_plan(
     return plan
 
 
+async def _typecheck_recursive_statement_with_admission(
+    *, lean: Any, statement: str, preamble: str, helpers: Sequence[Any],
+    timeout_s: float, dossier: Any, record_event: Optional[RecordEvent],
+    claim_record: Mapping[str, Any],
+) -> tuple[bool, bool, str]:
+    """Publish live Prop admission only from this exact checker continuation."""
+
+    graph = getattr(dossier, "proof_graph", None)
+    project = getattr(dossier, "_record_mini_recursive_graph_native_event", None)
+    ticket = None
+    helper_blocks = tuple(str(item or "") for item in helpers if str(item or "").strip())
+    checker = _live_lean_capability_for_new_work(lean)
+    if (graph is not None and callable(project)
+            and callable(getattr(checker, "check_proposition_type_raw", None))
+            and graph.may_schedule_prop_check("", statement=statement)):
+        pending = dict(claim_record)
+        pending.update(phase="mini_recursive_claim_typecheck", statement=statement,
+                       verdict="variant_typecheck_pending")
+        projected = project(pending)
+        claim_id = str(projected.get("claim_id") or "")
+        ticket = graph.begin_prop_check(claim_id, statement=statement) if claim_id else None
+        if ticket is not None and not (
+            ticket.context.checker_identity is checker
+            and ticket.context.preamble == preamble
+            and ticket.context.helper_blocks == helper_blocks
+        ):
+            graph.discard_prop_check(ticket)
+            ticket = None
+    try:
+        result = await _typecheck_claim_statement(
+            lean=checker, statement=statement, preamble=preamble, helpers=helper_blocks,
+            timeout_s=timeout_s,
+        )
+        if ticket is not None and graph is not None:
+            # The recorder is the driver's dispatch publication guard. This
+            # neutral notification carries no executable or proof authority.
+            _record(record_event, {"phase": "mini_recursive_statement_admission",
+                                  "verdict": "statement_check_completed"})
+            if not graph.prop_check_is_current(ticket):
+                return False, True, "Proposition check context changed before admission"
+            if result[0] and not result[1] and graph.confirm_prop_check(ticket) is None:
+                return False, True, "Proposition check context changed before admission"
+        return result
+    finally:
+        if ticket is not None and graph is not None:
+            graph.discard_prop_check(ticket)
+
+
 async def _typecheck_claim_statement(
     *,
     lean: Any,
@@ -36945,6 +37089,15 @@ async def _typecheck_claim_statement(
         op_timeout = 30.0
 
     async def _run_typecheck() -> Any:
+        proposition_checker = getattr(lean, "check_proposition_type_raw", None)
+        if callable(proposition_checker):
+            return (
+                "proposition_raw",
+                await proposition_checker(
+                    stmt, helper_blocks, preamble_override=preamble,
+                    timeout_s=operation_timeout_s,
+                ),
+            )
         checker = getattr(lean, "check_with_sorry_raw", None)
         if checker is not None:
             return (
@@ -36999,14 +37152,13 @@ async def _typecheck_claim_statement(
     except Exception as exc:
         return False, True, f"{type(exc).__name__}: {exc}"
 
-    if kind == "sorry_raw":
+    if kind in {"sorry_raw", "proposition_raw"}:
         parsed, output, returncode = payload
         out = str(output or "")
         if (
             bool(getattr(parsed, "timeout", False))
             or bool(getattr(parsed, "infra_failure", False))
-            or has_timeout(out)
-            or has_infra_failure(out)
+            or (kind == "sorry_raw" and (has_timeout(out) or has_infra_failure(out)))
         ):
             return (
                 False,

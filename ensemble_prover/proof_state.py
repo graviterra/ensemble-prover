@@ -12944,7 +12944,13 @@ class ProofSearchState:
             if metadata.get("formalization_required"):
                 note_skip(obligation, "formalization_required")
                 continue
-            if not graph_statement_is_executable(statement):
+            statement_checker = getattr(graph, "statement_is_executable", None)
+            statement_is_executable = (
+                statement_checker(statement, node_id=obligation.node_id)
+                if callable(statement_checker)
+                else graph_statement_is_executable(statement)
+            )
+            if not statement_is_executable:
                 note_skip(obligation, "non_executable")
                 continue
             route_id = str(metadata.get("route_id") or "").strip()
@@ -15031,7 +15037,18 @@ class ProofSearchState:
                     ),
                 )
                 if record.get("formalization_required"):
-                    if graph_statement_is_executable(target):
+                    statement_checker = getattr(graph, "statement_is_executable", None)
+                    statement_is_executable = (
+                        statement_checker(
+                            target,
+                            node_id=str(
+                                record.get("graph_node_id") or record.get("node_id") or ""
+                            ),
+                        )
+                        if callable(statement_checker)
+                        else graph_statement_is_executable(target)
+                    )
+                    if statement_is_executable:
                         move = "prove this formalized manufactured obligation or split it into smaller checked bridges"
                     else:
                         move = (

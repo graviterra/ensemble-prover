@@ -10219,6 +10219,66 @@ def _isolated_dispatch_tail_blocks_scheduler(
     return True
 
 
+def bind_session_statement_admission(session: Any) -> Any:
+    """Return a bound admission graph, or None when the capability is absent."""
+
+    from ensemble_prover.statement_admission import PropAdmissionContext
+
+    dossier = getattr(session, "dossier", None)
+    graph = getattr(dossier, "proof_graph", None)
+    if graph is None or not callable(getattr(graph, "bind_statement_admission", None)):
+        return None
+
+    def current_context() -> Any:
+        # Resolve through the live owner on every read: replacing the dossier,
+        # conversation, checker or helper set must invalidate prior admissions.
+        live_dossier = getattr(session, "dossier", None)
+        if getattr(live_dossier, "proof_graph", None) is not graph:
+            return None
+        from ensemble_prover.mini_recursive import _live_lean_capability_for_new_work
+
+        lean = _live_lean_capability_for_new_work(getattr(session, "lean", None))
+        if lean is None:
+            return None
+        conv = getattr(session, "conv", None)
+        if conv is None:
+            return None
+        cfg = getattr(lean, "cfg", None)
+        project = str(getattr(lean, "project_dir", "") or getattr(cfg, "project_dir", ""))
+        from pathlib import Path
+
+        toolchain = ""
+        if project:
+            try:
+                toolchain = (Path(project) / "lean-toolchain").read_text()
+            except OSError:
+                toolchain = ""
+        from ensemble_prover.lean_server import LeanREPL
+
+        environment_generation = int(getattr(lean, "_execution_environment_generation", 0) or 0)
+        environment_epoch = LeanREPL.global_env_epoch(str(Path(project).resolve())) if project else 0
+        execution_helpers = getattr(live_dossier, "execution_helper_blocks", None)
+        if callable(execution_helpers):
+            helper_blocks = tuple(execution_helpers(refresh_quality=False))
+        else:
+            helpers = getattr(live_dossier, "verified_helper_blocks_snapshot", None)
+            if not callable(helpers):
+                helpers = getattr(live_dossier, "verified_helper_blocks", None)
+            helper_blocks = tuple(helpers()) if callable(helpers) else ()
+        return PropAdmissionContext(
+            preamble=str(getattr(conv, "lean_preamble", "") or getattr(conv, "preamble", "") or ""),
+            helper_blocks=helper_blocks,
+            environment_stamp=str(getattr(live_dossier, "current_lean_environment_hash", "") or ""),
+            checker_identity=lean,
+            project_identity=project,
+            toolchain_identity=repr((toolchain, cfg, environment_generation, environment_epoch)),
+            target_context=str(getattr(conv, "goal_statement", "") or ""),
+        )
+
+    graph.bind_statement_admission(owner=session, context_supplier=current_context)
+    return graph
+
+
 @dataclass
 class MiniSession:
     """Owner of cross-action state for one prove invocation.
@@ -10267,9 +10327,24 @@ class MiniSession:
                 self.lean = current_generation()
             except Exception:
                 pass
+        bind_session_statement_admission(self)
         session_ref = weakref.ref(self, _discard_live_mini_session_ref)
         with _LIVE_MINI_SESSION_REFS_LOCK:
             _LIVE_MINI_SESSION_REFS.append(session_ref)
+
+    def _graph_statement_is_executable(
+        self, statement: str, *, record: Optional[Mapping[str, Any]] = None,
+        node_id: str = "",
+    ) -> bool:
+        graph = bind_session_statement_admission(self)
+        payload = dict(record if record is not None else self.selected_work_item_record or {})
+        if not node_id:
+            node_id = str(payload.get("variant_id") or payload.get("obligation_id")
+                          or payload.get("claim_id") or payload.get("graph_node_id")
+                          or payload.get("node_id") or "")
+        if graph is None:
+            return graph_statement_is_executable(statement)
+        return graph.statement_is_executable(statement, node_id=node_id)
 
     def planner_job_broker(self, *, create: bool = True) -> Optional[PlannerJobBroker]:
         """Return the process-local broker shared by this recursive lane."""
@@ -12878,7 +12953,7 @@ class MiniSession:
         if ticket is None:
             return ""
         candidate = str(getattr(ticket, "target_statement", "") or "").strip()
-        if not candidate or not graph_statement_is_executable(candidate):
+        if not candidate or not self._graph_statement_is_executable(candidate, record=record):
             return ""
         dossier = getattr(self, "dossier", None)
         graph = getattr(dossier, "proof_graph", None) if dossier is not None else None
@@ -15049,7 +15124,7 @@ class MiniSession:
         target_statement = str(selected.get("target_statement") or "").strip()
         if not target_statement and target_node is not None:
             target_statement = str(getattr(target_node, "statement", "") or "").strip()
-        if target_statement and not graph_statement_is_executable(target_statement):
+        if target_statement and not self._graph_statement_is_executable(target_statement, node_id=target_id):
             target_statement = ""
         rejection_fragments = [
             str(item or "").strip()
@@ -20346,7 +20421,6 @@ class MiniSession:
             if not text:
                 return False
             try:
-                from ensemble_prover.proof_graph import graph_statement_is_executable
                 from ensemble_prover.proof_dossier import (
                     is_answer_unsafe_statement_text,
                 )
@@ -20384,7 +20458,7 @@ class MiniSession:
                 return False
             if root_equivalent(text):
                 return False
-            return bool(graph_statement_is_executable(text))
+            return self._graph_statement_is_executable(text, record=merged)
 
         target_statement = str(merged.get("target_statement") or "").strip()
         if target_statement and not formalization_required:
@@ -20532,7 +20606,7 @@ class MiniSession:
             ).strip()
             if formalization_required and (
                 not target_statement
-                or not graph_statement_is_executable(target_statement)
+                or not self._graph_statement_is_executable(target_statement, record=merged)
             ):
                 logical_key = self._frontier_materialization_logical_key(work_item)
                 recovery_count = int(
@@ -34308,7 +34382,9 @@ class MiniSession:
         )
         if not pending:
             return ("", "", "", "", "")
-        if target_statement and graph_statement_is_executable(target_statement):
+        if target_statement and self._graph_statement_is_executable(
+            target_statement, record=self._work_item_to_record(work_item)
+        ):
             return ("", "", "", "", "")
         route_id = str(field("route_id") or "").strip()
         target_hash = str(field("target_hash") or "").strip()
@@ -35425,8 +35501,7 @@ class MiniSession:
             ]
         return []
 
-    @staticmethod
-    def _selected_work_target_resource_kind(record: Mapping[str, Any]) -> str:
+    def _selected_work_target_resource_kind(self, record: Mapping[str, Any]) -> str:
         """Return the typed execution resource carried by selected work.
 
         This deliberately separates a mathematical statement from a
@@ -35441,7 +35516,7 @@ class MiniSession:
             or payload.get("target_statement")
             or ""
         ).strip()
-        if target and graph_statement_is_executable(target):
+        if target and self._graph_statement_is_executable(target, record=payload):
             return "executable_statement"
         if str(payload.get("materialization_seed") or "").strip():
             return "materialization_seed"
@@ -35485,6 +35560,42 @@ class MiniSession:
         record = self._work_item_to_record(work_item)
         work_type = str(record.get("work_type") or "").strip()
         candidate_ids = list(self._frontier_candidate_ids_for_work_type(work_type))
+        graph = bind_session_statement_admission(self)
+        candidate_node_id = str(record.get("variant_id") or record.get("obligation_id")
+                                or record.get("claim_id") or record.get("graph_node_id")
+                                or record.get("node_id") or "")
+        from ensemble_prover.mini_session.actions.conversation_turn import (
+            _GRAPH_NATIVE_PROOF_WORK_TYPES,
+        )
+
+        graph_target_work = work_type in _GRAPH_NATIVE_PROOF_WORK_TYPES
+        # Proof-state node IDs use a separate namespace (including "root").
+        # Only graph-native work can inherit a graph node's admission state.
+        candidate_node = (
+            getattr(graph, "nodes", {}).get(candidate_node_id)
+            if graph_target_work else None
+        )
+        if (candidate_node is not None
+                and not graph.statement_is_executable(candidate_node.statement, node_id=candidate_node_id)
+                and graph.may_schedule_prop_check(candidate_node_id)):
+            # Keep the existing deterministic path for a bare Prop atom
+            # bound by the parent context. Other pending statements still
+            # require the conversation action's local proposition preflight.
+            from ensemble_prover.mini_session.actions.graph_native_shortcut import (
+                GraphNativeShortcutAction,
+            )
+
+            local_formalization = (
+                work_type == "formalize_claim"
+                and GraphNativeShortcutAction._can_formalize_claim(
+                    graph, candidate_node, self, record
+                )
+            )
+            return [
+                action_id for action_id in candidate_ids
+                if str(action_id).startswith("conversation_turn")
+                or (action_id == "graph_native_shortcut" and local_formalization)
+            ]
         resource_kind = self._selected_work_target_resource_kind(record)
         if resource_kind == "missing" and self._frontier_item_executable_statement(
             work_item,
@@ -40096,7 +40207,6 @@ class MiniSession:
             from ensemble_prover.proof_graph import (
                 graph_node_frontier_promoted_to_proof_state,
                 graph_node_frontier_quarantined,
-                graph_statement_is_executable,
             )
             from ensemble_prover.proof_dossier import is_answer_unsafe_statement_text
         except Exception:
@@ -40104,7 +40214,7 @@ class MiniSession:
         dossier = getattr(self, "dossier", None)
         graph = getattr(dossier, "proof_graph", None) if dossier is not None else None
         nodes = getattr(graph, "nodes", {}) if graph is not None else {}
-        if not isinstance(nodes, dict):
+        if graph is None or not isinstance(nodes, dict):
             return ""
         root_statement = str(getattr(dossier, "root_statement", "") or "").strip()
 
@@ -40229,7 +40339,11 @@ class MiniSession:
                 return ""
             if root_equivalent(statement):
                 return ""
-            return statement if graph_statement_is_executable(statement) else ""
+            return (
+                statement
+                if self._graph_statement_is_executable(statement, node_id=obligation_id)
+                else ""
+            )
         field_order_by_work_type = {
             "formalize_claim": ("claim_id", "graph_node_id", "node_id"),
             "formalize_missing_obligation": (
@@ -40301,7 +40415,7 @@ class MiniSession:
                 and not materialization_root_equiv_allowed
             ):
                 continue
-            if graph_statement_is_executable(statement):
+            if self._graph_statement_is_executable(statement, node_id=node_id):
                 return statement
         return ""
 

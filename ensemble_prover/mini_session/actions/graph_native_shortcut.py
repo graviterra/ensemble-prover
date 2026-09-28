@@ -7,7 +7,6 @@ from typing import Any, ClassVar, Dict, FrozenSet, Optional
 
 from ensemble_prover.proof_graph import (
     _graph_statement_is_context_bare_prop_atom,
-    graph_statement_is_executable,
     graph_node_frontier_promoted_to_proof_state,
     graph_node_frontier_quarantined,
 )
@@ -252,8 +251,8 @@ class GraphNativeShortcutAction:
             and not context_bare_prop_atom
         ):
             return False
-        if not graph_statement_is_executable(
-            statement
+        if not graph.statement_is_executable(
+            statement, node_id=claim.node_id
         ) and not context_bare_prop_atom:
             return False
         return not cls._matching_variant_exists(graph, claim.node_id, statement)
@@ -441,6 +440,7 @@ class GraphNativeShortcutAction:
                 claim_node_id=node.node_id,
                 claim_name=str(getattr(node, "name", "") or ""),
                 statement=statement,
+                checked_admission=graph.checked_prop_admission(node.node_id, statement=statement),
                 variant_name=str(getattr(node, "name", "") or "formal"),
                 source=self.id,
                 phase=self.id,

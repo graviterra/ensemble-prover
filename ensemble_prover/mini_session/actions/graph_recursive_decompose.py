@@ -34,7 +34,6 @@ from ...llm_error_policy import (
 )
 from ...llm_usage import llm_usage_context_metadata
 from ...proof_graph import (
-    graph_statement_is_executable,
     graph_statement_root_equivalent,
 )
 from ...proof_dossier import (
@@ -1422,7 +1421,7 @@ class GraphRecursiveDecomposeAction:
                 "mini_session_graph_recursive_decompose_root_equivalent_skipped",
             )
             return False
-        if not graph_statement_is_executable(statement):
+        if not graph.statement_is_executable(statement, node_id=obligation_id):
             self._bump_metric(
                 session, "mini_session_graph_recursive_decompose_non_executable_skipped"
             )
@@ -1765,7 +1764,7 @@ class GraphRecursiveDecomposeAction:
                     "strong_progress": False,
                 },
             )
-        if not graph_statement_is_executable(statement):
+        if not graph.statement_is_executable(statement, node_id=obligation_id):
             return MiniOutcome(
                 action_id=self.id,
                 solved=False,

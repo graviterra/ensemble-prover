@@ -18,7 +18,7 @@ from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from threading import Lock, local
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .lean_decl_parser import find_decl_header_end
 from .math_utils import (
@@ -42,6 +42,10 @@ from .contract_identity import (
     parse_lean_contract_identity,
 )
 from .proof_lineage import ProofLineageEnvelope
+from .statement_admission import (
+    CheckedPropAdmission, PropAdmissionBinding, PropAdmissionContext,
+    PropAdmissionRegistry, PropCheckTicket, StatementAdmission,
+)
 from .utils import (
     contains_metavariable_placeholder,
     has_sorry_or_admit,
@@ -1416,6 +1420,27 @@ def _graph_compact_lean_whitespace(
     )
 
 
+_GRAPH_PROCEDURAL_TARGET_PREFIXES = (
+    "claim has ",
+    "claim was ",
+    "convert ",
+    "formalize ",
+    "state ",
+    "show that ",
+    "prove that ",
+    "derive ",
+    "explain ",
+    "construct ",
+    "prove missing dependency ",
+    "missing dependency ",
+    "sample check ",
+    "formal variant ",
+    "variant ",
+    "tactic rejected",
+    "claim exhausted",
+)
+
+
 def _graph_statement_looks_like_prose_instruction(text: str) -> bool:
     compact = graph_identity_text(text)
     if not compact:
@@ -2293,27 +2318,55 @@ def _graph_fun_arg_arity(args_text: str) -> int | None:
     return count
 
 
-def _graph_fun_rhs_prop_arity(rhs: str) -> int | None:
+def _graph_parameter_binder_context(binder_context: str, parameters: str) -> str:
+    """Keep unknown parameter types from inheriting an outer name's type."""
+
+    for chunk in _graph_binder_group_chunks(parameters):
+        body = _graph_unwrap_binder_group(chunk)
+        if _graph_top_level_token_index(body, ":") < 0:
+            names = _graph_binder_names_from_chunk(chunk)
+            if not names:
+                continue
+            chunk = f"({' '.join(names)} : Type)"
+        binder_context = _graph_join_binder_context(binder_context, chunk)
+    return binder_context
+
+
+def _graph_literal_prop_atom(text: str, binder_context: str) -> bool:
+    name = _graph_local_name_key(graph_identity_text(text))
+    if name not in {"True", "False"}:
+        return False
+    local_names = {
+        _graph_local_name_key(local)
+        for local in _graph_binder_context_names(binder_context)
+    }
+    return name not in local_names or _graph_scoped_prop_atom(text, binder_context)
+
+
+def _graph_fun_rhs_prop_arity(rhs: str, binder_context: str = "") -> int | None:
     clean = graph_identity_text(rhs)
     parts = split_lean_top_level_implications(clean)
     if len(parts) >= 2 and graph_identity_text(parts[-1]) == "Prop":
         return None
     lambda_parts = _graph_leading_lambda_parts(clean)
     if lambda_parts is None:
-        if clean in {"True", "False"} or _graph_contains_top_level_proposition_marker(
+        if _graph_literal_prop_atom(clean, binder_context) or _graph_contains_top_level_proposition_marker(
             clean
         ):
             return 0
         return None
     args_text, body = lambda_parts
+    body_context = _graph_parameter_binder_context(binder_context, args_text)
     if not body or not (
-        body in {"True", "False"} or _graph_contains_top_level_proposition_marker(body)
+        _graph_literal_prop_atom(body, body_context) or _graph_contains_top_level_proposition_marker(body)
     ):
         return None
     return _graph_fun_arg_arity(args_text)
 
 
-def _graph_let_binding_prop_signature(binding: str) -> Tuple[str, int] | Tuple[str, None]:
+def _graph_let_binding_prop_signature(
+    binding: str, binder_context: str = "",
+) -> Tuple[str, int] | Tuple[str, None]:
     binding_text = graph_identity_text(binding)
     bind_match = re.match(
         rf"let\s+(?:rec\s+)?({_GRAPH_LEAN_IDENTIFIER_PATTERN})(?P<tail>.*)$",
@@ -2334,7 +2387,12 @@ def _graph_let_binding_prop_signature(binding: str) -> Tuple[str, int] | Tuple[s
     if colon_index >= 0 and colon_index < annotation_end:
         arity = _graph_prop_annotation_arity(binding_text[colon_index:annotation_end])
     if arity is None and assign_index >= 0:
-        arity = _graph_fun_rhs_prop_arity(binding_text[assign_index + 2 :])
+        parameter_end = colon_index if 0 <= colon_index < annotation_end else annotation_end
+        parameters = binding_text[bind_match.end(1):parameter_end].strip()
+        rhs_context = _graph_parameter_binder_context(binder_context, parameters)
+        if re.match(r"let\s+rec\b", binding_text):
+            rhs_context = _graph_join_binder_context(rhs_context, f"({name} : Type)")
+        arity = _graph_fun_rhs_prop_arity(binding_text[assign_index + 2 :], rhs_context)
     return name, arity
 
 
@@ -2401,6 +2459,7 @@ def _graph_let_body_is_plausibly_local_prop(
     text: str,
     *,
     binding: str = "",
+    binder_context: str = "",
 ) -> bool:
     compact = graph_identity_text(text)
     if not compact:
@@ -2427,7 +2486,7 @@ def _graph_let_body_is_plausibly_local_prop(
         )
     ):
         return False
-    prop_head, prop_arity = _graph_let_binding_prop_signature(binding)
+    prop_head, prop_arity = _graph_let_binding_prop_signature(binding, binder_context)
     if not prop_head or prop_arity is None:
         return False
     arg_count = _graph_application_arg_count(compact, prop_head)
@@ -2948,19 +3007,52 @@ def _graph_let_value_has_residue(binding: str) -> bool:
     return _graph_fragment_has_syntax_residue(value)
 
 
+class _GraphBinderContext(str):
+    """Scope text with immutable origins for synthesized declaration names.
+
+    The metadata is produced only by context construction, never decoded from
+    user spellings. It remains local to one classifier traversal.
+    """
+
+    __slots__ = ("source_names",)
+    source_names: Tuple[Tuple[str, str], ...]
+
+    def __new__(
+        cls, text: str, source_names: Iterable[Tuple[str, str]] = ()
+    ) -> "_GraphBinderContext":
+        result = super().__new__(cls, text)
+        object.__setattr__(result, "source_names", tuple(source_names))
+        return result
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("binder context provenance is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("binder context provenance is immutable")
+
+
+def _graph_join_binder_context(*parts: str) -> str:
+    """Compose scope records without dropping generated-name provenance."""
+
+    source_names: Dict[str, str] = {}
+    for part in parts:
+        if isinstance(part, _GraphBinderContext):
+            source_names.update(part.source_names)
+    text = ", ".join(part for part in parts if part)
+    return _GraphBinderContext(text, source_names.items()) if source_names else text
+
+
 def _graph_binder_context_after_let(
     binder_context: str, binding: str, *, is_have: bool = False
 ) -> str:
     """Hide an outer name with a local let or a destructuring pattern."""
 
-    name, arity = _graph_let_binding_prop_signature(binding)
+    name, arity = _graph_let_binding_prop_signature(binding, binder_context)
     if not name:
         additions = _graph_let_destructuring_additions(binding, binder_context)
         if not additions:
             return binder_context
-        return ", ".join(
-            [binder_context, *additions] if binder_context else additions
-        )
+        return _graph_join_binder_context(binder_context, *additions)
     assignment = _graph_top_level_token_index(binding, ":=")
     colon = _graph_top_level_token_index(binding, ":")
     annotation = (
@@ -2997,7 +3089,7 @@ def _graph_binder_context_after_let(
         # The context is a surface scope record, not submitted Lean source.
         # Let definitions are not reverted as hypotheses by dependent matches.
         addition = "(let " + addition[1:]
-    return ", ".join(part for part in (binder_context, addition) if part)
+    return _graph_join_binder_context(binder_context, addition)
 
 
 def _graph_split_top_level_symbol(text: str, symbol: str) -> List[str]:
@@ -3077,13 +3169,27 @@ def _graph_scrutinee_type_text(scrutinee: str, binder_context: str) -> str:
     compact = _graph_strip_balanced_outer_parens(graph_identity_text(scrutinee))
     name = _graph_unicode_identifier_name(compact)
     if name and name == compact:
-        return _graph_binder_type_signatures(binder_context).get(name, "")
+        return _graph_pattern_type_hint(
+            _graph_binder_type_signatures(binder_context).get(name, ""), binder_context,
+        )
     subject, sort = _graph_top_level_ascription(compact)
     if subject and sort:
-        return graph_identity_text(sort)
+        return _graph_pattern_type_hint(graph_identity_text(sort), binder_context)
     if compact.startswith("some ") or compact.startswith("some("):
         payload = _graph_strip_balanced_outer_parens(compact[5:].strip())
-        if payload in {"True", "False"}:
+        local_names = {
+            _graph_local_name_key(local)
+            for local in _graph_binder_context_names(binder_context)
+        }
+        if "some" in local_names:
+            return ""
+        if _graph_local_name_key(payload) in local_names:
+            annotation = _graph_binder_type_signatures(binder_context).get(payload, "")
+            if not annotation:
+                return ""
+            argument = annotation if _graph_unicode_identifier_name(annotation) == annotation else f"({annotation})"
+            return f"Option {argument}"
+        if _graph_literal_prop_atom(payload, binder_context):
             return "Option Prop"
         if payload in {"true", "false"}:
             return "Option Bool"
@@ -3207,8 +3313,22 @@ def _graph_pattern_arguments(tail: str) -> Tuple[List[str], str]:
         rest = new_tail
 
 
+def _graph_pattern_type_hint(type_text: str, binder_context: str) -> str:
+    """Structural payload inference cannot resolve locally bound type heads."""
+
+    if type_text and binder_context:
+        names = {
+            _graph_local_name_key(name): name
+            for name in _graph_binder_context_names(binder_context)
+        }
+        _rewritten, references = _graph_annotation_local_references(type_text, names)
+        if references:
+            return ""
+    return type_text
+
+
 def _graph_pattern_bindings(
-    pattern: str, type_text: str, depth: int = 0
+    pattern: str, type_text: str, depth: int = 0, *, binder_context: str = "",
 ) -> List[Tuple[str, str]]:
     """Return names bound by one pattern and the type text recorded for each.
 
@@ -3224,6 +3344,7 @@ def _graph_pattern_bindings(
         return []
     if depth >= _GRAPH_PATTERN_WALK_LIMIT:
         return [(name, "Type") for name in _graph_pattern_fallback_names(raw)]
+    type_text = _graph_pattern_type_hint(type_text, binder_context)
     alias_at = _graph_find_top_level_symbol(raw, "@", 0)
     if alias_at > 0:
         left = raw[:alias_at].strip()
@@ -3238,18 +3359,18 @@ def _graph_pattern_bindings(
                 found.append(
                     (left_name, _graph_pattern_binder_annotation(type_text))
                 )
-            found.extend(_graph_pattern_bindings(right, type_text, depth + 1))
+            found.extend(_graph_pattern_bindings(right, type_text, depth + 1, binder_context=binder_context))
             return found
     subject, sort = _graph_top_level_ascription(raw)
     if subject and sort:
         return _graph_pattern_bindings(
-            subject, graph_identity_text(sort), depth + 1
+            subject, graph_identity_text(sort), depth + 1, binder_context=binder_context,
         )
     cons_parts = _graph_split_top_level_symbol(raw, "::")
     if len(cons_parts) > 1:
         found = []
         for part in cons_parts:
-            found.extend(_graph_pattern_bindings(part, "", depth + 1))
+            found.extend(_graph_pattern_bindings(part, "", depth + 1, binder_context=binder_context))
         return found
     if raw[0] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
         end = _graph_matching_group_index(raw, 0)
@@ -3264,10 +3385,10 @@ def _graph_pattern_bindings(
                 for index, part in enumerate(parts):
                     component = components[index] if index < len(components) else ""
                     found.extend(
-                        _graph_pattern_bindings(part, component, depth + 1)
+                        _graph_pattern_bindings(part, component, depth + 1, binder_context=binder_context)
                     )
                 return found
-            return _graph_pattern_bindings(inner, type_text, depth + 1)
+            return _graph_pattern_bindings(inner, type_text, depth + 1, binder_context=binder_context)
     head, tail = _graph_pattern_head(raw)
     if not head:
         return [(name, "Type") for name in _graph_pattern_fallback_names(raw)]
@@ -3282,7 +3403,7 @@ def _graph_pattern_bindings(
     base = _graph_head_base_name(head[1:] if head.startswith(".") else head)
     payload = _graph_option_payload_type(type_text) if base == "some" else ""
     if payload and len(args) == 1 and not leftover.strip():
-        return _graph_pattern_bindings(args[0], payload, depth + 1)
+        return _graph_pattern_bindings(args[0], payload, depth + 1, binder_context=binder_context)
     components = (
         _graph_product_component_types(type_text, len(args))
         if args and not leftover.strip()
@@ -3291,9 +3412,9 @@ def _graph_pattern_bindings(
     found = []
     for index, arg in enumerate(args):
         component = components[index] if index < len(components) else ""
-        found.extend(_graph_pattern_bindings(arg, component, depth + 1))
+        found.extend(_graph_pattern_bindings(arg, component, depth + 1, binder_context=binder_context))
     if leftover.strip():
-        found.extend(_graph_pattern_bindings(leftover, "", depth + 1))
+        found.extend(_graph_pattern_bindings(leftover, "", depth + 1, binder_context=binder_context))
     return found
 
 
@@ -3353,6 +3474,10 @@ def _graph_pattern_value(
     }:
         return "Bool." + _graph_head_base_name(raw), []
     head, tail = _graph_pattern_head(raw)
+    if _graph_leading_identifier(type_text) in {"Decidable", "_root_.Decidable"} and head in {
+        ".isTrue", ".isFalse", "isTrue", "isFalse",
+    }:
+        head = "Decidable." + head.lstrip(".")
     arguments, leftover = _graph_pattern_arguments(tail) if head else ([], raw)
     if arguments and not leftover:
         payload = _graph_option_payload_type(type_text) if _graph_head_base_name(head) == "some" else ""
@@ -3418,7 +3543,7 @@ def _graph_let_destructuring_additions(
         return []
     return [
         f"({name} : {annotation})"
-        for name, annotation in _graph_pattern_bindings(pattern, type_text)
+        for name, annotation in _graph_pattern_bindings(pattern, type_text, binder_context=binder_context)
     ]
 
 
@@ -3511,6 +3636,7 @@ def _graph_annotation_local_references(
     Binding types see preceding binders; lambda, quantifier, local binding,
     and match bodies see their own names. Literal content is irrelevant to dependencies,
     but executable interpolation bodies and quoted identifiers remain code.
+    Bare sort keywords never refer to escaped locals with the same spelling.
     Work items avoid a frame per nested group.
     """
 
@@ -3662,7 +3788,9 @@ def _graph_annotation_local_references(
                     for pattern, arm in zip(patterns, arms):
                         local = dict(visible)
                         bound_names = proof_names + [
-                            name for name, _kind in _graph_pattern_bindings(pattern, "")
+                            name for name, _kind in _graph_pattern_bindings(
+                                _graph_pattern_local_constructor_names(pattern, visible), ""
+                            )
                         ]
                         for name in bound_names:
                             local.pop(_graph_local_name_key(name), None)
@@ -3681,7 +3809,9 @@ def _graph_annotation_local_references(
                     if component is not None:
                         key = _graph_local_name_key(component.group(0))
                         suffix = name[component.end() :]
-                if key in visible and (index == 0 or raw[index - 1] != "."):
+                if name not in {"Prop", "Type", "Sort"} and key in visible and (
+                    index == 0 or raw[index - 1] != "."
+                ):
                     found.add(key)
                     out.append(visible[key] + suffix)
                 else:
@@ -3722,53 +3852,572 @@ def _graph_unwrap_type_ascriptions(text: str) -> str:
     return raw
 
 
-def _graph_annotation_literal_result(text: str) -> str:
-    """Read a literal through anonymous dependency-preserving local wrappers."""
+@dataclass
+class _GraphAnnotationScope:
+    """Ordered, local-only information used while freezing conditionals."""
 
-    raw = _graph_unwrap_type_ascriptions(text)
-    for _depth in range(_GRAPH_PATTERN_WALK_LIMIT):
-        if not _graph_keyword_at(raw, 0, "let"):
-            return raw
-        binding, body = _graph_top_level_let_parts(raw)
-        assignment = _graph_top_level_token_index(binding, ":=")
-        if not body or assignment < 0 or binding[3:assignment].strip() != "_":
-            return raw
-        raw = _graph_unwrap_type_ascriptions(body)
+    types: Dict[str, str] = field(default_factory=dict)
+    values: Dict[str, str] = field(default_factory=dict)
+    origins: Dict[str, str] = field(default_factory=dict)
+    dictionaries: List[Tuple[str, str, str]] = field(default_factory=list)
+    serial: int = 0
+
+    def copy(self) -> "_GraphAnnotationScope":
+        return _GraphAnnotationScope(
+            dict(self.types), dict(self.values), dict(self.origins),
+            list(self.dictionaries), self.serial,
+        )
+
+
+def _graph_annotation_head(text: str, local_names: Iterable[str]) -> Tuple[str, str]:
+    """Return the surface head and its unshadowed global spelling.
+
+    Only an actual root qualifier bypasses lexical locals. A quoted atomic
+    component has the same spelling; a whole quoted dotted name does not.
+    """
+
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    if raw.startswith("_root_."):
+        component = _graph_leading_identifier(raw[len("_root_.") :])
+        return "_root_." + component, _graph_local_name_key(component)
+    surface = _graph_leading_identifier(raw)
+    key = _graph_local_name_key(surface)
+    return surface, "" if key in local_names else key
+
+
+def _graph_annotation_value_type(text: str, scope: _GraphAnnotationScope) -> str:
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    value = _graph_annotation_known_result(raw, scope.values, 0)
+    if value.startswith("bool:"):
+        return "_root_.Bool"
+    if value.startswith("prop:"):
+        return "Prop"
+    key = _graph_local_name_key(raw)
+    if key in scope.types:
+        return scope.types[key]
+    subject, annotation = _graph_top_level_ascription(raw)
+    if subject:
+        annotation = _graph_strip_balanced_outer_parens(annotation)
+        surface, head = _graph_annotation_head(annotation, scope.types)
+        if head == "Bool" and _graph_application_arg_texts(annotation, surface) == []:
+            return "_root_.Bool"
+        return annotation
     return ""
 
 
-def _graph_annotation_reduces_to_prop(text: str, depth: int = 0) -> bool:
-    """Recognize explicit Prop results without evaluating arbitrary Lean terms."""
-
-    if depth >= 32:
-        return False
+def _graph_annotation_condition_origin(text: str, scope: _GraphAnnotationScope) -> str:
     raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
-    if raw == "Prop":
-        return True
+    value = _graph_annotation_known_result(raw, scope.values, 0)
+    if value.startswith(("bool:", "prop:")):
+        return value
+    return scope.origins.get(_graph_local_name_key(raw), "")
+
+
+
+def _graph_parameter_type_dependencies(
+    text: str, local_dependencies: Mapping[str, set[int]], depth: int = 0,
+) -> set[int]:
+    """Collect effective parameter references through explicit local beta/zeta.
+
+    This inference-only walk differs from match generalization, which retains
+    erased syntactic dependencies. Locals hold closed declaration-id sets; no
+    expressions are substituted under binders. Unsupported forms retain their
+    conservative lexical references, without unfolding globals or closures.
+    """
+
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    if depth >= 32:
+        return set().union(*local_dependencies.values())
+
+    def dependencies(value: str, local: Mapping[str, set[int]] = local_dependencies) -> set[int]:
+        return _graph_parameter_type_dependencies(value, local, depth + 1)
+
+    keyword = "have" if _graph_keyword_at(raw, 0, "have") else "let"
+    if _graph_keyword_at(raw, 0, keyword):
+        binding, body = _graph_top_level_let_parts("let" + raw[len(keyword) :])
+        if not body:
+            # The general let validator has an older ASCII name grammar.
+            # A complete simple Unicode binder is checked below; keep this
+            # fallback local to inference, without widening statement syntax.
+            separator = _graph_top_level_token_index(raw, ";")
+            if separator >= 0:
+                binding = "let" + raw[len(keyword) : separator]
+                body = raw[separator + 1 :].strip()
+        assignment = _graph_top_level_token_index(binding, ":=")
+        if body and assignment >= 0:
+            declaration = binding[3:assignment].strip()
+            colon = _graph_top_level_token_index(declaration, ":")
+            header = declaration[:colon].strip() if colon >= 0 else declaration
+            name = _graph_leading_identifier(header)
+            initializer = binding[assignment + 2 :].strip()
+            if (
+                name and header == name and initializer
+                and (colon < 0 or declaration[colon + 1 :].strip())
+                and not _graph_keyword_at(header, 0, "rec")
+            ):
+                value = dependencies(initializer)
+                local = dict(local_dependencies)
+                if name != "_":
+                    local[_graph_local_name_key(name)] = value
+                return dependencies(body, local)
+    if raw.startswith("("):
+        end = _graph_matching_group_index(raw, 0)
+        if 0 < end < len(raw) - 1:
+            function = _graph_strip_balanced_outer_parens(raw[1:end])
+            parts = _graph_leading_lambda_parts(function)
+            if parts is not None:
+                binders, body = parts
+                arguments = _graph_application_arg_texts(raw, raw[: end + 1])
+                names: List[str] = []
+                for chunk in _graph_binder_group_chunks(binders):
+                    if chunk.startswith(("{", "[", "⦃")):
+                        break
+                    group = _graph_unwrap_binder_group(chunk)
+                    colon = _graph_top_level_token_index(group, ":")
+                    surface = group[:colon] if colon >= 0 else group
+                    names.extend(_graph_lean_identifier_tokens(surface))
+                else:
+                    if arguments and len(names) == len(arguments):
+                        # All arguments see the caller, including repeated names.
+                        values = [dependencies(argument) for argument in arguments]
+                        local = dict(local_dependencies)
+                        for name, value in zip(names, values):
+                            if name != "_":
+                                local[_graph_local_name_key(name)] = value
+                        return dependencies(body, local)
+    subject, _annotation = _graph_top_level_ascription(raw)
+    if subject and _graph_leading_lambda_parts(raw) is None:
+        return dependencies(subject)
+    references = _graph_text_local_names(raw, set(local_dependencies))
+    return set().union(*(local_dependencies[name] for name in references))
+
+
+def _graph_annotation_add_local(
+    scope: _GraphAnnotationScope, name: str, annotation: str, *,
+    value: str = "", initializer: str = "", instance: bool = False,
+) -> None:
+    """Retain dictionary candidates even when a later name hides their spelling."""
+
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(annotation))
+    descriptor: Tuple[str, str, str] | None = None
+    surface_head, head = _graph_annotation_head(raw, scope.types)
+    args = _graph_application_arg_texts(raw, surface_head) if surface_head else None
+    if head in {"Decidable", "_root_.Decidable"} and args and len(args) == 1:
+        target = _graph_strip_balanced_outer_parens(args[0])
+        truth = _graph_annotation_known_result(target, scope.values, 0)
+        if truth.startswith("prop:"):
+            descriptor = ("prop", truth, name)
+        else:
+            equality = _graph_split_top_level_symbol(target, "=")
+            if len(equality) == 2 and _graph_annotation_known_result(
+                equality[1], scope.values, 0
+            ) == "bool:true":
+                origin = _graph_annotation_condition_origin(equality[0], scope)
+                descriptor = ("bool", origin or "*", name)
+            else:
+                descriptor = ("opaque", "", name)
+    elif head in {"DecidableEq", "_root_.DecidableEq"} and args and len(args) == 1:
+        target = _graph_strip_balanced_outer_parens(args[0])
+        target_surface, target_head = _graph_annotation_head(target, scope.types)
+        if target_head == "Bool" and _graph_application_arg_texts(target, target_surface) == []:
+            descriptor = ("bool_eq", "", name)
+    elif head in {"DecidablePred", "_root_.DecidablePred"} and args and len(args) == 1:
+        predicate = _graph_leading_lambda_parts(_graph_strip_balanced_outer_parens(args[0]))
+        if predicate is not None:
+            binders, body = predicate
+            names = _graph_binder_names_from_chunk(binders)
+            equality = _graph_split_top_level_symbol(body, "=")
+            if len(names) == 1 and len(equality) == 2 and (
+                _graph_local_name_key(equality[0].strip()) == _graph_local_name_key(names[0])
+                and _graph_annotation_known_result(equality[1], scope.values, 0) == "bool:true"
+            ):
+                descriptor = ("bool_pred", "", name)
+        if descriptor is None:
+            descriptor = ("opaque", "", name)
+    elif _graph_proposition_quantifier_token_len(raw):
+        parameters: List[Tuple[str, str, str]] = []
+        parameter_dependencies: List[set[int]] = []
+        visible_parameters: Dict[str, int] = {}
+        result = raw
+        for _ in range(32):
+            length = _graph_proposition_quantifier_token_len(result)
+            if not length:
+                break
+            comma = _graph_find_top_level_comma(result[length:])
+            if comma < 0:
+                break
+            binders = result[length : length + comma]
+            for chunk in _graph_binder_group_chunks(binders):
+                kind = "instance" if chunk.startswith("[") else (
+                    "implicit" if chunk.startswith(("{", "⦃")) else "explicit"
+                )
+                group = _graph_unwrap_binder_group(chunk)
+                colon = _graph_top_level_token_index(group, ":")
+                if colon < 0 and kind == "instance":
+                    # Anonymous instances still occupy a synthesizable slot;
+                    # later lexical binders must continue to be collected.
+                    names = ("",)
+                    annotation_text = group
+                else:
+                    names = _graph_binder_names_from_chunk(group[:colon] if colon >= 0 else group)
+                    annotation_text = group[colon + 1 :].strip() if colon >= 0 else ""
+                for bound in names:
+                    # Lean resolves even a shared group annotation sequentially.
+                    # Keep its prior declaration identities, not later spellings.
+                    dependencies = _graph_parameter_type_dependencies(
+                        annotation_text,
+                        {key: {identity} for key, identity in visible_parameters.items()},
+                    )
+                    ordinal = len(parameters)
+                    parameters.append((bound, annotation_text, kind))
+                    parameter_dependencies.append(dependencies)
+                    if bound and bound != "_":
+                        visible_parameters[_graph_local_name_key(bound)] = ordinal
+            result = _graph_strip_balanced_outer_parens(result[length + comma + 1 :])
+        else:
+            descriptor = ("opaque", "", name)
+        result_locals = set(scope.types) | {
+            _graph_local_name_key(bound) for bound, _annotation, _kind in parameters if bound
+        }
+        result_surface, result_head = _graph_annotation_head(result, result_locals)
+        result_args = _graph_application_arg_texts(result, result_surface) if result_surface else None
+        if (
+            len(parameters) == 1 and _graph_strip_balanced_outer_parens(parameters[0][1]) == "Prop"
+            and result_head == "Decidable" and result_args is not None
+            and len(result_args) == 1
+            and _graph_local_name_key(_graph_unwrap_type_ascriptions(result_args[0]))
+            == _graph_local_name_key(parameters[0][0])
+        ):
+            descriptor = ("all_props", "", name)
+        elif result_head == "Decidable" and parameters:
+            ordinary_parameters = {
+                ordinal for ordinal, (_bound, _annotation, kind) in enumerate(parameters)
+                if kind != "instance"
+            }
+            # Infer from each reduced result argument, just as for parameter
+            # types: an occurrence erased by beta/zeta cannot determine a slot.
+            used_parameters: set[int] = set()
+            visible_dependencies = {
+                key: {identity} for key, identity in visible_parameters.items()
+            }
+            for result_argument in result_args or []:
+                used_parameters.update(_graph_parameter_type_dependencies(
+                    result_argument, visible_dependencies,
+                ))
+            pending_parameters = list(used_parameters)
+            while pending_parameters:
+                dependencies = parameter_dependencies[pending_parameters.pop()] - used_parameters
+                used_parameters.update(dependencies)
+                pending_parameters.extend(dependencies)
+            if len(parameters) == 1 or ordinary_parameters <= used_parameters:
+                # Result arguments can determine parameters used in their types.
+                # Other unused ordinary slots cannot be supplied by this finite
+                # shape. Instance slots may be synthesized; keep them opaque
+                # without attempting general typeclass inference.
+                descriptor = ("opaque", "", name)
+    elif instance and head != "Inhabited":
+        # Explicit unknown instance groups are a conservative boundary. This
+        # does not attempt to unfold global class aliases or solve instances.
+        descriptor = ("opaque", "", name)
+    key = _graph_local_name_key(name)
+    scope.serial += 1
+    origin = _graph_annotation_condition_origin(initializer, scope) if initializer else ""
+    scope.types[key] = "_root_.Bool" if head == "Bool" and args == [] else raw
+    scope.values[key] = value
+    scope.origins[key] = origin or f"local:{scope.serial}"
+    if descriptor is not None:
+        scope.dictionaries.append(descriptor)
+
+
+def _graph_annotation_decider(
+    condition: str, scope: _GraphAnnotationScope
+) -> Tuple[str, str]:
+    """Choose only explicit local dictionary shapes or canonical literal defaults."""
+
+    kind = _graph_annotation_value_type(condition, scope)
+    truth = _graph_annotation_known_result(condition, scope.values, 0)
+    origin = _graph_annotation_condition_origin(condition, scope)
+    if kind == "_root_.Bool":
+        proposition = f"({condition}) = _root_.Bool.true"
+    elif truth in {"prop:true", "prop:false"}:
+        proposition = condition
+    else:
+        return "", ""
+    for family, target, expression in reversed(scope.dictionaries):
+        if family == "opaque":
+            return "", ""
+        if family == "prop" and truth == target:
+            return proposition, expression
+        if kind == "_root_.Bool":
+            if family == "bool" and target in {origin, "*"}:
+                return proposition, expression
+            if family == "bool_eq":
+                return proposition, f"{expression} ({condition}) _root_.Bool.true"
+            if family == "bool_pred":
+                return proposition, f"{expression} ({condition})"
+        if family == "all_props":
+            return proposition, f"@{expression} ({proposition})"
+    if kind == "_root_.Bool":
+        return proposition, f"_root_.Bool.decEq ({condition}) _root_.Bool.true"
+    if truth == "prop:true":
+        return proposition, "_root_.Decidable.isTrue _root_.True.intro"
+    return proposition, "_root_.Decidable.isFalse (fun h => h)"
+
+
+def _graph_prepare_annotation(
+    text: str, scope: _GraphAnnotationScope, depth: int = 0,
+    *, reserved: str = "", fresh_counter: List[int] | None = None,
+) -> str:
+    """Freeze local conditional elaboration before dependent binders are moved.
+
+    The output uses actual root-qualified Lean primitives with explicit chosen
+    dictionaries. Both branches and their proof binders remain in the text,
+    so free-reference analysis retains syntactic and inferred dependencies.
+    Only this bounded local grammar is prepared; opaque forms stay unknown.
+    """
+
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    if depth >= 32:
+        return raw
+    if fresh_counter is None:
+        fresh_counter = [0]
+        reserved = " ".join((reserved, raw, *scope.types))
+
+    def fresh() -> str:
+        while True:
+            name = f"__graph_annotation_local_{fresh_counter[0]}"
+            fresh_counter[0] += 1
+            if name not in reserved:
+                return name
+
+    def prepare(value: str, local: _GraphAnnotationScope = scope) -> str:
+        return _graph_prepare_annotation(
+            value, local, depth + 1, reserved=reserved, fresh_counter=fresh_counter
+        )
+
     if _graph_keyword_at(raw, 0, "if"):
         incomplete, branches = _graph_conditional_structure(raw)
         if incomplete or branches is None:
-            return False
-        _name, condition = _graph_split_named_if_condition(
+            return raw
+        proof_name, condition = _graph_split_named_if_condition(
             _graph_leading_conditional_condition(raw)
         )
-        condition = _graph_annotation_literal_result(condition)
-        # A match may make a dependent conditional's condition concrete.
-        # Its selected branch determines the local type in this arm.
-        if condition in {"true", "Bool.true", "True", "false", "Bool.false", "False"}:
-            branch = branches[0 if condition in {"true", "Bool.true", "True"} else 1]
-            return _graph_annotation_reduces_to_prop(branch, depth + 1)
-        return all(
-            _graph_annotation_reduces_to_prop(branch, depth + 1)
-            for branch in branches
+        condition = prepare(condition)
+        proposition, dictionary = _graph_annotation_decider(condition, scope)
+        if not dictionary:
+            return raw
+        # A local condition avoids duplicating nested expressions, keeping
+        # generated work linear in the original conditional tree.
+        local_name = fresh()
+        local = scope.copy()
+        _graph_annotation_add_local(
+            local, local_name, _graph_annotation_value_type(condition, scope),
+            value=_graph_annotation_known_result(condition, scope.values, 0),
+            initializer=condition,
         )
+        proposition, dictionary = _graph_annotation_decider(local_name, local)
+        branch_scope = local.copy()
+        branch_name = fresh() if proof_name else "_"
+        prepared_branches = []
+        for branch in branches:
+            if proof_name:
+                branch, _references = _graph_annotation_local_references(
+                    branch, {_graph_local_name_key(proof_name): branch_name}
+                )
+                _graph_annotation_add_local(branch_scope, branch_name, "Type")
+            prepared_branches.append(prepare(branch, branch_scope))
+        return (
+            f"(let {local_name} := {condition}; @_root_.dite _ ({proposition}) "
+            f"({dictionary}) (fun {branch_name} => {prepared_branches[0]}) "
+            f"(fun {branch_name} => {prepared_branches[1]}))"
+        )
+    keyword = "have" if _graph_keyword_at(raw, 0, "have") else "let"
+    if _graph_keyword_at(raw, 0, keyword):
+        binding, body = _graph_top_level_let_parts("let" + raw[len(keyword) :])
+        assignment = _graph_top_level_token_index(binding, ":=")
+        if not body or assignment < 0:
+            return raw
+        declaration = binding[3:assignment].strip()
+        colon = _graph_top_level_token_index(declaration, ":")
+        header = declaration[:colon].strip() if colon >= 0 else declaration
+        if _graph_keyword_at(header, 0, "rec"):
+            return raw
+        name = _graph_leading_identifier(header)
+        parameters = header[len(name) :].strip() if name else ""
+        initializer = binding[assignment + 2 :].strip()
+        if parameters:
+            if colon >= 0:
+                initializer = f"({initializer} : {declaration[colon + 1 :]})"
+            initializer = f"fun {parameters} => {initializer}"
+        value = prepare(initializer)
+        annotation = prepare(declaration[colon + 1 :]) if colon >= 0 else ""
+        local = scope.copy()
+        if name and not parameters:
+            renamed = fresh() if name != "_" else "_"
+            if name != "_":
+                body, _references = _graph_annotation_local_references(
+                    body, {_graph_local_name_key(name): renamed}
+                )
+                _graph_annotation_add_local(
+                    local, renamed, annotation or _graph_annotation_value_type(value, scope),
+                    value=_graph_annotation_known_result(value, scope.values, 0), initializer=value,
+                )
+            header = renamed + (f" : {annotation}" if annotation else "")
+        elif name:
+            _graph_annotation_add_local(local, name, "Type")
+            header = name
+        else:
+            for bound in _graph_binder_names_from_chunk(header):
+                _graph_annotation_add_local(local, bound, "Type")
+        return f"({keyword} {header} := {value}; {prepare(body, local)})"
+    function_end = _graph_matching_group_index(raw, 0) if raw.startswith("(") else -1
+    arguments = (
+        _graph_application_arg_texts(raw, raw[: function_end + 1])
+        if 0 < function_end < len(raw) - 1 else None
+    )
+    lambda_text = raw[1:function_end] if arguments is not None else raw
+    lambda_parts = _graph_leading_lambda_parts(_graph_strip_balanced_outer_parens(lambda_text))
+    if lambda_parts is not None:
+        binders, body = lambda_parts
+        # Prepare argument expressions in the caller, before any callee binders.
+        prepared_arguments = [prepare(arg) for arg in arguments] if arguments is not None else None
+        local = scope.copy()
+        replacements: Dict[str, str] = {}
+        groups = []
+        for chunk in _graph_binder_group_chunks(binders):
+            group = _graph_unwrap_binder_group(chunk)
+            colon = _graph_top_level_token_index(group, ":")
+            surface = group[:colon] if colon >= 0 else group
+            annotation = group[colon + 1 :] if colon >= 0 else ""
+            annotation, _references = _graph_annotation_local_references(annotation, replacements)
+            annotation = prepare(annotation, local) if annotation else ""
+            renamed_names = []
+            for name in _graph_lean_identifier_tokens(surface):
+                renamed = fresh() if name != "_" else "_"
+                renamed_names.append(renamed)
+                if name != "_":
+                    replacements[_graph_local_name_key(name)] = renamed
+                    _graph_annotation_add_local(local, renamed, annotation)
+            open_char = chunk[0] if chunk.startswith(("(", "{", "[", "⦃")) else "("
+            close_char = _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE[open_char]
+            group_text = " ".join(renamed_names) + (f" : {annotation}" if annotation else "")
+            groups.append(open_char + group_text + close_char)
+        body, _references = _graph_annotation_local_references(body, replacements)
+        function = "fun " + " ".join(groups) + " => " + prepare(body, local)
+        if prepared_arguments is None:
+            return function
+        return "(" + function + ") " + " ".join(f"({arg})" for arg in prepared_arguments)
+    if raw.startswith("@_root_.dite "):
+        args = _graph_application_arg_texts(raw, "@_root_.dite")
+        if args is not None and len(args) == 5:
+            return "@_root_.dite " + " ".join(f"({prepare(arg)})" for arg in args)
+    subject, annotation = _graph_top_level_ascription(raw)
+    if subject:
+        return f"({prepare(subject)} : {prepare(annotation)})"
+    return raw
+
+
+def _graph_annotation_known_result(
+    text: str, local_results: Mapping[str, str], depth: int
+) -> str:
+    """Recognize only Prop and literal conditions under explicit beta/zeta steps.
+
+    Locals hold closed results, never source expressions or closures. Arguments
+    and initializers are read in their caller scope before binding body names.
+    Only fully applied, explicit positional lambdas are supported; local
+    functions, partial applications, and arbitrary Lean reduction stay unknown.
+    Each argument/body is visited once, only a known conditional branch is
+    visited, and the existing depth bound also limits nested local reductions.
+    """
+
+    if depth >= 32:
+        return ""
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    # Prop is a reserved sort keyword; a quoted local «Prop» is an identifier.
+    if raw == "Prop":
+        return "Prop"
+    key = _graph_local_name_key(raw)
+    if key in local_results:
+        return local_results[key]
+    if raw in {"true", "Bool.true", "_root_.Bool.true"}:
+        return "bool:true"
+    if raw in {"false", "Bool.false", "_root_.Bool.false"}:
+        return "bool:false"
+    if raw in {"True", "_root_.True"}:
+        return "prop:true"
+    if raw in {"False", "_root_.False"}:
+        return "prop:false"
+    head = _graph_leading_identifier(raw)
+    arguments = _graph_application_arg_texts(raw, head) if head else None
+    if head in {"Decidable.isTrue", "_root_.Decidable.isTrue"} and arguments and len(arguments) == 1:
+        return "dict:true"
+    if head in {"Decidable.isFalse", "_root_.Decidable.isFalse"} and arguments and len(arguments) == 1:
+        return "dict:false"
+    if head == "_root_.Bool.decEq" and arguments and len(arguments) == 2:
+        values = [
+            _graph_annotation_known_result(argument, local_results, depth + 1)
+            for argument in arguments
+        ]
+        if all(value in {"bool:true", "bool:false"} for value in values):
+            return "dict:true" if values[0] == values[1] else "dict:false"
+        return ""
+    if raw.startswith("@_root_.dite "):
+        arguments = _graph_application_arg_texts(raw, "@_root_.dite")
+        if arguments is None or len(arguments) != 5:
+            return ""
+        dictionary = _graph_annotation_known_result(arguments[2], local_results, depth + 1)
+        if dictionary not in {"dict:true", "dict:false"}:
+            return ""
+        branch = arguments[3 if dictionary == "dict:true" else 4]
+        parts = _graph_leading_lambda_parts(_graph_strip_balanced_outer_parens(branch))
+        if parts is None:
+            return ""
+        proof_parameters: List[str] = []
+        for chunk in _graph_binder_group_chunks(parts[0]):
+            group = _graph_unwrap_binder_group(chunk)
+            colon = _graph_top_level_token_index(group, ":")
+            proof_parameters.extend(_graph_lean_identifier_tokens(group[:colon] if colon >= 0 else group))
+        if len(proof_parameters) != 1:
+            return ""
+        body_results = dict(local_results)
+        for name in _graph_binder_names_from_chunk(parts[0]):
+            if name != "_":
+                body_results[_graph_local_name_key(name)] = ""
+        return _graph_annotation_known_result(parts[1], body_results, depth + 1)
+    if _graph_keyword_at(raw, 0, "if"):
+        # Surface ite has no frozen dictionary. Only prepared explicit forms
+        # may claim definitional reduction under the original local scope.
+        return ""
     if _graph_keyword_at(raw, 0, "have"):
         raw = "let" + raw[4:]
     if _graph_keyword_at(raw, 0, "let"):
         binding, body = _graph_top_level_let_parts(raw)
-        return bool(binding and body) and _graph_annotation_reduces_to_prop(
-            body, depth + 1
-        )
+        assignment = _graph_top_level_token_index(binding, ":=")
+        if not body or assignment < 0:
+            return ""
+        declaration = binding[3:assignment].strip()
+        colon = _graph_top_level_token_index(declaration, ":")
+        header = declaration[:colon].strip() if colon >= 0 else declaration
+        recursive = _graph_keyword_at(header, 0, "rec")
+        if recursive:
+            header = header[3:].lstrip()
+        name = _graph_leading_identifier(header)
+        parameters = header[len(name) :].strip() if name else ""
+        body_results = dict(local_results)
+        if name:
+            value = ""
+            if not parameters and not recursive:
+                value = _graph_annotation_known_result(
+                    binding[assignment + 2 :], local_results, depth + 1
+                )
+            if name != "_":
+                body_results[_graph_local_name_key(name)] = value
+        else:
+            # Destructured locals hide outer names; tuple/match reduction is
+            # outside this small classifier's explicit lambda/alias contract.
+            for bound_name in _graph_binder_names_from_chunk(header):
+                body_results[_graph_local_name_key(bound_name)] = ""
+        return _graph_annotation_known_result(body, body_results, depth + 1)
     if raw.startswith("("):
         end = _graph_matching_group_index(raw, 0)
         if 0 < end < len(raw) - 1:
@@ -3777,15 +4426,49 @@ def _graph_annotation_reduces_to_prop(text: str, depth: int = 0) -> bool:
             if lambda_parts is not None:
                 binders, body = lambda_parts
                 arguments = _graph_application_arg_texts(raw, raw[: end + 1])
-                arity = _graph_fun_arg_arity(binders)
-                if arguments is None or not arguments or arity != len(arguments):
-                    return False
-                return _graph_annotation_reduces_to_prop(body, depth + 1)
-    return False
+                names: List[str] = []
+                for chunk in _graph_binder_group_chunks(binders):
+                    if chunk.startswith(("{", "[", "⦃")):
+                        return ""
+                    group = _graph_unwrap_binder_group(chunk)
+                    colon = _graph_top_level_token_index(group, ":")
+                    surface = group[:colon] if colon >= 0 else group
+                    # Preserve repeated and anonymous parameters positionally.
+                    names.extend(_graph_lean_identifier_tokens(surface))
+                if arguments is None or not arguments or len(names) != len(arguments):
+                    return ""
+                argument_results = [
+                    _graph_annotation_known_result(argument, local_results, depth + 1)
+                    for argument in arguments
+                ]
+                body_results = dict(local_results)
+                for name, value in zip(names, argument_results):
+                    if name != "_":
+                        body_results[_graph_local_name_key(name)] = value
+                return _graph_annotation_known_result(body, body_results, depth + 1)
+    subject, _annotation = _graph_top_level_ascription(raw)
+    if subject and _graph_leading_lambda_parts(raw) is None:
+        return _graph_annotation_known_result(subject, local_results, depth + 1)
+    return ""
+
+
+def _graph_annotation_reduces_to_prop(
+    text: str, depth: int = 0, *, local_names: Iterable[str] = (),
+    scope: _GraphAnnotationScope | None = None,
+) -> bool:
+    """Recognize a bounded explicit Prop result in its original dictionary scope."""
+
+    if scope is None:
+        scope = _GraphAnnotationScope()
+        for name in local_names:
+            _graph_annotation_add_local(scope, name, "Type")
+    prepared = _graph_prepare_annotation(text, scope, depth)
+    return _graph_annotation_known_result(prepared, scope.values, depth) == "Prop"
 
 
 def _graph_match_generalized_context(
-    scrutinee: str, pattern: str, binder_context: str, arm_text: str = ""
+    scrutinee: str, pattern: str, binder_context: str, arm_text: str = "",
+    *, generalize: bool = True,
 ) -> Tuple[str, List[Tuple[str, str]], Dict[str, str]]:
     """Return dependent locals a match reintroduces over later shadowing.
 
@@ -3798,31 +4481,70 @@ def _graph_match_generalized_context(
     visible: Dict[str, int] = {}
     declarations: List[Tuple[str, str, Dict[str, int], bool]] = []
     chunks: List[Tuple[str, int | None]] = []
+    scope = _GraphAnnotationScope()
+    source_names = dict(binder_context.source_names) if isinstance(binder_context, _GraphBinderContext) else {}
+    reserved_annotations = " ".join((binder_context, scrutinee, pattern, arm_text))
+    hidden_dictionaries: Dict[int, str] = {}
     for part in _graph_binder_context_parts(binder_context):
         for chunk in _graph_binder_group_chunks(part):
             body = _graph_unwrap_binder_group(str(chunk or "").strip())
             colon = _graph_top_level_token_index(body, ":")
+            instance = str(chunk).strip().startswith("[")
+            if colon < 0 and instance:
+                name = f"__graph_instance_{scope.serial}"
+                while name in reserved_annotations:
+                    name += "_"
+                body = f"{name} : {body}"
+                colon = _graph_top_level_token_index(body, ":")
             if colon < 0:
                 chunks.append((chunk, None))
                 continue
-            annotation = body[colon + 1 :].strip()
+            original_annotation = body[colon + 1 :].strip()
+            annotation = _graph_prepare_annotation(
+                original_annotation, scope, reserved=reserved_annotations
+            )
             references = {
                 name: visible[name]
                 for name in _graph_text_local_names(annotation, set(visible))
             }
             is_definition = _graph_keyword_at(body, 0, "let")
             for name in _graph_binder_names_from_chunk(body[:colon]):
-                visible[_graph_local_name_key(name)] = len(declarations)
+                key = _graph_local_name_key(name)
+                if key in visible and any(
+                    _graph_local_name_key(expression) == key
+                    for _family, _target, expression in scope.dictionaries
+                ):
+                    # Instance search retains an older dictionary after its
+                    # source name is hidden. Give its existing declaration
+                    # identity a fresh internal spelling before binding again.
+                    hidden_identity = visible[key]
+                    fresh = f"__graph_hidden_dictionary_{hidden_identity}"
+                    while fresh in reserved_annotations:
+                        fresh += "_"
+                    reserved_annotations += " " + fresh
+                    hidden_dictionaries[hidden_identity] = fresh
+                    source_names[fresh] = source_names.get(key, name)
+                    visible[fresh] = hidden_identity
+                    scope.types[fresh] = scope.types[key]
+                    scope.values[fresh] = scope.values[key]
+                    scope.origins[fresh] = scope.origins[key]
+                    scope.dictionaries = [
+                        (family, target, fresh if _graph_local_name_key(expression) == key else expression)
+                        for family, target, expression in scope.dictionaries
+                    ]
+                visible[key] = len(declarations)
                 prefix = "let " if is_definition else ""
-                chunks.append((f"({prefix}{name} : {annotation})", len(declarations)))
+                opener, closer = ("[", "]") if instance else ("(", ")")
+                chunks.append((f"{opener}{prefix}{name} : {annotation}{closer}", len(declarations)))
+                _graph_annotation_add_local(scope, name, original_annotation, instance=instance)
                 declarations.append((
                     name, annotation, references, not is_definition,
                 ))
     # Pattern names may hide an original discriminant. Preserve its identity
     # for equation proofs and unspecialized annotation references. The fresh
     # spelling is absent even from later binders in this arm, quoted or plain.
-    renamed: Dict[int, str] = {}
-    reserved = " ".join((binder_context, scrutinee, pattern, arm_text))
+    renamed: Dict[int, str] = dict(hidden_dictionaries)
+    reserved = reserved_annotations
     for name, _annotation in _graph_pattern_bindings(pattern, ""):
         identity = visible.get(_graph_local_name_key(name))
         if identity is None or identity in renamed:
@@ -3842,7 +4564,7 @@ def _graph_match_generalized_context(
         discriminant = _graph_unwrap_type_ascriptions(piece)
         name = _graph_unicode_identifier_name(discriminant)
         identity = visible.get(_graph_local_name_key(name))
-        if name and identity is not None:
+        if name and identity is not None and generalize:
             matched.add(identity)
             if index < len(patterns):
                 value, aliases = _graph_pattern_value(
@@ -3861,18 +4583,25 @@ def _graph_match_generalized_context(
             matched.add(identity)
             retired.add(identity)
             replacements = {
-                ref: f"({specializations[dependency]})" if dependency in specializations else renamed[dependency]
+                ref: (
+                    f"({specializations[dependency]})" if dependency in specializations
+                    else source_names.get(
+                        _graph_local_name_key(declarations[dependency][0]), declarations[dependency][0]
+                    ) if dependency in retired
+                    else renamed[dependency]
+                )
                 for ref, dependency in references.items()
-                if dependency in specializations or dependency in renamed
+                if dependency in specializations or dependency in renamed or dependency in retired
             }
             if replacements:
                 annotation, _names = _graph_annotation_local_references(
                     annotation, replacements
                 )
-            generalized.append((name, annotation))
+            generalized.append((source_names.get(_graph_local_name_key(name), name), annotation))
     # Generalization replaces the old local. Retaining its unspecialized
     # type would resurrect a dependency on the original discriminant later.
     retained = []
+    retained_sources: Dict[str, str] = {}
     for chunk, identity in chunks:
         if identity in retired:
             continue
@@ -3882,9 +4611,17 @@ def _graph_match_generalized_context(
             if replacements:
                 annotation, _names = _graph_annotation_local_references(annotation, replacements)
             prefix = "" if generalizable else "let "
-            chunk = f"({prefix}{renamed.get(identity, name)} : {annotation})"
+            opener, closer = ("[", "]") if chunk.startswith("[") else ("(", ")")
+            chunk = f"{opener}{prefix}{renamed.get(identity, name)} : {annotation}{closer}"
+        if identity is not None:
+            name = declarations[identity][0]
+            internal_name = renamed.get(identity, name)
+            source_name = source_names.get(_graph_local_name_key(name), name)
+            if internal_name != source_name:
+                retained_sources[_graph_local_name_key(internal_name)] = source_name
         retained.append(chunk)
-    return ", ".join(retained), generalized, outer_names
+    context = _GraphBinderContext(", ".join(retained), retained_sources.items())
+    return context, generalized, outer_names
 
 
 def _graph_named_condition_context(
@@ -3895,13 +4632,31 @@ def _graph_named_condition_context(
     condition_text = graph_identity_text(condition)
     if not name or not condition_text:
         return binder_context
-    return ", ".join(
-        part for part in (binder_context, f"({name} : {condition_text})") if part
-    )
+    return _graph_join_binder_context(binder_context, f"({name} : {condition_text})")
+
+
+def _graph_pattern_local_constructor_names(
+    pattern: str, local_names: Iterable[str]
+) -> str:
+    """Keep bare Boolean constructor spellings that Lean resolves as locals.
+
+    Quoting is only an internal scope representation. It leaves qualified and
+    dotted constructors intact while the existing pattern walkers retain the
+    local binding, including a local that shadows an earlier local's name.
+    """
+
+    replacements = {
+        key: f"«{key}»" for name in local_names
+        if (key := _graph_local_name_key(name)) in {"true", "false"}
+    }
+    if not replacements:
+        return pattern
+    return _graph_annotation_local_references(pattern, replacements)[0]
 
 
 def _graph_pattern_binder_context(
-    pattern: str, scrutinee: str, binder_context: str, arm_text: str = ""
+    pattern: str, scrutinee: str, binder_context: str, arm_text: str = "",
+    *, single_arm: bool = False,
 ) -> str:
     """Extend binders with every name a match pattern introduces.
 
@@ -3914,7 +4669,9 @@ def _graph_pattern_binder_context(
     """
 
     _proof_names, scrutinee_text = _graph_match_scrutinee_bindings(scrutinee)
-    compact = graph_identity_text(pattern)
+    compact = _graph_pattern_local_constructor_names(
+        graph_identity_text(pattern), _graph_binder_context_names(binder_context)
+    )
     pieces = _graph_split_top_level_symbol(compact, ",")
     scrutinees = _graph_split_top_level_symbol(scrutinee_text, ",")
     bindings: List[Tuple[str, str]] = []
@@ -3926,24 +4683,37 @@ def _graph_pattern_binder_context(
                 if component
                 else ""
             )
-            bindings.extend(_graph_pattern_bindings(piece, component_type))
+            bindings.extend(_graph_pattern_bindings(piece, component_type, binder_context=binder_context))
     else:
         bindings.extend(
             _graph_pattern_bindings(
                 compact,
                 _graph_scrutinee_type_text(scrutinee_text, binder_context),
+                binder_context=binder_context,
             )
         )
+    # Lean's plain one-variable Boolean arm is a local alias. Named
+    # discriminants, multiple scrutinees, and typed/alias patterns still
+    # elaborate a dependent matcher, even if there is only one arm.
+    variable = _graph_unicode_identifier_name(compact)
+    irrefutable = (
+        single_arm
+        and not _proof_names
+        and len(pieces) == len(scrutinees) == 1
+        and bool(variable)
+        and variable == compact
+        and _graph_scrutinee_type_text(scrutinee_text, binder_context) == "Bool"
+        and bool(_graph_pattern_bindings(compact, "Bool"))
+    )
     context, generalized, outer_names = _graph_match_generalized_context(
-        scrutinee_text, compact, binder_context, arm_text
+        scrutinee_text, compact, binder_context, arm_text,
+        generalize=not irrefutable,
     )
     if bindings:
         additions = [f"({name} : {annotation})" for name, annotation in bindings]
-        context = ", ".join([context, *additions] if context else additions)
+        context = _graph_join_binder_context(context, *additions)
     for name, annotation in generalized:
-        context = ", ".join(
-            part for part in (context, f"({name} : {annotation})") if part
-        )
+        context = _graph_join_binder_context(context, f"({name} : {annotation})")
     for index, piece in enumerate(_graph_split_top_level_symbol(scrutinee, ",")):
         name, expression = _graph_named_discriminant(piece)
         if not name:
@@ -3956,10 +4726,8 @@ def _graph_pattern_binder_context(
         )
         if outer_names:
             expression, _references = _graph_annotation_local_references(expression, outer_names)
-        context = ", ".join(
-            part for part in (
-                context, f"({name} : ({expression}) = ({matched_pattern}))"
-            ) if part
+        context = _graph_join_binder_context(
+            context, f"({name} : ({expression}) = ({matched_pattern}))"
         )
     return context
 
@@ -4061,7 +4829,9 @@ def _graph_prop_match_surface_ok(
     return all(
         _graph_arm_is_proposition(
             arm,
-            _graph_pattern_binder_context(pattern, scrutinee, binder_context, arm),
+            _graph_pattern_binder_context(
+                pattern, scrutinee, binder_context, arm, single_arm=len(patterns) == 1
+            ),
         )
         for pattern, arm in zip(patterns, arms)
     )
@@ -4226,7 +4996,9 @@ def _graph_bool_term_ok(text: str, binder_context: str = "") -> bool:
         return all(
             _graph_bool_term_ok(
                 arm,
-                _graph_pattern_binder_context(pattern, scrutinee, binder_context, arm),
+                _graph_pattern_binder_context(
+                    pattern, scrutinee, binder_context, arm, single_arm=len(patterns) == 1
+                ),
             )
             for pattern, arm in zip(patterns, arms)
         )
@@ -4278,9 +5050,7 @@ def _graph_fun_bool_arrow(value: str, binder_context: str = "") -> str:
         name, type_text, binders = parsed
         type_text = graph_identity_text(type_text)
         domains.append(type_text)
-        local = ", ".join(
-            part for part in (local, f"({name} : {type_text})") if part
-        )
+        local = _graph_join_binder_context(local, f"({name} : {type_text})")
     if not domains or not _graph_bool_term_ok(body, local):
         return ""
     return " → ".join([*domains, "Bool"])
@@ -4442,7 +5212,9 @@ def _graph_condition_match_ok(
     if any(_graph_fragment_has_syntax_residue(pattern) for pattern in patterns):
         return False
     for pattern, arm in zip(patterns, arms):
-        scope = _graph_pattern_binder_context(pattern, scrutinee, binder_context, arm)
+        scope = _graph_pattern_binder_context(
+            pattern, scrutinee, binder_context, arm, single_arm=len(patterns) == 1
+        )
         if not _graph_condition_value_ok(arm, scope):
             return False
     return True
@@ -4657,7 +5429,7 @@ def _graph_fragment_role_ok(
         body = remainder[comma + 1 :].strip()
         if not binder or not body or not _graph_term_tokens_ok(binder):
             return False
-        extended = ", ".join(part for part in (binder_context, binder) if part)
+        extended = _graph_join_binder_context(binder_context, binder)
         return _graph_fragment_role_ok(body, role, extended)
     if _graph_keyword_at(raw, 0, "if"):
         incomplete, branches = _graph_conditional_structure(raw)
@@ -4933,18 +5705,29 @@ def _graph_binder_prop_signatures(binder_text: str) -> Dict[str, int | None]:
     chunks: List[str] = []
     for part in _graph_binder_context_parts(raw):
         chunks.extend(_graph_binder_group_chunks(part))
+    scope = _GraphAnnotationScope()
     for chunk in chunks:
         body = _graph_unwrap_binder_group(str(chunk or "").strip())
         colon = _graph_top_level_token_index(body, ":")
         if colon < 0:
+            if str(chunk).strip().startswith("["):
+                name = f"__graph_instance_{scope.serial}"
+                while name in raw:
+                    name += "_"
+                _graph_annotation_add_local(scope, name, body, instance=True)
             continue
         names = _graph_binder_names_from_chunk(body[:colon])
         if not names:
             continue
         arity = _graph_prop_annotation_arity(body[colon:])
-        if arity is None and _graph_annotation_reduces_to_prop(body[colon + 1 :]):
+        if arity is None and _graph_annotation_reduces_to_prop(
+            body[colon + 1 :], scope=scope
+        ):
             arity = 0
         for name in names:
+            _graph_annotation_add_local(
+                scope, name, body[colon + 1 :], instance=str(chunk).strip().startswith("[")
+            )
             # A later binder of the same name hides the outer annotation.
             # A non-proposition annotation removes the name from Prop scope.
             for spelling in _graph_local_name_spellings(name):
@@ -5284,9 +6067,7 @@ def _graph_quantified_statement_is_executable(
         body
     ) or _graph_quantified_body_has_proof_tail(body):
         return False
-    binder_context = ", ".join(
-        part for part in (outer_binder, *binder_contexts) if part
-    )
+    binder_context = _graph_join_binder_context(outer_binder, *binder_contexts)
     if _graph_keyword_at(body, 0, "if"):
         return _graph_iterative_conditional_proposition(body, binder_context)
     bare_tail_atom = _graph_bare_prop_atom_name(body)
@@ -5400,7 +6181,7 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
     if _graph_statement_is_obvious_non_proposition(compact):
         return False
     if compact in {"True", "False"}:
-        return True
+        return _graph_literal_prop_atom(compact, binder_context)
     if has_sorry_or_admit(compact) or contains_metavariable_placeholder(compact):
         return False
     if _graph_scoped_prop_atom(compact, binder_context):
@@ -5526,7 +6307,7 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
         extended = _graph_binder_context_after_let(
             binder_context, let_binding, is_have=is_have
         )
-        local_head, _local_arity = _graph_let_binding_prop_signature(let_binding)
+        local_head, _local_arity = _graph_let_binding_prop_signature(let_binding, binder_context)
         if (
             local_head
             and _graph_application_arg_count(let_body, local_head) is not None
@@ -5535,6 +6316,7 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
             return _graph_let_body_is_plausibly_local_prop(
                 let_body,
                 binding=let_binding,
+                binder_context=binder_context,
             )
         return bool(
             let_body
@@ -5545,30 +6327,11 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
                 or _graph_let_body_is_plausibly_local_prop(
                     let_body,
                     binding=let_binding,
+                    binder_context=binder_context,
                 )
             )
         )
-    if lowered.startswith(
-        (
-            "claim has ",
-            "claim was ",
-            "convert ",
-            "formalize ",
-            "state ",
-            "show that ",
-            "prove that ",
-            "derive ",
-            "explain ",
-            "construct ",
-            "prove missing dependency ",
-            "missing dependency ",
-            "sample check ",
-            "formal variant ",
-            "variant ",
-            "tactic rejected",
-            "claim exhausted",
-        )
-    ):
+    if lowered.startswith(_GRAPH_PROCEDURAL_TARGET_PREFIXES):
         return False
     if _graph_statement_looks_like_prose_instruction(compact):
         return False
@@ -5645,6 +6408,125 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
         if re.search(r"\b\d+\b", args):
             return True
     return False
+
+
+
+def _graph_prop_check_term_surface(text: str, depth: int = 0) -> bool:
+    """Conservative single-term prefilter; Lean's term parser remains authority."""
+
+    if depth >= 32:
+        return False
+    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    if not raw or not _graph_text_has_balanced_groups(raw):
+        return False
+    quantifier = _graph_proposition_quantifier_token_len(raw)
+    if quantifier:
+        comma = _graph_find_top_level_comma(raw[quantifier:])
+        if comma < 0:
+            return False
+        header = raw[quantifier : quantifier + comma]
+        return _graph_prop_check_term_surface(header, depth + 1) and _graph_prop_check_term_surface(
+            raw[quantifier + comma + 1 :], depth + 1
+        )
+    keyword = "have" if _graph_keyword_at(raw, 0, "have") else "let"
+    if _graph_keyword_at(raw, 0, keyword):
+        binding, body = _graph_top_level_let_parts("let" + raw[len(keyword) :])
+        assignment = _graph_top_level_token_index(binding, ":=")
+        return bool(
+            body and assignment >= 0
+            and _graph_prop_check_term_surface(binding[3:assignment], depth + 1)
+            and _graph_prop_check_term_surface(binding[assignment + 2 :], depth + 1)
+            and _graph_prop_check_term_surface(body, depth + 1)
+        )
+    if _graph_keyword_at(raw, 0, "if"):
+        incomplete, branches = _graph_conditional_structure(raw)
+        if incomplete or branches is None:
+            return False
+        _name, condition = _graph_split_named_if_condition(_graph_leading_conditional_condition(raw))
+        return all(_graph_prop_check_term_surface(value, depth + 1) for value in (condition, *branches))
+    if _graph_keyword_at(raw, 0, "match"):
+        parsed = _graph_parse_match_term(raw, 0)
+        if parsed is None or raw[parsed[0]:].strip():
+            return False
+        _end, arms, scrutinee, patterns = parsed
+        return all(
+            _graph_prop_check_term_surface(value, depth + 1)
+            for value in (scrutinee, *patterns, *arms)
+        )
+    if _graph_find_top_level_symbol(raw, ":=", 0) >= 0:
+        return False
+    if not _graph_term_tokens_ok(raw):
+        return False
+    index = 0
+    while index < len(raw):
+        lexical = _lean_lexical_skip_end(raw, index)
+        if lexical is not None:
+            index = lexical
+            continue
+        if raw[index] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+            end = _graph_matching_group_index(raw, index)
+            if end < 0:
+                return False
+            if raw[index + 1:end].strip() and not _graph_prop_check_term_surface(raw[index + 1:end], depth + 1):
+                return False
+            index = end + 1
+            continue
+        if raw[index] == "#" or any(
+            _graph_keyword_at(raw, index, word)
+            for word in ("namespace", "section", "end", "import", "export", "attribute", "syntax", "macro", "elab", "initialize")
+        ):
+            return False
+        index += 1
+    return True
+
+
+def _graph_statement_may_check_prop(text: str) -> bool:
+    """Bound unsupported syntax before requesting the trusted Lean Prop check."""
+
+    if not isinstance(text, str) or not text.strip() or len(text) > 16384:
+        return False
+    try:
+        raw = _graph_strip_balanced_outer_parens(
+            graph_identity_text(_graph_blank_lexical_comments(text))
+        )
+        if (
+            _graph_keyword_at(raw, 0, "fun")
+            or _graph_keyword_at(raw, 0, "by")
+            or raw.startswith("λ")
+        ):
+            return False
+        if (
+            raw.lower().startswith(_GRAPH_PROCEDURAL_TARGET_PREFIXES)
+            or _graph_statement_looks_like_prose_instruction(raw)
+        ):
+            return False
+        # The single-term surface parser also accepts sequences of identifiers.
+        # Require a recognizable formal shape so procedural materialization
+        # prompts retain their ordinary provider formalization path.
+        head = _graph_leading_identifier(raw)
+        formal_shape = bool(
+            graph_statement_is_executable(text)
+            or _graph_proposition_quantifier_token_len(raw)
+            or any(_graph_keyword_at(raw, 0, word) for word in ("let", "have", "if", "match"))
+            or _graph_contains_proposition_marker(raw)
+            or (_graph_unicode_identifier_name(raw) and not raw.endswith("."))
+            or (head and not head.endswith(".") and (
+                raw[len(head):].lstrip().startswith("(")
+                or ("." in head and _graph_application_arg_texts(raw, head))
+            ))
+        )
+        return bool(
+            formal_shape
+            and _graph_lexical_islands_closed(text)
+            and not has_sorry_or_admit(text)
+            and not contains_metavariable_placeholder(text)
+            and "⊢" not in text
+            and not graph_statement_non_theorem_reason(text)
+            and not _graph_statement_is_obvious_non_proposition(text)
+            and _graph_prop_check_term_surface(text)
+        )
+    except RecursionError:
+        return False
 
 
 def _mark_non_theorem_graph_target(
@@ -9660,6 +10542,15 @@ class ProofGraphNode:
     attempt_ids: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Runtime source revisions are excluded from dataclass serialization.
+        if name in {"node_id", "kind", "name", "statement", "source_hash"} and name in self.__dict__:
+            if self.__dict__[name] != value:
+                object.__setattr__(self, "_prop_admission_revision", int(
+                    self.__dict__.get("_prop_admission_revision", 0)
+                ) + 1)
+        object.__setattr__(self, name, value)
+
 
 @dataclass
 class ProofGraphBranchFrame:
@@ -9746,6 +10637,151 @@ class ProofGraph:
         self._rebuild_edge_index()
         self.ensure_root(self.root_statement)
         self._sync_next_attempt_index()
+
+    def bind_statement_admission(
+        self, *, owner: object,
+        context_supplier: Callable[[], PropAdmissionContext | None],
+    ) -> None:
+        registry = getattr(self, "_statement_admission_registry", None)
+        if not isinstance(registry, PropAdmissionRegistry) or not registry.owned_by(self):
+            registry = PropAdmissionRegistry()
+            self._statement_admission_registry = registry
+        registry.bind(self, owner, context_supplier)
+
+    def _admission_node(self, node_or_id: ProofGraphNode | str) -> ProofGraphNode | None:
+        if isinstance(node_or_id, ProofGraphNode):
+            return node_or_id if self.nodes.get(node_or_id.node_id) is node_or_id else None
+        return self.nodes.get(str(node_or_id))
+
+    @staticmethod
+    def _static_prop_rejection(node: ProofGraphNode) -> bool:
+        metadata = node.metadata or {}
+        return bool(
+            node.status == "rejected"
+            and metadata.get("graph_statement_non_theorem") is True
+            and metadata.get("graph_statement_non_theorem_reason") == "non_executable_statement"
+            and metadata.get("rejection_reason") == "graph_statement_non_theorem"
+            and metadata.get("last_rejection_evidence_hash") == graph_text_hash(
+                "\n".join(("graph_statement_non_theorem", "non_executable_statement", node.statement))
+            )
+        )
+
+    def _prop_admission_blocked(self, node: ProofGraphNode) -> bool:
+        static_rejection = self._static_prop_rejection(node)
+        if self.is_superseded_tombstone(node):
+            return True
+        if node.status in {"rejected", "disproved", "failed", "abandoned", "superseded", "invalid"} and not static_rejection:
+            return True
+        view = copy.copy(node)
+        view.metadata = dict(node.metadata or {})
+        if static_rejection:
+            for key in ("schedulable", "graph_statement_non_theorem", "graph_statement_non_theorem_reason", "rejection_reason"):
+                view.metadata.pop(key, None)
+        if (
+            graph_node_frontier_quarantined(view)
+            or view.metadata.get("graph_statement_non_theorem")
+            or view.metadata.get("prop_admission_rejection_preserved")
+        ):
+            return True
+        return any(
+            attempt.node_id == node.node_id and attempt.verdict == "variant_type_rejected"
+            for attempt in self.attempts
+        )
+
+    def _prop_admission_binding(
+        self, node: ProofGraphNode, statement: str | None = None,
+    ) -> PropAdmissionBinding:
+        return PropAdmissionBinding(
+            node=node, node_id=node.node_id,
+            revision=int(getattr(node, "_prop_admission_revision", 0)),
+            node_statement=node.statement,
+            statement=node.statement if statement is None else statement,
+            kind=node.kind, name=node.name, source_hash=node.source_hash,
+        )
+
+    def current_prop_check_context(self) -> PropAdmissionContext | None:
+        registry = getattr(self, "_statement_admission_registry", None)
+        return registry.current_context(self) if isinstance(registry, PropAdmissionRegistry) else None
+
+    def checked_prop_admission(
+        self, node_or_id: ProofGraphNode | str, *, statement: str | None = None,
+    ) -> CheckedPropAdmission | None:
+        node = self._admission_node(node_or_id)
+        registry = getattr(self, "_statement_admission_registry", None)
+        if node is None or self._prop_admission_blocked(node) or not isinstance(registry, PropAdmissionRegistry):
+            return None
+        binding = self._prop_admission_binding(node, statement)
+        if not _graph_statement_may_check_prop(binding.statement):
+            return None
+        return registry.receipt(self, binding)
+
+    def statement_admission(
+        self, node_or_id: ProofGraphNode | str = "", *, statement: str | None = None,
+    ) -> StatementAdmission:
+        node = self._admission_node(node_or_id)
+        if isinstance(node_or_id, ProofGraphNode) and node is None:
+            return StatementAdmission.HARD_REJECT
+        raw = statement if statement is not None else (node.statement if node is not None else str(node_or_id))
+        if node is not None and self._prop_admission_blocked(node):
+            return StatementAdmission.HARD_REJECT
+        if graph_statement_is_executable(raw):
+            return StatementAdmission.PLAUSIBLE
+        if not _graph_statement_may_check_prop(raw):
+            return StatementAdmission.HARD_REJECT
+        if node is not None and self.checked_prop_admission(node, statement=raw) is not None:
+            return StatementAdmission.CHECKED_PROP
+        return StatementAdmission.NEEDS_PROP_CHECK
+
+    def statement_is_executable(self, statement: str, *, node_id: str = "") -> bool:
+        if node_id not in self.nodes:
+            return graph_statement_is_executable(statement)
+        return self.statement_admission(node_id, statement=statement).executable
+
+    def may_schedule_prop_check(
+        self, node_or_id: ProofGraphNode | str = "", *, statement: str | None = None,
+    ) -> bool:
+        node = self._admission_node(node_or_id)
+        if isinstance(node_or_id, ProofGraphNode) and node is None:
+            return False
+        if node is not None and (self._prop_admission_blocked(node) or node.status not in {"open", "blocked", "rejected"}):
+            return False
+        raw = statement if statement is not None else (node.statement if node is not None else str(node_or_id))
+        return _graph_statement_may_check_prop(raw)
+
+    def begin_prop_check(
+        self, node_or_id: ProofGraphNode | str, *, statement: str | None = None,
+    ) -> PropCheckTicket | None:
+        node = self._admission_node(node_or_id)
+        registry = getattr(self, "_statement_admission_registry", None)
+        if node is None or not isinstance(registry, PropAdmissionRegistry) or not self.may_schedule_prop_check(node, statement=statement):
+            return None
+        return registry.begin(self, self._prop_admission_binding(node, statement))
+
+    def prop_check_is_current(self, ticket: object) -> bool:
+        if not isinstance(ticket, PropCheckTicket):
+            return False
+        node = self._admission_node(ticket.node_id)
+        registry = getattr(self, "_statement_admission_registry", None)
+        return bool(
+            node is not None and isinstance(registry, PropAdmissionRegistry)
+            and self.may_schedule_prop_check(node, statement=ticket.statement)
+            and registry.is_current(self, ticket, self._prop_admission_binding(node, ticket.statement))
+        )
+
+    def discard_prop_check(self, ticket: object) -> None:
+        registry = getattr(self, "_statement_admission_registry", None)
+        if isinstance(registry, PropAdmissionRegistry):
+            registry.discard(ticket)
+
+    def confirm_prop_check(self, ticket: object) -> CheckedPropAdmission | None:
+        registry = getattr(self, "_statement_admission_registry", None)
+        if not isinstance(registry, PropAdmissionRegistry):
+            return None
+        if not self.prop_check_is_current(ticket) or not isinstance(ticket, PropCheckTicket):
+            registry.discard(ticket)
+            return None
+        node = self.nodes[ticket.node_id]
+        return registry.confirm(self, ticket, self._prop_admission_binding(node, ticket.statement))
 
     def set_active_root_target_statements(self, targets: Iterable[str]) -> None:
         seen: Set[str] = set()
@@ -10577,6 +11613,7 @@ class ProofGraph:
         relation_kind: str = "mutates_to",
         score: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        checked_admission: object = None,
     ) -> ProofGraphNode:
         """Record one formalization candidate for an informal/proposed claim."""
 
@@ -10872,6 +11909,10 @@ class ProofGraph:
             node_metadata["score"] = self._coerce_float(score)
         node_metadata.update(incoming_metadata)
         node = self.nodes.get(node_id)
+        admission_blocked_before = node is not None and self._prop_admission_blocked(node)
+        preserve_type_rejection = bool(
+            node is not None and node.status == "rejected" and not self._static_prop_rejection(node)
+        )
         if node is None:
             node = ProofGraphNode(
                 node_id=node_id,
@@ -10898,6 +11939,42 @@ class ProofGraph:
             if source:
                 node.source_hash = graph_text_hash(source)
             node.metadata.update(node_metadata)
+        if preserve_type_rejection:
+            node.metadata["prop_admission_rejection_preserved"] = True
+        if (
+            non_theorem_reason == "non_executable_statement"
+            and not admission_blocked_before and not incoming_invalid
+            and isinstance(checked_admission, CheckedPropAdmission)
+            and statement == formal_statement == checked_admission.statement
+        ):
+            registry = getattr(self, "_statement_admission_registry", None)
+            source_node = self._admission_node(checked_admission.binding.node_id)
+            source_is_authorized = bool(
+                source_node is not None and (
+                    (source_node.kind == "proposed_claim" and source_node.node_id == claim_id)
+                    or (source_node.kind == "formal_variant" and source_node.node_id == node.node_id
+                        and source_node.metadata.get("claim_node_id") == claim_id)
+                )
+            )
+            if source_is_authorized and source_node is not None and isinstance(registry, PropAdmissionRegistry):
+                source_binding = self._prop_admission_binding(source_node, statement)
+                if (
+                    not self._prop_admission_blocked(source_node)
+                    and _graph_statement_may_check_prop(statement)
+                    and registry.transfer(
+                        self, checked_admission, source_binding,
+                        self._prop_admission_binding(node, statement),
+                    ) is not None
+                ):
+                    non_theorem_reason = ""
+                    for key in (
+                        "schedulable", "graph_statement_non_theorem",
+                        "graph_statement_non_theorem_reason", "rejection_reason",
+                        "last_rejection_evidence_hash",
+                    ):
+                        node.metadata.pop(key, None)
+                    node.status = "open"
+                    node.metadata["unverified"] = True
         if non_theorem_reason:
             _mark_non_theorem_graph_target(
                 node,
@@ -13567,6 +14644,12 @@ class ProofGraph:
         if not identity:
             raise ValueError("missing obligation requires a statement or reason")
         node_id = self.missing_obligation_node_id(identity)
+        # This classifies the incoming source before lifecycle reconciliation.
+        # A retired route may still own this node until the live route below
+        # revives it; that state must not turn a proposition into prose.
+        statement_is_executable = statement_is_executable or (
+            self.checked_prop_admission(node_id, statement=raw_statement) is not None
+        )
         node_metadata: Dict[str, Any] = {
             "reason": reason_text,
             "source_node_id": source_id,
@@ -13736,8 +14819,12 @@ class ProofGraph:
             node.kind = "missing_obligation"
             if node_statement:
                 existing_statement = str(node.statement or "").strip()
-                existing_executable = graph_statement_is_executable(existing_statement)
-                incoming_executable = graph_statement_is_executable(node_statement)
+                existing_executable = graph_statement_is_executable(existing_statement) or (
+                    self.checked_prop_admission(node, statement=existing_statement) is not None
+                )
+                incoming_executable = graph_statement_is_executable(node_statement) or (
+                    self.checked_prop_admission(node, statement=node_statement) is not None
+                )
                 if not (existing_executable and not incoming_executable):
                     node.statement = node_statement
             if phase:
@@ -19484,7 +20571,7 @@ class ProofGraph:
             metadata = dict(graph_node.metadata or {})
             statement = str(graph_node.statement or "").strip()
             formalization_required = bool(metadata.get("formalization_required"))
-            statement_executable = graph_statement_is_executable(statement)
+            statement_executable = self.statement_is_executable(statement, node_id=graph_node.node_id)
             formalization_work = str(work_type or "").strip() in {
                 "formalize_claim",
                 "formalize_missing_obligation",
@@ -19853,7 +20940,7 @@ class ProofGraph:
                         return
                     if obligation_metadata.get(
                         "formalization_required"
-                    ) or not graph_statement_is_executable(obligation_statement):
+                    ) or not self.statement_is_executable(obligation_statement, node_id=obligation.node_id):
                         return
                     obligation_suppression = graph_root_equivalent_suppression_decision(
                         obligation_statement,
@@ -20330,7 +21417,7 @@ class ProofGraph:
                 ):
                     continue
                 statement = str(graph_node.statement or "").strip()
-                statement_executable = graph_statement_is_executable(statement)
+                statement_executable = self.statement_is_executable(statement, node_id=graph_node.node_id)
                 if (
                     metadata.get("target_integrity_adjudication")
                     and statement_executable
@@ -21682,8 +22769,8 @@ class ProofGraph:
                 )
                 if str(metadata.get(key) or "").strip()
             ]
-            if not live_parent_values and graph_statement_is_executable(
-                obligation.statement
+            if not live_parent_values and self.statement_is_executable(
+                obligation.statement, node_id=obligation.node_id
             ):
                 live_parent_values.append(str(obligation.statement or "").strip())
             live_parent_keys = {

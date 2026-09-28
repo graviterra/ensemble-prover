@@ -1341,7 +1341,7 @@ def _repair_ticket_from_lean_rejection(
     selected_target_executable = (
         bool(selected_target_statement)
         and selected_work_type != "route_replan"
-        and graph_statement_is_executable(selected_target_statement)
+        and _session_graph_statement_is_executable(session, selected_target_statement)
     )
     active_root_target = active_root_target_statement(
         getattr(session, "dossier", None),
@@ -2647,7 +2647,7 @@ def _format_graph_native_selected_work_prompt(
                 node_key == primary_node_id
                 or bool(node_metadata.get("formalization_required"))
             )
-            and not graph_statement_is_executable(raw_statement)
+            and not _session_graph_statement_is_executable(session, raw_statement, node_id=node_key)
         )
         statement = prompt_safe(
             (
@@ -3591,7 +3591,25 @@ def _selected_work_terminal_graph_target_suppressed(
     return True
 
 
-def _selected_graph_native_proof_target(session: Any) -> Dict[str, str]:
+def _session_graph_statement_is_executable(
+    session: Any, statement: str, *, node_id: str = "",
+) -> bool:
+    from ensemble_prover.mini_session.session import bind_session_statement_admission
+
+    graph = bind_session_statement_admission(session)
+    if graph is None:
+        return graph_statement_is_executable(statement)
+    if not node_id:
+        record = dict(getattr(session, "selected_work_item_record", {}) or {})
+        node_id = str(record.get("variant_id") or record.get("obligation_id")
+                      or record.get("claim_id") or record.get("graph_node_id")
+                      or record.get("node_id") or "")
+    return graph.statement_is_executable(statement, node_id=node_id)
+
+
+def _selected_graph_native_proof_target(
+    session: Any, *, for_prop_check: bool = False,
+) -> Dict[str, str]:
     """Return the selected graph-native proof node target, if any.
 
     Conversation turns can be scheduled as a fallback for graph-native work.
@@ -3616,6 +3634,17 @@ def _selected_graph_native_proof_target(session: Any) -> Dict[str, str]:
     graph_record = dict(record.get("graph_record") or {})
     merged = {**graph_record, **item_record, **record}
     official_answer_visible = _effective_official_answer_visibility(session)
+
+    from ensemble_prover.mini_session.session import bind_session_statement_admission
+
+    admission_graph = bind_session_statement_admission(session)
+
+    def statement_admitted(statement: str, node_id: str) -> bool:
+        if admission_graph is None:
+            return graph_statement_is_executable(statement)
+        if admission_graph.statement_is_executable(statement, node_id=node_id):
+            return True
+        return bool(for_prop_check and node_id and admission_graph.may_schedule_prop_check(node_id, statement=statement))
 
     def statement_allowed_for_execution(statement: str) -> bool:
         return bool(
@@ -3724,10 +3753,13 @@ def _selected_graph_native_proof_target(session: Any) -> Dict[str, str]:
         statement = str(
             merged.get("target_statement") or getattr(node, "statement", "") or ""
         ).strip()
+        if (for_prop_check and not graph_statement_is_executable(statement)
+                and statement != str(getattr(node, "statement", "") or "")):
+            return {}
         if (
             not statement
             or not statement_allowed_for_execution(statement)
-            or not graph_statement_is_executable(statement)
+            or not statement_admitted(statement, node_id)
         ):
             return {}
         if root_equivalent(statement) and not target_integrity_root_equivalent_allowed(
@@ -3780,7 +3812,7 @@ def _selected_graph_native_proof_target(session: Any) -> Dict[str, str]:
         if (
             not statement
             or not statement_allowed_for_execution(statement)
-            or not graph_statement_is_executable(statement)
+            or not statement_admitted(statement, obligation_id)
         ):
             return {}
         if (
@@ -3809,7 +3841,7 @@ def _selected_graph_native_proof_target(session: Any) -> Dict[str, str]:
             continue
         if not statement_allowed_for_execution(statement):
             continue
-        if not graph_statement_is_executable(statement):
+        if not statement_admitted(statement, node_id):
             continue
         if (
             root_equivalent(statement)
@@ -4034,7 +4066,7 @@ def _selected_formalization_helper_contract(
     raw_target_statement = str(
         merged.get("target_statement") or getattr(node, "statement", "") or ""
     ).strip()
-    if raw_target_statement and graph_statement_is_executable(raw_target_statement):
+    if raw_target_statement and _session_graph_statement_is_executable(session, raw_target_statement, node_id=node_id):
         return {}
     target_statement = ""
     if raw_target_statement:
@@ -4216,7 +4248,7 @@ def _recovered_formalization_helper_contracts(
             if work_type not in allowed_work_types:
                 work_type = "formalize_missing_obligation"
             target_statement = str(getattr(node, "statement", "") or "").strip()
-            if target_statement and graph_statement_is_executable(target_statement):
+            if target_statement and _session_graph_statement_is_executable(session, target_statement, node_id=node.node_id):
                 continue
             parent_statement = _formalization_parent_statement(
                 session,
@@ -4274,6 +4306,7 @@ def _formalization_helper_candidates(
     lemma_dag_candidates: Sequence[str],
     *,
     require_executable_statement: bool = True,
+    session: Any = None,
 ) -> List[str]:
     out: List[str] = []
     seen: set[str] = set()
@@ -4301,7 +4334,7 @@ def _formalization_helper_candidates(
         statement = helper_decl_statement(text)
         if not statement:
             continue
-        if require_executable_statement and not graph_statement_is_executable(statement):
+        if require_executable_statement and not _session_graph_statement_is_executable(session, statement):
             continue
         body = helper_decl_body(text)
         if not body or has_sorry_or_admit(body):
@@ -4430,6 +4463,7 @@ def _proof_turn_decl_graph_formalization_candidate(
     *,
     contract: Dict[str, Any],
     proof_text: str = "",
+    session: Any = None,
 ) -> tuple[str, List[str]]:
     """Recover complete declarations from proof-turn formalization replies.
 
@@ -4449,7 +4483,7 @@ def _proof_turn_decl_graph_formalization_candidate(
         if not name:
             continue
         statement = helper_decl_statement(candidate)
-        if not statement or not graph_statement_is_executable(statement):
+        if not statement or not _session_graph_statement_is_executable(session, statement):
             continue
         body = helper_decl_body(candidate)
         if not body or has_sorry_or_admit(body):
@@ -4457,7 +4491,7 @@ def _proof_turn_decl_graph_formalization_candidate(
         bridge_status = _formalization_bridge_status(
             contract,
             statement,
-            helper_name=name,
+            helper_name=name, session=session,
         )
         referenced_by_proof = _lean_identifier_referenced(proof_scan_text, name)
         referenced_later = any(
@@ -4704,10 +4738,17 @@ def _formalization_parent_target_binding(
     live_parent_statement = str(
         getattr(parent_obligation, "statement", "") or ""
     ).strip()
+    statement_checker = getattr(graph, "statement_is_executable", None)
     live_statement_is_authoritative = bool(
         live_parent_statement
         and (
-            graph_statement_is_executable(live_parent_statement)
+            (
+                statement_checker(
+                    live_parent_statement, node_id=parent_obligation.node_id
+                )
+                if callable(statement_checker)
+                else graph_statement_is_executable(live_parent_statement)
+            )
             or re.fullmatch(
                 r"(?:_root_\.)?[A-Za-z_][A-Za-z0-9_'.]*(?:\.[A-Za-z_][A-Za-z0-9_']*)*",
                 live_parent_statement,
@@ -5848,6 +5889,7 @@ def _formalization_bridge_status(
     *,
     helper_name: str = "",
     contract_identity: str = "",
+    session: Any = None,
 ) -> Dict[str, Any]:
     """Check whether a declaration may close a non-executable graph target.
 
@@ -5878,6 +5920,9 @@ def _formalization_bridge_status(
         }
     selected = dict(contract.get("selected_graph_work") or {})
     target_statement = str(contract.get("target_statement") or "").strip()
+    target_executable = bool(target_statement and _session_graph_statement_is_executable(
+        session, target_statement, node_id=str(contract.get("node_id") or ""),
+    ))
     bridge_contract = str(
         selected.get("formalization_bridge_contract")
         or contract.get("formalization_bridge_contract")
@@ -6042,7 +6087,7 @@ def _formalization_bridge_status(
             ),
         }
     if parent_statement and not (
-        target_statement and graph_statement_is_executable(target_statement)
+        target_executable
     ):
         rejection = parent_rejection_status(
             restates_reason="bridge_restates_parent_target",
@@ -6052,7 +6097,7 @@ def _formalization_bridge_status(
         )
         if rejection is not None:
             return rejection
-    if target_statement and graph_statement_is_executable(target_statement):
+    if target_executable:
         if " ".join(target_statement.split()).strip() == statement:
             return {
                 "accepted": True,
@@ -6104,10 +6149,11 @@ async def _typecheck_graph_native_goal_statement(
     *,
     session: Any,
     statement: str,
+    admission_context: Any = None,
 ) -> Dict[str, Any]:
     if not str(statement or "").strip():
         return {"ok": True, "inconclusive": False, "output": ""}
-    lean = getattr(session, "lean", None)
+    lean = admission_context.checker_identity if admission_context is not None else getattr(session, "lean", None)
     if lean is None:
         return {
             "ok": False,
@@ -6115,7 +6161,8 @@ async def _typecheck_graph_native_goal_statement(
             "output": "Lean checker missing",
         }
     if not (
-        callable(getattr(lean, "check_with_sorry_raw", None))
+        callable(getattr(lean, "check_proposition_type_raw", None))
+        or callable(getattr(lean, "check_with_sorry_raw", None))
         or callable(getattr(lean, "check", None))
     ):
         return {
@@ -6128,11 +6175,16 @@ async def _typecheck_graph_native_goal_statement(
     try:
         from ensemble_prover.mini_recursive import _typecheck_claim_statement
 
-        helpers = (
-            list(dossier.verified_helper_blocks())
-            if dossier is not None and hasattr(dossier, "verified_helper_blocks")
-            else []
-        )
+        if admission_context is not None:
+            helpers = list(admission_context.helper_blocks)
+            if not callable(getattr(lean, "check_proposition_type_raw", None)):
+                return {"ok": False, "inconclusive": True, "output": "Lean checker missing proposition admission API"}
+        else:
+            helpers = (
+                list(dossier.verified_helper_blocks())
+                if dossier is not None and hasattr(dossier, "verified_helper_blocks")
+                else []
+            )
         configured_timeout_s = max(
             float(getattr(getattr(lean, "cfg", None), "timeout_s", 0.0) or 0.0),
             float(getattr(lean, "timeout_s", 0.0) or 0.0),
@@ -6140,7 +6192,7 @@ async def _typecheck_graph_native_goal_statement(
         return_ok, return_inconclusive, output = await _typecheck_claim_statement(
             lean=lean,
             statement=str(statement or ""),
-            preamble=str(
+            preamble=admission_context.preamble if admission_context is not None else str(
                 getattr(conv, "lean_preamble", "")
                 or getattr(conv, "preamble", "")
                 or ""
@@ -6391,6 +6443,7 @@ async def _run_graph_native_formalization_helper_contract(
         require_executable_statement=not bool(
             allow_prefix_scoped_candidate_statements
         ),
+        session=session,
     )
     if not candidates:
         feedback = _formalization_helper_feedback(contract=contract)
@@ -6800,7 +6853,7 @@ async def _run_graph_native_formalization_helper_contract(
             replay_bridge_status = _formalization_bridge_status(
                 contract,
                 formal_statement,
-                helper_name=helper_decl_name(candidate) or "",
+                helper_name=helper_decl_name(candidate) or "", session=session,
             )
             if bool(replay_bridge_status.get("accepted")):
                 replay_bridge_status = {
@@ -6828,7 +6881,7 @@ async def _run_graph_native_formalization_helper_contract(
         bridge_status = _formalization_bridge_status(
             contract,
             formal_statement,
-            helper_name=helper_decl_name(candidate) or "",
+            helper_name=helper_decl_name(candidate) or "", session=session,
             contract_identity=str(
                 getattr(contract_analysis, "structural_identity", "") or ""
             ),
@@ -7303,7 +7356,7 @@ async def _run_graph_native_formalization_helper_contract(
             bridge_status = _formalization_bridge_status(
                 contract,
                 formal_statement,
-                helper_name=helper_decl_name(candidate) or "",
+                helper_name=helper_decl_name(candidate) or "", session=session,
             )
             if not bool(bridge_status.get("accepted")):
                 last_failure = str(
@@ -7789,6 +7842,7 @@ async def _run_graph_native_formalization_helper_contract(
                     claim_node_id=node.node_id,
                     claim_name=str(getattr(node, "name", "") or ""),
                     statement=formal_statement,
+                    checked_admission=graph.checked_prop_admission(node.node_id, statement=formal_statement),
                     variant_name=helper_name,
                     source="graph_native_formalization_helper",
                     phase=f"{getattr(conv, 'role', 'prove')}_graph_native_formalization",
@@ -10135,11 +10189,17 @@ class ConversationTurnAction:
         return {"state": state, "history": history, "binding": binding}
 
     @staticmethod
-    def _provider_quantum_live_binding(session: Any) -> Tuple[str, str]:
-        """Return the target and repair cycle currently owned by the scheduler."""
+    def _provider_quantum_live_binding(
+        session: Any, *, for_prop_check: bool = False,
+    ) -> Tuple[str, str]:
+        """Return the target and repair cycle currently owned by the scheduler.
+
+        Restore may authenticate an exact pending graph target before local
+        proposition checking. That identity does not authorize provider work.
+        """
 
         conv = getattr(session, "conv", None)
-        graph_target = _selected_graph_native_proof_target(session)
+        graph_target = _selected_graph_native_proof_target(session, for_prop_check=for_prop_check)
         target = str(graph_target.get("statement") or "").strip()
         if not target and _selected_assemble_route_authoring_ready(session):
             target = _selected_assemble_route_goal_statement(session)
@@ -10933,7 +10993,7 @@ class ConversationTurnAction:
                 session.selected_work_item_action_id = ""
                 session.selected_work_item_record = {}
         live_target, live_repair_cycle = self._provider_quantum_live_binding(
-            session
+            session, for_prop_check=True,
         )
         checkpoint = self._validated_provider_quantum_checkpoint(
             self._provider_quantum_checkpoint,
@@ -11829,6 +11889,127 @@ class ConversationTurnAction:
                 return False
         return True
 
+    def _restore_pending_prop_check_selection(self, session: Any) -> None:
+        """Restore only the identity of a parked graph target before preflight."""
+
+        if (not self._provider_quantum_checkpoint
+                or getattr(session, "selected_work_item_record", None)
+                or getattr(session, "selected_work_item", None) is not None):
+            return
+        conv = getattr(session, "conv", None)
+        if conv is None:
+            return
+        previous_digest = str(getattr(session, "_selected_proof_idea_context_digest", "") or "")
+        restored = False
+        try:
+            parked = self._validated_provider_quantum_checkpoint(
+                self._provider_quantum_checkpoint, conv=conv,
+            )
+            lane = str(parked["state"].get("provider_turn_lane_identity") or "")
+            if lane and lane in set(getattr(session, "provider_turn_retired_lane_identities", ()) or ()):
+                return
+            record = self._rehydrate_provider_quantum_selected_work_record(
+                parked["binding"].get("selected_work_record"),
+                target=str(parked["binding"].get("target") or ""),
+            )
+            restore = getattr(session, "_restore_selected_work_record", None)
+            if not record or not callable(restore):
+                return
+            session._selected_proof_idea_context_digest = str(
+                parked["binding"].get("selected_context_digest") or ""
+            )
+            if not restore(record, self.id, context="provider_quantum_prop_preflight"):
+                return
+            target, repair_cycle = self._provider_quantum_live_binding(session, for_prop_check=True)
+            self._validated_provider_quantum_checkpoint(
+                parked, conv=conv, expected_target=target,
+                expected_repair_cycle=repair_cycle,
+            )
+            restored = True
+        except StateSnapshotCompatibilityError:
+            # Normal checkpoint activation owns retirement of invalid cursors.
+            pass
+        finally:
+            if not restored:
+                session._selected_proof_idea_context_digest = previous_digest
+                clear = getattr(session, "_clear_selected_work_item", None)
+                if callable(clear):
+                    clear()
+
+    async def _preflight_pending_graph_statement(self, session: Any) -> Optional[MiniOutcome]:
+        from ensemble_prover.mini_session.session import bind_session_statement_admission
+
+        started = time.monotonic()
+        self._restore_pending_prop_check_selection(session)
+        graph = bind_session_statement_admission(session)
+        target = _selected_graph_native_proof_target(session, for_prop_check=True)
+        if graph is None or not target:
+            return None
+        node_id = target["node_id"]
+        statement = target["statement"]
+        if graph.statement_is_executable(statement, node_id=node_id):
+            return None
+        ticket = graph.begin_prop_check(node_id, statement=statement)
+        dispatch_id = str(getattr(session, "_inflight_action_dispatch_id", "") or "").strip()
+        receipt = None
+        try:
+            if ticket is None:
+                status = {"ok": False, "inconclusive": True, "output": "Current proposition-check context is unavailable"}
+            else:
+                status = await _typecheck_graph_native_goal_statement(
+                    session=session, statement=ticket.statement, admission_context=ticket.context,
+                )
+                require_current_action_dispatch(session, dispatch_id)
+            # Re-resolve ownership and policy after suspension. The registry
+            # additionally compares exact source and checker inputs.
+            current_target = _selected_graph_native_proof_target(session, for_prop_check=True)
+            stale = current_target != target
+            if not stale and ticket is not None and bool(status.get("ok")):
+                receipt = graph.confirm_prop_check(ticket)
+                stale = receipt is None
+            elif not stale and ticket is not None:
+                stale = not graph.prop_check_is_current(ticket)
+        finally:
+            if ticket is not None:
+                graph.discard_prop_check(ticket)
+        if receipt is not None:
+            node = graph.nodes[node_id]
+            node.metadata["graph_target_preflight_evidence"] = {"status": "lean_executable", "statement_sha256": hashlib.sha256(statement.encode()).hexdigest()}
+            if node.kind != "proposed_claim" or bool(self._provider_quantum_checkpoint):
+                return None
+            graph.record_formal_variant(
+                claim_node_id=node_id, claim_name=node.name, statement=statement,
+                variant_name=node.name, phase="graph_native_statement_typecheck",
+                checked_admission=receipt,
+            )
+            verdict = "graph_native_statement_typecheck_admitted"
+        elif not stale and not bool(status.get("inconclusive")):
+            _mark_graph_native_goal_statement_type_rejected(
+                session=session, graph_native_target=target,
+                output=str(status.get("output") or ""), phase_turn=0,
+            )
+            verdict = "graph_native_statement_type_rejected"
+        else:
+            verdict = "graph_native_statement_typecheck_deferred"
+        pending = verdict.endswith("deferred")
+        return MiniOutcome(
+            action_id=self.id, solved=False, proof=None, helpers_added=(), progress=False,
+            cost_seconds=time.monotonic() - started,
+            metadata={
+                "verdict": verdict, "lean_verdict": verdict,
+                "graph_native_target_node_id": node_id,
+                "graph_native_goal_statement": statement,
+                "lean_error": str(status.get("output") or ""),
+                "graph_native_statement_typecheck_pending": pending,
+                "provider_attempts": [], "preserve_action_budget": True,
+                "preserve_frontier_work": pending,
+                "defer_selected_frontier_action": pending,
+                "scheduler_neutral": True, "stagnation_neutral": True,
+                "hard_pivot_neutral": True, "iteration_neutral": True,
+                "non_consuming_repair_ticket_continuation": True,
+            },
+        )
+
     async def run(self, session: Any) -> MiniOutcome:  # noqa: C901, PLR0912, PLR0915
         # every return path must clear
         # ``session.last_turn_extraction`` and ``session.last_lean_verdict``
@@ -11836,6 +12017,18 @@ class ConversationTurnAction:
         # PostLeanFailureAction) does not act on stale data from a prior
         # turn. Wrapping the body in try/finally is the only way to
         # guarantee this across the many early returns in the pipeline.
+        try:
+            local_preflight = await self._preflight_pending_graph_statement(session)
+        except BaseException:
+            session.last_turn_extraction = None
+            session.last_lean_verdict = None
+            session.last_llm_content = ""
+            raise
+        if local_preflight is not None:
+            session.last_turn_extraction = None
+            session.last_lean_verdict = None
+            session.last_llm_content = ""
+            return local_preflight
         self._activate_provider_quantum_checkpoint(session)
         authenticated_provider_resume = self._authenticated_live_provider_resume(
             session
@@ -13067,7 +13260,13 @@ class ConversationTurnAction:
             # owned candidate reaches its conclusive Lean adjudication.
             type_status = (
                 {"ok": True, "inconclusive": False, "output": ""}
-                if answer_safe_pending_replay
+                if (answer_safe_pending_replay or (
+                    getattr(dossier, "proof_graph", None) is not None
+                    and dossier.proof_graph.checked_prop_admission(
+                        str(graph_native_target.get("node_id") or ""),
+                        statement=graph_native_goal_statement,
+                    ) is not None
+                ))
                 else await _typecheck_graph_native_goal_statement(
                     session=session,
                     statement=graph_native_goal_statement,
@@ -16258,7 +16457,7 @@ class ConversationTurnAction:
         repair_submission_has_executable_lean = bool(
             str(proof or "").strip()
             or any(
-                graph_statement_is_executable(helper_decl_statement(candidate))
+                _session_graph_statement_is_executable(session, helper_decl_statement(candidate))
                 and bool(str(helper_decl_body(candidate) or "").strip())
                 and not has_sorry_or_admit(candidate)
                 for candidate in dict.fromkeys(
@@ -17187,7 +17386,7 @@ class ConversationTurnAction:
             ) = _proof_turn_decl_graph_formalization_candidate(
                 extraction,
                 contract=formalization_helper_contract,
-                proof_text=proof or "",
+                proof_text=proof or "", session=session,
             )
             if proof_turn_formalization_candidate:
                 session.last_turn_extraction = None
@@ -18466,7 +18665,7 @@ class ConversationTurnAction:
             negative_candidates = _formalization_helper_candidates(
                 helpers,
                 lemma_dag_candidates,
-                require_executable_statement=True,
+                require_executable_statement=True, session=session,
             )
             raw_local_declarations = [
                 *list(helpers or ()),

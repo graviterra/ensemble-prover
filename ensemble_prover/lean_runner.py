@@ -320,6 +320,7 @@ def _check_meta_escape_violation(*texts: str) -> str:
 def _check_source_boundary_file(
     preamble: str, statement: str, proof: str, lemmas: str,
     *, goal_name: str, max_heartbeats: Optional[int] = None,
+    declaration_prefix: Optional[str] = None,
 ) -> str:
     """Parse candidate data before any untrusted command can be elaborated.
 
@@ -345,7 +346,8 @@ def _check_source_boundary_file(
     # a newline-delimited ``let rec`` body can become part of its last local
     # definition. Preserve the actual columns, while still requiring each
     # candidate to parse as one complete term before elaborating any of it.
-    declaration_prefix = f"opaque {goal_name} : "
+    if declaration_prefix is None:
+        declaration_prefix = f"opaque {goal_name} : "
     statement_input = " " * len(declaration_prefix) + statement
     proof_prefix = (declaration_prefix + statement + " := ").rsplit("\n", 1)[-1]
     proof_input = " " * len(proof_prefix) + proof
@@ -3728,6 +3730,7 @@ class LeanRunner:
             "analyze_statement_contracts",
             "canonicalize_statement_types",
             "check_statement_type_raw",
+            "check_proposition_type_raw",
             "apply_decl_to_goal",
             "supports_silence_fast_fail",
             "get_stats",
@@ -5196,6 +5199,7 @@ class LeanRunner:
         warning_as_error: bool = True,
         max_heartbeats: Optional[int] = None,
         axiom_audit_names: Optional[Sequence[str]] = None,
+        require_proposition: bool = False,
     ) -> "_BuiltLeanFile":
         """Assemble the Lean source for a single check.
 
@@ -5245,6 +5249,8 @@ class LeanRunner:
             if audit_requested
             else f"example : {statement} := {proof_code}\n"
         )
+        if require_proposition:
+            goal_line = f"theorem {goal_name} : {statement} := {proof_code}\n"
         scoped_block = goal_line
         if target_omit_variables:
             scoped_block = (
@@ -9435,6 +9441,97 @@ private def {serializer_prefix}_contractDefeq
             output,
             returncode,
         )
+
+    async def check_proposition_type_raw(
+        self,
+        statement: str,
+        lemmas: Sequence[str],
+        *,
+        preamble_override: str | None = None,
+        timeout_s: Optional[float] = None,
+    ) -> tuple[LeanParseResult, str, int]:
+        """Confirm one closed proposition in its target scope, without proving it.
+
+        The controlled proof stub is admitted only for type elaboration. The
+        candidate itself must parse as one term and have a proposition type
+        without admitted terms or unresolved metavariables.
+        """
+
+        deadline = self._execution_deadline(timeout_s)
+        raw_statement = str(statement or "")
+        helpers = "\n".join(str(block) for block in lemmas)
+        violation = _check_meta_escape_violation(raw_statement, helpers)
+        if not raw_statement.strip() or has_sorry_or_admit(raw_statement) or violation:
+            output = "error: proposition preflight: invalid candidate source"
+            return parse_lean_output(output, 1), output, 1
+        await self.ensure_project_imports_built()
+        proof = "by\n  sorry"
+        preamble = _append_imports_to_preamble(
+            self.cfg.preamble_import if preamble_override is None else preamble_override,
+            ["Lean"],
+        )
+        name = f"ensemble_prop_preflight_{uuid.uuid4().hex}"
+        qualified_name = f"_root_.{name}"
+        heartbeat_limit = getattr(self, "default_max_heartbeats", None)
+        if not isinstance(heartbeat_limit, int) or heartbeat_limit <= 0:
+            heartbeat_limit = None
+        boundary = _check_source_boundary_file(
+            self._resolve_preamble(preamble, proof_code=proof),
+            raw_statement, proof, helpers, goal_name=qualified_name,
+            max_heartbeats=heartbeat_limit,
+            declaration_prefix=f"theorem {qualified_name} : ",
+        )
+
+        def finish(
+            execution: _BackendExecutionResult | None,
+            write_error: str | None,
+            *, goal_start_line: int = 0,
+        ) -> tuple[LeanParseResult, str, int]:
+            output = (
+                execution.output if execution is not None else str(
+                    write_error or "proposition preflight infrastructure failure"
+                )
+            )
+            code = int(execution.returncode) if execution is not None else 1
+            if execution is not None:
+                # Count the logical type check once; backend counters retain
+                # the individual syntax and elaboration executions.
+                self._check_count += 1
+                self._sorry_check_count += 1
+                if code == 0:
+                    self._sorry_check_ok_count += 1
+                else:
+                    self._check_fail_count += 1
+                    self._sorry_check_fail_count += 1
+            return parse_lean_output(output, code, goal_start_line=goal_start_line), output, code
+
+        _path, execution, write_error = await self._execute_generated_file(
+            mode="proposition_type_source_boundary", goal_name=f"{name}_boundary",
+            content=boundary, timeout_s=timeout_s, warning_as_error=False,
+            operation_deadline=deadline,
+        )
+        if execution is None or execution.returncode != 0:
+            return finish(execution, write_error)
+        built = self._build_file(
+            raw_statement, proof, helpers, qualified_name,
+            preamble_override=preamble, warning_as_error=False,
+            max_heartbeats=heartbeat_limit, require_proposition=True,
+        )
+        # Inspect only the declaration's type: its controlled proof contains
+        # sorry, and therefore cannot serve as a mathematical certificate.
+        content = built.content + f"""
+run_cmd Lean.Elab.Command.liftTermElabM do
+  let declaration ← Lean.getConstInfo `{name}
+  if declaration.type.hasMVar || declaration.type.hasSorry then
+    Lean.throwError "proposition preflight: unresolved or admitted statement type"
+  unless ← Lean.Meta.isProp declaration.type do
+    Lean.throwError "proposition preflight: statement is not a proposition"
+"""
+        _path, execution, write_error = await self._execute_generated_file(
+            mode="proposition_type", goal_name=name, content=content,
+            timeout_s=timeout_s, warning_as_error=False, operation_deadline=deadline,
+        )
+        return finish(execution, write_error, goal_start_line=built.goal_start_line)
 
     async def check_statement_type_raw(
         self,
