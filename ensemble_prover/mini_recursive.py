@@ -33073,8 +33073,13 @@ class _FrozenPlannerRequestEnvelope(MiniRequestEnvelopePolicy):
     """One exact ordered set of serving-leaf requests, including after restart."""
 
     def __init__(self, client: Any, receipts: Sequence[MiniRequestEnvelopeReceipt]):
+        from .mini_client_capabilities import mini_request_transparent_client_binding
+
         super().__init__(work_type="recursive_planner")
-        leaves = [leaf for leaf, _cfg in mini_request_concrete_leaf_bindings(client)]
+        leaves = [
+            mini_request_transparent_client_binding(leaf)[0]
+            for leaf, _cfg in mini_request_concrete_leaf_bindings(client)
+        ]
         if len(leaves) != len(receipts):
             raise ValueError("saved planner envelope serving-leaf count changed")
         self._leaf_receipts: dict[int, MiniRequestEnvelopeReceipt] = {}
@@ -33094,7 +33099,10 @@ class _FrozenPlannerRequestEnvelope(MiniRequestEnvelopePolicy):
     async def resolve_for(
         self, client: Any, *, messages: Any = None, tools: Any = None,
     ) -> MiniRequestEnvelopeReceipt:
+        from .mini_client_capabilities import mini_request_transparent_client_binding
+
         del messages, tools
+        client, _fences = mini_request_transparent_client_binding(client)
         receipt = self._leaf_receipts.get(id(client))
         if receipt is None or not mini_request_envelope_receipt_is_valid_for(
             receipt, client, receipt.max_output_tokens,

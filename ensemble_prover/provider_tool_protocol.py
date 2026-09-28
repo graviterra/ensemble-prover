@@ -1400,6 +1400,9 @@ async def resolve_mini_request_output_tokens(
 def mini_request_wrapper_children(client: Any) -> List[Any]:
     """Return one wrapper layer in deterministic dispatch order."""
 
+    from .mini_client_capabilities import mini_request_transparent_client_binding
+
+    client, _fences = mini_request_transparent_client_binding(client)
     members = getattr(client, "members", None)
     if isinstance(members, list) and members:
         return [getattr(member, "client", member) for member in members]
@@ -1412,10 +1415,13 @@ def mini_request_wrapper_children(client: Any) -> List[Any]:
 def mini_request_concrete_leaf_bindings(client: Any) -> List[tuple[Any, Any]]:
     """Return concrete leaves with wrapper-supplied cfg fallbacks."""
 
+    from .mini_client_capabilities import mini_request_transparent_client_binding
+
     leaves: List[tuple[Any, Any]] = []
     active: set[int] = set()
 
     def visit(node: Any, inherited_cfg: Any = None) -> None:
+        node, _fences = mini_request_transparent_client_binding(node)
         node_id = id(node)
         if node_id in active:
             raise RuntimeError("model wrapper cycle in Mini request envelope")

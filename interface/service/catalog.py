@@ -41,8 +41,34 @@ _PROVIDERS = (
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,159}\Z")
 
 
+_CATALOG_MESSAGES = {
+    "directory_unreadable": "This directory could not be read. Choose another folder.",
+    "choose_directory": "Choose a directory within the available locations.",
+    "symlink": "Symlinks are not included in the project browser.",
+    "directory_missing": "Choose an existing directory.",
+    "source_missing": "Choose an existing Lean source file.",
+    "path_unavailable": "The selected path is unavailable.",
+    "outside_locations": "This path is outside the available project locations.",
+    "project_missing": "Choose a Lake project containing lakefile.toml or lakefile.lean.",
+    "outside_project": "Choose a Lean file inside the selected project.",
+    "declarations_unreadable": "Could not read the declarations in this Lean file. Check that declaration headers are complete.",
+    "source_irregular": "Choose a regular Lean source file.",
+    "source_large": "This Lean file is too large for the declaration picker.",
+    "source_encoding": "This Lean file is not valid UTF-8 text.",
+    "source_unreadable": "The selected Lean file could not be read.",
+}
+
+
 class CatalogError(ValueError):
-    """An actionable error safe to display in the local browser."""
+    """Catalog failure with a public message selected independently of its detail."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(_CATALOG_MESSAGES.get(code, "The selected path is unavailable."))
+
+    @property
+    def public_message(self) -> str:
+        return _CATALOG_MESSAGES.get(self.code, "The selected path is unavailable.")
 
 
 def _visible(name: str) -> bool:
@@ -102,7 +128,7 @@ def _children(directory: Path, limit: int) -> tuple[list[tuple[Path, bool]], boo
                 except OSError:
                     continue
     except OSError as exc:
-        raise CatalogError("This directory could not be read. Choose another folder.") from exc
+        raise CatalogError("directory_unreadable") from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -187,10 +213,10 @@ class ProjectCatalog:
 
     def _contained(self, selector: str, *, directory: bool = True) -> Path:
         if not selector or len(selector) > 4096 or any(ch in selector for ch in "\0\n\r"):
-            raise CatalogError("Choose a directory within the available locations.")
+            raise CatalogError("choose_directory")
         path = Path(selector)
         if not path.is_absolute() or ".." in path.parts:
-            raise CatalogError("Choose a directory within the available locations.")
+            raise CatalogError("choose_directory")
         for root in sorted(self.roots, key=lambda item: len(item.parts), reverse=True):
             try:
                 relative = path.relative_to(root)
@@ -203,24 +229,24 @@ class ProjectCatalog:
                 for part in relative.parts:
                     cursor = cursor / part
                     if cursor.is_symlink():
-                        raise CatalogError("Symlinks are not included in the project browser.")
+                        raise CatalogError("symlink")
                 resolved = cursor.resolve(strict=True)
                 resolved.relative_to(root)
                 if directory and not resolved.is_dir():
-                    raise CatalogError("Choose an existing directory.")
+                    raise CatalogError("directory_missing")
                 if not directory and not resolved.is_file():
-                    raise CatalogError("Choose an existing Lean source file.")
+                    raise CatalogError("source_missing")
                 return resolved
             except (OSError, RuntimeError, ValueError) as exc:
                 if isinstance(exc, CatalogError):
                     raise
-                raise CatalogError("The selected path is unavailable.") from exc
-        raise CatalogError("This path is outside the available project locations.")
+                raise CatalogError("path_unavailable") from exc
+        raise CatalogError("outside_locations")
 
     def _project(self, selector: str) -> Path:
         directory = self._contained(selector)
         if not _is_project(directory):
-            raise CatalogError("Choose a Lake project containing lakefile.toml or lakefile.lean.")
+            raise CatalogError("project_missing")
         return directory
 
     def workspace(self, *, control: bool) -> dict[str, Any]:
@@ -356,17 +382,17 @@ class ProjectCatalog:
         project = self._project(selector)
         relative = Path(filename)
         if not filename or relative.is_absolute() or any(not _visible(part) for part in relative.parts) or relative.suffix != ".lean":
-            raise CatalogError("Choose a Lean file inside the selected project.")
+            raise CatalogError("outside_project")
         source = self._contained(str(project / relative), directory=False)
         try:
             source.relative_to(project)
         except ValueError as exc:
-            raise CatalogError("Choose a Lean file inside the selected project.") from exc
+            raise CatalogError("outside_project") from exc
         content = self._read_source(source)
         try:
             declarations = [item for item in scan_lean_theorems(content) if not item.private]
         except (ValueError, RecursionError) as exc:
-            raise CatalogError("Could not read the declarations in this Lean file. Check that declaration headers are complete.") from exc
+            raise CatalogError("declarations_unreadable") from exc
         return {
             "theorems": [{"name": item.canonical_name, "statement": item.statement_type[:8000]} for item in declarations[:MAX_DECLARATIONS]],
             "truncated": len(declarations) > MAX_DECLARATIONS,
@@ -387,17 +413,17 @@ class ProjectCatalog:
             with os.fdopen(source_fd, "rb") as handle:
                 info = os.fstat(handle.fileno())
                 if not stat.S_ISREG(info.st_mode):
-                    raise CatalogError("Choose a regular Lean source file.")
+                    raise CatalogError("source_irregular")
                 if info.st_size > MAX_LEAN_BYTES:
-                    raise CatalogError("This Lean file is too large for the declaration picker.")
+                    raise CatalogError("source_large")
                 content = handle.read(MAX_LEAN_BYTES + 1)
                 if len(content) > MAX_LEAN_BYTES:
-                    raise CatalogError("This Lean file is too large for the declaration picker.")
+                    raise CatalogError("source_large")
             return content.decode("utf-8")
         except UnicodeError as exc:
-            raise CatalogError("This Lean file is not valid UTF-8 text.") from exc
+            raise CatalogError("source_encoding") from exc
         except OSError as exc:
-            raise CatalogError("The selected Lean file could not be read.") from exc
+            raise CatalogError("source_unreadable") from exc
         finally:
             if directory_fd is not None:
                 os.close(directory_fd)

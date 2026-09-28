@@ -9,6 +9,7 @@ import tempfile
 import time
 from typing import Mapping, Sequence
 
+from .sync_subprocess import run_process_group
 from .subprocess_environment import sanitized_subprocess_environment
 
 
@@ -61,11 +62,10 @@ def audit_compiled_source(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("compiled axiom audit deadline exhausted")
-            return subprocess.run(
+            return run_process_group(
                 ["lake", "env", "lean", *arguments], cwd=project_dir,
                 env=sanitized_subprocess_environment(env),
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                timeout=remaining, check=False,
+                timeout=remaining,
             )
 
         try:

@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import tempfile
 import time
 import uuid
@@ -21,6 +20,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .export_dependency_graph import _strip_comments_and_strings
+from .sync_subprocess import run_process_group
 from .subprocess_environment import sanitized_subprocess_environment
 from .theorem_project import scan_lean_theorems, split_lean_import_header
 
@@ -337,10 +337,9 @@ def _probe(content: str, path: Path, *, project: Path, timeout_s: float,
     ) if audit_root else ""
     path.write_text(content + "\n" + _CONTRACT_PROBE.replace(
         "__PRESENTATION_MARKER__", marker) + audit, encoding="utf-8")
-    proc = subprocess.run(
+    proc = run_process_group(
         ["lake", "env", "lean", str(path.resolve())], cwd=project,
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        timeout=timeout_s, check=False,
+        timeout=timeout_s,
         env=sanitized_subprocess_environment(_export_lean_env(extra_lean_paths)),
     )
     output = str(proc.stdout or "")

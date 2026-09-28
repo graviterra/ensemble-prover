@@ -61,7 +61,7 @@ class ProcessObservation:
 
 def _is_real_dir(path: Path) -> bool:
     try:
-        return path.is_dir() and not path.is_symlink()
+        return not path.is_symlink() and path.is_dir()
     except OSError:
         return False
 
@@ -168,8 +168,42 @@ def discover_runs(root: str | os.PathLike[str], *, limit: int = 500) -> list[Run
     return found[: max(0, int(limit))]
 
 
+def resolve_contained_directory(root: Path, selector: str) -> Path | None:
+    """Select existing, non-symlink children of a trusted root for the browser.
+
+    Request components are compared with directory entries, never used to build
+    a filesystem path. This differs deliberately from the CLI's explicit paths.
+    """
+    selector = selector.strip()
+    relative = Path(selector)
+    if not selector or "\0" in selector or relative.is_absolute() or ".." in relative.parts:
+        return None
+    if not relative.parts:
+        return None
+    descriptor: int | None = None
+    try:
+        current = root.resolve(strict=True)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        descriptor = os.open(current, flags)
+        for component in relative.parts:
+            with os.scandir(descriptor) as children:
+                match = next((child for child in children if child.name == component), None)
+                if match is None:
+                    return None
+                child = os.open(match.name, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+                current = current / match.name
+        return current
+    except (OSError, RuntimeError, ValueError):
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def resolve_run_dir(root: Path, selector: str, listing: list[RunInfo] | None = None) -> Path | None:
-    """Resolve a listing index, a run name or a path to a confined run directory."""
+    """Resolve an explicitly requested CLI index, run name, or local path."""
     selector = selector.strip()
     if not selector:
         return None

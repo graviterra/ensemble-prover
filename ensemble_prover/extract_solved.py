@@ -32,7 +32,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import time
@@ -81,6 +80,7 @@ from ensemble_prover.solved_export_policy import (  # noqa: E402
     export_status_values as policy_export_status_values,
     solved_export_verified_payload as policy_solved_export_verified_payload,
 )
+from ensemble_prover.sync_subprocess import run_process_group  # noqa: E402
 from ensemble_prover.subprocess_environment import (  # noqa: E402
     sanitized_subprocess_environment,
 )
@@ -1757,14 +1757,10 @@ def _verify_exported_lean(
         else PROJECT_ROOT / "external" / "PutnamBench" / "lean4"
     )
     try:
-        proc = subprocess.run(
+        proc = run_process_group(
             ["lake", "env", "lean", str(Path(lean_path).resolve())],
             cwd=str(project_dir),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
             timeout=max(1.0, float(timeout_s or 180.0)),
-            check=False,
             env=sanitized_subprocess_environment(
                 _export_lean_env(extra_lean_paths)
             ),
@@ -1794,15 +1790,11 @@ def _build_export_project_imports(
     if lean_project_dir is None:
         return False, "project import targets have no Lean project"
     try:
-        build = subprocess.run(
+        build = run_process_group(
             ["lake", "build", *build_targets],
             cwd=str(Path(lean_project_dir)),
             env=sanitized_subprocess_environment(),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
             timeout=max(1.0, float(timeout_s or 180.0)),
-            check=False,
         )
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
@@ -1828,15 +1820,11 @@ def _build_export_support_projects(
         if not project.is_absolute() or not project.is_dir():
             return False, f"invalid supporting Lean project: {project}"
         try:
-            build = subprocess.run(
+            build = run_process_group(
                 ["lake", "build", *targets],
                 cwd=str(project),
                 env=sanitized_subprocess_environment(),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
                 timeout=max(1.0, float(timeout_s or 180.0)),
-                check=False,
             )
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}"

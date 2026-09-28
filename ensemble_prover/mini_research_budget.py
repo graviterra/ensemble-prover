@@ -14,6 +14,11 @@ import math
 from typing import Any
 
 from .mini_session.action import ActionBudget
+from .mini_client_capabilities import (
+    bind_owned_research_client,
+    mini_request_transparent_client_binding,
+)
+from .runtime_context import RuntimeCapabilityRevokedError
 
 
 @dataclass(frozen=True)
@@ -46,8 +51,13 @@ def _supported_client(client: Any) -> bool:
     from .codex_subscription import CodexSubscriptionClient
     from .models import OpenAICompatClient
 
+    try:
+        client, _fences = mini_request_transparent_client_binding(client)
+    except RuntimeCapabilityRevokedError:
+        return False
     # Reconstructing an arbitrary subclass or wrapper can lose authentication,
-    # routing, or safety restrictions. Support only the concrete CLI transports.
+    # routing, or safety restrictions. Known cancellation fences are preserved;
+    # the underlying transport must still match the exact supported type.
     return type(client) in {
         OpenAICompatClient, CodexSubscriptionClient, ClaudeCodeSubscriptionClient,
     } and bool(getattr(client, "supports_transport_dispatch_authorization", False))
@@ -60,6 +70,13 @@ def clone_research_client(client: Any) -> Any:
     the returned client, never the donor. A deep copy includes dynamic policy
     attributes that dataclass replacement would silently omit.
     """
+    transport, fences = mini_request_transparent_client_binding(client)
+    clone = _clone_research_transport(transport)
+    return bind_owned_research_client(clone, fences)
+
+
+def _clone_research_transport(client: Any) -> Any:
+    """Clone one concrete supported leaf before restoring its lease chain."""
     from .models import OpenAICompatClient
 
     if not _supported_client(client):
@@ -196,7 +213,7 @@ def select_donor(session: Any) -> Donor | None:
                 donor = _donor(session, action, parent_seconds)
                 if donor is not None:
                     return donor
-    except (TypeError, ValueError, OverflowError, AttributeError):
+    except (TypeError, ValueError, OverflowError, AttributeError, RuntimeCapabilityRevokedError):
         return None
     return None
 

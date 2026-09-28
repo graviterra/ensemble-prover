@@ -82,6 +82,40 @@ _FIELDS = (
 _BY_KEY = {field.key: field for field in _FIELDS}
 
 
+class OptionValidationError(ValueError):
+    """A setting failure whose browser text uses only trusted schema metadata."""
+
+    def __init__(self, code: str, *, key: str = "", role: str = "") -> None:
+        self.code = code
+        self.key = key
+        self.role = role
+        super().__init__(self.public_message)
+
+    @property
+    def public_message(self) -> str:
+        if self.code == "object":
+            return "options must be an object"
+        if self.code == "unsupported":
+            return "unsupported option; choose a setting from the available options"
+        if self.role in ("prover", "refiner"):
+            role = "prover" if self.role == "prover" else "refiner"
+            if self.code == "reasoning_off":
+                return f"{role} reasoning mode off requires reasoning effort none or an omitted effort"
+            if self.code == "reasoning_on":
+                return f"{role} reasoning mode on cannot be combined with reasoning effort none"
+        field = _BY_KEY.get(self.key)
+        if field is not None:
+            if self.code == "boolean":
+                return f"{field.key} must be true or false"
+            if self.code == "select":
+                return f"{field.key} must be one of: {', '.join(field.choices)}"
+            if self.code == "number":
+                return f"{field.key} must be a finite number of at least {field.minimum}"
+            if self.code == "integer":
+                return f"{field.key} must be a whole number"
+        return "Invalid launch options. Choose settings from the available options."
+
+
 def option_schema() -> dict[str, list[dict[str, Any]]]:
     """Metadata only: no project or provider execution."""
     return {"fields": [field.schema() for field in _FIELDS]}
@@ -93,9 +127,9 @@ def _validate_reasoning(options: dict[str, Any], *, refiner_enabled: bool) -> No
         mode = options.get(f"{role}-reasoning-mode", options.get("reasoning-mode", "provider-default"))
         effort = options.get(f"{role}-reasoning-effort", options.get("reasoning-effort"))
         if mode == "off" and effort not in (None, "none"):
-            raise ValueError(f"{role} reasoning mode off cannot be combined with reasoning effort {effort}")
+            raise OptionValidationError("reasoning_off", role=role)
         if mode == "on" and effort == "none":
-            raise ValueError(f"{role} reasoning mode on cannot be combined with reasoning effort none")
+            raise OptionValidationError("reasoning_on", role=role)
 
 
 def option_args(
@@ -103,10 +137,10 @@ def option_args(
 ) -> list[str]:
     """Validate typed settings and return only allowlisted argument tokens."""
     if not isinstance(options, dict):
-        raise ValueError("options must be an object")
+        raise OptionValidationError("object")
     for key in options:
         if key not in _BY_KEY:
-            raise ValueError(f"unsupported option: {key}")
+            raise OptionValidationError("unsupported")
     args: list[str] = []
     for field in _FIELDS:
         if field.key not in options:
@@ -115,14 +149,14 @@ def option_args(
         flag = f"--{field.key}"
         if field.kind == "boolean":
             if not isinstance(value, bool):
-                raise ValueError(f"{field.key} must be true or false")
+                raise OptionValidationError("boolean", key=field.key)
             if value:
                 args.append(flag)
             elif field.false_flag:
                 args.append(field.false_flag)
         elif field.kind == "select":
             if not isinstance(value, str) or value not in field.choices:
-                raise ValueError(f"{field.key} must be one of: {', '.join(field.choices)}")
+                raise OptionValidationError("select", key=field.key)
             args.extend([flag, value])
         else:
             try:
@@ -130,9 +164,9 @@ def option_args(
             except OverflowError:
                 finite = False
             if not finite or value < field.minimum:
-                raise ValueError(f"{field.key} must be a finite number of at least {field.minimum}")
+                raise OptionValidationError("number", key=field.key)
             if field.integer and int(value) != value:
-                raise ValueError(f"{field.key} must be a whole number")
+                raise OptionValidationError("integer", key=field.key)
             args.extend([flag, str(int(value) if field.integer else value)])
     if proof_search:
         _validate_reasoning(options, refiner_enabled=refiner_enabled)

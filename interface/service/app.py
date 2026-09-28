@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from console.launcher import RegistryStateError
-from console.runs import RunInfo, discover_runs, inspect_run_dir, is_run_dir, resolve_run_dir
+from console.runs import RunInfo, discover_runs, inspect_run_dir, is_run_dir, resolve_contained_directory
 from console.session import AttachedRun
 from console.viewmodel import cost_text, root_status_text
 from .projection import (
@@ -40,9 +40,16 @@ from .projection import (
 )
 from .catalog import CatalogError, ProjectCatalog
 from .security import LocalBoundary, browser_boundary
-from .options import option_args, option_schema
+from .options import OptionValidationError, option_args, option_schema
 
 _STOP_TOKEN_TTL_S = 60.0
+_STOP_MESSAGES = {
+    "signalled": "One cooperative interrupt was delivered to the owned launch group.",
+    "already_requested": "A stop was already requested; no second signal was sent.",
+    "refused": "The launch is no longer running or its process identity could not be verified; no signal was sent.",
+    "delivery_unknown": "The interrupt could not be confirmed. Check the local console for details.",
+    "unknown": "The stop outcome is unavailable. Check the local console for details.",
+}
 _LIBRARY_LIMIT = 500
 _FORBIDDEN_KEYS = frozenset({"command", "argv", "args", "shell"})
 _ROLE_FLAGS = (
@@ -146,21 +153,21 @@ def create_app(
         try:
             return JSONResponse(app.state.catalog.browse(path))
         except CatalogError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+            return JSONResponse({"error": exc.public_message}, status_code=400)
 
     @app.get("/api/project")
     def catalog_project(path: str = "") -> JSONResponse:
         try:
             return JSONResponse(app.state.catalog.project(path))
         except CatalogError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+            return JSONResponse({"error": exc.public_message}, status_code=400)
 
     @app.get("/api/theorems")
     def catalog_theorems(project: str = "", file: str = "") -> JSONResponse:
         try:
             return JSONResponse(app.state.catalog.theorems(project, file))
         except CatalogError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+            return JSONResponse({"error": exc.public_message}, status_code=400)
 
     @app.get("/api/runs/{run_id:path}")
     def run_detail(run_id: str) -> JSONResponse:
@@ -233,12 +240,13 @@ def create_app(
                 status_code=409,
             )
         result = await run_in_threadpool(app.state.registry.stop, launch_id, request_id=token)
-        outcome = str(getattr(result, "outcome", "") or "")
+        raw_outcome = getattr(result, "outcome", "")
+        outcome = raw_outcome if isinstance(raw_outcome, str) and raw_outcome in _STOP_MESSAGES else "unknown"
         return JSONResponse(
             {
                 "signalled": outcome == "signalled",
                 "outcome": outcome,
-                "detail": getattr(result, "detail", ""),
+                "detail": _STOP_MESSAGES[outcome],
             }
         )
 
@@ -339,19 +347,8 @@ def _owned_directory(
 ) -> tuple[Path | None, Any | None]:
     """A launch directory that exists before the prover has written a marker."""
 
-    selector = selector.strip().strip("/")
-    if not selector or selector.startswith("/") or ".." in Path(selector).parts:
-        return None, None
-    root = Path(app.state.run_root).resolve()
-    spelled = root / selector
-    try:
-        if spelled.is_symlink():
-            return None, None
-        candidate = spelled.resolve()
-        candidate.relative_to(root)
-    except (OSError, ValueError):
-        return None, None
-    if not candidate.is_dir():
+    candidate = resolve_contained_directory(Path(app.state.run_root), selector)
+    if candidate is None:
         return None, None
     record = by_path.get(candidate) or _registry_owned(app, candidate)
     return (candidate, record) if record is not None else (None, None)
@@ -369,20 +366,8 @@ def _registry_owned(app: FastAPI, run_dir: Path) -> Any | None:
 
 
 def _resolve_contained(root: Path, selector: str) -> Path | None:
-    selector = selector.strip().strip("/")
-    if not selector:
-        return None
-    found = resolve_run_dir(root, selector)
-    if found is None:
-        return None
-    try:
-        relative = found.resolve().relative_to(root.resolve())
-    except ValueError:
-        return None
-    if relative.is_absolute() or ".." in relative.parts:
-        return None
-    spelled = root.joinpath(relative)
-    return spelled if spelled.exists() else found
+    found = resolve_contained_directory(root, selector)
+    return found if found is not None and is_run_dir(found) else None
 
 
 def _graph(attached: AttachedRun) -> list[dict[str, Any]]:
@@ -518,6 +503,23 @@ def _launch_response(run_root: Path, record: Any) -> JSONResponse:
     return JSONResponse(_launch_body(run_root, record), status_code=201)
 
 
+def _public_launch_rejection(detail: object) -> str:
+    """Keep validator stderr and exception details in the local console only."""
+    messages = {
+        "invalid provider choice": "invalid provider choice",
+        "empty theorem text": "The theorem text must not be empty.",
+        "project path must contain a Lake project (lakefile.toml or lakefile.lean)":
+            "Choose a Lake project containing lakefile.toml or lakefile.lean.",
+        "translate-only does not accept prover arguments":
+            "Translation only does not accept prover arguments.",
+        "argument contains an invalid character":
+            "A launch setting contains an invalid character.",
+    }
+    if isinstance(detail, str) and detail in messages:
+        return messages[detail]
+    return "The launch settings were rejected. Check the selected project, theorem and options."
+
+
 def _start_english(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip() or any(ch in text for ch in "\0"):
@@ -540,8 +542,10 @@ def _start_english(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
             payload.get("options", {}), refiner_enabled=bool(payload.get("refiner")),
             proof_search=not formalize_only,
         )
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
+    except OptionValidationError as exc:
+        return JSONResponse({"error": exc.public_message}, status_code=400)
+    except ValueError:
+        return JSONResponse({"error": "Invalid launch options. Choose settings from the available options."}, status_code=400)
     user_args = [] if formalize_only else _role_args(payload)
     if isinstance(user_args, JSONResponse):
         return user_args
@@ -552,7 +556,7 @@ def _start_english(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
             "--project-path", str(project_path), *user_args,
         ])
         if not verdict.ok:
-            return JSONResponse({"error": verdict.error}, status_code=400)
+            return JSONResponse({"error": _public_launch_rejection(verdict.error)}, status_code=400)
     idempotency_key = _idempotency_key(payload)
     if isinstance(idempotency_key, JSONResponse):
         return idempotency_key
@@ -564,7 +568,7 @@ def _start_english(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
         formalize_only=formalize_only,
     )
     if record is None:
-        return JSONResponse({"error": str(detail or "not launched")}, status_code=400)
+        return JSONResponse({"error": _public_launch_rejection(detail)}, status_code=400)
     return _launch_response(app.state.run_root, record)
 
 
@@ -594,8 +598,10 @@ def _start_lean(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
         user_args.extend(option_args(
             payload.get("options", {}), refiner_enabled=bool(payload.get("refiner")),
         ))
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
+    except OptionValidationError as exc:
+        return JSONResponse({"error": exc.public_message}, status_code=400)
+    except ValueError:
+        return JSONResponse({"error": "Invalid launch options. Choose settings from the available options."}, status_code=400)
     idempotency_key = _idempotency_key(payload)
     if isinstance(idempotency_key, JSONResponse):
         return idempotency_key
@@ -614,7 +620,7 @@ def _start_lean(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
         idempotency_key=idempotency_key,
     )
     if record is None:
-        return JSONResponse({"error": str(detail or "not launched")}, status_code=400)
+        return JSONResponse({"error": _public_launch_rejection(detail)}, status_code=400)
     return _launch_response(app.state.run_root, record)
 
 
