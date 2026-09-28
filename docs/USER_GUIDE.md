@@ -500,6 +500,24 @@ and output allowance so cost admission and the provider request agree. The
 small fallback tables for known routes do not determine whether a new model
 ID can be used.
 
+Automatic proof, planner, answer, and statement-repair requests use the model's
+output allowance, including both hidden reasoning and visible output. Fresh
+OpenRouter catalog output limits replace automatic role defaults; other routes
+use verified model allowances. Unknown routes retain conservative legacy
+fallbacks until capacity metadata or an explicit allowance is available.
+Short expected answers do not impose a smaller hidden completion ceiling.
+Before dispatch, the automatic allowance is reduced only as needed to preserve
+space for the selected prompt and tool definitions within the known context
+window. The same resolved allowance is used for cost admission and transport.
+
+An explicitly configured role `max_tokens` remains an upper bound, subject to
+provider capacity and available context. A positive
+`conversation_max_tokens_override` is an exact per-request override, including
+when it exceeds the ordinary role allowance. Higher automatic output allowances
+can increase the cost reserved for a call; existing dollar and time limits
+remain enforced. A larger allowance permits longer reasoning but does not
+require the model to consume it.
+
 Each run records the resolved reasoning configuration in `turns.jsonl` and
 prints it before long model work. `reasoning_output_tokens` records the
 provider's reported reasoning breakdown. A zero can also mean the provider

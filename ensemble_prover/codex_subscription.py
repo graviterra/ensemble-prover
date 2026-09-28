@@ -8,6 +8,7 @@ No private endpoints, extracted login tokens, or API-key fallback are used.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from copy import deepcopy
 
@@ -33,6 +34,7 @@ from .models import (
     _sanitize_request_messages,
 )
 from .provider_response import publish_provider_response
+from .provider_progress import PROGRESS_KEY, progress_snapshot
 from .sampling_controls import is_api_default_temperature_override
 from .subscription_cli import (
     bounded_subscription_transport,
@@ -429,6 +431,32 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
         dispatched = False
         authority: dict[str, Any] = {}
         generation_items: dict[tuple[str, str], int] = {}
+        progress: dict[str, Any] = {
+            "backend": "codex_subscription", "status": "requesting",
+            "event_count": 0, "thinking_event_count": 0,
+            "assistant_event_count": 0,
+        }
+        final_progress_status = "failed"
+
+        def report_progress(
+            status: str, *, item_type: str = "", observed_event: bool = False,
+        ) -> None:
+            progress["status"] = status
+            progress["elapsed_s"] = time.monotonic() - started
+            if observed_event:
+                progress["event_count"] += 1
+            if item_type == "reasoning":
+                progress["thinking_event_count"] += 1
+            elif item_type == "agent_message":
+                progress["assistant_event_count"] += 1
+            clean = progress_snapshot(progress)
+            if clean is not None:
+                metadata[PROGRESS_KEY] = clean
+                try:
+                    publish_provider_request_metadata(metadata)
+                except Exception:
+                    # An observer cannot alter transport or usage accounting.
+                    pass
 
         def generation_advanced(event: dict[str, Any]) -> bool:
             item = event.get("item")
@@ -443,6 +471,12 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
             if len(text) <= generation_items.get(key, 0):
                 return False
             generation_items[key] = len(text)
+            # These are observed item-growth events, not billed token counts.
+            # Keep native reasoning and answer text out of live telemetry.
+            report_progress(
+                "thinking" if item["type"] == "reasoning" else "responding",
+                item_type=item["type"], observed_event=True,
+            )
             return True
 
         def on_event(event: dict[str, Any]) -> None:
@@ -469,6 +503,9 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
                     )
             if kind == "thread.started":
                 thread_id = str(event.get("thread_id") or "")
+                report_progress("initialized", observed_event=True)
+            elif kind == "turn.started":
+                report_progress("requesting", observed_event=True)
             elif (
                 kind == "item.completed"
                 and isinstance(item, dict)
@@ -532,6 +569,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
             check_subscription_transport_admission()
             dispatched = True
             mark_provider_dispatched(**authority)
+            report_progress("requesting")
 
         with tempfile.TemporaryDirectory(prefix="ensemble-codex-") as cwd:
             Path(cwd, "response.json").write_text(
@@ -578,6 +616,14 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
                     ),
                     on_progress=generation_advanced,
                 )
+                if completed and not failed_turn and code == 0:
+                    final_progress_status = "finished"
+            except asyncio.CancelledError:
+                final_progress_status = "cancelled"
+                raise
+            except TimeoutError:
+                final_progress_status = "timed_out"
+                raise
             finally:
                 if not dispatched:
                     # No prompt has been written: retire this exact admission
@@ -590,22 +636,29 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
                     )
                 elif not usage_observed:
                     self._usage_missing += 1
+                if dispatched and final_progress_status != "finished":
+                    report_progress(final_progress_status)
         if code or not completed or failed_turn:
             raise _cli_failure(
                 failure + "\n" + stderr.decode("utf-8", errors="replace")
             )
-        if not isinstance(answer, str):
-            raise self._response_validation_error("missing_response") from None
-        content, calls = self._decode_answer(
-            answer, allowed, bool(selected or tool_choice == "required")
-        )
-        if response_format == "json":
-            try:
-                inner = json.loads(content, parse_constant=_reject_json_constant)
-            except (ValueError, RecursionError):
-                raise self._response_validation_error("json_content") from None
-            if not isinstance(inner, dict):
-                raise self._response_validation_error("json_content_object") from None
+        try:
+            if not isinstance(answer, str):
+                raise self._response_validation_error("missing_response") from None
+            content, calls = self._decode_answer(
+                answer, allowed, bool(selected or tool_choice == "required")
+            )
+            if response_format == "json":
+                try:
+                    inner = json.loads(content, parse_constant=_reject_json_constant)
+                except (ValueError, RecursionError):
+                    raise self._response_validation_error("json_content") from None
+                if not isinstance(inner, dict):
+                    raise self._response_validation_error("json_content_object") from None
+        except Exception:
+            report_progress("failed")
+            raise
+        report_progress("finished")
         raw = {
             "id": thread_id,
             "model": self.cfg.model,

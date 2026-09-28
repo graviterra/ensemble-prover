@@ -21,7 +21,7 @@ from .utils import (
     _split_top_level_let_body,
     _split_top_level_implication_conclusion,
     _split_top_level,
-    _telescope_quantifier_bound_names,
+    _free_identifier_tokens,
     expand_relation_forall_binders,
     merge_contextual_binders,
     normalize_subgoal_statement,
@@ -316,9 +316,7 @@ def _needed_context_names(
 ) -> set[str]:
     if not stmt or not context_declared:
         return set()
-    local_declared = _telescope_quantifier_bound_names(stmt)
-    used = _identifier_tokens(stmt)
-    return (used & context_declared) - local_declared
+    return _free_identifier_tokens(stmt) & context_declared
 
 
 def _segment_annotation(segment: str) -> str:
@@ -443,14 +441,16 @@ def _space_normalized(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip())
 
 
-def _strip_mutated_root_binder_prefix(stmt: str, root_statement: str) -> str:
-    """Drop planner-restated root binders when their types drift.
+def _repair_restated_root_binder_prefix(stmt: str, root_statement: str) -> str:
+    """Restore the full real root telescope when a restated prefix differs.
 
     Planner models often restate the full root context in a helper claim.
     That is safe only if the restated binders match the actual theorem
     context. If a model mutates a root hypothesis type, the helper becomes a
-    different theorem. In that case, remove the polluted root prefix and let
-    the context compiler re-close the body over the real root binders.
+    different theorem. Replace a differing complete prefix with the real
+    context, retaining every assumption even when the body has no free names.
+    Syntax comparisons are conservative; the authored proposition remains an
+    independent fallback in the caller.
     """
 
     raw = str(stmt or "").strip()
@@ -464,13 +464,29 @@ def _strip_mutated_root_binder_prefix(stmt: str, root_statement: str) -> str:
     root_names = _declared_names_from_binders(root_binders)
     if not root_names:
         return raw
+    if _free_identifier_tokens(raw) & root_names & _declared_names_from_binders(claim_binders):
+        # A dependent local binder such as ∀ (n : Fin n), ... refers to an
+        # outer n in its annotation. It is not a mutated copy of the root n.
+        return raw
 
     root_segments: list[str] = []
     kept_segments: list[str] = []
+    matched_root_names: set[str] = set()
     for seg in claim_binders:
         names = _declared_names_from_binders([seg])
-        if names and names <= root_names:
+        if matched_root_names >= root_names:
+            kept_segments.append(seg)
+        elif names and names <= root_names:
+            segment_names: set[str] = set()
+            for chunk in _binder_chunks(seg):
+                chunk_names = _declared_names_from_binder_segment(chunk)
+                if chunk_names & (matched_root_names | segment_names):
+                    # Repeated names introduce a distinct lexical scope; a
+                    # syntactic repair cannot collapse them into one binder.
+                    return raw
+                segment_names.update(chunk_names)
             root_segments.append(seg)
+            matched_root_names.update(names)
         else:
             kept_segments.append(seg)
 
@@ -478,15 +494,14 @@ def _strip_mutated_root_binder_prefix(stmt: str, root_statement: str) -> str:
         return raw
     if not (_declared_names_from_binders(root_segments) >= root_names):
         return raw
-    if _space_normalized(" ".join(root_segments)) == _space_normalized(
-        " ".join(root_binders)
+    if _space_normalized(normalize_nat_factorial_notation(" ".join(root_segments))) == (
+        _space_normalized(normalize_nat_factorial_notation(" ".join(root_binders)))
     ):
         return raw
 
-    rebuilt = str(body or "").strip()
-    if kept_segments:
-        rebuilt = "".join(f"∀ {seg}, " for seg in kept_segments) + rebuilt
-    return rebuilt
+    return "".join(
+        f"∀ {seg}, " for seg in [*root_binders, *kept_segments]
+    ) + str(body or "").strip()
 
 
 def build_subgoal_variants(
@@ -504,9 +519,10 @@ def build_subgoal_variants(
     base = normalize_nat_factorial_notation(
         _canonicalize_top_level_let_in(normalize_subgoal_statement(raw_subgoal))
     )
+    authored_base = base
     base = _canonicalize_top_level_let_in(
         normalize_subgoal_statement(
-            _strip_mutated_root_binder_prefix(base, root_statement or "")
+            _repair_restated_root_binder_prefix(base, root_statement or "")
         )
     )
     if not base:
@@ -614,4 +630,13 @@ def build_subgoal_variants(
         _add(base, "raw")
     else:
         _add(base, "raw")
-    return candidates[: max(1, int(max_variants))]
+    limit = max(1, int(max_variants))
+    if authored_base != base:
+        _add(authored_base, "raw")
+        if limit >= 2 and len(candidates) > limit:
+            authored = next(
+                candidate for candidate in candidates
+                if candidate.statement == authored_base
+            )
+            return [*candidates[:limit - 1], authored]
+    return candidates[:limit]

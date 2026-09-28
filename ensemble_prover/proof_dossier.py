@@ -18897,6 +18897,15 @@ class ProofDossier:
                     "selected_index": selected_index,
                 }
             )
+            # Authored fragments are provenance only. All executable identity
+            # and root-relation checks above bind to the checked statement.
+            authored_statement = str(item.get("authored_statement") or "").strip()
+            source_variant = item.get("contract_source_variant")
+            if authored_statement and isinstance(source_variant, dict):
+                contract_claims[-1]["authored_statement"] = authored_statement
+                contract_claims[-1]["contract_source_variant"] = copy.deepcopy(
+                    source_variant
+                )
         if not required_node_ids:
             return {}
         turn_index = int(record.get("turn_in_phase", record.get("turn_index", 0)) or 0)

@@ -29,6 +29,10 @@ class OpenRouterReasoningCapabilities:
     default_enabled: Optional[bool] = None
     mandatory: Optional[bool] = None
     source: str = "openrouter_models_catalog"
+    # Completion capacity includes hidden reasoning on reasoning models.
+    # Unknown limits stay distinct from reasoning support and context size.
+    max_completion_tokens: Optional[int] = None
+    context_length: Optional[int] = None
 
     def to_record(self) -> dict[str, object]:
         return asdict(self)
@@ -320,6 +324,12 @@ def _parse_openrouter_pricing_catalog(payload: object) -> dict[str, PricingTuple
     return parsed
 
 
+def _positive_catalog_token_limit(value: object) -> Optional[int]:
+    """Accept only positive integer limits from the provider's JSON catalog."""
+
+    return value if type(value) is int and value > 0 else None
+
+
 def _openrouter_reasoning_capabilities(
     entry: object,
 ) -> OpenRouterReasoningCapabilities:
@@ -362,6 +372,22 @@ def _openrouter_reasoning_capabilities(
             or "none" in efforts
         )
     )
+    raw_provider = entry.get("top_provider")
+    top_provider = raw_provider if isinstance(raw_provider, dict) else {}
+    max_completion_tokens = _positive_catalog_token_limit(
+        top_provider.get("max_completion_tokens")
+    ) or _positive_catalog_token_limit(entry.get("max_completion_tokens"))
+    context_limits = [
+        value
+        for value in (
+            _positive_catalog_token_limit(entry.get("context_length")),
+            _positive_catalog_token_limit(top_provider.get("context_length")),
+        )
+        if value is not None
+    ]
+    # Model context can exceed the capacity advertised for the serving route.
+    # Keep prompt plus completion within every applicable catalog bound.
+    context_length = min(context_limits) if context_limits else None
     return OpenRouterReasoningCapabilities(
         supports_reasoning=supports_reasoning,
         supports_max_tokens=(reasoning.get("supports_max_tokens") is True),
@@ -369,6 +395,8 @@ def _openrouter_reasoning_capabilities(
         supported_efforts=efforts,
         default_enabled=default_enabled,
         mandatory=mandatory,
+        max_completion_tokens=max_completion_tokens,
+        context_length=context_length,
     )
 
 

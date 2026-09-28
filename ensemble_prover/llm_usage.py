@@ -1578,10 +1578,15 @@ def _reservation_pricing_targets(client: Any) -> List[tuple[str, str]]:
 async def _request_envelope_receipts(
     client: Any,
     max_tokens_override: Any,
+    *,
+    messages: Sequence[Dict[str, Any]],
+    tools: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[MiniRequestEnvelopeReceipt]:
     if not isinstance(max_tokens_override, MiniRequestEnvelopePolicy):
         return []
-    return await resolve_mini_request_envelopes(client, max_tokens_override)
+    return await resolve_mini_request_envelopes(
+        client, max_tokens_override, messages=messages, tools=tools,
+    )
 
 
 def _reservation_output_token_limits(
@@ -2568,6 +2573,8 @@ class CostBudgetController:
         envelope_receipts = await _request_envelope_receipts(
             client,
             max_tokens_override,
+            messages=messages,
+            tools=tools,
         )
         if envelope_receipts:
             if len(envelope_receipts) != len(targets):
@@ -6048,7 +6055,17 @@ async def call_with_optional_usage_callback(
             or isinstance(getattr(owner, "clients", None), list)
         )
         if owner is not None and not is_wrapper:
-            request_receipt = await request_policy.resolve_for(owner)
+            request_receipt = await request_policy.resolve_for(
+                owner,
+                messages=args[0] if args else call_kwargs.get("messages"),
+                tools=call_kwargs.get(
+                    "tools",
+                    args[1]
+                    if len(args) > 1
+                    and getattr(method, "__name__", "") == "chat_with_tools"
+                    else None,
+                ),
+            )
             call_kwargs["max_tokens_override"] = int(
                 request_receipt.max_output_tokens
             )

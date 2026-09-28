@@ -12,7 +12,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from .lean_decl_parser import find_decl_header_end
+from .lean_decl_parser import _HAVE_KEYWORDS, _LET_KEYWORDS, _matches_word, find_decl_header_end
 
 
 def now_ts() -> float:
@@ -5118,21 +5118,28 @@ def _canonicalize_top_level_let_in(stmt: str) -> str:
     return rebuilt
 
 
-def _top_level_token_positions(stmt: str, tokens: tuple[str, ...]) -> list[tuple[int, str]]:
+def _top_level_token_positions(
+    stmt: str,
+    tokens: tuple[str, ...],
+    *,
+    constructor_groups: bool = False,
+) -> list[tuple[int, str]]:
     positions: list[tuple[int, str]] = []
     depth = 0
     i = 0
+    openers = (*_GROUP_OPEN_TO_CLOSE, "⟨") if constructor_groups else _GROUP_OPEN_TO_CLOSE
+    closers = (*_GROUP_OPEN_TO_CLOSE.values(), "⟩") if constructor_groups else _GROUP_OPEN_TO_CLOSE.values()
     while i < len(stmt):
         skip_to = _lean_lexical_skip_end(stmt, i)
         if skip_to is not None:
             i = skip_to
             continue
         ch = stmt[i]
-        if ch in _GROUP_OPEN_TO_CLOSE:
+        if ch in openers:
             depth += 1
             i += 1
             continue
-        if ch in _GROUP_OPEN_TO_CLOSE.values():
+        if ch in closers:
             depth = max(0, depth - 1)
             i += 1
             continue
@@ -5590,8 +5597,20 @@ def _extract_leading_quantifier_binders(statement: str) -> list[str]:
     return binders
 
 
-def _telescope_quantifier_bound_names(statement: str) -> set[str]:
-    """Telescope-bound names with no free occurrences outside their scope.
+_UNSUPPORTED_SCOPED_TERM_KEYWORDS = (
+    *_HAVE_KEYWORDS,
+    *(keyword for keyword in _LET_KEYWORDS if keyword != "let"),
+    "match", "by", "do",
+)
+_SCOPED_TERM_KEYWORDS = tuple(sorted(
+    (*_UNSUPPORTED_SCOPED_TERM_KEYWORDS, "fun", "λ", "let", "if"),
+    key=len,
+    reverse=True,
+))
+
+
+def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
+    """Return telescope-bound names and free identifiers under lexical scopes.
 
     A conclusion's quantifiers can follow several implications. Their names
     must not be supplied again by the root context, but they cannot capture
@@ -5614,12 +5633,61 @@ def _telescope_quantifier_bound_names(statement: str) -> set[str]:
             if rest.startswith("(") and _scan_group(rest, 0) == len(rest):
                 rest = rest[1:-1].strip()
                 continue
+            # Unsupported term/tactic syntax must not let one inner lambda
+            # capture identifiers from a different branch or constructor field.
+            if (
+                "`" in rest
+                or any(_matches_word(rest, 0, keyword) for keyword in _UNSUPPORTED_SCOPED_TERM_KEYWORDS)
+            ):
+                free.update(_binder_identifier_tokens(rest) - bound)
+                break
+            # A tuple/list comma terminates the preceding component's scope.
+            # Quantifier-header commas instead introduce that binder's body.
+            quantifier_headers = 0
+            sibling_comma = None
+            for index, token in _top_level_token_positions(rest, ("∀", "∃", ","), constructor_groups=True):
+                if token != ",":
+                    quantifier_headers += 1
+                elif quantifier_headers:
+                    quantifier_headers -= 1
+                else:
+                    sibling_comma = index
+                    break
+            if sibling_comma is not None:
+                pending.append((rest[:sibling_comma].strip(), set(bound), False))
+                rest, in_telescope = rest[sibling_comma + 1 :].strip(), False
+                continue
+            if rest.startswith("if "):
+                depth = 0
+                then_index = else_index = None
+                for index, token in _top_level_token_positions(rest, ("if", "then", "else"), constructor_groups=True):
+                    if (
+                        (index and re.match(r"[\w'.]", rest[index - 1]))
+                        or re.match(r"[\w']", rest[index + len(token) :])
+                    ):
+                        continue
+                    if token == "if":
+                        depth += 1
+                    elif token == "then" and depth == 1 and then_index is None:
+                        then_index = index
+                    elif token == "else":
+                        depth -= 1
+                        if depth == 0:
+                            else_index = index
+                            break
+                if then_index is not None and else_index is not None:
+                    pending.append((rest[3:then_index].strip(), set(bound), False))
+                    pending.append((rest[then_index + 4 : else_index].strip(), set(bound), False))
+                    rest, in_telescope = rest[else_index + 4 :].strip(), False
+                    continue
+                free.update(_binder_identifier_tokens(rest) - bound)
+                break
             lambda_head = re.match(r"(?:fun|λ)(?=\s|[({⦃])", rest)
             is_quantifier = rest.startswith(("∀", "∃")) and not rest.startswith("∀ᶠ")
             if is_quantifier or lambda_head:
                 tail = rest[lambda_head.end() if lambda_head else 1 :].lstrip()
                 if lambda_head:
-                    delimiters = _top_level_token_positions(tail, ("=>", "↦"))
+                    delimiters = _top_level_token_positions(tail, ("=>", "↦"), constructor_groups=True)
                     if delimiters:
                         index, delimiter = delimiters[0]
                         split = tail[:index], tail[index + len(delimiter) :]
@@ -5627,14 +5695,15 @@ def _telescope_quantifier_bound_names(statement: str) -> set[str]:
                         split = None
                     in_telescope = False
                 else:
-                    comma = _first_top_level_comma(tail)
+                    commas = _top_level_token_positions(tail, (",",), constructor_groups=True)
+                    comma = commas[0][0] if commas else -1
                     split = (tail[:comma], tail[comma + 1 :]) if comma != -1 else None
                 if split is None:
                     free.update(_binder_identifier_tokens(rest) - bound)
                     break
                 head, body = (part.strip() for part in split)
                 if lambda_head and (
-                    _top_level_token_positions(head, ("|",))
+                    _top_level_token_positions(head, ("|",), constructor_groups=True)
                     or any(
                         opener
                         and _first_top_level_colon(inner) == -1
@@ -5702,16 +5771,42 @@ def _telescope_quantifier_bound_names(statement: str) -> set[str]:
                         rest, in_telescope = body, False
                         continue
             operators = _top_level_token_positions(
-                rest, ("<->", "↔", "→", "->", "∨", "∧", "∀", "∃")
+                rest,
+                ("<->", "↔", "→", "->", "∨", "∧", "∀", "∃", *_SCOPED_TERM_KEYWORDS),
+                constructor_groups=True,
             )
-            # A quantifier owns the remainder of this group. Do not split an
-            # implication in its body away from the binder that scopes it.
-            quantifier_start = next(
-                (idx for idx, op in operators if op in {"∀", "∃"}), len(rest)
+            # A binder also scopes a term on an operator's RHS, e.g.
+            # ``f = fun n => n``. It owns the remainder of this group, so
+            # implications in its body must not be split from their binder.
+            binder_start = next(
+                (
+                    idx
+                    for idx, op in operators
+                    if op in {"∀", "∃"}
+                    or (
+                        op in _SCOPED_TERM_KEYWORDS
+                        and _matches_word(rest, idx, op)
+                    )
+                ),
+                len(rest),
             )
-            separators = [(idx, op) for idx, op in operators if idx < quantifier_start]
+            # Unknown local assignments can contain sibling terms. A lambda
+            # after their assignment marker does not bind the whole suffix.
+            # Recognized embedded binders before the marker still own their
+            # scope (e.g. ``f = let n := 1; n`` or a lambda containing a let).
+            assignment = _first_top_level_assign(rest)
+            if assignment != -1 and assignment < binder_start:
+                free.update(_binder_identifier_tokens(rest) - bound)
+                break
             precedence = {"<->": 0, "↔": 0, "→": 1, "->": 1, "∨": 2, "∧": 3}
+            separators = [
+                (idx, op) for idx, op in operators if idx < binder_start and op in precedence
+            ]
             if not separators:
+                if 0 < binder_start < len(rest) and "`" not in rest:
+                    pending.append((rest[:binder_start].strip(), set(bound), False))
+                    rest, in_telescope = rest[binder_start:], False
+                    continue
                 if rest.startswith("¬"):
                     rest, in_telescope = rest[1:].lstrip(), False
                     continue
@@ -5750,7 +5845,19 @@ def _telescope_quantifier_bound_names(statement: str) -> set[str]:
             if operator not in {"→", "->"}:
                 in_telescope = False
             rest = conclusion.strip()
-    return names - free
+    return names - free, free
+
+
+def _telescope_quantifier_bound_names(statement: str) -> set[str]:
+    """Telescope-bound names with no free occurrences outside their scope."""
+
+    return _scoped_identifier_uses(statement)[0]
+
+
+def _free_identifier_tokens(statement: str) -> set[str]:
+    """Identifiers referenced outside any recognized local binding scope."""
+
+    return _scoped_identifier_uses(statement)[1]
 
 
 def _binder_identifier_tokens(text: str) -> set[str]:
@@ -6081,9 +6188,9 @@ def _binder_segment_referenced_names(segment: str) -> set[str]:
         return set()
     opener, inner, _closer = _binder_segment_parts(raw)
     content = inner if opener else raw
-    assign_idx = _first_top_level_assign(content)
-    if assign_idx != -1:
-        content = content[:assign_idx].strip()
+    default_end = find_decl_header_end(content, 0)
+    if default_end is not None:
+        content = content[:default_end - 2].strip()
     colon_idx = _first_top_level_colon(content)
     # Membership binders (x ∈ s) use ∈ as a delimiter analogous to :.
     if colon_idx == -1:
@@ -6093,12 +6200,9 @@ def _binder_segment_referenced_names(segment: str) -> set[str]:
     body = content[colon_idx + 1 :].strip() if colon_idx != -1 else content.strip()
     if not body:
         return set()
-    nested_declared = _telescope_quantifier_bound_names(body)
-    return (
-        _binder_identifier_tokens(body)
-        - nested_declared
-        - set(_binder_segment_declared_names(segment))
-    )
+    # A binder is not in scope in its own annotation. A repeated name here
+    # refers to an outer binding (for example the inner n in n : Fin n).
+    return _free_identifier_tokens(body)
 
 
 def _binder_segment_annotation(segment: str) -> str:
@@ -6107,9 +6211,9 @@ def _binder_segment_annotation(segment: str) -> str:
         return ""
     opener, inner, _closer = _binder_segment_parts(raw)
     content = inner if opener else raw
-    assign_idx = _first_top_level_assign(content)
-    if assign_idx != -1:
-        content = content[:assign_idx].strip()
+    default_end = find_decl_header_end(content, 0)
+    if default_end is not None:
+        content = content[:default_end - 2].strip()
     colon_idx = _first_top_level_colon(content)
     if colon_idx == -1:
         return ""
@@ -6212,8 +6316,9 @@ def _rebuild_binder_segment(segment: str, names: Sequence[str]) -> str:
         return ""
     opener, inner, closer = _binder_segment_parts(raw)
     content = inner if opener else raw
-    if ":=" in content:
-        content = content.split(":=", 1)[0].strip()
+    default_end = find_decl_header_end(content, 0)
+    if default_end is not None:
+        content = content[:default_end - 2].strip()
     colon_idx = _first_top_level_colon(content)
     rebuilt_inner = " ".join(name_list)
     if colon_idx != -1:
@@ -6239,13 +6344,12 @@ def select_contextual_binders(
     raw_stmt = str(stmt or "").strip()
     raw_binders = _split_binder_segments(_extract_leading_quantifier_binders(raw_stmt))
     leading_declared = _declared_names_from_binder_segments(raw_binders)
-    local_declared = _telescope_quantifier_bound_names(raw_stmt)
+    local_declared, free_names = _scoped_identifier_uses(raw_stmt)
     nested_declared = local_declared - leading_declared
     flattened = _split_binder_segments(binders)
     if needed_names is None:
         context_declared = _declared_names_from_binder_segments(flattened)
-        used = _binder_identifier_tokens(raw_stmt)
-        needed = (used & context_declared) - local_declared
+        needed = free_names & context_declared
     else:
         needed = {str(name).strip() for name in needed_names if str(name).strip()}
     if not flattened or not needed:
@@ -6258,6 +6362,7 @@ def select_contextual_binders(
     # Close those dependencies before pruning shadowed context binders.
     required_context = set(needed)
     context_names = _declared_names_from_binder_segments(flattened)
+    free_context = free_names & context_names
     context_annotations = _declared_name_annotations_from_binder_segments(flattened)
     dependencies = []
     for seg in flattened:
@@ -6275,14 +6380,19 @@ def select_contextual_binders(
         )
     changed = True
     while changed:
-        before = len(required_context)
+        before = (len(required_context), len(free_context))
         for declared, referenced, supporting in dependencies:
-            if declared & required_context or (
-                supporting and referenced & required_context
-            ):
-                required_context.update(referenced)
-        changed = len(required_context) != before
-    required_outer = required_context & nested_declared
+            for required in (required_context, free_context):
+                if declared & required or (supporting and referenced & required):
+                    required.update(referenced)
+        changed = (len(required_context), len(free_context)) != before
+    # Free outer terms keep the types and hypotheses from their own scope,
+    # even when a leading local quantifier uses the same name. Additional
+    # shorthand-binder support can still specialize a bare local binder when
+    # no actual free term depends on the shadowed outer binding.
+    required_outer = (required_context & nested_declared) | (
+        free_context & leading_declared
+    )
     local_declared -= required_outer
     nested_declared -= required_outer
 
@@ -6309,9 +6419,10 @@ def select_contextual_binders(
         if not normalized_key or normalized_key in seen_keys:
             continue
         raw_referenced_names = _binder_segment_referenced_names(seg)
-        if raw_referenced_names & nested_declared:
-            # Cannot merge into the leading ∀: the annotation mentions a name
-            # bound only after a later top-level implication.
+        if raw_referenced_names & nested_declared & context_names:
+            # Only names owned by this context can refer to an outer binder.
+            # Conservative references from unknown syntax (such as patterns)
+            # must not discard a hypothesis merely matching a nested name.
             continue
         seen_keys.add(normalized_key)
         referenced_names = raw_referenced_names - local_declared
@@ -6388,6 +6499,19 @@ def merge_contextual_binders(
     if not raw_stmt:
         return None
     raw_segments, body = _split_leading_forall_statement(raw_stmt)
+    local_names = _declared_names_from_binder_segments(
+        _split_binder_segments(raw_segments)
+    )
+    context_names = _declared_names_from_binder_segments(_split_binder_segments(binders))
+    if local_names & context_names:
+        # Selection retained an outer binding that must coexist with a local
+        # binder of the same name. Dependencies can occur in the local binder's
+        # annotation or transitively through a free outer term and its support.
+        # Preserve both scopes instead of capturing those outer dependencies.
+        prefix = build_forall_prefix_from_binders(
+            list(binders), max_prefix_chars=max_prefix_chars,
+        )
+        return f"{prefix}, {raw_stmt}" if prefix else None
     merged: list[list[Any]] = []
     seen_keys: set[str] = set()
     declared_names: set[str] = set()

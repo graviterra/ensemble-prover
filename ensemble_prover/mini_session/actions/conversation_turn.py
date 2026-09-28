@@ -640,7 +640,9 @@ def _conversation_client_role_configs(client: Any) -> Tuple[Any, ...]:
 
 
 def _selected_work_max_tokens_override(session: Any, client: Any) -> Optional[int]:
-    """Return the explicit or work-aware output ceiling for one turn."""
+    """Return the explicit or model-capacity output ceiling for one turn."""
+
+    from ensemble_prover.provider_tool_protocol import mini_model_output_capacity
 
     explicit_session_cap = getattr(
         session,
@@ -651,10 +653,6 @@ def _selected_work_max_tokens_override(session: Any, client: Any) -> Optional[in
         session_explicit_cap = int(explicit_session_cap)
     except Exception:
         session_explicit_cap = 0
-    selected = getattr(session, "selected_work_item_record", None)
-    if not isinstance(selected, dict):
-        selected = {}
-    work_type = str(selected.get("work_type") or "").strip()
     configs = _conversation_client_role_configs(client)
     if not configs:
         configs = (getattr(client, "cfg", None),)
@@ -679,24 +677,9 @@ def _selected_work_max_tokens_override(session: Any, client: Any) -> Optional[in
         # client adapter. Do not re-clamp it to the role default, or operators
         # can lower graph caps but can never deliberately raise them.
         return int(explicit_cap)
-    automatic_caps: List[int] = []
-    for cfg in configs:
-        reasoning_cap = _reasoning_aware_conversation_cap(cfg)
-        cap = (
-            reasoning_cap
-            if reasoning_cap > _DEFAULT_CONVERSATION_MAX_TOKENS
-            else _GRAPH_NATIVE_MAX_TOKEN_CAPS.get(work_type, reasoning_cap)
-        )
-        try:
-            cfg_limit = int(getattr(cfg, "max_tokens", 0) or 0)
-        except Exception:
-            cfg_limit = 0
-        automatic_caps.append(
-            max(1, min(int(cap), cfg_limit))
-            if cfg_limit > 0
-            else int(cap)
-        )
-    return max(automatic_caps, default=_DEFAULT_CONVERSATION_MAX_TOKENS)
+    return max(
+        mini_model_output_capacity(SimpleNamespace(cfg=cfg)) for cfg in configs
+    )
 
 
 def _selected_work_request_envelope_policy(session: Any) -> Any:

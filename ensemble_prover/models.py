@@ -13,6 +13,7 @@ import random
 import socket
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
@@ -60,6 +61,7 @@ from .provider_tool_protocol import (
     current_mini_request_envelope_receipt,
     extract_dsml_tool_calls,
     mini_deepseek_v4_model,
+    mini_model_context_window,
     mini_openrouter_deepseek_v4_explicit_enable_model,
     mini_request_envelope_receipt_is_valid_for,
     resolve_mini_request_output_tokens,
@@ -328,6 +330,13 @@ def _gated_chat_entrypoint(method):
                     resolved, receipt = await resolve_mini_request_output_tokens(
                         self,
                         request_policy,
+                        messages=args[0] if args else call_kwargs.get("messages"),
+                        tools=call_kwargs.get(
+                            "tools",
+                            args[1]
+                            if len(args) > 1 and method.__name__ == "chat_with_tools"
+                            else None,
+                        ),
                     )
                     call_kwargs["max_tokens_override"] = resolved
                     if (
@@ -1765,16 +1774,8 @@ def _prompt_budget_for_cfg(
     cfg: RoleConfig,
     *,
     max_tokens_override: Optional[int] = None,
+    base_url: str = "",
 ) -> Optional[int]:
-    ctx = getattr(cfg, "context_window", None)
-    if ctx is None:
-        return None
-    try:
-        ctx_i = int(ctx)
-    except Exception:
-        return None
-    if ctx_i <= 0:
-        return None
     max_out = max(
         0,
         int(
@@ -1783,10 +1784,28 @@ def _prompt_budget_for_cfg(
             else getattr(cfg, "max_tokens", 0) or 0
         ),
     )
-    budget = ctx_i - max_out
-    if budget < _CTX_MIN_PROMPT_TOKENS:
+    effective_base_url = base_url or getattr(cfg, "base_url", "") or ""
+    context_values = [mini_model_context_window(cfg, base_url=effective_base_url)]
+    receipt = current_mini_request_envelope_receipt()
+    if receipt is not None and mini_request_envelope_receipt_is_valid_for(
+        receipt, SimpleNamespace(cfg=cfg, base_url=effective_base_url), max_out,
+    ):
+        context_values.append(receipt.reasoning_capability.get("context_length"))
+    contexts = []
+    for value in context_values:
+        if isinstance(value, bool):
+            continue
+        try:
+            context = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if context > 0:
+            contexts.append(context)
+    if not contexts:
         return None
-    return budget
+    # A tiny remaining context is still a real provider bound. Returning None
+    # would disable trimming and erase the required-context overflow guard.
+    return max(1, min(contexts) - max_out)
 
 
 def _messages_tokens(
@@ -3013,6 +3032,7 @@ class OpenAICompatClient:
         base_budget = _prompt_budget_for_cfg(
             self.cfg,
             max_tokens_override=max_tokens_override,
+            base_url=self.base_url,
         )
         cap = self._runtime_prompt_budget_cap_tokens
         if cap is None:
@@ -3020,7 +3040,7 @@ class OpenAICompatClient:
         cap_i = max(_CTX_MIN_PROMPT_TOKENS, int(cap))
         if base_budget is None:
             return cap_i
-        return max(_CTX_MIN_PROMPT_TOKENS, min(int(base_budget), cap_i))
+        return min(int(base_budget), cap_i)
 
     def _tighten_prompt_budget(
         self,

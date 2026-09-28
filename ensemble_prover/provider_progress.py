@@ -25,13 +25,14 @@ def progress_snapshot(value: Any) -> dict[str, Any] | None:
     """Allow only known telemetry fields; never copy provider text or usage."""
     if not isinstance(value, Mapping):
         return None
-    if value.get("backend") != "claude_code_subscription":
+    backend = value.get("backend")
+    if backend not in ("claude_code_subscription", "codex_subscription"):
         return None
     status = value.get("status")
     if not isinstance(status, str) or status not in _STATUSES:
         return None
     clean: dict[str, Any] = {
-        "backend": "claude_code_subscription", "status": status,
+        "backend": backend, "status": status,
         "usage_authoritative": False,
     }
     for key in _COUNTERS:

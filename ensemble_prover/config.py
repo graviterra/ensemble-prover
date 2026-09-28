@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, cast
 
 import yaml
 
@@ -269,6 +269,9 @@ def _append_imports_to_preamble(preamble: str, extra_imports: Sequence[str]) -> 
     return "\n".join(merged)
 
 
+_AUTOMATIC_ROLE_MAX_TOKENS = cast(int, object())
+
+
 @dataclass
 class RoleConfig:
     name: str
@@ -277,7 +280,7 @@ class RoleConfig:
     api_key: Optional[str] = None
     temperature: float = 0.2
     top_p: float = 0.95
-    max_tokens: int = 1024
+    max_tokens: int = _AUTOMATIC_ROLE_MAX_TOKENS
     # Optional lane-level override for MiniSession conversation turns. Unlike
     # ``max_tokens`` (the role default/capacity used by ordinary calls), this
     # value is passed as the concrete request limit and may intentionally raise
@@ -303,6 +306,21 @@ class RoleConfig:
     codex_binary: str = "codex"
     # Executable used only by the claude-code://subscription transport.
     claude_code_binary: str = "claude"
+    # The original automatic allowance, not an operator cap. Catalog evidence
+    # may replace it only while max_tokens still equals this value.
+    model_default_max_tokens: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.max_tokens is _AUTOMATIC_ROLE_MAX_TOKENS:
+            from .provider_tool_protocol import mini_model_token_defaults
+
+            context, output = mini_model_token_defaults(self.model, base_url=self.base_url)
+            # Preserve the legacy fallback when no provider capacity is known.
+            # Catalog resolution can still replace this automatic allowance.
+            self.max_tokens = output if context is not None else 1024
+            self.model_default_max_tokens = self.max_tokens
+            if self.context_window is None:
+                self.context_window = context
 
 
 @dataclass
@@ -1414,6 +1432,12 @@ def _role_from_dict(name: str, data: Dict[str, Any]) -> RoleConfig:
             env_key = None
         if env_key and env_key.strip():
             api_key = env_key.strip()
+    from .provider_tool_protocol import mini_model_token_defaults
+
+    default_context, default_output = mini_model_token_defaults(model, base_url=base_url)
+    if default_context is None:
+        default_output = 1024
+    automatic_output = "max_tokens" not in data
     return RoleConfig(
         name=name,
         base_url=base_url,
@@ -1421,7 +1445,8 @@ def _role_from_dict(name: str, data: Dict[str, Any]) -> RoleConfig:
         api_key=api_key,
         temperature=float(data.get("temperature", 0.2)),
         top_p=float(data.get("top_p", 0.95)),
-        max_tokens=int(data.get("max_tokens", 1024)),
+        max_tokens=int(data.get("max_tokens", default_output)),
+        model_default_max_tokens=(default_output if automatic_output else None),
         conversation_max_tokens_override=(
             int(data["conversation_max_tokens_override"])
             if data.get("conversation_max_tokens_override") is not None
@@ -1430,7 +1455,7 @@ def _role_from_dict(name: str, data: Dict[str, Any]) -> RoleConfig:
         context_window=(
             int(data["context_window"])
             if data.get("context_window") is not None
-            else None
+            else None if "context_window" in data else default_context
         ),
         reasoning_effort=(
             str(data["reasoning_effort"]).strip()

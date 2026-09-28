@@ -132,30 +132,60 @@ def mini_reasoning_effort(client: Any, *, minimum: str) -> str:
     return selected
 
 
+def mini_model_token_defaults(model: Any, *, base_url: str = "") -> tuple[Optional[int], int]:
+    """Known context/output allowances, with a local fallback for unknown routes.
+
+    Fresh OpenRouter catalog limits supersede automatic defaults at dispatch.
+    The fallback is an allowance, not an assertion of provider capacity.
+    """
+
+    name = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    if mini_deepseek_v4_model(str(model or ""), base_url=base_url):
+        return 1_000_000, 384_000
+    if name == "gpt-5.2" or name.startswith("gpt-5.2-"):
+        return 400_000, 128_000
+    if any(name == prefix or name.startswith(prefix + "-") for prefix in ("gpt-5.4-mini", "gpt-5.4-nano")):
+        return 400_000, 128_000
+    if any(name == prefix or name.startswith(prefix + "-") for prefix in ("gpt-5.4", "gpt-5.5", "gpt-5.6")) or mini_gpt6_model(name):
+        return 1_050_000, 128_000
+    if mini_qwen_mandatory_reasoning_model(name):
+        return 1_000_000, 131_072
+    if _mini_gpt_oss_120b_model(name):
+        return 131_072, 65_536
+    if name == "gpt-4o-mini" or re.fullmatch(r"gpt-4o-mini-\d{4}-\d{2}-\d{2}", name):
+        return 128_000, 16_384
+    return None, 8192
+
+
 def mini_model_output_capacity(client: Any, *, fallback: int = 8192) -> int:
-    """Return the configured output allowance or a model-family fallback."""
+    """Return a configured allowance, or fresh capacity for automatic defaults."""
 
     cfg = getattr(client, "cfg", None)
-    try:
-        configured = int(getattr(cfg, "max_tokens", 0) or 0)
-    except (TypeError, ValueError):
-        configured = 0
-    if configured > 0:
-        return configured
-    model = str(getattr(cfg, "model", "") or "").strip().lower().rsplit("/", 1)[-1]
-    if mini_deepseek_v4_model(
-        getattr(cfg, "model", ""), base_url=str(getattr(cfg, "base_url", "") or "")
-    ):
-        return 384_000
-    if model.startswith("gpt-5.2") or model.startswith("gpt-5.6"):
-        return 128_000
-    if mini_qwen_mandatory_reasoning_model(model):
-        # Local allowance shared with the mandatory-reasoning envelope policy.
-        return _MINI_QWEN_MANDATORY_REASONING_TOTAL_OUTPUT_CAP
-    if mini_gpt6_model(model):
-        # A local reasoning allowance, not an advertised provider maximum.
-        return _MINI_GPT_REASONING_TOTAL_OUTPUT_CAP
-    return max(1, int(fallback))
+    configured = _positive_int(getattr(cfg, "max_tokens", None))
+    base_url = str(getattr(client, "base_url", "") or getattr(cfg, "base_url", "") or "")
+    capability = lookup_openrouter_reasoning_capabilities(base_url, getattr(cfg, "model", ""))
+    advertised = _positive_int(getattr(capability, "max_completion_tokens", None))
+    automatic = configured == _positive_int(getattr(cfg, "model_default_max_tokens", None))
+    if advertised and (automatic or not configured):
+        return advertised
+    if configured:
+        return min(configured, advertised) if advertised else configured
+    context, allowance = mini_model_token_defaults(getattr(cfg, "model", ""), base_url=base_url)
+    return allowance if context is not None else max(1, int(fallback))
+
+
+def mini_model_context_window(cfg: Any, *, base_url: str = "") -> Optional[int]:
+    """Use known context for omitted custom-client fields, preserving explicit None."""
+
+    if hasattr(cfg, "context_window"):
+        if isinstance(cfg.context_window, bool):
+            return None
+        return _positive_int(cfg.context_window) or None
+    context, _output = mini_model_token_defaults(
+        getattr(cfg, "model", ""),
+        base_url=str(base_url or getattr(cfg, "base_url", "") or ""),
+    )
+    return context
 
 _DSML_INVOKE_RE = re.compile(
     r"<｜｜DSML｜｜invoke\b(?P<attrs>[^>]*)>(?P<body>.*?)</｜｜DSML｜｜invoke>",
@@ -431,7 +461,10 @@ class MiniRequestEnvelopePolicy:
             "reasoning_effort": str(self.reasoning_effort or ""),
         }
 
-    async def resolve_for(self, client: Any) -> MiniRequestEnvelopeReceipt:
+    async def resolve_for(
+        self, client: Any, *, messages: Optional[Sequence[Dict[str, Any]]] = None,
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> MiniRequestEnvelopeReceipt:
         cfg = getattr(client, "cfg", None)
         model = str(getattr(cfg, "model", "") or "").strip()
         base_url = str(
@@ -460,15 +493,24 @@ class MiniRequestEnvelopePolicy:
             and bool(getattr(cfg, "reasoning_control_required", False))
         ):
             effective_effort = "none"
+        prompt_key = ""
+        if messages is not None:
+            prompt_key = hashlib.sha256(json.dumps(
+                [list(messages), list(tools or ())],
+                sort_keys=True, ensure_ascii=True, default=str,
+            ).encode("utf-8")).hexdigest()
         # Include every config input used by cap resolution.  ``id(client)``
         # alone is not stable after a short-lived adapter is collected and
         # Python reuses its address within the same request policy.
         cache_key = (
             id(client),
+            prompt_key,
             model,
             base_url,
             str(effective_effort or ""),
             _positive_int(getattr(cfg, "max_tokens", None)),
+            _positive_int(getattr(cfg, "model_default_max_tokens", None)),
+            mini_model_context_window(cfg, base_url=base_url),
             _positive_int(
                 getattr(cfg, "conversation_max_tokens_override", None)
             ),
@@ -500,6 +542,13 @@ class MiniRequestEnvelopePolicy:
                     mandatory=True,
                     source="static_gpt_oss_contract",
                 )
+                fresh = lookup_openrouter_reasoning_capabilities(base_url, model)
+                if fresh is not None:
+                    capability = replace(
+                        capability,
+                        max_completion_tokens=fresh.max_completion_tokens,
+                        context_length=fresh.context_length,
+                    )
             elif (
                 mini_openrouter_deepseek_v4_explicit_enable_model(model)
                 and not _strict_reasoning_off(cfg)
@@ -579,6 +628,15 @@ class MiniRequestEnvelopePolicy:
                 capability=capability,
             )
         )
+        if messages is not None and not operator_override:
+            fitted_tokens = mini_prompt_output_capacity(
+                cfg=cfg, model=model, capability=capability,
+                messages=messages, tools=tools, output_tokens=output_tokens,
+                base_url=base_url,
+            )
+            if fitted_tokens < output_tokens:
+                output_tokens = fitted_tokens
+                cap_source += "+prompt_context"
         effective_effort, reasoning_transport_control = (
             _resolve_mini_reasoning_transport_control(
                 cfg=cfg,
@@ -752,7 +810,7 @@ def _mini_openrouter_mandatory_model(model: str) -> bool:
 def _positive_int(value: Any) -> int:
     try:
         parsed = int(value or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
     return parsed if parsed > 0 else 0
 
@@ -908,22 +966,75 @@ def _resolve_mini_leaf_output_cap(
         automatic_cap = max(automatic_cap, int(planner_visible_floor))
         cap_source = f"{cap_source}+{request_kind}_visible_floor"
     capacity = _positive_int(getattr(cfg, "max_tokens", None))
-    if capacity > 0:
-        if str(request_kind or "") == "final_no_tools" or (
-            (leaf_name.startswith("gpt-5.6") or mini_gpt6_model(model))
-            and planner_visible_floor
-        ):
-            # Serialization receives the configured output allowance, not a
-            # graph-search heuristic. Low reasoning effort is not a token
-            # bound: providers can consume a smaller shared envelope entirely
-            # on reasoning, leaving no final proof. Preserve explicit reasoning
-            # intent and let cost admission reserve this same concrete limit.
-            # Explicit request overrides have already returned above.
-            automatic_cap = capacity
+    advertised = _positive_int(getattr(capability, "max_completion_tokens", None))
+    default_capacity = _positive_int(getattr(cfg, "model_default_max_tokens", None))
+    if advertised and (not capacity or capacity == default_capacity):
+        # Catalog evidence replaces only automatic defaults. A YAML/programmatic
+        # limit or a later role edit remains an operator-owned constraint.
+        capacity = advertised
+        cap_source = "catalog_output_capacity"
+    elif capacity:
+        cap_source = "model_output_capacity"
+        if advertised and advertised < capacity:
+            capacity = advertised
+            cap_source += "+provider_limit"
+    else:
+        known_context, known_capacity = mini_model_token_defaults(
+            model, base_url=base_url
+        )
+        if known_context is not None:
+            # Custom clients can omit role capacity. Keep the same known-model
+            # allowance as configured clients instead of reviving phase caps.
+            capacity = known_capacity
             cap_source = "model_output_capacity"
-        else:
-            automatic_cap = min(automatic_cap, capacity)
+    if capacity:
+        # Hidden reasoning and visible proof share this limit. Phase-size
+        # heuristics must not silently discard the model's available output.
+        automatic_cap = capacity
+
     return max(1, int(automatic_cap)), cap_source, transport_mode, False
+
+
+def mini_prompt_output_capacity(
+    *,
+    cfg: Any,
+    model: str,
+    capability: Any,
+    messages: Sequence[Dict[str, Any]],
+    tools: Optional[Sequence[Dict[str, Any]]] = None,
+    output_tokens: int,
+    base_url: str = "",
+) -> int:
+    """Fit an automatic allowance around the required mathematical context."""
+
+    context_limits = [limit for limit in (
+        mini_model_context_window(cfg, base_url=base_url),
+        _positive_int(getattr(capability, "context_length", None)),
+    ) if limit]
+    if not context_limits:
+        return output_tokens
+    # Use transport's token estimator and leave room for provider framing and
+    # tool schemas without discarding the input selected by the proof search.
+    from .models import (
+        _messages_tokens, _required_prompt_envelope, _structured_tokens,
+    )
+
+    tool_tokens = _structured_tokens(list(tools or ()), model=model)
+    framing_tokens = 256 + 16 * len(tools or ())
+    prompt_tokens = (
+        _messages_tokens(list(messages), model=model)
+        + tool_tokens + framing_tokens + 16 * len(messages)
+    )
+    if prompt_tokens >= min(context_limits):
+        # Transport can compact optional history while preserving all required
+        # facts and a usable completion allowance.
+        retained = _required_prompt_envelope(list(messages))
+        prompt_tokens = (
+            _messages_tokens(retained, model=model)
+            + tool_tokens + framing_tokens + 16 * len(retained)
+        )
+    available = max(1, min(context_limits) - prompt_tokens)
+    return min(output_tokens, available)
 
 
 def _minimum_advertised_reasoning_effort(
@@ -1274,12 +1385,15 @@ def mini_request_envelope_policy(
 async def resolve_mini_request_output_tokens(
     client: Any,
     value: Any,
+    *,
+    messages: Optional[Sequence[Dict[str, Any]]] = None,
+    tools: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> tuple[Any, Optional[MiniRequestEnvelopeReceipt]]:
     """Resolve an opaque Mini policy for exactly one concrete client leaf."""
 
     if not isinstance(value, MiniRequestEnvelopePolicy):
         return value, None
-    receipt = await value.resolve_for(client)
+    receipt = await value.resolve_for(client, messages=messages, tools=tools)
     return int(receipt.max_output_tokens), receipt
 
 
@@ -1345,6 +1459,9 @@ def mini_request_concrete_leaves(client: Any) -> List[Any]:
 async def resolve_mini_request_envelopes(
     client: Any,
     value: Any,
+    *,
+    messages: Optional[Sequence[Dict[str, Any]]] = None,
+    tools: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[MiniRequestEnvelopeReceipt]:
     """Resolve one request against all concrete leaves before admission."""
 
@@ -1352,7 +1469,7 @@ async def resolve_mini_request_envelopes(
         return []
     receipts: List[MiniRequestEnvelopeReceipt] = []
     for leaf in mini_request_concrete_leaves(client):
-        receipts.append(await value.resolve_for(leaf))
+        receipts.append(await value.resolve_for(leaf, messages=messages, tools=tools))
     return receipts
 
 

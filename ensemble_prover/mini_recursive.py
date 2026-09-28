@@ -135,10 +135,14 @@ from .models import (
 )
 from .provider_tool_protocol import (
     MiniReasoningCapabilityUnavailable,
+    MiniRequestEnvelopePolicy,
+    MiniRequestEnvelopeReceipt,
     mini_bounded_visible_output_reasoning_effort,
-    mini_model_output_capacity,
+    mini_prompt_output_capacity,
     mini_reasoning_effort,
+    mini_request_concrete_leaf_bindings,
     mini_request_envelope_policy,
+    mini_request_envelope_receipt_is_valid_for,
     mini_request_wrapper_children,
     resolve_mini_request_output_tokens,
     _resolve_mini_leaf_output_cap,
@@ -6596,10 +6600,11 @@ def _planner_io_policy_record(
     request_timeout_s: float,
     operation_timeout_s: float,
     deadlines_enabled: bool,
+    output_limit: Any = None,
 ) -> dict[str, Any]:
     """Durable logical bounds for one exact provider request."""
 
-    return {
+    record = {
         "schema_version": 1,
         "max_tokens": max(1, int(max_tokens or 1)),
         "reasoning_effort": str(reasoning_effort or ""),
@@ -6612,6 +6617,9 @@ def _planner_io_policy_record(
         "operation_timeout_s": float(operation_timeout_s),
         "deadlines_enabled": bool(deadlines_enabled),
     }
+    if isinstance(output_limit, _FrozenPlannerRequestEnvelope):
+        record["request_envelope_receipts"] = output_limit.receipt_records()
+    return record
 
 
 def _validated_planner_io_policy(
@@ -6650,7 +6658,7 @@ def _validated_planner_io_policy(
             return None
         if not -2.0 <= temperature <= 2.0:
             return None
-    return _planner_io_policy_record(
+    normalized = _planner_io_policy_record(
         max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
         temperature=temperature,
@@ -6659,6 +6667,14 @@ def _validated_planner_io_policy(
         operation_timeout_s=operation_timeout_s,
         deadlines_enabled=deadlines_enabled,
     )
+    if "request_envelope_receipts" in policy:
+        receipts = _validated_planner_envelope_receipts(
+            policy["request_envelope_receipts"]
+        )
+        if receipts is None or max(r.max_output_tokens for r in receipts) != max_tokens:
+            return None
+        normalized["request_envelope_receipts"] = [r.to_record() for r in receipts]
+    return normalized
 
 
 def _planner_bound_request_fingerprint(
@@ -7906,8 +7922,24 @@ _DEPENDENCY_HANDWAVE_PATTERNS = (
 
 _SQRT_RATIONALITY_ROLE_PATTERNS = (
     re.compile(
-        r"\b(?:sqrt|square\s+root(?:s)?)\b.{0,140}\brational(?:ity)?\b"
-        r"|\brational(?:ity)?\b.{0,140}\b(?:sqrt|square\s+root(?:s)?)\b",
+        r"\b(?:sqrt(?:\([^()\n]*\))?|square[\s-]+roots?)"
+        r"(?:\s+of\s+[^,.;\n]{1,80}?)?\s+"
+        r"(?:(?:must|need|may|might|could|can|to)\s+(?:not\s+)?)?"
+        r"\b(?:is|are|be|being)\s+(?:not\s+)?(?:necessarily\s+)?rational\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:take|taking|extract|extracting)\s+square[\s-]+roots?\b"
+        r".{0,100}\b(?:deduc|conclud|deriv|infer|obtain|show|prove)\w*\b"
+        r".{0,100}\b(?:norm|value|quantity)\b.{0,80}\brational\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:sqrt|square[\s-]+roots?)\s+rationality\b"
+        r"|\brational(?:ity)?\s+(?:of\s+)?(?:the\s+|a\s+)?"
+        r"(?:sqrt|square[\s-]+roots?)\b"
+        r"|\brationality\s+(?:assumption|claim|property|bridge)\s+"
+        r"(?:about|of|for)\s+(?:the\s+)?(?:sqrt|square[\s-]+roots?)\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -9980,6 +10012,37 @@ def _bound_claim_contract_identity(claim: MiniSubgoalClaim) -> str:
     return identity
 
 
+def _claim_contract_projection_fields(claim: MiniSubgoalClaim) -> dict[str, Any]:
+    """Project the checked theorem while retaining the authored surface as provenance.
+
+    A context-closed variant can bind variables or hypotheses absent from the
+    planner's fragment. Only its own receipt authorizes the graph statement;
+    recording that statement does not certify the original fragment separately.
+    Invalid evidence is left intact for the graph's existing strict rejection.
+    """
+
+    authored = str(claim.statement or "").strip()
+    fields: dict[str, Any] = {"statement": authored}
+    if not _bound_claim_contract_identity(claim):
+        return fields
+    statement_key = str(claim.contract_identity_statement_key or "").strip()
+    if statement_key == graph_statement_key(authored):
+        return fields
+    for index, variant in enumerate(claim.variants, start=1):
+        source = str(variant.statement or "").strip()
+        if source and graph_statement_key(source) == statement_key:
+            return {
+                "statement": source,
+                "authored_statement": authored,
+                "contract_source_variant": {
+                    "index": index,
+                    "mode": str(variant.mode or ""),
+                    "authored_statement_key": graph_statement_key(authored),
+                },
+            }
+    return fields
+
+
 def _bound_variant_contract_identity(variant: SubgoalVariant) -> str:
     """Return receipt-bound Lean identity for one compiled claim variant."""
 
@@ -10651,91 +10714,107 @@ def _claim_square_root_role_text(
     plan: MiniSubgoalPlan,
     assembly_like: bool,
 ) -> str:
-    claim_role = " ".join(
+    # Fields describe distinct assertions. Joining them with spaces used to
+    # combine unrelated rational roots and radical identities into one role.
+    claim_role = "\n".join(
         str(part or "")
         for part in (
             getattr(claim, "name", ""),
             getattr(claim, "rationale", ""),
-            " ".join(getattr(claim, "invariant_refs", ()) or ()),
+            "\n".join(getattr(claim, "invariant_refs", ()) or ()),
             getattr(claim, "sanity_check", ""),
         )
     )
     if not assembly_like:
         return claim_role
-    return " ".join(
+    return "\n".join(
         str(part or "")
         for part in (
             claim_role,
             getattr(plan, "strategy", ""),
-            " ".join(getattr(plan, "notes", ()) or ()),
+            "\n".join(getattr(plan, "notes", ()) or ()),
         )
     )
 
 
-def _statement_supplies_square_root_rationality_contract(statement: str) -> bool:
-    raw = str(statement or "").strip()
-    if not raw:
-        return False
-    norm = _contract_norm(raw)
-    compact = re.sub(r"\s+", "", raw)
-    has_implication = "→" in raw or "->" in raw
-    has_existential = "∃" in raw or re.search(r"\bexists\b", norm) is not None
-    has_rational_range = (
-        "Set.range" in raw
-        and "ℚ" in raw
-        and ("∈" in raw or re.search(r"\bin\b", norm) is not None)
+def _role_asserts_square_root_rationality(role_text: str) -> bool:
+    """Recognize a local affirmative bridge, not mere keyword co-occurrence.
+
+    This is a scheduling diagnostic, not a natural-language truth oracle.
+    Unrelated or negated commentary must leave the proposition to Lean.
+    """
+
+    clauses = re.split(
+        r"\n|;|[.!](?=\s|$)|(?<=\?)\s+|\b(?:but|however|instead|yet)\b",
+        role_text, flags=re.IGNORECASE,
     )
-    has_rational_marker = (
-        "ℚ" in raw
-        or re.search(r"\bRat(?:ional)?\b", raw, re.IGNORECASE) is not None
-        or re.search(r"\bq\d*'?[:∈]", compact) is not None
-        or has_rational_range
-    )
-    has_square_marker = (
-        re.search(r"\^\s*(?:2|\(2\)|\(2\s*:\s*ℕ\))", raw) is not None
-        or re.search(r"\bpow\s+2\b", norm) is not None
-        or re.search(r"\bsq\b", norm) is not None
-    )
-    has_sqrt_marker = "sqrt" in norm
-    if has_sqrt_marker and has_rational_marker and has_implication:
-        return True
-    return bool(
-        has_square_marker
-        and has_rational_marker
-        and (has_existential or has_rational_range)
-        and has_implication
-    )
+    for clause in clauses:
+        if clause.strip().endswith("?"):
+            continue
+        # These ordinary double negatives affirm rationality. Focus modifiers
+        # such as 'not merely assume' likewise do not withdraw an assertion.
+        clause = re.sub(r"\bnot\s+irrational\b", "rational", clause, flags=re.IGNORECASE)
+        clause = re.sub(r"\bnot\s+false\b", "true", clause, flags=re.IGNORECASE)
+        clause = re.sub(r"\bnot\s+(?:only|merely|just)\b", "", clause, flags=re.IGNORECASE)
+        for pattern in _SQRT_RATIONALITY_ROLE_PATTERNS:
+            for match in pattern.finditer(clause):
+                # A disclaimer before a comma does not negate a later,
+                # independent assertion ('without assuming X, prove X').
+                prefix_start = clause.rfind(",", 0, match.start()) + 1
+                prefix = clause[prefix_start:match.start()]
+                assertion = match.group(0)
+                suffix = clause[match.end():]
+                if (
+                    re.search(r"\b(?:if|whether|suppose|supposing)\b[^,]*$", prefix, re.IGNORECASE)
+                    or re.search(r"\bfor\s+contradiction\b", suffix, re.IGNORECASE)
+                    or re.search(r"\b(?:may|might|could|possibly|perhaps)\b", assertion, re.IGNORECASE)
+                ):
+                    continue
+                suffix_negated = bool(re.match(
+                    r"\s+(?:is|are)\s+(?:false\b|not\s+(?:needed|required|assumed|used|claimed|"
+                    r"true|valid|justified|established|proved|proven|known|supported)\b)",
+                    suffix, re.IGNORECASE,
+                ))
+                # Scope prefix negation to the claimed bridge. An unrelated
+                # 'no simplification is needed to show ...' must not suppress
+                # the following affirmative rationality claim.
+                prefix_negated = bool(re.search(
+                    r"\b(?:without\s+(?:assuming\s+)?|no\s+(?:reason\s+to\s+)?|"
+                    r"(?:not|never|cannot|can't|don't|doesn't|mustn't|false|avoid)\s+)"
+                    r"(?:(?:assum\w*|us\w*|conclud\w*|prov\w*|deriv\w*|infer\w*|"
+                    r"obtain\w*|show\w*|need\w*|requir\w*|claim\w*|assert\w*|"
+                    r"deduc\w*|establish\w*|tak\w*|true|necessary|to|the\s+case)\s+)*"
+                    r"(?:(?:that|the|a|any|a\s+priori)\s+)*$",
+                    prefix, re.IGNORECASE,
+                ))
+                negations = re.findall(
+                    r"\b(?:not|never|cannot|can't|isn't|aren't)\b",
+                    assertion, re.IGNORECASE,
+                )
+                if (len(negations) + prefix_negated + suffix_negated) % 2 == 0:
+                    return True
+    return False
 
 
-def _claim_semantic_role_contract_reasons(
+def _claim_square_root_role_advisories(
     claim: MiniSubgoalClaim,
     *,
     plan: MiniSubgoalPlan,
-    support_statements: Sequence[str],
     assembly_like: bool,
 ) -> tuple[str, ...]:
+    """Describe prose roles without granting or denying formal work.
+
+    The explanation can describe how several intermediate lemmas compose.
+    A surface parser cannot decide that mathematical entailment. The actual
+    premise/dependency contracts and Lean checks remain the authority.
+    """
+
     role_text = _claim_square_root_role_text(
-        claim,
-        plan=plan,
-        assembly_like=assembly_like,
+        claim, plan=plan, assembly_like=assembly_like,
     )
-    if not any(
-        pattern.search(role_text) for pattern in _SQRT_RATIONALITY_ROLE_PATTERNS
-    ):
+    if not _role_asserts_square_root_rationality(role_text):
         return ()
-    candidate_statements = (
-        str(getattr(claim, "statement", "") or ""),
-        *tuple(str(stmt or "") for stmt in support_statements),
-    )
-    if any(
-        _statement_supplies_square_root_rationality_contract(statement)
-        for statement in candidate_statements
-    ):
-        return ()
-    return (
-        "semantic_role_mismatch:"
-        "sqrt_or_square_rationality_bridge_without_formal_contract",
-    )
+    return ("sqrt_or_square_rationality_role_requires_formal_verification",)
 
 
 def _claim_dependency_contract_reasons(
@@ -10865,14 +10944,6 @@ def _claim_dependency_contract_reasons(
         and claim_parameter_profile == root_parameter_profile
         else ()
     )
-    semantic_role_reasons = _claim_semantic_role_contract_reasons(
-        claim,
-        plan=plan,
-        support_statements=support_statements,
-        assembly_like=assembly_like,
-    )
-    if semantic_role_reasons:
-        return semantic_role_reasons
     if not premises:
         return ()
     available_structural_hashes = {
@@ -11038,7 +11109,7 @@ def _reasons_are_inline_dischargeable_route_premise(
 
     Excludes ``root_contract_drift`` antecedents (the model mis-stating the root
     relation) and every other reason kind (``handwaved_dependency_bridge``,
-    ``semantic_role_mismatch``, ambiguity, cycles, ...), which remain hard
+    ambiguity, cycles, ...), which remain hard
     defects that stay rejected.  Both root-adjacent
     ``unmet_assembly_premise`` and transitive
     ``unmet_complex_bridge_premise`` are admissible because both denote local
@@ -14230,6 +14301,11 @@ async def _repair_contract_identity_statements(
         ]
         call_completed = False
         repair_response = _PlannerRawResponse()
+        repair_envelope = _planner_request_envelope(
+            request_kind="statement_repair",
+            reasoning_mode="bounded",
+            reasoning_effort="none" if empty_retry else "low",
+        )
         try:
             repair_timeout_s = max(1.0, float(operation_timeout_s or 1.0))
             raw = await _await_with_hard_timeout(
@@ -14241,7 +14317,7 @@ async def _repair_contract_identity_statements(
                     scope="mini_recursive",
                     action_id=(f"mini_contract_identity_repair_{pass_index}_{index}"),
                     call_kind="chat_contract_identity_statement_repair",
-                    max_tokens_override=512,
+                    max_tokens_override=repair_envelope,
                     metadata={
                         "temperature": 0.0,
                         "phase": "contract_identity_statement_repair",
@@ -14257,13 +14333,8 @@ async def _repair_contract_identity_statements(
                                 "operation_timeout_override_s",
                             ),
                             temperature_override=0.0,
-                            max_tokens_override=512,
-                            reasoning_effort_override=(
-                                mini_bounded_visible_output_reasoning_effort(
-                                    client,
-                                    effort=("none" if empty_retry else "low"),
-                                )
-                            ),
+                            max_tokens_override=repair_envelope,
+                            reasoning_effort_override=repair_envelope.reasoning_effort,
                             operation_timeout_override_s=repair_timeout_s,
                             usage_callback=usage_callback,
                         )
@@ -14750,6 +14821,22 @@ def _filter_plan_dependency_contract(
     prepared_claims: list[MiniSubgoalClaim] = []
     for claim in plan.claims:
         claim_name = str(claim.name or "").strip()
+        prose_advisories = _claim_square_root_role_advisories(
+            claim,
+            plan=plan,
+            assembly_like=_is_assembly_like_claim(
+                claim, root_statement=plan.root_statement,
+            ),
+        )
+        if prose_advisories:
+            _record(record_event, {
+                "phase": "mini_recursive_plan_semantic_role_advisory",
+                "pass_index": pass_index,
+                "claim_name": claim.name,
+                "advisories": list(prose_advisories),
+                "scheduling_authority": False,
+                "verdict": "claim_prose_role_advisory",
+            })
         ambiguous_binder_types = (
             ()
             if _has_lean_structural_contract_evidence(
@@ -15076,20 +15163,7 @@ def _filter_plan_dependency_contract(
         )
         if suspended:
             stats.dependency_contract_claims_suspended += 1
-        if any(
-            str(reason or "").startswith("semantic_role_mismatch:")
-            for reason in reasons
-        ):
-            _add_planner_feedback(
-                planner_feedback,
-                f"Planner claim `{claim.name}` was rejected before proving because "
-                "its prose role describes a square-root/rationality bridge "
-                "that is not present in the formal Lean statement or its "
-                f"dependencies: {reason_text}. Add an explicit Lean-checkable "
-                "bridge theorem, or remove the square-root bridge role from "
-                "this claim.",
-            )
-        elif unmet_assembly_bridge:
+        if unmet_assembly_bridge:
             _add_planner_feedback(
                 planner_feedback,
                 f"Planner claim `{claim.name}` was rejected before proving because "
@@ -29807,7 +29881,7 @@ async def run_mini_recursive_driver(
                     "accepted_claims": [
                         {
                             "name": claim.name,
-                            "statement": claim.statement,
+                            **_claim_contract_projection_fields(claim),
                             "role": claim.role,
                             "rationale": claim.rationale,
                             "invariant_refs": list(claim.invariant_refs),
@@ -32958,7 +33032,93 @@ def _planner_request_envelope(
     )
 
 
-async def _resolve_planner_output_tokens(client: Any, envelope: Any) -> int:
+def _validated_planner_envelope_receipts(
+    records: Any,
+) -> Optional[tuple[MiniRequestEnvelopeReceipt, ...]]:
+    if not isinstance(records, list) or not records:
+        return None
+    receipts = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            return None
+        try:
+            receipt = MiniRequestEnvelopeReceipt(**dict(record))
+            if (
+                type(receipt.max_output_tokens) is not int
+                or not 1 <= receipt.max_output_tokens <= 10_000_000
+                or not isinstance(receipt.reasoning_capability, Mapping)
+                or not isinstance(receipt.reasoning_transport_control, Mapping)
+                or type(receipt.operator_override) is not bool
+                or any(not isinstance(getattr(receipt, field), str) for field in (
+                    "model", "base_url", "work_type", "request_kind",
+                    "effective_reasoning_effort", "reasoning_transport_mode",
+                    "cap_source", "digest",
+                ))
+                or not mini_request_envelope_receipt_is_valid_for(
+                    receipt,
+                    SimpleNamespace(cfg=SimpleNamespace(
+                        model=receipt.model, base_url=receipt.base_url,
+                    )),
+                    receipt.max_output_tokens,
+                )
+            ):
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        receipts.append(receipt)
+    return tuple(receipts)
+
+
+class _FrozenPlannerRequestEnvelope(MiniRequestEnvelopePolicy):
+    """One exact ordered set of serving-leaf requests, including after restart."""
+
+    def __init__(self, client: Any, receipts: Sequence[MiniRequestEnvelopeReceipt]):
+        super().__init__(work_type="recursive_planner")
+        leaves = [leaf for leaf, _cfg in mini_request_concrete_leaf_bindings(client)]
+        if len(leaves) != len(receipts):
+            raise ValueError("saved planner envelope serving-leaf count changed")
+        self._leaf_receipts: dict[int, MiniRequestEnvelopeReceipt] = {}
+        self._ordered_receipts = tuple(receipts)
+        for leaf, receipt in zip(leaves, receipts):
+            if not mini_request_envelope_receipt_is_valid_for(
+                receipt, leaf, receipt.max_output_tokens,
+            ):
+                raise ValueError("saved planner envelope serving-leaf identity changed")
+            previous = self._leaf_receipts.setdefault(id(leaf), receipt)
+            if previous != receipt:
+                raise ValueError("one planner leaf has conflicting saved envelopes")
+
+    def receipt_records(self) -> list[dict[str, Any]]:
+        return [receipt.to_record() for receipt in self._ordered_receipts]
+
+    async def resolve_for(
+        self, client: Any, *, messages: Any = None, tools: Any = None,
+    ) -> MiniRequestEnvelopeReceipt:
+        del messages, tools
+        receipt = self._leaf_receipts.get(id(client))
+        if receipt is None or not mini_request_envelope_receipt_is_valid_for(
+            receipt, client, receipt.max_output_tokens,
+        ):
+            raise ValueError("planner envelope reached a different serving leaf")
+        return receipt
+
+
+def _saved_planner_output_limit(client: Any, io_policy: Mapping[str, Any]) -> Any:
+    records = io_policy.get("request_envelope_receipts")
+    if records is None:
+        return int(io_policy["max_tokens"])
+    receipts = _validated_planner_envelope_receipts(records)
+    if receipts is None:
+        raise ValueError("saved planner envelope receipts are invalid")
+    return _FrozenPlannerRequestEnvelope(client, receipts)
+
+
+async def _prepare_planner_output_request(
+    client: Any,
+    envelope: Any,
+    *,
+    messages: Sequence[dict[str, Any]],
+) -> tuple[int, Any]:
     """Resolve a planner envelope without turning a catalog outage into a miss.
 
     Planner dispatch uses a bounded local fallback when capability discovery
@@ -32966,11 +33126,20 @@ async def _resolve_planner_output_tokens(client: Any, envelope: Any) -> int:
     """
 
     try:
-        tokens, _receipt = await resolve_mini_request_output_tokens(
-            client,
-            envelope,
+        leaf_tokens = []
+        leaf_receipts = []
+        for leaf, _cfg in mini_request_concrete_leaf_bindings(client):
+            tokens, receipt = await resolve_mini_request_output_tokens(
+                leaf,
+                envelope,
+                messages=messages,
+            )
+            leaf_tokens.append(max(1, int(tokens or 0)))
+            if receipt is not None:
+                leaf_receipts.append(receipt)
+        return max(leaf_tokens, default=1), _FrozenPlannerRequestEnvelope(
+            client, leaf_receipts,
         )
-        return max(1, int(tokens or 0))
     except MiniReasoningCapabilityUnavailable:
         cfg = getattr(client, "cfg", None)
         model = str(getattr(cfg, "model", "") or "").strip()
@@ -32997,7 +33166,16 @@ async def _resolve_planner_output_tokens(client: Any, envelope: Any) -> int:
             session_override=getattr(envelope, "session_max_tokens_override", None),
             capability=None,
         )
-        return max(1, int(tokens))
+        if not _override:
+            tokens = mini_prompt_output_capacity(
+                cfg=cfg, model=model, capability=None,
+                base_url=base_url,
+                messages=messages, output_tokens=tokens,
+            )
+        # Keep the existing catalog-outage fallback as an exact allowance.
+        # Healthy requests retain their policy so cost admission and transport
+        # use the same frozen, prompt-aware receipt for each serving leaf.
+        return max(1, int(tokens)), max(1, int(tokens))
 
 
 def _merge_alternative_planner_root_routes(
@@ -34089,12 +34267,14 @@ async def _request_planner_deliberation(
             selected_parent_proof_idea_context=(selected_parent_proof_idea_context),
             round_index=round_index,
         )
-        current_max_tokens = await _resolve_planner_output_tokens(
+        current_max_tokens, current_output_limit = await _prepare_planner_output_request(
             request_client,
             max_tokens_policy,
+            messages=request_messages,
         )
         current_io_policy = _planner_io_policy_record(
             max_tokens=current_max_tokens,
+            output_limit=current_output_limit,
             reasoning_effort=reasoning_effort,
             temperature=0.0,
             provider_dispatch_max_attempts=provider_dispatch_max_attempts,
@@ -34145,11 +34325,31 @@ async def _request_planner_deliberation(
             saved_deliberation_context_compatible
             and saved_deliberation_envelope is not None
         )
+        saved_response_provider: Optional[tuple[str, str]] = None
         if exact_saved_receipt:
             # The broker's closure is already bound to the exact provider
             # request. Preserve its identity while pending or consume its
             # one-shot receipt without reconstructing provider-private state.
             deliberation_identity = planner_job_identity
+            if saved_deliberation_envelope is not None:
+                receipts = _validated_planner_envelope_receipts(
+                    saved_deliberation_envelope[1].get("request_envelope_receipts")
+                )
+                if receipts is not None and len(receipts) == 1:
+                    # A paid leaf response keeps its original provenance even
+                    # if the leaf disappeared or the wrapper was reconstructed.
+                    # This also prevents its opaque state from being relabeled
+                    # as belonging to the remaining provider on continuation.
+                    saved_response_provider = (receipts[0].model, receipts[0].base_url)
+            saved_request_client = _planner_provider_lane_client(
+                client, planner_job_identity.provider_lane_fingerprint,
+            )
+            if saved_request_client is not None:
+                # A resumed leaf call does not update its outer wrapper's
+                # last-used fields. Keep response provenance provider-affine
+                # for any further opaque continuation, without requiring the
+                # serving lane to remain available to consume a paid receipt.
+                request_client = saved_request_client
         elif exact_saved_request and planner_job_identity is not None:
             saved_request_client = _planner_provider_lane_client(
                 client,
@@ -34215,6 +34415,7 @@ async def _request_planner_deliberation(
             effective_io_policy = saved_deliberation_envelope[1]
         request_messages = list(effective_messages)
         max_tokens = int(effective_io_policy["max_tokens"])
+        output_limit = current_output_limit
         effective_reasoning_effort = str(effective_io_policy["reasoning_effort"])
         effective_temperature = effective_io_policy["temperature"]
         effective_dispatch_attempts = int(
@@ -34243,15 +34444,29 @@ async def _request_planner_deliberation(
         try:
 
             async def run_deliberation_io() -> Any:
+                dispatch_client = request_client
+                dispatch_output_limit = output_limit
+                if exact_saved_request and planner_job_identity is not None:
+                    # Ready/pending broker work already owns its exact leaf
+                    # request. Reconstruct the saved envelope only when this
+                    # closure actually dispatches after a process restart.
+                    dispatch_client = _planner_provider_lane_client(
+                        client, planner_job_identity.provider_lane_fingerprint,
+                    )
+                    if dispatch_client is None:
+                        raise ValueError("saved planner serving lane is unavailable")
+                    dispatch_output_limit = _saved_planner_output_limit(
+                        dispatch_client, effective_io_policy,
+                    )
                 return await metered_or_plain_call(
                     cost_controller=cost_controller,
-                    client=request_client,
+                    client=dispatch_client,
                     messages=effective_messages,
                     role="planner",
                     scope="mini_recursive",
                     action_id="mini_recursive_plan_deliberation",
                     call_kind="chat_raw_deliberation",
-                    max_tokens_override=max_tokens,
+                    max_tokens_override=dispatch_output_limit,
                     metadata={
                         "phase": "planner_deliberation",
                         "trigger": str(trigger),
@@ -34262,7 +34477,7 @@ async def _request_planner_deliberation(
                         ),
                     },
                     invoke=lambda usage_callback: call_with_optional_usage_callback(
-                        request_client.chat_raw,
+                        dispatch_client.chat_raw,
                         effective_messages,
                         required_keywords=(
                             "max_tokens_override",
@@ -34272,7 +34487,7 @@ async def _request_planner_deliberation(
                             "operation_timeout_override_s",
                         ),
                         temperature_override=effective_temperature,
-                        max_tokens_override=max_tokens,
+                        max_tokens_override=dispatch_output_limit,
                         reasoning_effort_override=effective_reasoning_effort,
                         deadline=_wall_clock_deadline(effective_deadline_monotonic),
                         request_timeout_override_s=(effective_request_timeout_s),
@@ -34309,7 +34524,9 @@ async def _request_planner_deliberation(
             return pending_artifact
         response = _planner_raw_response(raw)
         resolved_max_tokens = int(max_tokens or 0)
-        response_model_id, response_base_url = _provider_identity(request_client)
+        response_model_id, response_base_url = (
+            saved_response_provider or _provider_identity(request_client)
+        )
         # Provider reasoning is incomplete private work, never an advisory.
         # OpenAI opaque output items are retained solely for exact continuation.
         content = str(response.content or getattr(raw, "content", "") or "")
@@ -34549,7 +34766,14 @@ async def _request_plan_parse_repair(
     # Syntax repair may need to reproduce the complete plan, including every
     # claim and dependency.  Restricting it to 8K silently reintroduced the
     # truncation boundary removed from the primary planner request.
-    repair_max_tokens = mini_model_output_capacity(client)
+    repair_envelope = _planner_request_envelope(
+        request_kind="planner_parse_repair",
+        reasoning_mode="bounded",
+        reasoning_effort="low",
+    )
+    repair_max_tokens, repair_output_limit = await _prepare_planner_output_request(
+        client, repair_envelope, messages=repair_messages,
+    )
     repair_reasoning_effort = mini_bounded_visible_output_reasoning_effort(
         client,
         effort="low",
@@ -34557,6 +34781,7 @@ async def _request_plan_parse_repair(
     repair_temperature_override = repair_temperature.provider_temperature_override()
     repair_io_policy = _planner_io_policy_record(
         max_tokens=repair_max_tokens,
+        output_limit=repair_output_limit,
         reasoning_effort=repair_reasoning_effort,
         temperature=repair_temperature_override,
         provider_dispatch_max_attempts=provider_dispatch_max_attempts,
@@ -34571,6 +34796,7 @@ async def _request_plan_parse_repair(
     if saved_repair_io_policy is not None:
         repair_io_policy = saved_repair_io_policy
         repair_max_tokens = int(repair_io_policy["max_tokens"])
+        repair_output_limit = _saved_planner_output_limit(client, repair_io_policy)
         repair_reasoning_effort = str(repair_io_policy["reasoning_effort"])
         repair_temperature_override = repair_io_policy["temperature"]
         provider_dispatch_max_attempts = int(
@@ -34594,7 +34820,7 @@ async def _request_plan_parse_repair(
             call_kind="chat_json_plan_repair",
             # Syntax normalization is not another theorem-planning attempt,
             # but it must be able to reproduce the entire visible plan.
-            max_tokens_override=repair_max_tokens,
+            max_tokens_override=repair_output_limit,
             metadata={
                 **repair_temperature.metadata(client=client),
                 "provider_dispatch_max_attempts": max(
@@ -34614,7 +34840,7 @@ async def _request_plan_parse_repair(
                 ),
                 response_format="json",
                 temperature_override=repair_temperature_override,
-                max_tokens_override=repair_max_tokens,
+                max_tokens_override=repair_output_limit,
                 reasoning_effort_override=repair_reasoning_effort,
                 deadline=_wall_clock_deadline(repair_deadline_monotonic),
                 request_timeout_override_s=request_timeout_s,
@@ -35662,9 +35888,10 @@ async def _request_plan(
             reasoning_mode="floor",
             reasoning_effort=planner_reasoning_effort,
         )
-        planner_max_tokens = await _resolve_planner_output_tokens(
+        planner_max_tokens, planner_output_limit = await _prepare_planner_output_request(
             plan_request_client,
             planner_envelope,
+            messages=request_messages,
         )
         planner_io_messages = (
             saved_request_messages
@@ -35681,16 +35908,18 @@ async def _request_plan(
         planner_io_reasoning_effort = planner_reasoning_effort
         planner_io_temperature = temperature_decision.provider_temperature_override()
         planner_io_max_tokens = planner_max_tokens
+        planner_io_output_limit = planner_output_limit
         if planner_io_stage == "reasoning_recovery":
             planner_io_action_id = "mini_recursive_plan_reasoning_recovery"
             planner_io_call_kind = "chat_raw_json_plan_reasoning_recovery"
-            planner_io_max_tokens = await _resolve_planner_output_tokens(
+            planner_io_max_tokens, planner_io_output_limit = await _prepare_planner_output_request(
                 plan_request_client,
                 _planner_request_envelope(
                     request_kind="planner_reasoning_recovery",
                     reasoning_mode="floor",
                     reasoning_effort=planner_reasoning_effort,
                 ),
+                messages=planner_io_messages,
             )
         elif planner_io_stage == "visibility_recovery":
             planner_io_action_id = "mini_recursive_plan_visibility_recovery"
@@ -35700,16 +35929,18 @@ async def _request_plan(
                 effort="none",
             )
             planner_io_temperature = 0.0
-            planner_io_max_tokens = await _resolve_planner_output_tokens(
+            planner_io_max_tokens, planner_io_output_limit = await _prepare_planner_output_request(
                 plan_request_client,
                 _planner_request_envelope(
                     request_kind="planner_visibility_recovery",
                     reasoning_mode="bounded",
                     reasoning_effort="none",
                 ),
+                messages=planner_io_messages,
             )
         planner_io_policy = _planner_io_policy_record(
             max_tokens=planner_io_max_tokens,
+            output_limit=planner_io_output_limit,
             reasoning_effort=planner_io_reasoning_effort,
             temperature=planner_io_temperature,
             provider_dispatch_max_attempts=planner_dispatch_max_attempts,
@@ -35765,6 +35996,9 @@ async def _request_plan(
                         "verdict": "planner_visibility_policy_refreshed",
                     })
             planner_io_max_tokens = int(planner_io_policy["max_tokens"])
+            planner_io_output_limit = _saved_planner_output_limit(
+                plan_request_client, planner_io_policy,
+            )
             planner_io_reasoning_effort = str(planner_io_policy["reasoning_effort"])
             saved_planner_io_temperature = planner_io_policy["temperature"]
             if (
@@ -35824,17 +36058,18 @@ async def _request_plan(
             )
             return None
 
-        planner_io_output_limit = (
-            _planner_request_envelope(
+        if (
+            saved_request_io_policy is not None
+            and "request_envelope_receipts" not in saved_request_io_policy
+            and planner_io_stage == "visibility_recovery"
+        ):
+            planner_io_output_limit = _planner_request_envelope(
                 request_kind="planner_visibility_recovery",
                 reasoning_mode="bounded",
                 reasoning_effort=planner_io_reasoning_effort,
                 # Preserve the exact saved allowance on process restart.
                 session_max_tokens_override=planner_io_max_tokens,
             )
-            if planner_io_stage == "visibility_recovery"
-            else planner_io_max_tokens
-        )
 
         async def run_primary_planner_io() -> Any:
             return await _await_with_planner_inflight_heartbeat(
@@ -36138,13 +36373,10 @@ async def _request_plan(
             reasoning_mode="bounded",
             reasoning_effort="none",
         )
-        visibility_max_tokens = await _resolve_planner_output_tokens(
+        visibility_max_tokens, visibility_envelope = await _prepare_planner_output_request(
             plan_request_client,
             visibility_envelope,
-        )
-        visibility_envelope = dataclass_replace(
-            visibility_envelope,
-            session_max_tokens_override=visibility_max_tokens,
+            messages=visibility_messages,
         )
         (
             planner_dispatch_max_attempts,
@@ -36205,6 +36437,7 @@ async def _request_plan(
             material=visibility_messages,
             io_policy=_planner_io_policy_record(
                 max_tokens=visibility_max_tokens,
+                output_limit=visibility_envelope,
                 reasoning_effort=visibility_reasoning_effort,
                 temperature=0.0,
                 provider_dispatch_max_attempts=(planner_dispatch_max_attempts),
@@ -36309,9 +36542,10 @@ async def _request_plan(
                 reasoning_mode="floor",
                 reasoning_effort=planner_reasoning_effort,
             )
-            reasoning_max_tokens = await _resolve_planner_output_tokens(
+            reasoning_max_tokens, reasoning_output_limit = await _prepare_planner_output_request(
                 plan_request_client,
                 reasoning_envelope,
+                messages=reasoning_messages,
             )
             (
                 planner_dispatch_max_attempts,
@@ -36329,7 +36563,7 @@ async def _request_plan(
                         scope="mini_recursive",
                         action_id="mini_recursive_plan_reasoning_recovery",
                         call_kind="chat_raw_json_plan_reasoning_recovery",
-                        max_tokens_override=reasoning_max_tokens,
+                        max_tokens_override=reasoning_output_limit,
                         metadata={
                             **temperature_metadata,
                             "phase": "planner_reasoning_recovery",
@@ -36354,7 +36588,7 @@ async def _request_plan(
                                 temperature_decision.provider_temperature_override()
                             ),
                             reasoning_effort_override=planner_reasoning_effort,
-                            max_tokens_override=reasoning_max_tokens,
+                            max_tokens_override=reasoning_output_limit,
                             deadline=_wall_clock_deadline(
                                 planner_operation_deadline_monotonic
                                 if planner_deadlines_enabled
@@ -36393,6 +36627,7 @@ async def _request_plan(
                 material=reasoning_messages,
                 io_policy=_planner_io_policy_record(
                     max_tokens=reasoning_max_tokens,
+                    output_limit=reasoning_output_limit,
                     reasoning_effort=planner_reasoning_effort,
                     temperature=(temperature_decision.provider_temperature_override()),
                     provider_dispatch_max_attempts=(planner_dispatch_max_attempts),
@@ -36553,15 +36788,10 @@ async def _request_plan(
                     reasoning_mode="bounded",
                     reasoning_effort="none",
                 )
-                visibility_max_tokens = await _resolve_planner_output_tokens(
+                visibility_max_tokens, visibility_envelope = await _prepare_planner_output_request(
                     plan_request_client,
                     visibility_envelope,
-                )
-                # Reasoning resolves per serving leaf, while output admission
-                # and the saved request share one immutable token allowance.
-                visibility_envelope = dataclass_replace(
-                    visibility_envelope,
-                    session_max_tokens_override=visibility_max_tokens,
+                    messages=visibility_messages,
                 )
                 (
                     planner_dispatch_max_attempts,
@@ -36637,6 +36867,7 @@ async def _request_plan(
                     material=visibility_messages,
                     io_policy=_planner_io_policy_record(
                         max_tokens=visibility_max_tokens,
+                        output_limit=visibility_envelope,
                         reasoning_effort=visibility_reasoning_effort,
                         temperature=0.0,
                         provider_dispatch_max_attempts=(planner_dispatch_max_attempts),

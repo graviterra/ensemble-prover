@@ -368,9 +368,8 @@ from .provider_tool_protocol import (
     is_deepseek_client,
     mini_bounded_visible_output_reasoning_effort,
     mini_deepseek_v4_model,
-    mini_gpt6_model,
-    mini_qwen_mandatory_reasoning_model,
-    mini_model_output_capacity,
+    mini_model_token_defaults,
+    mini_request_envelope_policy,
     mini_visible_output_reasoning_effort,
     preflight_mini_reasoning_contract,
     resolve_final_no_tools_output,
@@ -5998,7 +5997,7 @@ async def run_conversation(
             *,
             messages_for_record: Optional[Sequence[dict]] = None,
             tools_for_cost: Sequence[dict] = (),
-            max_tokens_override: Optional[int] = None,
+            max_tokens_override: Any = None,
         ) -> Any:
             nonlocal llm_retry_count
             nonlocal temperature_call_metadata
@@ -6122,7 +6121,23 @@ async def run_conversation(
                 request_max_tokens_override = (
                     conversation_max_tokens_override
                     if conversation_max_tokens_override > 0
-                    else None
+                    else mini_request_envelope_policy(
+                        work_type="root_repair",
+                    ).for_request(
+                        request_kind=(
+                            "tool_search" if can_call_tools else
+                            "final_no_tools" if use_tools and tools_list else
+                            "proof"
+                        ),
+                        reasoning_mode=(
+                            "bounded" if use_tools and tools_list and not can_call_tools
+                            else "floor"
+                        ),
+                        reasoning_effort=(
+                            MINI_TOOL_REASONING_EFFORT if can_call_tools else
+                            "low" if use_tools and tools_list else ""
+                        ),
+                    )
                 )
                 if can_call_tools:
                     content, tool_calls = await _invoke_llm_with_retry(
@@ -6170,7 +6185,7 @@ async def run_conversation(
                         else None
                     )
                 elif use_tools and tools_list:
-                    finalizer_max_tokens = mini_model_output_capacity(client)
+                    finalizer_max_tokens = request_max_tokens_override
                     if should_use_raw_final_no_tools(client):
                         _increment_dossier_tool_metric(DEEPSEEK_FINAL_RAW_NO_TOOLS_METRIC)
                         raw_final_messages = toolless_final_messages(current_messages)
@@ -12503,36 +12518,10 @@ def _canonical_openrouter_model_id(model: str) -> str:
 def _model_token_defaults(
     model: Optional[str], *, provider: Optional[str] = None,
 ) -> Tuple[Optional[int], int]:
-    """Return (context_window, max_tokens) defaults for a given model name.
-
-    Per-model overrides handle frontier models whose context/output limits
-    differ from the system-wide default of (None, 8192). Unknown models
-    fall through to the safe default.
-
-    DeepSeek-V4: 1,000,000 token context, 384,000 max output tokens.
-    GPT-5.2: 400,000 token context, 128,000 max output tokens.
-    GPT-5.6: 1,050,000 token context, 128,000 max output tokens.
-    """
-    # OpenRouter IDs are namespaced as ``provider/model``. Capability matching
-    # is about the routed model, not the transport namespace.
-    name = _routed_model_name(model)
-    if mini_deepseek_v4_model(
-        str(model or ""), base_url=_PROVIDER_BASE_URLS.get(str(provider or "").lower(), "")
-    ):
-        return 1_000_000, 384_000
-    if name.startswith("gpt-5.2"):
-        return 400_000, 128_000
-    if name.startswith("gpt-5.6"):
-        return 1_050_000, 128_000
-    if mini_qwen_mandatory_reasoning_model(name):
-        # A local completion allowance, including mandatory hidden reasoning.
-        # This is not a claim about the provider context window or maximum.
-        return None, 48_000
-    if mini_gpt6_model(name):
-        # Local default allowance for hidden reasoning plus visible output.
-        # No provider context window or maximum is asserted for this family.
-        return None, 32_768
-    return None, 8192
+    """Return shared model allowances before per-request catalog resolution."""
+    return mini_model_token_defaults(
+        model, base_url=_PROVIDER_BASE_URLS.get(str(provider or "").lower(), ""),
+    )
 
 
 def _model_timeout_default(
@@ -12643,6 +12632,7 @@ def _make_role_cfg(
         temperature=0.6,
         top_p=0.95,
         max_tokens=max_out,
+        model_default_max_tokens=max_out,
         context_window=context_window,
         timeout_s=timeout_f,
     )
