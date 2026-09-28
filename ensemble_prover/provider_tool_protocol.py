@@ -472,7 +472,20 @@ class MiniRequestEnvelopePolicy:
             or getattr(cfg, "base_url", "")
             or ""
         ).strip()
-        if self.reasoning_mode == "bounded":
+        explicit_effort = ""
+        if self.reasoning_mode == "explicit":
+            # A phase-specific operator control is exact. The concrete
+            # provider must reject unsupported controls rather than silently
+            # replacing an explicit off/effort request with another mode.
+            explicit_effort = mini_reasoning_effort(
+                SimpleNamespace(cfg=SimpleNamespace(
+                    model=model, base_url=base_url,
+                    reasoning_effort=self.reasoning_effort,
+                )),
+                minimum="",
+            )
+            effective_effort = explicit_effort
+        elif self.reasoning_mode == "bounded":
             effective_effort = mini_bounded_visible_output_reasoning_effort(
                 client,
                 effort=self.reasoning_effort or "low",
@@ -613,6 +626,19 @@ class MiniRequestEnvelopePolicy:
                             "OpenRouter reasoning capability is temporarily "
                             f"unavailable for model={model}"
                         ) from exc
+        if (
+            self.reasoning_mode == "explicit"
+            and explicit_effort == "max"
+            and mini_deepseek_v4_model(model, base_url=base_url)
+            and capability is not None
+            and "xhigh" in capability.supported_efforts
+            and "max" not in capability.supported_efforts
+        ):
+            # Mini's strongest-effort alias is named xhigh by these DeepSeek routes.
+            # Do not extend this equivalence to a weaker advertised high.
+            explicit_effort = "xhigh"
+            if effective_effort == "max":
+                effective_effort = explicit_effort
         capability_record = (
             capability.to_record() if capability is not None else {}
         )
@@ -648,6 +674,16 @@ class MiniRequestEnvelopePolicy:
                 capability=capability,
             )
         )
+        if (
+            self.reasoning_mode == "explicit"
+            and effective_effort != explicit_effort
+        ):
+            from .models import ProviderCapabilityError
+
+            raise ProviderCapabilityError(
+                "explicit Mini reasoning effort cannot be honored by the "
+                f"provider: requested={self.reasoning_effort!r}, model={model}"
+            )
         body = {
             "schema_version": _MINI_REQUEST_ENVELOPE_SCHEMA_VERSION,
             "model": model,
@@ -1180,7 +1216,9 @@ def _resolve_mini_reasoning_transport_control(
             budget = min(budget, max(1, int(output_tokens) - 1))
             return effort or "medium", {"reasoning": {"max_tokens": budget}}
         if transport_mode in {"mandatory", "advertised_effort"}:
-            if transport_mode == "mandatory" and _strict_reasoning_on(cfg):
+            if transport_mode == "mandatory" and (
+                _strict_reasoning_on(cfg) or effort not in {"", "none"}
+            ):
                 selected, _relation = _advertised_reasoning_effort_resolution(
                     effort,
                     capability,
@@ -1220,7 +1258,9 @@ def _resolve_mini_reasoning_transport_control(
                 f"OpenRouter model={model}"
             )
         return effort, {}
-    if transport_mode == "mandatory" and _strict_reasoning_on(cfg):
+    if transport_mode == "mandatory" and (
+        _strict_reasoning_on(cfg) or effort not in {"", "none"}
+    ):
         selected, _relation = _advertised_reasoning_effort_resolution(
             effort,
             capability,

@@ -1387,6 +1387,12 @@ CLI.
 `--formal-state-search-backtrack-limit`,
 `--formal-state-search-max-no-improvement-quanta`
 
+Formal-state search inherits the selected provider's output capacity and reasoning
+settings by default. Set `--formal-state-search-provider-max-tokens` to a positive
+number to impose a phase-specific output limit; `0` selects automatic capacity.
+Use `--formal-state-search-provider-reasoning-effort auto` to inherit the role's
+reasoning setting. Explicit reasoning settings must be supported by the provider.
+
 ### Falsification and verified caches
 
 `--mini-falsification`, `--no-mini-falsification`,

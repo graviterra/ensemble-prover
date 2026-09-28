@@ -13644,16 +13644,18 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_MAX_TOKENS,
         help=(
-            "Maximum output tokens reserved and sent for one compact tactic "
-            "policy generation (default: %(default)s)."
+            "Output limit for goal-conditioned tactic generation. Zero uses "
+            "each serving model's full configured capacity; positive values "
+            "are explicit limits (default: %(default)s)."
         ),
     )
     p.add_argument(
         "--formal-state-search-provider-reasoning-effort",
         default=DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT,
         help=(
-            "Reasoning-effort override for compact formal tactic policy "
-            "generation (default: %(default)s)."
+            "Reasoning effort for goal-conditioned tactic generation. Auto "
+            "inherits each serving model's role policy; explicit supported "
+            "efforts are preserved (default: %(default)s)."
         ),
     )
     p.add_argument(

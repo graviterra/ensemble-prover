@@ -49,6 +49,11 @@ from .mini_runtime_defaults import (
 from .mini_tactic_closer import generate_tactic_candidates
 from .mini_prompt_support import tactic_gen_multi_messages
 from .proof_dossier import is_answer_unsafe_statement_text
+from .provider_tool_protocol import (
+    MiniRequestEnvelopePolicy,
+    mini_model_context_window,
+    resolve_mini_request_envelopes,
+)
 from .runtime_context import (
     hard_timeout_writeback_allowed,
     mark_runtime_owned_callback,
@@ -70,12 +75,8 @@ from .tactic_tree import (
 )
 
 
-# Formal-state policy calls produce a handful of short Lean tactics, not a
-# proof narrative.  Giving this phase the prover role's full completion and
-# hidden-reasoning budget can turn one 120-second search quantum into a
-# multi-minute generation which contains no executable tactic.  These are
-# independent capability bounds; planning and ordinary proof authoring retain
-# their configured model budgets.
+# Formal-state requests retain their own dispatch ownership and search quantum
+# while using the same per-model output and reasoning envelopes as proof work.
 _PROVIDER_LOCKS: "weakref.WeakKeyDictionary[Any, weakref.WeakKeyDictionary[Any, asyncio.Lock]]" = (
     weakref.WeakKeyDictionary()
 )
@@ -169,9 +170,23 @@ def _formal_policy_provider_configs(client: Any) -> List[Any]:
 
 
 def _formal_policy_provider_max_tokens(client: Any, configured_cap: int) -> int:
-    """Return the operator-owned formal-policy cap without silent expansion."""
+    """Retain a positive operator cap or the zero marker for model capacity."""
 
-    return max(1, int(configured_cap or 1))
+    return max(0, int(configured_cap or 0))
+
+
+def _formal_policy_request_envelope(cfg: FormalStateSearchConfig) -> MiniRequestEnvelopePolicy:
+    """Resolve automatic controls per serving leaf without changing role cfg."""
+
+    effort = str(cfg.provider_reasoning_effort or "auto").strip().lower()
+    automatic_reasoning = effort in {"auto", "provider-default"}
+    return MiniRequestEnvelopePolicy(
+        work_type="formal_state_search",
+        request_kind="tactic_generation",
+        session_max_tokens_override=cfg.provider_max_tokens or None,
+        reasoning_mode="floor" if automatic_reasoning else "explicit",
+        reasoning_effort="" if automatic_reasoning else effort,
+    )
 
 
 def _formal_policy_has_mandatory_unbounded_reasoning(client: Any) -> bool:
@@ -892,9 +907,9 @@ class FormalStateSearchConfig:
 
     ``operation_timeout_s`` is an optional in-flight Lean asyncio bound.
     Zero waits for the live check; the search quantum still yields between
-    steps via ``total_timeout_s``. Tactic generation has its own output,
-    reasoning, and wall-clock bounds because it is a compact structured phase;
-    it must not inherit an arbitrary proof-authoring completion budget.
+    steps via ``total_timeout_s``. Tactic generation inherits the serving
+    model's output capacity and configured reasoning unless the operator sets
+    a positive output cap or an explicit phase-specific reasoning effort.
     """
 
     enabled: bool = True
@@ -948,7 +963,7 @@ class FormalStateSearchConfig:
             operation_timeout_s=operation,
             provider_timeout_s=provider,
             provider_max_tokens=max(
-                1,
+                0,
                 int(
                     self.provider_max_tokens
                     or DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_MAX_TOKENS
@@ -1267,11 +1282,24 @@ def _formal_policy_identity(client: Any, cfg: FormalStateSearchConfig) -> str:
                 "max_tokens": int(
                     getattr(provider_cfg, "max_tokens", 0) or 0
                 ),
+                "conversation_max_tokens_override": int(
+                    getattr(provider_cfg, "conversation_max_tokens_override", 0) or 0
+                ),
+                "model_default_max_tokens": int(
+                    getattr(provider_cfg, "model_default_max_tokens", 0) or 0
+                ),
+                "context_window": mini_model_context_window(provider_cfg),
                 "reasoning_effort": str(
                     getattr(provider_cfg, "reasoning_effort", "") or ""
                 ),
                 "thinking_enabled": bool(
                     getattr(provider_cfg, "thinking_enabled", False)
+                ),
+                "reasoning_control_required": bool(
+                    getattr(provider_cfg, "reasoning_control_required", False)
+                ),
+                "reasoning_requested_mode": str(
+                    getattr(provider_cfg, "reasoning_requested_mode", "") or ""
                 ),
             }
         )
@@ -1284,6 +1312,7 @@ def _formal_policy_identity(client: Any, cfg: FormalStateSearchConfig) -> str:
             }
         )
     payload = {
+        "request_envelope_schema": 1,
         "targets": targets,
         "provider_timeout_s": float(cfg.provider_timeout_s),
         "provider_max_tokens": int(cfg.provider_max_tokens),
@@ -1419,9 +1448,10 @@ async def run_goal_conditioned_formal_search(
         client,
         cfg.provider_max_tokens,
     )
+    provider_output_policy = _formal_policy_request_envelope(cfg)
     mandatory_reasoning_lane_disabled = bool(
         _formal_policy_has_mandatory_unbounded_reasoning(client)
-        and int(cfg.provider_max_tokens)
+        and 0 < int(cfg.provider_max_tokens)
         < _MANDATORY_REASONING_EXPLICIT_MIN_TOKENS
     )
     goals = list(initial_goals)
@@ -1658,8 +1688,11 @@ async def run_goal_conditioned_formal_search(
                 messages,
                 usage_callback=usage_callback,
                 temperature_override=cfg.model_temperature,
-                max_tokens_override=provider_max_tokens,
-                reasoning_effort_override=cfg.provider_reasoning_effort,
+                max_tokens_override=provider_output_policy,
+                reasoning_effort_override=(
+                    None if cfg.provider_reasoning_effort in {"auto", "provider-default"}
+                    else cfg.provider_reasoning_effort
+                ),
                 request_timeout_override_s=cfg.provider_timeout_s,
                 operation_timeout_override_s=cfg.provider_timeout_s,
                 required_keywords=(
@@ -1671,6 +1704,9 @@ async def run_goal_conditioned_formal_search(
             )
 
         async def call_provider() -> Any:
+            receipts = await resolve_mini_request_envelopes(
+                client, provider_output_policy, messages=messages,
+            )
             with provider_dispatch_observer(persist_policy_dispatch):
                 return await metered_or_plain_call(
                     cost_controller=cost_controller,
@@ -1683,7 +1719,7 @@ async def run_goal_conditioned_formal_search(
                     # Cost admission and the transport must use the same cap.
                     # Requiring the client keyword above prevents silent
                     # under-reservation if an adapter lacks phase controls.
-                    max_tokens_override=provider_max_tokens,
+                    max_tokens_override=provider_output_policy,
                     candidate_count=cfg.max_candidates_per_state,
                     metadata={
                         "formal_state_search": True,
@@ -1693,8 +1729,9 @@ async def run_goal_conditioned_formal_search(
                             cfg.provider_timeout_s
                         ),
                         "formal_policy_provider_max_tokens": int(
-                            provider_max_tokens
+                            max(receipt.max_output_tokens for receipt in receipts)
                         ),
+                        "formal_policy_configured_max_tokens": provider_max_tokens,
                         "formal_policy_reasoning_effort": str(
                             cfg.provider_reasoning_effort
                         ),
