@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from .model import THEORY_POLICY_VERSION
+from .promotion_context import LEAN_IDENTIFIER_CONTINUATION, _mask_lean_noncode
 
 
 _FORBIDDEN_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_'])\b(?:sorry|admit)\b")
@@ -19,83 +20,49 @@ _EXECUTABLE_META_RE = re.compile(
     r"(?<![A-Za-z0-9_'])\b(?:run_tac|run_term_elab|elabTermEnsuringType)\b"
 )
 _DIRECTIVE_RE = re.compile(r"(?<![A-Za-z0-9_'])#[A-Za-z_][A-Za-z0-9_']*")
+_TOKEN_START = rf"(?<![{LEAN_IDENTIFIER_CONTINUATION}.`])"
+_TOKEN_END = rf"(?![{LEAN_IDENTIFIER_CONTINUATION}.])"
 _HIDDEN_DECLARATION_RE = re.compile(
-    r"(?m)^\s*(?:@\[[^\]]*\]\s*)*(?:private|local)\s+"
-    r"(?:noncomputable\s+)?(?:def|abbrev|structure|class|inductive|instance|theorem|lemma)\b"
+    _TOKEN_START + r"(?:private|local)\s+"
+    r"(?:noncomputable\s+)?(?:def|abbrev|structure|class|inductive|instance|theorem|lemma)"
+    + _TOKEN_END
 )
 _ANONYMOUS_INSTANCE_RE = re.compile(
-    r"(?m)^\s*(?:@\[[^\]]*\]\s*)*(?:noncomputable\s+)?instance\s*[:{(\[]"
+    _TOKEN_START + r"instance\s*[:{(\[]"
 )
 _SOLUTION_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_'])putnam_[A-Za-z0-9_']*_solution[A-Za-z0-9_']*",
     re.IGNORECASE,
 )
-_FORBIDDEN_COMMAND_RE = re.compile(
+_COMMAND_PREFIX = (
     r"(?m)^\s*(?:@\[[^\]]*\]\s*)*"
     r"(?:(?:private|protected|noncomputable|partial)\s+)*"
-    r"(?:axiom|constant|unsafe|run_cmd|initialize|builtin_initialize|"
-    r"elab|elab_rules|macro|syntax|declare_syntax_cat|register_option|"
-    r"register_simp_attr|opaque)\b"
 )
+_FORBIDDEN_COMMAND_WORDS = (
+    r"axiom|run_cmd|initialize|builtin_initialize|"
+    r"elab|elab_rules|macro|syntax|declare_syntax_cat|register_option|"
+    r"register_simp_attr|opaque"
+)
+_FORBIDDEN_COMMAND_RE = re.compile(
+    _TOKEN_START + rf"(?:{_FORBIDDEN_COMMAND_WORDS})" + _TOKEN_END
+)
+# `constant` is an ordinary Lean 4 identifier. Preserve the legacy line-head
+# gate without applying it to mathematical terms such as `for x in constant`.
+_LEGACY_CONSTANT_COMMAND_RE = re.compile(_COMMAND_PREFIX + r"constant\b")
 _PARTIAL_DECLARATION_RE = re.compile(
-    r"(?m)^\s*(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|noncomputable)\s+)*"
-    r"partial\s+(?:def|abbrev|theorem|lemma)\b"
+    _TOKEN_START + r"partial\s+(?:def|abbrev|theorem|lemma)" + _TOKEN_END
+)
+_UNSAFE_DECLARATION_RE = re.compile(
+    _TOKEN_START + r"unsafe\s+(?:(?:private|protected|noncomputable|partial)\s+)*"
+    r"(?:def|abbrev|instance|theorem|lemma|example|opaque|axiom|irreducible_def)"
+    + _TOKEN_END
 )
 _IMPORT_RE = re.compile(r"(?m)^\s*import\s+([^\s]+)\s*$")
+_QUOTED_IDENTIFIER_RE = re.compile(r"«[^»\r\n]+»")
 
 
 def _strip_comments_and_strings(source: str) -> str:
-    text = str(source or "")
-    out: list[str] = []
-    index = 0
-    block_depth = 0
-    in_string = False
-    while index < len(text):
-        if block_depth:
-            if text.startswith("/-", index):
-                block_depth += 1
-                index += 2
-                continue
-            if text.startswith("-/", index):
-                block_depth -= 1
-                index += 2
-                continue
-            out.append("\n" if text[index] == "\n" else " ")
-            index += 1
-            continue
-        if in_string:
-            char = text[index]
-            out.append("\n" if char == "\n" else " ")
-            if char == "\\" and index + 1 < len(text):
-                out.append(" ")
-                index += 2
-                continue
-            if char == '"':
-                in_string = False
-            index += 1
-            continue
-        if text.startswith("--", index):
-            newline = text.find("\n", index + 2)
-            if newline < 0:
-                out.extend(" " for _ in text[index:])
-                break
-            out.extend(" " for _ in text[index:newline])
-            out.append("\n")
-            index = newline + 1
-            continue
-        if text.startswith("/-", index):
-            block_depth = 1
-            out.extend((" ", " "))
-            index += 2
-            continue
-        if text[index] == '"':
-            in_string = True
-            out.append(" ")
-            index += 1
-            continue
-        out.append(text[index])
-        index += 1
-    return "".join(out)
+    return _mask_lean_noncode(source)
 
 
 @dataclass(frozen=True)
@@ -120,23 +87,33 @@ class TheoryPolicy:
 
     def evaluate(self, source: str, *, declared_imports: Iterable[str] = ()) -> TheoryPolicyVerdict:
         raw = str(source or "")
-        clean = _strip_comments_and_strings(raw)
+        lexical = _strip_comments_and_strings(raw)
+        clean = _QUOTED_IDENTIFIER_RE.sub(" q ", lexical)
+        # Reserved command heads can follow arbitrary same-line commands, not
+        # just `in` wrappers. Syntax quotations are command data; meta execution
+        # checks still inspect `clean`, including quotation antiquotations.
+        commands = _mask_lean_noncode(clean, mask_syntax_quotations=True)
         reasons: list[str] = []
         if not clean.strip():
             reasons.append("empty_source")
         if _FORBIDDEN_TOKEN_RE.search(clean):
             reasons.append("proof_placeholder")
-        if _FORBIDDEN_COMMAND_RE.search(clean) or _PARTIAL_DECLARATION_RE.search(clean):
+        if (
+            _FORBIDDEN_COMMAND_RE.search(commands)
+            or _LEGACY_CONSTANT_COMMAND_RE.search(clean)
+            or _PARTIAL_DECLARATION_RE.search(commands)
+            or _UNSAFE_DECLARATION_RE.search(commands)
+        ):
             reasons.append("forbidden_command")
         if _EXECUTABLE_META_RE.search(clean) or _DIRECTIVE_RE.search(clean):
             reasons.append("executable_meta_command")
-        if _HIDDEN_DECLARATION_RE.search(clean):
+        if _HIDDEN_DECLARATION_RE.search(commands):
             reasons.append("hidden_declaration")
-        if _ANONYMOUS_INSTANCE_RE.search(clean):
+        if _ANONYMOUS_INSTANCE_RE.search(commands):
             reasons.append("anonymous_instance_not_auditable")
-        if _SOLUTION_TOKEN_RE.search(clean):
+        if _SOLUTION_TOKEN_RE.search(lexical):
             reasons.append("answer_placeholder_reference")
-        imports = tuple(dict.fromkeys(match.group(1).strip() for match in _IMPORT_RE.finditer(clean)))
+        imports = tuple(dict.fromkeys(match.group(1).strip() for match in _IMPORT_RE.finditer(lexical)))
         declared = tuple(
             dict.fromkeys(str(item or "").strip() for item in declared_imports if str(item or "").strip())
         )

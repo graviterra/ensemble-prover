@@ -112,6 +112,7 @@ from .llm_error_policy import (
     ProviderAccountUnavailable,
     ProviderTransportUnavailable,
     is_resumable_provider_failure,
+    is_provider_infrastructure_failure,
     classify_llm_exception,
     is_terminal_llm_failure_reason,
     llm_failure_scope,
@@ -126,6 +127,7 @@ from .llm_usage import (
     reservation_pricing_targets,
 )
 from .models import (
+    provider_serving_fingerprint,
     message_reasoning_text,
     provider_defer_record_from_exception,
     response_output_items,
@@ -6423,6 +6425,95 @@ def _planner_provider_lane_fingerprint(client: Any) -> str:
             separators=(",", ":"),
         )
     )
+
+
+# A provider refusal is temporary operational evidence, not lost mathematical
+# capability. A fresh worker may observe repaired credentials/account state,
+# and a long-running worker periodically probes again under its existing budget.
+_PLANNER_ESCALATION_WORKER_GENERATION = secrets.token_hex(16)
+_PLANNER_ESCALATION_COOLDOWN_S = 300.0
+
+
+def _planner_escalation_retry_at(value: Any) -> float:
+    if type(value) not in {int, float}:
+        return 0.0
+    try:
+        retry_at = float(value)
+    except OverflowError:
+        return 0.0
+    now = time.time()
+    if not math.isfinite(retry_at) or not now < retry_at <= now + _PLANNER_ESCALATION_COOLDOWN_S:
+        return 0.0
+    return retry_at
+
+
+def _planner_escalation_configuration_fingerprint(client: Any) -> str:
+    """Bind an unavailable premium lane to its configuration, including key rotation.
+
+    Reuse the installation-keyed serving identity so checkpoints neither
+    expose credentials nor provide an offline credential-guessing verifier.
+    """
+
+    if client is None:
+        return ""
+    configurations = []
+    for candidate in _planner_provider_candidates(client):
+        cfg = getattr(candidate, "cfg", None)
+        configurations.append({
+            "lane": _planner_provider_lane_fingerprint(candidate),
+            "serving_identity": provider_serving_fingerprint(cfg or candidate),
+            "max_tokens": str(getattr(cfg, "max_tokens", "") or ""),
+        })
+    return text_hash(json.dumps({
+        "worker_generation": _PLANNER_ESCALATION_WORKER_GENERATION,
+        "configurations": configurations,
+    }, sort_keys=True, separators=(",", ":")))
+
+
+def merge_planner_escalation_failure_state(
+    shared: dict[str, float], restored: Mapping[str, Any],
+) -> None:
+    """Retain newer live cooldowns when a saved child or sample is rebound."""
+
+    merged: dict[str, float] = {}
+    for source in (shared, restored):
+        for identity, value in source.items():
+            retry_at = _planner_escalation_retry_at(value)
+            if isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{16}", identity) and retry_at:
+                merged[identity] = max(merged.get(identity, 0.0), retry_at)
+    shared.clear()
+    shared.update(merged)
+
+
+def planner_escalation_state_for_session(session: Any) -> dict[str, float]:
+    """Share durable provider receipts only within this session's attempt tree.
+
+    Restored children have independent JSON dictionaries. Merge their receipts
+    into the live ancestor before a new recursive call so retiring the child's
+    planner cursor cannot erase an unavailable-provider observation.
+    """
+
+    lineage = []
+    seen: set[int] = set()
+    current = session
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        lineage.append(current)
+        current = getattr(current, "parent", None)
+    state: dict[str, float] = {}
+    for owner in reversed(lineage):
+        saved = getattr(owner, "planner_escalation_failure_state", None)
+        if isinstance(saved, dict):
+            merge_planner_escalation_failure_state(state, saved)
+    # Keep the ancestor's dictionary identity stable for already active calls.
+    shared = getattr(lineage[-1], "planner_escalation_failure_state", None)
+    if not isinstance(shared, dict):
+        shared = {}
+    shared.clear()
+    shared.update(state)
+    for owner in lineage:
+        owner.planner_escalation_failure_state = shared
+    return shared
 
 
 def _planner_provider_lane_matches(client: Any, fingerprint: str) -> bool:
@@ -17580,6 +17671,7 @@ async def run_mini_recursive_attempt(
     prover_client: Any,
     refiner_client: Any,
     planner_escalation_client: Any = None,
+    planner_escalation_failure_state: Optional[dict[str, float]] = None,
     lean: Any,
     llm_preamble: str,
     lean_preamble: Optional[str] = None,
@@ -17652,6 +17744,8 @@ async def run_mini_recursive_attempt(
     """
 
     cfg = config or MiniRecursiveConfig()
+    if planner_escalation_failure_state is None:
+        planner_escalation_failure_state = {}
     # A recursive child needs the admitted planner policy/capability to
     # decompose its own obligations. Legacy callbacks may predate these
     # optional keywords; never retry a callback after a runtime TypeError.
@@ -17660,6 +17754,7 @@ async def run_mini_recursive_attempt(
         for key, value in (
             ("config", cfg),
             ("planner_escalation_client", planner_escalation_client),
+            ("planner_escalation_failure_state", planner_escalation_failure_state),
         )
         if _callable_accepts_keyword(run_conversation_fn, key)
     }
@@ -20515,6 +20610,7 @@ async def run_mini_recursive_attempt(
             lean_signature=lean_signature,
             client=prover_client,
             planner_escalation_client=planner_escalation_client,
+            planner_escalation_failure_state=planner_escalation_failure_state,
             prove_root_close=(prove_root_close if llm_root_close_enabled else None),
             lean=lean,
             answer_safe_preamble=answer_safe_preamble,
@@ -21056,6 +21152,7 @@ async def run_mini_recursive_driver(
     # degenerate (empty/unparseable) planning response; see
     # MiniRecursiveConfig.planner_escalation_max_calls.
     planner_escalation_client: Any = None,
+    planner_escalation_failure_state: Optional[dict[str, float]] = None,
     lean: Any,
     answer_safe_preamble: str,
     get_helpers: GetHelpersFn,
@@ -21753,6 +21850,27 @@ async def run_mini_recursive_driver(
     empty_planner_degeneracy_reason = str(
         resume_frame.get("empty_planner_degeneracy_reason") or ""
     ).strip()
+    planner_escalation_identity = _planner_escalation_configuration_fingerprint(
+        planner_escalation_client
+    )
+    saved_escalation_identity = str(
+        resume_frame.get("planner_escalation_disabled_fingerprint") or ""
+    )
+    planner_escalation_retry_at = max(
+        _planner_escalation_retry_at(
+            resume_frame.get("planner_escalation_retry_at_epoch_s")
+        ) if saved_escalation_identity == planner_escalation_identity else 0.0,
+        _planner_escalation_retry_at(
+            planner_escalation_failure_state.get(planner_escalation_identity)
+        ) if planner_escalation_failure_state is not None else 0.0,
+    )
+    planner_escalation_disabled = bool(planner_escalation_retry_at)
+    # Migrate a saved active-driver cooldown before its cursor retires. Legacy
+    # permanent booleans have no bounded lease and deliberately reopen.
+    if planner_escalation_retry_at and planner_escalation_failure_state is not None:
+        planner_escalation_failure_state[planner_escalation_identity] = (
+            planner_escalation_retry_at
+        )
     resumed_last_pass_lacked_root_route = bool(
         resume_frame.get("last_pass_lacked_root_route") or False
     )
@@ -22437,6 +22555,11 @@ async def run_mini_recursive_driver(
             "empty_planner_streak": int(empty_planner_streak),
             "empty_planner_degeneracy_reason": (empty_planner_degeneracy_reason),
             "last_pass_lacked_root_route": bool(last_pass_lacked_root_route),
+            "planner_escalation_disabled_fingerprint": (
+                planner_escalation_identity
+                if planner_escalation_retry_at else ""
+            ),
+            "planner_escalation_retry_at_epoch_s": planner_escalation_retry_at,
             "helper_only_last_granted_frontier_key": (
                 helper_only_last_granted_frontier_key
             ),
@@ -24587,12 +24710,6 @@ async def run_mini_recursive_driver(
         )
         return result
 
-    # Set when an escalated planner call fails TERMINALLY (auth/quota): no
-    # further premium attempts this invocation — every retry stays on the
-    # main planner. Deliberately not persisted: a resumed invocation may
-    # retry once (the key could have been rotated), and the fallback keeps
-    # even that retry harmless.
-    planner_escalation_disabled = False
     # Set when the previous non-resume pass compiled claims but ended with NO
     # root route (schema-missing root_assembly OR every root claim filtered):
     # putnam_1975_a1 proved BOTH directions of its iff as helpers yet died of
@@ -24604,6 +24721,20 @@ async def run_mini_recursive_driver(
     # exactly the deployment that produced the motivating failure.
     last_pass_lacked_root_route = resumed_last_pass_lacked_root_route
     while pass_index <= passes:
+        # Sibling planners can refresh a shared lease while this driver is
+        # doing mathematical work. Observe that newer refusal before reopening.
+        shared_retry_at = _planner_escalation_retry_at(
+            planner_escalation_failure_state.get(planner_escalation_identity)
+        ) if planner_escalation_failure_state is not None else 0.0
+        local_retry_at = _planner_escalation_retry_at(planner_escalation_retry_at)
+        if shared_retry_at or local_retry_at:
+            planner_escalation_retry_at = max(local_retry_at, shared_retry_at)
+            planner_escalation_disabled = True
+        elif planner_escalation_retry_at:
+            planner_escalation_disabled = False
+            planner_escalation_retry_at = 0.0
+            if planner_escalation_failure_state is not None:
+                planner_escalation_failure_state.pop(planner_escalation_identity, None)
         lean = _live_lean_capability_for_new_work(lean)
         resuming_this_pass = bool(
             resume_frame and int(resume_frame.get("pass_index", 0) or 0) == pass_index
@@ -25188,6 +25319,7 @@ async def run_mini_recursive_driver(
                 and resumed_planner_job_compatible
                 and resumed_planner_job_identity is not None
                 and resumed_planner_job_identity.stage != "deliberation"
+                and not planner_escalation_disabled
                 and planner_escalation_client is not None
                 and _planner_provider_lane_matches(
                     planner_escalation_client,
@@ -25678,8 +25810,8 @@ async def run_mini_recursive_driver(
                 # response). A premium-lane failure must never consume the
                 # cheap planner's recovery retry, manufacture a spurious
                 # empty-planner fixed point, or terminally abort the run:
-                # disable escalation for the rest of this invocation on
-                # terminal failures, then retry this same pass once with the
+                # disable this configured escalation lane on terminal
+                # failures, then retry this same pass once with the
                 # main planner (pre-escalation behavior).
                 escalated_failure_reason = ""
                 if int(stats.planner_call_failures or 0) > planner_call_failures_before:
@@ -25690,6 +25822,15 @@ async def run_mini_recursive_driver(
                     escalated_failure_reason
                 ):
                     planner_escalation_disabled = True
+                    if (is_provider_infrastructure_failure(escalated_failure_reason)
+                            and escalated_failure_reason != "provider_transport_unavailable"):
+                        planner_escalation_retry_at = (
+                            time.time() + _PLANNER_ESCALATION_COOLDOWN_S
+                        )
+                        if planner_escalation_failure_state is not None:
+                            planner_escalation_failure_state[
+                                planner_escalation_identity
+                            ] = planner_escalation_retry_at
                 _record(
                     record_event,
                     {

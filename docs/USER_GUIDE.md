@@ -333,12 +333,41 @@ The full answer and proof plan are saved and handed to ordinary Mini proof searc
 Source and model text are not silently truncated; oversized or incomplete
 responses stop rather than becoming partial candidates.
 
-`--answer-attempts` bounds proposal/interpretation/type repairs (default 3).
-In this first frontend, **one admitted candidate enters proof search**; a failed
-proof does not automatically start a search for a different answer. Failure to
-prove it is not evidence that the answer is false. The model review assesses
-answer form, not mathematical truth or novelty; only Lean verification can
-establish the instantiated theorem.
+`--answer-attempts` bounds proposal, review, and admission repairs (default 3).
+Review asks for an independent numerical check or a discriminating example, and
+a bounded Lean refutation probe can reject a false candidate before proof search.
+These checks do not establish the answer: only a verified proof establishes the
+instantiated theorem. **One admitted candidate enters proof search.** A failed
+proof does not automatically start another answer search, and failure to prove
+a candidate is not evidence that it is false.
+
+When proof search finishes with an audited Lean certificate refuting the exact
+candidate, request a new answer generation explicitly:
+
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover \
+  --rediscover-from runs/question-answer/proof \
+  --answer-attempts 3 \
+  --output-dir runs/question-answer-corrected
+```
+
+Rediscovery checks the original question and candidate receipts, replays the
+negation and its axiom audit, and supplies that refutation to answer discovery.
+It rejects the identical recorded answer and preserves the original artifacts.
+It restores
+saved provider and search settings, deducts prior proof usage from the remaining
+cost and time allowances, and then accounts for the new preparation normally.
+The no-strong-progress allowance is an inactivity window, so certified refutation
+renews it instead of deducting the whole productive run. Preparation is bounded
+by that window; completing candidate admission starts proof search with the full
+window. Cumulative worker, run-time, and cost limits remain debited across phases.
+Exhausted budgets, incomplete cost accounting under a dollar cap, changed source,
+and interrupted or uncertified prior attempts prevent this handoff. Enabled cumulative
+time limits also require a completed checkpoint clock receipt. For a candidate refuted
+after checkpoint resume, use its latest completed generation; rediscovery checks
+its predecessor chain and deducts the cumulative worker time. Use a fresh output
+directory. For Putnam candidates, pass the proof output directory itself to
+`--rediscover-from`, as with checkpoint resume.
 
 Proposal and review use your prover/provider/reasoning settings. Their usage is
 recorded, and their time and cost are deducted from enabled global run limits
@@ -793,6 +822,15 @@ bundles under `~/.cache/mini_prover/theory`.
 bundle identifiers. Use `--mini-theory-promote-verified-helpers` only when you
 intend generic verified helpers to be recompiled and published into the
 persistent store.
+
+A `promotion_context_recapture_required` diagnostic marks a historical receipt
+whose captured Lean context cannot be reused. Resume the originating run with
+helper promotion enabled to capture the original context again and independently
+verify a new receipt. Historical receipts can remain deferred, including in the
+pending count, after the new receipt publishes; they do not trigger compilation
+retries. Older incompatible bundles remain unavailable for reuse. If the
+originating session is unavailable, the helper must be checked and staged again
+in its original theorem context.
 
 ## 10. Terminal output and run files
 

@@ -646,7 +646,9 @@ async def check_negation_proof_in_feedback_world(
         )
     if error_kind:
         return False, True, f"visible Lean replay infrastructure failed: {output}"[:500]
-    return ok, False, ("" if ok else "Lean rejected the prompt-visible negation")
+    return ok, False, (
+        "" if ok else "Lean rejected the prompt-visible negation: " + output[:1500]
+    )
 
 
 def _parse_axioms(output: str, theorem_name: str) -> tuple[str, ...] | None:
@@ -714,10 +716,14 @@ async def _axiom_audit(
         operation_ownership="result_only",
     )
     helper_block = "\n".join(safe_helper_sources(helpers))
+    # An active namespace in the admitted preamble affects the printed
+    # declaration name. Root-qualify only our fresh audit declaration so its
+    # identity is stable while the target/proof keep their original scopes.
+    audit_name = "_root_." + theorem_name
     content = (
         f"{resolved_preamble}\n\n{helper_block}\n\n"
-        f"theorem {theorem_name} : ¬ ({statement}) := {proof}\n\n"
-        f"#print axioms {theorem_name}\n"
+        f"theorem {audit_name} : ¬ ({statement}) := {proof}\n\n"
+        f"#print axioms {audit_name}\n"
     )
     execution, _path, _backend = await invoke_with_strict_deadline(
         execute,
@@ -863,6 +869,7 @@ async def certify_negation_proof_result(
     helpers: Sequence[Any],
     policy: FalsificationPolicy,
     environment_hash: str = "",
+    include_lean_diagnostics: bool = False,
 ) -> CertificationResult:
     """Replay and classify rejection separately from retryable infrastructure.
 
@@ -907,7 +914,10 @@ async def certify_negation_proof_result(
     if not ok:
         return CertificationResult(
             CertificationStatus.DEFINITIVE_REJECTION,
-            reason="Lean rejected the persisted full-negation proof",
+            reason=(
+                "Lean rejected the persisted full-negation proof"
+                + (": " + output[:1500] if include_lean_diagnostics else "")
+            ),
         )
     environment_identity = str(environment_hash or "").strip() or content_hash(
         {"preamble": preamble, "helpers": safe_helper_sources(helpers)}

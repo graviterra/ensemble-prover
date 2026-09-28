@@ -363,6 +363,15 @@ def authoritative_certificate_record_is_valid(data: Any) -> bool:
     return certificate_record_is_valid(data, require_authoritative=True)
 
 
+def _nonnegative_finite_number(value: Any) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(float(value)) and value >= 0
+    except (ValueError, OverflowError):
+        return False
+
+
 def falsification_report_record_is_valid(data: Any) -> bool:
     """Validate the content-addressed envelope used by the durable ledger."""
 
@@ -376,10 +385,7 @@ def falsification_report_record_is_valid(data: Any) -> bool:
     if not (
         re.fullmatch(r"[0-9a-f]{64}", claimed_hash)
         and statement
-        and isinstance(started_at, (int, float))
-        and not isinstance(started_at, bool)
-        and math.isfinite(float(started_at))
-        and float(started_at) >= 0.0
+        and _nonnegative_finite_number(started_at)
         and str(record.get("target_kind") or "") in {item.value for item in TargetKind}
         and str(record.get("outcome") or "")
         in {item.value for item in FalsificationOutcome}
@@ -405,10 +411,7 @@ def falsification_report_record_is_valid(data: Any) -> bool:
             and isinstance(checks_run, int)
             and not isinstance(checks_run, bool)
             and checks_run >= 0
-            and isinstance(elapsed_s, (int, float))
-            and not isinstance(elapsed_s, bool)
-            and math.isfinite(float(elapsed_s))
-            and float(elapsed_s) >= 0.0
+            and _nonnegative_finite_number(elapsed_s)
             and isinstance(finding.get("cursor"), Mapping)
             and isinstance(finding.get("error_kind"), str)
         ):

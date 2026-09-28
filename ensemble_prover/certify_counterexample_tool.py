@@ -175,12 +175,13 @@ async def _run_certify_counterexample_tool_impl(
                 "certify_counterexample infrastructure error: "
                 "independent Lean replay was temporarily unavailable"
             )
-        return (
-            "certify_counterexample rejected. Full negation did not pass "
-            "independent Lean replay and axiom audit."
+        rejection = next(
+            (result.reason for result in reversed(certification_results) if result.reason),
+            "no admissible exact-negation certificate was produced",
         )
+        return "certify_counterexample rejected. " + str(rejection)[:2000]
     return (
-        "certify_counterexample accepted. The active target is authoritatively "
+        "certify_counterexample accepted. The requested target is authoritatively "
         f"refuted. certificate={certificate_hash}; "
         f"terminalized_aliases={len(terminalized)}"
     )

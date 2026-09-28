@@ -143,12 +143,15 @@ def mini_model_output_capacity(client: Any, *, fallback: int = 8192) -> int:
     if configured > 0:
         return configured
     model = str(getattr(cfg, "model", "") or "").strip().lower().rsplit("/", 1)[-1]
-    if model.startswith("deepseek-v4") or mini_deepseek_v4_model(
+    if mini_deepseek_v4_model(
         getattr(cfg, "model", ""), base_url=str(getattr(cfg, "base_url", "") or "")
     ):
         return 384_000
-    if model.startswith("gpt-5.2"):
+    if model.startswith("gpt-5.2") or model.startswith("gpt-5.6"):
         return 128_000
+    if mini_qwen_mandatory_reasoning_model(model):
+        # Local allowance shared with the mandatory-reasoning envelope policy.
+        return _MINI_QWEN_MANDATORY_REASONING_TOTAL_OUTPUT_CAP
     if mini_gpt6_model(model):
         # A local reasoning allowance, not an advertised provider maximum.
         return _MINI_GPT_REASONING_TOTAL_OUTPUT_CAP
@@ -621,7 +624,10 @@ def mini_deepseek_v4_model(model: str, *, base_url: str = "") -> bool:
     capabilities for a third-party route. Keep the HTTP model identity intact.
     """
     name = str(model or "").strip().lower()
-    return name.rsplit("/", 1)[-1].startswith("deepseek-v4-") or (
+    return bool(re.fullmatch(
+        r"deepseek-v4(?:\.[0-9]+)*(?:-[a-z0-9][a-z0-9.-]*)?",
+        name.rsplit("/", 1)[-1],
+    )) or (
         name == "deepseek-flash"
         and base_url_matches_provider(base_url, "deepseek")
     )
@@ -652,9 +658,16 @@ def mini_openrouter_deepseek_v4_explicit_enable_model(model: str) -> bool:
 def _static_openrouter_deepseek_v4_family_capability(
     model: str,
 ) -> Optional[OpenRouterReasoningCapabilities]:
-    """Return the outage-safe DeepSeek v4 contract for any dated snapshot."""
+    """Return the established DeepSeek v4 contract for its dated snapshots.
 
-    if not mini_deepseek_v4_model(model):
+    Recognizing a newer minor version for output headroom does not establish
+    its reasoning controls. Those routes still need live catalog evidence.
+    """
+
+    leaf = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    if not mini_deepseek_v4_model(model) or not (
+        leaf == "deepseek-v4" or leaf.startswith("deepseek-v4-")
+    ):
         return None
     return OpenRouterReasoningCapabilities(
         supports_reasoning=True,
@@ -725,9 +738,15 @@ def _mini_gpt_oss_120b_model(model: str) -> bool:
     return name.startswith("gpt-oss-120b")
 
 
-def _mini_openrouter_mandatory_model(model: str) -> bool:
+def mini_qwen_mandatory_reasoning_model(model: str) -> bool:
+    """Recognize the Qwen routes with a mandatory reasoning envelope."""
+
     name = str(model or "").strip().lower().rsplit("/", 1)[-1]
-    return name.startswith("qwen3.8-max") or _mini_gpt_oss_120b_model(model)
+    return name == "qwen3.8-max" or name.startswith("qwen3.8-max-")
+
+
+def _mini_openrouter_mandatory_model(model: str) -> bool:
+    return mini_qwen_mandatory_reasoning_model(model) or _mini_gpt_oss_120b_model(model)
 
 
 def _positive_int(value: Any) -> int:

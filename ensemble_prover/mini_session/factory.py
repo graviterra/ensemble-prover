@@ -58,8 +58,11 @@ from ..deadline_guard import await_with_strict_deadline
 from ..mini_recursive import (
     PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
     PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S,
+    merge_planner_escalation_failure_state,
 )
 from ..mini_theory.promotion_outbox import PromotionOutbox
+from ..mini_theory.promotion_context import promotion_context_commands
+from ..mini_theory.model import THEORY_POLICY_VERSION
 from ..mini_branching import (
     _GuardedProofCache,
     _GuardedRecorder,
@@ -706,6 +709,16 @@ def _session_theory_promotion_enabled(session: Any) -> bool:
     )
 
 
+def _session_promotion_context(session: Any) -> tuple[str, ...]:
+    conv = getattr(session, "conv", None)
+    return promotion_context_commands(str(
+        getattr(conv, "lean_preamble", None)
+        or getattr(conv, "preamble", "")
+        or getattr(getattr(session, "problem", None), "preamble", "")
+        or ""
+    ))
+
+
 def _session_promotion_metadata(
     session: Any,
     source_dossier: Any = None,
@@ -760,6 +773,7 @@ def _session_promotion_metadata(
             or ""
         ),
         "workspace_id": workspace_id,
+        "context_commands": _session_promotion_context(session),
         "generated_by_run": str(getattr(builder, "generated_by_run", "") or ""),
         "generated_by_model": str(getattr(builder, "generated_by_model", "") or ""),
         # Root provenance lets startup recovery find helpers accepted in a
@@ -781,6 +795,13 @@ def _stage_session_verified_helper(
 
     if not _session_theory_promotion_enabled(session):
         return None
+    try:
+        context_commands = _session_promotion_context(session)
+    except ValueError as exc:
+        return SimpleNamespace(
+            staged=False, entry_id="", diagnostic="promotion_context_unsupported",
+            error_kind=type(exc).__name__, error=str(exc),
+        )
     if not force:
         helper_name = str(getattr(helper, "name", "") or "").strip()
         persisted_fingerprints = dict(
@@ -788,7 +809,7 @@ def _stage_session_verified_helper(
         )
         if helper_name and persisted_fingerprints.get(
             helper_name
-        ) == _helper_promotion_fingerprint(helper):
+        ) == _helper_promotion_fingerprint(helper, context_commands):
             # Workspace publication deliberately revisits every verified
             # helper. Once this exact promotion payload is durable, another
             # callback is neither new authority nor useful telemetry.
@@ -897,7 +918,7 @@ def _stage_session_verified_helper(
             fingerprints = dict(
                 getattr(session, "_theory_promotion_helper_fingerprints", {}) or {}
             )
-            fingerprints[name] = _helper_promotion_fingerprint(helper)
+            fingerprints[name] = _helper_promotion_fingerprint(helper, context_commands)
             session._theory_promotion_helper_fingerprints = fingerprints
             durable_dossier = source_dossier or session.dossier
             durable_fingerprints = dict(
@@ -945,8 +966,14 @@ def _promotion_stage_result_is_settled(result: Any) -> bool:
     )
 
 
-def _helper_promotion_fingerprint(helper: Any) -> tuple[Any, ...]:
+def _helper_promotion_fingerprint(
+    helper: Any, context_commands: Sequence[str] = (),
+) -> tuple[Any, ...]:
     return (
+        # These tuples survive durable session restore. A policy change must
+        # recapture context and restage even when the helper text is unchanged.
+        THEORY_POLICY_VERSION,
+        tuple(context_commands),
         str(getattr(helper, "source_hash", "") or ""),
         str(getattr(helper, "render_policy", "") or ""),
         tuple(
@@ -977,12 +1004,17 @@ def _initialize_promotion_helper_baseline(
 ) -> None:
     """Suppress only inherited helpers already attested durable by a parent."""
 
+    try:
+        context_commands = _session_promotion_context(session)
+    except ValueError:
+        context_commands = ()
+        durable_parent_fingerprints = {}
     helpers = dict(getattr(session.dossier, "verified_helpers", {}) or {})
     durable = dict(durable_parent_fingerprints or {})
     fingerprints = {
-        name: _helper_promotion_fingerprint(helper)
+        name: _helper_promotion_fingerprint(helper, context_commands)
         for name, helper in helpers.items()
-        if durable.get(name) == _helper_promotion_fingerprint(helper)
+        if durable.get(name) == _helper_promotion_fingerprint(helper, context_commands)
     }
     # A copied fingerprint is only a claim until the current configured
     # outbox/root re-attests it. Keep locally persisted receipts separate so
@@ -1003,6 +1035,11 @@ def _stage_all_session_verified_helpers(
         getattr(session, "_theory_promotion_retry_after_monotonic", 0.0) or 0.0
     ):
         return False
+    try:
+        context_commands = _session_promotion_context(session)
+    except ValueError:
+        # This context cannot be promoted safely; proof search remains usable.
+        return True
     all_settled = True
     helpers = dict(getattr(session.dossier, "verified_helpers", {}) or {})
     known = set(
@@ -1029,7 +1066,7 @@ def _stage_all_session_verified_helpers(
     )
     claimed_durable_names: set[str] = set()
     for name, helper in helpers.items():
-        fingerprint = _helper_promotion_fingerprint(helper)
+        fingerprint = _helper_promotion_fingerprint(helper, context_commands)
         if fingerprints.get(name) != fingerprint and (
             inherited_fingerprints.get(name) == fingerprint
             or durable_fingerprints.get(name) == fingerprint
@@ -1046,6 +1083,7 @@ def _stage_all_session_verified_helpers(
                 helpers,
                 domain=str(metadata.get("domain") or ""),
                 imports=tuple(metadata.get("imports") or ()),
+                context_commands=tuple(metadata.get("context_commands") or ()),
                 owner_id=str(metadata.get("owner_id") or ""),
                 workspace_id=str(metadata.get("workspace_id") or ""),
                 source_theorem=str(metadata.get("source_theorem") or ""),
@@ -1067,7 +1105,7 @@ def _stage_all_session_verified_helpers(
         # are not authority across roots, policy changes, or tombstones.
         for name in claimed_durable_names:
             helper = helpers[name]
-            fingerprint = _helper_promotion_fingerprint(helper)
+            fingerprint = _helper_promotion_fingerprint(helper, context_commands)
             if name in attested_names:
                 known.add(name)
                 fingerprints[name] = fingerprint
@@ -1083,7 +1121,7 @@ def _stage_all_session_verified_helpers(
         session._theory_promotion_known_helper_names = known
         session._theory_promotion_helper_fingerprints = fingerprints
     for name, helper in tuple(helpers.items()):
-        if fingerprints.get(name) != _helper_promotion_fingerprint(helper):
+        if fingerprints.get(name) != _helper_promotion_fingerprint(helper, context_commands):
             try:
                 result = _stage_session_verified_helper(session, helper, force=force)
             except Exception:
@@ -1968,6 +2006,7 @@ def build_session_for_prove_problem(
     prover_client: OpenAICompatClient,
     refiner_client: Optional[OpenAICompatClient],
     planner_escalation_client: Optional[OpenAICompatClient] = None,
+    planner_escalation_failure_state: Optional[dict[str, float]] = None,
     lean: LeanRunner,
     max_prove_turns: int,
     max_refine_turns: int,
@@ -2582,6 +2621,8 @@ def build_session_for_prove_problem(
     # degenerate (empty/unparseable) planning response; actions read it via
     # getattr so absence keeps existing behavior.
     session.planner_escalation_client = planner_escalation_client
+    if planner_escalation_failure_state is not None:
+        session.planner_escalation_failure_state = planner_escalation_failure_state
     set_active_bundle_ids = getattr(searcher, "set_active_bundle_ids", None)
     if callable(set_active_bundle_ids):
         set_active_bundle_ids(session.theory_imported_bundle_ids)
@@ -3429,6 +3470,7 @@ async def prove_problem_via_session(
         field="falsification_engine_timeout_s",
     )
     checkpoint_registry = kwargs.pop("checkpoint_registry", None)
+    attempt_escalation_failure_state: dict[str, float] = {}
     def _saved_outer_phase(name: str) -> Any:
         if checkpoint_registry is None:
             return None
@@ -4473,6 +4515,7 @@ async def prove_problem_via_session(
                 prover_client=prover_client,
                 refiner_client=kwargs.get("refiner_client"),
                 planner_escalation_client=kwargs.get("planner_escalation_client"),
+                planner_escalation_failure_state=attempt_escalation_failure_state,
                 lean=lean,
                 llm_preamble=llm_preamble,
                 lean_preamble=lean_preamble,
@@ -4813,6 +4856,7 @@ async def prove_problem_via_session(
             for key in ("parallel_late_sample_grace_s",):
                 container_kwargs.pop(key, None)
             _strip_startup_root_fast_lane_session_kwargs(container_kwargs)
+            container_kwargs["planner_escalation_failure_state"] = attempt_escalation_failure_state
             container = build_session_for_prove_problem(**container_kwargs)
             if str(getattr(container.conv, "preamble", "") or "") != str(
                 post_fanin_llm_preamble
@@ -4896,6 +4940,8 @@ async def prove_problem_via_session(
             container = _build_post_fanin_recursive_session()
             if checkpoint_registry is not None:
                 await checkpoint_registry.bind_session("parallel_fanin_recursive", container)
+            merge_planner_escalation_failure_state(attempt_escalation_failure_state, container.planner_escalation_failure_state)
+            container.planner_escalation_failure_state = attempt_escalation_failure_state
             try:
                 ok, proof = await container.run()
             finally:
@@ -5121,6 +5167,7 @@ async def prove_problem_via_session(
             # startup lane, but sample construction still drops the knobs
             # locally so a future caller that reintroduces them cannot crash.
             _strip_startup_root_fast_lane_session_kwargs(session_kwargs)
+            session_kwargs["planner_escalation_failure_state"] = attempt_escalation_failure_state
             session = build_session_for_prove_problem(**session_kwargs)
             # The builder may clone the supplied dossier. Register the exact
             # object MiniSession will mutate before its first awaited action.
@@ -5147,6 +5194,8 @@ async def prove_problem_via_session(
                 # Restore overwrites this freshly constructed transcript;
                 # appending afterward would duplicate saved premise input.
                 await checkpoint_registry.bind_session(f"sample:{sample_index}", session)
+            merge_planner_escalation_failure_state(attempt_escalation_failure_state, session.planner_escalation_failure_state)
+            session.planner_escalation_failure_state = attempt_escalation_failure_state
             if sample_count > 1:
                 # Fresh restore replaces dossier runtime hooks. Rebind only
                 # after it has restored this generation's reporting owner.
@@ -7003,6 +7052,13 @@ async def _mini_session_run_conversation_callback(
         "planner_escalation_client",
         getattr(theory_parent_session, "planner_escalation_client", None),
     )
+    inherited_escalation_state = kwargs.get("planner_escalation_failure_state")
+    if inherited_escalation_state is None:
+        inherited_escalation_state = getattr(
+            theory_parent_session, "planner_escalation_failure_state", None
+        )
+    if isinstance(inherited_escalation_state, dict):
+        session.planner_escalation_failure_state = inherited_escalation_state
     session._recursive_paid_no_artifact_provider_calls_applied = 0
     session._recursive_paid_no_artifact_provider_dispatches_applied = 0
     recursive_session_ref = weakref.ref(session)
@@ -7671,6 +7727,9 @@ async def _mini_session_run_conversation_callback(
             graph_subpass_context=kwargs.get("checkpoint_graph_subpass_context"),
         )
         deadline_epoch_s = session.recursive_elapsed_deadline_epoch_s
+    if isinstance(inherited_escalation_state, dict):
+        merge_planner_escalation_failure_state(inherited_escalation_state, session.planner_escalation_failure_state)
+        session.planner_escalation_failure_state = inherited_escalation_state
     checkpoint_result = checkpoint_child.replay_result() if checkpoint_child is not None else None
     if lane_ledger is not None:
         reservation = lane_ledger.try_reserve(

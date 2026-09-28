@@ -488,13 +488,23 @@ async def record_authoritative_negation_artifact(
         getattr(dossier, "current_lean_environment_hash", "") or ""
     ).strip()
     acceptance_preamble = str(preamble or "")
-    if (
-        dossier is None
-        or not statement
-        or not _statement_is_interpolation_safe(statement)
-        or not callable(record_report)
-        or not target_environment_hash
-    ):
+    admission_failure = ""
+    if dossier is None or not callable(record_report):
+        admission_failure = "counterexample admission requires an active proof dossier"
+    elif not statement:
+        admission_failure = "counterexample admission requires a nonempty target"
+    elif not _statement_is_interpolation_safe(statement):
+        admission_failure = "target contains unbalanced delimiters, comments, or an unterminated literal"
+    elif not target_environment_hash:
+        admission_failure = "counterexample admission requires a bound Lean environment"
+    if admission_failure:
+        if certification_results is not None:
+            certification_results.append(
+                CertificationResult(
+                    CertificationStatus.DEFINITIVE_REJECTION,
+                    reason=admission_failure,
+                )
+            )
         return False, "", ()
     if text_hash(acceptance_preamble) != target_environment_hash:
         if certification_results is not None:
@@ -515,6 +525,13 @@ async def record_authoritative_negation_artifact(
             proofs.append(body)
     proofs = list(dict.fromkeys(proofs))
     if not proofs:
+        if certification_results is not None:
+            certification_results.append(
+                CertificationResult(
+                    CertificationStatus.DEFINITIVE_REJECTION,
+                    reason="no proof of the exact target's negation was supplied",
+                )
+            )
         return False, "", ()
 
     helpers = tuple(
@@ -595,10 +612,12 @@ async def record_authoritative_negation_artifact(
                     timeout_s=policy.operation_timeout_s,
                 )
             )
-            if visible_retryable and certification_results is not None:
+            if not visible_ok and certification_results is not None:
                 certification_results.append(
                     CertificationResult(
-                        CertificationStatus.RETRYABLE_INFRASTRUCTURE,
+                        CertificationStatus.RETRYABLE_INFRASTRUCTURE
+                        if visible_retryable
+                        else CertificationStatus.DEFINITIVE_REJECTION,
                         reason=visible_reason,
                     )
                 )
@@ -613,6 +632,7 @@ async def record_authoritative_negation_artifact(
             helpers=helpers,
             policy=policy,
             environment_hash=environment_hash,
+            include_lean_diagnostics=not visible_replay_required,
         )
         if certification_results is not None:
             certification_results.append(certification_result)
@@ -760,6 +780,13 @@ async def record_authoritative_negation_artifact(
         if not record_report(report):
             if report_conflicted(certificate_hash):
                 return False, certificate_hash, ()
+            if certification_results is not None:
+                certification_results.append(
+                    CertificationResult(
+                        CertificationStatus.DEFINITIVE_REJECTION,
+                        reason="verified negation could not be bound to the active target",
+                    )
+                )
             continue
         terminalized = terminalize_exact_proof_state_aliases(
             parent_session=parent_session,
@@ -958,8 +985,10 @@ def _statement_is_interpolation_safe(statement: str) -> bool:
     under the scheduler's ``theorem … : {statement} := …`` wrapping yet flipped
     under the certifier's negation wrapping — any breakout that fools one wrapper
     also breaks the other, so this is defense-in-depth, not the primary gate. We
-    still refuse a statement carrying a top-level Lean comment opener or a ``:=``
-    (which could comment out / re-open the wrapper) or unbalanced brackets.
+    still refuse comments, unterminated literals, and unbalanced brackets.
+    Local ``let``/``have`` assignments are ordinary term syntax: ``:=`` cannot
+    close the surrounding parenthesis, so rejecting it blocks valid targets.
+    Lean replay remains responsible for validating the expression's grammar.
     """
 
     text = str(statement or "")
@@ -968,21 +997,23 @@ def _statement_is_interpolation_safe(statement: str) -> bool:
     stack: list[str] = []
     index = 0
     while index < len(text):
-        # Actual comments and assignments can escape or obscure the generated
-        # theorem wrapper. Identical tokens inside literals are inert and are
-        # skipped by the Lean-aware lexical scanner below.
+        # Comments can obscure the generated wrapper. Identical tokens inside
+        # literals are inert and skipped by the Lean-aware lexical scanner.
         if (
             text.startswith("--", index)
             or text.startswith("/-", index)
             or text.startswith("-/", index)
-            or text.startswith(":=", index)
         ):
             return False
         skip_to = _lean_lexical_skip_end(text, index)
         if skip_to is not None:
             atom = text[index:skip_to]
-            if text[index] == '"' and not atom.endswith('"'):
-                return False
+            if text[index] == '"':
+                # An escaped final quote is not a closing delimiter. The
+                # scanner returns EOF for both closed and unfinished atoms.
+                trailing_slashes = len(atom[:-1]) - len(atom[:-1].rstrip("\\"))
+                if len(atom) < 2 or not atom.endswith('"') or trailing_slashes % 2:
+                    return False
             if text[index] == "'" and not atom.endswith("'"):
                 return False
             if text.startswith("«", index) and not atom.endswith("»"):
@@ -993,11 +1024,19 @@ def _statement_is_interpolation_safe(statement: str) -> bool:
                     hash_index += 1
                 if hash_index < len(text) and text[hash_index] == '"':
                     terminator = '"' + text[index + 1 : hash_index]
-                    if not atom.endswith(terminator):
+                    opener_length = hash_index - index + 1
+                    if (
+                        len(atom) < opener_length + len(terminator)
+                        or not atom.endswith(terminator)
+                    ):
                         return False
             index = skip_to
             continue
         ch = text[index]
+        if ch == "'":
+            previous = text[index - 1] if index else ""
+            if not (previous.isalnum() or (previous and previous in "_'»")):
+                return False  # An unfinished character literal was not skipped.
         if ch in openers:
             stack.append(ch)
         elif ch in pairs:

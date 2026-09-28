@@ -421,9 +421,7 @@ class NativeResearchCoordinator:
                 try:
                     settled = await self._settle_pending(session, wait=frontier_exhausted)
                 except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-                    if self._pending is not None:
-                        self._pending["settlement_failed"] = True
-                    _event(session, "research_settlement_deferred", error_type=type(exc).__name__)
+                    self._settlement_deferred(session, exc)
                     return False
             try:
                 state = self._state(session)
@@ -746,8 +744,21 @@ class NativeResearchCoordinator:
             except asyncio.CancelledError:
                 pass
             except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-                _event(session, "research_settlement_deferred", error_type=type(exc).__name__)
+                self._settlement_deferred(session, exc)
             raise
+
+    def _settlement_deferred(self, session: Any, exc: Exception) -> None:
+        pending = self._pending or {}
+        if pending:
+            pending["settlement_failed"] = True
+        grant = pending.get("grant", {})
+        _event(session, "research_settlement_deferred",
+               error_type=type(exc).__name__, error=str(exc)[:500],
+               settlement_stage=pending.get("settlement_stage", "unknown"),
+               grant_id=grant.get("id", ""),
+               action_id=grant.get("action_id", ""),
+               elapsed_accounted=grant.get("elapsed_accounted", 0.0),
+               dispatches_accounted=grant.get("accounted", 0))
 
     def has_pending(self, session: Any) -> bool:
         return self._pending is not None and self._pending["session"] is session
@@ -781,6 +792,7 @@ class NativeResearchCoordinator:
         task = pending["task"]
         if not task.done() and not wait:
             return False
+        pending["settlement_stage"] = "worker_completion"
         result: dict[str, Any] = {"reason": "research_cancelled", "paid_dispatches": 0}
         try:
             result = await asyncio.shield(task)
@@ -796,20 +808,25 @@ class NativeResearchCoordinator:
                 # later proof action happens to yield a scheduler boundary.
                 elapsed = pending["elapsed"]
                 grant = pending["grant"]
+                pending["settlement_stage"] = "state_binding"
                 state = self._state(session)
+                pending["settlement_stage"] = "elapsed_accounting"
                 uncharged = max(0.0, elapsed - float(grant.get("elapsed_accounted", 0.0)))
                 charge_elapsed(session, pending["donor"], uncharged)
                 grant["elapsed_accounted"] = elapsed
+                pending["settlement_stage"] = "ledger_reconciliation"
                 self._reconcile(session, grant, elapsed_s=elapsed)
                 accrue = getattr(session, "_accrue_run_governor_elapsed", None)
                 if callable(accrue):
                     accrue()
+                pending["settlement_stage"] = "advice_settlement"
                 state["grant"] = None
                 self._settle_answered_objections(session, grant)
                 if deliver and _allowed(session):
                     self._deliver(session)
-                self._pending = None
+                pending["settlement_stage"] = "checkpoint"
                 await _checkpoint(session)
+                self._pending = None
         research_outcome = result.get("reason", "unknown")
         if research_outcome in {"quantum_timeout", "deadline_exhausted", "parent_deadline_exhausted"}:
             _event(session, "research_timed_out", reason=research_outcome,
@@ -837,7 +854,7 @@ class NativeResearchCoordinator:
                 # Its durable grant and paid research receipts remain the
                 # recovery source. Optional ledger storage cannot revoke a
                 # root already accepted by the proof session.
-                _event(session, "research_settlement_deferred", error_type=type(exc).__name__)
+                self._settlement_deferred(session, exc)
 
     async def _ensure_loop(self, session: Any, client: Any, role: str) -> None:
         from .mini_research_budget import clone_research_client

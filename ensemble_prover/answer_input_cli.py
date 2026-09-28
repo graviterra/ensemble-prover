@@ -308,7 +308,9 @@ async def validate_answers(
                 "answer name-scope validation failed:\n" + diagnostic
             )
         try:
-            await _preflight_theorem_project_input(runner, problem, timeout_s=timeout_s)
+            problem = await _preflight_theorem_project_input(
+                runner, problem, timeout_s=timeout_s
+            )
         except ValueError as exc:
             detail = str(exc)
             if (
@@ -325,8 +327,55 @@ async def validate_answers(
             ):
                 raise AnswerValidationError(detail) from exc
             raise
+        await _reject_refuted_candidate(runner, problem, timeout_s=timeout_s)
     finally:
         await runner.aclose()
+
+
+async def _reject_refuted_candidate(runner: Any, problem: Any, *, timeout_s: float) -> None:
+    """Spend a small bounded probe on easy false answers before proof search.
+
+    Failure to find a disproof says nothing about the candidate's truth.
+    Rejection requires the same exact-target replay and independent axiom
+    audit as a disproof found during search; a model's judgment never suffices.
+    The problem here was built from the sanitized question and proposed term,
+    so the probe cannot use an opaque benchmark's hidden solution.
+    """
+    from .mini_falsification import CounterexampleCandidate, FalsificationPolicy
+    from .mini_falsification.certificate import certify_negation_proof_result
+
+    # Both the checked proof and the separate audit start Lean. Keep enough
+    # room for those process launches, even when the computation itself is
+    # trivial, while bounding the whole optional probe rather than each step.
+    limit = min(20.0, max(0.1, float(timeout_s)))
+    proof = (
+        "by\n  first\n"
+        "  | (solve | simp_all)\n"
+        "  | (solve | norm_num)\n"
+        "  | (solve | decide +kernel)"
+    )
+    try:
+        async with asyncio.timeout(limit):
+            result = await certify_negation_proof_result(
+                runner,
+                statement=problem.statement_type,
+                proof=proof,
+                candidate=CounterexampleCandidate(
+                    engine="answer_admission", explanation="bounded exact negative check"
+                ),
+                preamble=problem.lean_preamble,
+                helpers=(),
+                policy=FalsificationPolicy(
+                    operation_timeout_s=limit, engine_timeout_s=limit
+                ),
+            )
+    except TimeoutError:
+        return
+    if result.authoritative:
+        raise AnswerValidationError(
+            "the exact proposed candidate was refuted by Lean replay and axiom audit; "
+            "revise the answer. Negation proof:\n" + proof
+        )
 
 
 def proof_arguments(
@@ -358,7 +407,6 @@ def proof_arguments(
         ("cost_budget_usd", "--cost-budget-usd"),
         ("mini_worker_timeout_s", "--mini-worker-timeout-s"),
         ("mini_run_wall_clock_budget_s", "--mini-run-wall-clock-budget-s"),
-        ("mini_no_strong_progress_budget_s", "--mini-no-strong-progress-budget-s"),
     ):
         limit = float(getattr(args, dest, 0) or 0)
         if limit > 0:
@@ -366,12 +414,17 @@ def proof_arguments(
             if remaining <= 0:
                 raise ValueError(f"{flag} budget exhausted during answer discovery")
             replacements[flag] = str(remaining)
+    # Preparation is independently bounded by the inactivity allowance.
+    # Completing admission starts proof search with its full window; reducing
+    # the configured duration here would also shorten every later renewal.
     owned = {
         "lean_file",
         "output_dir",
         "theorem_project_description",
         "theorem_project_description_file",
         "answer_attempts",
+        "answer_refutation_from",
+        "rediscover_from",
     }
     owned.update(
         a.dest
@@ -459,6 +512,8 @@ async def _prepare(
     limit = min((value for value in limits if value > 0), default=0)
     theory_library = None
     capability_cancelled: tuple[str, int] | None = None
+    prior_refutation = ""
+    refuted_answers = None
 
     def record_capability(
         phase: str, status: str, attempt: int, error: str = ""
@@ -612,6 +667,25 @@ async def _prepare(
             scratch_dir=directory / ".lean_environment",
             theory_library=theory_library,
         )
+        if getattr(args, "answer_refutation_from", None):
+            from .answer_rediscovery import load_refuted_answer, verify_refutation
+
+            prior = load_refuted_answer(Path(args.answer_refutation_from))
+            if prior.request != request or prior.template.original_bytes != template.original_bytes:
+                raise ValueError("rediscovery worker question differs from the bound original")
+            remaining = max(0, started + limit - time.monotonic()) if limit else None
+            async with asyncio.timeout(remaining):
+                prior_refutation = await verify_refutation(
+                    prior, timeout_s=float(args.lean_timeout_s),
+                    scratch_dir=directory / ".refutation_replay", theory_library=theory_library,
+                )
+            refuted_answers = prior.candidate.answers
+            (directory / "prior_refutation.json").write_text(
+                json.dumps({"run_dir": str(prior.run_dir),
+                            "candidate_sha256": prior.candidate.source_sha256,
+                            "feedback": prior_refutation}, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
         if callable(getattr(client, "preflight", None)):
             await client.preflight()
         await prepare_capabilities(
@@ -638,6 +712,8 @@ async def _prepare(
                     ask=ask,
                     validate=validate,
                     max_attempts=args.answer_attempts,
+                    prior_refutation=prior_refutation,
+                    refuted_answers=refuted_answers,
                 )
         except TimeoutError as exc:
             if not discovery_deadline.expired() or capability_cancelled is None:
@@ -687,6 +763,10 @@ def run_cli(args: argparse.Namespace, argv: Sequence[str]) -> int:
     started = time.monotonic()
     directory: Path | None = None
     try:
+        if getattr(args, "answer_refutation_from", None) and not getattr(
+            args, "_answer_rediscovery_rebound", False
+        ):
+            raise ValueError("use --rediscover-from to bind prior refutation and remaining budgets")
         request = _request(args)
         template = _template(args, request)
         if template is None:

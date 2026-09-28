@@ -10,14 +10,12 @@ from typing import Any, Iterable, Optional, Sequence
 from .library import MiniTheoryLibrary, TheoryPublishResult
 from .model import TheoryBundleCandidate
 from .store import TheoryStorePublicationCommitted
+from .promotion_context import helper_promotion_context, is_promotion_context_command, split_promotion_context
 
 
 _DECLARATION_HEAD_RE = re.compile(
     r"^(?:@\[[^\]\n]+\]\s*)*(?:protected\s+)?"
     r"(?P<kind>theorem|lemma)\s+(?P<name>[A-Za-z_][A-Za-z0-9_']*)\b"
-)
-_OPEN_COMMAND_RE = re.compile(
-    r"^open\s+[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*$"
 )
 _IDENTIFIER_RE = re.compile(
     r"\b[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*\b"
@@ -157,6 +155,11 @@ class VerifiedHelperPromoter:
     ) -> HelperPromotionPreparation:
         helper_name = str(getattr(helper, "name", "") or "").strip()
         source = str(getattr(helper, "source", "") or "").strip()
+        try:
+            context = helper_promotion_context(source, ())
+        except ValueError:
+            context = ()
+        source = "\n".join((*context, source))
         declaration = self._extract_declaration(source, helper_name)
         if not helper_name or declaration is None:
             return HelperPromotionPreparation(
@@ -191,9 +194,11 @@ class VerifiedHelperPromoter:
                 verification=None,
                 diagnostic="problem_local_constants:" + ",".join(used_forbidden),
             )
+        replay_context, declaration_body = split_promotion_context(declaration)
         candidate = TheoryBundleCandidate.create(
             domain=domain,
-            source=declaration,
+            source=declaration_body,
+            context_commands=replay_context,
             imports=imports,
             dependency_bundle_ids=dependency_bundle_ids,
             satisfies_need_ids=satisfies_need_ids,
@@ -334,7 +339,7 @@ class VerifiedHelperPromoter:
             if (
                 not stripped
                 or stripped.startswith("--")
-                or _OPEN_COMMAND_RE.fullmatch(stripped)
+                or is_promotion_context_command(stripped)
                 or _ATTRIBUTE_LINE_RE.fullmatch(stripped)
             ):
                 declaration_index += 1

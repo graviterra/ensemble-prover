@@ -26,26 +26,29 @@ from .model import (
 )
 from .environment import dependency_environment_fingerprint
 from .policy import TheoryPolicy
+from .promotion_context import (
+    _DOTTED_IDENT, _IDENT_COMPONENT, _masked_preamble,
+    lean_name_components, promotion_context_namespace,
+)
 from .store import TheoryStore
-from ..theorem_project import _mask_noncode
 from ..subprocess_environment import sanitized_subprocess_environment
 
 
 _DECL_RE = re.compile(
     r"^\s*(?:@\[[^\]]*\]\s*)*"
     r"(?:(?:protected|noncomputable)\s+)*"
-    r"(?P<kind>def|abbrev|structure|class|inductive|instance|theorem|lemma)\s+"
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*)\b"
+    r"(?P<kind>def|abbrev|structure|class|inductive|instance|theorem|lemma)(?=\s|«)\s*"
+    rf"(?P<name>{_DOTTED_IDENT})(?=\.\{{|\s|:|\(|\{{|⦃|\[|$)"
 )
 _NAMESPACE_RE = re.compile(
-    r"^\s*namespace\s+([A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*)\s*$"
+    rf"^\s*namespace\s+({_DOTTED_IDENT})\s*$"
 )
 _SECTION_RE = re.compile(
     r"^\s*section(?:\s+[A-Za-z_][A-Za-z0-9_']*)?\s*$"
 )
 _MUTUAL_RE = re.compile(r"^\s*mutual\s*$")
 _END_RE = re.compile(
-    r"^\s*end(?:\s+(?P<name>[A-Za-z_][A-Za-z0-9_'.]*))?\s*$"
+    rf"^\s*end(?:\s+(?P<name>{_DOTTED_IDENT}))?\s*$"
 )
 _PRINT_AXIOMS_DEPENDS_RE = re.compile(
     r"'([^\r\n]+)'\s+depends\s+on\s+axioms:\s*\[([^\]]*)\]"
@@ -54,15 +57,21 @@ _PRINT_AXIOMS_NONE_RE = re.compile(
     r"'([^\r\n]+)'\s+does\s+not\s+depend\s+on\s+any\s+axioms"
 )
 _ALLOWED_AXIOMS = frozenset({"propext", "Classical.choice", "Quot.sound"})
-_CIRCULAR_PREMISE_MARKER_RE = re.compile(
-    r"MINI_THEORY_CIRCULAR_PREMISE:([^\s]+)"
-)
-_FORBIDDEN_PREMISE_MARKER_RE = re.compile(
-    r"MINI_THEORY_FORBIDDEN_PREMISE:([^:\s]+):([^\s]+)"
-)
-_NAMESPACE_FORBIDDEN_AXIOM_MARKER_RE = re.compile(
-    r"MINI_THEORY_NS_FORBIDDEN_AXIOM:([^\s]+):([^\s]+)"
-)
+def _audit_markers(output: str, marker: str, arity: int) -> tuple[tuple[str, ...], ...]:
+    """Decode complete Lean name receipts without delimiter ambiguity."""
+
+    results: list[tuple[str, ...]] = []
+    for line in output.splitlines():
+        if not line.startswith(marker + ":"):
+            continue
+        payload = json.loads(line[len(marker) + 1:])
+        if not isinstance(payload, list) or len(payload) != arity or any(
+            not isinstance(item, str) or not item for item in payload
+        ):
+            raise ValueError("malformed theory audit marker")
+        results.append(tuple(payload))
+    return tuple(dict.fromkeys(results))
+
 
 
 @dataclass(frozen=True)
@@ -74,7 +83,8 @@ class TheoryVerificationResult:
     # Filled only by the independent verifier. Publication validates this
     # seal again at the persistence boundary.
     publication_seal: str = ""
-    # Set from process status, never from generated declarations or Lean output.
+    # Infrastructure failure after any bounded resource retry. Generated
+    # declaration text alone must never establish an infrastructure failure.
     retryable: bool = False
 
     @property
@@ -123,7 +133,9 @@ class TheoryBundleVerifier:
         declarations = self._candidate_declarations(candidate)
         if not declarations:
             return self._rejected(candidate, "no_named_declarations")
-        namespace_escape = self._namespace_escape_error(declarations)
+        namespace_escape = self._namespace_escape_error(
+            declarations, ambient_namespace=promotion_context_namespace(candidate.context_commands),
+        )
         if namespace_escape:
             return self._rejected(candidate, namespace_escape)
         forbidden_targets = tuple(
@@ -176,7 +188,7 @@ class TheoryBundleVerifier:
             env = os.environ.copy()
             env.update(self.environment)
             env["LEAN_PATH"] = lean_path
-            compile_run = self._run(
+            compile_run = self._run_with_resource_retry(
                 [
                     str(lean_executable),
                     "-R",
@@ -185,6 +197,7 @@ class TheoryBundleVerifier:
                     str(artifact_path),
                     str(source_path),
                 ],
+                source_path=source_path,
                 env=env,
                 cancellation_event=cancellation_event,
             )
@@ -192,7 +205,11 @@ class TheoryBundleVerifier:
             if compile_run.returncode != 0 or not artifact_path.is_file():
                 return self._rejected(
                     candidate,
-                    "lean_compile_failed",
+                    (
+                        "lean_compile_resource_budget_exhausted"
+                        if self._resource_exhausted(compile_run, source_path)
+                        else "lean_compile_failed"
+                    ),
                     compile_output=compile_output,
                     retryable=(
                         compile_run.returncode in {124, 127, 130}
@@ -206,11 +223,13 @@ class TheoryBundleVerifier:
                 fq_declarations,
                 forbidden_target_statements=forbidden_targets,
                 namespace=candidate.namespace,
+                source_declaration_names=self._source_declaration_names(candidate.source),
             )
             audit_path = scratch / "Audit.lean"
             audit_path.write_text(audit_source, encoding="utf-8")
-            audit_run = self._run(
+            audit_run = self._run_with_resource_retry(
                 [str(lean_executable), "-R", str(scratch), str(audit_path)],
+                source_path=audit_path,
                 env=env,
                 cancellation_event=cancellation_event,
             )
@@ -218,7 +237,11 @@ class TheoryBundleVerifier:
             if audit_run.returncode != 0:
                 return self._rejected(
                     candidate,
-                    "lean_audit_failed",
+                    (
+                        "lean_audit_resource_budget_exhausted"
+                        if self._resource_exhausted(audit_run, audit_path)
+                        else "lean_audit_failed"
+                    ),
                     compile_output=compile_output,
                     audit_output=audit_output,
                     retryable=(
@@ -226,13 +249,22 @@ class TheoryBundleVerifier:
                         or audit_run.returncode < 0
                     ),
                 )
-            circular_declarations = tuple(
-                dict.fromkeys(
-                    match.group(1).strip()
-                    for match in _CIRCULAR_PREMISE_MARKER_RE.finditer(audit_output)
-                    if match.group(1).strip()
+            try:
+                circular_markers = _audit_markers(audit_output, "MINI_THEORY_CIRCULAR_PREMISE", 1)
+                forbidden_premises = _audit_markers(audit_output, "MINI_THEORY_FORBIDDEN_PREMISE", 2)
+                namespace_forbidden_axioms = _audit_markers(audit_output, "MINI_THEORY_NS_FORBIDDEN_AXIOM", 2)
+                namespace_escapes = _audit_markers(audit_output, "MINI_THEORY_MODULE_ESCAPE", 1)
+            except ValueError:
+                return self._rejected(
+                    candidate, "malformed_audit_marker", compile_output=compile_output,
+                    audit_output=audit_output,
                 )
-            )
+            if namespace_escapes:
+                return self._rejected(
+                    candidate, "namespace_escaping_declaration:" + ",".join(item[0] for item in namespace_escapes),
+                    compile_output=compile_output, audit_output=audit_output,
+                )
+            circular_declarations = tuple(item[0] for item in circular_markers)
             if circular_declarations:
                 return self._rejected(
                     candidate,
@@ -241,13 +273,6 @@ class TheoryBundleVerifier:
                     compile_output=compile_output,
                     audit_output=audit_output,
                 )
-            forbidden_premises = tuple(
-                dict.fromkeys(
-                    (match.group(1).strip(), match.group(2).strip())
-                    for match in _FORBIDDEN_PREMISE_MARKER_RE.finditer(audit_output)
-                    if match.group(1).strip() and match.group(2).strip()
-                )
-            )
             if forbidden_premises:
                 return self._rejected(
                     candidate,
@@ -270,21 +295,9 @@ class TheoryBundleVerifier:
                     compile_output=compile_output,
                     audit_output=audit_output,
                 )
-            # Fail-closed backstop, checked after the precise per-declaration
-            # audit: reject any constant Lean elaborated under the bundle
-            # namespace whose axiom closure escaped the allowlist but which the
-            # name parser never listed (e.g. a declaration hidden by a
-            # partial-width `end`).  For parser-visible declarations the
-            # per-declaration `unexpected_axioms` diagnostic above fires first.
-            namespace_forbidden_axioms = tuple(
-                dict.fromkeys(
-                    (match.group(1).strip(), match.group(2).strip())
-                    for match in (
-                        _NAMESPACE_FORBIDDEN_AXIOM_MARKER_RE.finditer(audit_output)
-                    )
-                    if match.group(1).strip() and match.group(2).strip()
-                )
-            )
+            # The defining-module inventory also covers declarations hidden
+            # behind command wrappers, independent of their namespace. Parsed
+            # declarations retain the precise per-declaration diagnostic above.
             if namespace_forbidden_axioms:
                 return self._rejected(
                     candidate,
@@ -451,6 +464,53 @@ class TheoryBundleVerifier:
             return "lean_path_unavailable"
         return lean_path, path_run.stdout.strip()
 
+    @staticmethod
+    def _resource_exhausted(
+        run: subprocess.CompletedProcess[str], source_path: Path,
+    ) -> bool:
+        if run.returncode != 1:
+            return False
+        # Require an actual error at the file we invoked, not a theorem name,
+        # quoted warning or arbitrary generated trace mentioning a timeout.
+        error = re.compile(
+            r"^" + re.escape(str(source_path))
+            + r":\d+:\d+: error(?:\([^\r\n)]*\))?: "
+            r"\(deterministic\) timeout[^\r\n]*"
+            r"maximum number of heartbeats \([0-9]+\) has been reached",
+            re.MULTILINE,
+        )
+        return bool(error.search(TheoryBundleVerifier._combined_output(run)))
+
+    def _run_with_resource_retry(
+        self,
+        command: Sequence[str],
+        *,
+        source_path: Path,
+        env: Mapping[str, str],
+        cancellation_event: Optional[threading.Event] = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Retry heartbeat exhaustion once without extending the wall budget."""
+
+        deadline = time.monotonic() + self.timeout_s
+        result: Optional[subprocess.CompletedProcess[str]] = None
+        for heartbeats in (200_000, 800_000):
+            remaining = deadline - time.monotonic()
+            if result is not None and (
+                remaining <= 0
+                or (cancellation_event is not None and cancellation_event.is_set())
+            ):
+                break
+            result = self._run(
+                [command[0], f"-DmaxHeartbeats={heartbeats}", *command[1:]],
+                env=env,
+                cancellation_event=cancellation_event,
+                timeout_s=max(0.0, remaining),
+            )
+            if not self._resource_exhausted(result, source_path):
+                break
+        assert result is not None
+        return result
+
     def _run(
         self,
         command: Sequence[str],
@@ -458,6 +518,7 @@ class TheoryBundleVerifier:
         env: Mapping[str, str],
         cancellation_event: Optional[threading.Event] = None,
         cwd: Optional[Path] = None,
+        timeout_s: Optional[float] = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
             process = subprocess.Popen(
@@ -476,7 +537,8 @@ class TheoryBundleVerifier:
                 stdout="",
                 stderr=f"{type(exc).__name__}: {exc}",
             )
-        deadline = time.monotonic() + self.timeout_s
+        effective_timeout_s = self.timeout_s if timeout_s is None else max(0.0, timeout_s)
+        deadline = time.monotonic() + effective_timeout_s
         while True:
             cancelled = bool(cancellation_event and cancellation_event.is_set())
             remaining = deadline - time.monotonic()
@@ -493,7 +555,7 @@ class TheoryBundleVerifier:
                     except (OSError, ProcessLookupError):
                         pass
                     stdout, stderr = process.communicate()
-                reason = "cancelled" if cancelled else f"timeout after {self.timeout_s}s"
+                reason = "cancelled" if cancelled else f"timeout after {effective_timeout_s}s"
                 return subprocess.CompletedProcess(
                     list(command),
                     130 if cancelled else 124,
@@ -528,13 +590,13 @@ class TheoryBundleVerifier:
         # leaves `Inner` open.  Modelling `namespace A.B` as a single fixed
         # width popped whole on any `end` desynchronises from Lean and can
         # mis-name (and thereby drop from the audit) a later declaration;
-        # see the namespace axiom backstop for the fail-closed guarantee.
+        # see the defining-module audit for the fail-closed guarantee.
         namespaces: list[str] = []
         declarations: list[tuple[str, str]] = []
-        for line in _mask_noncode(candidate.source).splitlines():
+        for line in _masked_preamble(candidate.source).splitlines():
             namespace_match = _NAMESPACE_RE.match(line)
             if namespace_match is not None:
-                namespaces.extend(namespace_match.group(1).split("."))
+                namespaces.extend(re.findall(_IDENT_COMPONENT, namespace_match.group(1)))
                 continue
             if _SECTION_RE.match(line) is not None:
                 continue
@@ -544,12 +606,12 @@ class TheoryBundleVerifier:
             if end_match is not None:
                 end_name = end_match.group("name")
                 if end_name:
-                    end_segments = end_name.split(".")
+                    end_segments = re.findall(_IDENT_COMPONENT, end_name)
                     # Only pop when the `end` names the trailing open
                     # namespace; a named `section`/`mutual` end (whose label
                     # is not a namespace) leaves the namespace stack intact.
                     width = len(end_segments)
-                    if namespaces[-width:] == end_segments:
+                    if tuple(segment.strip("«»") for segment in namespaces[-width:]) == tuple(segment.strip("«»") for segment in end_segments):
                         del namespaces[-width:]
                 # An anonymous `end` closes a `section`/`mutual`, which never
                 # contributes namespace segments; nothing to pop.
@@ -569,8 +631,28 @@ class TheoryBundleVerifier:
         return tuple(dict.fromkeys(declarations))
 
     @staticmethod
+    def _source_declaration_names(source: str) -> tuple[str, ...]:
+        """Identify authored heads even when a command wrapper precedes them.
+
+        This inventory only prevents user names from borrowing compiler-auxiliary
+        exemptions. Module ownership and axiom authority come from Lean itself.
+        """
+
+        code = _masked_preamble(source)
+        names: list[str] = []
+        for token in re.finditer(_DOTTED_IDENT, code):
+            if token.group() not in {"theorem", "lemma", "def", "abbrev", "structure", "class", "inductive", "instance"}:
+                continue
+            head = _DECL_RE.match(code[token.start():])
+            if head is not None:
+                names.append(head.group("name"))
+        return tuple(dict.fromkeys(names))
+
+    @staticmethod
     def _namespace_escape_error(
         declarations: Sequence[tuple[str, str]],
+        *,
+        ambient_namespace: str = "",
     ) -> str:
         """Reject `_root_.`-anchored names that escape the bundle namespace.
 
@@ -582,11 +664,16 @@ class TheoryBundleVerifier:
         generated theory and rejecting it fails closed.
         """
 
-        escaping = tuple(
-            fq_name
-            for _kind, fq_name in declarations
-            if "_root_" in fq_name.split(".")
-        )
+        ambient = lean_name_components(ambient_namespace) if ambient_namespace else ()
+        escaping = []
+        for _kind, fq_name in declarations:
+            components = lean_name_components(fq_name)
+            # A literal namespace called `_root_` is safe only when captured
+            # in the authenticated ambient context. An explicit declaration
+            # escape anywhere after it remains forbidden.
+            tail = components[len(ambient):] if ambient and components[:len(ambient)] == ambient else components
+            if "_root_" in tail:
+                escaping.append(fq_name)
         if escaping:
             return "namespace_escaping_declaration:" + ",".join(escaping)
         return ""
@@ -598,11 +685,23 @@ class TheoryBundleVerifier:
         *,
         forbidden_target_statements: Sequence[str] = (),
         namespace: str = "",
+        source_declaration_names: Sequence[str] = (),
     ) -> str:
         lines = [
             f"import {module_name}",
+            # Audit implementation APIs need not be exported by mathematical imports.
+            "import Lean.Elab.PreDefinition.EqUnfold",
             "",
         ]
+        root_declared = tuple(
+            name[name.index(".") + 1:]
+            for name in source_declaration_names
+            if lean_name_components(name)[:1] == ("_root_",) and "." in name
+        )
+        locally_declared = tuple(
+            name for name in source_declaration_names
+            if lean_name_components(name)[:1] != ("_root_",)
+        )
         forbidden_names: list[str] = []
         for index, statement in enumerate(forbidden_target_statements):
             name = f"miniTheoryForbiddenTarget{index}"
@@ -820,7 +919,7 @@ class TheoryBundleVerifier:
             "  let declName ← resolveGlobalConstNoOverload n",
             "  let circular ← liftTermElabM do miniTheoryHasCircularPremise declName",
             "  if circular then",
-            '    logInfo m!"MINI_THEORY_CIRCULAR_PREMISE:{declName}"',
+            '    logInfo m!"MINI_THEORY_CIRCULAR_PREMISE:{(Lean.toJson #[declName.toString]).compress}"',
             "",
             "private partial def miniTheoryProofContainsForbidden",
             "    (proof forbidden : Expr) (theoremArgs : Array FVarId)",
@@ -876,42 +975,85 @@ class TheoryBundleVerifier:
             "  let forbidden ← liftTermElabM do",
             "    miniTheoryHasForbiddenPremise declName targetName",
             "  if forbidden then",
-            '    logInfo m!"MINI_THEORY_FORBIDDEN_PREMISE:{declName}:{targetName}"',
+            '    logInfo m!"MINI_THEORY_FORBIDDEN_PREMISE:{(Lean.toJson #[declName.toString, targetName.toString]).compress}"',
             "",
-            # Fail-closed backstop independent of the Python name parser: walk
-            # every constant Lean actually elaborated under the bundle
-            # namespace and flag any whose transitive axiom closure escapes the
-            # allowlist.  This catches declarations the parser mis-namespaced
-            # or dropped (e.g. via a partial-width `end`) and therefore never
-            # audited per-declaration.
-            "elab \"#mini_theory_audit_namespace_axioms\" n:ident : command => do",
+            # Lazy equation registries are reconstructed after module import.
+            # Existing theorem membership, plus the authored-name veto below,
+            # distinguishes compiler equations from user-written lookalikes.
+            "private def miniTheoryIsEquation (declName : Name) : MetaM Bool := do",
+            "  if ← Lean.Meta.isEqnThm declName then return true",
+            "  let some (parent, suffix) := Lean.Meta.declFromEqLikeName (← getEnv) declName | return false",
+            "  if suffix == Lean.Meta.unfoldThmSuffix then",
+            "    return (← Lean.Meta.getUnfoldEqnFor? parent (nonRec := true)) == some declName",
+            "  if suffix == Lean.Meta.eqUnfoldThmSuffix then",
+            "    return (← Lean.Meta.getConstUnfoldEqnFor? parent) == some declName",
+            "  let some eqns ← Lean.Meta.getEqnsFor? parent | return false",
+            "  return eqns.contains declName",
+            "",
+            # Inspect the actual defining module, independently of the source
+            # parser. Wrappers can hide a declaration head, and a root escape
+            # is outside the bundle namespace despite belonging to its module.
+            'elab "#mini_theory_audit_module" m:ident n:ident ts:ident* : command => do',
             "  let env ← getEnv",
             "  let nsName := n.getId",
+            "  let some moduleIdx := env.getModuleIdx? m.getId",
+            '    | throwError "candidate defining module is unavailable"',
+            "  let targets ← ts.mapM resolveGlobalConstNoOverload",
+            "  let privatePrefix := mkPrivateNameCore m.getId .anonymous",
+            "  let sourceDeclared : List Name := ["
+            + ", ".join(f"`{name}" for name in locally_declared) + "]",
+            "  let rootSourceDeclared : List Name := ["
+            + ", ".join(f"`{name}" for name in root_declared) + "]",
+            "  let explicitlyAudited : List Name := ["
+            + ", ".join(f"`{name}" for _kind, name in declarations) + "]",
             "  let allowed : List Name := ["
             + ", ".join(f"`{axiom_name}" for axiom_name in sorted(_ALLOWED_AXIOMS))
             + "]",
-            "  for (declName, _) in env.constants.toList do",
-            "    if nsName.isPrefixOf declName && declName != nsName then",
-            "      let axs ← liftCoreM <| collectAxioms declName",
-            "      for ax in axs do",
-            "        if !(allowed.contains ax) then",
-            '          logInfo m!"MINI_THEORY_NS_FORBIDDEN_AXIOM:{declName}:{ax}"',
+            "  for (declName, info) in env.constants.toList do",
+            "    if env.getModuleIdxFor? declName != some moduleIdx then",
+            "      continue",
+            "    let inNamespace := nsName.isPrefixOf declName && declName != nsName",
+            "    let relativeName := declName.replacePrefix nsName .anonymous",
+            "    let privateAuxiliary := privatePrefix.isPrefixOf declName",
+            "    let sourceAuthored := rootSourceDeclared.contains declName ||",
+            "      (inNamespace && sourceDeclared.any (·.isSuffixOf declName))",
+            "    let registeredAuxiliary := env.isProjectionFn declName || (!sourceAuthored &&",
+            "      ((← liftTermElabM <| miniTheoryIsEquation declName) || Lean.Meta.Match.isMatchEqnTheorem env declName))",
+            "    let auxiliary := privateAuxiliary || registeredAuxiliary ||",
+            "      (!sourceAuthored && relativeName.isInternalOrNum)",
+            "    if !inNamespace && !privateAuxiliary && !registeredAuxiliary then",
+            '      logInfo m!"MINI_THEORY_MODULE_ESCAPE:{(Lean.toJson #[declName.toString]).compress}"',
+            # Every generated auxiliary is axiom-audited. Curation heuristics
+            # apply to public mathematical theorems, not compiler induction or
+            # equation helpers that may legitimately restate local premises.
+            "    let axs ← liftCoreM <| collectAxioms declName",
+            "    for ax in axs do",
+            "      if !(allowed.contains ax) then",
+            '        logInfo m!"MINI_THEORY_NS_FORBIDDEN_AXIOM:{(Lean.toJson #[declName.toString, ax.toString]).compress}"',
+            "    if (info matches .thmInfo _) && !auxiliary && !(explicitlyAudited.contains declName) then",
+            "      let circular ← liftTermElabM do miniTheoryHasCircularPremise declName",
+            "      if circular then",
+            '        logInfo m!"MINI_THEORY_CIRCULAR_PREMISE:{(Lean.toJson #[declName.toString]).compress}"',
+            "      for targetName in targets do",
+            "        let forbidden ← liftTermElabM do miniTheoryHasForbiddenPremise declName targetName",
+            "        if forbidden then",
+            '          logInfo m!"MINI_THEORY_FORBIDDEN_PREMISE:{(Lean.toJson #[declName.toString, targetName.toString]).compress}"',
             "",
         ])
         for kind, name in declarations:
             lines.extend(
                 (
                     "set_option pp.universes true in",
-                    f"#check {name}",
-                    f"#print axioms {name}",
+                    f"#check _root_.{name}",
+                    f"#print axioms _root_.{name}",
                     *(
-                        (f"#mini_theory_audit_circular {name}",)
+                        (f"#mini_theory_audit_circular _root_.{name}",)
                         if kind in {"theorem", "lemma"}
                         else ()
                     ),
                     *(
                         tuple(
-                            f"#mini_theory_audit_forbidden {name} {target_name}"
+                            f"#mini_theory_audit_forbidden _root_.{name} {target_name}"
                             for target_name in forbidden_names
                         )
                         if kind in {"theorem", "lemma"}
@@ -923,7 +1065,7 @@ class TheoryBundleVerifier:
         namespace_probe = str(namespace or "").strip()
         if namespace_probe:
             lines.append(
-                f"#mini_theory_audit_namespace_axioms {namespace_probe}"
+                f"#mini_theory_audit_module {module_name} {namespace_probe} " + " ".join(forbidden_names)
             )
             lines.append("")
         return "\n".join(lines)
@@ -936,10 +1078,12 @@ class TheoryBundleVerifier:
         records: list[TheoryDeclaration] = []
         for kind, fq_name in declarations:
             type_text = ""
-            type_match = re.search(
-                rf"(?ms)^{re.escape(fq_name)}(?P<type>.*?)(?=^'{re.escape(fq_name)}'\s+(?:depends|does)\b)",
-                str(output or ""),
-            )
+            type_match = next((
+                match for match in re.finditer(
+                    rf"(?ms)^(?P<name>{_DOTTED_IDENT})(?P<type>.*?)(?=^'[^\r\n]+'\s+(?:depends|does)\b)",
+                    str(output or ""),
+                ) if lean_name_components(match.group("name")) == lean_name_components(fq_name)
+            ), None)
             if type_match is not None:
                 rendered = " ".join(type_match.group("type").split()).strip()
                 if rendered.startswith(":"):
@@ -984,7 +1128,7 @@ class TheoryBundleVerifier:
             # ``[`` swallowed a later real report: ambiguous, fail closed.
             if re.search(r"'|\bdepend", match.group(2)):
                 return None
-            if match.group(1).strip() == fq_name:
+            if lean_name_components(match.group(1).strip()) == lean_name_components(fq_name):
                 found = True
                 axioms.update(
                     (item.strip(), None)
@@ -992,7 +1136,7 @@ class TheoryBundleVerifier:
                     if item.strip()
                 )
         for match in _PRINT_AXIOMS_NONE_RE.finditer(output):
-            if match.group(1).strip() == fq_name:
+            if lean_name_components(match.group(1).strip()) == lean_name_components(fq_name):
                 found = True
         return list(axioms) if found else None
 

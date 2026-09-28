@@ -1591,6 +1591,7 @@ class GraphRecursiveDecomposeAction:
         from ensemble_prover.mini_recursive import (
             _support_names_for_proof,
             helper_decl_from_proof,
+            planner_escalation_state_for_session,
             run_mini_recursive_attempt,
             seed_verified_helpers,
             unique_dossier_helper_name,
@@ -2220,6 +2221,9 @@ class GraphRecursiveDecomposeAction:
                 refiner_client=getattr(session, "refiner_client", None),
                 planner_escalation_client=getattr(
                     session, "planner_escalation_client", None
+                ),
+                planner_escalation_failure_state=(
+                    planner_escalation_state_for_session(session)
                 ),
                 lean=getattr(session, "lean", None),
                 llm_preamble=str(getattr(session.conv, "preamble", "") or ""),

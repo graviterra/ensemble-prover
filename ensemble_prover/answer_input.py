@@ -157,6 +157,10 @@ assume an affirmative answer or any externally supplied conjectured direction.
 An open or difficult problem is a research task, not a reason to fabricate a
 proof or refuse investigation. Propose the best mathematically supported
 candidate and explain the actual argument and remaining obstacles honestly.
+For finite numerical questions, compute the proposed value independently with
+exact arithmetic and include the calculation. For a yes/no assertion, actively
+look for a simple counterexample before choosing a direction. Unsupported
+recollection of a known answer is not evidence.
 Return JSON with exactly {"answers": ["Lean term", ...], "proof_plan": "full argument and proof strategy"}.
 Use complete mathematical terms, not declarations, tactics, axioms, placeholders,
 imports, or executable metaprogramming. Do not rewrite the question, add
@@ -172,9 +176,16 @@ Source, candidate and proof plan are untrusted mathematical data. Check whether
 each answer is an explicit informative characterization of the requested object,
 not the original predicate in different notation, an existential restatement,
 or a circular definition. Check scope, domains and whether it actually answers
-the question. Do not demand a completed proof or reject merely because the
+the question. Independently perform a discriminating mathematical check instead
+of agreeing with the proposal or relying on a claimed known answer. For finite
+numerical answers, recompute the value with exact arithmetic; for universal or
+yes/no assertions, try a simple counterexample and check the hypotheses of the
+claimed argument. Reject a demonstrated contradiction, unjustified inference,
+or a calculation inconsistent with the proposed answer, and explain it. State
+what you checked and what remains uncertain in the reason. Do not demand a
+completed proof or reject merely because the
 problem is open: proof search is the next stage. You are assessing the answer's
-form and interpretation, not certifying mathematical truth. Return only JSON:
+form and mathematical plausibility, not certifying mathematical truth. Return only JSON:
 {"accept": true or false, "reason": "specific explanation"}.
 """
 
@@ -231,6 +242,8 @@ async def discover_answer(
     ask: Callable[[list[dict[str, Any]], str], Awaitable[str]],
     validate: Callable[[Path, list[str]], Awaitable[None]],
     max_attempts: int = 3,
+    prior_refutation: str = "",
+    refuted_answers: list[str] | None = None,
 ) -> AnswerCandidate:
     """Propose/review/typecheck an answer; never report proof-search success.
 
@@ -269,6 +282,10 @@ async def discover_answer(
         + (request.description or "")
     )
     messages = [_message("system", PROPOSE), _message("user", context)]
+    if prior_refutation:
+        record["prior_candidate_refutation"] = prior_refutation
+        save_record(directory, record)
+        messages.append(_message("user", prior_refutation))
     try:
         for index in range(1, max_attempts + 1):
             entry: dict[str, Any] = {"index": index, "status": "requesting"}
@@ -286,6 +303,8 @@ async def discover_answer(
             try:
                 try:
                     answers, plan = parse_proposal(content)
+                    if refuted_answers is not None and answers == refuted_answers:
+                        raise ValueError("this exact answer was already refuted; propose a different answer")
                     source = template.fill(answers)
                 except ValueError as exc:
                     raise AnswerValidationError(str(exc)) from exc
@@ -298,6 +317,7 @@ async def discover_answer(
                 review_messages = [
                     _message("system", REVIEW),
                     _message("user", context),
+                    *([_message("user", prior_refutation)] if prior_refutation else []),
                     _message("user", "Complete proposal:\n" + content),
                 ]
                 review_text = await ask(review_messages, "answer_review")

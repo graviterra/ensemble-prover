@@ -11,17 +11,13 @@ from typing import Any, Iterable, Literal, Mapping, Sequence
 
 
 MINI_THEORY_SCHEMA_VERSION = 3
-# 15: verifier audit now (a) namespaces dotted declaration names, (b) rejects
-# `_root_`-escaping declarations, (c) tracks `end NAME` with Lean's real
-# per-segment popping (a partial-width `end` previously desynchronised the
-# namespace stack and could drop a declaration from the per-declaration
-# audit entirely), and (d) adds a fail-closed environment-level backstop that
-# rejects any constant under the bundle namespace whose transitive axiom
-# closure escapes the allowlist — regardless of how the name parser behaved.
-# Receipts issued under <=14 may have skipped the axiom/anti-shortcut audits
-# for a mis-namespaced declaration, so bundles verified under <=14 must not be
-# served or reused.
-THEORY_POLICY_VERSION = 15
+# 17: context capture respects comment state around quoted identifiers, and
+# verifier support imports and apostrophe masking no longer reject valid
+# helpers. Policy-16 contexts cannot be reconstructed from extracted commands;
+# their outbox receipts require recapture from the original session preamble.
+# Advancing the policy also invalidates earlier published bundles and terminal
+# rejections instead of reusing their stale semantic/verification evidence.
+THEORY_POLICY_VERSION = 17
 
 TheoryNeedKind = Literal[
     "definition",
@@ -92,14 +88,23 @@ def render_theory_module(
     namespace: str,
     imports: Sequence[str],
     body: str,
+    context_commands: Sequence[str] = (),
 ) -> str:
+    from .promotion_context import promotion_context_namespace, validate_promotion_context
+
+    context = validate_promotion_context(context_commands)
+    ambient = promotion_context_namespace(context)
+    local_namespace = namespace.removeprefix(ambient + ".") if ambient else namespace
     import_block = "\n".join(f"import {module}" for module in imports)
     parts = [
         import_block,
         "set_option autoImplicit false",
-        f"namespace {namespace}",
+        "\n".join(context),
+        f"namespace {local_namespace}",
         _clean_text(body),
-        f"end {namespace}",
+        f"end {local_namespace}",
+        "\n".join("end " + command.removeprefix("namespace ") for command in reversed(context) if command.startswith("namespace ")),
+
     ]
     return "\n\n".join(part for part in parts if part).strip()
 
@@ -293,6 +298,7 @@ class TheoryBundleCandidate:
     generated_by_run: str = ""
     generated_by_model: str = ""
     source_theorem: str = ""
+    context_commands: tuple[str, ...] = ()
 
     @classmethod
     def create(
@@ -306,7 +312,11 @@ class TheoryBundleCandidate:
         generated_by_run: str = "",
         generated_by_model: str = "",
         source_theorem: str = "",
+        context_commands: Sequence[str] = (),
     ) -> "TheoryBundleCandidate":
+        from .promotion_context import promotion_context_namespace, validate_promotion_context
+
+        context = validate_promotion_context(context_commands)
         clean_domain = _clean_text(domain)
         clean_source = _theory_body_without_imports(source)
         if not clean_domain:
@@ -323,16 +333,22 @@ class TheoryBundleCandidate:
             "imports": clean_imports,
             "dependency_bundle_ids": clean_dependencies,
         }
+        if context:
+            identity["context_commands"] = context
         bundle_id = content_hash(_canonical_json(identity))
         domain_segment = sanitize_module_segment(clean_domain)
         module_name = (
             f"MiniTheory.Domains.{domain_segment}.Bundles.B_{bundle_id}.Theory"
         )
         namespace = f"MiniTheory.Domains.{domain_segment}.B_{bundle_id}"
+        ambient = promotion_context_namespace(context)
+        if ambient:
+            namespace = ambient + "." + namespace
         rendered_source = render_theory_module(
             namespace=namespace,
             imports=clean_imports,
             body=clean_source,
+            context_commands=context,
         )
         return cls(
             candidate_id=f"candidate_{bundle_id}",
@@ -348,10 +364,13 @@ class TheoryBundleCandidate:
             generated_by_run=_clean_text(generated_by_run),
             generated_by_model=_clean_text(generated_by_model),
             source_theorem=_clean_text(source_theorem),
+            context_commands=context,
         )
 
     def to_dict(self, *, include_source: bool = True) -> dict[str, Any]:
         payload = asdict(self)
+        if not self.context_commands:
+            payload.pop("context_commands", None)
         if not include_source:
             payload.pop("source", None)
         return payload
@@ -409,9 +428,12 @@ class PublishedTheoryBundle:
     created_ts: float = 0.0
     status: str = "published"
     manifest_hash: str = ""
+    context_commands: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        if not self.context_commands:
+            payload.pop("context_commands", None)
         payload["declarations"] = [item.to_dict() for item in self.declarations]
         return payload
 
@@ -422,7 +444,10 @@ class PublishedTheoryBundle:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "PublishedTheoryBundle":
+        from .promotion_context import validate_promotion_context
+
         data = dict(payload)
+        data["context_commands"] = validate_promotion_context(data.get("context_commands", ()))
         for key in ("imports", "dependency_bundle_ids", "satisfies_need_ids"):
             data[key] = tuple(data.get(key) or ())
         data["declarations"] = tuple(

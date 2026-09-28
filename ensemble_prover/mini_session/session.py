@@ -10985,6 +10985,10 @@ class MiniSession:
     # distinct from the upfront recursive prepass: exhausting the prepass
     # must not make the fallback disappear before it can run after stall.
     adaptive_recursive_pass_budget_remaining: int = 0
+    # Bounded provider cooldowns outlive any one recursive planner cursor.
+    # Keys are protected worker/configuration identities, never credentials;
+    # values are retry timestamps so long attempts can regain a repaired lane.
+    planner_escalation_failure_state: Dict[str, float] = field(default_factory=dict)
 
     # recursion-depth bound for the helper-prover
     # action. The root MiniSession is depth=0; child sessions spawned by
@@ -24172,6 +24176,13 @@ class MiniSession:
                     restore_dispatch_stage_authority_once()
                 except BaseException:
                     raise
+                # A joined cancellation has settled provider exposure and
+                # restored terminal authority. Release the checkpoint fence
+                # before background research settles in the owner's finally
+                # block. Resistant tails must retain their existing fence.
+                if (not self._operator_cancelled_dispatch_reuse_fenced
+                        and not self._pending_isolated_dispatch_tails):
+                    self._inflight_action_dispatch_id = ""
                 raise
             except DispatchScopeDetached as exc:
                 # A nested strict-deadline operation has already invalidated

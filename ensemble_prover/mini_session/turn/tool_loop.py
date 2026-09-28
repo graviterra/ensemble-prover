@@ -103,11 +103,29 @@ from ...provider_tool_protocol import (
 from ...utils import (
     canonical_lean_identifier,
     display_line_count,
+    extract_code_fences,
     format_exception,
     parse_tool_arguments,
 )
 from ...deadline_guard import detach_task_from_loop_shutdown
 from ..process_watchdog import begin_process_deadline
+
+
+def _find_forbidden_final_command(content: str) -> Optional[str]:
+    """Apply the proof extractor's safe preamble normalization before its gate.
+
+    Leading imports are discarded, never executed, and leading opens are
+    replayed by proof extraction as local scopes. Every remaining command
+    still passes the same policy check and downstream Lean validation.
+    """
+
+    text = str(content or "")
+    for source in extract_code_fences(text) or [text]:
+        normalized, _opens = _partition_redundant_preamble_commands(source)
+        forbidden = _find_forbidden_lean_command([], normalized)
+        if forbidden is not None:
+            return forbidden
+    return None
 
 
 class SelectedProofIdeaDispatchContextError(RuntimeError):
@@ -3946,6 +3964,25 @@ async def _call_llm_with_tools_one_round_impl(
         nonlocal llm_error, llm_failure_kind, llm_failure_reason
         nonlocal llm_retryable, llm_terminal
         clean_reason = str(reason or "").strip()
+        if clean_reason == "final_no_tools_token_exhausted":
+            # A later scheduler action must not silently repeat the same
+            # all-reasoning response. Narrow the next step without granting
+            # another call or exceeding an operator's completion allowance.
+            guidance = (
+                "The previous response exhausted the completion allowance "
+                "before returning a usable Lean artifact or tool call. On "
+                "the next attempt, take one small Lean-checkable step: emit "
+                "one focused tool call when tools are available, or one "
+                "complete concise proof artifact otherwise. Reuse the "
+                "existing verified context; do not restart a long derivation."
+            )
+            conv.ensure_bootstrap()
+            if not any(
+                isinstance(message, Mapping)
+                and message.get("content") == guidance
+                for message in conv.history
+            ):
+                conv.history.append({"role": "user", "content": guidance})
         _advance_chain_after_unusable_output()
         llm_error = clean_reason
         llm_failure_kind = clean_reason
@@ -4822,7 +4859,7 @@ async def _call_llm_with_tools_one_round_impl(
                             content = ""
                             break
                 forbidden_final_command = (
-                    _find_forbidden_lean_command([], str(content or ""))
+                    _find_forbidden_final_command(str(content or ""))
                     if use_tools and tools_list and is_deepseek_client(client)
                     else None
                 )

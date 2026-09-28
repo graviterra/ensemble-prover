@@ -741,7 +741,10 @@ class RecursiveControllerAction:
         return str(getattr(session.problem, "docstring", "") or "")
 
     async def run(self, session: Any) -> MiniOutcome:
-        from ensemble_prover.mini_recursive import run_mini_recursive_attempt
+        from ensemble_prover.mini_recursive import (
+            planner_escalation_state_for_session,
+            run_mini_recursive_attempt,
+        )
         from ensemble_prover.mini_prover import Conversation
 
         started = time.monotonic()
@@ -1033,6 +1036,9 @@ class RecursiveControllerAction:
             refiner_client=session.refiner_client,
             planner_escalation_client=getattr(
                 session, "planner_escalation_client", None
+            ),
+            planner_escalation_failure_state=(
+                planner_escalation_state_for_session(session)
             ),
             lean=session.lean,
             llm_preamble=str(getattr(session.conv, "preamble", "") or ""),

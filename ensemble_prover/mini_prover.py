@@ -369,6 +369,7 @@ from .provider_tool_protocol import (
     mini_bounded_visible_output_reasoning_effort,
     mini_deepseek_v4_model,
     mini_gpt6_model,
+    mini_qwen_mandatory_reasoning_model,
     mini_model_output_capacity,
     mini_visible_output_reasoning_effort,
     preflight_mini_reasoning_contract,
@@ -12515,7 +12516,7 @@ def _model_token_defaults(
     # OpenRouter IDs are namespaced as ``provider/model``. Capability matching
     # is about the routed model, not the transport namespace.
     name = _routed_model_name(model)
-    if name.startswith("deepseek-v4") or mini_deepseek_v4_model(
+    if mini_deepseek_v4_model(
         str(model or ""), base_url=_PROVIDER_BASE_URLS.get(str(provider or "").lower(), "")
     ):
         return 1_000_000, 384_000
@@ -12523,6 +12524,10 @@ def _model_token_defaults(
         return 400_000, 128_000
     if name.startswith("gpt-5.6"):
         return 1_050_000, 128_000
+    if mini_qwen_mandatory_reasoning_model(name):
+        # A local completion allowance, including mandatory hidden reasoning.
+        # This is not a claim about the provider context window or maximum.
+        return None, 48_000
     if mini_gpt6_model(name):
         # Local default allowance for hidden reasoning plus visible output.
         # No provider context window or maximum is asserted for this family.
@@ -12537,7 +12542,7 @@ def _model_timeout_default(
 ) -> float:
     name = _routed_model_name(model)
     provider_name = str(provider or "").strip().lower()
-    if name.startswith("deepseek-v4") or mini_deepseek_v4_model(
+    if mini_deepseek_v4_model(
         str(model or ""), base_url=_PROVIDER_BASE_URLS.get(str(provider or "").lower(), "")
     ):
         return 600.0
@@ -12989,6 +12994,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--resume-from", default=None,
         help="Resume an attempt checkpoint into a new output generation, retaining its saved configuration.",
     )
+    input_group.add_argument(
+        "--rediscover-from", default=None, metavar="REFUTED_RUN",
+        help=("Explicitly discover a different answer after an audited candidate refutation. "
+              "Restores the original question into a fresh run and retains remaining cost/time limits."),
+    )
+    p.add_argument("--answer-refutation-from", default=None, help=argparse.SUPPRESS)
     p.add_argument(
         "--resume-accept-source-hash", default="", metavar="SAVED_SHA256",
         help=("Explicitly approve resuming after an executor update by supplying the saved "
@@ -17935,6 +17946,10 @@ def main() -> int:
     if not is_watchdog_worker():
         from .answer_input_cli import run_cli as run_answer_input, should_discover
 
+        if args.rediscover_from:
+            from .answer_rediscovery import run_rediscovery
+
+            return run_rediscovery(sys.argv[1:])
         try:
             discover_answer = should_discover(args)
         except (ValueError, OSError) as error:
@@ -18024,6 +18039,15 @@ def main() -> int:
                     supervised_output_dir,
                     args=args,
                 )
+                from .answer_rediscovery import recovery_command
+
+                correction = recovery_command(supervised_output_dir)
+                if correction:
+                    print(
+                        "The proposed answer was refuted. To investigate a corrected answer "
+                        "in a fresh run with the remaining budget:\n" + correction,
+                        flush=True,
+                    )
             return worker_rc
         export_rc = _complete_supervised_solved_export(
             supervised_output_dir,

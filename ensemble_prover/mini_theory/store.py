@@ -285,6 +285,7 @@ class TheoryStore:
             domain=candidate.domain,
             module_name=candidate.module_name,
             namespace=candidate.namespace,
+            context_commands=candidate.context_commands,
             source_hash=candidate.source_hash,
             imports=candidate.imports,
             dependency_bundle_ids=candidate.dependency_bundle_ids,
@@ -469,7 +470,12 @@ class TheoryStore:
         expected_module = (
             f"MiniTheory.Domains.{expected_segment}.Bundles.B_{bundle_id}.Theory"
         )
+        from .promotion_context import promotion_context_namespace
+
         expected_namespace = f"MiniTheory.Domains.{expected_segment}.B_{bundle_id}"
+        ambient = promotion_context_namespace(bundle.context_commands)
+        if ambient:
+            expected_namespace = ambient + "." + expected_namespace
         if (
             bundle.schema_version != MINI_THEORY_SCHEMA_VERSION
             or bundle.bundle_id != bundle_id
@@ -580,18 +586,20 @@ class TheoryStore:
         bundle: PublishedTheoryBundle,
         source: str,
     ) -> bool:
-        import_block = "\n".join(f"import {module}" for module in bundle.imports)
-        prefix = "\n\n".join(
-            part
-            for part in (
-                import_block,
-                "set_option autoImplicit false",
-                f"namespace {bundle.namespace}",
-            )
-            if part
-        ) + "\n\n"
-        suffix = f"\n\nend {bundle.namespace}"
-        if not source.startswith(prefix) or not source.endswith(suffix):
+        from .model import render_theory_module
+
+        # A generated marker identifies the body boundaries while retaining
+        # the original command ordering and each explicit namespace close.
+        marker = "ensembleTheoryBodyBoundary"
+        header_text = "\n".join((*bundle.imports, bundle.namespace, *bundle.context_commands))
+        while marker in header_text:
+            marker += "_"
+        wrapper = render_theory_module(
+            namespace=bundle.namespace, imports=bundle.imports,
+            body=marker, context_commands=bundle.context_commands,
+        )
+        prefix, separator, suffix = wrapper.partition(marker)
+        if not separator or not source.startswith(prefix) or not source.endswith(suffix):
             return False
         body = source[len(prefix) : -len(suffix)]
         try:
@@ -600,6 +608,7 @@ class TheoryStore:
                 source=body,
                 imports=bundle.imports,
                 dependency_bundle_ids=bundle.dependency_bundle_ids,
+                context_commands=bundle.context_commands,
             )
         except (TypeError, ValueError):
             return False

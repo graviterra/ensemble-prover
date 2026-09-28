@@ -24,11 +24,13 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 from ..proof_dossier import VerifiedHelper, text_hash
 from .model import THEORY_POLICY_VERSION, TheoryBundleCandidate
+from .promotion_context import helper_promotion_context, validate_promotion_context, split_promotion_context
 
 
-PROMOTION_OUTBOX_SCHEMA_VERSION = 2
-_SUPPORTED_PROMOTION_OUTBOX_SCHEMA_VERSIONS = frozenset({1, 2})
-PROMOTION_RESULT_POLICY_VERSION = 3
+PROMOTION_OUTBOX_SCHEMA_VERSION = 3
+_SUPPORTED_PROMOTION_OUTBOX_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+PROMOTION_RESULT_POLICY_VERSION = 4
+_CONTEXT_RECAPTURE_POLICY_VERSIONS = frozenset({16})
 _HEX_32_RE = re.compile(r"^[0-9a-f]{32}$")
 _HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
 _NON_GENERIC_QUALITY_TAGS = frozenset(
@@ -47,6 +49,18 @@ _NON_GENERIC_PROVENANCE_TAGS = frozenset(
         "root_finalization_certificate",
     }
 )
+
+
+def _supported_schema_version(value: Any) -> bool:
+    return type(value) is int and value in _SUPPORTED_PROMOTION_OUTBOX_SCHEMA_VERSIONS
+
+
+def _requires_context_recapture(entry: "PromotionOutboxEntry") -> bool:
+    # Policy 16 could add or omit ambient commands, even producing an empty
+    # context. The receipt has no original preamble with which to repair it.
+    # Keep these entries in authority history so restaging supersedes them
+    # and never revives an older producer/helper receipt.
+    return entry.policy_version in _CONTEXT_RECAPTURE_POLICY_VERSIONS
 
 
 def _canonical_json(payload: Mapping[str, Any]) -> str:
@@ -137,10 +151,12 @@ class PromotionDependencyReceipt:
     source_hash: str
     source_sha256: str = ""
     source: str = ""
+    context_commands: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "PromotionDependencyReceipt":
         return cls(
+            context_commands=validate_promotion_context(payload.get("context_commands", ())),
             helper_name=str(payload.get("helper_name") or "").strip(),
             source_hash=str(payload.get("source_hash") or "").strip(),
             source_sha256=str(payload.get("source_sha256") or "").strip(),
@@ -170,10 +186,14 @@ class PromotionOutboxEntry:
     created_ts: float = 0.0
     workspace_id: str = ""
     supersedes_entry_id: str = ""
+    context_commands: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "PromotionOutboxEntry":
         return cls(
+            context_commands=validate_promotion_context(
+                payload.get("context_commands", ())
+            ),
             schema_version=int(payload.get("schema_version") or 0),
             entry_id=str(payload.get("entry_id") or "").strip(),
             receipt_sha256=str(payload.get("receipt_sha256") or "").strip(),
@@ -230,6 +250,10 @@ class PromotionOutboxEntry:
             excluded.append("owner_id")
             excluded.append("workspace_id")
             excluded.append("supersedes_entry_id")
+        if self.schema_version <= 2:
+            excluded.append("context_commands")
+            for dependency in payload["support_receipts"]:
+                dependency.pop("context_commands", None)
         for key in excluded:
             payload.pop(key, None)
         return payload
@@ -237,6 +261,10 @@ class PromotionOutboxEntry:
     def receipt_payload(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("receipt_sha256", None)
+        if self.schema_version <= 2:
+            payload.pop("context_commands", None)
+            for dependency in payload["support_receipts"]:
+                dependency.pop("context_commands", None)
         if self.schema_version <= 1:
             payload.pop("workspace_id", None)
             payload.pop("supersedes_entry_id", None)
@@ -357,6 +385,7 @@ class PromotionOutbox:
         domain: str,
         imports: Sequence[str],
         owner_id: str,
+        context_commands: Sequence[str] = (),
         generated_by_run: str = "",
         generated_by_model: str = "",
         source_theorem: str = "",
@@ -486,6 +515,7 @@ class PromotionOutbox:
                     helper,
                     domain=domain,
                     imports=imports,
+                    context_commands=context_commands,
                     owner_id=owner_id,
                     generated_by_run=generated_by_run,
                     generated_by_model=generated_by_model,
@@ -505,6 +535,7 @@ class PromotionOutbox:
                             helper,
                             domain=domain,
                             imports=imports,
+                            context_commands=context_commands,
                             owner_id=owner_id,
                             generated_by_run=generated_by_run,
                             generated_by_model=generated_by_model,
@@ -583,6 +614,7 @@ class PromotionOutbox:
         domain: str,
         imports: Sequence[str],
         owner_id: str,
+        context_commands: Sequence[str] = (),
         generated_by_run: str = "",
         generated_by_model: str = "",
         source_theorem: str = "",
@@ -607,6 +639,7 @@ class PromotionOutbox:
                 helper,
                 domain=domain,
                 imports=imports,
+                context_commands=context_commands,
                 owner_id=owner_id,
                 generated_by_run=generated_by_run,
                 generated_by_model=generated_by_model,
@@ -669,6 +702,7 @@ class PromotionOutbox:
             entry.support_receipts,
             entry.domain,
             entry.imports,
+            entry.context_commands,
             entry.origin_environment_key,
             tuple(sorted(entry.forbidden_problem_constants)),
             entry.policy_version,
@@ -800,6 +834,7 @@ class PromotionOutbox:
         domain: str,
         imports: Sequence[str],
         owner_id: str,
+        context_commands: Sequence[str] = (),
         source_theorem: str,
         forbidden_problem_constants: Sequence[str],
         workspace_id: str = "",
@@ -862,6 +897,7 @@ class PromotionOutbox:
                         source_hash=dependency_hash,
                         source_sha256=_sha256(dependency_source),
                         source=dependency_source,
+                        context_commands=helper_promotion_context(dependency_source, context_commands),
                     )
                 )
             if not complete:
@@ -871,6 +907,7 @@ class PromotionOutbox:
                 source_hash,
                 _sha256(source),
                 tuple(support_receipts),
+                helper_promotion_context(source, context_commands),
             )
         if not expected:
             return set()
@@ -962,6 +999,7 @@ class PromotionOutbox:
                     entry.source_hash,
                     entry.source_sha256,
                     entry.support_receipts,
+                    entry.context_commands,
                 )
                 == identity
             ):
@@ -1013,10 +1051,13 @@ class PromotionOutbox:
         )
         published = 0
         rejected = 0
+        context_recapture_required = 0
         authoritative_ids = context.authoritative_ids
         for entry in entries:
             if entry.entry_id not in authoritative_ids:
                 continue
+            if _requires_context_recapture(entry):
+                context_recapture_required += 1
             result = self._read_result(entry, _context=context)
             status = str((result or {}).get("status") or "")
             if status == "published":
@@ -1032,6 +1073,7 @@ class PromotionOutbox:
             "claimed": claimed,
             "published": published,
             "rejected": rejected,
+            "context_recapture_required": context_recapture_required,
         }
 
     def owner_ids_for_generated_run(
@@ -1144,6 +1186,21 @@ class PromotionOutbox:
                     break
                 if limit and report.attempted >= limit:
                     break
+                if _requires_context_recapture(entry):
+                    # Recompiling the extracted commands would simply certify
+                    # the wrong context again. Only a fresh session capture can
+                    # replace this receipt; no claim or terminal result is due.
+                    report.deferred += 1
+                    processed.add(entry.entry_id)
+                    self._event(
+                        report,
+                        event_callback,
+                        phase="domain_theory_promotion",
+                        helper_name=entry.helper_name,
+                        diagnostic="promotion_context_recapture_required",
+                        verdict="helper_promotion_deferred_context_recapture",
+                    )
+                    continue
                 current_owner_has_authority = current_owner_id in (
                     validation_context.authority_owner_ids_by_entry.get(
                         entry.entry_id,
@@ -1182,7 +1239,8 @@ class PromotionOutbox:
                         (
                             candidate_result
                             for provider in providers
-                            if (
+                            if self._dependency_provider_matches(entry, dependency, provider)
+                            and (
                                 candidate_result := self._read_result(
                                     provider,
                                     _context=validation_context,
@@ -1473,6 +1531,7 @@ class PromotionOutbox:
         domain: str,
         imports: Sequence[str],
         owner_id: str,
+        context_commands: Sequence[str] = (),
         generated_by_run: str,
         generated_by_model: str,
         source_theorem: str,
@@ -1526,6 +1585,7 @@ class PromotionOutbox:
                         _sha256(dependency_source) if dependency_source else ""
                     ),
                     source=dependency_source,
+                    context_commands=helper_promotion_context(dependency_source, context_commands),
                 )
             )
         entry = PromotionOutboxEntry(
@@ -1559,6 +1619,7 @@ class PromotionOutbox:
             ),
             policy_version=self.policy_version,
             created_ts=time.time(),
+            context_commands=helper_promotion_context(source, context_commands),
             workspace_id=workspace,
             supersedes_entry_id=str(supersedes_entry_id or "").strip(),
         )
@@ -1697,7 +1758,7 @@ class PromotionOutbox:
                         entry = self._read_entry(path)
                     except (OSError, ValueError, json.JSONDecodeError):
                         continue
-                    if entry.schema_version != 2:
+                    if entry.schema_version < 2:
                         continue
                     key = (
                         entry.origin_environment_key,
@@ -1725,7 +1786,18 @@ class PromotionOutbox:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, Mapping):
             raise ValueError("promotion receipt must be an object")
-        entry = PromotionOutboxEntry.from_dict(payload)
+        if not _supported_schema_version(payload.get("schema_version")):
+            raise ValueError("malformed promotion receipt schema version")
+        try:
+            entry = PromotionOutboxEntry.from_dict(payload)
+        except (TypeError, OverflowError) as exc:
+            # Malformed JSON shapes must be an invalid receipt, not an
+            # exception that aborts the entire shared-inbox maintenance pass.
+            raise ValueError("malformed promotion receipt structure") from exc
+        if entry.schema_version <= 2 and (
+            entry.context_commands or any(item.context_commands for item in entry.support_receipts)
+        ):
+            raise ValueError("legacy promotion context is not authenticated")
         if entry.schema_version not in _SUPPORTED_PROMOTION_OUTBOX_SCHEMA_VERSIONS:
             raise ValueError("unsupported promotion receipt schema")
         if not _HEX_64_RE.fullmatch(entry.entry_id):
@@ -1810,7 +1882,9 @@ class PromotionOutbox:
         entry: PromotionOutboxEntry,
         dependency_results: Sequence[Mapping[str, Any]],
     ) -> tuple[VerifiedHelper, tuple[str, ...], tuple[str, ...]]:
-        source = entry.source
+        if _requires_context_recapture(entry):
+            raise ValueError("promotion_context_recapture_required")
+        source = "\n".join((*helper_promotion_context(entry.source, entry.context_commands), entry.source))
         dependency_ids: list[str] = []
         imports = list(entry.imports)
         for dependency, result in zip(entry.support_receipts, dependency_results):
@@ -1843,6 +1917,25 @@ class PromotionOutbox:
             },
         )
         return helper, tuple(dependency_ids), tuple(imports)
+
+    @staticmethod
+    def _dependency_provider_matches(
+        entry: PromotionOutboxEntry,
+        receipt: PromotionDependencyReceipt,
+        provider: PromotionOutboxEntry,
+    ) -> bool:
+        if _requires_context_recapture(provider):
+            return False
+        # Equal source text can elaborate differently under different opens or
+        # imports. The dependency's context is captured before adding the
+        # dependent helper's own generated universe declarations.
+        expected_context = helper_promotion_context(
+            receipt.source or provider.source, receipt.context_commands,
+        )
+        return (
+            provider.imports == entry.imports
+            and helper_promotion_context(provider.source, provider.context_commands) == expected_context
+        )
 
     def _published_result(self, entry: PromotionOutboxEntry, result: Any, bundle: Any):
         declarations = tuple(getattr(bundle, "declarations", ()) or ())
@@ -2171,8 +2264,7 @@ class PromotionOutbox:
         workspace_id = str(payload.get("workspace_id") or "").strip()
         helper_name = str(payload.get("helper_name") or "").strip()
         if (
-            payload.get("schema_version")
-            not in _SUPPORTED_PROMOTION_OUTBOX_SCHEMA_VERSIONS
+            not _supported_schema_version(payload.get("schema_version"))
             or not origin_environment_key
             or not _HEX_32_RE.fullmatch(owner_id)
             or not _HEX_32_RE.fullmatch(workspace_id)
@@ -2610,17 +2702,20 @@ class PromotionOutbox:
         *,
         _context: Optional[_ResultValidationContext] = None,
     ) -> bool:
-        if entry is None or not isinstance(payload, dict):
+        if (
+            entry is None
+            or _requires_context_recapture(entry)
+            or not isinstance(payload, dict)
+        ):
             return False
         if (
-            payload.get("schema_version")
-            not in _SUPPORTED_PROMOTION_OUTBOX_SCHEMA_VERSIONS
+            not _supported_schema_version(payload.get("schema_version"))
             or payload.get("result_policy_version")
             != PROMOTION_RESULT_POLICY_VERSION
             or payload.get("entry_id") != entry.entry_id
             or payload.get("environment_key") != self.environment_key
             or payload.get("policy_version") != self.policy_version
-            or payload.get("status") not in {"published", "terminal_rejected"}
+            or payload.get("status") not in ("published", "terminal_rejected")
         ):
             return False
         if payload.get("status") == "terminal_rejected":
@@ -2701,7 +2796,8 @@ class PromotionOutbox:
                     (
                         candidate
                         for provider in providers
-                        if (
+                        if self._dependency_provider_matches(entry, receipt, provider)
+                        and (
                             candidate := self._read_result(
                                 provider,
                                 _context=context,
@@ -2715,7 +2811,7 @@ class PromotionOutbox:
                 if provider_result is None:
                     return False
                 dependency_results.append(provider_result)
-            body = entry.source
+            body = "\n".join((*helper_promotion_context(entry.source, entry.context_commands), entry.source))
             namespaces = [
                 str(item.get("namespace") or "")
                 for item in dependency_results
@@ -2729,9 +2825,11 @@ class PromotionOutbox:
                     expected_imports.append(dependency_module)
             if tuple(bundle.imports or ()) != tuple(expected_imports):
                 return False
+            replay_context, declaration_body = split_promotion_context(body)
             expected = TheoryBundleCandidate.create(
                 domain=entry.domain,
-                source=body,
+                source=declaration_body,
+                context_commands=replay_context,
                 imports=tuple(expected_imports),
                 dependency_bundle_ids=dependency_ids,
             )
@@ -2768,8 +2866,7 @@ class PromotionOutbox:
             payload.get("required_authority_owner_id") or ""
         )
         if (
-            payload.get("schema_version")
-            not in _SUPPORTED_PROMOTION_OUTBOX_SCHEMA_VERSIONS
+            not _supported_schema_version(payload.get("schema_version"))
             or payload.get("result_policy_version")
             != PROMOTION_RESULT_POLICY_VERSION
             or payload.get("entry_id") != entry_id
