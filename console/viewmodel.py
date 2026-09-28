@@ -101,6 +101,8 @@ def lanes_text(state: RunState) -> list[str]:
 
 
 def status_lines(run: AttachedRun) -> list[str]:
+    if run.info.kind == "input_batch":
+        return batch_status_lines(run.info)
     state, summary = run.state, run.summary
     snap = state.snapshot
     theorem = summary.problem or run.info.label
@@ -126,6 +128,14 @@ def status_lines(run: AttachedRun) -> list[str]:
     boundary = " · resumed generation" if state.generation_boundary else ""
     l3 = f"{process_text(run.info, run.liveness, summary)} · lanes {' '.join(lane_bits) or 'none'}{deferred}{backlog}{boundary}"
     return [l1, l2, l3]
+
+
+def batch_status_lines(info: RunInfo) -> list[str]:
+    """A batch is an orchestration record, never a theorem's proof summary."""
+    counts = ", ".join(f"{status}={count}" for status, count in sorted(info.batch_counts.items()))
+    return [f"Input batch {info.name} · {info.batch_state}",
+            f"Targets: {counts or 'preparation in progress'}",
+            "Use /runs and /attach to inspect individual proofs and checkpoints."]
 
 
 def config_lines(state: RunState) -> list[str]:
@@ -216,5 +226,9 @@ def run_listing_lines(listing: list[RunInfo], *, now: float | None = None) -> li
             flags.append("checkpoints")
         if info.attempt_id:
             flags.append(f"attempt {info.attempt_id[:8]}")
+        if info.target_status:
+            flags.append(info.target_status)
+        if info.kind == "input_batch":
+            flags = [info.batch_state]
         lines.append(f"{index:3d}. {info.label:60s} {fmt_age(age_seconds(info.last_write_ts, now=now)):>10s}  {info.turns_bytes / 1e6:7.1f} MB  {' '.join(flags)}")
     return lines or ["no run directories found"]

@@ -254,8 +254,51 @@ run.
 
 ## 4. Prepare an arbitrary theorem project
 
-`--lean-file` is the general interface. The project directory must exist and
-contain `lakefile.lean` or `lakefile.toml`.
+Pass a Lean file or directory directly to discover its unfinished problems:
+
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover /path/to/problems --prover openai
+```
+
+`--input PATH` is equivalent. `--lean-file PATH` also discovers targets when
+given a directory or when the theorem or project selection is omitted.
+Use `--theorem-name` to select a declaration rather than all unfinished targets.
+
+Discovery recursively visits Lean sources, skipping dependency caches, build
+directories, and nested symbolic links. Each file uses its containing Lake
+project, including when the directory contains multiple projects. Loose sources
+use an available `lean_project` runtime; `--project-path` selects a compatible
+project explicitly. A conflicting source toolchain pin requires an explicit
+project selection. The project must exist and contain `lakefile.lean` or
+`lakefile.toml`. Lean and Lake must be available; preparation builds required
+local imports using the selected project.
+
+Mini prepares immutable per-target inputs without modifying the originals.
+Lean compares the target's elaborated type and retained declaration contracts
+before and after isolating it from other unfinished theorems. Independent
+problems can proceed even when an earlier declaration contains `sorry`.
+Unresolved dependencies and changes to the mathematical contract block that
+target and appear in `batch_manifest.json`. Arbitrary compiler errors are not
+silently removed. A recognized unavailable elaborator compatibility option can
+be removed from the prepared copy, with the adjustment recorded in the manifest.
+Automatic preparation requires location-independent elaboration. Recognized
+uses of source-relative file inclusion or custom elaborators that depend on the
+input's module name or source location are reported as unsupported.
+Compiler-discovered unfinished declarations
+outside the supported declaration syntax are reported rather than skipped.
+
+Add `--check-input` to run discovery and local Lean checks without contacting a
+model. Otherwise ready targets run sequentially using the ordinary supervised
+proof and export workflow. Existing model, reasoning, recursive-search, and
+budget settings apply independently to each target; there is no shared batch
+budget. Directory ingestion adds no proof-search time or token cap. Preparation
+respects `--lean-timeout-s` and `--lean-max-heartbeats`. Ctrl-C stops the active
+attempt and the queue. Individual
+attempts retain their normal checkpoints and `--resume-from` command. A new
+directory launch requires a fresh output directory.
+
+For explicit selection of one theorem, `--lean-file`, `--theorem-name`, and
+`--project-path` retain the ordinary single-target interface.
 
 A minimal target file can look like this:
 

@@ -26,14 +26,16 @@ EXCLUDED_DIR_NAMES = frozenset(
 )
 RUN_MARKERS = ("turns.jsonl", "run.log", "summary.json", "attempt_checkpoint.json")
 _MAX_SMALL_JSON = 1024 * 1024
+_MAX_INPUT_BATCH_JSON = 32 * 1024 * 1024
 _MAX_CMDLINE = 64 * 1024
+_INPUT_GENERATION_MARKER = ".ensemble-input-generation"
 
 
 @dataclass
 class RunInfo:
     path: Path
     name: str
-    kind: str = "run"  # run | sweep_attempt
+    kind: str = "run"  # run | sweep_attempt | input_batch | input_attempt
     sweep: str = ""
     has_turns: bool = False
     has_summary: bool = False
@@ -44,11 +46,20 @@ class RunInfo:
     turns_bytes: int = 0
     last_write_ts: float | None = None
     attempt_id: str = ""
+    batch_root: str = ""
+    batch_state: str = ""
+    batch_counts: dict[str, int] = field(default_factory=dict)
+    target_name: str = ""
+    target_status: str = ""
 
     @property
     def label(self) -> str:
         if self.kind == "sweep_attempt":
             return f"{self.sweep}/{self.name}"
+        if self.kind == "input_attempt":
+            return f"{Path(self.batch_root).name}/{self.target_name}"
+        if self.kind == "input_batch":
+            return f"{self.name} [input batch]"
         return self.name
 
 
@@ -66,19 +77,101 @@ def _is_real_dir(path: Path) -> bool:
         return False
 
 
-def _read_small_json(path: Path) -> Any:
+def _read_small_json(path: Path, *, max_bytes: int = _MAX_SMALL_JSON) -> Any:
     try:
         if path.is_symlink() or not path.is_file():
             return None
-        if path.stat().st_size > _MAX_SMALL_JSON:
+        if path.stat().st_size > max_bytes:
             return None
         with path.open("rb") as handle:
-            return json.loads(handle.read().decode("utf-8"))
+            raw = handle.read(max_bytes + 1)
+        return json.loads(raw.decode("utf-8")) if len(raw) <= max_bytes else None
     except (OSError, ValueError):
         return None
 
 
-def inspect_run_dir(path: Path, *, kind: str = "run", sweep: str = "") -> RunInfo:
+def _input_batch_manifest(path: Path) -> dict[str, Any] | None:
+    data = _read_small_json(path / "batch_manifest.json", max_bytes=_MAX_INPUT_BATCH_JSON)
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        return None
+    if data.get("kind") == "lean_input_batch":
+        rows = data.get("queue")
+    elif data.get("status") == "checked" and isinstance(data.get("metadata"), dict):
+        rows = data.get("targets")
+    else:
+        return None
+    return data if isinstance(rows, list) and all(isinstance(row, dict) for row in rows) else None
+
+
+def is_input_batch_dir(path: Path) -> bool:
+    """Recognize preparation and batch manifests without inventing run telemetry."""
+    if not _is_real_dir(path):
+        return False
+    marker = path / _INPUT_GENERATION_MARKER
+    return (not marker.is_symlink() and marker.is_file()) or _input_batch_manifest(path) is not None
+
+
+def _input_batch_children(path: Path) -> list[tuple[Path, dict[str, Any]]]:
+    manifest = _input_batch_manifest(path)
+    if manifest is None or manifest.get("kind") != "lean_input_batch":
+        return []
+    children = []
+    for row in manifest["queue"]:
+        output = row.get("output_dir")
+        if not isinstance(output, str):
+            continue
+        try:
+            relative = Path(output).relative_to(path.absolute())
+        except ValueError:
+            continue
+        # Only the producer's fixed layout is meaningful. Recorded paths may
+        # not select another run, an external directory, or a symlink target.
+        if len(relative.parts) != 3 or relative.parts[0] != "attempts" or relative.parts[2] != "run":
+            continue
+        child = resolve_contained_directory(path, str(relative))
+        if child is None:
+            continue
+        proof = resolve_contained_directory(path, str(relative / "proof"))
+        if proof is not None and is_run_dir(proof):
+            child = proof
+        if is_run_dir(child):
+            children.append((child, row))
+    return children
+
+
+def active_input_batch_run(path: Path) -> Path | None:
+    """Select only the currently running target; completed batches show totals."""
+    manifest = _input_batch_manifest(path)
+    if manifest is None or "exit_code" in manifest:
+        return None
+    return next((child for child, row in _input_batch_children(path)
+                 if row.get("status") == "running"), None)
+
+
+def _input_batch_membership(path: Path) -> tuple[Path, dict[str, Any]] | None:
+    path = path.absolute()
+    if path.name == "proof" and path.parent.name == "run" and len(path.parents) >= 4:
+        batch = path.parents[3]
+    elif path.name == "run" and len(path.parents) >= 3:
+        batch = path.parents[2]
+    else:
+        return None
+    if not is_input_batch_dir(batch):
+        return None
+    return next(((batch, row) for child, row in _input_batch_children(batch)
+                 if child == path or (child.name == "proof" and child.parent == path)), None)
+
+
+def input_batch_for_run(path: Path) -> Path | None:
+    """Bind a child to its batch only through a confined, matching manifest row."""
+    binding = _input_batch_membership(path)
+    return binding[0] if binding is not None else None
+
+
+def inspect_run_dir(
+    path: Path, *, kind: str = "run", sweep: str = "",
+    batch_target: tuple[Path, dict[str, Any]] | None = None,
+) -> RunInfo:
     info = RunInfo(path=path, name=path.name, kind=kind, sweep=sweep)
     latest: float | None = None
     for name in (
@@ -113,6 +206,34 @@ def inspect_run_dir(path: Path, *, kind: str = "run", sweep: str = "") -> RunInf
             info.has_maintenance_receipt = True
     info.has_checkpoints = _is_real_dir(path / "checkpoints")
     info.last_write_ts = latest
+    if is_input_batch_dir(path):
+        manifest = _input_batch_manifest(path)
+        info.kind, info.batch_root = "input_batch", str(path)
+        info.batch_state = "preparing"
+        if manifest is not None:
+            rows = manifest.get("queue", manifest.get("targets", []))
+            for row in rows:
+                status = str(row.get("status") or ("blocked" if row.get("error") else "ready"))
+                info.batch_counts[status] = info.batch_counts.get(status, 0) + 1
+            info.batch_state = ("checked" if manifest.get("status") == "checked" else
+                                f"complete (exit {manifest['exit_code']})" if "exit_code" in manifest else
+                                "running" if info.batch_counts.get("running") else "ready")
+        elif (path / "batch_manifest.json").exists():
+            info.batch_state = "manifest unavailable"
+        for name in ("batch_manifest.json", _INPUT_GENERATION_MARKER):
+            candidate = path / name
+            try:
+                if not candidate.is_symlink() and candidate.is_file():
+                    info.last_write_ts = max(info.last_write_ts or 0, candidate.stat().st_mtime)
+            except OSError:
+                pass
+    else:
+        binding = batch_target or _input_batch_membership(path)
+        if binding is not None:
+            batch, row = binding
+            info.kind, info.batch_root = "input_attempt", str(batch)
+            info.target_name = str(row.get("theorem_name") or row.get("name") or path.parent.name)
+            info.target_status = str(row.get("status") or "unknown")
     return info
 
 
@@ -146,6 +267,18 @@ def discover_runs(root: str | os.PathLike[str], *, limit: int = 500) -> list[Run
             continue
         if is_run_dir(child):
             found.append(inspect_run_dir(child))
+        if is_input_batch_dir(child):
+            if not is_run_dir(child):
+                found.append(inspect_run_dir(child))
+            found.extend(inspect_run_dir(path, batch_target=(child, row))
+                         for path, row in _input_batch_children(child))
+    inputs = root_path / "inputs"
+    if _is_real_dir(inputs):
+        for batch in _safe_children(inputs):
+            if is_input_batch_dir(batch):
+                found.append(inspect_run_dir(batch))
+                found.extend(inspect_run_dir(path, batch_target=(batch, row))
+                             for path, row in _input_batch_children(batch))
     sweeps = root_path / "sweeps"
     if _is_real_dir(sweeps):
         for sweep in _safe_children(sweeps):
@@ -214,7 +347,7 @@ def resolve_run_dir(root: Path, selector: str, listing: list[RunInfo] | None = N
         return None
     candidates = [Path(selector), root / selector]
     for candidate in candidates:
-        if is_run_dir(candidate):
+        if is_run_dir(candidate) or is_input_batch_dir(candidate):
             return candidate.resolve()
     return None
 

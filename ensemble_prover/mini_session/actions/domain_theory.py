@@ -31,7 +31,8 @@ from ensemble_prover.proof_graph import (
     graph_text_hash,
 )
 from ensemble_prover.lean_decl_parser import find_decl_header_end
-from ensemble_prover.theorem_project import _mask_noncode, scan_lean_declarations
+from ensemble_prover.lean_source_lexing import _command_matches, _mask_noncode
+from ensemble_prover.theorem_project import scan_lean_declarations
 
 from ..action import MiniOutcome
 
@@ -66,7 +67,7 @@ def _theory_support_declaration_surfaces(source: str) -> tuple[tuple[str, str], 
     text = str(source or "")
     masked = _mask_noncode(text)
     surfaces: list[tuple[str, str]] = []
-    for match in _THEORY_SUPPORT_DECLARATION_HEAD_RE.finditer(masked):
+    for match in _command_matches(_THEORY_SUPPORT_DECLARATION_HEAD_RE, masked):
         header_end = find_decl_header_end(
             text,
             match.end("kind"),

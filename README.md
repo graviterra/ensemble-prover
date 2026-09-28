@@ -138,7 +138,18 @@ directories. Keep it local; it is not a shared network service.
 
 ## Run from the terminal
 
-For a Lean theorem in an existing project:
+Pass a Lean file or a directory of problems:
+
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover /path/to/problems --prover openai
+```
+
+Mini discovers unfinished theorems recursively, infers each file's Lake project,
+and starts supervised proof attempts. Loose files can use an available
+`lean_project` runtime, or an explicit `--project-path`. Add `--check-input` to
+verify preparation without model calls. Original source files remain unchanged.
+
+To select a particular theorem in an existing project:
 
 ```bash
 .venv/bin/python -m ensemble_prover.mini_prover \

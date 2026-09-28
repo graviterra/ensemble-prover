@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from .model import content_hash
-from ..theorem_project import _mask_noncode
+from ..lean_source_lexing import _mask_noncode
 
 
 _IMPORT_LINE_RE = re.compile(r"^\s*import\s+([^\s]+)\s*$")
@@ -29,10 +29,18 @@ class TheoryContext:
         header_lines: list[str] = []
         body_lines: list[str] = []
         source = str(preamble or "")
-        source_lines = source.splitlines()
-        masked_lines = _mask_noncode(source).splitlines()
+        # Only split on the physical newline preserved by both lexical masks.
+        # str.splitlines() also splits Unicode characters that may belong to
+        # an escaped identifier and are correctly blanked in the command mask.
+        source_lines = source.split("\n")
+        masked_lines = _mask_noncode(source).split("\n")
+        command_lines = _mask_noncode(source, mask_quoted_identifiers=True).split("\n")
         for index, line in enumerate(source_lines):
-            masked_line = masked_lines[index] if index < len(masked_lines) else ""
+            masked_line = masked_lines[index]
+            head = len(masked_line) - len(masked_line.lstrip())
+            if head == len(masked_line) or command_lines[index][head].isspace():
+                body_lines.append(line)
+                continue
             stripped = masked_line.strip()
             if stripped == "prelude" or stripped == "module" or stripped.startswith("module "):
                 header_lines.append(line)

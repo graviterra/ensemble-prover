@@ -918,6 +918,7 @@ def run_attempt(
     cleanup_timeout_s: float = 130,
     should_stop: Callable[[], bool] = lambda: False,
     on_started: Callable[[int], None] = lambda _pid: None,
+    cwd: Path | None = None,
 ) -> dict[str, Any]:
     """Own one CLI process group; never advance before its supervisor settles."""
     poll_interval_s, cleanup_timeout_s = (
@@ -925,7 +926,7 @@ def run_attempt(
         _seconds(cleanup_timeout_s),
     )
     startup_liveness_s = _acceptance_seconds(startup_liveness_s)
-    startup_timeout_s = _seconds(startup_timeout_s)
+    startup_timeout_s = _acceptance_seconds(startup_timeout_s)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     if any(
@@ -952,7 +953,7 @@ def run_attempt(
         relay = _ConsoleRelay(reader)
         proc = subprocess.Popen(
             list(command),
-            cwd=ROOT,
+            cwd=ROOT if cwd is None else cwd,
             stdin=subprocess.DEVNULL,
             stdout=console,
             stderr=subprocess.STDOUT,
@@ -978,7 +979,7 @@ def run_attempt(
                     if transaction.pending:
                         raise RuntimeError("sweep_acceptance_authority_unavailable")
                     if ready_at is None:
-                        if now - start >= startup_timeout_s:
+                        if startup_timeout_s and now - start >= startup_timeout_s:
                             cutoff = "startup_deadline"
                         elif startup.expired(now=now, proof_alive=tail.alive):
                             cutoff = "startup_liveness_deadline"

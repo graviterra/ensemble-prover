@@ -7,7 +7,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .reducer import RunState, reduce
-from .runs import ProcessObservation, RunInfo, inspect_run_dir, observe_processes
+from .runs import (
+    ProcessObservation, RunInfo, active_input_batch_run, input_batch_for_run,
+    inspect_run_dir, is_input_batch_dir, observe_processes,
+)
 from .summary import SummaryView, load_summary
 from .tailer import JsonlTailer, TailEvent
 
@@ -31,14 +34,37 @@ class AttachedRun:
     last_summary_read: float = 0.0
     last_liveness_read: float = 0.0
     polls: int = 0
+    batch_root: Path | None = None
+    follow_batch: bool = False
 
     @classmethod
     def attach(cls, run_dir: Path) -> "AttachedRun":
         run_dir = Path(run_dir)
-        return cls(run_dir=run_dir, info=inspect_run_dir(run_dir), tailer=JsonlTailer(run_dir / "turns.jsonl"))
+        is_batch = is_input_batch_dir(run_dir)
+        return cls(run_dir=run_dir, info=inspect_run_dir(run_dir), tailer=JsonlTailer(run_dir / "turns.jsonl"),
+                   batch_root=run_dir if is_batch else input_batch_for_run(run_dir), follow_batch=is_batch)
+
+    def _follow_input_batch(self) -> None:
+        if self.batch_root is None and is_input_batch_dir(self.run_dir):
+            self.batch_root, self.follow_batch = self.run_dir, True
+        if not self.follow_batch or self.batch_root is None:
+            return
+        target = active_input_batch_run(self.batch_root) or self.batch_root
+        if target == self.run_dir:
+            return
+        self.run_dir = target
+        self.info = inspect_run_dir(target)
+        self.tailer = JsonlTailer(target / "turns.jsonl")
+        self.state, self.summary = RunState(), SummaryView()
+        self.liveness = ProcessObservation("unknown", [], "target changed")
+        self.tail_events.clear()
+        self.backlog, self.trace_size = False, 0
+        self.last_summary_read = self.last_liveness_read = 0.0
+        self.polls = 0
 
     def poll(self, *, now: float | None = None, proc_root: str = "/proc") -> int:
         """Ingest up to MAX_SLICES_PER_POLL slices. Returns new record count."""
+        self._follow_input_batch()
         now = time.time() if now is None else now
         self.polls += 1
         new_records = 0

@@ -1,7 +1,8 @@
 """CLI and composition root for Lean-verified ensemble theorem search.
 
-The primary interface targets one theorem in a caller-supplied Lean project
-(``--lean-file``, ``--theorem-name``, and ``--project-path``). The release does
+Pass a Lean file or directory to discover unfinished theorems and their Lean
+projects, or select one with ``--lean-file``, ``--theorem-name``, and
+``--project-path``. The release does
 not bundle Lean, Lake, Mathlib, or benchmark sources. ``--putnam-file`` is an
 optional PutnamBench adapter; the underlying theorem-project model is generic.
 
@@ -26,6 +27,8 @@ Use ``python -m ensemble_prover.mini_prover --help`` as the authority for
 current options and defaults.
 
 Examples::
+
+    python -m ensemble_prover.mini_prover /path/to/problems
 
     python -m ensemble_prover.mini_prover \\
         --lean-file /path/to/project/MyTheorem.lean \\
@@ -12935,6 +12938,11 @@ def _build_argparser() -> argparse.ArgumentParser:
             "prepasses, and turn-by-turn Lean feedback."
         ),
         epilog=(
+            "Input discovery:\n"
+            "  File and directory discovery runs unfinished targets sequentially. "
+            "Model, search, and budget options apply independently to each target; "
+            "a directory has no shared aggregate cost or wall-clock cap. "
+            "Use --check-input for local preparation without model calls.\n"
             "Reasoning controls:\n"
             "  The default --reasoning-mode provider-default (alias: auto) "
             "sends no reasoning/thinking field, so the provider/model default "
@@ -12981,6 +12989,18 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     input_group = p.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
+        "_input_path", nargs="?", default=argparse.SUPPRESS, metavar="PATH",
+        help="Lean file or directory: discover unfinished theorems and infer their Lake projects.",
+    )
+    input_group.add_argument(
+        "--input", dest="_input_path", default=argparse.SUPPRESS, metavar="PATH",
+        help="Lean file or directory to discover and prove (also accepted as a positional path).",
+    )
+    p.add_argument(
+        "--check-input", dest="_check_input", action="store_true",
+        help="Discover and verify input preparation locally, without starting model work.",
+    )
+    input_group.add_argument(
         "--resume-from", default=None,
         help="Resume an attempt checkpoint into a new output generation, retaining its saved configuration.",
     )
@@ -13003,7 +13023,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     input_group.add_argument(
         "--lean-file",
         default=None,
-        help="Path to an arbitrary Lean source file containing the target theorem.",
+        help="Lean source file or directory; omitted theorem/project selections are discovered automatically.",
     )
     input_group.add_argument(
         "--putnam-file",
@@ -13017,7 +13037,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--theorem-name",
         default=None,
         help=(
-            "Fully qualified target theorem name. Required with --lean-file; "
+            "Select one target theorem name; otherwise discover unfinished theorems. "
             "the PutnamBench adapter retains its legacy first-theorem default."
         ),
     )
@@ -13246,7 +13266,8 @@ def _build_argparser() -> argparse.ArgumentParser:
         dest="lean_project_dir",
         default=None,
         help=(
-            "Lake project used for compilation. Required with --lean-file. "
+            "Lake project used for compilation. Otherwise infer each source's owning project "
+            "or use the available lean_project runtime. "
             "--lean-project-dir is retained as a compatibility alias; the "
             "Putnam adapter can infer its project from the source path."
         ),
@@ -17922,7 +17943,8 @@ def _shutdown_artifact_identity(
 
 def main() -> int:
     parser = _build_argparser()
-    args = resolve_resume_args(parser.parse_args())
+    parsed_args = parser.parse_args()
+    from .lean_input_cli import run_path_input, should_prepare
     from .mini_session.process_watchdog import (
         VERIFY_STAGED_SOLUTION_EXIT_CODE,
         begin_process_deadline,
@@ -17930,6 +17952,16 @@ def main() -> int:
         run_cli_worker_under_watchdog,
         worker_overall_deadline,
     )
+
+    try:
+        if not is_watchdog_worker() and should_prepare(parsed_args):
+            return run_path_input(parsed_args, sys.argv[1:], parser)
+    except KeyboardInterrupt:
+        return 130
+    except (ValueError, OSError, TimeoutError) as error:
+        print(f"Problem input rejected: {error}", file=sys.stderr, flush=True)
+        return 2
+    args = resolve_resume_args(parsed_args)
 
     parallel_sample_count = max(
         1,

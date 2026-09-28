@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from .lean_decl_parser import find_decl_header_end
+from .lean_source_lexing import _command_matches, _mask_noncode
 from .utils import _first_top_level_colon_after, has_sorry_or_admit
 
 
@@ -18,7 +19,23 @@ THEOREM_PROJECT_SCHEMA_VERSION = 2
 GENERIC_ADAPTER_ID = "generic"
 PUTNAMBENCH_ADAPTER_ID = "putnam_bench"
 
-_IDENT_COMPONENT = r"(?:«[^»\r\n]+»|(?:[^\W\d]|_)[\w']*)"
+# Lean's isLetterLike/isSubScriptAlnum (Init/Meta/Defs.lean) include symbols
+# and unassigned codepoints outside Python's Unicode word-character class.
+# Retain the existing word-character support and add the compiler's ranges.
+_LEAN_LETTERLIKE = (
+    r"\u03b1-\u03ba\u03bc-\u03c9"  # Lower Greek, excluding lambda.
+    r"\u0391-\u039f\u03a1-\u03a2\u03a4-\u03a9"  # Excluding Pi/Sigma.
+    r"\u03ca-\u03fb\u1f00-\u1ffe\u2100-\u214f"
+    r"\U0001d49c-\U0001d59f"
+    r"\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff"  # Excluding ×/÷.
+    r"\u0100-\u017f"
+)
+_LEAN_SUBSCRIPT_ALNUM = r"\u2080-\u2089\u2090-\u209c\u1d62-\u1d6a\u2c7c"
+# ! and ? are continuation characters, including within namespace components.
+_IDENT_COMPONENT = (
+    rf"(?:«[^»\r\n]+»|(?:[^\W\d]|_|[{_LEAN_LETTERLIKE}])"
+    rf"[\w'!?{_LEAN_LETTERLIKE}{_LEAN_SUBSCRIPT_ALNUM}]*)"
+)
 _DOTTED_IDENT = rf"(?:_root_\.)?{_IDENT_COMPONENT}(?:\.{_IDENT_COMPONENT})*"
 _ATTR = r"(?:@\[[^\]]*\]\s*)"
 _SCOPED_LINE_COMMAND = (
@@ -58,7 +75,6 @@ _END_RE = re.compile(
     flags=re.UNICODE,
 )
 _MUTUAL_RE = re.compile(r"(?<!\S)mutual\b")
-_RAW_STRING_START_RE = re.compile(r'r(?P<hashes>#+)?"')
 _TARGET_CONTEXT_MARKER = "-- ensemble-theorem-target-context: "
 
 
@@ -75,148 +91,6 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
-def _mask_noncode(text: str) -> str:
-    """Mask comments and literals while preserving source offsets/newlines."""
-
-    src = str(text or "")
-    out = list(src)
-    n = len(src)
-    i = 0
-
-    def mask(start: int, end: int) -> None:
-        for pos in range(start, min(end, n)):
-            if out[pos] not in {"\n", "\r"}:
-                out[pos] = " "
-
-    while i < n:
-        if src.startswith("--", i):
-            end = src.find("\n", i + 2)
-            end = n if end < 0 else end
-            mask(i, end)
-            i = end
-            continue
-        if src.startswith("/-", i):
-            depth = 1
-            end = i + 2
-            while end < n and depth:
-                if src.startswith("/-", end):
-                    depth += 1
-                    end += 2
-                elif src.startswith("-/", end):
-                    depth -= 1
-                    end += 2
-                else:
-                    end += 1
-            mask(i, end)
-            i = end
-            continue
-        raw_match = _RAW_STRING_START_RE.match(src, i) if src[i] == "r" else None
-        if raw_match is not None and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] in "_")):
-            hashes = raw_match.group("hashes") or ""
-            close = '"' + hashes
-            body_start = raw_match.end()
-            close_at = src.find(close, body_start)
-            end = n if close_at < 0 else close_at + len(close)
-            mask(i, end)
-            i = end
-            continue
-        if src[i] == '"':
-            end = i + 1
-            while end < n:
-                if src[end] == "\\":
-                    end += 2
-                    continue
-                if src[end] == '"':
-                    end += 1
-                    break
-                end += 1
-            mask(i, end)
-            i = end
-            continue
-        if src[i] == "`" and i + 1 < n and src[i + 1] in "([{":
-            # Lean syntax quotations can contain command-shaped text, e.g.
-            # `` `(theorem generated : True := by trivial) ``. These are
-            # macro data, not declarations in the input module. Mask a
-            # balanced quotation so a line-oriented declaration scan cannot
-            # select a quoted theorem as the target.
-            pairs = {"(": ")", "[": "]", "{": "}"}
-            stack = [pairs[src[i + 1]]]
-            end = i + 2
-            while end < n and stack:
-                if src.startswith("--", end):
-                    newline = src.find("\n", end + 2)
-                    end = n if newline < 0 else newline
-                    continue
-                raw_match = _RAW_STRING_START_RE.match(src, end) if src[end] == "r" else None
-                if raw_match is not None and (
-                    end == 0
-                    or not (src[end - 1].isalnum() or src[end - 1] == "_")
-                ):
-                    hashes = raw_match.group("hashes") or ""
-                    close = '"' + hashes
-                    body_start = raw_match.end()
-                    close_at = src.find(close, body_start)
-                    end = n if close_at < 0 else close_at + len(close)
-                    continue
-                if src[end] == "'" and (
-                    end == 0
-                    or not (src[end - 1].isalnum() or src[end - 1] in "_'")
-                ):
-                    char_end = end + 1
-                    char_end += 2 if char_end < n and src[char_end] == "\\" else 1
-                    if char_end < n and src[char_end] == "'":
-                        end = char_end + 1
-                        continue
-                if src.startswith("/-", end):
-                    depth = 1
-                    end += 2
-                    while end < n and depth:
-                        if src.startswith("/-", end):
-                            depth += 1
-                            end += 2
-                        elif src.startswith("-/", end):
-                            depth -= 1
-                            end += 2
-                        else:
-                            end += 1
-                    continue
-                if src[end] == '"':
-                    end += 1
-                    while end < n:
-                        if src[end] == "\\":
-                            end += 2
-                            continue
-                        if src[end] == '"':
-                            end += 1
-                            break
-                        end += 1
-                    continue
-                char = src[end]
-                if char in pairs:
-                    stack.append(pairs[char])
-                elif stack and char == stack[-1]:
-                    stack.pop()
-                end += 1
-            mask(i, end)
-            i = end
-            continue
-        if src[i] == "'" and (
-            i == 0 or not (src[i - 1].isalnum() or src[i - 1] in "_'")
-        ):
-            end = i + 1
-            if end < n and src[end] == "\\":
-                end += 2
-            else:
-                end += 1
-            if end < n and src[end] == "'":
-                end += 1
-                mask(i, end)
-                i = end
-                continue
-        i += 1
-    return "".join(out)
-
-
 def _mask_attribute_contents(text: str) -> str:
     """Mask balanced ``@[...]`` payloads while retaining their outer shape.
 
@@ -230,12 +104,20 @@ def _mask_attribute_contents(text: str) -> str:
     out = list(source)
     cursor = 0
     while cursor < len(source) - 1:
+        if source[cursor] == "«":
+            close = source.find("»", cursor + 1)
+            cursor = len(source) if close < 0 else close + 1
+            continue
         if not source.startswith("@[", cursor):
             cursor += 1
             continue
         depth = 1
         end = cursor + 2
         while end < len(source) and depth:
+            if source[end] == "«":
+                close = source.find("»", end + 1)
+                end = len(source) if close < 0 else close + 1
+                continue
             if source[end] == "[":
                 depth += 1
             elif source[end] == "]":
@@ -364,7 +246,7 @@ def _active_command_scopes(
         ("mutual", _MUTUAL_RE),
         ("end", _END_RE),
     ):
-        events.extend((match.start(), kind, match) for match in pattern.finditer(masked))
+        events.extend((match.start(), kind, match) for match in _command_matches(pattern, masked))
     events.sort(key=lambda item: item[0])
     scopes: list[tuple[str, str, int, int]] = []
     for _offset, kind, match in events:
@@ -459,7 +341,7 @@ def _multiline_scoped_prefix_before(
         return None
 
     while current > 0:
-        candidates = list(command_re.finditer(masked, 0, current))
+        candidates = list(_command_matches(command_re, masked, end=current))
         if not candidates:
             break
         candidate = candidates[-1]
@@ -693,7 +575,7 @@ def scan_lean_declarations(text: str) -> tuple[LeanTheoremDeclaration, ...]:
         ("end", _END_RE),
         ("declaration", _DECL_RE),
     ):
-        events.extend((match.start(), kind, match) for match in pattern.finditer(masked))
+        events.extend((match.start(), kind, match) for match in _command_matches(pattern, masked))
     events.sort(key=lambda item: (item[0], item[1] != "declaration"))
 
     scopes: list[tuple[str, str]] = []
@@ -868,14 +750,11 @@ def normalize_imports(imports: Iterable[str]) -> tuple[str, ...]:
 def scan_lean_imports(text: str) -> tuple[str, ...]:
     source = str(text or "")
     imports: list[str] = []
-    for line in _mask_noncode(source).splitlines():
-        match = re.fullmatch(
-            r"\s*(?:public\s+)?import\s+(.+?)\s*",
-            line,
-        )
-        if match is None:
-            continue
-        module = str(match.group(1) or "").strip()
+    import_re = re.compile(
+        r"(?m)^[^\S\r\n]*(?:public[^\S\r\n]+)?import[^\S\r\n]+([^\r\n]+?)[^\S\n]*$"
+    )
+    for match in _command_matches(import_re, _mask_noncode(source)):
+        module = match.group(1).strip()
         if is_valid_lean_qualified_name(module) and module not in imports:
             imports.append(module)
     return tuple(imports)
@@ -1007,7 +886,7 @@ def active_include_variables(text: str, end: int) -> tuple[str, ...]:
         ("mutual", _MUTUAL_RE),
         ("end", _END_RE),
     ):
-        events.extend((match.start(), kind, match) for match in pattern.finditer(masked))
+        events.extend((match.start(), kind, match) for match in _command_matches(pattern, masked))
     lines = masked.splitlines(keepends=True)
     offsets: list[int] = []
     cursor = 0
@@ -1017,9 +896,12 @@ def active_include_variables(text: str, end: int) -> tuple[str, ...]:
     include_head_re = re.compile(
         r"^(?P<indent>[ \t]*)(?P<kind>include|omit)\b(?P<names>[^\r\n]*)"
     )
+    command_masked = _mask_noncode(masked, mask_quoted_identifiers=True)
     for index, line in enumerate(lines):
         match = include_head_re.match(line)
         if match is None:
+            continue
+        if command_masked[offsets[index] + match.start("kind")].isspace():
             continue
         scan = offsets[index] + match.start("names")
         name_parts: list[str] = []

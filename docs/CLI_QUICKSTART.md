@@ -59,7 +59,21 @@ The live CLI help is authoritative:
 .venv/bin/python -m ensemble_prover.mini_prover --help
 ```
 
-For an arbitrary Lean theorem project:
+For a Lean file or a directory containing Lean problems:
+
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover /path/to/problems --prover openai
+```
+
+`--input /path/to/problems` and `--lean-file /path/to/problems` also work.
+Mini finds unfinished theorem and lemma declarations, checks their inputs with
+Lean, and runs them sequentially through the ordinary proof workflow. It infers
+each source's containing Lake project; loose files use an available `lean_project`
+runtime. Use `--project-path` to choose a different compatible project.
+Add `--check-input` to perform only local preparation, without provider calls.
+All model, reasoning, search, and budget options apply to each proof attempt.
+
+For one named theorem in an arbitrary Lean project:
 
 ```bash
 .venv/bin/python -m ensemble_prover.mini_prover \
