@@ -42,6 +42,7 @@ from ...mini_lean_extract import (
     _find_forbidden_lean_command,
     _has_plausible_lean_proof_head,
     _is_plausible_lean_symbolic_atom,
+    _is_plausible_tactic_body,
     _partition_redundant_preamble_commands,
     _strip_balanced_outer_proof_parentheses,
     _strip_lean_comments,
@@ -373,34 +374,7 @@ def _is_structural_finalizer_lean_term(
             "return",
         }
     if head == "by":
-        body = candidate[2:].strip()
-        if not body:
-            return False
-        if body.startswith("·"):
-            for line in body.splitlines():
-                line_body = line.strip().removeprefix("·").strip()
-                if not line_body:
-                    continue
-                line_atoms = _split_finalizer_lean_atoms(line_body)
-                if not line_atoms:
-                    return False
-                line_head = line_atoms[0].lower().rstrip("!?;")
-                if line_head in _FINALIZER_CHATTER_HEADS:
-                    return False
-            return True
-        body_atoms = _split_finalizer_lean_atoms(body)
-        if not body_atoms:
-            return False
-        body_head = body_atoms[0]
-        normalized_head = body_head.lower().rstrip("!?;")
-        if normalized_head in _FINALIZER_CHATTER_HEADS:
-            return False
-        return bool(
-            re.fullmatch(
-                rf"(?:{_FINALIZER_LEAN_IDENT_START}[\w'.]*|«[^»]+»)(?:[!?])?",
-                body_head,
-            )
-        )
+        return _is_plausible_tactic_body(candidate[2:])
     atoms = _split_finalizer_lean_atoms(candidate)
     if not atoms:
         return False

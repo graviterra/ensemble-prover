@@ -97,6 +97,11 @@ _PLAUSIBLE_PROOF_CHATTER_HEADS = {
     "you",
 }
 
+# A ``by`` body is tactic syntax. These words are legitimate Lean tactic
+# heads even though they also look like chatter as standalone responses.
+# Extraction only identifies candidates; Lean still checks their proofs.
+_PLAUSIBLE_TACTIC_CHATTER_HEADS = _PLAUSIBLE_PROOF_CHATTER_HEADS - {"try", "done"}
+
 _PLAUSIBLE_PROOF_CHATTER_WORDS = {
     "again",
     "following",
@@ -628,33 +633,7 @@ def _is_plausible_main_proof(
             "return",
         }
     if head == "by":
-        body = s[2:].strip()
-        if not body:
-            return False
-        if body.startswith("·"):
-            for line in body.splitlines():
-                line_body = line.strip().removeprefix("·").strip()
-                if not line_body:
-                    continue
-                line_atoms = _split_plausible_lean_atoms(line_body)
-                if not line_atoms:
-                    return False
-                line_head = line_atoms[0].lower().rstrip("!?;")
-                if line_head in _PLAUSIBLE_PROOF_CHATTER_HEADS:
-                    return False
-            return True
-        body_atoms = _split_plausible_lean_atoms(body)
-        if not body_atoms:
-            return False
-        body_head = body_atoms[0].lower().rstrip("!?;")
-        if body_head in _PLAUSIBLE_PROOF_CHATTER_HEADS:
-            return False
-        return bool(
-            re.fullmatch(
-                rf"(?:{_PLAUSIBLE_LEAN_IDENT_START}[\w'.]*|«[^»]+»)(?:[!?])?",
-                body_atoms[0],
-            )
-        )
+        return _is_plausible_tactic_body(s[2:])
     atoms = _split_plausible_lean_atoms(s)
     if not atoms:
         return False
@@ -699,7 +678,9 @@ def _is_plausible_main_proof(
     )
 
 
-def _split_plausible_lean_atoms(text: str) -> Optional[List[str]]:
+def _split_plausible_lean_atoms(
+    text: str, *, tactic_separators: bool = False
+) -> Optional[List[str]]:
     """Split top-level Lean atoms while retaining nested argument groups."""
 
     pairs = {"(": ")", "[": "]", "{": "}", "«": "»"}
@@ -707,7 +688,19 @@ def _split_plausible_lean_atoms(text: str) -> Optional[List[str]]:
     stack: List[str] = []
     atoms: List[str] = []
     start: Optional[int] = None
+    skip_until = 0
     for index, token in enumerate(text):
+        if index < skip_until:
+            continue
+        if tactic_separators and not stack:
+            separator = "<;>" if text.startswith("<;>", index) else token
+            if separator in {";", "<;>"}:
+                if start is not None:
+                    atoms.append(text[start:index])
+                    start = None
+                atoms.append(separator)
+                skip_until = index + len(separator)
+                continue
         if token.isspace() and not stack:
             if start is not None:
                 atoms.append(text[start:index])
@@ -725,6 +718,49 @@ def _split_plausible_lean_atoms(text: str) -> Optional[List[str]]:
     if start is not None:
         atoms.append(text[start:])
     return atoms
+
+
+
+def _is_plausible_tactic_body(body: str) -> bool:
+    """Recognize tactic candidates without treating layout or literals as prose.
+
+    Delimiters belong to the complete body, not individual physical lines.
+    This only selects candidates; callers retain the original text for Lean.
+    """
+    body = _strip_lean_comments_and_strings(body).strip()
+    atoms = _split_plausible_lean_atoms(body, tactic_separators=True)
+    if not atoms:
+        return False
+
+    # Like a non-bullet body, inspect the first tactic head only. Subsequent
+    # lines may be continuation terms named ``proof`` or ``this``; Lean checks
+    # the complete body rather than an English heuristic interpreting them.
+    while atoms:
+        head = atoms[0].removeprefix("·")
+        if not head:
+            atoms = atoms[1:]
+            continue
+        if head.startswith(("(", "{")):
+            closing = ")" if head.startswith("(") else "}"
+            if not head.endswith(closing):
+                return False
+            atoms = _split_plausible_lean_atoms(
+                head[1:-1].strip(), tactic_separators=True
+            )
+            continue
+        # Lean does not require whitespace between a tactic identifier and
+        # its argument or combinator: ``exact(h)``, ``exact‹P›``, ``first|...``.
+        identifier = re.match(
+            rf"(?:{_PLAUSIBLE_LEAN_IDENT_START}[\w'.]*|«[^»]+»)(?:[!?])?",
+            head,
+        )
+        return bool(
+            identifier
+            and identifier.group().lower().rstrip("!?")
+            not in _PLAUSIBLE_TACTIC_CHATTER_HEADS
+        )
+    return False
+
 
 
 def _append_lean_padding(out: List[str], ch: str) -> None:
