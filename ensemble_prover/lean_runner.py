@@ -2573,6 +2573,12 @@ class LeanStatementContractAnalysis:
     contract_definitionally_equal_indices: tuple[int, ...] = ()
     definitionally_checked_indices: tuple[int, ...] = ()
     contract_definitionally_checked_indices: tuple[int, ...] = ()
+    # Same-telescope positions reported by Lean from LocalDecl/FVarId, never
+    # pretty-printer names. A dependency always refers to an earlier binder.
+    # These are scoped to this full statement, not standalone fact identities.
+    semantic_dependencies_version: int = 0
+    binder_dependencies: tuple[tuple[int, ...], ...] = ()
+    conclusion_dependencies: tuple[int, ...] = ()
     # Per-invocation timings are carried with the returned structural receipt
     # instead of sampled from LeanRunner's process-wide cumulative counters.
     # This keeps overlapping contract batches from charging each other's work.
@@ -3534,6 +3540,20 @@ def _contract_analysis_from_payload(
     expr = payload.get("expr")
     if expr is None:
         return LeanStatementContractAnalysis(display_type=display_type)
+    semantic_format = payload.get("semanticFormat", 0)
+    if type(semantic_format) is not int or (
+        "semanticFormat" in payload and semantic_format != 1
+    ):
+        return LeanStatementContractAnalysis(display_type=display_type)
+    if semantic_format and (
+        not _lean_serialized_expr_is_closed(expr)
+        or "contractExpr" not in payload
+        or (
+            payload["contractExpr"] is not None
+            and not _lean_serialized_expr_is_closed(payload["contractExpr"])
+        )
+    ):
+        return LeanStatementContractAnalysis(display_type=display_type)
     canonical_expr = _canonical_contract_expr_payload(expr)
     full_identity_payload = json.dumps(
         {
@@ -3553,9 +3573,25 @@ def _contract_analysis_from_payload(
     binder_normalized_types: list[str] = []
     proof_binder_types: list[str] = []
     proof_binder_structural_hashes: list[str] = []
-    for binder in binders:
+    binder_dependencies: list[tuple[int, ...]] = []
+
+    def dependencies(value: Any, limit: int) -> tuple[int, ...] | None:
+        if not isinstance(value, list) or any(
+            type(index) is not int or not 0 <= index < limit for index in value
+        ):
+            return None
+        if value != sorted(set(value)):
+            return None
+        return tuple(value)
+
+    for binder_index, binder in enumerate(binders):
         if not isinstance(binder, dict):
             return LeanStatementContractAnalysis(display_type=display_type)
+        if semantic_format:
+            indices = dependencies(binder.get("dependencies"), binder_index)
+            if indices is None:
+                return LeanStatementContractAnalysis(display_type=display_type)
+            binder_dependencies.append(indices)
         binder_sort = str(binder.get("sort") or "").strip().lower()
         if binder_sort not in {"proof", "data"}:
             return LeanStatementContractAnalysis(display_type=display_type)
@@ -3594,10 +3630,18 @@ def _contract_analysis_from_payload(
                         )
                     )
                 )
-    contract_expr = _proof_erased_contract_expr(
-        canonical_expr,
-        binder_sorts,
-    )
+    conclusion_dependencies: tuple[int, ...] = ()
+    if semantic_format:
+        indices = dependencies(payload.get("conclusionDependencies"), len(binders))
+        if indices is None:
+            return LeanStatementContractAnalysis(display_type=display_type)
+        conclusion_dependencies = indices
+        # Lean removes independent proof locals with mkForallFVars and checks
+        # FVarId occurrences. Python only validates and hashes that result.
+        contract_expr = payload["contractExpr"]
+    else:
+        # Compatibility reader for older analyzer fixtures and saved payloads.
+        contract_expr = _proof_erased_contract_expr(canonical_expr, binder_sorts)
     contract_profile_hash = None
     contract_conclusion_structural_hash = ""
     if contract_expr is not None:
@@ -3656,6 +3700,9 @@ def _contract_analysis_from_payload(
             proof_binder_structural_hashes
         ),
         component_hash_version=LEAN_CONTRACT_COMPONENT_HASH_VERSION,
+        semantic_dependencies_version=semantic_format,
+        binder_dependencies=tuple(binder_dependencies),
+        conclusion_dependencies=conclusion_dependencies,
         contract_conclusion_structural_hash=(
             contract_conclusion_structural_hash
         ),
@@ -8750,11 +8797,20 @@ private partial def {serializer_prefix}_expr :
         Lean.Json.str typeName.toString, Lean.ToJson.toJson index,
         {serializer_prefix}_expr projected]
 
+private def {serializer_prefix}_localDependencies
+    (type : Lean.Expr) (locals : Array Lean.Expr) : Array Nat := Id.run do
+  let mut dependencies := #[]
+  for index in [:locals.size] do
+    if type.containsFVar locals[index]!.fvarId! then
+      dependencies := dependencies.push index
+  return dependencies
+
 private def {serializer_prefix}_binders (type : Lean.Expr) :
-    Lean.MetaM (Array Lean.Json) :=
-  Lean.Meta.forallTelescope type fun fvars _body => do
+    Lean.MetaM (Array Lean.Json × Array Nat) :=
+  Lean.Meta.forallTelescope type fun fvars body => do
     let mut binders : Array Lean.Json := #[]
-    for fvar in fvars do
+    for index in [:fvars.size] do
+      let fvar := fvars[index]!
       let localDecl ← fvar.fvarId!.getDecl
       let domain := localDecl.type
       let proof ← Lean.Meta.isProp domain
@@ -8768,9 +8824,11 @@ private def {serializer_prefix}_binders (type : Lean.Expr) :
           ("sort", Lean.Json.str (if proof then "proof" else "data")),
           ("type", Lean.Json.str rendered.pretty),
           ("normalizedType", Lean.Json.str normalizedRendered.pretty),
+          ("dependencies", Lean.ToJson.toJson
+            ({serializer_prefix}_localDependencies domain (fvars.extract 0 index))),
           ("expr", {serializer_prefix}_expr normalizedDomain)
         ]
-    pure binders
+    pure (binders, {serializer_prefix}_localDependencies body fvars)
 
 -- A declaration compiles local recursive auxiliaries; standalone elabType
 -- deliberately leaves those auxiliaries pending until declaration finalization.
@@ -8948,17 +9006,24 @@ private def {serializer_prefix}_contractDefeq
                         for other in (raw_statements[other_index],)
                     ),
                     "    let normalizedType ← Lean.Meta.whnf type",
-                    f"    let binders ← {serializer_prefix}_binders normalizedType",
+                    f"    let (binders, conclusionDependencies) ← {serializer_prefix}_binders normalizedType",
+                    f"    let contractType ← {serializer_prefix}_contractType type",
+                    "    let contractExpr := match contractType with",
+                    f"      | some value => {serializer_prefix}_expr value",
+                    "      | none => Lean.Json.null",
                     "    let contractConclusionExpr ←",
-                    f"      match ← {serializer_prefix}_contractType type with",
+                    "      match contractType with",
                     "      | some contractType =>",
                     "        pure <| "
                     f"{serializer_prefix}_expr (← Lean.Meta.whnf contractType)",
                     "      | none => pure Lean.Json.null",
                     "    let payload := Lean.Json.mkObj [",
                     f'      ("format", Lean.ToJson.toJson {_CONTRACT_ANALYSIS_FORMAT_VERSION}),',
+                    '      ("semanticFormat", Lean.ToJson.toJson (1 : Nat)),',
                     f'      ("expr", {serializer_prefix}_expr normalizedType),',
                     '      ("binders", Lean.Json.arr binders),',
+                    '      ("contractExpr", contractExpr),',
+                    '      ("conclusionDependencies", Lean.ToJson.toJson conclusionDependencies),',
                     '      ("contractConclusionExpr", contractConclusionExpr),',
                     '      ("defeq", Lean.Json.arr defeq),',
                     '      ("contractDefeq", Lean.Json.arr contractDefeq),',

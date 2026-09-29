@@ -125,6 +125,9 @@ class MiniSubgoalClaim:
     contract_identity_statement_key: str = ""
     contract_identity_environment_hash: str = ""
     contract_identity_evidence_receipt: str = ""
+    # Exact analyzed executable source, independent of graph-local text
+    # normalization. Empty only for evidence from older checkpoints.
+    contract_source_sha256: str = ""
     # Lean-certified same-batch definitional connection to the root or an
     # active target.  The receipt binds this advisory route relation to the
     # claim's own evidence receipt, the anchor identity, environment, and

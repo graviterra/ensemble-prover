@@ -1100,6 +1100,76 @@ class _ContractIdentityCoverage:
         )
 
 
+def _recursive_variant_key(variant: SubgoalVariant) -> str:
+    return text_hash(json.dumps(
+        {"statement": variant.statement, "mode": variant.mode},
+        sort_keys=True, separators=(",", ":"),
+    ))
+
+
+def _restore_recursive_selected_variants(
+    variants: Sequence[SubgoalVariant], frame: Mapping[str, Any],
+) -> list[SubgoalVariant]:
+    """Recover the paid selection before current evidence can reorder it."""
+
+    keys = frame.get("selected_variant_keys")
+    cursor = frame.get("next_variant_index")
+    if (
+        not isinstance(keys, (list, tuple))
+        or not keys
+        or any(not isinstance(key, str) or not key for key in keys)
+        or len(set(keys)) != len(keys)
+        or type(cursor) is not int
+        or not 1 <= cursor <= len(keys)
+        or frame.get("selected_variant_key") != keys[cursor - 1]
+    ):
+        raise RuntimeError("recursive resume checkpoint has invalid selected variant order")
+    by_key: dict[str, SubgoalVariant] = {}
+    ambiguous_keys: set[str] = set()
+    for variant in variants:
+        key = _recursive_variant_key(variant)
+        if key in by_key:
+            ambiguous_keys.add(key)
+        by_key[key] = variant
+    if any(key not in by_key or key in ambiguous_keys for key in keys):
+        raise RuntimeError("recursive resume checkpoint lost its selected variant source")
+    return [by_key[key] for key in keys]
+
+
+def _restore_recursive_active_variant(
+    selected: SubgoalVariant, frame: Mapping[str, Any],
+) -> SubgoalVariant:
+    """Recover executable repair bytes without changing the planner's variant."""
+
+    retained_key = str(frame.get("active_variant_key") or "")
+    selected_key = _recursive_variant_key(selected)
+    if "active_variant" not in frame and "selected_variant_key" not in frame:
+        # Old checkpoints only identify unchanged executable variants. A
+        # repaired legacy frame lacks the bytes required for safe recovery.
+        if retained_key and retained_key == selected_key:
+            return selected
+        raise RuntimeError("recursive resume checkpoint lost its stable variant identity")
+    active = frame.get("active_variant")
+    if (
+        frame.get("selected_variant_key") != selected_key
+        or not isinstance(active, Mapping)
+        or not isinstance(active.get("statement"), str)
+        or not active["statement"].strip()
+        or not isinstance(active.get("mode"), str)
+    ):
+        raise RuntimeError("recursive resume checkpoint has invalid executable variant")
+    executable = SubgoalVariant(statement=active["statement"], mode=active["mode"])
+    if not retained_key or _recursive_variant_key(executable) != retained_key:
+        raise RuntimeError("recursive resume checkpoint lost its stable variant identity")
+    if executable.statement == selected.statement and executable.mode == selected.mode:
+        return selected
+    if executable.mode != f"{selected.mode}_statement_repair":
+        raise RuntimeError("recursive resume checkpoint has invalid statement repair mode")
+    # Repaired syntax has no authority to inherit the selected source's Lean
+    # receipt. Proof acceptance will analyze the executable statement afresh.
+    return executable
+
+
 def _recursive_plan_state_record(plan: MiniSubgoalPlan) -> dict[str, Any]:
     record = asdict(plan)
     # Default-valued additions must not invalidate authenticated pre-upgrade
@@ -1107,6 +1177,9 @@ def _recursive_plan_state_record(plan: MiniSubgoalPlan) -> dict[str, Any]:
     for key in ("search_disposition", "impasse_reason", "bottleneck_claim"):
         if not record[key]:
             record.pop(key)
+    for claim in record["claims"]:
+        if not claim.get("contract_source_sha256"):
+            claim.pop("contract_source_sha256", None)
     return record
 
 
@@ -2447,6 +2520,8 @@ def _missing_claim_dependencies(
 
 def _reused_statement_contract_evidence(
     candidate: Any,
+    *,
+    statement: Optional[str] = None,
 ) -> dict[str, str]:
     """Carry the matched claim's Lean receipt across the telemetry boundary.
 
@@ -2455,7 +2530,9 @@ def _reused_statement_contract_evidence(
     so graph reconciliation can certify that differently spelled target.
     """
 
-    if not _bound_variant_contract_identity(candidate):
+    if not _bound_statement_contract_identity(
+        candidate, candidate.statement if statement is None else statement,
+    ):
         return {}
     return {
         key: str(getattr(candidate, key, "") or "")
@@ -5024,10 +5101,26 @@ def _claim_variant_root_equivalent_suppression_reason(
     *,
     root_statement: str,
     active_target_statements: Sequence[str] = (),
+    allowed_anchor_identities: AbstractSet[str] = frozenset(),
+    expected_environment_hash: Optional[str] = None,
 ) -> str:
     root = str(root_statement or "").strip()
     statement = str(getattr(variant, "statement", "") or "").strip()
     if not root or not statement:
+        return ""
+    if (
+        claim.role == "root_assembly"
+        and claim.contract_source_sha256
+        and _claim_contract_source_matches(claim, statement)
+        and _bound_statement_contract_identity(
+            claim, statement, expected_environment_hash=expected_environment_hash,
+        )
+        and _bound_contract_route_relation_anchor(
+            claim, allowed_anchor_identities=allowed_anchor_identities,
+        )
+    ):
+        # A checked route's exact executable source must not be suppressed
+        # because its authored fragment omitted the compiled context.
         return ""
     active_targets = tuple(
         str(item or "").strip()
@@ -10013,6 +10106,10 @@ def _claim_contract_analysis_statement(claim: MiniSubgoalClaim) -> str:
 def _claim_contract_source_statement(claim: MiniSubgoalClaim) -> str:
     """Return the preferred executable variant for Lean contract analysis."""
 
+    if _bound_claim_contract_identity(claim):
+        for source in (claim.statement, *(variant.statement for variant in claim.variants)):
+            if _claim_contract_source_matches(claim, source):
+                return str(source).strip()
     for variant in claim.variants:
         statement = str(getattr(variant, "statement", "") or "").strip()
         if statement:
@@ -10069,12 +10166,28 @@ def _has_lean_structural_contract_evidence(identity: str) -> bool:
     return has_lean_contract_identity(identity)
 
 
+def _claim_contract_source_matches(claim: MiniSubgoalClaim, source: str) -> bool:
+    """Bind new receipts to exact source; old checkpoints keep their old fence."""
+
+    source = str(source or "").strip()
+    if not source or graph_statement_key(source) != claim.contract_identity_statement_key:
+        return False
+    digest = str(claim.contract_source_sha256 or "")
+    return not digest or bool(
+        re.fullmatch(r"[0-9a-f]{64}", digest)
+        and secrets.compare_digest(
+            digest, hashlib.sha256(source.encode("utf-8")).hexdigest()
+        )
+    )
+
+
 def _bound_claim_contract_identity(claim: MiniSubgoalClaim) -> str:
     identity = str(claim.contract_identity or "").strip()
     statement_key = str(claim.contract_identity_statement_key or "").strip()
     environment_hash = str(claim.contract_identity_environment_hash or "").strip()
-    if statement_key not in _claim_contract_source_statement_keys(
-        claim
+    if not any(
+        _claim_contract_source_matches(claim, source)
+        for source in (claim.statement, *(variant.statement for variant in claim.variants))
     ) or not lean_contract_evidence_receipt_matches(
         claim.contract_identity_evidence_receipt,
         identity=identity,
@@ -10091,19 +10204,24 @@ def _claim_contract_projection_fields(claim: MiniSubgoalClaim) -> dict[str, Any]
     A context-closed variant can bind variables or hypotheses absent from the
     planner's fragment. Only its own receipt authorizes the graph statement;
     recording that statement does not certify the original fragment separately.
-    Invalid evidence is left intact for the graph's existing strict rejection.
+    Apply these fields after the claim's serialized fields. Invalid exact-source
+    evidence has its receipt revoked, so the graph's existing strict rejection
+    cannot accept an identity through its coarser statement normalization.
     """
 
     authored = str(claim.statement or "").strip()
     fields: dict[str, Any] = {"statement": authored}
     if not _bound_claim_contract_identity(claim):
+        if claim.contract_source_sha256:
+            # Keep the advertised identity/key: removing all evidence would
+            # permit a fallback to legacy textual matching at the graph edge.
+            fields["contract_identity_evidence_receipt"] = ""
         return fields
-    statement_key = str(claim.contract_identity_statement_key or "").strip()
-    if statement_key == graph_statement_key(authored):
+    if _claim_contract_source_matches(claim, authored):
         return fields
     for index, variant in enumerate(claim.variants, start=1):
         source = str(variant.statement or "").strip()
-        if source and graph_statement_key(source) == statement_key:
+        if _claim_contract_source_matches(claim, source):
             return {
                 "statement": source,
                 "authored_statement": authored,
@@ -10116,22 +10234,61 @@ def _claim_contract_projection_fields(claim: MiniSubgoalClaim) -> dict[str, Any]
     return fields
 
 
-def _bound_variant_contract_identity(variant: SubgoalVariant) -> str:
-    """Return receipt-bound Lean identity for one compiled claim variant."""
+def _bound_statement_contract_identity(
+    item: SubgoalVariant | MiniSubgoalClaim, statement: str,
+    *, expected_environment_hash: Optional[str] = None,
+) -> str:
+    """Validate identity against the exact statement offered for evidence reuse."""
 
-    identity = str(variant.contract_identity or "").strip()
-    statement_key = str(variant.contract_identity_statement_key or "").strip()
-    environment_hash = str(variant.contract_identity_environment_hash or "").strip()
+    identity = str(item.contract_identity or "").strip()
+    statement_key = str(item.contract_identity_statement_key or "").strip()
+    environment_hash = str(item.contract_identity_environment_hash or "").strip()
+    if expected_environment_hash is not None and environment_hash != expected_environment_hash:
+        return ""
+    digest = str(getattr(item, "contract_source_sha256", "") or "")
+    if digest and (
+        not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or not secrets.compare_digest(
+            digest, hashlib.sha256(str(statement or "").strip().encode("utf-8")).hexdigest()
+        )
+    ):
+        return ""
     if statement_key != graph_statement_key(
-        variant.statement
+        statement
     ) or not lean_contract_evidence_receipt_matches(
-        variant.contract_identity_evidence_receipt,
+        item.contract_identity_evidence_receipt,
         identity=identity,
         statement_key=statement_key,
         environment_hash=environment_hash,
     ):
         return ""
     return identity
+
+
+def _bound_variant_contract_identity(variant: SubgoalVariant | MiniSubgoalClaim) -> str:
+    """Return receipt-bound Lean identity for one compiled claim variant."""
+
+    return _bound_statement_contract_identity(variant, variant.statement)
+
+
+def _claim_variant_contract_evidence_source(
+    claim: MiniSubgoalClaim, variant: SubgoalVariant,
+    *, expected_environment_hash: Optional[str] = None,
+) -> MiniSubgoalClaim | SubgoalVariant | None:
+    """Resolve checked evidence without rewriting immutable variant provenance."""
+
+    if (
+        (claim.contract_source_sha256 or variant.statement == claim.statement)
+        and _bound_statement_contract_identity(
+            claim, variant.statement, expected_environment_hash=expected_environment_hash,
+        )
+    ):
+        return claim
+    if _bound_statement_contract_identity(
+        variant, variant.statement, expected_environment_hash=expected_environment_hash,
+    ):
+        return variant
+    return None
 
 
 def _resolve_recursive_child_proof_idea_context(
@@ -13354,6 +13511,29 @@ async def _canonicalize_dependency_contract_inputs(
         *(str(statement or "") for statement in support_statements),
         *(str(statement or "") for statement in analysis_statements),
     )
+    # Keep the root/claim/support indices stable for downstream consumers, and
+    # append alternative EXECUTABLE variants. Authored fragments are not added
+    # implicitly: a receipt for a context-closed variant cannot certify them.
+    variant_batch_indices: list[tuple[int, ...]] = []
+    extra_statements: list[str] = []
+    for claim_index, claim in enumerate(plan.claims, start=1):
+        candidate_indices = [claim_index]
+        seen = {statements[claim_index].strip()}
+        if use_structural_analysis and (
+            str(claim.role or "").strip().lower() == "root_assembly"
+            or claim.source_arbitration_provisional
+        ):
+            # Helpers retain their existing bounded execution-time fallback.
+            # Eagerly elaborating every helper wrapper multiplies ordinary
+            # batches without helping root-route admission.
+            for variant in claim.variants:
+                source = str(variant.statement or "").strip()
+                if source and source not in seen:
+                    seen.add(source)
+                    candidate_indices.append(len(statements) + len(extra_statements))
+                    extra_statements.append(source)
+        variant_batch_indices.append(tuple(candidate_indices))
+    statements = (*statements, *extra_statements)
     started = time.monotonic()
     operation_timeout_s = max(1.0, float(timeout_s))
     runner_operation_telemetry: dict[str, Any] = {}
@@ -13429,7 +13609,9 @@ async def _canonicalize_dependency_contract_inputs(
                             analysis_start_index + len(analysis_statements),
                         ),
                     ),
-                    "defeq_candidate_indices": tuple(range(1, 1 + len(plan.claims))),
+                    "defeq_candidate_indices": tuple(
+                        index for indices in variant_batch_indices for index in indices
+                    ),
                 }
             )
 
@@ -13593,6 +13775,52 @@ async def _canonicalize_dependency_contract_inputs(
                 returncode=normalized_returncode,
             ),
         )
+    if use_structural_analysis and len(analyzed or ()) == len(statements):
+        # The preferred syntactic wrapper may elaborate yet introduce extra
+        # parameters, or fail while another compiled variant is valid. Let
+        # Lean's same-batch comparisons select an exact root route first.
+        selected_items = list(analyzed)
+        selected_sources = list(claim_analysis_statements)
+        anchor_indices = set(identity_kwargs.get("defeq_anchor_indices", ()))
+        for claim_index, (claim, indices) in enumerate(
+            zip(plan.claims, variant_batch_indices), start=1
+        ):
+            available = [
+                index for index in indices
+                if has_lean_contract_identity(str(
+                    getattr(analyzed[index], "structural_identity", "") or ""
+                ))
+            ]
+            if not available:
+                continue
+            selected = available[0]
+            basis = "first_elaborated_variant"
+            if str(claim.role or "").strip().lower() == "root_assembly":
+                for relation, reason in (
+                    ("definitionally_equal_indices", "lean_root_defeq"),
+                    ("contract_definitionally_equal_indices", "lean_root_profile_defeq"),
+                ):
+                    match = next((index for index in available if anchor_indices.intersection(
+                        getattr(analyzed[index], relation, ()) or ()
+                    )), None)
+                    if match is not None:
+                        selected, basis = match, reason
+                        break
+            selected_items[claim_index] = analyzed[selected]
+            selected_sources[claim_index - 1] = statements[selected]
+            if selected != claim_index:
+                _record(record_event, {
+                    "phase": "mini_recursive_plan_dependency_contract_identity",
+                    "pass_index": pass_index,
+                    "claim_name": claim.name,
+                    "candidate_count": len(indices),
+                    "selected_batch_index": selected,
+                    "selection_basis": basis,
+                    "statement": statements[selected],
+                    "verdict": "contract_variant_selected",
+                })
+        analyzed = tuple(selected_items)
+        claim_analysis_statements = tuple(selected_sources)
     if use_structural_analysis:
         analysis_items = tuple(analyzed or ())
         rendered_items = tuple(
@@ -13780,6 +14008,10 @@ async def _canonicalize_dependency_contract_inputs(
                 claim,
                 contract_identity=identity,
                 contract_identity_statement_key=statement_key,
+                contract_source_sha256=(
+                    hashlib.sha256(analyzed_statement.strip().encode("utf-8")).hexdigest()
+                    if identity else ""
+                ),
                 contract_identity_environment_hash=(
                     evidence_environment_hash if identity else ""
                 ),
@@ -14167,6 +14399,7 @@ def _claim_with_recompiled_statement(
         ),
         contract_identity="",
         contract_identity_statement_key="",
+        contract_source_sha256="",
         contract_identity_environment_hash="",
         contract_identity_evidence_receipt="",
         contract_route_relation_kind="",
@@ -18247,14 +18480,18 @@ async def run_mini_recursive_attempt(
                         "claim_index": claim_index,
                         "claim_name": claim.name,
                         "source_index": claim.source_index,
-                        "statement": claim.statement,
+                        "statement": variant.statement,
                     }
                 )
                 or {}
             )
+        variant_evidence = _claim_variant_contract_evidence_source(
+            claim, variant,
+            expected_environment_hash=str(getattr(attempt_dossier, "current_lean_environment_hash", "") or ""),
+        )
         variant_statement_identity = structural_statement_identity(
             variant.statement,
-            contract_identity=_bound_variant_contract_identity(variant),
+            contract_identity=(variant_evidence.contract_identity if variant_evidence else ""),
             statement_key=canonical_dossier_statement_key(variant.statement),
         )
         proof_idea_context, proof_idea_resolution = (
@@ -21429,6 +21666,12 @@ async def run_mini_recursive_driver(
             return str(proof_environment_fingerprint or "")
         return str(get_proof_environment_fingerprint() or "")
 
+    def current_contract_evidence_environment_hash() -> str:
+        return (
+            str(getattr(dossier, "current_lean_environment_hash", "") or "")
+            or current_proof_environment_fingerprint()
+        )
+
     def current_root_tactic_environment_fingerprint() -> str:
         if get_root_tactic_environment_fingerprint is not None:
             return str(get_root_tactic_environment_fingerprint() or "")
@@ -22447,6 +22690,8 @@ async def run_mini_recursive_driver(
         accepted_helper_proof: str = "",
         active_variant_statement: str = "",
         active_variant_mode: str = "",
+        selected_variant_key: str = "",
+        selected_variant_keys: Sequence[str] = (),
         pass_helper_fingerprints_before: Optional[Sequence[str]] = None,
         pass_helpers_accepted_before: Optional[int] = None,
         planner_fallback_pending_pass: Optional[int] = None,
@@ -22598,17 +22843,16 @@ async def run_mini_recursive_driver(
                 _recursive_helper_continuation_sources(dossier)
                 if phase == "helper_accepted" else {}
             ),
+            "selected_variant_key": selected_variant_key,
+            "selected_variant_keys": list(selected_variant_keys),
+            "active_variant": (
+                {"statement": active_variant_statement, "mode": active_variant_mode}
+                if active_variant_statement else None
+            ),
             "active_variant_key": (
-                text_hash(
-                    json.dumps(
-                        {
-                            "statement": str(active_variant_statement or ""),
-                            "mode": str(active_variant_mode or ""),
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                )
+                _recursive_variant_key(SubgoalVariant(
+                    statement=active_variant_statement, mode=active_variant_mode,
+                ))
                 if str(active_variant_statement or "")
                 else ""
             ),
@@ -23083,50 +23327,15 @@ async def run_mini_recursive_driver(
         variant: SubgoalVariant,
         replay_helpers: Sequence[str],
     ) -> dict[str, Any]:
-        def bound_contract_identity(item: Any, statement: str) -> str:
-            identity = str(getattr(item, "contract_identity", "") or "").strip()
-            statement_key = str(
-                getattr(item, "contract_identity_statement_key", "") or ""
-            ).strip()
-            environment_hash = str(
-                getattr(item, "contract_identity_environment_hash", "") or ""
-            ).strip()
-            if statement_key != graph_statement_key(
-                statement
-            ) or not lean_contract_evidence_receipt_matches(
-                str(
-                    getattr(
-                        item,
-                        "contract_identity_evidence_receipt",
-                        "",
-                    )
-                    or ""
-                ),
-                identity=identity,
-                statement_key=statement_key,
-                environment_hash=environment_hash,
-            ):
-                return ""
-            return identity
-
-        claim_identity = bound_contract_identity(claim, claim.statement)
-        if (
-            variant.statement == claim.statement
-            and _has_lean_structural_contract_evidence(claim_identity)
-        ):
+        evidence = _claim_variant_contract_evidence_source(
+            claim, variant, expected_environment_hash=current_contract_evidence_environment_hash(),
+        )
+        if evidence is not None:
             return {
-                "contract_identity": claim_identity,
-                "contract_display_statement": (claim.contract_display_statement),
-                "contract_binder_sorts": claim.contract_binder_sorts,
-                "contract_proof_binder_types": (claim.contract_proof_binder_types),
-            }
-        variant_identity = bound_contract_identity(variant, variant.statement)
-        if _has_lean_structural_contract_evidence(variant_identity):
-            return {
-                "contract_identity": variant_identity,
-                "contract_display_statement": (variant.contract_display_statement),
-                "contract_binder_sorts": variant.contract_binder_sorts,
-                "contract_proof_binder_types": (variant.contract_proof_binder_types),
+                "contract_identity": evidence.contract_identity,
+                "contract_display_statement": evidence.contract_display_statement,
+                "contract_binder_sorts": evidence.contract_binder_sorts,
+                "contract_proof_binder_types": evidence.contract_proof_binder_types,
             }
         analyzer = getattr(lean, "analyze_statement_contracts", None)
         if not callable(analyzer):
@@ -24383,14 +24592,7 @@ async def run_mini_recursive_driver(
             ),
             pass_index=pass_index,
             record_event=record_event,
-            environment_hash=str(
-                getattr(
-                    dossier,
-                    "current_lean_environment_hash",
-                    "",
-                )
-                or ""
-            ),
+            environment_hash=current_contract_evidence_environment_hash(),
             declaration_context=_verified_helper_declaration_blocks(
                 helper_snapshot,
                 suppress_solution_placeholders=suppress_solution_placeholders,
@@ -24419,14 +24621,7 @@ async def run_mini_recursive_driver(
             active_target_contract_identities=(
                 _active_root_target_contract_identities(
                     _current_active_root_targets(),
-                    expected_environment_hash=str(
-                        getattr(
-                            dossier,
-                            "current_lean_environment_hash",
-                            "",
-                        )
-                        or ""
-                    ),
+                    expected_environment_hash=current_contract_evidence_environment_hash(),
                 )
             ),
         )
@@ -25334,17 +25529,7 @@ async def run_mini_recursive_driver(
                         "recursive_active_root_target_infrastructure_unavailable"
                     ),
                 )
-            current_planner_route_environment_hash = (
-                str(
-                    getattr(
-                        dossier,
-                        "current_lean_environment_hash",
-                        "",
-                    )
-                    or ""
-                )
-                or current_proof_environment_fingerprint()
-            )
+            current_planner_route_environment_hash = current_contract_evidence_environment_hash()
             current_planner_visibility_policy_hash = text_hash(
                 json.dumps(
                     {
@@ -26428,14 +26613,7 @@ async def run_mini_recursive_driver(
                 (),
                 _active_root_target_contract_identity_map(
                     _current_active_root_targets(),
-                    expected_environment_hash=str(
-                        getattr(
-                            dossier,
-                            "current_lean_environment_hash",
-                            "",
-                        )
-                        or ""
-                    ),
+                    expected_environment_hash=current_contract_evidence_environment_hash(),
                 ),
             )
         )
@@ -26581,9 +26759,7 @@ async def run_mini_recursive_driver(
                 ),
                 pass_index=pass_index,
                 record_event=record_dependency_contract_event,
-                environment_hash=str(
-                    getattr(dossier, "current_lean_environment_hash", "") or ""
-                ),
+                environment_hash=current_contract_evidence_environment_hash(),
                 declaration_context=_verified_helper_declaration_blocks(
                     contract_helpers,
                     suppress_solution_placeholders=(suppress_solution_placeholders),
@@ -26622,9 +26798,7 @@ async def run_mini_recursive_driver(
                     )
                     if has_lean_contract_identity(identity)
                 }
-                evidence_environment_hash = str(
-                    getattr(dossier, "current_lean_environment_hash", "") or ""
-                ).strip()
+                evidence_environment_hash = current_contract_evidence_environment_hash()
                 for item in active_root_targets:
                     statements = active_root_equivalence_statements([item])
                     if not statements:
@@ -26967,9 +27141,7 @@ async def run_mini_recursive_driver(
                         ),
                         pass_index=pass_index,
                         record_event=record_dependency_contract_event,
-                        environment_hash=str(
-                            getattr(dossier, "current_lean_environment_hash", "") or ""
-                        ),
+                        environment_hash=current_contract_evidence_environment_hash(),
                         declaration_context=_verified_helper_declaration_blocks(
                             contract_helpers,
                             suppress_solution_placeholders=(
@@ -26996,14 +27168,7 @@ async def run_mini_recursive_driver(
                             coverage.analysis_structural_identities,
                             _active_root_target_contract_identity_map(
                                 _current_active_root_targets(),
-                                expected_environment_hash=str(
-                                    getattr(
-                                        dossier,
-                                        "current_lean_environment_hash",
-                                        "",
-                                    )
-                                    or ""
-                                ),
+                                expected_environment_hash=current_contract_evidence_environment_hash(),
                             ),
                         )
                     )
@@ -27201,14 +27366,7 @@ async def run_mini_recursive_driver(
                     ),
                     pass_index=pass_index,
                     record_event=record_dependency_contract_event,
-                    environment_hash=str(
-                        getattr(
-                            dossier,
-                            "current_lean_environment_hash",
-                            "",
-                        )
-                        or ""
-                    ),
+                    environment_hash=current_contract_evidence_environment_hash(),
                     declaration_context=_verified_helper_declaration_blocks(
                         contract_helpers,
                         suppress_solution_placeholders=(suppress_solution_placeholders),
@@ -27233,14 +27391,7 @@ async def run_mini_recursive_driver(
                         coverage.analysis_structural_identities,
                         _active_root_target_contract_identity_map(
                             _current_active_root_targets(),
-                            expected_environment_hash=str(
-                                getattr(
-                                    dossier,
-                                    "current_lean_environment_hash",
-                                    "",
-                                )
-                                or ""
-                            ),
+                            expected_environment_hash=current_contract_evidence_environment_hash(),
                         ),
                     )
                 )
@@ -27738,17 +27889,7 @@ async def run_mini_recursive_driver(
                         "planner_feedback": list(planner_feedback),
                     }
                     contract_root_hash = text_hash(str(root_statement or ""))
-                    contract_route_environment_hash = (
-                        str(
-                            getattr(
-                                dossier,
-                                "current_lean_environment_hash",
-                                "",
-                            )
-                            or ""
-                        )
-                        or current_proof_environment_fingerprint()
-                    )
+                    contract_route_environment_hash = current_contract_evidence_environment_hash()
                     contract_visibility_hash = text_hash(
                         json.dumps(
                             {
@@ -28120,14 +28261,7 @@ async def run_mini_recursive_driver(
                         ),
                         pass_index=pass_index,
                         record_event=record_dependency_contract_event,
-                        environment_hash=str(
-                            getattr(
-                                dossier,
-                                "current_lean_environment_hash",
-                                "",
-                            )
-                            or ""
-                        ),
+                        environment_hash=current_contract_evidence_environment_hash(),
                         declaration_context=_verified_helper_declaration_blocks(
                             contract_helpers,
                             suppress_solution_placeholders=(
@@ -28204,14 +28338,7 @@ async def run_mini_recursive_driver(
                                 ),
                                 pass_index=pass_index,
                                 record_event=record_dependency_contract_event,
-                                environment_hash=str(
-                                    getattr(
-                                        dossier,
-                                        "current_lean_environment_hash",
-                                        "",
-                                    )
-                                    or ""
-                                ),
+                                environment_hash=current_contract_evidence_environment_hash(),
                                 declaration_context=(
                                     _verified_helper_declaration_blocks(
                                         contract_helpers,
@@ -28355,14 +28482,7 @@ async def run_mini_recursive_driver(
                             ),
                             pass_index=pass_index,
                             record_event=record_dependency_contract_event,
-                            environment_hash=str(
-                                getattr(
-                                    dossier,
-                                    "current_lean_environment_hash",
-                                    "",
-                                )
-                                or ""
-                            ),
+                            environment_hash=current_contract_evidence_environment_hash(),
                             declaration_context=(
                                 _verified_helper_declaration_blocks(
                                     contract_helpers,
@@ -28452,14 +28572,7 @@ async def run_mini_recursive_driver(
                             replan_coverage.analysis_structural_identities,
                             _active_root_target_contract_identity_map(
                                 _current_active_root_targets(),
-                                expected_environment_hash=str(
-                                    getattr(
-                                        dossier,
-                                        "current_lean_environment_hash",
-                                        "",
-                                    )
-                                    or ""
-                                ),
+                                expected_environment_hash=current_contract_evidence_environment_hash(),
                             ),
                         )
                     )
@@ -29322,12 +29435,22 @@ async def run_mini_recursive_driver(
                     candidate.statement,
                     *(variant.statement for variant in candidate.variants),
                 ]
-                reusable_identities = [
-                    _bound_variant_contract_identity(candidate),
+                reusable_evidence_sources = [
+                    candidate,
                     *(
-                        _bound_variant_contract_identity(variant)
+                        _claim_variant_contract_evidence_source(
+                            candidate, variant,
+                            expected_environment_hash=current_contract_evidence_environment_hash(),
+                        ) or variant
                         for variant in candidate.variants
                     ),
+                ]
+                reusable_identities = [
+                    _bound_statement_contract_identity(
+                        item, statement,
+                        expected_environment_hash=current_contract_evidence_environment_hash(),
+                    )
+                    for item, statement in zip(reusable_evidence_sources, reusable_statements)
                 ]
                 reuse_helper_name, reuse_statement, reuse_candidate_index = _reusable_verified_helper_match_with_candidate(
                     prepriority_helper_blocks,
@@ -29355,7 +29478,8 @@ async def run_mini_recursive_driver(
                             "helper_name": reuse_helper_name,
                             "statement": reuse_statement,
                             **_reused_statement_contract_evidence(
-                                (candidate, *candidate.variants)[reuse_candidate_index]
+                                reusable_evidence_sources[reuse_candidate_index],
+                                statement=reuse_statement,
                             ),
                             "verdict": "claim_reused_before_priority",
                         },
@@ -29932,26 +30056,14 @@ async def run_mini_recursive_driver(
                             "contract_identity_statement_key": graph_statement_key(
                                 statement
                             ),
-                            "contract_identity_environment_hash": str(
-                                getattr(
-                                    dossier,
-                                    "current_lean_environment_hash",
-                                    "",
-                                )
-                                or ""
+                            "contract_identity_environment_hash": (
+                                current_contract_evidence_environment_hash()
                             ),
                             "contract_identity_evidence_receipt": (
                                 make_lean_contract_evidence_receipt(
                                     identity,
                                     graph_statement_key(statement),
-                                    str(
-                                        getattr(
-                                            dossier,
-                                            "current_lean_environment_hash",
-                                            "",
-                                        )
-                                        or ""
-                                    ),
+                                    current_contract_evidence_environment_hash(),
                                 )
                             ),
                         }
@@ -29968,7 +30080,6 @@ async def run_mini_recursive_driver(
                     "accepted_claims": [
                         {
                             "name": claim.name,
-                            **_claim_contract_projection_fields(claim),
                             "role": claim.role,
                             "rationale": claim.rationale,
                             "invariant_refs": list(claim.invariant_refs),
@@ -30017,6 +30128,7 @@ async def run_mini_recursive_driver(
                             "controller_role_restored": bool(
                                 claim.controller_role_restored
                             ),
+                            **_claim_contract_projection_fields(claim),
                         }
                         for selected_index, claim in enumerate(claims, start=1)
                     ],
@@ -30031,7 +30143,17 @@ async def run_mini_recursive_driver(
                     "The declared root route was rejected by graph projection. "
                     "Replan it before attempting any child claim work.",
                 )
-                continue
+                _record(record_event, {
+                    "phase": "mini_recursive_route_contract",
+                    "pass_index": pass_index,
+                    "rejected_claim_names": [claim.name for claim in claims],
+                    "verdict": "root_route_contract_projection_rejected",
+                })
+                # No selected work is executable until graph admission agrees.
+                # Settle this attempted plan through the shared empty-queue
+                # pass checkpoint below; jumping to the planner here would
+                # bypass both the pass limit and its scheduling quantum.
+                claims = []
         elif claims and not restored_selected_plan:
             if not restored_selected_plan:
                 if compiled_root_assembly_claim_names:
@@ -30777,6 +30899,9 @@ async def run_mini_recursive_driver(
                             ),
                             "child_receipt": None,
                             "active_variant_key": "",
+                            "active_variant": None,
+                            "selected_variant_key": "",
+                            "selected_variant_keys": [],
                             "accepted_helper_name": "",
                             "accepted_helper_statement": "",
                             "accepted_helper_proof": "",
@@ -30851,6 +30976,11 @@ async def run_mini_recursive_driver(
         heuristic_quarantined_claim_indices: set[int] = set()
         heuristic_quarantine_tainted_claim_names: set[str] = set()
         all_quarantined_fixed_point = False
+        allowed_execution_anchor_identities = frozenset(
+            identity for identity in (
+                _bound_root_contract_identity(plan), *active_target_contract_identities,
+            ) if has_lean_contract_identity(identity)
+        )
         prior_candidates_for_statement = getattr(
             dossier,
             "unpromoted_refutation_candidates_for_statement",
@@ -30878,6 +31008,8 @@ async def run_mini_recursive_driver(
                         int(config.max_variants_per_claim or 1),
                     ),
                     active_target_statements=active_targets,
+                    allowed_anchor_identities=allowed_execution_anchor_identities,
+                    expected_environment_hash=current_contract_evidence_environment_hash(),
                 )
                 if not durable_variants or not all(
                     not _claim_variant_root_equivalent_suppression_reason(
@@ -30885,6 +31017,8 @@ async def run_mini_recursive_driver(
                         variant,
                         root_statement=root_statement,
                         active_target_statements=active_targets,
+                        allowed_anchor_identities=allowed_execution_anchor_identities,
+                        expected_environment_hash=current_contract_evidence_environment_hash(),
                     )
                     and bool(prior_candidates_for_statement(variant.statement))
                     for variant in durable_variants
@@ -30941,12 +31075,26 @@ async def run_mini_recursive_driver(
                 )
                 else 0
             )
-            variants, skipped_variants = _select_claim_variants(
-                claim,
-                root_statement=root_statement,
-                max_variants=max(1, int(config.max_variants_per_claim or 1)),
-                active_target_statements=claim_active_target_statements,
-            )
+            if (
+                resuming_this_pass
+                and str(resume_frame.get("phase") or "") in {"child_pending", "child_receipt"}
+                and claim_index - 1 == int(resume_frame.get("next_claim_index", -1) or 0)
+                and "selected_variant_keys" in resume_frame
+            ):
+                # Cache growth can stale a selection receipt without changing
+                # the static route. Retain its paid order, but let the live
+                # filters below reject stale evidence and invalidated targets.
+                variants = _restore_recursive_selected_variants(claim.variants, resume_frame)
+                skipped_variants: list[SubgoalVariant] = []
+            else:
+                variants, skipped_variants = _select_claim_variants(
+                    claim,
+                    root_statement=root_statement,
+                    max_variants=max(1, int(config.max_variants_per_claim or 1)),
+                    active_target_statements=claim_active_target_statements,
+                    allowed_anchor_identities=allowed_execution_anchor_identities,
+                    expected_environment_hash=current_contract_evidence_environment_hash(),
+                )
             root_equivalent_suppressed_variants: list[
                 tuple[int, SubgoalVariant, str]
             ] = []
@@ -30957,11 +31105,21 @@ async def run_mini_recursive_driver(
             claim_heuristic_quarantined_variant_indices: set[int] = set()
             live_variants: list[tuple[int, SubgoalVariant]] = []
             for idx, variant in enumerate(variants, start=1):
+                if (
+                    resuming_this_pass
+                    and str(resume_frame.get("phase") or "")
+                    in {"child_pending", "child_receipt"}
+                    and claim_index - 1 == int(resume_frame.get("next_claim_index", -1) or 0)
+                    and idx == int(resume_frame.get("next_variant_index", -1) or 0)
+                ):
+                    variant = _restore_recursive_active_variant(variant, resume_frame)
                 suppression_reason = _claim_variant_root_equivalent_suppression_reason(
                     claim,
                     variant,
                     root_statement=root_statement,
                     active_target_statements=claim_active_target_statements,
+                    allowed_anchor_identities=allowed_execution_anchor_identities,
+                    expected_environment_hash=current_contract_evidence_environment_hash(),
                 )
                 if suppression_reason:
                     root_equivalent_suppressed_variants.append(
@@ -31254,12 +31412,24 @@ async def run_mini_recursive_driver(
                 claim.statement,
                 *(variant.statement for _idx, variant in live_variants),
             ]
-            reusable_candidate_identities = [
-                _bound_variant_contract_identity(claim),
+            reusable_candidate_evidence_sources = [
+                claim,
                 *(
-                    _bound_variant_contract_identity(variant)
+                    _claim_variant_contract_evidence_source(
+                        claim, variant,
+                        expected_environment_hash=current_contract_evidence_environment_hash(),
+                    ) or variant
                     for _idx, variant in live_variants
                 ),
+            ]
+            reusable_candidate_identities = [
+                _bound_statement_contract_identity(
+                    item, statement,
+                    expected_environment_hash=current_contract_evidence_environment_hash(),
+                )
+                for item, statement in zip(
+                    reusable_candidate_evidence_sources, reusable_candidate_statements,
+                )
             ]
             reuse_helper_name, reuse_statement, reuse_candidate_index = _reusable_verified_helper_match_with_candidate(
                 reusable_helper_blocks,
@@ -31287,7 +31457,8 @@ async def run_mini_recursive_driver(
                         "helper_name": reuse_helper_name,
                         "statement": reuse_statement,
                         **_reused_statement_contract_evidence(
-                            (claim, *(variant for _idx, variant in live_variants))[reuse_candidate_index],
+                            reusable_candidate_evidence_sources[reuse_candidate_index],
+                            statement=reuse_statement,
                         ),
                         "verdict": "claim_reused_existing_verified_helper",
                     },
@@ -31350,27 +31521,6 @@ async def run_mini_recursive_driver(
                         "recursive_claim_falsification_quantum"
                     )
 
-                if resume_same_variant:
-                    retained_variant_key = str(
-                        resume_frame.get("active_variant_key") or ""
-                    )
-                    current_variant_key = text_hash(
-                        json.dumps(
-                            {
-                                "statement": str(variant.statement or ""),
-                                "mode": str(variant.mode or ""),
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                    )
-                    if (
-                        not retained_variant_key
-                        or retained_variant_key != current_variant_key
-                    ):
-                        raise RuntimeError(
-                            "recursive resume checkpoint lost its stable variant identity"
-                        )
                 resume_child_receipt = bool(
                     resume_same_variant
                     and resume_variant_phase == "child_receipt"
@@ -31379,8 +31529,9 @@ async def run_mini_recursive_driver(
                 if not resume_same_variant:
                     stats.claims_attempted += 1
                 attempted_this_claim = True
-                original_variant_statement = str(variant.statement or "")
-                last_attempted_statement = original_variant_statement
+                selected_variant = variants[variant_index - 1]
+                original_variant_statement = str(selected_variant.statement or "")
+                last_attempted_statement = str(variant.statement or "")
                 helper_name = _suggest_helper_name(
                     theorem_name,
                     claim.name,
@@ -31508,6 +31659,7 @@ async def run_mini_recursive_driver(
                                 statement=repaired_statement,
                                 mode=f"{variant.mode}_statement_repair",
                             )
+                            last_attempted_statement = repaired_statement
                             type_ok = True
                             type_output = repaired_output
                             repair_succeeded = True
@@ -31893,6 +32045,8 @@ async def run_mini_recursive_driver(
                             completed_claim_keys=completed_claim_keys,
                             active_variant_statement=variant.statement,
                             active_variant_mode=variant.mode,
+                            selected_variant_key=_recursive_variant_key(selected_variant),
+                            selected_variant_keys=tuple(_recursive_variant_key(item) for item in variants),
                             pass_helper_fingerprints_before=(
                                 verified_helper_fingerprints_before
                             ),
@@ -31966,6 +32120,8 @@ async def run_mini_recursive_driver(
                             completed_claim_keys=completed_claim_keys,
                             active_variant_statement=variant.statement,
                             active_variant_mode=variant.mode,
+                            selected_variant_key=_recursive_variant_key(selected_variant),
+                            selected_variant_keys=tuple(_recursive_variant_key(item) for item in variants),
                             pass_helper_fingerprints_before=(
                                 verified_helper_fingerprints_before
                             ),
@@ -32645,6 +32801,7 @@ async def run_mini_recursive_driver(
                     claim_index=claim_index,
                     reason=last_failure_reason or "claim_exhausted",
                     diagnostic=last_failure_diagnostic,
+                    expected_environment_hash=current_contract_evidence_environment_hash(),
                 )
                 materialized_bottleneck = bool(
                     bottleneck_record.get("materialized")
@@ -39766,6 +39923,7 @@ def _record_durable_bottleneck_obligation(
     claim_index: int,
     reason: str,
     diagnostic: str = "",
+    expected_environment_hash: Optional[str] = None,
 ) -> dict[str, Any]:
     graph = getattr(dossier, "proof_graph", None) if dossier is not None else None
     nodes = getattr(graph, "nodes", {}) if graph is not None else {}
@@ -39783,6 +39941,28 @@ def _record_durable_bottleneck_obligation(
     target_statement = str(statement or claim.statement or "").strip()
     if not target_statement:
         return {"materialized": False, "pending_adjudication": False}
+    environment_hash = str(
+        getattr(dossier, "current_lean_environment_hash", "")
+        or expected_environment_hash or ""
+    )
+    statement_environment_metadata = dict(dossier.statement_environment_metadata())
+    if not statement_environment_metadata.get("statement_environment_hash") and environment_hash:
+        statement_environment_metadata.update({
+            "statement_environment_hash": environment_hash,
+            "statement_environment_ancestor_hashes": [],
+        })
+    # A failed fallback or local repair need not be the source Lean analyzed
+    # for its parent claim. Bind retry lineage to the actual target and the
+    # current environment, retaining variant-owned evidence when available.
+    target_variant = next(
+        (variant for variant in claim.variants
+         if str(variant.statement or "").strip() == target_statement),
+        SubgoalVariant(statement=target_statement, mode="raw"),
+    )
+    evidence_source = _claim_variant_contract_evidence_source(
+        claim, target_variant,
+        expected_environment_hash=environment_hash,
+    )
     root_id = str(getattr(graph, "root_node_id", "") or "root").strip() or "root"
     claim_name = str(claim.name or f"claim_{claim_index}").strip()
     planned_claim: Mapping[str, Any] = {}
@@ -39848,7 +40028,7 @@ def _record_durable_bottleneck_obligation(
         claim_id=str(planned_claim.get("claim_node_id") or "").strip(),
         statement_identity=structural_statement_identity(
             target_statement,
-            contract_identity=_bound_claim_contract_identity(claim),
+            contract_identity=(evidence_source.contract_identity if evidence_source else ""),
             statement_key=canonical_dossier_statement_key(target_statement),
         ),
     )
@@ -39917,7 +40097,7 @@ def _record_durable_bottleneck_obligation(
                 if certified_fact
                 else "uncertified_recursive_bottleneck_pending_adjudication"
             ),
-            **dossier.statement_environment_metadata(),
+            **statement_environment_metadata,
         },
     )
     obligation.metadata.update(bottleneck_lineage.merged_metadata(obligation.metadata))
@@ -40227,10 +40407,25 @@ def _select_claim_variants(
     root_statement: str,
     max_variants: int,
     active_target_statements: Sequence[str] = (),
+    allowed_anchor_identities: AbstractSet[str] = frozenset(),
+    expected_environment_hash: Optional[str] = None,
 ) -> tuple[list[SubgoalVariant], list[SubgoalVariant]]:
     variants = list(claim.variants or ())
     if not variants:
         return [], []
+    # The contract analyzer may select a later, fully bound raw variant over
+    # an overclosed or ill-typed wrapper. Its fresh source-bound Lean receipt
+    # outranks the name-based unbound-local heuristic and the execution cap.
+    # Do not mutate claim.variants: its original indices remain provenance.
+    bound_key = (
+        str(claim.contract_identity_statement_key or "")
+        if _bound_claim_contract_identity(claim) and (
+            expected_environment_hash is None
+            or claim.contract_identity_environment_hash == expected_environment_hash
+        ) else ""
+    )
+    if bound_key:
+        variants.sort(key=lambda variant: not _claim_contract_source_matches(claim, variant.statement))
     cap = max(1, int(max_variants or 1))
     context_names = _root_context_names(root_statement)
     selected: list[SubgoalVariant] = []
@@ -40240,6 +40435,7 @@ def _select_claim_variants(
         if (
             variant.mode == "raw"
             and has_contextual_variant
+            and not (bound_key and _claim_contract_source_matches(claim, variant.statement))
             and (_identifier_tokens(variant.statement) & context_names)
         ):
             skipped.append(variant)
@@ -40253,6 +40449,8 @@ def _select_claim_variants(
                 item,
                 root_statement=root_statement,
                 active_target_statements=active_target_statements,
+                allowed_anchor_identities=allowed_anchor_identities,
+                expected_environment_hash=expected_environment_hash,
             )
         )
         if live_selected_count >= cap:

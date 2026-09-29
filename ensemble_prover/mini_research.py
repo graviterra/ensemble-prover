@@ -1134,18 +1134,28 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
         raise ValueError("native research is not active")
     if name == "read_native_research_artifact":
         object_fields(payload, {"artifact_id", "offset", "length", "path"}, set(), name)
-        if owner.store is None:
-            raise ValueError("no native research artifacts yet")
         if "artifact_id" not in payload:
             guidance = owner._guidance_for(conv)
-            if guidance is None:
-                raise ValueError("no native research advice for the active target yet")
+            if owner.store is None or guidance is None:
+                return {
+                    "status": "not_available_yet",
+                    "reason": "no_advice_for_active_target",
+                    "kernel_verified": False,
+                    "instruction": (
+                        "No research advice is available for the active target in its current Lean context. "
+                        "Continue proof work. If investigation is needed, call request_native_research "
+                        "with the exact statement and reason, then settle the action; research runs "
+                        "at a committed boundary. Repeated reads do not start research."
+                    ),
+                }
             # Optional prompt advice may be dropped to preserve the original
             # source. Keep its entire argument/handoff index discoverable even
             # when the provider never saw an artifact hash.
             payload = {**payload, "artifact_id": owner.store.put_artifact(
                 _json(guidance).encode(), name="current-native-research-guidance.json",
             )}
+        if owner.store is None:
+            raise ValueError("no native research artifacts yet")
         return read_page(owner.store, **payload)
     if name != "request_native_research":
         raise ValueError("unknown native research tool")
@@ -1183,6 +1193,6 @@ NATIVE_TOOLS = [
      "description": "Request independent investigation of an unsupported ancestor or stalled method; never refutes or stops the run.",
      "parameters": {"type": "object", "properties": {"statement": {"type": "string"}, "reason": {"type": "string"}, "evidence_artifact_ids": {"type": "array", "items": {"type": "string"}}}, "required": ["statement", "reason"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "read_native_research_artifact",
-     "description": "Read exact pages of archived research arguments or sources. Omit artifact_id for the complete current advice envelope, including argument and handoff links.",
+     "description": "Read exact pages of archived research arguments or sources. Omit artifact_id for the complete current advice envelope, including argument and handoff links. If advice is not yet available for the active target and context, returns not_available_yet; reading does not start research.",
      "parameters": {"type": "object", "properties": {"artifact_id": {"type": "string"}, "offset": {"type": "integer"}, "length": {"type": "integer"}, "path": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}}, "required": [], "additionalProperties": False}}},
 ]
