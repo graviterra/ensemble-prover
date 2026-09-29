@@ -99,6 +99,13 @@ policy violation rather than undoing an action already performed by the CLI.
   Automatic bounded-output recovery uses `low`, which the transport supports.
 - Temperature and top-p are recorded as unsent. Explicit temperature requirements
   fail before generation because this CLI cannot apply them.
+- Known current `opus`, `sonnet`, `fable`, `best`, and `opusplan` aliases default
+  to a 128,000-token output allowance; `haiku` defaults to 64,000. Recognized
+  versioned models use their published output allowance. Explicit operator
+  limits retain precedence. Subscription context remains unspecified locally:
+  CLI version, account access and `[1m]` selection determine the usable window.
+  See [model configuration](https://code.claude.com/docs/en/model-config) and
+  [model specifications](https://platform.claude.com/docs/en/models/overview).
 - Output-token settings are prompt targets. Claude Code retains its model's
   native total output allowance, which covers both thinking and response text.
   Converting a small response target into `CLAUDE_CODE_MAX_OUTPUT_TOKENS` can

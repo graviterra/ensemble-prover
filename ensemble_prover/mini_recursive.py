@@ -19682,7 +19682,7 @@ async def run_mini_recursive_attempt(
         speculative_operational_probe: bool = False,
         max_elapsed_s: Optional[float] = None,
     ) -> Optional[str]:
-        """Honest root close: run ONE conversational prove turn against the
+        """Honest root close: run a conversational proof attempt against the
         canonical root with a route-local verified helper context. The model
         writes the bridging proof (for example applying a root-equivalent
         certificate or assembling membership/minimality helpers); Lean verifies
@@ -23994,8 +23994,8 @@ async def run_mini_recursive_driver(
     ) -> Optional[str]:
         """Honest root-close short-circuit. When a verified root-equivalent
         certificate or newly accepted route-local helper may make the current
-        helper set sufficient, hand the root to ONE conversational root-close
-        turn. The model writes the bridge; Lean verifies. Returns the verified
+        helper set sufficient, hand the root to a conversational root-close
+        attempt. The model writes the bridge; Lean verifies. Returns the verified
         root proof text, or None. Bounded by
         ``config.llm_root_close_max_attempts`` and deduped per helper context
         so it never loops."""
@@ -24046,6 +24046,14 @@ async def run_mini_recursive_driver(
             if certificate_names
             else ("helper_set_assembly" if assembly_helper_names else "")
         )
+        if (
+            assembly_reason == "accepted_verified_helper_context"
+            and _ready_root_route_status(dossier, root_statement).get("ready")
+        ):
+            # A checked route with proved dependencies may still need its
+            # assembly bridge authored and repaired interactively. Ordinary
+            # helpers can complete that route without acquiring advisory tags.
+            assembly_reason = "ready_root_assembly_contract"
         speculative_assembly = bool(
             root_close_mode == "helper_set_assembly"
             and assembly_reason == "accepted_verified_helper_context"
@@ -24124,11 +24132,19 @@ async def run_mini_recursive_driver(
                 )
             )
         )
+        # A spent speculative receipt cannot consume a later checked route's
+        # interactive authoring opportunity in the same helper context. Keep
+        # all older speculative/certificate keys unchanged across resumes.
         attempt_key = frozenset(
             (
                 f"mode:{root_close_mode}",
                 f"helper_context:{helper_context_key}",
                 *attempt_names,
+                *(
+                    ("authority:ready_root_assembly_contract",)
+                    if assembly_reason == "ready_root_assembly_contract"
+                    else ()
+                ),
             )
         )
         if attempt_key in llm_root_close_attempted_keys:

@@ -132,13 +132,67 @@ def mini_reasoning_effort(client: Any, *, minimum: str) -> str:
     return selected
 
 
-def mini_model_token_defaults(model: Any, *, base_url: str = "") -> tuple[Optional[int], int]:
-    """Known context/output allowances, with a local fallback for unknown routes.
+# Published model allowances; request-time OpenRouter metadata remains authoritative.
+# Claude Code aliases are transport-specific and may resolve differently by account.
+_MINI_CLAUDE_TOKEN_DEFAULTS = {
+    "claude-opus-4-5": (200_000, 64_000),
+    "claude-opus-4-6": (1_000_000, 128_000),
+    "claude-opus-4-7": (1_000_000, 128_000),
+    "claude-opus-4-8": (1_000_000, 128_000),
+    "claude-opus-5": (1_000_000, 128_000),
+    "claude-opus-5-5": (1_000_000, 128_000),
+    "claude-sonnet-4-5": (200_000, 64_000),
+    "claude-sonnet-4-6": (1_000_000, 128_000),
+    "claude-sonnet-5": (1_000_000, 128_000),
+    "claude-sonnet-5-5": (1_000_000, 128_000),
+    "claude-haiku-4-5": (200_000, 64_000),
+    "claude-fable-5": (1_000_000, 128_000),
+    "claude-fable-5-1": (1_000_000, 128_000),
+}
+_MINI_CLAUDE_CODE_ALIAS_OUTPUT = {
+    "opus": 128_000,
+    "sonnet": 128_000,
+    "haiku": 64_000,
+    "fable": 128_000,
+    "best": 128_000,
+    "opusplan": 128_000,
+}
 
-    Fresh OpenRouter catalog limits supersede automatic defaults at dispatch.
-    The fallback is an allowance, not an assertion of provider capacity.
-    """
 
+def _mini_claude_token_defaults(
+    model: Any, *, base_url: str,
+) -> Optional[tuple[Optional[int], int]]:
+    name = str(model or "").strip().lower()
+    subscription = str(base_url or "").strip().lower() == "claude-code://subscription"
+    if subscription:
+        name = name.removesuffix("[1m]")
+        if name in _MINI_CLAUDE_CODE_ALIAS_OUTPUT:
+            return None, _MINI_CLAUDE_CODE_ALIAS_OUTPUT[name]
+    if name.startswith("anthropic/"):
+        name = name.removeprefix("anthropic/")
+        if base_url_matches_provider(base_url, "openrouter"):
+            # OpenRouter spells minor versions with a dot. The exact table
+            # still bounds recognition after normalizing that spelling.
+            name = re.sub(r"(?<=\d)\.(?=\d)", "-", name)
+    # Snapshot dates are supported, but unrelated/future versions and suffixes
+    # must not inherit a capacity from a partial family-name match.
+    name = re.sub(r"-\d{8}$", "", name)
+    known = _MINI_CLAUDE_TOKEN_DEFAULTS.get(name)
+    if known is None:
+        return None
+    if subscription:
+        # Subscription context depends on CLI version, account and [1m] mode.
+        # Do not turn a published API window into an invented CLI context cap.
+        return None, known[1]
+    return known
+
+
+def _mini_known_model_token_defaults(
+    model: Any, *, base_url: str = "",
+) -> Optional[tuple[Optional[int], int]]:
+    claude = _mini_claude_token_defaults(model, base_url=base_url)
+    if claude is not None:
+        return claude
     name = str(model or "").strip().lower().rsplit("/", 1)[-1]
     if mini_deepseek_v4_model(str(model or ""), base_url=base_url):
         return 1_000_000, 384_000
@@ -154,7 +208,18 @@ def mini_model_token_defaults(model: Any, *, base_url: str = "") -> tuple[Option
         return 131_072, 65_536
     if name == "gpt-4o-mini" or re.fullmatch(r"gpt-4o-mini-\d{4}-\d{2}-\d{2}", name):
         return 128_000, 16_384
-    return None, 8192
+    return None
+
+
+def mini_model_token_defaults(model: Any, *, base_url: str = "") -> tuple[Optional[int], int]:
+    """Known output allowances and context windows where the route establishes them.
+
+    Fresh OpenRouter catalog limits supersede automatic defaults at dispatch.
+    The unknown-model fallback is an allowance, not a provider capacity claim.
+    Claude Code keeps context unspecified and output as a prompt target.
+    """
+
+    return _mini_known_model_token_defaults(model, base_url=base_url) or (None, 8192)
 
 
 def mini_model_output_capacity(client: Any, *, fallback: int = 8192) -> int:
@@ -170,8 +235,8 @@ def mini_model_output_capacity(client: Any, *, fallback: int = 8192) -> int:
         return advertised
     if configured:
         return min(configured, advertised) if advertised else configured
-    context, allowance = mini_model_token_defaults(getattr(cfg, "model", ""), base_url=base_url)
-    return allowance if context is not None else max(1, int(fallback))
+    known = _mini_known_model_token_defaults(getattr(cfg, "model", ""), base_url=base_url)
+    return known[1] if known is not None else max(1, int(fallback))
 
 
 def mini_model_context_window(cfg: Any, *, base_url: str = "") -> Optional[int]:
@@ -1015,13 +1080,11 @@ def _resolve_mini_leaf_output_cap(
             capacity = advertised
             cap_source += "+provider_limit"
     else:
-        known_context, known_capacity = mini_model_token_defaults(
-            model, base_url=base_url
-        )
-        if known_context is not None:
+        known = _mini_known_model_token_defaults(model, base_url=base_url)
+        if known is not None:
             # Custom clients can omit role capacity. Keep the same known-model
             # allowance as configured clients instead of reviving phase caps.
-            capacity = known_capacity
+            capacity = known[1]
             cap_source = "model_output_capacity"
     if capacity:
         # Hidden reasoning and visible proof share this limit. Phase-size
