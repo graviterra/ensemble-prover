@@ -177,3 +177,96 @@ def _command_matches(
             span = next(quoted, None)
         if span is None or start < span.start():
             yield match
+
+
+def _physical_source_lines(text: str) -> list[str]:
+    """Split on ``\\n`` and ``\\r\\n`` only.
+
+    ``str.splitlines()`` also splits Unicode separators that Lean keeps inside
+    an escaped identifier or a ``--`` comment. A trailing newline is dropped,
+    and a CR that belongs to CRLF is dropped with that newline.
+    """
+
+    source = str(text or "")
+    if source == "":
+        return []
+    if source.endswith("\n"):
+        source = source[:-1]
+    return [line[:-1] if line.endswith("\r") else line for line in source.split("\n")]
+
+
+def _unclosed_block_comment_at(line: str, *, quote_open: bool = False) -> Optional[int]:
+    """Index of a ``/-`` that is still open at the end of one physical line.
+
+    ``quote_open`` means this line begins inside an escaped identifier, so
+    characters before its ``»`` cannot start a comment.
+    """
+
+    index = 0
+    limit = len(line)
+    depth = 0
+    start: Optional[int] = None
+    while index < limit:
+        if quote_open:
+            if line[index] == "»":
+                quote_open = False
+            index += 1
+            continue
+        if line[index] == "'" and (
+            index == 0 or not (line[index - 1].isalnum() or line[index - 1] in "_'")
+        ):
+            end = index + 1
+            if end < limit and line[end] == "\\":
+                end += 2
+            else:
+                end += 1
+            if end < limit and line[end] == "'":
+                index = end + 1
+                continue
+        if line.startswith("«", index):
+            quote_open = True
+            index += 1
+            continue
+        if line.startswith("--", index):
+            break
+        if line.startswith("/-", index):
+            if depth == 0:
+                start = index
+            depth += 1
+            index += 2
+            continue
+        if line.startswith("-/", index) and depth:
+            depth -= 1
+            if depth == 0:
+                start = None
+            index += 2
+            continue
+        if line[index] == '"':
+            index += 1
+            while index < limit:
+                if line[index] == "\\":
+                    index += 2
+                    continue
+                if line[index] == '"':
+                    index += 1
+                    break
+                index += 1
+            continue
+        index += 1
+    if depth == 0:
+        return None
+    return start
+
+
+def _quoted_identifier_open_before(masked_lines: list[str], index: int) -> bool:
+    """Whether an escaped identifier is still open at the start of ``index``."""
+
+    open_quote = False
+    for line in masked_lines[:index]:
+        for char in line:
+            if open_quote:
+                if char == "»":
+                    open_quote = False
+            elif char == "«":
+                open_quote = True
+    return open_quote
