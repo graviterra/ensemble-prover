@@ -1,0 +1,787 @@
+"""Exclusive durable ownership of one attempt across fresh run generations.
+
+Session records are immutable committed values. A sibling checkpoint never
+walks another live session, whose proof action may still be in flight.
+"""
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import hashlib
+import inspect
+import json
+import math
+import time
+import uuid
+from pathlib import Path
+from typing import Any, cast
+
+from ..state_data import clone_json_value
+from ..llm_error_policy import classify_llm_exception, is_resumable_provider_failure
+from ..tactic_attempt_telemetry import MONOTONIC_LEAN_ATTEMPT_METRICS
+
+_MANIFEST = "attempt_checkpoint.json"
+_SCHEMA = 1
+
+
+def _json(value: Any) -> Any:
+    return clone_json_value(value, label="attempt checkpoint")
+
+
+def _digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode()).hexdigest()
+
+
+def _read(path: Path) -> dict[str, Any]:
+    from .durable_checkpoint import read_checkpoint_record
+    return read_checkpoint_record(path)
+
+
+def _write(path: Path, value: dict[str, Any]) -> None:
+    from .durable_checkpoint import write_checkpoint_record
+    write_checkpoint_record(path, value)
+
+
+def expand_completed_children(record: dict[str, Any], registry_root: Path) -> dict[str, Any]:
+    """Read archived child data without acquiring ownership or resuming execution.
+
+    The caller must validate the manifest and snapshot identity first. Archive
+    names are content hashes; their complete payloads remain inert JSON and
+    require the same session admission checks as an uncompressed snapshot.
+    """
+    from ..snapshot_codec import MAX_SNAPSHOT_BYTES, decompress_snapshot, snapshot_bytes
+
+    if (type(record) is not dict or type(record.get("schema_version")) is not int
+            or record["schema_version"] != 2):
+        return record
+    record = _json(record)
+    record["schema_version"] = _SCHEMA
+    archived = record.pop("archived_children", None)
+    if type(archived) is not dict:
+        raise ValueError("Invalid completed child archive map")
+    expanded_size = len(snapshot_bytes(record))
+    if expanded_size > MAX_SNAPSHOT_BYTES:
+        raise ValueError("expanded checkpoint exceeds snapshot size limit")
+    # The archive envelope is not part of the expanded checkpoint. Allow only
+    # this fixed overhead beyond the remaining space before decompressing.
+    envelope_size = len(snapshot_bytes({
+        "session": None, "child": None, "planner_receipts": None,
+    }))
+    for lane, digest in archived.items():
+        if (type(lane) is not str or not lane or type(digest) is not str
+                or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+            raise ValueError("Invalid completed child archive identity")
+        archive = _read(registry_root / "completed" / f"{digest}.json")
+        if (set(archive) != {"encoding", "sha256", "data"}
+                or archive["encoding"] != "json-zlib-v1" or archive["sha256"] != digest):
+            raise ValueError("Invalid completed child archive")
+        payload = decompress_snapshot(
+            archive["data"], max_bytes=MAX_SNAPSHOT_BYTES - expanded_size + envelope_size,
+        )
+        if (type(payload) is not dict or _digest(payload) != digest
+                or set(payload) != {"session", "child", "planner_receipts"}
+                or type(payload["child"]) is not dict
+                or payload["child"].get("result") is None):
+            raise ValueError("Completed child archive hash or shape mismatch")
+        for field, value in (("sessions", payload["session"]), ("children", payload["child"]),
+                             ("planner_receipts", payload["planner_receipts"])):
+            if type(record.get(field)) is not dict or lane in record[field]:
+                raise ValueError("Conflicting completed child archive lane")
+            if value is not None:
+                expanded_size += (len(snapshot_bytes(lane)) + 1 + len(snapshot_bytes(value))
+                                  + int(bool(record[field])))
+                if expanded_size > MAX_SNAPSHOT_BYTES:
+                    raise ValueError("expanded checkpoint exceeds snapshot size limit")
+                record[field][lane] = value
+    return record
+
+
+def _validated_execution_audit(value: Any, sessions: dict[str, Any]) -> dict[str, dict[str, int]]:
+    """Observability only: no proof, budget, or scheduling keys are allowed."""
+    if type(value) is not dict:
+        raise ValueError("Invalid checkpoint execution audit")
+    for lane, metrics in value.items():
+        if type(lane) is not str or lane not in sessions or type(metrics) is not dict:
+            raise ValueError("Invalid checkpoint execution audit lane")
+        if any(key not in MONOTONIC_LEAN_ATTEMPT_METRICS
+               or type(amount) is not int or amount < 0 for key, amount in metrics.items()):
+            raise ValueError("Invalid checkpoint execution audit metric")
+    return _json(value)
+
+
+def _worker_clock_receipt(record: dict[str, Any]) -> tuple[float, float, bool]:
+    elapsed = record.get("worker_active_elapsed_s")
+    observed = record.get("worker_observed_epoch_s")
+    completed = record.get("worker_generation_completed")
+    if (type(elapsed) not in {int, float} or not math.isfinite(elapsed) or elapsed < 0
+            or type(observed) not in {int, float} or not math.isfinite(observed) or observed < 0
+            or type(completed) is not bool):
+        raise ValueError("Invalid cumulative worker clock receipt")
+    return float(elapsed), float(observed), completed
+
+
+def _approved_source_transition(
+    saved: dict[str, Any], current: dict[str, Any], approval: str,
+) -> dict[str, str]:
+    """Approve only the exact predecessor source, never policy or input drift."""
+    if not approval:
+        if saved != current:
+            raise ValueError("Attempt checkpoint configuration identity mismatch")
+        return {}
+    old = saved.get("executor_source_hash") if type(saved) is dict else None
+    new = current.get("executor_source_hash")
+    for value in (approval, old, new):
+        if (type(value) is not str or len(value) != 64
+                or any(c not in "0123456789abcdef" for c in value)):
+            raise ValueError("Source approval requires exact SHA256 source fingerprints")
+    if approval != old:
+        raise ValueError("Source approval does not match the saved executor source hash")
+    expected = dict(saved, executor_source_hash=new)
+    if expected != current:
+        raise ValueError("Source approval cannot override checkpoint configuration identity")
+    return {"from": cast(str, old), "to": cast(str, new)} if old != new else {}
+
+
+def worker_elapsed_for_resume(record: dict[str, Any]) -> float:
+    """Include the unknown interval after an interrupted worker observation.
+
+    A clean completion receipt excludes subsequent downtime. Without that
+    receipt, process death and downtime cannot be distinguished, so the whole
+    observation gap is conservatively charged before new work is admitted.
+    """
+    elapsed, observed, completed = _worker_clock_receipt(record)
+    if not completed:
+        gap = time.time() - observed
+        if not math.isfinite(gap) or gap < 0:
+            raise ValueError("Cannot bound interrupted worker time after a wall-clock reversal")
+        elapsed += gap
+    if not math.isfinite(elapsed):
+        raise ValueError("Invalid cumulative worker elapsed time")
+    return float(elapsed)
+
+
+class AttemptCheckpointRegistry:
+    """One locked writer and a map of the latest committed session records."""
+
+    def __init__(
+        self, directory: Path, *, identity: dict[str, Any],
+        resume_from: Path | None = None, recorder: Any = None,
+        resume_accept_source_hash: str = "",
+        cost_controller: Any = None,
+        startup_artifacts: dict[str, str] | None = None,
+        worker_started_monotonic: float | None = None,
+        worker_admitted_elapsed_s: float | None = None,
+    ) -> None:
+        now = time.monotonic()
+        if worker_started_monotonic is None:
+            worker_started_monotonic = now
+        if (type(worker_started_monotonic) not in {int, float}
+                or not math.isfinite(worker_started_monotonic)
+                or not 0 <= worker_started_monotonic <= now):
+            raise ValueError("Invalid worker generation clock origin")
+        self._worker_started_monotonic = float(worker_started_monotonic)
+        if worker_admitted_elapsed_s is not None and (
+            type(worker_admitted_elapsed_s) not in {int, float}
+            or not math.isfinite(worker_admitted_elapsed_s) or worker_admitted_elapsed_s < 0
+        ):
+            raise ValueError("Invalid admitted predecessor worker time")
+        self._worker_admitted_elapsed_s = worker_admitted_elapsed_s
+        self._restored_worker_active_elapsed_s = float(worker_admitted_elapsed_s or 0.0)
+        self.directory = Path(directory).resolve()
+        self.identity = _json(identity)
+        if type(self.identity) is not dict or not self.identity:
+            raise ValueError("Attempt checkpoint identity must be a nonempty object")
+        self.recorder = recorder
+        self.cost_controller = cost_controller
+        self._lock = asyncio.Lock()
+        self._journal_lock = asyncio.Lock()
+        self._journal_writer = None
+        self._sessions: dict[str, dict[str, Any]] = {}
+        self._children: dict[str, dict[str, Any]] = {}
+        self._outer_state: dict[str, Any] = {}
+        self._planner_receipts: dict[str, dict[str, Any]] = {}
+        self._durable_child_archives: set[str] = set()
+        self._bound_sessions: dict[str, Any] = {}
+        self._audit_ready_lanes: set[str] = set()
+        self._execution_audit: dict[str, dict[str, int]] = {}
+        self._sequence = 0
+        self._closed = False
+        self._publication_failed = False
+        self._lock_fp = None
+        self._restored_cost_record = None
+        self._restored_recorder_record = None
+        self._restored_journal_watermark = 0
+        self._resuming = resume_from is not None
+        self.source_transition: dict[str, str] = {}
+        self._account_failure_planner_retries: dict[str, int] = {}
+        if resume_accept_source_hash and resume_from is None:
+            raise ValueError("Source approval requires resume_from")
+        predecessor = None
+        if resume_from is not None:
+            predecessor = Path(resume_from).resolve()
+            if predecessor == self.directory:
+                raise ValueError("Resume requires a new generation directory")
+            manifest = self._load_manifest(predecessor)
+            self.source_transition = _approved_source_transition(
+                manifest["identity"], self.identity, resume_accept_source_hash,
+            )
+            self.attempt_id = manifest["attempt_id"]
+            self.registry_root = Path(manifest["registry_root"])
+        else:
+            self.attempt_id = uuid.uuid4().hex
+            self.registry_root = self.directory.parent / ".mini_attempts" / self.attempt_id
+        self.registry_root.mkdir(parents=True, exist_ok=True)
+        self._lock_fp = (self.registry_root / "writer.lock").open("a+b")
+        try:
+            try:
+                fcntl.flock(self._lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError("Attempt checkpoint already has an active writer") from error
+            if predecessor is not None:
+                # Reload under the shared lock: a former writer may have
+                # published a later generation while we were acquiring it.
+                manifest = self._load_manifest(predecessor)
+                if (manifest["attempt_id"] != self.attempt_id
+                        or Path(manifest["registry_root"]) != self.registry_root):
+                    raise ValueError("Attempt checkpoint owner identity changed under lock")
+                self.source_transition = _approved_source_transition(
+                    manifest["identity"], self.identity, resume_accept_source_hash,
+                )
+                head = _read(self.registry_root / "head.json")
+                # The candidate per-generation manifest may lead the sole
+                # committed shared head after an interrupted publication.
+                # Resolve the committed head only within the requested
+                # generation; older generations must not regain spending.
+                if (
+                    head.get("generation_id") != manifest["head"]["generation_id"]
+                    or Path(head.get("snapshot_path", "")).parent
+                    != predecessor / "checkpoints"
+                ):
+                    raise ValueError("Stale checkpoint generation; resume the latest attempt head")
+                snapshot = _read(Path(head["snapshot_path"]))
+                if _digest(snapshot) != head["snapshot_hash"]:
+                    raise ValueError("Attempt checkpoint snapshot hash mismatch")
+                self._restore_snapshot(snapshot, expected_identity=manifest["identity"])
+                # A provider-stopped lane must not immediately replay its
+                # stale outage as the result of an explicit fresh recovery.
+                # Successful plans and every other error receipt remain exact.
+                from .planner_jobs import planner_result_from_record
+                for lane, receipts in self._planner_receipts.items():
+                    saved = self._sessions.get(lane, {}).get("scheduler", {}).get("session_state", {})
+                    terminal_reason = saved.get("terminal_failure_reason", "")
+                    for key, raw in tuple(receipts.items()):
+                        result = planner_result_from_record(raw)
+                        reason = (classify_llm_exception(result.exception).failure_reason
+                                  if result.exception is not None else "")
+                        # A live background transport pause unwinds like
+                        # cancellation, preserving the reserved pass without
+                        # setting a session terminal latch. Its typed receipt
+                        # is itself evidence of the run-wide provider pause.
+                        unlatched_transport_pause = (
+                            reason == "provider_transport_unavailable"
+                            and not terminal_reason
+                            and saved.get("root_finalized") is False
+                        )
+                        if (is_resumable_provider_failure(reason) and (
+                                is_resumable_provider_failure(terminal_reason)
+                                or unlatched_transport_pause)):
+                            receipts.pop(key)
+                            self._account_failure_planner_retries[lane] = self._account_failure_planner_retries.get(lane, 0) + 1
+                # A failed provider call is not a completed mathematical child
+                # result. Explicit resume authorizes another attempt under the
+                # SAME saved action and cost limits, after fresh Lean restore.
+                for lane, frame in self._children.items():
+                    saved = self._sessions.get(lane, {}).get("scheduler", {}).get("session_state", {})
+                    result = frame.get("result")
+                    if (is_resumable_provider_failure(saved.get("terminal_failure_reason", ""))
+                            and saved.get("root_finalized") is False
+                            and type(result) is dict and set(result) == {"ok", "proof", "timed_out"}
+                            and result["ok"] is False and result["proof"] is None
+                            and result["timed_out"] is False):
+                        frame["result"] = None
+            if self.directory.exists() and any(self.directory.iterdir()):
+                from ..mini_generation_artifacts import validate_startup_artifact_receipts
+                # A recorder may already own this new directory; only its
+                # fresh generation artifacts are allowed before registration.
+                allowed = {"run.log", "turns.jsonl"} if recorder is not None else set()
+                allowed.update(validate_startup_artifact_receipts(self.directory, startup_artifacts))
+                if any(path.name not in allowed for path in self.directory.iterdir()):
+                    raise ValueError("Checkpoint generation directory is not empty")
+            from .durable_checkpoint import JournalWriter
+            self._journal_writer = JournalWriter(self.registry_root / "journal")
+            self.directory.mkdir(parents=True, exist_ok=True)
+            self.generation_id = uuid.uuid4().hex
+            self.predecessor = str(predecessor) if predecessor is not None else None
+            self._publish(self._snapshot_payload())
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _load_manifest(directory: Path) -> dict[str, Any]:
+        record = _read(directory / _MANIFEST)
+        required = {"schema_version", "attempt_id", "registry_root", "identity", "head"}
+        if type(record) is not dict or set(record) != required or type(record["schema_version"]) is not int or record["schema_version"] != _SCHEMA:
+            raise ValueError("Unsupported attempt checkpoint manifest schema")
+        attempt_id = record["attempt_id"]
+        if type(attempt_id) is not str or len(attempt_id) != 32 or any(c not in "0123456789abcdef" for c in attempt_id):
+            raise ValueError("Invalid attempt checkpoint identity")
+        root = Path(record["registry_root"])
+        if not root.is_absolute() or root.name != attempt_id or root.parent.name != ".mini_attempts":
+            raise ValueError("Invalid attempt checkpoint owner directory")
+        head = record["head"]
+        if type(head) is not dict or set(head) != {"generation_id", "snapshot_path", "snapshot_hash"}:
+            raise ValueError("Invalid attempt checkpoint head")
+        snapshot_path = Path(head["snapshot_path"])
+        if snapshot_path.parent != directory.resolve() / "checkpoints":
+            raise ValueError("Attempt checkpoint snapshot escaped its generation")
+        return record
+
+    def _restore_snapshot(self, record: dict[str, Any], *,
+                          expected_identity: dict[str, Any] | None = None) -> None:
+        record = self._expand_completed_children(record)
+        required = {"schema_version", "attempt_id", "identity", "sessions", "children", "outer_state", "planner_receipts", "cost_ledger", "recorder", "journal_watermark", "predecessor", "worker_active_elapsed_s", "worker_observed_epoch_s", "worker_generation_completed"}
+        if type(record) is not dict or set(record) not in (required, required | {"execution_audit"}) or type(record["schema_version"]) is not int or record["schema_version"] != _SCHEMA:
+            raise ValueError("Unsupported attempt checkpoint snapshot schema")
+        if (record["identity"] != (self.identity if expected_identity is None else expected_identity)
+                or record["attempt_id"] != self.attempt_id):
+            raise ValueError("Attempt checkpoint snapshot identity mismatch")
+        for name in ("sessions", "children", "outer_state", "planner_receipts"):
+            if type(record[name]) is not dict:
+                raise ValueError("Invalid attempt checkpoint state map")
+        execution_audit = _validated_execution_audit(record.get("execution_audit", {}), record["sessions"])
+        watermark = record["journal_watermark"]
+        if type(watermark) is not int or watermark < 0:
+            raise ValueError("Invalid attempt checkpoint journal watermark")
+        admitted = self._worker_admitted_elapsed_s
+        if admitted is None:
+            self._restored_worker_active_elapsed_s = worker_elapsed_for_resume(record)
+        else:
+            committed, _, _ = _worker_clock_receipt(record)
+            # A subtraction of the supervisor's residual cap can round by a
+            # few ulps. It may never lower the actual committed clock floor.
+            if admitted < committed and not math.isclose(admitted, committed, rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError("Worker lease would erase committed predecessor time")
+            self._restored_worker_active_elapsed_s = max(admitted, committed)
+        self._sessions = _json(record["sessions"])
+        self._children = _json(record["children"])
+        self._outer_state = _json(record["outer_state"])
+        self._planner_receipts = _json(record["planner_receipts"])
+        self._execution_audit = execution_audit
+        self._restored_cost_record = _json(record["cost_ledger"])
+        self._restored_recorder_record = _json(record["recorder"])
+        self._restored_journal_watermark = watermark
+
+    def _archive_completed_children(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Keep immutable child payloads out of every subsequent full snapshot.
+
+        Archives retain complete replay and revalidation inputs; they are not
+        proof receipts. Publish them durably before the head can reference them.
+        Earlier generations may still refer to them, so they are never pruned
+        by the ordinary snapshot writer.
+        """
+        from ..snapshot_codec import MAX_SNAPSHOT_BYTES, compress_snapshot, snapshot_bytes
+
+        if len(snapshot_bytes(record)) > MAX_SNAPSHOT_BYTES:
+            raise ValueError("checkpoint exceeds snapshot size limit")
+        archived: dict[str, str] = {}
+        sessions = dict(record["sessions"])
+        children = dict(record["children"])
+        receipts = dict(record["planner_receipts"])
+        for lane, frame in record["children"].items():
+            if frame.get("result") is None or lane not in sessions:
+                continue
+            payload = {"session": sessions[lane], "child": frame,
+                       "planner_receipts": receipts.get(lane)}
+            digest = _digest(payload)
+            path = self.registry_root / "completed" / f"{digest}.json"
+            # An existing file can be an orphan from a writer whose rename
+            # succeeded but directory fsync failed. Only this writer's own
+            # durability acknowledgements allow skipping publication.
+            if digest not in self._durable_child_archives:
+                _write(path, {"encoding": "json-zlib-v1", "sha256": digest,
+                              "data": compress_snapshot(payload)})
+                self._durable_child_archives.add(digest)
+            archived[lane] = digest
+            sessions.pop(lane)
+            children.pop(lane)
+            receipts.pop(lane, None)
+        if not archived:
+            return record
+        return {**record, "schema_version": 2, "sessions": sessions, "children": children,
+                "planner_receipts": receipts, "archived_children": archived}
+
+    def _expand_completed_children(self, record: dict[str, Any]) -> dict[str, Any]:
+        return expand_completed_children(record, self.registry_root)
+
+    def _snapshot_payload(self) -> dict[str, Any]:
+        observed_epoch_s = time.time()
+        return {
+            "schema_version": _SCHEMA, "attempt_id": self.attempt_id,
+            "identity": self.identity, "sessions": self._sessions,
+            "children": self._children, "outer_state": self._outer_state,
+            "planner_receipts": self._planner_receipts,
+            "execution_audit": self._execution_audit,
+            "cost_ledger": self._restored_cost_record,
+            "recorder": self._restored_recorder_record,
+            "journal_watermark": self._restored_journal_watermark,
+            "worker_active_elapsed_s": self._restored_worker_active_elapsed_s + max(
+                0.0, time.monotonic() - self._worker_started_monotonic,
+            ),
+            "worker_observed_epoch_s": observed_epoch_s,
+            "worker_generation_completed": False,
+            "predecessor": getattr(self, "predecessor", None),
+        }
+
+    def _require_writable(self) -> None:
+        if self._closed:
+            raise RuntimeError("Attempt checkpoint writer is closed")
+        if self._publication_failed:
+            raise RuntimeError(
+                "Attempt checkpoint writer failed; close and resume from the validated attempt head"
+            )
+
+    def _publish(self, record: dict[str, Any]) -> None:
+        self._require_writable()
+        next_sequence = self._sequence + 1
+        snapshot_path = self.directory / "checkpoints" / f"{next_sequence:012d}.json"
+        # The shared head prevents a later restart from silently restoring an
+        # older generation's cost capacity. Never fall back past this head.
+        try:
+            snapshot = self._archive_completed_children(_json(record))
+            head = {"generation_id": self.generation_id, "snapshot_path": str(snapshot_path),
+                    "snapshot_hash": _digest(snapshot)}
+            manifest = {"schema_version": _SCHEMA, "attempt_id": self.attempt_id,
+                        "registry_root": str(self.registry_root), "identity": self.identity,
+                        "head": head}
+            _write(snapshot_path, snapshot)
+            _write(self.directory / _MANIFEST, manifest)
+            _write(self.registry_root / "head.json", head)
+        except BaseException:
+            # A rename may have published the new head before its durability
+            # acknowledgement failed. Reusing this sequence would overwrite a
+            # committed snapshot with stale in-memory state. Keep ownership,
+            # but fence sibling, shutdown and journal writes until fresh resume.
+            self._publication_failed = True
+            raise
+        self._sequence = next_sequence
+        # Resume reads only the shared head, which now names this snapshot.
+        # Each snapshot is a full copy of the attempt state, so keeping every
+        # superseded one grows disk use quadratically over a long attempt.
+        # Only the snapshot this writer itself published last is removed; a
+        # failed unlink merely leaves a stale file behind.
+        previous = getattr(self, "_last_published_snapshot", None)
+        self._last_published_snapshot = snapshot_path
+        if previous is not None and previous != snapshot_path:
+            try:
+                previous.unlink()
+            except OSError:
+                pass
+
+    @property
+    def is_resume(self) -> bool:
+        return self._resuming
+
+    @property
+    def recorder_resume_state(self) -> dict[str, Any] | None:
+        return _json(self._restored_recorder_record)
+
+    @property
+    def cost_resume_state(self) -> dict[str, Any] | None:
+        return _json(self._restored_cost_record)
+
+    def validated_journal_records(self) -> list[dict[str, Any]]:
+        from .durable_checkpoint import read_journal_records
+        records = read_journal_records(self.registry_root / "journal")
+        watermark = self._restored_journal_watermark
+        cost = self._restored_cost_record
+        if cost is None:
+            if watermark or records:
+                raise ValueError("Cost journal has no committed ledger baseline")
+            return []
+        if (type(cost) is not dict or type(cost.get("journal_sequence")) is not int
+                or cost["journal_sequence"] != watermark or watermark > len(records)):
+            raise ValueError("Cost ledger and attempt journal watermarks disagree")
+        actual_hash = records[watermark - 1]["record_hash"] if watermark else ""
+        if cost.get("journal_hash") != actual_hash:
+            raise ValueError("Cost journal prefix differs from the saved ledger watermark")
+        if watermark and records[watermark - 1]["payload"].get("ledger_id") != cost.get("ledger_id"):
+            raise ValueError("Cost journal prefix belongs to another ledger")
+        return records[watermark:]
+
+    def planner_receipt_records(self, lane_key: str) -> tuple[dict[str, Any], ...]:
+        return tuple(_json(record) for record in self._planner_receipts.get(lane_key, {}).values())
+
+    async def persist_planner_receipt(self, lane_key: str, record: dict[str, Any],
+                                     *, publication_guard: Any) -> None:
+        from .planner_jobs import planner_result_from_record
+        if lane_key not in self._sessions:
+            raise ValueError("Planner receipt requires a committed session lane")
+        data = _json(record)
+        identity = planner_result_from_record(data).identity
+        key = _digest([identity.job_id, identity.request_fingerprint])
+        await self._commit_update(planner_receipt_updates={lane_key: {key: data}},
+                                  publication_guard=publication_guard)
+
+    def lane_record(self, lane_key: str) -> dict[str, Any] | None:
+        return _json(self._sessions.get(lane_key))
+
+    def child_record(self, child_lane: str) -> dict[str, Any] | None:
+        return _json(self._children.get(child_lane))
+
+    def child_records_for_parent(self, parent_lane: str) -> dict[str, dict[str, Any]]:
+        return _json({lane: frame for lane, frame in self._children.items()
+                      if frame.get("parent_lane") == parent_lane})
+
+    @property
+    def outer_state(self) -> dict[str, Any]:
+        return _json(self._outer_state)
+
+    async def bind_session(self, lane_key: str, session: Any) -> None:
+        self._require_writable()
+        from .durable_checkpoint import restore_session_record
+        from .durable_session_record import (
+            initialize_theory_checkpoint_context, session_checkpoint_identity,
+        )
+        if type(lane_key) is not str or not lane_key:
+            raise ValueError("Checkpoint lane identity is required")
+        if lane_key in self._bound_sessions:
+            if self._bound_sessions[lane_key] is session:
+                return
+            raise ValueError("Checkpoint lane already has a live session owner")
+        # Reserve this process-local lane before any fresh Lean check awaits.
+        # Parallel restores of distinct lanes remain independent.
+        self._bound_sessions[lane_key] = session
+        previous_registry = getattr(session, "checkpoint_registry", None)
+        previous_lane = getattr(session, "checkpoint_lane_key", "")
+        try:
+            initialize_theory_checkpoint_context(session)
+            # Bind immutable disk inputs before providers or prepasses start.
+            # Later synchronous captures reuse this verifier generation's hash.
+            await asyncio.to_thread(session_checkpoint_identity, session)
+            record = self._sessions.get(lane_key)
+            if record is not None:
+                await restore_session_record(session, _json(record), expected_identity=record["identity"])
+            session.checkpoint_registry = self
+            session.checkpoint_lane_key = lane_key
+            child_frames = self.child_records_for_parent(lane_key)
+            for action in session.actions:
+                restore_children = getattr(action, "restore_checkpoint_children", None)
+                if callable(restore_children):
+                    restored = restore_children(session, child_frames)
+                    if inspect.isawaitable(restored):
+                        await restored
+            # Child preparation may restore the parent a second time. Release
+            # only generation-local account latches after every such restore.
+            reason = getattr(session, "terminal_failure_reason", "")
+            if self.is_resume and record is not None and is_resumable_provider_failure(reason):
+                session.terminal_failure_reason = ""
+                session.terminal_failure_kind = ""
+                if getattr(session, "last_failure_reason", "") == reason:
+                    session.last_failure_reason = ""
+                for owner, reason_field, kind_field in (
+                    (session.conv, "_last_llm_failure_reason", "_last_llm_failure_kind"),
+                    (session.dossier, "session_failure_reason", "session_failure_kind"),
+                ):
+                    if is_resumable_provider_failure(getattr(owner, reason_field, "")):
+                        setattr(owner, reason_field, "")
+                        setattr(owner, kind_field, "")
+                session._record_event({
+                    "phase": "checkpoint_resume", "verdict": "provider_failure_retry_on_resume",
+                    "previous_failure_reason": reason, "lane": lane_key,
+                    "planner_account_failures_reopened": self._account_failure_planner_retries.get(lane_key, 0),
+                    "generation_id": self.generation_id,
+                })
+            # Prepared-child restore deliberately retains the pre-action parent
+            # record and its identity. Recover reporting separately, by same-lane
+            # maximum, never by summing inherited child totals or firing sinks.
+            for key, floor in self._execution_audit.get(lane_key, {}).items():
+                session.dossier.tool_metrics[key] = max(
+                    int(session.dossier.tool_metrics.get(key, 0) or 0), floor,
+                )
+            if record is None:
+                await self.commit_session(lane_key, session)
+            self._audit_ready_lanes.add(lane_key)
+        except BaseException:
+            if self._bound_sessions.get(lane_key) is session:
+                self._bound_sessions.pop(lane_key)
+            session.checkpoint_registry = previous_registry
+            session.checkpoint_lane_key = previous_lane
+            raise
+
+    async def commit_session(self, lane_key: str, session: Any) -> None:
+        from .durable_checkpoint import capture_session_record
+        if self._bound_sessions.get(lane_key) is not session:
+            raise ValueError("Checkpoint session does not own its lane")
+        record = capture_session_record(session)
+        broker = session.planner_job_broker(create=False)
+        acknowledged = broker.acknowledged_receipts() if broker is not None else ()
+        owner = getattr(session, "_recursive_lane_authority", None) or session
+        broker_lane = getattr(owner, "checkpoint_lane_key", "")
+        # A descendant cannot commit receipt consumption by its parent broker.
+        if owner is not session:
+            acknowledged = ()
+        removals = {broker_lane: [_digest([item.job_id, item.request_fingerprint])
+                                 for item in acknowledged]} if acknowledged else {}
+        await self._commit_update(session_updates={lane_key: _json(record)},
+                                  planner_receipt_removals=removals)
+        if acknowledged:
+            broker.confirm_receipts_committed(acknowledged)
+
+    async def _commit_update(self, **updates: Any) -> None:
+        # Serialize companion snapshots with the manifest transaction. The
+        # accounting lock may await durable_cost_event, which uses only the
+        # independent journal lock and never acquires this transaction lock.
+        async with self._lock:
+            self._require_writable()
+            publication_guard = updates.pop("publication_guard", None)
+            if publication_guard is not None and not publication_guard():
+                raise RuntimeError("Planner publication ownership was revoked")
+            planner_updates = updates.pop("planner_receipt_updates", {})
+            planner_removals = updates.pop("planner_receipt_removals", {})
+            planner_receipts = _json(self._planner_receipts)
+            for lane, keys in planner_removals.items():
+                for key in keys:
+                    planner_receipts.get(lane, {}).pop(key, None)
+            for lane, receipts in planner_updates.items():
+                destination = planner_receipts.setdefault(lane, {})
+                for key, receipt in receipts.items():
+                    if key in destination and destination[key] != receipt:
+                        raise ValueError("Conflicting completed planner receipt")
+                    destination[key] = receipt
+            prepared_children = updates.pop("prepared_child_updates", {})
+            completed_children = updates.pop("completed_child_updates", {})
+            child_updates = updates.pop("child_updates", {})
+            for lane, frame in prepared_children.items():
+                existing = self._children.get(lane)
+                if existing is not None:
+                    if {**existing, "result": None} != frame:
+                        raise ValueError("Prepared child identity or attempt frame changed")
+                    return
+                child_updates[lane] = frame
+            for lane, result in completed_children.items():
+                frame = self._children.get(lane)
+                if frame is None:
+                    raise ValueError("Unknown prepared child lane")
+                if frame["result"] is not None:
+                    if frame["result"] != result:
+                        raise ValueError("Completed child receipt is immutable")
+                    return
+                child_updates[lane] = {**frame, "result": result}
+            cost_record = (
+                await self.cost_controller.to_execution_record()
+                if self.cost_controller is not None else self._restored_cost_record
+            )
+            recorder_record = (
+                self.recorder.to_execution_record()
+                if self.recorder is not None else self._restored_recorder_record
+            )
+            # The cost snapshot's own acknowledgement is the exact replay
+            # floor. Reading the journal head afterward could skip a newer
+            # financial transition which is absent from this snapshot.
+            watermark = (
+                cost_record["journal_sequence"]
+                if cost_record is not None else self._restored_journal_watermark
+            )
+            snapshot = self._snapshot_payload()
+            session_updates = updates.pop("session_updates", {})
+            snapshot["sessions"] = {**self._sessions, **session_updates}
+            execution_audit = _json(self._execution_audit)
+            for lane, session in self._bound_sessions.items():
+                # bind_session reserves ownership before asynchronous restore;
+                # a pending/failed new bind is not a committed reporting lane.
+                if (lane not in snapshot["sessions"]
+                        or (lane not in self._audit_ready_lanes and lane not in session_updates)):
+                    continue
+                metrics = dict(session.dossier.tool_metrics)
+                floor = execution_audit.setdefault(lane, {})
+                for key in MONOTONIC_LEAN_ATTEMPT_METRICS:
+                    amount = metrics.get(key, 0)
+                    if type(amount) is not int or amount < 0:
+                        raise ValueError("Invalid live execution audit metric")
+                    if amount:
+                        floor[key] = max(floor.get(key, 0), amount)
+            snapshot["execution_audit"] = execution_audit
+            snapshot["children"] = {**self._children, **child_updates}
+            snapshot["planner_receipts"] = planner_receipts
+            snapshot.update(updates)
+            snapshot.update(cost_ledger=cost_record, recorder=recorder_record,
+                            journal_watermark=watermark)
+            if publication_guard is not None and not publication_guard():
+                raise RuntimeError("Planner publication ownership was revoked")
+            self._publish(snapshot)
+            self._sessions = snapshot["sessions"]
+            self._children = snapshot["children"]
+            self._outer_state = snapshot["outer_state"]
+            self._planner_receipts = planner_receipts
+            self._execution_audit = execution_audit
+            self._restored_cost_record = cost_record
+            self._restored_recorder_record = recorder_record
+            self._restored_journal_watermark = watermark
+
+    async def prepare_child(
+        self, parent_lane: str, descriptor: dict[str, Any],
+        action_runtime: dict[str, Any], selected_work: dict[str, Any],
+        *, publication_guard: Any = None,
+    ) -> str:
+        self._require_writable()
+        if publication_guard is not None and not publication_guard():
+            raise RuntimeError("Child publication ownership was revoked")
+        if parent_lane not in self._sessions:
+            raise ValueError("Child needs a committed parent checkpoint")
+        descriptor = _json(descriptor)
+        child_lane = descriptor.get("child_lane")
+        if type(child_lane) is not str or not child_lane or child_lane == parent_lane:
+            raise ValueError("Prepared child needs a distinct stable lane identity")
+        frame = {"parent_lane": parent_lane, "descriptor": descriptor,
+                 "action_runtime": _json(action_runtime), "selected_work": _json(selected_work),
+                 "result": None}
+        existing = self._children.get(child_lane)
+        if existing is not None:
+            comparable = {**existing, "result": None}
+            if comparable != frame:
+                raise ValueError("Prepared child identity or attempt frame changed")
+            return child_lane
+        await self._commit_update(prepared_child_updates={child_lane: frame},
+                                  publication_guard=publication_guard)
+        return child_lane
+
+    async def complete_child(self, child_lane: str, result_record: dict[str, Any],
+                             *, publication_guard: Any = None) -> None:
+        if child_lane not in self._children:
+            raise ValueError("Unknown prepared child lane")
+        result = _json(result_record)
+        if type(result) is not dict:
+            raise ValueError("Completed child receipt must be an object")
+        await self._commit_update(completed_child_updates={child_lane: result},
+                                  publication_guard=publication_guard)
+
+    async def update_outer_state(self, record: dict[str, Any]) -> None:
+        await self._commit_update(outer_state=_json(record))
+
+    async def write_snapshot(self) -> None:
+        await self._commit_update()
+
+    async def complete_worker_generation(self) -> None:
+        """Acknowledge stopped execution after the caller has fenced new work."""
+        await self._commit_update(worker_generation_completed=True)
+
+    async def durable_cost_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        async with self._journal_lock:
+            self._require_writable()
+            return self._journal_writer.append(kind="cost_ledger", payload=_json(payload))
+
+    def close(self) -> None:
+        self._closed = True
+        if self._journal_writer is not None:
+            self._journal_writer.close()
+            self._journal_writer = None
+        if self._lock_fp is not None:
+            try:
+                fcntl.flock(self._lock_fp.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._lock_fp.close()
+                self._lock_fp = None

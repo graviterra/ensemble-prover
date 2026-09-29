@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Start or resume integrated research using this checkout's Python environment.
+set -euo pipefail
+RESEARCH_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -x "$RESEARCH_ROOT/.venv/bin/python" ]]; then
+  echo "Research needs the project environment. Run scripts/setup_venv.sh first." >&2
+  exit 2
+fi
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="$RESEARCH_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "$RESEARCH_ROOT/.venv/bin/python" -P -u -m ensemble_prover.research_launcher "$@"
