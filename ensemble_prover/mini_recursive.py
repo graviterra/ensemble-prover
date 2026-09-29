@@ -110,8 +110,10 @@ from .mini_temperature import (
 )
 from .llm_error_policy import (
     ProviderAccountUnavailable,
+    ProviderLocalResourceUnavailable,
     ProviderTransportUnavailable,
     is_resumable_provider_failure,
+    is_provider_account_failure,
     is_provider_infrastructure_failure,
     classify_llm_exception,
     is_terminal_llm_failure_reason,
@@ -6396,6 +6398,7 @@ async def _await_planner_job_or_yield(
     broker: Optional[PlannerJobBroker],
     identity: Optional[PlannerJobIdentity],
     run: Callable[[], Awaitable[Any]],
+    provider_account_pause_enabled: bool = False,
     before_yield: Optional[Callable[[PlannerJobIdentity], Awaitable[None]]] = None,
 ) -> Any:
     """Consume one exact raw planner receipt or transfer its pure I/O job.
@@ -6406,8 +6409,19 @@ async def _await_planner_job_or_yield(
     session scheduler after this action returns.
     """
 
+    def pause_for_local_resource(error: BaseException) -> None:
+        if (provider_account_pause_enabled
+                and classify_llm_exception(error).failure_reason == "llm_local_resource_error"):
+            # Host failure leaves this exact planner request unfinished.  The
+            # controller retains its pass reservation and any paid receipts.
+            raise ProviderLocalResourceUnavailable() from error
+
     if broker is None or identity is None:
-        return await run()
+        try:
+            return await run()
+        except Exception as error:
+            pause_for_local_resource(error)
+            raise
     result = broker.peek(identity.job_id, identity.request_fingerprint)
     launch = PlannerJobLaunch(identity=identity, run=run)
     if result is None:
@@ -6427,6 +6441,7 @@ async def _await_planner_job_or_yield(
             await before_yield(identity)
         raise PlannerJobYield(launch)
     if result.exception is not None:
+        pause_for_local_resource(result.exception)
         try:
             replay_exception = copy.copy(result.exception)
         except Exception:
@@ -25873,6 +25888,7 @@ async def run_mini_recursive_driver(
                     )
 
                 return await _request_plan(
+                    provider_account_pause_enabled=provider_account_pause_enabled,
                     theorem_name=theorem_name,
                     root_statement=root_statement,
                     problem_text=problem_text,
@@ -26015,6 +26031,12 @@ async def run_mini_recursive_driver(
             if int(stats.planner_call_failures or 0) > planner_call_failures_before:
                 planner_failure_reason = str(stats.last_planner_failure_reason or "")
             if planner_failure_reason.strip():
+                if (provider_account_pause_enabled
+                        and is_provider_account_failure(planner_failure_reason)):
+                    # The primary planner remains unavailable after any
+                    # premium fallback. This allocation has no mathematical
+                    # result and remains reserved for explicit recovery.
+                    raise ProviderAccountUnavailable(planner_failure_reason)
                 planner_failure_scope = llm_failure_scope(planner_failure_reason)
                 stats.passes_completed += 1
                 if planner_failure_scope == "scoped":
@@ -27932,7 +27954,9 @@ async def run_mini_recursive_driver(
                             planner_job_identity=asdict(identity),
                         )
 
+                    contract_planner_failures_before = int(stats.planner_call_failures or 0)
                     replan = await _request_plan(
+                        provider_account_pause_enabled=provider_account_pause_enabled,
                         theorem_name=theorem_name,
                         root_statement=root_statement,
                         problem_text=problem_text,
@@ -27970,6 +27994,10 @@ async def run_mini_recursive_driver(
                             checkpoint_pending_contract_replan
                         ),
                     )
+                    if (replan is None and provider_account_pause_enabled
+                            and int(stats.planner_call_failures or 0) > contract_planner_failures_before
+                            and is_provider_account_failure(stats.last_planner_failure_reason)):
+                        raise ProviderAccountUnavailable(stats.last_planner_failure_reason)
                     if replan is not None:
                         replan = _bind_plan_obligation_identities(replan)
                         # Receipt precedes all local replan filtering and Lean
@@ -31902,6 +31930,8 @@ async def run_mini_recursive_driver(
                         # child result or a reason to discard a paid plan.
                         if claim_proof_result.terminal_failure_reason == "provider_transport_unavailable":
                             raise ProviderTransportUnavailable()
+                        if claim_proof_result.terminal_failure_reason == "llm_local_resource_error":
+                            raise ProviderLocalResourceUnavailable()
                         raise ProviderAccountUnavailable(claim_proof_result.terminal_failure_reason)
                     if not (
                         claim_proof_result.controller_projection_invalidated
@@ -34220,6 +34250,7 @@ async def _request_planner_deliberation(
     planner_job_pending_callback: Optional[
         Callable[[PlannerJobIdentity], Awaitable[None]]
     ] = None,
+    provider_account_pause_enabled: bool = False,
 ) -> Optional[DeliberationArtifact]:
     """Phase A: reasoning-enabled prose deliberation. Never blocks planning."""
 
@@ -34554,6 +34585,7 @@ async def _request_planner_deliberation(
                 )
 
             raw = await _await_planner_job_or_yield(
+                provider_account_pause_enabled=provider_account_pause_enabled,
                 broker=planner_job_broker,
                 identity=deliberation_identity,
                 run=run_deliberation_io,
@@ -34721,6 +34753,7 @@ async def _request_plan_parse_repair(
     planner_job_pending_callback: Optional[
         Callable[[PlannerJobIdentity], Awaitable[None]]
     ] = None,
+    provider_account_pause_enabled: bool = False,
 ) -> Optional["MiniSubgoalPlan"]:
     """One-shot JSON repair re-prompt for a planner response.
 
@@ -34917,6 +34950,7 @@ async def _request_plan_parse_repair(
         )
     )
     raw = await _await_planner_job_or_yield(
+        provider_account_pause_enabled=provider_account_pause_enabled,
         broker=planner_job_broker,
         identity=repair_identity,
         run=run_parse_repair_io,
@@ -35093,6 +35127,7 @@ async def _request_plan(
     planner_job_pending_callback: Optional[
         Callable[[PlannerJobIdentity], Awaitable[None]]
     ] = None,
+    provider_account_pause_enabled: bool = False,
 ) -> Optional[MiniSubgoalPlan]:
     started = time.monotonic()
     background_result = (
@@ -35623,6 +35658,7 @@ async def _request_plan(
             primary_job_identity = planner_job_identity
             deferred_primary_receipt_started = True
             resumed_repair = await _request_plan_parse_repair(
+                provider_account_pause_enabled=provider_account_pause_enabled,
                 base_messages=request_messages,
                 unparseable_content="",
                 parse_error=ValueError("resuming completed planner parse repair"),
@@ -35676,6 +35712,7 @@ async def _request_plan(
                 official_answer_payload_present=(official_answer_payload_present),
             )
             fresh_deliberation = await _request_planner_deliberation(
+                provider_account_pause_enabled=provider_account_pause_enabled,
                 client=deliberation_client,
                 cost_controller=cost_controller,
                 config=config,
@@ -36266,6 +36303,7 @@ async def _request_plan(
             planner_job_broker is not None and primary_job_identity is not None
         )
         raw = await _await_planner_job_or_yield(
+            provider_account_pause_enabled=provider_account_pause_enabled,
             broker=planner_job_broker,
             identity=primary_job_identity,
             run=run_primary_planner_io,
@@ -36348,16 +36386,13 @@ async def _request_plan(
                 "planner_failure_base_url": failure_base_url,
             }
         )
+        stats.last_planner_failure_reason = classification.failure_reason
+        stats.last_planner_failure_kind = classification.kind
+        stats.last_planner_failure_metadata = dict(failure_metadata)
         if classification.terminal:
             stats.planner_terminal_failures += 1
-            stats.last_planner_failure_reason = classification.failure_reason
-            stats.last_planner_failure_kind = classification.kind
-            stats.last_planner_failure_metadata = dict(failure_metadata)
         elif failure_scope == "scoped":
             stats.planner_scoped_failures += 1
-            stats.last_planner_failure_reason = classification.failure_reason
-            stats.last_planner_failure_kind = classification.kind
-            stats.last_planner_failure_metadata = dict(failure_metadata)
         _record(
             record_event,
             {
@@ -36504,6 +36539,7 @@ async def _request_plan(
             ),
         )
         resumed_visibility_raw = await _await_planner_job_or_yield(
+            provider_account_pause_enabled=provider_account_pause_enabled,
             broker=planner_job_broker,
             identity=resumed_visibility_identity,
             run=run_resumed_visibility_io,
@@ -36694,6 +36730,7 @@ async def _request_plan(
                 ),
             )
             reasoning_raw = await _await_planner_job_or_yield(
+                provider_account_pause_enabled=provider_account_pause_enabled,
                 broker=planner_job_broker,
                 identity=reasoning_identity,
                 run=run_reasoning_recovery_io,
@@ -36753,16 +36790,13 @@ async def _request_plan(
                 transport_failure_record_from_exception(reasoning_exc)
             )
             stats.planner_call_failures += 1
+            stats.last_planner_failure_reason = classification.failure_reason
+            stats.last_planner_failure_kind = classification.kind
+            stats.last_planner_failure_metadata = dict(failure_metadata)
             if classification.terminal:
                 stats.planner_terminal_failures += 1
-                stats.last_planner_failure_reason = classification.failure_reason
-                stats.last_planner_failure_kind = classification.kind
-                stats.last_planner_failure_metadata = dict(failure_metadata)
             elif failure_scope == "scoped":
                 stats.planner_scoped_failures += 1
-                stats.last_planner_failure_reason = classification.failure_reason
-                stats.last_planner_failure_kind = classification.kind
-                stats.last_planner_failure_metadata = dict(failure_metadata)
             _record(
                 record_event,
                 {
@@ -36934,6 +36968,7 @@ async def _request_plan(
                     ),
                 )
                 visibility_raw = await _await_planner_job_or_yield(
+                    provider_account_pause_enabled=provider_account_pause_enabled,
                     broker=planner_job_broker,
                     identity=visibility_identity,
                     run=run_visibility_recovery_io,
@@ -36992,16 +37027,13 @@ async def _request_plan(
                     transport_failure_record_from_exception(visibility_exc)
                 )
                 stats.planner_call_failures += 1
+                stats.last_planner_failure_reason = classification.failure_reason
+                stats.last_planner_failure_kind = classification.kind
+                stats.last_planner_failure_metadata = dict(failure_metadata)
                 if classification.terminal:
                     stats.planner_terminal_failures += 1
-                    stats.last_planner_failure_reason = classification.failure_reason
-                    stats.last_planner_failure_kind = classification.kind
-                    stats.last_planner_failure_metadata = dict(failure_metadata)
                 elif failure_scope == "scoped":
                     stats.planner_scoped_failures += 1
-                    stats.last_planner_failure_reason = classification.failure_reason
-                    stats.last_planner_failure_kind = classification.kind
-                    stats.last_planner_failure_metadata = dict(failure_metadata)
                 _record(
                     record_event,
                     {
@@ -37127,6 +37159,7 @@ async def _request_plan(
                     planner_operation_timeout_s,
                 ) = escalation_transport_bounds(plan_call_is_premium)
                 repair_plan = await _request_plan_parse_repair(
+                    provider_account_pause_enabled=provider_account_pause_enabled,
                     base_messages=request_messages,
                     unparseable_content=repair_source,
                     parse_error=exc,
@@ -37175,11 +37208,11 @@ async def _request_plan(
                 failure_metadata.update(
                     transport_failure_record_from_exception(repair_exc)
                 )
+                stats.last_planner_failure_reason = classification.failure_reason
+                stats.last_planner_failure_kind = classification.kind
+                stats.last_planner_failure_metadata = dict(failure_metadata)
                 if classification.terminal:
                     stats.planner_terminal_failures += 1
-                    stats.last_planner_failure_reason = classification.failure_reason
-                    stats.last_planner_failure_kind = classification.kind
-                    stats.last_planner_failure_metadata = dict(failure_metadata)
                     _record(
                         record_event,
                         {
@@ -37196,9 +37229,6 @@ async def _request_plan(
                     return None
                 if failure_scope == "scoped":
                     stats.planner_scoped_failures += 1
-                    stats.last_planner_failure_reason = classification.failure_reason
-                    stats.last_planner_failure_kind = classification.kind
-                    stats.last_planner_failure_metadata = dict(failure_metadata)
                     _record(
                         record_event,
                         {

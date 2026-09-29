@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import re
@@ -53,7 +54,7 @@ class SubscriptionBackendError(RuntimeError):
         self, message: str, *, kind: str = "protocol",
         validation_stage: str = "", tool_index: int | None = None,
     ) -> None:
-        if kind not in {"auth", "quota", "rate_limit", "transport", "protocol", "response", "capability", "compatibility", "context"}:
+        if kind not in {"auth", "quota", "rate_limit", "transport", "protocol", "response", "capability", "compatibility", "context", "local_resource"}:
             raise ValueError(f"Unknown subscription error kind: {kind}")
         diagnostic = subscription_response_validation_record({
             "validation_stage": validation_stage, "tool_index": tool_index,
@@ -174,6 +175,7 @@ _TERMINAL_LLM_FAILURE_REASONS = {
     "provider_protocol_incompatible",
     "provider_transport_unavailable",
     "llm_required_prompt_context_overflow",
+    "llm_local_resource_error",
 }
 _SCOPED_LLM_FAILURE_REASONS = {
     "llm_network_error",
@@ -621,6 +623,19 @@ def classify_llm_exception(
             kind=exc.reason, failure_reason=exc.reason,
             retryable=False, terminal=True, message=str(exc),
         )
+    if isinstance(exc, ProviderLocalResourceUnavailable):
+        return LLMErrorClassification(
+            kind="local_resource", failure_reason=exc.reason,
+            retryable=False, terminal=True, message=str(exc),
+        )
+    if isinstance(exc, OSError) and exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+        return LLMErrorClassification(
+            kind="local_resource",
+            failure_reason="llm_local_resource_error",
+            retryable=False,
+            terminal=True,
+            message="Local filesystem storage or quota is exhausted.",
+        )
     if isinstance(exc, SubscriptionBackendError):
         reason = {
             "auth": "llm_auth_error",
@@ -629,8 +644,9 @@ def classify_llm_exception(
             "compatibility": "provider_protocol_incompatible",
             "context": "llm_required_prompt_context_overflow",
             "response": "provider_response_invalid",
+            "local_resource": "llm_local_resource_error",
         }.get(exc.backend_kind, "llm_network_error")
-        terminal = exc.backend_kind in {"auth", "quota", "capability", "compatibility", "context"}
+        terminal = exc.backend_kind in {"auth", "quota", "capability", "compatibility", "context", "local_resource"}
         return LLMErrorClassification(
             kind={
                 "auth": "auth", "quota": "insufficient_quota",
@@ -639,6 +655,7 @@ def classify_llm_exception(
                 "transport": "transport", "protocol": "transient",
                 "response": "provider_response_invalid",
                 "context": "llm_required_prompt_context_overflow",
+                "local_resource": "local_resource",
             }[exc.backend_kind],
             retryable=not terminal and not (
                 exc.backend_kind == "response" and exc.validation_stage == "output_limit"
@@ -897,7 +914,7 @@ def classify_llm_error_text(error_text: str) -> LLMErrorClassification:
     """Classify a rendered LLM error after the original exception is gone."""
 
     text = _lower_text(error_text)
-    codex_error = re.search(r"(?:^|:\s*)\[(codex|claude-code):(auth|quota|rate_limit|capability|compatibility|transport|protocol|response|context)\]", text)
+    codex_error = re.search(r"(?:^|:\s*)\[(codex|claude-code):(auth|quota|rate_limit|capability|compatibility|transport|protocol|response|context|local_resource)\]", text)
     if codex_error:
         error_type = CodexBackendError if codex_error.group(1) == "codex" else ClaudeCodeBackendError
         stage = (
@@ -1082,8 +1099,10 @@ def is_provider_infrastructure_failure(reason: str) -> bool:
 
 
 def is_resumable_provider_failure(reason: str) -> bool:
-    """External account or transport state may recover in a fresh run."""
-    return is_provider_account_failure(reason) or reason == "provider_transport_unavailable"
+    """Account, transport or local storage state may recover in a fresh run."""
+    return is_provider_account_failure(reason) or reason in {
+        "provider_transport_unavailable", "llm_local_resource_error",
+    }
 
 
 class ProviderAccountUnavailable(BaseException):
@@ -1105,6 +1124,21 @@ class ProviderTransportUnavailable(ProviderAccountUnavailable):
 
     def __init__(self) -> None:
         self.reason = "provider_transport_unavailable"
+        BaseException.__init__(self, self.reason)
+
+    def __reduce__(self):
+        return (type(self), (), self.__dict__)
+
+
+class ProviderLocalResourceUnavailable(ProviderAccountUnavailable):
+    """Pause prepared work for host repair without retiring a provider account.
+
+    Share the controller's cancellation-style pause envelope, as transport
+    outages do, while retaining a distinct non-account failure reason.
+    """
+
+    def __init__(self) -> None:
+        self.reason = "llm_local_resource_error"
         BaseException.__init__(self, self.reason)
 
     def __reduce__(self):

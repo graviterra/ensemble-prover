@@ -27,6 +27,7 @@ from typing import Any, Callable, ClassVar, FrozenSet, List, Optional, Sequence,
 from ..action import MiniOutcome
 from ..state_codec import StateSnapshotCompatibilityError
 from ...llm_error_policy import (
+    ProviderAccountUnavailable,
     classify_llm_exception,
     is_terminal_llm_failure_reason,
     llm_failure_scope,
@@ -2213,6 +2214,7 @@ class GraphRecursiveDecomposeAction:
         sub_pass_interrupted = False
         try:
             result = await run_mini_recursive_attempt(
+                provider_account_pause_enabled=getattr(session, "checkpoint_registry", None) is not None,
                 theorem_name=obligation_theorem_name,
                 root_statement=statement,
                 problem_text=problem_text,
@@ -2598,7 +2600,7 @@ class GraphRecursiveDecomposeAction:
                     "strong_progress": False,
                 },
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, ProviderAccountUnavailable):
             sub_pass_interrupted = True
             raise
         except Exception as exc:

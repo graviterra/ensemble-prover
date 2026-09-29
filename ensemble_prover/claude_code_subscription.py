@@ -180,6 +180,20 @@ def _usage_counts(usage: Any) -> dict[str, int] | None:
 def _cli_failure(diagnostic: str) -> ClaudeCodeBackendError:
     """Classify locally; never copy arbitrary CLI stderr into run artifacts."""
     text = diagnostic.lower()
+    status_match = re.search(
+        r"\b(?:http(?:/\d(?:\.\d)?)?|(?:unexpected\s+)?status(?:\s+code)?)"
+        r"[\s:=]+([45]\d{2})\b", text,
+    )
+    status = int(status_match[1]) if status_match else None
+    if (
+        "disk quota exceeded" in text or "no space left on device" in text
+        or re.search(r"\bos error (?:122|28)\b", text)
+    ):
+        # A filesystem quota is not the shared Claude.ai subscription quota.
+        return ClaudeCodeBackendError(
+            "Claude Code could not write local files; free disk space or resolve the filesystem quota.",
+            kind="local_resource",
+        )
     if any(
         word in text
         for word in (
@@ -217,8 +231,8 @@ def _cli_failure(diagnostic: str) -> ClaudeCodeBackendError:
         )
     if any(
         word in text
-        for word in ("rate limit", "rate_limit", "too many requests", "429")
-    ):
+        for word in ("rate limit", "rate_limit", "too many requests")
+    ) or status == 429:
         return ClaudeCodeBackendError(
             "Claude Code is temporarily rate limited; retry after backoff.",
             kind="rate_limit",
@@ -233,9 +247,8 @@ def _cli_failure(diagnostic: str) -> ClaudeCodeBackendError:
             "sign in",
             "sign-in",
             "login",
-            "401",
         )
-    ):
+    ) or status == 401:
         return ClaudeCodeBackendError(
             "Claude Code Claude.ai authentication failed; run `claude auth login` and select Claude.ai.",
             kind="auth",
@@ -977,7 +990,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     kind="response", validation_stage="output_limit",
                 )
             observe_failure(stderr.decode("utf-8", errors="replace"))
-            for kind in ("context", "quota", "auth", "capability", "rate_limit", "response", "transport"):
+            for kind in ("local_resource", "context", "quota", "auth", "capability", "rate_limit", "response", "transport"):
                 if kind in observed_failures:
                     raise observed_failures[kind]
         # Completion includes the full wire stream and a successful process exit.

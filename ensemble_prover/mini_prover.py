@@ -13051,14 +13051,14 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--planner-escalation",
-        default="auto",
+        default="off",
         choices=["auto", "openai", "deepseek", "openrouter", "off"],
         help=(
             "Escalation provider for the recursive planner. After a "
             "degenerate (empty/unparseable) planning response, the next "
             "planner call uses this stronger role instead of the prover "
             "model (bounded by planner_escalation_max_calls per attempt). "
-            "'auto' (default) uses the OpenAI API when OPENAI_API_KEY is set "
+            "'off' (default) disables escalation. 'auto' uses the OpenAI API when OPENAI_API_KEY is set "
             "and otherwise disables escalation with a warning; an explicit "
             "provider fails loudly if its key is missing; 'off' disables "
             "escalation only. The base planner still uses the prover model "
@@ -15278,14 +15278,14 @@ async def _main_async(args: argparse.Namespace) -> int:
             )
         planner_escalation_client = None
         planner_escalation_choice = str(
-            getattr(args, "planner_escalation", "auto") or "auto"
+            getattr(args, "planner_escalation", "off") or "off"
         ).strip().lower()
         if planner_escalation_choice == "auto" and {"codex", "claude-code"} & {args.prover, args.refiner}:
             # Subscription selection must not silently activate an API-billed
             # escalation role because an unrelated API key is in the shell.
             planner_escalation_choice = ""
         if planner_escalation_choice == "auto":
-            # On by default via the OpenAI API, but fail-soft: a run
+            # Explicit auto selection uses the OpenAI API, but fail-soft: a run
             # configured without OPENAI_API_KEY must keep working (an
             # EXPLICIT provider choice below still fails loudly).
             if os.environ.get(

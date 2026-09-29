@@ -1,6 +1,6 @@
 # Codex subscription backend
 
-Last updated: 2026-09-10.
+Last updated: 2026-09-29.
 
 Mini and autonomous discovery can use your saved **ChatGPT Codex subscription
 sign-in** for their model roles. Select `codex` as the provider and explicitly select a model
@@ -162,8 +162,10 @@ and the CLI's sandbox context markers.
 
 ## Controls and accounting
 
-- `--reasoning-effort low|medium|high|max` is supported (`max` maps to Codex's
-  `xhigh`). Support for a chosen effort also depends on the selected model.
+- `--reasoning-effort low|medium|high|max` is supported. Explicit `max` is sent
+  unchanged for modern models, including GPT-5.6 and GPT-6. Legacy GPT-5 models
+  through GPT-5.5 retain the `max` alias for `xhigh`. Support for a chosen effort
+  also depends on the selected model and installed Codex CLI.
   Explicit reasoning-off is rejected by this transport.
 - Temperature and top-p are not exposed by this CLI interface. Requested
   temperature is recorded as unsent. Explicit temperature requirements fail

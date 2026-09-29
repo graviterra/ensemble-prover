@@ -5514,8 +5514,10 @@ async def prove_problem_via_session(
                 sample_failures.append(record_parallel_sample_failure(
                     attempt_dossier, sample_index=sample_index,
                     error_kind=type(exc).__name__, error=exc.reason,
-                    stage=("provider_transport_pause" if exc.reason == "provider_transport_unavailable"
-                           else "provider_account_pause"),
+                    stage={
+                        "provider_transport_unavailable": "provider_transport_pause",
+                        "llm_local_resource_error": "provider_local_resource_pause",
+                    }.get(exc.reason, "provider_account_pause"),
                 ))
         late_sample_grace_s = max(
             0.0,

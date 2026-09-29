@@ -13,6 +13,7 @@ import base64
 from copy import deepcopy
 
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -93,9 +94,49 @@ def _subscription_environment() -> dict[str, str]:
     return env
 
 
-def _cli_failure(diagnostic: str) -> CodexBackendError:
-    """Classify locally; never copy arbitrary CLI stderr into run artifacts."""
+def _cli_failure(
+    diagnostic: str, *, returncode: int | None = None,
+    completed: bool | None = None, failed_turn: bool | None = None,
+    fallback_diagnostic: str = "",
+) -> CodexBackendError:
+    """Retain allowlisted failure facts, never arbitrary stderr or event text."""
     text = diagnostic.lower()
+    status_match = re.search(
+        r"\b(?:http(?:/\d(?:\.\d)?)?|(?:unexpected\s+)?status(?:\s+code)?)"
+        r"[\s:=]+([45]\d{2})\b", text,
+    )
+    status = int(status_match[1]) if status_match else None
+    disk_quota = "disk quota exceeded" in text or bool(re.search(r"\bos error 122\b", text))
+    disk_full = "no space left on device" in text or bool(re.search(r"\bos error 28\b", text))
+    cause = (
+        "disk_quota_exceeded" if disk_quota else
+        "disk_full" if disk_full else
+        "stream_disconnected" if "stream disconnected" in text else
+        "connection_reset" if "connection reset" in text else
+        "http_error" if status is not None else "unknown"
+    )
+    facts = [f"cause={cause}"]
+    if type(returncode) is int and -(2 ** 31) <= returncode < 2 ** 31:
+        facts.append(f"exit_code={returncode}")
+        if returncode < 0:
+            facts.append(f"signal={-returncode}")
+    if type(completed) is bool:
+        facts.append(f"turn_completed={str(completed).lower()}")
+    if type(failed_turn) is bool:
+        facts.append(f"turn_failed={str(failed_turn).lower()}")
+    if status is not None:
+        facts.append(f"http_status={status}")
+
+    def error(message: str, *, kind: str) -> CodexBackendError:
+        return CodexBackendError(message + " (" + "; ".join(facts) + ")", kind=kind)
+
+    # Filesystem quota is a host failure, not exhausted subscription allowance.
+    # In particular, it must not retire every role sharing a ChatGPT account.
+    if disk_quota or disk_full:
+        return error(
+            "Codex could not write local files; free disk space or resolve the filesystem quota.",
+            kind="local_resource",
+        )
     if any(
         word in text
         for word in (
@@ -107,7 +148,7 @@ def _cli_failure(diagnostic: str) -> CodexBackendError:
             "maximum context length",
         )
     ):
-        return CodexBackendError(
+        return error(
             "The supplied conversation exceeds the Codex model context window; "
             "this transport cannot shorten checkpoint-owned context.",
             kind="context",
@@ -120,15 +161,15 @@ def _cli_failure(diagnostic: str) -> CodexBackendError:
             "quota exceeded",
         )
     ):
-        return CodexBackendError(
+        return error(
             "Codex subscription usage limit reached; resume after the allowance resets.",
             kind="quota",
         )
     if any(
         word in text
-        for word in ("rate limit", "rate_limit", "too many requests", "429")
-    ):
-        return CodexBackendError(
+        for word in ("rate limit", "rate_limit", "too many requests")
+    ) or status == 429:
+        return error(
             "Codex is temporarily rate limited; retry after backoff.",
             kind="rate_limit",
         )
@@ -142,10 +183,9 @@ def _cli_failure(diagnostic: str) -> CodexBackendError:
             "sign in",
             "sign-in",
             "login",
-            "401",
         )
-    ):
-        return CodexBackendError(
+    ) or status == 401:
+        return error(
             "Codex ChatGPT authentication failed; run `codex login` and select ChatGPT.",
             kind="auth",
         )
@@ -162,11 +202,16 @@ def _cli_failure(diagnostic: str) -> CodexBackendError:
             "does not exist",
         )
     ):
-        return CodexBackendError(
+        return error(
             "Codex CLI or selected model does not support the requested configuration.",
             kind="capability",
         )
-    return CodexBackendError(
+    if cause == "unknown" and fallback_diagnostic:
+        return _cli_failure(
+            fallback_diagnostic, returncode=returncode,
+            completed=completed, failed_turn=failed_turn,
+        )
+    return error(
         "Codex invocation failed before delivering a complete response.",
         kind="transport",
     )
@@ -188,7 +233,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
 
     async def preflight(self) -> None:
         """Verify CLI support and saved subscription auth without a model call."""
-        self._resolve_effort(self.cfg.reasoning_effort)
+        self._resolve_effort(self.cfg.reasoning_effort, model=self.cfg.model)
         async with self._preflight_lock:
             if self._closed:
                 raise CodexBackendError("Codex client is closed", kind="capability")
@@ -243,13 +288,16 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
             self._preflight_done = True
 
     @staticmethod
-    def _resolve_effort(effort: str | None) -> str:
-        effort = str(effort or "").lower()
-        # Mini uses max for the highest setting; Codex spells it xhigh.
-        effort = "xhigh" if effort == "max" else effort
-        if effort not in {"", "minimal", "low", "medium", "high", "xhigh"}:
+    def _resolve_effort(effort: str | None, *, model: str = "") -> str:
+        effort = str(effort or "").strip().lower()
+        model_name = str(model or "").strip().lower().rsplit("/", 1)[-1]
+        # Older GPT-5 families called their strongest setting xhigh. Modern
+        # models advertise max separately; never silently lower that request.
+        if effort == "max" and re.fullmatch(r"gpt-5(?:\.[0-5])?(?:-.*)?", model_name):
+            effort = "xhigh"
+        if effort not in {"", "minimal", "low", "medium", "high", "xhigh", "max"}:
             raise CodexBackendError(
-                "Codex subscription transport supports reasoning efforts minimal/low/medium/high/xhigh; reasoning-off is unavailable.",
+                "Codex subscription transport supports reasoning efforts minimal/low/medium/high/xhigh/max; reasoning-off is unavailable.",
                 kind="capability",
             )
         return effort
@@ -280,7 +328,6 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
             "history.persistence": "none",
             "model_instructions_file": str(Path(cwd) / "instructions.txt"),
             "mcp_servers": {},
-            "tools.view_image": False,
             "skills.include_instructions": False,
             "skills.bundled.enabled": False,
         }
@@ -348,7 +395,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
             reasoning_effort_override,
         )
         requested_effort = effort if effort is not None else self.cfg.reasoning_effort
-        effort = self._resolve_effort(requested_effort)
+        effort = self._resolve_effort(requested_effort, model=self.cfg.model)
         if response_format not in {None, "json"}:
             raise ValueError("Codex response_format must be None or json")
         definitions = tools or []
@@ -424,6 +471,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
         completed = False
         answer: str | None = None
         failure = ""
+        terminal_failure = ""
         failed_turn = False
         thread_id = ""
         usage_payload: dict[str, Any] | None = None
@@ -480,7 +528,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
             return True
 
         def on_event(event: dict[str, Any]) -> None:
-            nonlocal completed, answer, failure, failed_turn
+            nonlocal completed, answer, failure, terminal_failure, failed_turn
             nonlocal thread_id, usage_payload, usage_observed
             kind = event.get("type")
             item = event.get("item")
@@ -555,7 +603,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
                         emit_usage_callback(usage_callback, record)
             elif kind == "turn.failed":
                 failed_turn = True
-                failure = str(event.get("error") or "Codex turn failed")
+                terminal_failure = str(event.get("error") or "")
             elif kind == "error":
                 # CLI can emit recoverable stream errors before turn.completed.
                 failure = str(
@@ -640,7 +688,9 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
                     report_progress(final_progress_status)
         if code or not completed or failed_turn:
             raise _cli_failure(
-                failure + "\n" + stderr.decode("utf-8", errors="replace")
+                terminal_failure or failure,
+                returncode=code, completed=completed, failed_turn=failed_turn,
+                fallback_diagnostic=stderr.decode("utf-8", errors="replace"),
             )
         try:
             if not isinstance(answer, str):

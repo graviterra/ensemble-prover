@@ -26,7 +26,7 @@ from .config import LeanConfig
 from .lean_runner import LeanRunner
 from .lean_parser import has_infra_failure, has_timeout
 from .llm_error_policy import (
-    ProviderAccountUnavailable, classify_llm_exception,
+    ProviderAccountUnavailable, ProviderTransportUnavailable, classify_llm_exception,
     is_provider_infrastructure_failure,
 )
 from .llm_usage import (
@@ -600,24 +600,83 @@ async def _prepare(
         await prepare_capabilities(
             lambda: resolve_mini_request_envelopes(client, policy), phase
         )
-        response = await metered_or_plain_call(
-            cost_controller=meter,
-            client=client,
-            messages=messages,
-            role="answer_discovery",
-            scope="answer_input",
-            call_kind="chat_raw_json_answer",
-            max_tokens_override=policy,
-            metadata={"answer_phase": phase},
-            invoke=lambda callback: call_with_optional_usage_callback(
-                client.chat_raw,
-                messages,
-                response_format="json",
-                max_tokens_override=policy,
-                usage_callback=callback,
-                required_keywords=("response_format", "max_tokens_override"),
-            ),
-        )
+        # Transport attempts are separate from mathematical proposals. Each
+        # attempt retains the full prompt/envelope and gets its own admission
+        # and accounting; missing usage must never become a free retry.
+        for attempt in range(1, 4):
+            if limit and time.monotonic() >= started + limit:
+                raise TimeoutError("run budget exhausted before answer request")
+            try:
+                response = await metered_or_plain_call(
+                    cost_controller=meter,
+                    client=client,
+                    messages=messages,
+                    role="answer_discovery",
+                    scope="answer_input",
+                    call_kind="chat_raw_json_answer",
+                    max_tokens_override=policy,
+                    metadata={"answer_phase": phase, "answer_provider_attempt": attempt},
+                    invoke=lambda callback: call_with_optional_usage_callback(
+                        client.chat_raw,
+                        messages,
+                        response_format="json",
+                        max_tokens_override=policy,
+                        usage_callback=callback,
+                        required_keywords=("response_format", "max_tokens_override"),
+                    ),
+                )
+            except Exception as exc:
+                classification = classify_llm_exception(exc)
+                retryable = (
+                    classification.retryable
+                    and not classification.terminal
+                    and classification.failure_reason == "llm_network_error"
+                    # Invalid completed output belongs to answer validation.
+                    and not isinstance(exc, json.JSONDecodeError)
+                    # Local file/permission failures are not network outages,
+                    # regardless of words appearing in a path or diagnostic.
+                    and (not isinstance(exc, OSError)
+                         or isinstance(exc, (ConnectionError, TimeoutError)))
+                )
+                delay = float(attempt)
+                remaining = started + limit - time.monotonic() if limit else None
+                retry = retryable and attempt < 3 and (
+                    remaining is None or remaining > delay
+                )
+                try:
+                    with (directory / "provider_attempts.jsonl").open(
+                        "a", encoding="utf-8"
+                    ) as handle:
+                        handle.write(json.dumps({
+                            "phase": phase, "attempt": attempt,
+                            "kind": classification.kind,
+                            "failure_reason": classification.failure_reason,
+                            "status": "retry" if retry else "failed",
+                            "retry_delay_s": delay if retry else 0,
+                        }) + "\n")
+                except OSError:
+                    # Optional diagnostics must not replace the provider
+                    # failure or permit further spending while writes fail.
+                    retry = False
+                    print(
+                        "[answer_discovery] could not record provider attempt diagnostics; "
+                        "stopping with the original provider failure",
+                        file=sys.stderr, flush=True,
+                    )
+                if not retry:
+                    if retryable:
+                        # Preserve a resumable infrastructure outcome instead
+                        # of marking the theorem as a mathematical failure.
+                        raise ProviderTransportUnavailable() from exc
+                    raise
+                print(
+                    f"[answer_discovery] transient {phase} provider failure; "
+                    f"retrying {attempt + 1}/3 in {delay:g}s",
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+            else:
+                break
         text, raw = response
         error = _completion_error(raw)
         if error or bool(getattr(client, "last_truncated", False)):

@@ -183,10 +183,10 @@ The direct Mini Prover CLI has three independently configurable model roles:
 - **Refiner:** optionally takes over after prover stalls or rejected attempts.
 - **Planner escalation:** repairs an empty or unparseable recursive plan.
 
-Planner escalation defaults to `auto`. If `OPENAI_API_KEY` exists, `auto` uses
-the OpenAI API with `gpt-5.6-terra`; otherwise it disables escalation with a
-warning. Use `--planner-escalation off` to disable it deliberately, or choose
-another provider and model explicitly.
+Planner escalation defaults to `off`; the ordinary planner still uses the
+prover model. Opt in with `--planner-escalation auto` or select a provider and
+model explicitly. If `OPENAI_API_KEY` exists, `auto` uses the OpenAI API with
+`gpt-5.6-terra`; otherwise it disables escalation with a warning.
 
 When either Mini role uses `codex` or `claude-code`, automatic API planner escalation is disabled.
 Select a model explicitly and set `--cost-budget-usd 0`; subscription allowances

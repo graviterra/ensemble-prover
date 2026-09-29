@@ -121,13 +121,13 @@ def mini_reasoning_effort(client: Any, *, minimum: str) -> str:
     base_url = str(getattr(cfg, "base_url", "") or "")
     if (
         selected == "max"
-        and (model.startswith("gpt-5.2") or mini_gpt6_model(model))
+        and model.startswith("gpt-5.2")
         and (
             base_url_matches_provider(base_url, "openai")
             or base_url_matches_provider(base_url, "openrouter")
         )
     ):
-        # These families name their strongest supported setting ``xhigh``.
+        # This legacy family names its strongest supported setting ``xhigh``.
         return "xhigh"
     return selected
 

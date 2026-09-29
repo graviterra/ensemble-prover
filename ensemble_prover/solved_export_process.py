@@ -176,12 +176,12 @@ def _run_process(command: Sequence[str], *, cwd: Path) -> subprocess.CompletedPr
     from .mini_session.process_watchdog import _proc_identity
 
     nonce = uuid.uuid4().hex
-    environment = sanitized_subprocess_environment(overrides={_OWNERSHIP_ENV: nonce})
     # A crashed supervisor must not leave communicate() waiting on a pipe
     # still held open by an orphaned new-session Lean process.
     with tempfile.TemporaryFile() as output_file:
         proc = subprocess.Popen(
-            list(command), cwd=cwd, env=environment,
+            list(command), cwd=cwd,
+            env=sanitized_subprocess_environment(overrides={_OWNERSHIP_ENV: nonce}),
             stdout=output_file, stderr=subprocess.STDOUT, start_new_session=True,
         )
         identity = _proc_identity(proc.pid)

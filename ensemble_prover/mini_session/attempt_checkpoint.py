@@ -276,18 +276,18 @@ class AttemptCheckpointRegistry:
                         result = planner_result_from_record(raw)
                         reason = (classify_llm_exception(result.exception).failure_reason
                                   if result.exception is not None else "")
-                        # A live background transport pause unwinds like
+                        # A live background infrastructure pause unwinds like
                         # cancellation, preserving the reserved pass without
                         # setting a session terminal latch. Its typed receipt
                         # is itself evidence of the run-wide provider pause.
-                        unlatched_transport_pause = (
-                            reason == "provider_transport_unavailable"
+                        unlatched_provider_pause = (
+                            is_resumable_provider_failure(reason)
                             and not terminal_reason
                             and saved.get("root_finalized") is False
                         )
                         if (is_resumable_provider_failure(reason) and (
                                 is_resumable_provider_failure(terminal_reason)
-                                or unlatched_transport_pause)):
+                                or unlatched_provider_pause)):
                             receipts.pop(key)
                             self._account_failure_planner_retries[lane] = self._account_failure_planner_retries.get(lane, 0) + 1
                 # A failed provider call is not a completed mathematical child
