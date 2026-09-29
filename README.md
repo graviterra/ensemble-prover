@@ -19,7 +19,7 @@ mathematical retrieval, proof repair, and Lean verification in an autonomous
 proof-search system. Give it a theorem or an English claim, follow the work in
 your browser, and inspect the formal mathematics behind recorded progress.
 
-**380 Putnam problems with saved solutions—and counting.**
+**393 Putnam problems with saved solutions—and counting.**
 
 [Results and evaluation scope](#results)
 
@@ -184,8 +184,8 @@ they can support a proof claim.
 
 | Distinct problems with saved solutions | Listed on PutnamBench |
 | :---: | :---: |
-| **257+ distinct Putnam problems** | **65 problems** |
-| Cumulative archive · September 26, 2026 | Public metadata checked · September 26, 2026 |
+| **393 distinct Putnam problems** | **65 problems** |
+| Cumulative archive · September 29, 2026 | Public metadata checked · September 26, 2026 |
 
 The cumulative count combines models, configurations, and budgets and does not
 establish a controlled benchmark solve rate. Historical artifacts can have

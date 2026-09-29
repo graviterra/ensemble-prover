@@ -5,7 +5,7 @@ listing. They have different evidence and evaluation scopes.
 
 | Record | Problems | Date | Evidence |
 | --- | ---: | --- | --- |
-| Cumulative saved solutions | **257+ distinct problems** | September 26, 2026 | Distinct Putnam problem identifiers in the project’s local solved archive |
+| Cumulative saved solutions | **393 distinct problems** | September 29, 2026 | Distinct Putnam problem identifiers in the project’s local solved archive |
 | PutnamBench listing | **65 problems** | Public data checked September 26, 2026 | [Leaderboard](https://trishullab.github.io/PutnamBench/leaderboard.html) and [results metadata](https://trishullab.github.io/PutnamBench/results.json) |
 
 The archive count combines models, configurations, and budgets and
