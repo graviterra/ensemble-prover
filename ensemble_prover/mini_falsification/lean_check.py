@@ -197,5 +197,17 @@ async def check_concrete_negation(
     output = str(getattr(result, "output", "") or "")
     parsed = getattr(result, "parsed", None)
     if bool(getattr(parsed, "infra_failure", False)):
+        # LeanRunner returns its own deadline receipt after cleaning up; it
+        # need not raise TimeoutError. A foreground lease shorter than the
+        # requested operation allowance has not tested this witness with its
+        # full budget. Preserve the cursor and yield to full-budget coverage,
+        # just as for the raised-timeout path above. Queue/environment failures
+        # and full-allowance backend failures remain infrastructure retries.
+        if (
+            check_self_bounded
+            and effective_timeout_s + 1e-9 < requested_timeout_s
+            and output.strip() == "Lean timeout while waiting for Lean backend execution"
+        ):
+            return False, output, "partial_timeout"
         return False, output, "infrastructure"
     return bool(getattr(result, "ok", False)), output, ""

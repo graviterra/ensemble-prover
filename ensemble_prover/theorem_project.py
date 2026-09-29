@@ -14,9 +14,8 @@ from .lean_decl_parser import find_decl_header_end
 from .lean_source_lexing import (
     _command_matches,
     _mask_noncode,
-    _physical_source_lines,
     _quoted_identifier_open_before,
-    _unclosed_block_comment_at,
+    _scan_lean_header,
 )
 from .utils import _first_top_level_colon_after, has_sorry_or_admit
 
@@ -767,121 +766,51 @@ def scan_lean_imports(text: str) -> tuple[str, ...]:
 
 
 def split_lean_import_header(text: str) -> tuple[str, str]:
-    """Split leading prelude/module/import commands from declaration content."""
+    """Split complete leading Lean header commands from declaration content."""
 
-    source = str(text or "")
-    lines = _physical_source_lines(source)
-    masked_lines = _physical_source_lines(_mask_noncode(source))
-    end = 0
-    index = 0
-    while index < len(masked_lines):
-        if _quoted_identifier_open_before(masked_lines, index):
-            if end != index:
-                break
-            extra = lines[index]
-            close = extra.find("»")
-            if close >= 0 and extra[close + 1 :].strip(" \t\r"):
-                lines[index] = extra[: close + 1]
-                lines.insert(index + 1, extra[close + 1 :].lstrip(" \t"))
-                end = index + 1
-                break
-            end = index + 1
-            index += 1
-            continue
-        stripped = masked_lines[index].strip()
-        if (
-            not stripped
-            or stripped == "prelude"
-            or stripped == "module"
-            or stripped.startswith("module ")
-            or re.fullmatch(r"(?:public\s+)?import\s+.+", stripped) is not None
-        ):
-            end = index + 1
-            index += 1
-            continue
-        break
-    return "\n".join(lines[:end]), "\n".join(lines[end:])
+    source = str(text or "").replace("\r\n", "\n")
+    _, body_start = _scan_lean_header(source)
+    header = source[:body_start]
+    body = source[body_start:]
+    if not _quoted_identifier_open_before([_mask_noncode(header)], 1):
+        header = header.rstrip(" \t\r").removesuffix("\n")
+    if not _quoted_identifier_open_before([_mask_noncode(body)], 1):
+        body = body.removesuffix("\n")
+    return header, body
 
 
 def merge_imports(preamble: str, imports: Sequence[str]) -> str:
-    additions = normalize_imports(imports)
-    source = str(preamble or "")
+    additions = list(normalize_imports(imports))
+    original = str(preamble or "")
     if not additions:
-        return source
-    lines = _physical_source_lines(source)
-    masked_lines = _physical_source_lines(_mask_noncode(source))
-    existing: list[str] = []
-    header_prefix_end = 0
-    last_import_end: Optional[int] = None
-    index = 0
-
-    def detach_open_comment(at: int) -> bool:
-        comment_at = _unclosed_block_comment_at(lines[at])
-        if comment_at is None:
-            return False
-        lines.insert(at + 1, lines[at][comment_at:])
-        lines[at] = lines[at][:comment_at].rstrip(" \t")
-        masked_lines.insert(at + 1, "")
-        return True
-
-    while index < len(masked_lines):
-        if _quoted_identifier_open_before(masked_lines, index):
-            extra = lines[index]
-            close = extra.find("»")
-            if last_import_end == index and existing:
-                piece = extra if close < 0 else extra[: close + 1]
-                existing[-1] += "\n" + piece
-                if close >= 0 and extra[close + 1 :].strip(" \t\r"):
-                    lines[index] = piece
-                    lines.insert(index + 1, extra[close + 1 :].lstrip(" \t"))
-                    masked_lines.insert(index + 1, "")
-                last_import_end = index + 1
-                index += 1
-                continue
-            if last_import_end is None and header_prefix_end == index:
-                if close >= 0 and extra[close + 1 :].strip(" \t\r"):
-                    lines[index] = extra[: close + 1]
-                    lines.insert(index + 1, extra[close + 1 :].lstrip(" \t"))
-                    header_prefix_end = index + 1
-                    break
-                header_prefix_end = index + 1
-                index += 1
-                continue
-            break
-        stripped = masked_lines[index].strip()
-        if (
-            not stripped
-            or stripped == "prelude"
-            or stripped == "module"
-            or stripped.startswith("module ")
-        ):
-            if last_import_end is None:
-                if detach_open_comment(index):
-                    header_prefix_end = index + 1
-                    break
-                header_prefix_end = index + 1
-            index += 1
+        return original
+    source = original.replace("\r\n", "\n")
+    commands, body_start = _scan_lean_header(source)
+    existing = set()
+    for command in commands:
+        if command.kind != "import":
             continue
-        match = re.fullmatch(r"(?:public\s+)?import\s+(.+?)\s*", stripped)
-        if match is None:
-            break
-        module = str(match.group(1) or "").strip()
-        if module and module not in existing:
-            existing.append(module)
-        if detach_open_comment(index):
-            last_import_end = index + 1
-            index += 1
-            continue
-        last_import_end = index + 1
-        index += 1
+        modifiers = {source[start:end] for start, end in command.code_spans[:-1]}
+        if "meta" not in modifiers and "all" not in modifiers:
+            existing.add(source[command.module_start:command.end])
     new_lines = [f"import {module}" for module in additions if module not in existing]
     if not new_lines:
-        return source
-    insert_at = last_import_end if last_import_end is not None else header_prefix_end
-    lines[insert_at:insert_at] = new_lines
-    trailing_newline = source.endswith(("\n", "\r"))
-    merged = "\n".join(lines)
-    return merged + ("\n" if trailing_newline else "")
+        return original
+    insert_at = commands[-1].end if commands else (
+        body_start if body_start < len(source) else 0
+    )
+    if commands and _quoted_identifier_open_before(
+        [_mask_noncode(source[commands[-1].start:commands[-1].end])], 1,
+    ):
+        # Keep an incomplete editor name intact; an added command must never
+        # become part of that name.
+        insert_at = commands[-1].start
+    before, after = source[:insert_at], source[insert_at:]
+    if before and not before.endswith("\n"):
+        before += "\n"
+    if after and not after.startswith("\n"):
+        after = "\n" + (after.lstrip(" \t") if insert_at else after)
+    return before + "\n".join(new_lines) + after
 
 
 def theorem_reusable_preamble(

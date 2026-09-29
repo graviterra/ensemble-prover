@@ -11068,6 +11068,7 @@ async def prove_problem(
     max_prove_turns: int,
     max_refine_turns: int,
     autonomous_research: bool = True,
+    frontier_research: Optional[Dict[str, Any]] = None,
     trace_prefix: str = "",
     recorder: Optional[RunRecorder] = None,
     searcher: Optional[MathlibApiSearcher] = None,
@@ -11942,15 +11943,6 @@ def _auto_export_solved_run(
 ) -> Dict[str, Any]:
     """Best-effort export of a solved run to runs/mini_prover/solved."""
 
-    try:
-        from .extract_solved import (
-            SolvedExportVerificationError,
-            export_solved_run,
-        )
-    except Exception as exc:
-        print(f"Solved Lean export skipped: could not import exporter ({exc})")
-        return _mini_solved_export_status("import_error", diagnostic=str(exc))
-
     project_dir = (
         Path(lean_project_dir)
         if lean_project_dir is not None
@@ -11959,48 +11951,38 @@ def _auto_export_solved_run(
     if not project_dir.is_absolute():
         project_dir = (_PROJECT_ROOT / project_dir).resolve()
     try:
-        record = export_solved_run(
-            Path(output_dir),
-            verify_lean=True,
-            allow_pre_export_bootstrap=True,
-            lean_project_dir=project_dir,
-        )
-    except SolvedExportVerificationError as exc:
-        print("Solved Lean export rejected by Lean self-check.")
-        return _mini_solved_export_status(
-            str(getattr(exc, "status", "") or "lean_rejected"),
-            diagnostic=getattr(exc, "output", str(exc)),
+        from .solved_export_process import export_solved_run_in_fresh_process
+
+        result = export_solved_run_in_fresh_process(
+            Path(output_dir), lean_project_dir=project_dir,
         )
     except Exception as exc:
         print(f"Solved Lean export failed: {type(exc).__name__}: {exc}")
         return _mini_solved_export_status(
-            "exception",
-            diagnostic=f"{type(exc).__name__}: {exc}",
+            "exception", diagnostic=f"{type(exc).__name__}: {exc}",
         )
 
-    if record is None:
-        print(
-            "Solved Lean export skipped: no kernel-verified reconstructable "
-            "solved run artifact."
-        )
-        return _mini_solved_export_status("not_reconstructable")
-    visibility_bits = [str(getattr(record, "answer_visibility", "") or "")]
+    status = result["status"]
+    diagnostic = str(result.get("diagnostic") or "")
+    if status != "verified":
+        print(f"Solved Lean export pending: {status}: {diagnostic}")
+        return _mini_solved_export_status(status, diagnostic=diagnostic)
+    record = result["record"]
+    visibility_bits = [str(record.get("answer_visibility") or "")]
     for attr in (
         "opaque_mode",
         "allow_official_answer_visibility",
         "official_answer_payload_present",
     ):
-        value = getattr(record, attr, None)
+        value = record.get(attr)
         if isinstance(value, bool):
             visibility_bits.append(f"{attr}={'true' if value else 'false'}")
     print(
         "Solved Lean exported: "
-        f"{record.output_path} ({', '.join(visibility_bits)})"
+        f"{record['output_path']} ({', '.join(visibility_bits)})"
     )
     return _mini_solved_export_status(
-        "verified",
-        path=record.output_path,
-        diagnostic=record.export_verification_output,
+        "verified", path=record["output_path"], diagnostic=diagnostic,
     )
 
 
@@ -13239,6 +13221,12 @@ def _build_argparser() -> argparse.ArgumentParser:
             "the existing run budget (default: enabled for new runs). "
             "Checkpoints created before this option retain disabled behavior."
         ),
+    )
+    p.add_argument(
+        "--frontier-research",
+        choices=("off", "observe", "adaptive"),
+        default="off",
+        help="Frontier research allocation policy within the existing run budget (default: off).",
     )
     p.add_argument(
         "--cost-budget-usd",
@@ -15037,6 +15025,10 @@ async def _main_async(args: argparse.Namespace) -> int:
         # Programmatic namespaces must persist the same effective policy as
         # parsed fresh launches; legacy resume has already supplied False.
         args.autonomous_research = True
+    if not hasattr(args, "frontier_research"):
+        args.frontier_research = "off"
+    if args.frontier_research != "off" and not args.autonomous_research:
+        raise ValueError("frontier research requires autonomous research")
     args.cost_budget_usd = require_cost_budget_usd(getattr(args, "cost_budget_usd", 0.0))
     # CLI namespaces can also be supplied programmatically.  Validate the
     # complete falsification numeric surface before installing handlers,
@@ -15606,6 +15598,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 max_prove_turns=int(args.max_prove_turns),
                 max_refine_turns=int(args.max_refine_turns),
                 autonomous_research=bool(getattr(args, "autonomous_research", True)),
+                frontier_research={"mode": args.frontier_research},
                 recorder=recorder,
                 checkpoint_registry=checkpoint_registry,
                 searcher=searcher,

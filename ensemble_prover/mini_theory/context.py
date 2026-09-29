@@ -9,8 +9,7 @@ from typing import Iterable, Optional
 from .model import content_hash
 from ..lean_source_lexing import (
     _mask_noncode,
-    _quoted_identifier_open_before,
-    _unclosed_block_comment_at,
+    _scan_lean_header,
 )
 
 
@@ -51,40 +50,6 @@ def _trim_plain_edges(text: str) -> str:
     return text.strip(_PLAIN_EDGE)
 
 
-def _suffix_after_import(source_line: str, module: str) -> str:
-    """Text on an import line after the module token, such as a trailing comment."""
-
-    marker = source_line.find("import")
-    if marker < 0:
-        return ""
-    rest = source_line[marker + len("import") :].lstrip(" \t")
-    if not rest.startswith(module):
-        return ""
-    return rest[len(module) :].lstrip(" \t")
-
-
-def _import_module_text(masked_line: str) -> Optional[str]:
-    """Return the module token on one masked import line.
-
-    An unclosed ``«`` keeps every remaining character, including spaces.
-    A closed quoted name or ordinary token must occupy the rest of the line.
-    """
-
-    matched = re.match(r"^\s*import\s+(.*)$", masked_line)
-    if matched is None:
-        return None
-    rest = matched.group(1)
-    if rest.startswith("«"):
-        close = rest.find("»")
-        if close < 0:
-            return rest
-        if rest[close + 1 :].strip():
-            return None
-        return rest[: close + 1]
-    token = re.match(r"\S+", rest)
-    if token is None or rest[token.end() :].strip():
-        return None
-    return token.group(0)
 
 
 @dataclass(frozen=True)
@@ -98,82 +63,31 @@ class TheoryContext:
 
     @classmethod
     def from_preamble(cls, preamble: str) -> "TheoryContext":
-        imports: list[str] = []
-        header_lines: list[str] = []
-        body_lines: list[str] = []
         source = str(preamble or "")
-        # Only split on the physical newline preserved by both lexical masks.
-        # str.splitlines() also splits Unicode characters that may belong to
-        # an escaped identifier and are correctly blanked in the command mask.
-        source_lines = source.split("\n")
-        masked_lines = _mask_noncode(source).split("\n")
-        command_lines = _mask_noncode(source, mask_quoted_identifiers=True).split("\n")
-        index = 0
-        limit = len(source_lines)
-        while index < limit:
-            if _quoted_identifier_open_before(masked_lines, index):
-                body_lines.append(source_lines[index])
-                index += 1
-                continue
-            line = source_lines[index]
-            masked_line = masked_lines[index]
-            command_line = command_lines[index] if index < len(command_lines) else ""
-            head = len(masked_line) - len(masked_line.lstrip())
-            if head == len(masked_line) or (
-                head < len(command_line) and command_line[head].isspace()
-            ):
-                body_lines.append(line)
-                index += 1
-                continue
-            stripped = masked_line.strip()
-            if stripped == "prelude" or stripped == "module" or stripped.startswith("module "):
-                comment_at = _unclosed_block_comment_at(line)
-                if comment_at is None:
-                    header_lines.append(line)
-                else:
-                    header_lines.append(line[:comment_at].rstrip(" \t"))
-                    body_lines.append(line[comment_at:])
-                index += 1
-                if comment_at is None:
-                    while index < limit and _quoted_identifier_open_before(masked_lines, index):
-                        extra = source_lines[index]
-                        comment_at = _unclosed_block_comment_at(extra, quote_open=True)
-                        if comment_at is None:
-                            header_lines.append(extra)
-                            index += 1
-                            continue
-                        header_lines.append(extra[:comment_at].rstrip(" \t"))
-                        body_lines.append(extra[comment_at:])
-                        index += 1
-                        break
-                continue
-            module = _import_module_text(masked_line)
-            if module is None:
-                body_lines.append(line)
-                index += 1
-                continue
-            suffix = _suffix_after_import(line, module)
-            if suffix:
-                body_lines.append(suffix)
-            index += 1
-            while not suffix and index < limit and _quoted_identifier_open_before(masked_lines, index):
-                extra = source_lines[index]
-                close = extra.find("»")
-                if close < 0:
-                    module += "\n" + extra
-                    index += 1
-                    continue
-                module += "\n" + extra[: close + 1]
-                remainder = extra[close + 1 :].lstrip(" \t")
-                index += 1
-                if remainder.strip("\r"):
-                    body_lines.append(remainder)
-                break
-            if module not in imports:
-                imports.append(module)
+        commands, _ = _scan_lean_header(source)
+        retain_import_order = any(command.decorated for command in commands)
+        imports: list[str] = []
+        headers: list[str] = []
+        removed: list[tuple[int, int]] = []
+        for command in commands:
+            if command.kind == "import" and not retain_import_order:
+                module = source[command.module_start:command.end]
+                if module not in imports:
+                    imports.append(module)
+            else:
+                # A modified import keeps the original header sequence ahead
+                # of appended theory imports, preserving phase and visibility.
+                headers.append(" ".join(source[start:end] for start, end in command.code_spans))
+            removed.extend(command.code_spans)
+        body_parts: list[str] = []
+        cursor = 0
+        for start, end in removed:
+            body_parts.append(source[cursor:start])
+            cursor = end
+        body_parts.append(source[cursor:])
         return cls(
-            base_header=_trim_plain_edges("\n".join(header_lines)),
-            base_preamble=_trim_plain_edges("\n".join(body_lines)),
+            base_header=_trim_plain_edges("\n".join(headers)),
+            base_preamble=_trim_plain_edges("".join(body_parts)),
             base_imports=tuple(imports),
         )
 
@@ -208,8 +122,34 @@ class TheoryContext:
         )
 
     def render(self) -> str:
-        imports = tuple(dict.fromkeys((*self.base_imports, *self.theory_imports)))
-        import_block = "\n".join(f"import {module}" for module in imports)
+        header = self.base_header
+        header_commands, _ = _scan_lean_header(header)
+        pending_header = ""
+        if header_commands and _ends_in_open_quote(header):
+            pending_header = header[header_commands[-1].start:]
+            header = header[:header_commands[-1].start].rstrip(_PLAIN_EDGE)
+            header_commands = header_commands[:-1]
+        existing = {
+            header[command.module_start:command.end]
+            for command in header_commands
+            if command.kind == "import" and not any(
+                header[start:end] in {"meta", "all"}
+                for start, end in command.code_spans[:-1]
+            )
+        }
+        imports = tuple(
+            module for module in dict.fromkeys((*self.base_imports, *self.theory_imports))
+            if module not in existing
+        )
+        import_block = "\n".join(
+            f"import {module}" for module in imports if not _ends_in_open_quote(module)
+        )
+        pending_imports = "\n".join(
+            f"import {module}" for module in imports if _ends_in_open_quote(module)
+        )
+        if any(command.kind == "import" for command in header_commands):
+            header = "\n".join(part for part in (header, import_block) if part)
+            import_block = ""
         inventory_block = ""
         if self.theory_inventory:
             inventory_block = "\n".join(
@@ -221,16 +161,18 @@ class TheoryContext:
                     ),
                 )
             )
-        header_first = not _ends_in_open_quote(self.base_header)
+        body = [self.base_preamble, inventory_block]
+        if _ends_in_open_quote(self.base_preamble):
+            body.reverse()
         return _trim_plain_edges(
             "\n\n".join(
                 part
                 for part in (
-                    self.base_header if header_first else "",
+                    header,
                     import_block,
-                    "" if header_first else self.base_header,
-                    self.base_preamble,
-                    inventory_block,
+                    *body,
+                    pending_imports,
+                    pending_header,
                 )
                 if _trim_plain_edges(part)
             )

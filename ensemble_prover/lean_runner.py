@@ -7988,6 +7988,34 @@ class LeanRunner:
         capture_syntax = f"miniResidualCapture_{nonce}"
         proof_rejection_marker = f"MINI_RESIDUAL_PROOF_REJECTION_{nonce}"
         postprocess_marker = f"MINI_RESIDUAL_POSTPROCESS_FAILURE_{nonce}"
+        helper_inventory = ""
+        helper_inventory_before = ""
+        helper_inventory_after = ""
+        helper_expansion = ""
+        if exact_lemmas:
+            inventory_function = f"{serializer_prefix}_inventory"
+            before_name = f"{serializer_prefix}_beforeHelpers"
+            after_name = f"{serializer_prefix}_afterHelpers"
+            name_list_type = "Lean.mkApp (Lean.mkConst ``List [Lean.Level.zero]) (Lean.mkConst ``Lean.Name)"
+            # Compile inventory operations in the trusted preamble scope so
+            # helper-local instances cannot alter Name/collection operations.
+            helper_inventory = f"""
+private def {inventory_function} (name : Lean.Name) : Lean.Elab.Command.CommandElabM Unit := do
+  let names := (← Lean.getEnv).constants.map₂.toList.map (·.1)
+  Lean.Elab.Command.liftCoreM <| Lean.addAndCompile <| .defnDecl {{
+    name := name, levelParams := [], type := {name_list_type},
+    value := Lean.toExpr names, hints := .opaque, safety := .safe
+  }}
+"""
+            helper_inventory_before = f"run_cmd {inventory_function} `{before_name}"
+            helper_inventory_after = f"run_cmd {inventory_function} `{after_name}"
+            helper_expansion = f"""
+  let beforeHelpers ← Lean.Meta.evalExpr (List Lean.Name) ({name_list_type}) (Lean.mkConst `{before_name})
+  let afterHelpers ← Lean.Meta.evalExpr (List Lean.Name) ({name_list_type}) (Lean.mkConst `{after_name})
+  let baseline := beforeHelpers.foldl (fun names name => names.insert name) ({{}} : Lean.NameSet)
+  let helperNames := afterHelpers.foldl (fun names name =>
+    if baseline.contains name then names else names.insert name) ({{}} : Lean.NameSet)
+"""
         statement_literal = json.dumps(raw_statement, ensure_ascii=False)
         proof_header = f"opaque goal_{short_id(raw_statement + raw_proof)} : {raw_statement} := "
         proof_column = len(proof_header.rsplit("\n", 1)[-1])
@@ -8203,12 +8231,28 @@ private def {serializer_prefix}_elabType
                 "    let target ← Lean.instantiateMVars (← goalId.getType)",
                 "    let lctx ← Lean.getLCtx",
                 "    let fvars := lctx.getFVarIds.map Lean.mkFVar",
-                "    let closed ← Lean.Meta.mkForallFVars fvars target",
-                "      (usedOnly := false) (usedLetOnly := false) (generalizeNondepLet := false)",
-                # Local values, including nondependent `have` facts, stay lets
-                # in this closed target. They are not residual arguments.
-                # Ordinary hypotheses still are.
-                "    let args := fvars.filter fun fvar => !((lctx.get! fvar.fvarId!).isLet (allowNondep := true))",
+                # Preserve proved facts as hypotheses rather than embedding
+                # their derivations in every standalone target. In particular,
+                # those derivations may name helpers unavailable to the trusted
+                # pre-helper target witness. The original values have already
+                # passed the unresolved-hole/sorry audit above. Proof
+                # irrelevance permits this change only for Prop-valued locals;
+                # data-valued lets must retain their defining values.
+                "    let instances ← Lean.Meta.getLocalInstances",
+                "    let mut residualLCtx := lctx",
+                "    for decl in lctx do",
+                "      if let .ldecl index id name type _ _ kind := decl then",
+                "        if ← Lean.Meta.isProp type then",
+                "          let bi := if instances.any (fun inst => inst.fvar.fvarId! == id)",
+                "            then Lean.BinderInfo.instImplicit else Lean.BinderInfo.default",
+                "          residualLCtx := residualLCtx.modifyLocalDecl id fun _ =>",
+                "            .cdecl index id name type bi kind",
+                "    let closed ← Lean.Meta.withLCtx residualLCtx instances <|",
+                "      Lean.Meta.mkForallFVars fvars target",
+                "        (usedOnly := false) (usedLetOnly := false) (generalizeNondepLet := false)",
+                # Apply the generalized proof hypotheses using their original
+                # local proofs. Lean checks this bridge in the original context.
+                "    let args := fvars.filter fun fvar => !((residualLCtx.get! fvar.fvarId!).isLet (allowNondep := true))",
                 "    let fresh ← Lean.Meta.withLCtx {} #[] <|",
                 "      Lean.Meta.mkFreshExprSyntheticOpaqueMVar closed",
                 "    let replacement := Lean.mkAppN fresh args",
@@ -8282,11 +8326,35 @@ private def {serializer_prefix}_elabType
                 "  let isAux := fun constant =>",
                 f"    (`{proof_witness}).isPrefixOf constant && constant != `{proof_witness} ||",
                 f"    (`{witness_name}).isPrefixOf constant && constant != `{witness_name}",
+                helper_expansion.rstrip(),
+                # Standalone target witnesses run before candidate helpers.
+                # Inline helper-defined data without changing its value; never
+                # turn a defined datum into an unconstrained hypothesis.
+                # The conditional bridge was already kernel checked above,
+                # and the expanded type must remain definitionally equal.
+                "  let expandTarget := fun constant => isAux constant || helperNames.contains constant"
+                if exact_lemmas else "  let expandTarget := isAux",
                 "  let goalPayloads ← try",
                 "    let mut goalPayloads : Array Lean.Json := #[]",
                 "    for slot in [:closedGoals.size] do",
                 "      let goalPayload ← do",
-                "        let closed ← Lean.Meta.deltaExpand closedGoals[slot]! isAux",
+                "        let closed ← Lean.Meta.deltaExpand closedGoals[slot]! expandTarget",
+                # Recursive definitions deliberately resist smart unfolding at
+                # symbolic arguments. Compare their expanded bodies using
+                # kernel transparency without changing proof-search options.
+                "        unless ← Lean.withOptions (fun options => options.setBool `smartUnfolding false) <|",
+                "            Lean.Meta.withTransparency .all <| Lean.Meta.withNewMCtxDepth <|",
+                "              Lean.Meta.isDefEq closed closedGoals[slot]! do",
+                '          Lean.throwError "residual helper normalization changed its type"',
+                # Opaque constants and fresh inductive types cannot be erased
+                # definitionally. Do not certify a standalone child that the
+                # normal target checker cannot elaborate. Required theory
+                # declarations belong in the trusted preamble; this failure
+                # leaves the parent proof available for continued search.
+                "        if let some dependent := closed.find? (fun expr => match expr with",
+                "            | .const name _ | .proj name _ _ => expandTarget name",
+                "            | _ => false) then",
+                '          Lean.throwError m!"residual target requires helper-local declaration {dependent}; place required theory declarations in the trusted preamble or continue the parent proof"',
                 "        if closed.hasMVar || closed.hasFVar || closed.hasLooseBVars then",
                 '          Lean.throwError "residual goal did not close"',
                 "        if closed.hasSorry then",
@@ -8304,7 +8372,12 @@ private def {serializer_prefix}_elabType
                 "          Lean.Meta.ppExpr closed",
                 f"        if rendered.pretty.length > {_LEAN_RESIDUAL_SOURCE_MAX_CHARS} then",
                 '          Lean.throwError "residual source exceeded size limit"',
-                f"        let replayed ← {serializer_prefix}_elabType rendered.pretty",
+                # Delaborated lets can span several lines. Give the term its
+                # own layout boundary so its meaning does not depend on the
+                # length of a later example/theorem declaration header.
+                '        let source := if (rendered.pretty.splitOn "\\n").length > 1',
+                '          then "(\\n" ++ rendered.pretty ++ "\\n)" else rendered.pretty',
+                f"        let replayed ← {serializer_prefix}_elabType source",
                 "        if replayed.hasSorry then",
                 '          Lean.throwError "replayed residual contains sorry"',
                 "        unless ← Lean.Meta.withNewMCtxDepth <|",
@@ -8312,7 +8385,7 @@ private def {serializer_prefix}_elabType
                 '          Lean.throwError "residual source round-trip changed its type"',
                 "        pure <| Lean.Json.mkObj [",
                 '          ("slot", Lean.ToJson.toJson slot),',
-                '          ("source", Lean.Json.str rendered.pretty),',
+                '          ("source", Lean.Json.str source),',
                 f'          ("expr", {serializer_prefix}_expr closed)',
                 "        ]",
                 "      goalPayloads := goalPayloads.push goalPayload",
@@ -8369,7 +8442,10 @@ private def {serializer_prefix}_elabType
             for part in (
                 preamble.strip(),
                 universe_decl,
+                helper_inventory.strip(),
+                helper_inventory_before,
                 lemma_block.strip(),
+                helper_inventory_after,
                 "open Lean Elab Command Meta",
                 serializer.strip(),
                 capture,

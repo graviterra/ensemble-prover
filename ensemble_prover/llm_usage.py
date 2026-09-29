@@ -6095,16 +6095,20 @@ async def call_with_optional_usage_callback(
     def invoke() -> Any:
         return method(*args, **call_kwargs)
 
-    if request_receipt is not None:
-        with bind_mini_request_envelope_receipt(request_receipt):
-            result = invoke()
-            if inspect.isawaitable(result):
-                return await result
-            return result
-    result = invoke()
-    if inspect.isawaitable(result):
-        return await result
-    return result
+    from .research_claims.strategy_runtime import provider_request_scope
+
+    with provider_request_scope(method, args[0] if args else call_kwargs.get("messages"),
+                                call_kwargs.get("tools", args[1] if len(args) > 1 else None)):
+        if request_receipt is not None:
+            with bind_mini_request_envelope_receipt(request_receipt):
+                result = invoke()
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+        result = invoke()
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
 
 def usage_totals_from_clients(

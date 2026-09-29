@@ -187,6 +187,11 @@ def initialize(
             raise ValueError(f"{name} must be finite and positive")
     if type(experiments) is not bool:
         raise ValueError("experiments must be boolean")
+    if strategy_policy is not None and not strategy_recovery:
+        from .frontier.config import normalize_config
+
+        if normalize_config(strategy_policy.get("frontier_research"))["mode"] != "off":
+            raise ValueError("frontier research requires strategy recovery")
     if not sources or any(
         not isinstance(name, str) or not name.strip() or not isinstance(content, str)
         for name, content in sources.items()
@@ -580,6 +585,7 @@ class DiscoveryLoop:
                 job = self.store.job(job["job_id"])
                 if self.strategy is not None and not self.strategy.research.before_request(job):
                     return self.store.job(job["job_id"])
+                job = self.store.job(job["job_id"])
                 job["messages"].extend(job["inbox"])
                 job["inbox"] = []
                 context = self._context(job)
@@ -642,13 +648,30 @@ class DiscoveryLoop:
                 )
                 self.store.save_job(job)
 
+            requested_job = dict(job)
             admission_open = True
+            dispatch_attempts: list[str] = []
+
+            def settle_dispatches(outcome: str) -> None:
+                if self.strategy is not None:
+                    for index, attempt_id in enumerate(dispatch_attempts):
+                        self.strategy.controller.settle(
+                            attempt_id, outcome=outcome if index == len(dispatch_attempts) - 1 else "unknown",
+                        )
+
             async def authorize(details: Any = None) -> Any:
                 if not admission_open:
                     raise StrategyYield("retired_transport")
                 if self.strategy is not None:
                     try:
-                        self.strategy.controller.admit_control(details["provider_dispatch_attempt_id"], job["job_id"], job["turn"])
+                        from .frontier.hooks import mode_of
+
+                        self.strategy.controller.admit_control(
+                            details["provider_dispatch_attempt_id"], job["job_id"], job["turn"],
+                            **({"retry": bool(dispatch_attempts)}
+                               if mode_of(self.strategy.controller.snapshot()) == "adaptive" else {}),
+                        )
+                        dispatch_attempts.append(details["provider_dispatch_attempt_id"])
                     except StrategyYield as exc:
                         # Only existing global limits end a run. Reservation
                         # contention defers this worker until proof work yields.
@@ -743,18 +766,38 @@ class DiscoveryLoop:
                                         with self.store.atomic():
                                             artifact_id = self._blob(
                                                 {"candidate_only": True, "late_research_response": result,
-                                                 "job_id": job["job_id"], "turn": job["turn"]},
+                                                 "job_id": requested_job["job_id"], "turn": requested_job["turn"]},
                                                 "late-research-response.json",
                                             )
-                                            producer = self.store.job(job["job_id"])
+                                            producer = self.store.job(requested_job["job_id"])
                                             candidates = producer.setdefault("late_research_candidates", [])
-                                            candidates.append({"artifact_id": artifact_id, "turn": job["turn"], "candidate_only": True})
+                                            candidates.append({"artifact_id": artifact_id, "turn": requested_job["turn"], "candidate_only": True})
                                             self.store.save_job(producer)
+                                            if self.strategy is not None and dispatch_attempts:
+                                                from .frontier.hooks import note_provider_success, record_response_tail
+
+                                                self.strategy.controller.settle(dispatch_attempts[-1], outcome="completed")
+                                                note_provider_success(
+                                                    self.strategy.controller, requested_job,
+                                                    attempt_id=dispatch_attempts[-1],
+                                                )
+                                                record_response_tail(
+                                                    self.strategy.controller,
+                                                    producer,
+                                                    dispatch_attempts[-1],
+                                                    "incomplete",
+                                                )
+                                            reopen = True
+                                            if self.strategy is not None:
+                                                from .frontier.hooks import mode_of
+
+                                                if mode_of(self.strategy.controller.snapshot()) == "adaptive":
+                                                    reopen = False
                                             self._notify(producer["job_id"], {
                                                 "late_research_candidate": candidates[-1],
                                                 "producer_job": producer["job_id"],
                                                 "instruction": "Inspect this unverified candidate before using it; no action or proof was accepted.",
-                                            }, requires_response=True)
+                                            }, requires_response=reopen)
                                 except BaseException:
                                     pass  # Closed ledger/cancelled tail has no authority.
                                 finally:
@@ -779,26 +822,74 @@ class DiscoveryLoop:
                         finally:
                             admission_open = False
                 # Save the entire raw provider output before interpretation.
+                ingress_error = None
                 with self.store.atomic():
-                    job = self.store.job(job["job_id"])
-                    job.update(
-                        status="responded",
-                        response=self._blob(response, "research-response.json"),
-                        incomplete=bool(
-                            _completion_error(response)
-                            or getattr(client, "last_truncated", False)
-                        ),
+                    job = self.store.job(requested_job["job_id"])
+                    response_artifact = self._blob(response, "research-response.json")
+                    current_response = (
+                        job["status"] == "running"
+                        and job["turn"] == requested_job["turn"]
+                        and job["revision"] == requested_job["revision"]
                     )
-                    # Record exposure only after a provider response. A timeout
-                    # or interrupted request retains the pending images for retry.
-                    job["source_images_presented"] = sorted(
-                        presented_images | {page["image_artifact"] for page in pending_images}
-                    )
+                    from .frontier.hooks import mode_of
+
+                    if (self.strategy is not None and dispatch_attempts
+                            and mode_of(self.strategy.controller.snapshot()) == "adaptive"):
+                        controller = self.strategy.controller
+                        for attempt_id in dispatch_attempts[:-1]:
+                            controller.settle(attempt_id, outcome="unknown")
+                        try:
+                            controller.receive_artifact(dispatch_attempts[-1], self.store.read_artifact(response_artifact))
+                        except ValueError as exc:
+                            if str(exc) not in {
+                                "artifact ingress size exceeded", "artifact ingress count exceeded",
+                                "artifact ingress expired or unknown",
+                            }:
+                                raise
+                            # Candidate admission is narrower than archival storage.
+                            # A rejected candidate cannot erase a completed paid call.
+                            ingress_error = str(exc)
+                        controller.settle(dispatch_attempts[-1], outcome="completed")
+                        if current_response:
+                            job["frontier_response_attempt_id"] = dispatch_attempts[-1]
+                    if current_response:
+                        job.update(
+                            status="responded", response=response_artifact,
+                            incomplete=bool(_completion_error(response) or getattr(client, "last_truncated", False)),
+                        )
+                        # A timeout retains pending images; only the matching
+                        # completed turn may mark them as presented.
+                        job["source_images_presented"] = sorted(
+                            presented_images | {page["image_artifact"] for page in pending_images}
+                        )
+                        if ingress_error:
+                            job["frontier_response_ingress_error"] = ingress_error
+                            job["status"] = "waiting"
+                    else:
+                        job.setdefault("late_research_candidates", []).append({
+                            "artifact_id": response_artifact, "turn": requested_job["turn"],
+                            "candidate_only": True,
+                            "attempt_id": dispatch_attempts[-1] if dispatch_attempts else None,
+                            "ingress_error": ingress_error,
+                        })
                     self.store.save_job(job)
+                    if self.strategy is not None and dispatch_attempts:
+                        from .frontier.hooks import note_provider_success
+
+                        note_provider_success(self.strategy.controller, requested_job, attempt_id=dispatch_attempts[-1])
+                        job = self.store.job(job["job_id"])
+                if not current_response:
+                    self._emit("response_retained", requested_job)
+                    return job
+                if self.strategy is not None:
+                    if ingress_error:
+                        self.strategy.research.handle_yield(job, "research_response_ingress_rejected")
+                        job = self.store.job(job["job_id"])
                 self._emit("response_saved", job)
                 return job
             except StrategyYield as exc:
                 with self.store.atomic():
+                    settle_dispatches("unknown")
                     current = self.store.job(job["job_id"])
                     # An old transport cannot revive or overwrite a newer turn.
                     if current["turn"] != job["turn"] or current["status"] != "running":
@@ -812,6 +903,20 @@ class DiscoveryLoop:
                     elif exc.reason.startswith("research_"):
                         self.strategy.research.handle_yield(current, exc.reason)
                         current = self.store.job(current["job_id"])
+                    elif exc.reason in {
+                        "fairness", "suspended", "frontier_permit_required", "paused_operational",
+                        "stale_permit_basis", "stale_frontier_scope", "formal_authority_revoked",
+                        "permit_expired", "claim_expired", "retry_exhausted",
+                    }:
+                        from .frontier.hooks import mode_of
+
+                        if mode_of(self.strategy.controller.snapshot()) == "adaptive":
+                            self.strategy.research.handle_yield(current, exc.reason)
+                            current = self.store.job(current["job_id"])
+                        else:
+                            current.update(status="pending", retry_after=time.time() + .2,
+                                           last_error=exc.reason)
+                            self.store.save_job(current)
                     else:
                         current.update(status="pending", retry_after=time.time() + .2,
                                        last_error=exc.reason)
@@ -819,8 +924,12 @@ class DiscoveryLoop:
                 return current
             except asyncio.CancelledError:
                 with self.store.atomic():
+                    settle_dispatches("unknown")
                     job = self.store.job(job["job_id"])
-                    if (
+                    if (job["turn"] != requested_job["turn"] or job["revision"] != requested_job["revision"]
+                            or job["status"] != "running"):
+                        pass
+                    elif (
                         self.store.get_claim(job["claim_id"])["revision"]
                         != job["revision"]
                     ):
@@ -831,7 +940,7 @@ class DiscoveryLoop:
                             last_error="interrupted_request_outcome_unknown",
                         )
                         self.store.save_job(job)
-                self._emit("provider_cancelled", job, error={
+                self._emit("provider_cancelled", requested_job, error={
                     "kind": "interrupted_request_outcome_unknown",
                     "exception_type": "CancelledError",
                 })
@@ -855,7 +964,21 @@ class DiscoveryLoop:
                 # Exception bodies can contain request URLs/credentials. Keep
                 # public status structural; provider responses above stay exact.
                 with self.store.atomic():
+                    settle_dispatches("unknown" if reason in {"provider_timeout", "deadline_exhausted"} else "failed")
                     job = self.store.job(job["job_id"])
+                    if (job["turn"] != requested_job["turn"] or job["revision"] != requested_job["revision"]
+                            or job["status"] != "running"):
+                        if self.strategy is not None and dispatch_attempts and reason != "deadline_exhausted":
+                            from .frontier.hooks import settle_provider_failure
+
+                            settle_provider_failure(
+                                self.strategy.controller, requested_job, reason, attempt_ids=dispatch_attempts,
+                                update_job=False,
+                            )
+                        self._emit("provider_failed", requested_job, error={
+                            "kind": reason, "exception_type": type(exc).__name__,
+                        })
+                        return job
                     error = {
                         "kind": reason,
                         "exception_type": type(exc).__name__,
@@ -879,7 +1002,30 @@ class DiscoveryLoop:
                     else:
                         job.update(status="pending", last_error=reason)
                         self.store.save_job(job)
+                    adaptive_decision = None
+                    if self.strategy is not None and reason not in {"deadline_exhausted"}:
+                        from .frontier.hooks import mode_of, settle_provider_failure
+
+                        if mode_of(self.strategy.controller.snapshot()) == "adaptive":
+                            adaptive_decision = settle_provider_failure(
+                                self.strategy.controller,
+                                job,
+                                reason,
+                                lane_attributed=False,
+                                preflight=not dispatch_attempts,
+                                attempt_ids=dispatch_attempts,
+                            )
                     run = self.store.run_record()
+                    if adaptive_decision in {"retry", "paused_operational", "defer"}:
+                        if reason == "context_overflow":
+                            run["context_char_limit"] = max(1200, int(run.get("context_char_limit", 20000) / 2))
+                            job["messages_archive"] = self._blob(job["messages"], "worker-context-history.json")
+                            job["messages"] = []
+                            job["source_pages"] = []
+                            self.store.save_job(job)
+                        self.store.save_run(run)
+                        self._emit("provider_failed", job, error=error)
+                        return job
                     if self.native_mode or (
                         self.strategy is not None
                         and reason in {"context_overflow", "provider_timeout"}
@@ -931,6 +1077,7 @@ class DiscoveryLoop:
             else {"polarity"}
             if kind == "formalize"
             else {"path", "offset", "length"} if kind == "read_artifact"
+            else {"substantive_progress"} if kind == "research_reorientation"
             else set()
         )
         object_fields(
@@ -1030,10 +1177,13 @@ class DiscoveryLoop:
         ):
             self._mark_stale(recipient)
             return
-        elif recipient["status"] == "waiting" or (
-            recipient["status"] == "finished" and requires_response
-        ):
-            recipient["status"] = "pending"
+        else:
+            from .frontier.hooks import mode_of
+
+            adaptive = mode_of(self.store.run_record(scheduling=True).get("strategy_review") or {}) == "adaptive"
+            if (requires_response and recipient["status"] in {"waiting", "finished"}
+                    or not adaptive and recipient["status"] == "waiting"):
+                recipient["status"] = "pending"
         self.store.save_job(recipient)
 
     def _mark_stale(self, job: dict[str, Any]) -> None:
@@ -1063,20 +1213,80 @@ class DiscoveryLoop:
                 requires_response=True,
             )
 
+    def _defer_native_response(self, job: dict[str, Any]) -> bool:
+        """Inside the action transaction, retain paid work for its exact grant."""
+        if self.strategy is None:
+            return False
+        run = self.store.run_record(scheduling=True)
+        if "native_active_target_claim_id" not in run:
+            return False
+        from .frontier.hooks import mode_of
+
+        state = self.strategy.controller.snapshot()
+        if mode_of(state) != "adaptive":
+            return False
+        attempt = state["attempts"].get(job.get("frontier_response_attempt_id", ""), {})
+        binding = attempt.get("frontier_binding") or {}
+        paid = (attempt.get("consumer_id") == job["job_id"]
+                and job["response"] in attempt.get("artifacts", []))
+        if (not paid
+                or binding.get("native_target_claim_id") != run["native_active_target_claim_id"]
+                or binding.get("native_context_binding") != run.get("native_active_target_context_binding")):
+            job["frontier_response_deferred"] = "native_grant_scope_changed"
+            if not paid:
+                job["status"] = "waiting"
+            self.store.save_job(job)
+            return True
+        if "frontier_response_deferred" in job:
+            job.pop("frontier_response_deferred")
+            self.store.save_job(job)
+        return False
+
     def apply_response(self, job: dict[str, Any]) -> None:
         """Commit mathematical mutations and the consumed response together."""
         try:
-            content, action = self._action(job)
             with self.store.atomic():
                 current = self.store.job(job["job_id"])
                 if (
                     current["status"] != "responded"
+                    or current["turn"] != job["turn"]
                     or current["response"] != job["response"]
                 ):
                     return
                 job = current
+                if self._defer_native_response(job):
+                    return
+                content, action = self._action(job)
                 self.store._fenced_claim(job["claim_id"], job["revision"])
                 run = self.store.run_record()
+                if self.strategy is not None:
+                    from .frontier.hooks import mode_of
+
+                    state = self.strategy.controller.snapshot()
+                    if mode_of(state) == "adaptive":
+                        attempt = state["attempts"].get(job.get("frontier_response_attempt_id", ""), {})
+                        binding = attempt.get("frontier_binding") or {}
+                        paid = (attempt.get("consumer_id") == job["job_id"]
+                                and job["response"] in attempt.get("artifacts", []))
+                        if job["role"] == "research":
+                            from .frontier.persist import load_campaign
+
+                            campaign = load_campaign(self.store, state["owner_id"])
+                            approach = (campaign or {}).get("approaches", {}).get(job.get("frontier_approach_id", ""), {})
+                            question = (campaign or {}).get("questions", {}).get(approach.get("question_id", ""), {})
+                            route = (campaign or {}).get("routes", {}).get(approach.get("route_id", ""), {})
+                            if (not paid or not approach
+                                    or binding.get("root_binding") != campaign["root"]["binding"]
+                                    or binding.get("approach_id") != approach["approach_id"]
+                                    or binding.get("question_id") != question.get("question_id")
+                                    or binding.get("question_revision") != question.get("revision")
+                                    or binding.get("route_id") != route.get("route_id")
+                                    or binding.get("route_revision") != route.get("revision")):
+                                from .frontier.hooks import retire_stale_research_response
+
+                                with self.strategy.controller._edit() as (live, _):
+                                    retire_stale_research_response(self.strategy.controller, live, job, "research_scope_changed")
+                                return
                 if (
                     self.store.get_claim(run["target_id"])["revision"]
                     != run["target_revision"]
@@ -1084,6 +1294,9 @@ class DiscoveryLoop:
                     raise RevisionConflict("original target changed")
                 result = self._apply_action(job, action)
                 if self.strategy is not None:
+                    from .frontier.tool_runtime import record_tool_result
+
+                    record_tool_result(self, job, action, result)
                     from .research_memory import record_action
                     novelty = record_action(self.store, job, action, result)
                 self._reply(job, content, result)
@@ -1169,6 +1382,11 @@ class DiscoveryLoop:
                 ]
             return result
         if kind == "read_artifact":
+            from .frontier.tool_runtime import begin_tool
+
+            refusal = begin_tool(self, job, action)
+            if refusal is not None:
+                return refusal
             if self.strategy is not None:
                 from .context_window import read_page
                 return read_page(self.store, action["artifact_id"], path=action.get("path"),
@@ -1178,6 +1396,11 @@ class DiscoveryLoop:
                 "complete_text": source_context(self.store, action["artifact_id"]),
             }
         if kind == "read_claim":
+            from .frontier.tool_runtime import begin_tool
+
+            refusal = begin_tool(self, job, action)
+            if refusal is not None:
+                return refusal
             return self.store.history(action["claim_id"])
         if kind == "investigate":
             question = text(action["question"], "research question")
@@ -1189,6 +1412,12 @@ class DiscoveryLoop:
                 )
                 self.store.create_claim(spec)
             child = self.store.add_job(claim_id, question, parent_job=job["job_id"])
+            if self.strategy is not None:
+                from .frontier.hooks import bind_research_job, mode_of
+
+                with self.strategy.controller._edit() as (state, run):
+                    if mode_of(state) == "adaptive":
+                        bind_research_job(self.strategy.controller, state, run, child, parent=job)
             return {
                 "program": child["job_id"],
                 "claim_id": claim_id,
@@ -1767,11 +1996,34 @@ class DiscoveryLoop:
             job = await self._request(job)
         if job["status"] != "responded":
             return
+        with self.store.atomic():
+            current = self.store.job(job["job_id"])
+            if (current["status"] != "responded" or current["turn"] != job["turn"]
+                    or current.get("response") != job.get("response")):
+                return
+            job = current
+            if self._defer_native_response(job):
+                return
         try:
             _, action = self._action(job)
         except (ValueError, KeyError):
             self.apply_response(job)
             return
+        if action["action"] in {*LITERATURE_FIELDS, "experiment"} and job["tool_result"] is None:
+            from .frontier.tool_runtime import begin_tool
+
+            with self.store.atomic():
+                current = self.store.job(job["job_id"])
+                if (current["status"] != "responded" or current["turn"] != job["turn"]
+                        or current.get("response") != job.get("response")):
+                    return
+                job = current
+                if self._defer_native_response(job):
+                    return
+                refusal = begin_tool(self, job, action)
+                if refusal is not None:
+                    job["tool_result"] = self._blob(refusal, "research-tool-deferred.json")
+                    self.store.save_job(job)
         if action["action"] in LITERATURE_FIELDS and job["tool_result"] is None:
             with self.store.atomic():
                 run = self.store.run_record()
@@ -1783,18 +2035,29 @@ class DiscoveryLoop:
                     return
                 job["status"] = "tool_running"
                 self.store.save_job(job)
+            attempted = job
             result = await self.literature.run(action, remaining_s=self.store.run_record()["deadline"] - time.time()) if self.strategy is not None else {"status": "unavailable", "coverage": "none", "reason": "strategy research disabled", "kernel_verified": False}
             with self.store.atomic():
                 job = self.store.job(job["job_id"])
                 artifact = self._blob(result, "literature-result.json")
+                if (job["status"] != "tool_running" or job["turn"] != attempted["turn"]
+                        or job.get("response") != attempted.get("response")):
+                    from .frontier.tool_runtime import record_tool_result
+
+                    record_tool_result(self, attempted, action, result)
+                    return
                 if (self.store.get_claim(job["claim_id"])["revision"] != job["revision"]
                         or self.store.get_claim(run["target_id"])["revision"] != run["target_revision"]):
                     job["tool_result"] = artifact
+                    from .frontier.tool_runtime import record_tool_result
+
+                    record_tool_result(self, job, action, result)
                     self._mark_stale(job)
                     return
                 job.update(status="responded", tool_result=artifact)
                 self.store.save_job(job)
         if action["action"] == "experiment" and job["tool_result"] is None:
+            attempted = job
             run = self.store.run_record()
             code = action["code"]
             result: dict[str, Any]
@@ -1832,11 +2095,22 @@ class DiscoveryLoop:
             with self.store.atomic():
                 job = self.store.job(job["job_id"])
                 result.update(scope=action["scope"], code=code, kernel_verified=False)
+                if (job["status"] != "tool_running" or job["turn"] != attempted["turn"]
+                        or job.get("response") != attempted.get("response")):
+                    from .frontier.tool_runtime import record_tool_result
+
+                    record_tool_result(self, attempted, action, result)
+                    return
                 job.update(
                     status="responded",
                     tool_result=self._blob(result, "experiment-result.json"),
                 )
                 self.store.save_job(job)
+        if job.get("tool_result") and action["action"] in {*LITERATURE_FIELDS, "experiment"}:
+            from .frontier.tool_runtime import record_tool_result
+
+            with self.store.atomic():
+                record_tool_result(self, job, action, self._read_json(job["tool_result"]))
         self.apply_response(job)
 
     def _recover_native_job(self, job: dict[str, Any]) -> None:
@@ -1933,12 +2207,18 @@ class DiscoveryLoop:
                                 break
                             jobs = self.store.jobs()
                             jobs_by_id = {job["job_id"]: job for job in jobs}
+                            from .frontier.hooks import mode_of
+                            from .research_control import native_job_context
+
+                            adaptive = mode_of(run.get("strategy_review") or {}) == "adaptive"
                             ready = sorted(
                                 (job for job in jobs
                                  if job["role"] != "formalization"
                                  and (target_claim_id is None or self.native_job_target(
                                      job, jobs_by_id
                                  ) == target_claim_id)
+                                 and (not adaptive or native_job_context(job, jobs_by_id)
+                                      == run.get("native_active_target_context_binding"))
                                  and (job["status"] == "responded" or (
                                      job["status"] == "pending" and not stop
                                      and admitted < max_requests

@@ -11,6 +11,9 @@ from .research_control import INSTRUCTIONS, REORIENTATION_FIELDS, ResearchContro
 
 
 ACTION_FIELDS = {
+    "frontier_reduction": {
+        "antecedent_obligation_ids", "consequent_obligation_id", "level", "proof_program_id", "quantitative",
+    },
     "research_reorientation": REORIENTATION_FIELDS,
     "request_strategy_review": {
         "subject_handle",
@@ -51,10 +54,10 @@ def _validate_action_values(action: dict[str, Any]) -> None:
     kind = action["action"]
     if kind not in ACTION_FIELDS:
         raise ValueError("unknown strategy action")
-    arrays = {"evidence_artifact_ids", "supersedes"}
-    booleans = {"relevant", "applicable", "substantive"}
+    arrays = {"evidence_artifact_ids", "supersedes", "antecedent_obligation_ids"}
+    booleans = {"relevant", "applicable", "substantive", "substantive_progress"}
     for field in ACTION_FIELDS[kind] - arrays - booleans:
-        text(action[field], field)
+        text(action[field], field, optional=field == "proof_program_id")
     if "method" in action:
         text(action["method"], "method", optional=True)
     for field in arrays & action.keys():
@@ -200,6 +203,23 @@ class StrategyIntegration:
                 context["assigned_strategy_objection"]["consequence"] = state[
                     "subjects"
                 ][review["consequence"]]
+        from .frontier.hooks import adaptive_context
+
+        context.update(adaptive_context(self.controller, job))
+        if self.controller._frontier_mode(state) == "adaptive" and job.get("frontier_approach_id"):
+            from .frontier.owner import FrontierOwner
+
+            campaign = FrontierOwner(self.controller).campaign()
+            context["frontier_research"]["obligations"] = list(campaign["obligations"].values())
+            context["frontier_research"]["reduction_action"] = {
+                "action": "frontier_reduction",
+                "antecedent_obligation_ids": ["issued obligation"],
+                "consequent_obligation_id": "issued obligation",
+                "level": "proposed|checked",
+                "proof_program_id": "verified formalization program for the exact implication, or empty for proposed",
+                "quantitative": "required constants, hypotheses, quantifiers and losses",
+                "checked_statement_format": "(premise1) → (premise2) → (conclusion)",
+            }
         return context
 
     def synchronize(self) -> None:
@@ -281,6 +301,10 @@ class StrategyIntegration:
 
     def ensure_work(self) -> bool:
         """An exhausted research program cannot turn the whole run idle/blocked."""
+        from .frontier.hooks import ensure_adaptive_work, mode_of
+
+        if mode_of(self.controller.snapshot()) == "adaptive":
+            return ensure_adaptive_work(self)
         if self.store.stop_reason() or self.store.run_record(scheduling=True)["status"] != "running":
             return False
         jobs = self.store.jobs()
@@ -309,6 +333,29 @@ class StrategyIntegration:
     ) -> dict[str, Any]:
         _validate_action_values(action)
         kind = action["action"]
+        if kind == "frontier_reduction":
+            from .frontier.owner import FrontierOwner
+
+            if self.controller._frontier_mode(self.controller.snapshot()) != "adaptive" or job["role"] != "research":
+                raise ValueError("frontier reductions require an adaptive research investigation")
+            owner = FrontierOwner(self.controller)
+            campaign = owner.campaign()
+            approach = campaign["approaches"].get(job.get("frontier_approach_id") or "")
+            if approach is None:
+                raise ValueError("frontier reduction requires an assigned approach")
+            if action["level"] not in {"proposed", "checked"}:
+                raise ValueError("a researcher may propose a reduction or reference a verified proof")
+            with self.store.atomic() if not self.store._applying else nullcontext():
+                reduction = owner.add_reduction(
+                    antecedents=action["antecedent_obligation_ids"],
+                    consequent=action["consequent_obligation_id"],
+                    level=action["level"],
+                    quantitative=action["quantitative"],
+                    certificate=action["proof_program_id"] or None,
+                    route_id=approach["route_id"],
+                )
+                owner.bind_route(approach["approach_id"], approach["route_id"], reduction["reduction_id"])
+            return {"reduction": reduction, "kernel_verified": False}
         if kind == "research_reorientation":
             return self.research.apply_reorientation(job, action)
         if kind == "report_investigation":
@@ -333,6 +380,16 @@ class StrategyIntegration:
                 name="complete-investigation.json",
             )
             with self.store.atomic() if not self.store._applying else nullcontext():
+                state = self.controller.snapshot()
+                if self.controller._frontier_mode(state) == "adaptive":
+                    from copy import deepcopy
+
+                    attempt = state["attempts"].get(job.get("frontier_response_attempt_id", ""), {})
+                    if attempt.get("consumer_id") == job["job_id"] and job.get("response") in attempt.get("artifacts", []):
+                        job["frontier_report_basis"] = {
+                            "attempt_id": attempt["attempt_id"], "binding": deepcopy(attempt.get("frontier_binding", {})),
+                            "response_artifact": job["response"], "report_artifact": aid,
+                        }
                 if not job.get("alternative_for"):
                     job.update(status="finished", investigation_artifact=aid)
                     self.store.save_job(job)
@@ -542,12 +599,50 @@ class StrategyIntegration:
                 ).encode(),
                 name="bottleneck-requirements.json",
             )
-            with self.controller._edit() as (state, _):
+            with self.controller._edit() as (state, run):
                 artifacts = state["subjects"][subject["subject_id"]].setdefault(
                     "requirements_artifacts", []
                 )
                 if note not in artifacts:
                     artifacts.append(note)
+                if self.controller._frontier_mode(state) == "adaptive" and job.get("frontier_approach_id"):
+                    from .frontier.persist import load_campaign, save_campaign
+                    from .frontier.progress import add_obligation, add_reduction, mark_permits_stale
+                    from .frontier.investigation import bind_question
+
+                    campaign = load_campaign(self.store, state["owner_id"])
+                    approach = campaign["approaches"].get(job["frontier_approach_id"])
+                    if approach is not None:
+                        obligation = next((item for item in campaign["obligations"].values()
+                                           if item["proposition"] == action["statement"]
+                                           and item["context"] == campaign["root"]["context"]), None)
+                        if obligation is None:
+                            obligation = add_obligation(campaign, proposition=action["statement"],
+                                                        context=campaign["root"]["context"],
+                                                        source_revision=campaign["root"]["environment"])
+                        if obligation["obligation_id"] != campaign["root_obligation"]:
+                            reduction = add_reduction(campaign, antecedents=[obligation["obligation_id"]],
+                                                      consequent=campaign["root_obligation"], level="proposed",
+                                                      quantitative=action["quantitative_requirements"], route_id=approach["route_id"])
+                            campaign["routes"][approach["route_id"]]["reductions"].append(reduction["reduction_id"])
+                        if approach["bottleneck_obligation"] != obligation["obligation_id"]:
+                            approach["bottleneck_obligation"] = obligation["obligation_id"]
+                            approach["subject_id"] = subject["subject_id"]
+                            route = campaign["routes"][approach["route_id"]]
+                            route["bottleneck"] = obligation["obligation_id"]
+                            route["revision"] += 1
+                            bind_question(campaign, approach_id=approach["approach_id"],
+                                          uncertainty=action["first_uncertain_inference"], why=action["quantitative_requirements"],
+                                          scope={"statement": action["statement"], "quantitative_target": action["quantitative_requirements"]},
+                                          operations=["derivation", "literature", "experiment", "lean_check"], changed=True)
+                            mark_permits_stale(campaign, approach["approach_id"])
+                        if (job.get("frontier_permit_consumed")
+                                and approach.get("admitted_consumer_id") == job["job_id"]):
+                            from .frontier.hooks import research_scope_basis
+
+                            job["frontier_consumed_basis"] = research_scope_basis(campaign, job)
+                            self.store.save_job(job)
+                        save_campaign(self.store, state["owner_id"], run["target_id"], campaign)
             return {
                 "subject": subject,
                 "requirements_artifact": note,
@@ -625,6 +720,7 @@ class StrategyIntegration:
                 self.retain_feedback(job, feedback)
             lease = job.get("strategy_lease")
             if lease:
+                self.controller.note_operational_yield(lease, outcome)
                 self.controller.finish_interval(lease)
             job.update(status="waiting", strategy_outcome=outcome, last_error=None)
             self.store.save_job(job)
@@ -690,6 +786,11 @@ class StrategyIntegration:
                     and a["method"] == method
                     and a["status"] == "active"
                     and not a.get("settlement_only")
+                    and (
+                        self.controller._frontier_mode(self.controller.snapshot()) != "adaptive"
+                        or a.get("frontier_approach_id") == job.get("frontier_approach_id")
+                        and not a.get("frontier_handoff_id")
+                    )
                     and job["job_id"] not in a["consumers"]
                 ),
                 None,

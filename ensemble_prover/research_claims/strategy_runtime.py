@@ -22,6 +22,9 @@ _CURRENT: contextvars.ContextVar[StrategyRuntime | None] = contextvars.ContextVa
 _SUBJECT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "strategy_subject", default=None
 )
+_PROVIDER_REQUEST: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "strategy_provider_request", default=None
+)
 # Strong references until cancellation-resistant transport cleanup completes.
 # These tasks have no dispatch/mutation capability after the owner fences them.
 _RETIRED: set[asyncio.Task[Any]] = set()
@@ -63,8 +66,11 @@ class StrategyRuntime:
                     # verification even if a simultaneous review revoked search.
                     return task.result()
                 self.check()
-        except BaseException:
+        except BaseException as exc:
             self.active = False
+            note_operational = getattr(self.controller, "note_operational_yield", None)
+            if isinstance(exc, StrategyYield) and callable(note_operational):
+                note_operational(self.lease, exc.to_dict())
             self.controller.finish_interval(self.lease)
             task.cancel()
             done, _ = await asyncio.wait({task}, timeout=0.05)
@@ -97,8 +103,10 @@ class StrategyRuntime:
         # The enclosing proof operation is timed to this absolute deadline,
         # including bounded cleanup. Later nested calls receive no fresh time.
         remaining = self.lease["expires_at"] - self.controller.clock()
+        provider_request_key = _PROVIDER_REQUEST.get()
         receipt = self.controller.admit(
-            self.lease, attempt_id, operation_seconds=max(0.001, remaining - 0.01)
+            self.lease, attempt_id, operation_seconds=max(0.001, remaining - 0.01),
+            **({"provider_request_key": provider_request_key} if provider_request_key is not None else {}),
         )
         self.last_attempt_id = attempt_id
         return receipt
@@ -258,6 +266,23 @@ class StrategyRuntime:
 
 def current_strategy() -> StrategyRuntime | None:
     return _CURRENT.get()
+
+
+@contextmanager
+def provider_request_scope(method: Any, messages: Any, tools: Any = None) -> Iterator[None]:
+    """Nested transport wrappers share one content-bound retry allowance."""
+    runtime = current_strategy()
+    if runtime is None or _PROVIDER_REQUEST.get() is not None or runtime.controller._frontier_mode(runtime.controller.snapshot()) != "adaptive":
+        yield
+        return
+    from .frontier.records import digest
+
+    key = digest({"method": getattr(method, "__name__", "request"), "messages": messages, "tools": tools})
+    token = _PROVIDER_REQUEST.set(key)
+    try:
+        yield
+    finally:
+        _PROVIDER_REQUEST.reset(token)
 
 
 def check_strategy() -> None:

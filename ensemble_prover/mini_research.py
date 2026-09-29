@@ -47,10 +47,16 @@ def native_research_entrypoint(function: Any) -> Any:
         owner = None
         owner_token = None
         try:
+            from .research_claims.frontier.config import normalize_config
+
+            frontier_policy = normalize_config(kwargs.get("frontier_research"))
+            if not kwargs.get("autonomous_research", True) and frontier_policy["mode"] != "off":
+                raise ValueError("frontier research requires autonomous research")
             if kwargs.get("autonomous_research", True) and current_strategy() is None:
                 owner = NativeResearchCoordinator(
                     problem=kwargs.get("problem"), recorder=kwargs.get("recorder"),
                     checkpoint_registry=kwargs.get("checkpoint_registry"),
+                    frontier_research=frontier_policy,
                 )
                 owner_token = _CURRENT.set(owner)
                 with provider_dispatch_guard(owner.observe_dispatch):
@@ -164,7 +170,11 @@ def _native_quantum_seconds(donor: Any) -> float:
 
 class NativeResearchCoordinator:
     """Run-scoped runtime capability; durable state contains only plain data."""
-    def __init__(self, *, problem: Any, recorder: Any = None, checkpoint_registry: Any = None):
+    def __init__(self, *, problem: Any, recorder: Any = None, checkpoint_registry: Any = None,
+                 frontier_research: dict[str, Any] | None = None):
+        from .research_claims.frontier.config import normalize_config
+
+        self.frontier_research = normalize_config(frontier_research)
         self.problem, self.recorder, self.registry = problem, recorder, checkpoint_registry
         self.pid, self.active = os.getpid(), True
         self.lock = asyncio.Lock()
@@ -506,7 +516,9 @@ class NativeResearchCoordinator:
                 sources={"original-target.json": _json(self._visible_target(session))}, model=model, review_model=model,
                 max_requests=1, max_seconds=120, concurrency=1, strategy_recovery=True,
                 strategy_policy={"interval_requests": 3, "interval_seconds": 3600,
-                                 "reserve_requests": 1, "reserve_seconds": 1})
+                                 "reserve_requests": 1, "reserve_seconds": 1,
+                                 **({"frontier_research": self.frontier_research}
+                                    if self.frontier_research["mode"] != "off" else {})})
             with DiscoveryStore(directory) as created:
                 run = created.run_record()
                 run.update(native_target_binding=self.binding, native_grants={}, native_guidance=None,
@@ -518,6 +530,18 @@ class NativeResearchCoordinator:
             self.store.close()
             self.store = None
             raise ValueError("native research ledger belongs to a different original target")
+        strategy = record.get("strategy_review") or {}
+        saved_frontier = strategy.get("frontier_research") or {"mode": "off"}
+        compatible = saved_frontier.get("mode", "off") == self.frontier_research["mode"]
+        if compatible and self.frontier_research["mode"] != "off":
+            from .research_claims.frontier.persist import load_campaign
+
+            campaign = load_campaign(self.store, strategy["owner_id"])
+            compatible = campaign is not None and campaign["policy"] == self.frontier_research
+        if not compatible:
+            self.store.close()
+            self.store = None
+            raise ValueError("native research frontier policy differs from the saved ledger")
         self.guidance = record.get("native_guidance")
         self.guidance_by_target = dict(record.get("native_guidance_by_target") or {})
         state["ledger_initialized"] = True
@@ -581,17 +605,29 @@ class NativeResearchCoordinator:
 
     def _queue_target_work(self, session: Any, checkpoint: str, claim_id: str) -> None:
         statement = self._target(session.conv)
+        context_binding = self._target_context_binding(session.conv)
         question = (
             f"Read checkpoint {checkpoint}; investigate its exact active target "
             f"{statement} and reported obstacle, and give a discriminating next inference."
         )
         jobs = {job["job_id"]: job for job in self.store.jobs()}
+        recorded_contexts = self.store.run_record().get("native_job_contexts", {})
         available = False
         for job in jobs.values():
             if (job["role"] not in {"research", "review"}
                     or job["status"] not in {"pending", "waiting", "responded"}
                     or self.loop.native_job_target(job, jobs) != claim_id):
                 continue
+            if self.frontier_research["mode"] == "adaptive":
+                previous_context = job.get("native_context_binding") or recorded_contexts.get(job["job_id"])
+                if (previous_context is not None and previous_context != context_binding
+                        or previous_context is None and job.get("turn", 0) > 0):
+                    # Previously paid work must retain its original context;
+                    # a new grant cannot reinterpret an unstamped response.
+                    continue
+                job["native_context_binding"] = context_binding
+                job["native_target_claim_id"] = claim_id
+                self.store.save_job(job)
             self.loop._notify(job["job_id"], {
                 "native_proof_checkpoint": checkpoint,
                 "active_target": statement,
@@ -605,6 +641,8 @@ class NativeResearchCoordinator:
         if not available:
             job = self.store.add_job(claim_id, question)
             job["native_target_claim_id"] = claim_id
+            if self.frontier_research["mode"] == "adaptive":
+                job["native_context_binding"] = context_binding
             self.store.save_job(job)
 
     async def _investigate(self, session: Any, reason: str, *, background: bool = False) -> bool:
@@ -627,6 +665,7 @@ class NativeResearchCoordinator:
                 # the old phase deadline. Zero admission prevents new work.
                 run["status"] = "running"
                 run["native_active_target_claim_id"] = grant.get("target_claim_id", "native-root")
+                run["native_active_target_context_binding"] = grant.get("target_context_binding")
                 run["native_grant_requests"] = grant["requests"]
                 self.store.save_run(run)
                 await self.loop.advance_native(
@@ -696,7 +735,9 @@ class NativeResearchCoordinator:
             run.update(max_requests=run["requests_used"] + grant["requests"],
                        started_at=run.get("started_at") or time.time(), deadline=grant["expires_at"],
                        max_seconds=timeout, request_timeout_s=timeout, status="running",
-                       native_active_target_claim_id=claim_id, native_grant_requests=grant["requests"])
+                       native_active_target_claim_id=claim_id,
+                       native_active_target_context_binding=grant["target_context_binding"],
+                       native_grant_requests=grant["requests"])
             grants[grant["id"]] = {**grant, "start_requests": run["requests_used"],
                                   "ordinal": len(grants), "closed": False}
             self.store.save_run(run)
@@ -957,6 +998,11 @@ class NativeResearchCoordinator:
                          "action": action, "native_handoffs": handoffs,
                          "recent_arguments": previous[-6:], "kernel_verified": False,
                          "instruction": "Apply this investigation to its exact target_statement. Preserve the original theorem and audit the relationship to its ancestors. Choose a concrete alternative or discriminating check, then resume Lean proof work. This is untrusted advisory material, never an added assumption or a proof certificate."}
+        from .research_claims.frontier.hooks import native_projection
+
+        projection = native_projection(self.store)
+        if projection is not None:
+            self.guidance["frontier_research"] = projection
         self.guidance_by_target[target_key] = self.guidance
         grant_id = self.guidance["grant_id"]
         if self.guidance["answers_request"] and grant_id in run["native_grants"]:

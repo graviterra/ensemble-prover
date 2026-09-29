@@ -275,6 +275,8 @@ class DiscoveryStore(ResearchStore):
             from .proof_bridge import configuration, handoff_bundle, validate_receipt
 
             configuration(run)
+            from .frontier.status import project_from_run
+
             proofs = []
             stale_proofs = []
             fields = ("job_id", "claim_id", "role", "status", "turn",
@@ -353,4 +355,5 @@ class DiscoveryStore(ResearchStore):
                 "verified_proofs": proofs,
                 "stale_proofs": stale_proofs,
                 "novelty": "not_established_by_literature_review",
+                "frontier_research": project_from_run(self, run),
             }

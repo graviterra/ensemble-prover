@@ -173,6 +173,8 @@ def register(commands: Any) -> None:
     init.add_argument("--strategy-reserve-requests", type=int, default=4)
     init.add_argument("--strategy-reserve-seconds", type=float, default=60)
     init.add_argument("--strategy-max-no-progress", type=int, default=2)
+    init.add_argument("--frontier-research", choices=("off", "observe", "adaptive"), default="off",
+                      help="Opt-in frontier progress and approach scheduling policy")
     init.add_argument(
         "--experiments",
         action="store_true",
@@ -359,7 +361,8 @@ def dispatch(args: argparse.Namespace) -> Any:
                              "interval_seconds": args.strategy_interval_seconds,
                              "reserve_requests": args.strategy_reserve_requests,
                              "reserve_seconds": args.strategy_reserve_seconds,
-                             "max_no_progress": args.strategy_max_no_progress},
+                             "max_no_progress": args.strategy_max_no_progress,
+                             "frontier_research": {"mode": args.frontier_research}},
         )
         if adoption:
             from .adoption import import_artifacts

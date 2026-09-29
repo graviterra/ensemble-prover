@@ -239,6 +239,15 @@ from .utils import (
 RecordEvent = Callable[[dict[str, Any]], Any]
 ProgressCallback = Callable[..., Awaitable[None]]
 _PLANNER_INFLIGHT_HEARTBEAT_INTERVAL_S = 60.0
+
+# These receipts own planner/filter work, not an executable claim cursor.
+# Their claims may be removed or reordered before a selected queue is durable.
+_RECURSIVE_PRESELECTION_CHECKPOINT_PHASES = frozenset({
+    "plan_compiled",
+    "replan_compiled",
+    "contract_repair_progress",
+    "planner_job_pending",
+})
 TraceFn = Callable[[str], None]
 GetHelpersFn = Callable[[], Sequence[Any]]
 GetPreambleFn = Callable[[], str]
@@ -2216,6 +2225,55 @@ def _verified_helper_names(helpers: Sequence[Any]) -> set[str]:
         if name:
             names.add(name)
     return names
+
+
+def _recursive_replay_source_bindings(
+    helpers: Sequence[str], dossier: Any,
+) -> set[tuple[str, str]]:
+    """Bind replay declarations to unchanged stored proofs and exact aliases.
+
+    The dossier can render duplicate proofs as theorem aliases. Those aliases
+    keep the same checked declaration available while changing its source
+    hash, so a raw rendered hash must not erase its dependency receipt.
+    Arbitrary same-name or same-type replacements acquire no such authority.
+    """
+
+    sources = tuple(helpers)
+    bindings = {(helper_decl_name(block), text_hash(block)) for block in sources}
+    verified = getattr(dossier, "verified_helpers", {})
+    validate = getattr(dossier, "validate_helper_context", None)
+    if not isinstance(verified, Mapping) or not callable(validate):
+        return bindings
+    candidates = [
+        (name, helper)
+        for name, rendered_hash in bindings
+        if (helper := verified.get(name)) is not None
+        and str(getattr(helper, "source_hash", "") or "") != rendered_hash
+    ]
+    if not candidates:
+        return bindings
+    # Alias validation follows the complete replay support closure. Check the
+    # actual stored bytes of every supplied declaration as well: a stale
+    # recorded hash on the canonical proof must not authorize its aliases.
+    if any(
+        (helper := verified.get(name)) is not None
+        and text_hash(str(getattr(helper, "source", "") or ""))
+        != str(getattr(helper, "source_hash", "") or "")
+        for name, _rendered_hash in bindings
+    ):
+        return bindings
+    try:
+        # This recognizes only the dossier's exact current rendering, checks
+        # immutable proof/support hashes, and requires the alias dependencies
+        # to remain in this particular replay context.
+        validate(sources, refresh_quality=False)
+    except ValueError:
+        return bindings
+    for name, helper in candidates:
+        source_hash = str(getattr(helper, "source_hash", "") or "")
+        if source_hash and text_hash(str(getattr(helper, "source", "") or "")) == source_hash:
+            bindings.add((name, source_hash))
+    return bindings
 
 
 def _claim_matches_dependency_route(
@@ -22422,12 +22480,7 @@ async def run_mini_recursive_driver(
                     plan.claims[max(0, int(next_claim_index or 0))]
                 )
                 if plan is not None
-                and str(phase or "")
-                not in {
-                    "plan_compiled",
-                    "replan_compiled",
-                    "contract_repair_progress",
-                }
+                and str(phase or "") not in _RECURSIVE_PRESELECTION_CHECKPOINT_PHASES
                 and max(0, int(next_claim_index or 0)) < len(plan.claims)
                 else ""
             ),
@@ -22705,9 +22758,7 @@ async def run_mini_recursive_driver(
         proved_claim_obligation_ids.clear()
         proved_claim_obligation_origins.clear()
         proved_claim_statement_keys.clear()
-        replay_sources = {
-            (helper_decl_name(block), text_hash(block)) for block in get_helpers()
-        }
+        replay_sources = _recursive_replay_source_bindings(get_helpers(), dossier)
         candidate_bindings_by_name: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         for raw_binding_key, raw_binding in list(durable_claim_helper_bindings.items()):
             if not isinstance(raw_binding, dict):
@@ -22907,11 +22958,9 @@ async def run_mini_recursive_driver(
         the new scope. Keep old records for rollback and older continuations.
         """
 
-        retained_sources = {
-            (helper_decl_name(block), text_hash(block)) for block in previous_helpers
-        } & {
-            (helper_decl_name(block), text_hash(block)) for block in promoted_helpers
-        }
+        retained_sources = _recursive_replay_source_bindings(
+            previous_helpers, dossier,
+        ) & _recursive_replay_source_bindings(promoted_helpers, dossier)
         retained_binding_keys: set[str] = set()
         for binding_key in tuple(active_claim_binding_keys):
             binding = durable_claim_helper_bindings.get(binding_key)
@@ -26135,19 +26184,13 @@ async def run_mini_recursive_driver(
                 pass_helper_fingerprints_before=(verified_helper_fingerprints_before),
                 pass_helpers_accepted_before=pass_helpers_before,
             )
-        # Every persisted plan is checkpointed only after filtering and
-        # priority selection.  Re-running that pipeline on resume duplicates
-        # counters/events and can choose a different route under newly banked
-        # helpers, so treat the restored claims as the authoritative queue.
+        # Execution checkpoints own an already selected queue. Re-running
+        # selection on those receipts can change the claim owning paid work.
+        # Planner/filter receipts still need admission and priority selection.
         restored_selected_plan = bool(
             resuming_this_pass
             and str(resume_frame.get("phase") or "")
-            not in {
-                "plan_compiled",
-                "replan_compiled",
-                "contract_repair_progress",
-                "planner_job_pending",
-            }
+            not in _RECURSIVE_PRESELECTION_CHECKPOINT_PHASES
         )
         replaying_contract_replan_filters = bool(
             resume_contract_replan_pending
@@ -30205,7 +30248,7 @@ async def run_mini_recursive_driver(
             continue
 
         active_plan = dataclass_replace(plan, claims=tuple(claims))
-        if not resuming_this_pass:
+        if not restored_selected_plan:
             await publish_driver_state(
                 f"recursive_plan_ready:{pass_index}",
                 phase="plan_ready",
@@ -30216,6 +30259,12 @@ async def run_mini_recursive_driver(
                 pass_helper_fingerprints_before=verified_helper_fingerprints_before,
                 pass_helpers_accepted_before=pass_helpers_before,
             )
+            # A resumed planner/filter receipt has now become a selected
+            # queue. Older pending-planner frames may contain a raw-plan
+            # cursor; it owns neither this queue nor a child/variant receipt.
+            # Retire it only after the new plan-ready checkpoint is durable.
+            resume_frame = {}
+            resuming_this_pass = False
 
         active_claim_keys = {
             _dependency_contract_suspension_key(claim) for claim in claims

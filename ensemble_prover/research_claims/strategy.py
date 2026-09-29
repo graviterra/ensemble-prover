@@ -31,12 +31,16 @@ class StrategyYield(BaseException):
         self.allocation_id = allocation_id
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "status": "yielded_for_review",
             "reason": self.reason,
             "subject_id": self.subject_id,
             "allocation_id": self.allocation_id,
         }
+        lineage = getattr(self, "frontier_request_lineage", None)
+        if lineage is not None:
+            result["frontier_request_lineage"] = lineage
+        return result
 
 
 def _digest(value: Any) -> str:
@@ -86,6 +90,7 @@ class StrategyController:
         max_no_progress: int = 2,
         original_lean: dict[str, Any] | None = None,
         clock: Callable[[], float] = time.time,
+        frontier_research: dict[str, Any] | None = None,
     ) -> StrategyController:
         for name, value in (
             ("interval_requests", interval_requests),
@@ -156,10 +161,32 @@ class StrategyController:
                 "",
                 formal_identity,
             )
+            from .frontier.config import normalize_config
+
+            frontier = normalize_config(
+                frontier_research,
+                permit_lease_seconds=reserve_seconds,
+                max_no_progress=max_no_progress,
+            )
+            if frontier["mode"] != "off":
+                state["frontier_research"] = {
+                    "mode": frontier["mode"],
+                    "progress_policy_version": frontier["progress_policy_version"],
+                    "tool_policy_version": frontier["tool_policy_version"],
+                }
             run["strategy_review"] = state
             run["original_target_anchor"] = original_anchor
+            if frontier["mode"] != "off":
+                from .frontier.persist import install_campaign
+
+                install_campaign(store, state, run, frontier)
             store.save_run(run)
         return cls(store, clock=clock)
+
+    def _frontier_mode(self, state: dict[str, Any]) -> str:
+        from .frontier.hooks import mode_of
+
+        return mode_of(state)
 
     @staticmethod
     def _new_subject(
@@ -371,7 +398,14 @@ class StrategyController:
             consumer = self.store.job(consumer_id)
             if not settlement_only and self._blocked(state, [subject_id], method):
                 raise StrategyYield("suspended", subject_id=subject_id)
-            if (
+            prepared = None
+            if self._frontier_mode(state) == "adaptive" and not settlement_only:
+                from .frontier.hooks import authorize_prepare
+
+                prepared = authorize_prepare(
+                    self, state, run, subject_id, consumer_id, method
+                )
+            elif (
                 not settlement_only
                 and subject["no_progress_intervals"]
                 - subject["alternative_after_interval"]
@@ -379,14 +413,23 @@ class StrategyController:
             ):
                 raise StrategyYield("alternative_required", subject_id=subject_id)
             for previous in state["allocations"].values():
+                if (prepared is not None and previous["status"] == "prepared"
+                        and consumer_id in previous["consumers"]
+                        and previous.get("frontier_permit_id")
+                        and previous.get("frontier_permit_id") != prepared.get("permit_id")):
+                    from .frontier.hooks import release_prepared
+
+                    # An explicitly replaced permit fences the old preparation.
+                    # Its old claim may be released; the fresh claim stays held.
+                    release_prepared(self, state, run, previous)
                 if (
                     consumer_id in previous["consumers"]
-                    and previous["status"] == "active"
+                    and previous["status"] in {"active", "prepared"}
                     and not previous.get("consumer_bindings", {})
                     .get(consumer_id, {})
                     .get("released")
                 ):
-                    raise ValueError("consumer already has an active allocation")
+                    raise ValueError("consumer already has an active or prepared allocation")
             policy = state["policy"]
             available = (
                 run["max_requests"]
@@ -424,14 +467,14 @@ class StrategyController:
                 "owner_id": state["owner_id"],
                 "process_id": os.getpid(),
                 "request_limit": 0
-                if settlement_only
+                if settlement_only or prepared is not None
                 else min(policy["interval_requests"], available),
                 "requests_used": 0,
                 "settlement_only": settlement_only,
                 "producer_interval": subject["interval_sequence"] + 1,
                 "expires_at": self.clock() + seconds,
                 "started_at": self.clock(),
-                "status": "active",
+                "status": "prepared" if prepared is not None else "active",
                 "interval_recorded": False,
                 "consumer_bindings": {
                     consumer_id: {
@@ -443,6 +486,15 @@ class StrategyController:
                     }
                 },
             }
+            if prepared is not None:
+                allocation.update(
+                    frontier_approach_id=prepared["approach_id"],
+                    frontier_permit_id=prepared["permit_id"],
+                    frontier_claim_id=prepared["claim_id"],
+                    frontier_handoff_id=prepared.get("handoff_id"),
+                    frontier_handoff_producer=prepared.get("producer_id"),
+                )
+                allocation["frontier_basis"] = self._frontier_allocation_basis(state, allocation)
             state["allocations"][allocation_id] = allocation
             self._event(
                 state,
@@ -464,6 +516,9 @@ class StrategyController:
         subject_id = lease.get("subject_id", "")
         if current is None or lease.get("owner_id") != state["owner_id"]:
             raise StrategyYield("missing_owner_binding", subject_id=subject_id)
+        if current.get("frontier_approach_id") and not current.get("settlement_only"):
+            if current.get("frontier_basis") != self._frontier_allocation_basis(state, current):
+                raise StrategyYield("stale_frontier_scope", subject_id=subject_id, allocation_id=current["allocation_id"])
         consumer_binding = current.get("consumer_bindings", {}).get(
             lease.get("consumer_id"), {}
         )
@@ -479,7 +534,7 @@ class StrategyController:
         if (
             any(lease.get(key) != current[key] for key in ("generation", "process_id"))
             or current["process_id"] != os.getpid()
-            or current["status"] != "active"
+            or current["status"] != "active" and not (current["status"] == "prepared" and not dispatch)
         ):
             raise StrategyYield(
                 "stale_lease",
@@ -600,7 +655,8 @@ class StrategyController:
                 subjects.append(subject_id)
 
     def admit(
-        self, lease: dict[str, Any], attempt_id: str, *, operation_seconds: float
+        self, lease: dict[str, Any], attempt_id: str, *, operation_seconds: float,
+        provider_request_key: str | None = None,
     ) -> dict[str, Any]:
         text(attempt_id, "single-use attempt ID")
         _seconds(operation_seconds, "operation_seconds")
@@ -609,7 +665,35 @@ class StrategyController:
                 raise StrategyYield(
                     "attempt_reused", allocation_id=lease.get("allocation_id", "")
                 )
+            current = state["allocations"].get(lease.get("allocation_id"))
+            if (
+                current is not None
+                and current.get("status") == "prepared"
+                and self._frontier_mode(state) == "adaptive"
+            ):
+                from .frontier.hooks import activate_prepared
+
+                activate_prepared(self, state, run, current)
             allocation = self._check(state, run, lease, dispatch=True)
+            if allocation.get("frontier_handoff_id"):
+                from .frontier.hooks import check_handoff_admission
+
+                check_handoff_admission(self, state, run, allocation)
+            if provider_request_key and self._frontier_mode(state) == "adaptive":
+                from .frontier.persist import load_campaign, save_campaign
+                from .frontier.records import FrontierRefusal
+                from .frontier.retry import authorize_execution
+
+                campaign = load_campaign(self.store, state["owner_id"])
+                lineage = "proof-request:" + _digest({"basis": allocation["frontier_basis"], "request": provider_request_key})
+                try:
+                    authorize_execution(campaign, lineage, lane_id="provider", now=self.clock(),
+                                        deadline=min(allocation["expires_at"], run["deadline"]))
+                except FrontierRefusal as exc:
+                    refusal = StrategyYield(exc.reason, allocation_id=allocation["allocation_id"])
+                    refusal.frontier_request_lineage = lineage
+                    raise refusal from exc
+                save_campaign(self.store, state["owner_id"], run["target_id"], campaign)
             if (
                 run["requests_used"]
                 >= run["max_requests"] - state["policy"]["reserve_requests"]
@@ -650,7 +734,7 @@ class StrategyController:
             )
             return deepcopy(receipt)
 
-    def admit_control(self, attempt_id: str, job_id: str, turn: int) -> dict[str, Any]:
+    def admit_control(self, attempt_id: str, job_id: str, turn: int, *, retry: bool = False) -> dict[str, Any]:
         """Research and review spend reserved capacity through the same ledger."""
         with self._edit() as (state, run):
             job = self.store.job(job_id)
@@ -667,6 +751,13 @@ class StrategyController:
                 >= run["max_requests"]
             ):
                 raise StrategyYield("global_limit")
+            if self._frontier_mode(state) == "adaptive":
+                from .frontier.hooks import authorize_control_admission
+
+                job.pop("frontier_lane_probe", None)
+                if retry:
+                    job["frontier_retry_pending"] = True
+                authorize_control_admission(self, state, run, job)
             from .research_control import admit_research
 
             admit_research(self.store, job, state, run, self.clock(), self._reservations(state))
@@ -676,11 +767,20 @@ class StrategyController:
                 "allocation_id": None,
                 "admitted_at": self.clock(),
                 "consumer_id": job_id,
+                "consumer_turn": turn,
                 "status": "exposure_claimed",
                 "process_id": os.getpid(),
                 "artifacts": [],
                 "ingress_deadline": run["deadline"],
             }
+            if job.get("frontier_approach_allocation_id"):
+                receipt["approach_allocation_id"] = job["frontier_approach_allocation_id"]
+            if self._frontier_mode(state) == "adaptive":
+                from .frontier.tool_runtime import dispatch_binding
+
+                receipt["frontier_binding"] = dispatch_binding(self.store, state, job)
+                receipt["frontier_lane_probe"] = bool(job.get("frontier_lane_probe"))
+                receipt["frontier_operation_lineage"] = job.get("frontier_operation_lineage")
             state["attempts"][attempt_id] = receipt
             self._event(
                 state,
@@ -723,6 +823,30 @@ class StrategyController:
                 attempt["artifacts"].append(digest)
             return digest
 
+    def note_operational_yield(self, lease: dict[str, Any], outcome: dict[str, Any]) -> None:
+        """Persist operational refusal before any enclosing scope settles work."""
+        reasons = {"retry_exhausted", "retry_deadline", "paused_operational", "provider_timeout",
+                   "provider_failure", "context_overflow", "proof_context_overflow"}
+        if outcome.get("reason") not in reasons:
+            return
+        with self._edit() as (state, run):
+            if self._frontier_mode(state) != "adaptive":
+                return
+            allocation = state["allocations"][lease["allocation_id"]]
+            allocation["frontier_operational"] = True
+            allocation["frontier_explanation"] = outcome["reason"]
+            lineage = outcome.get("frontier_request_lineage")
+            if lineage:
+                from .frontier.persist import load_campaign, save_campaign
+
+                campaign = load_campaign(self.store, state["owner_id"])
+                budget = campaign["retries"].get(lineage)
+                if budget is not None:
+                    budget["paused"] = True
+                    campaign["approaches"][allocation["frontier_approach_id"]]["operation_lineage"] = lineage
+                    allocation["frontier_operation_lineage"] = lineage
+                    save_campaign(self.store, state["owner_id"], run["target_id"], campaign)
+
     def finish_interval(
         self,
         lease: dict[str, Any],
@@ -747,6 +871,11 @@ class StrategyController:
                     )
                 self._check_consumer(allocation, lease.get("consumer_id"))
                 allocation["pending_progress_receipt"] = progress_receipt
+            if allocation.get("status") == "prepared":
+                from .frontier.hooks import release_prepared
+
+                release_prepared(self, state, self.store.run_record(scheduling=True), allocation)
+                return
             if allocation["interval_recorded"]:
                 return
             bindings = allocation.get("consumer_bindings", {})
@@ -769,6 +898,11 @@ class StrategyController:
         self, state: dict[str, Any], allocation: dict[str, Any]
     ) -> None:
         """Settle one research interval identically on release and owner restart."""
+        if self._frontier_mode(state) == "adaptive":
+            from .frontier.hooks import settle_adaptive_interval
+
+            settle_adaptive_interval(self, state, allocation)
+            return
         progress = False
         progress_receipt = None
         pending = allocation.get("pending_progress_receipt")
@@ -806,6 +940,10 @@ class StrategyController:
             allocation_id=allocation["allocation_id"],
             progress=progress,
         )
+        if self._frontier_mode(state) == "observe":
+            from .frontier.hooks import note_observed_interval
+
+            note_observed_interval(self, state, allocation, progress=progress)
 
     @staticmethod
     def _review_key(scope: str, method: str) -> str:
@@ -940,6 +1078,11 @@ class StrategyController:
                     continue
                 allocation.update(status="suspended", generation=generation)
                 if not allocation["interval_recorded"]:
+                    if self._frontier_mode(state) == "adaptive":
+                        allocation["frontier_revoked"] = True
+                        self._record_interval(state, allocation)
+                        allocation["status"] = "suspended"
+                        continue
                     allocation["interval_recorded"] = True
                     state["subjects"][allocation["subject_id"]][
                         "no_progress_intervals"
@@ -975,6 +1118,10 @@ class StrategyController:
             )
             self._revoke(state, review["subject_id"], review["scope"], review["method"])
             self._refresh_dispositions(state)
+            if self._frontier_mode(state) == "adaptive":
+                from .frontier.hooks import sync_strategy_holds
+
+                sync_strategy_holds(self, state, self.store.run_record(scheduling=True))
 
     def expire_holds(self) -> None:
         with self._edit() as (state, _):
@@ -989,6 +1136,11 @@ class StrategyController:
                     )
                     self._event(state, "preliminary_hold_expired", review_id=review_id)
             self._refresh_dispositions(state)
+
+            if self._frontier_mode(state) == "adaptive":
+                from .frontier.hooks import sync_strategy_holds
+
+                sync_strategy_holds(self, state, self.store.run_record(scheduling=True))
 
     @staticmethod
     def _decision_identity(review: dict[str, Any]) -> dict[str, Any]:
@@ -1034,6 +1186,14 @@ class StrategyController:
                     state, review["subject_id"], review["scope"], review["method"]
                 )
             self._refresh_dispositions(state)
+            if self._frontier_mode(state) == "adaptive":
+                from .frontier.hooks import sync_strategy_holds
+
+                sync_strategy_holds(self, state, self.store.run_record(scheduling=True))
+            if self._frontier_mode(state) == "adaptive" and verdict == "dismiss":
+                from .frontier.hooks import restore_subject
+
+                restore_subject(self, state, review["subject_id"])
             self._event(
                 state,
                 "strategy_review_decided",
@@ -1064,6 +1224,37 @@ class StrategyController:
             for aid in review["artifact_ids"]
         }
 
+    def _frontier_allocation_basis(self, state: dict[str, Any], allocation: dict[str, Any]) -> dict[str, Any]:
+        from .frontier.persist import load_campaign
+
+        campaign = load_campaign(self.store, state["owner_id"])
+        approach_id = allocation["frontier_approach_id"]
+        approach = campaign["approaches"][approach_id]
+        return {
+            "root_binding": campaign["root"]["binding"],
+            "approach_id": approach_id,
+            "subject_identity": state["subjects"][allocation["subject_id"]]["formal_identity"],
+            "question_id": approach["question_id"],
+            "question_revision": campaign["questions"][approach["question_id"]]["revision"],
+            "route_id": approach["route_id"],
+            "route_revision": campaign["routes"][approach["route_id"]]["revision"],
+        }
+
+    def _progress_basis(self, state: dict[str, Any], allocation: dict[str, Any], *, current: bool = False) -> dict[str, Any]:
+        """A sibling method cannot obsolete this approach's independent assessment."""
+        subject = state["subjects"][allocation["subject_id"]]
+        approach_id = allocation.get("frontier_approach_id")
+        if self._frontier_mode(state) != "adaptive" or not approach_id:
+            return {"generation": subject["generation"], "interval_sequence": subject["interval_sequence"]}
+        if not current and not allocation.get("frontier_basis"):
+            raise ValueError("allocation lacks an immutable frontier scope")
+        basis = self._frontier_allocation_basis(state, allocation) if current else deepcopy(allocation["frontier_basis"])
+        settled = [item for item in state["allocations"].values()
+                   if item.get("frontier_approach_id") == approach_id and item["interval_recorded"]
+                   and isinstance(item.get("finished_interval"), int)]
+        basis["settled_allocations"] = [item["allocation_id"] for item in sorted(settled, key=lambda item: item["finished_interval"])]
+        return basis
+
     def request_progress(
         self, allocation_id: str, *, artifact_ids: list[str], argument: str, author: str
     ) -> dict[str, Any]:
@@ -1082,10 +1273,17 @@ class StrategyController:
                         "progress must reference artifacts from this admitted attempt"
                     )
                 subject = state["subjects"][allocation["subject_id"]]
+                basis = self._progress_basis(state, allocation)
+                if basis != self._progress_basis(state, allocation, current=True):
+                    raise ValueError("progress belongs to a stale frontier scope")
+                superseded = (
+                    allocation.get("finished_interval") != subject["interval_sequence"]
+                    if "approach_id" not in basis
+                    else bool(basis["settled_allocations"] and basis["settled_allocations"][-1] != allocation_id)
+                )
                 if allocation.get("progress_credited") or (
                     allocation["interval_recorded"]
-                    and allocation.get("finished_interval")
-                    != subject["interval_sequence"]
+                    and superseded
                 ):
                     raise ValueError(
                         "progress belongs to a previously credited or superseded interval"
@@ -1095,10 +1293,6 @@ class StrategyController:
                 )
                 if set(artifact_ids) & credited:
                     raise ValueError("progress evidence already credited")
-                basis = {
-                    "generation": subject["generation"],
-                    "interval_sequence": subject["interval_sequence"],
-                }
             review = self.request_review(
                 allocation["subject_id"],
                 scope="allocation_exhausted",
@@ -1133,10 +1327,7 @@ class StrategyController:
                 return deepcopy(review)
             subject = state["subjects"][review["subject_id"]]
             allocation = state["allocations"][review["allocation_id"]]
-            current = {
-                "generation": subject["generation"],
-                "interval_sequence": subject["interval_sequence"],
-            }
+            current = self._progress_basis(state, allocation, current=True)
             review.update(
                 rationale=rationale, verdict="relevant" if relevant else "unresolved"
             )
@@ -1151,7 +1342,15 @@ class StrategyController:
             elif relevant:
                 review["status"] = "progress"
                 allocation["progress_credited"] = True
-                if not allocation["interval_recorded"]:
+                if self._frontier_mode(state) == "adaptive":
+                    from .frontier.hooks import note_progress
+
+                    note_progress(self, state, review, formal=bool(review.get("frontier_formal")))
+                    if not allocation["interval_recorded"]:
+                        allocation["pending_progress_receipt"] = review_id
+                    else:
+                        review["progress_consumed"] = True
+                elif not allocation["interval_recorded"]:
                     allocation["pending_progress_receipt"] = review_id
                 else:
                     review["progress_consumed"] = True
@@ -1287,6 +1486,13 @@ class StrategyController:
                 raise ValueError(
                     "alternative investigation belongs to a stale requirement"
                 )
+            if self._frontier_mode(state) == "adaptive":
+                from .frontier.owner import report_scope_current
+                from .frontier.persist import load_campaign
+
+                campaign = load_campaign(self.store, state["owner_id"])
+                if campaign is None or not report_scope_current(self, campaign, job):
+                    raise ValueError("alternative investigation belongs to a stale frontier scope")
             receipt = {
                 "job_id": job_id,
                 "artifact_id": artifact_id,
@@ -1294,12 +1500,25 @@ class StrategyController:
             }
             if receipt not in subject["alternative_receipts"]:
                 subject["alternative_receipts"].append(receipt)
-            subject["alternative_after_interval"] = subject["no_progress_intervals"]
+            if self._frontier_mode(state) == "adaptive":
+                from .frontier.hooks import grant_alternative
+
+                grant_alternative(self, state, subject_id, job, artifact_id)
+            else:
+                subject["alternative_after_interval"] = subject["no_progress_intervals"]
 
     def recover(self) -> None:
         """A new owner process cannot revive an old dispatch permission."""
         with self._edit() as (state, _):
+            for attempt in state["attempts"].values():
+                if attempt["status"] == "exposure_claimed":
+                    attempt["status"] = "unknown"
             for allocation in state["allocations"].values():
+                if allocation.get("status") == "prepared":
+                    from .frontier.hooks import release_prepared
+
+                    release_prepared(self, state, self.store.run_record(scheduling=True), allocation)
+                    continue
                 if allocation["status"] == "active":
                     if not allocation["interval_recorded"]:
                         self._record_interval(state, allocation)
@@ -1307,8 +1526,9 @@ class StrategyController:
                         allocation.update(
                             status="yielded", generation=self._generation(state)
                         )
-            for attempt in state["attempts"].values():
-                if attempt["status"] == "exposure_claimed":
-                    attempt["status"] = "unknown"
+            if self._frontier_mode(state) == "adaptive":
+                from .frontier.hooks import settle_recovered_research
+
+                settle_recovered_research(self, state)
             self._event(state, "owner_recovered")
         self.expire_holds()

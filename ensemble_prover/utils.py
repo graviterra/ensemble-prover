@@ -5602,11 +5602,78 @@ _UNSUPPORTED_SCOPED_TERM_KEYWORDS = (
     *(keyword for keyword in _LET_KEYWORDS if keyword != "let"),
     "match", "by", "do",
 )
+_SCOPED_BIG_OPERATORS = ("∑'", "∏'", "∑", "∏", "⨆", "⨅", "⋃", "⋂")
+_COMMA_BINDER_OPERATORS = ("∀ᶠ", "∃ᶠ", *_SCOPED_BIG_OPERATORS, "∫", "⨍", "∐", "∀", "∃")
 _SCOPED_TERM_KEYWORDS = tuple(sorted(
     (*_UNSUPPORTED_SCOPED_TERM_KEYWORDS, "fun", "λ", "let", "if"),
     key=len,
     reverse=True,
 ))
+
+
+def _big_operator_pattern_names(pattern: str) -> Optional[set[str]]:
+    """Recognize simple indices and tuple patterns without binding constructors."""
+    pattern = pattern.strip()
+    if _BINDER_IDENT_RE.fullmatch(pattern):
+        return _binder_identifier_tokens(pattern)
+    if not any(pattern.startswith(a) and pattern.endswith(b)
+               for a, b in (("⟨", "⟩"), ("(", ")"))):
+        return None
+    inner = pattern[1:-1]
+    commas = _top_level_token_positions(inner, (",",), constructor_groups=True)
+    if not commas:
+        return None
+    ends = [index for index, _ in commas] + [len(inner)]
+    names: set[str] = set()
+    start = 0
+    for end in ends:
+        component = _big_operator_pattern_names(inner[start:end])
+        if component is None:
+            return None
+        names.update(component)
+        start = end + 1
+    return names
+
+
+def _finite_big_operator_binders(
+    head: str,
+) -> Optional[tuple[set[str], tuple[str, ...], str, str]]:
+    """Separate finite domains from the indices/filter they do not bind.
+
+    Mathlib expands a parenthesized binder collection to a product of finite
+    domains, all evaluated in the outer context. The optional filter sees all
+    indices, and a named filter proof is available only in the body.
+    """
+    predicate = proof_name = ""
+    filters = _top_level_token_positions(head, ("with",), constructor_groups=True)
+    filter_start = next((i for i, op in filters if _matches_word(head, i, op)), None)
+    if filter_start is not None:
+        head, predicate = head[:filter_start].strip(), head[filter_start + 4:].strip()
+        colon = _first_top_level_colon(predicate)
+        if colon != -1 and _BINDER_IDENT_RE.fullmatch(predicate[:colon].strip()):
+            proof_name = canonical_lean_identifier(predicate[:colon].strip())
+            predicate = predicate[colon + 1:].strip()
+    names: set[str] = set()
+    domains: list[str] = []
+    for segment in _split_binder_segments([head]):
+        _opener, content, _closer = _binder_segment_parts(segment)
+        delimiters = _top_level_token_positions(
+            content, (":", *(op for op, _ in _RELATION_FORALL_BINDER_OPS)),
+            constructor_groups=True,
+        )
+        if delimiters:
+            index, delimiter = delimiters[0]
+            pattern, domain = content[:index].strip(), content[index + len(delimiter):].strip()
+            if not domain:
+                return None
+            domains.append(domain)
+        else:
+            pattern = content
+        declared = _big_operator_pattern_names(pattern)
+        if declared is None:
+            return None
+        names.update(declared)
+    return names, tuple(domains), predicate, proof_name
 
 
 def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
@@ -5645,8 +5712,14 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
             # Quantifier-header commas instead introduce that binder's body.
             quantifier_headers = 0
             sibling_comma = None
-            for index, token in _top_level_token_positions(rest, ("∀", "∃", ","), constructor_groups=True):
+            for index, token in _top_level_token_positions(
+                rest, (*_COMMA_BINDER_OPERATORS, ","), constructor_groups=True,
+            ):
                 if token != ",":
+                    # Indexed unions/sups use a comma; unary operators such
+                    # as sUnion (⋃₀) do not introduce a binding scope.
+                    if rest[index + len(token) : index + len(token) + 1] == "₀":
+                        continue
                     quantifier_headers += 1
                 elif quantifier_headers:
                     quantifier_headers -= 1
@@ -5683,9 +5756,18 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                 free.update(_binder_identifier_tokens(rest) - bound)
                 break
             lambda_head = re.match(r"(?:fun|λ)(?=\s|[({⦃])", rest)
-            is_quantifier = rest.startswith(("∀", "∃")) and not rest.startswith("∀ᶠ")
-            if is_quantifier or lambda_head:
-                tail = rest[lambda_head.end() if lambda_head else 1 :].lstrip()
+            is_quantifier = rest.startswith(("∀", "∃")) and not rest.startswith(("∀ᶠ", "∃ᶠ"))
+            big_operator = next(
+                (op for op in _SCOPED_BIG_OPERATORS
+                 if rest.startswith(op) and rest[len(op) : len(op) + 1] != "₀"),
+                "",
+            )
+            if is_quantifier or lambda_head or big_operator:
+                tail = rest[
+                    lambda_head.end() if lambda_head else len(big_operator) or 1 :
+                ].lstrip()
+                if big_operator:
+                    in_telescope = False
                 if lambda_head:
                     delimiters = _top_level_token_positions(tail, ("=>", "↦"), constructor_groups=True)
                     if delimiters:
@@ -5702,6 +5784,24 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                     free.update(_binder_identifier_tokens(rest) - bound)
                     break
                 head, body = (part.strip() for part in split)
+                if big_operator:
+                    # Big-operator notation has a tighter body precedence
+                    # than comparisons (and sums/products also than addition).
+                    # A same-named index on that outer RHS remains free.
+                    outside_tokens = (
+                        "<->", "↔", "→", "->", "∨", "∧", "≠", "!=",
+                        "≤", "≥", "<=", ">=", "=", "<", ">", "∈", "∉",
+                    )
+                    if big_operator.startswith(("∑", "∏")):
+                        outside_tokens += ("+", "-")
+                    outside = _top_level_token_positions(
+                        body, outside_tokens, constructor_groups=True,
+                    )
+                    if outside:
+                        end = next((idx for idx, _ in outside if idx > 0), None)
+                        if end is not None:
+                            pending.append((body[end:], set(bound), False))
+                            body = body[:end].strip()
                 if lambda_head and (
                     _top_level_token_positions(head, ("|",), constructor_groups=True)
                     or any(
@@ -5716,9 +5816,25 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                 ):
                     free.update(_binder_identifier_tokens(rest) - bound)
                     break
+                if big_operator in {"∑", "∏"}:
+                    finite = _finite_big_operator_binders(head)
+                    if finite is None:
+                        # Extended/custom index syntax must retain possible
+                        # outer dependencies until a full parser handles it.
+                        free.update(_binder_identifier_tokens(head + " " + body) - bound)
+                        break
+                    declared, domains, predicate, proof_name = finite
+                    pending.extend((domain, set(bound), False) for domain in domains)
+                    bound.update(declared)
+                    if predicate:
+                        pending.append((predicate, set(bound), False))
+                    if proof_name and proof_name != "_":
+                        bound.add(proof_name)
+                    rest = body
+                    continue
                 relation = (
                     _split_relation_forall_binder_segment(head)
-                    if is_quantifier
+                    if is_quantifier or big_operator
                     else None
                 )
                 if relation is not None:
@@ -5732,6 +5848,14 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                         names.update(declared)
                 else:
                     for segment in _split_binder_segments([head]):
+                        if big_operator:
+                            _opener, content, _closer = _binder_segment_parts(segment)
+                            scoped_relation = _split_relation_forall_binder_segment(content)
+                            if scoped_relation is not None:
+                                name, _op, _label, annotation = scoped_relation
+                                bound.add(canonical_lean_identifier(name))
+                                pending.append((annotation, set(bound), False))
+                                continue
                         declared = _declared_names_from_binder_segments([segment])
                         annotation = _binder_segment_annotation(segment)
                         if not declared and not annotation:
@@ -5772,7 +5896,7 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                         continue
             operators = _top_level_token_positions(
                 rest,
-                ("<->", "↔", "→", "->", "∨", "∧", "∀", "∃", *_SCOPED_TERM_KEYWORDS),
+                ("<->", "↔", "→", "->", "∨", "∧", "∀", "∃", *_SCOPED_BIG_OPERATORS, *_SCOPED_TERM_KEYWORDS),
                 constructor_groups=True,
             )
             # A binder also scopes a term on an operator's RHS, e.g.
@@ -5782,7 +5906,7 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                 (
                     idx
                     for idx, op in operators
-                    if op in {"∀", "∃"}
+                    if op in {"∀", "∃", *_SCOPED_BIG_OPERATORS}
                     or (
                         op in _SCOPED_TERM_KEYWORDS
                         and _matches_word(rest, idx, op)

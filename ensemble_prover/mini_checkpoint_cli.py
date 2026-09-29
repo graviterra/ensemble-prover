@@ -63,6 +63,8 @@ def public_cli_config(args: argparse.Namespace) -> dict[str, Any]:
         # An older checkpoint predates this policy. Preserve its exact public
         # identity and disabled behavior; source approval cannot widen spend.
         config.pop("autonomous_research", None)
+    if getattr(args, "_legacy_frontier_research_policy", False):
+        config.pop("frontier_research", None)
     if getattr(args, "_legacy_output_limit_policy", False):
         config.pop("require_output_token_limit", None)
     return clone_json_value(config, label="checkpoint CLI configuration")
@@ -95,6 +97,11 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError("Resume configuration override is incompatible: autonomous_research")
         current.pop("autonomous_research", None)
     legacy_output_limit = "require_output_token_limit" not in saved
+    legacy_frontier = "frontier_research" not in saved
+    if legacy_frontier:
+        if "frontier_research" in explicit and current.get("frontier_research") != "off":
+            raise ValueError("Resume configuration override is incompatible: frontier_research")
+        current.pop("frontier_research", None)
     if legacy_output_limit:
         if ("require_output_token_limit" in explicit
                 and current.get("require_output_token_limit") is not False):
@@ -110,6 +117,8 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
     for name in explicit - _GENERATION_OPTIONS:
         if legacy_research and name == "autonomous_research":
             continue
+        if legacy_frontier and name == "frontier_research":
+            continue
         if legacy_output_limit and name == "require_output_token_limit":
             continue
         if name not in saved or current[name] != saved[name]:
@@ -121,6 +130,9 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
     if legacy_research:
         args.autonomous_research = False
         args._legacy_autonomous_research_policy = True
+    if legacy_frontier:
+        args.frontier_research = "off"
+        args._legacy_frontier_research_policy = True
     if legacy_output_limit:
         args.require_output_token_limit = False
         args._legacy_output_limit_policy = True

@@ -3,13 +3,25 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 
 _RAW_STRING_START_RE = re.compile(r'r(?P<hashes>#+)?"')
+_LETTER_LIKE = (
+    r"\u03b1-\u03ba\u03bc-\u03c9\u0391-\u039f\u03a1\u03a4-\u03a9"
+    r"\u03ca-\u03fb\u1f00-\u1ffe\u2100-\u214f\U0001d49c-\U0001d59f"
+    r"\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff\u0100-\u017f"
+)
+_IDENT_FIRST_RE = re.compile(rf"[A-Za-z_{_LETTER_LIKE}]")
+_IDENT_REST_RE = re.compile(
+    rf"[A-Za-z0-9_'!?{_LETTER_LIKE}\u2080-\u2089\u2090-\u209c\u1d62-\u1d6a\u2c7c]"
+)
 
 
-def _mask_noncode(text: str, *, mask_quoted_identifiers: bool = False) -> str:
+def _mask_noncode(
+    text: str, *, mask_quoted_identifiers: bool = False, preserve_doc_comments: bool = False,
+) -> str:
     """Mask comments/literals, optionally names, preserving offsets/newlines."""
 
     src = str(text or "")
@@ -50,16 +62,19 @@ def _mask_noncode(text: str, *, mask_quoted_identifiers: bool = False) -> str:
                     end += 2
                 else:
                     end += 1
-            mask(i, end)
+            # Documentation openers are parser syntax. Header consumers stop
+            # before them so imports/helpers cannot detach a declaration's doc.
+            documentation = preserve_doc_comments and src.startswith(("/--", "/-!"), i)
+            mask(i + 3 if documentation else i, end)
             i = end
             continue
         raw_match = _RAW_STRING_START_RE.match(src, i) if src[i] == "r" else None
         if raw_match is not None and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] in "_")):
             hashes = raw_match.group("hashes") or ""
-            close = '"' + hashes
+            raw_delimiter = '"' + hashes
             body_start = raw_match.end()
-            close_at = src.find(close, body_start)
-            end = n if close_at < 0 else close_at + len(close)
+            close_at = src.find(raw_delimiter, body_start)
+            end = n if close_at < 0 else close_at + len(raw_delimiter)
             mask(i, end)
             i = end
             continue
@@ -100,10 +115,10 @@ def _mask_noncode(text: str, *, mask_quoted_identifiers: bool = False) -> str:
                     or not (src[end - 1].isalnum() or src[end - 1] == "_")
                 ):
                     hashes = raw_match.group("hashes") or ""
-                    close = '"' + hashes
+                    raw_delimiter = '"' + hashes
                     body_start = raw_match.end()
-                    close_at = src.find(close, body_start)
-                    end = n if close_at < 0 else close_at + len(close)
+                    close_at = src.find(raw_delimiter, body_start)
+                    end = n if close_at < 0 else close_at + len(raw_delimiter)
                     continue
                 if src[end] == "'" and (
                     end == 0
@@ -179,83 +194,106 @@ def _command_matches(
             yield match
 
 
-def _physical_source_lines(text: str) -> list[str]:
-    """Split on ``\\n`` and ``\\r\\n`` only.
+def _identifier_token_end(masked: str, *, quote_open: bool = False) -> int:
+    """End of a name token, including qualified and escaped components.
 
-    ``str.splitlines()`` also splits Unicode separators that Lean keeps inside
-    an escaped identifier or a ``--`` comment. A trailing newline is dropped,
-    and a CR that belongs to CRLF is dropped with that newline.
-    """
-
-    source = str(text or "")
-    if source == "":
-        return []
-    if source.endswith("\n"):
-        source = source[:-1]
-    return [line[:-1] if line.endswith("\r") else line for line in source.split("\n")]
-
-
-def _unclosed_block_comment_at(line: str, *, quote_open: bool = False) -> Optional[int]:
-    """Index of a ``/-`` that is still open at the end of one physical line.
-
-    ``quote_open`` means this line begins inside an escaped identifier, so
-    characters before its ``»`` cannot start a comment.
+    The caller supplies an offset-preserving mask so comments cannot become
+    part of a name. An unfinished escaped component includes the entire line.
     """
 
     index = 0
-    limit = len(line)
-    depth = 0
-    start: Optional[int] = None
-    while index < limit:
-        if quote_open:
-            if line[index] == "»":
-                quote_open = False
+    while index < len(masked):
+        if quote_open or masked[index] == "«":
+            close = masked.find("»", index if quote_open else index + 1)
+            if close < 0:
+                return len(masked)
+            index = close + 1
+            quote_open = False
+        else:
+            if _IDENT_FIRST_RE.fullmatch(masked[index]) is None:
+                return index
             index += 1
-            continue
-        if line[index] == "'" and (
-            index == 0 or not (line[index - 1].isalnum() or line[index - 1] in "_'")
-        ):
-            end = index + 1
-            if end < limit and line[end] == "\\":
-                end += 2
-            else:
-                end += 1
-            if end < limit and line[end] == "'":
-                index = end + 1
-                continue
-        if line.startswith("«", index):
-            quote_open = True
-            index += 1
-            continue
-        if line.startswith("--", index):
-            break
-        if line.startswith("/-", index):
-            if depth == 0:
-                start = index
-            depth += 1
-            index += 2
-            continue
-        if line.startswith("-/", index) and depth:
-            depth -= 1
-            if depth == 0:
-                start = None
-            index += 2
-            continue
-        if line[index] == '"':
-            index += 1
-            while index < limit:
-                if line[index] == "\\":
-                    index += 2
-                    continue
-                if line[index] == '"':
-                    index += 1
-                    break
+            while index < len(masked) and _IDENT_REST_RE.fullmatch(masked[index]):
                 index += 1
-            continue
+        if (
+            index + 1 >= len(masked)
+            or masked[index] != "."
+            or (masked[index + 1] != "«" and not _IDENT_FIRST_RE.fullmatch(masked[index + 1]))
+        ):
+            return index
         index += 1
-    if depth == 0:
-        return None
-    return start
+    return index
+
+
+@dataclass(frozen=True)
+class _HeaderCommand:
+    kind: str
+    start: int
+    end: int
+    code_spans: tuple[tuple[int, int], ...]
+    module_start: Optional[int] = None
+    decorated: bool = False
+
+
+def _scan_lean_header(source: str) -> tuple[list[_HeaderCommand], int]:
+    """Locate header commands using Lean tokens, independently of physical lines.
+
+    Offsets refer to the original source. Comments remain outside code spans,
+    including comments between an import keyword and its module. The optional
+    quoted module label preserves incomplete editor preambles accepted by the
+    existing source consumers.
+    """
+
+    masked = _mask_noncode(source, preserve_doc_comments=True)
+    commands: list[_HeaderCommand] = []
+
+    def skip(index: int) -> int:
+        while index < len(masked) and masked[index].isspace():
+            index += 1
+        return index
+
+    def word(index: int) -> tuple[str, int]:
+        end = index + _identifier_token_end(masked[index:])
+        return masked[index:end], end
+
+    index = skip(0)
+    while index < len(masked):
+        start = index
+        token, end = word(index)
+        spans = [(index, end)]
+        if token in {"module", "prelude"}:
+            if token == "module":
+                label = end
+                while label < len(masked) and masked[label] in " \t\r":
+                    label += 1
+                if label < len(masked) and masked[label] == "«":
+                    end = label + _identifier_token_end(masked[label:])
+                    spans.append((label, end))
+            commands.append(_HeaderCommand(token, start, end, tuple(spans)))
+            index = skip(end)
+            continue
+        decorated = False
+        for modifier in ("public", "meta"):
+            if token == modifier:
+                decorated = True
+                index = skip(end)
+                token, end = word(index)
+                spans.append((index, end))
+        if token != "import":
+            return commands, start
+        index = skip(end)
+        token, end = word(index)
+        if token == "all":
+            decorated = True
+            spans.append((index, end))
+            index = skip(end)
+            token, end = word(index)
+        if not token:
+            return commands, start
+        spans.append((index, end))
+        commands.append(_HeaderCommand("import", start, end, tuple(spans), index, decorated))
+        index = skip(end)
+    return commands, index
 
 
 def _quoted_identifier_open_before(masked_lines: list[str], index: int) -> bool:

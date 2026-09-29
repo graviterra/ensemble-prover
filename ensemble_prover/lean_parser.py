@@ -292,6 +292,10 @@ _UNKNOWN_ID_RE = re.compile(
     r"unknown\s+(?:identifier|constant|declaration|namespace)",
     re.IGNORECASE,
 )
+_UNKNOWN_ID_HINT_RE = re.compile(
+    r"\b(?:the\s+)?identifier\s+([`'])([^\r\n]+?)\1\s+is\s+unknown\b",
+    re.IGNORECASE,
+)
 _UNKNOWN_ID_PREFIX_RE = re.compile(
     r"unknown\s+(?:identifier|constant|declaration|namespace)\s+",
     re.IGNORECASE,
@@ -672,6 +676,12 @@ def _extract_type_mismatch_details(
 
 def _extract_unknown_identifier(raw: str) -> Optional[str]:
     m = _UNKNOWN_ID_PREFIX_RE.search(raw)
+    hint = _UNKNOWN_ID_HINT_RE.search(raw)
+    if hint is not None and (m is None or hint.start() < m.start()):
+        # autoImplicit reports the actual name before explanatory prose such
+        # as "causes an unknown identifier to be treated ...". That prose's
+        # next word is not a missing Lean declaration.
+        return hint.group(2).strip() or None
     if not m:
         return None
     tail = raw[m.end() :].lstrip()
@@ -1149,7 +1159,8 @@ def has_type_mismatch(text: str) -> bool:
 
 
 def has_unknown_identifier(text: str) -> bool:
-    return bool(_UNKNOWN_ID_RE.search(str(text or "")))
+    raw = str(text or "")
+    return bool(_UNKNOWN_ID_RE.search(raw) or _UNKNOWN_ID_HINT_RE.search(raw))
 
 
 def has_missing_instance(text: str) -> bool:

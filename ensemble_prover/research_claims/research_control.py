@@ -37,10 +37,11 @@ request another generic summary or repeat a prior assignment under a new name.
 
 
 def _allocation(job: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    from .frontier.hooks import _research_producer
+
     record = job.setdefault("research_control", {})
     receipts = [item for item in state["attempts"].values()
-                if item.get("consumer_id") == job["job_id"]
-                and item.get("allocation_id") is None]
+                if _research_producer(state, item) == job["job_id"]]
     # Reconstruct from authoritative admissions, not turns or successful actions.
     record["requests_used"] = len(receipts)
     times = [item["admitted_at"] for item in receipts if "admitted_at" in item]
@@ -69,19 +70,47 @@ def native_job_target(job: dict[str, Any], jobs: dict[str, dict[str, Any]]) -> s
     raise ValueError("cyclic native research job lineage")
 
 
+def native_job_context(job: dict[str, Any], jobs: dict[str, dict[str, Any]]) -> Any:
+    """Resolve immutable owner context through the same native job lineage."""
+    seen: set[str] = set()
+    while job["job_id"] not in seen:
+        seen.add(job["job_id"])
+        if job.get("native_context_binding") is not None:
+            return job["native_context_binding"]
+        parent = jobs.get(job.get("parent_job"))
+        if parent is None:
+            return None
+        job = parent
+    raise ValueError("cyclic native research context lineage")
+
+
+def _native_attention_key(state: dict[str, Any], run: dict[str, Any]) -> str:
+    from .frontier.hooks import mode_of
+    from .frontier.records import digest
+
+    target = run["native_active_target_claim_id"]
+    context = run.get("native_active_target_context_binding")
+    return digest([target, context]) if mode_of(state) == "adaptive" and context is not None else target
+
+
 def _focused_jobs(store: Any, run: dict[str, Any]) -> list[dict[str, Any]]:
     jobs = store.jobs()
     target = run.get("native_active_target_claim_id")
     if target is None:
         return jobs
     by_id = {job["job_id"]: job for job in jobs}
-    return [job for job in jobs if native_job_target(job, by_id) == target]
+    from .frontier.hooks import mode_of
+
+    context = run.get("native_active_target_context_binding")
+    adaptive = mode_of(run.get("strategy_review") or {}) == "adaptive"
+    return [job for job in jobs if native_job_target(job, by_id) == target
+            and (not adaptive or context is None or native_job_context(job, by_id) == context)]
 
 
 def _reviewed_through(state: dict[str, Any], run: dict[str, Any]) -> int:
     target = run.get("native_active_target_claim_id")
     if target is not None:
-        return state.get("native_research_attention", {}).get(target, 0)
+        return state.get("native_research_attention", {}).get(_native_attention_key(state, run), 0)
     return state.get("research_attention", {}).get("reviewed_through", 0)
 
 
@@ -94,8 +123,9 @@ def _research_count(store: Any, state: dict[str, Any], run: dict[str, Any]) -> i
     # Old receipts have no role field. Resolve their durable producer rather
     # than resetting attention when a pre-upgrade run is resumed.
     researchers = {job["job_id"] for job in _focused_jobs(store, run) if job["role"] == "research"}
-    return sum(item.get("allocation_id") is None and item["consumer_id"] in researchers
-               for item in state["attempts"].values())
+    from .frontier.hooks import _research_producer
+
+    return sum(_research_producer(state, item) in researchers for item in state["attempts"].values())
 
 
 def _reason(store: Any, job: dict[str, Any], state: dict[str, Any], run: dict[str, Any], now: float,
@@ -173,12 +203,58 @@ class ResearchControl:
             result["assigned_research_checkpoint"] = load_json(
                 self.store.read_artifact(job["research_checkpoint"]).decode()
             )
+            from .frontier.hooks import mode_of
+
+            if mode_of(state) == "adaptive":
+                producer = self.store.job(job["research_reorientation_for"])
+                if producer.get("frontier_report_basis") and producer.get("investigation_artifact"):
+                    result["assigned_report_progress_assessment"] = {
+                        "report_artifact": producer["investigation_artifact"],
+                        "basis": producer["frontier_report_basis"]["binding"],
+                        "instruction": "Independently inspect this completed report for substantive NEW evidence advancing its exact assigned inference. You may add substantive_progress:true to research_reorientation only for an actual new derivation, check or useful source application; repeated facts, plans and revised wording do not qualify. Missing/false means no progress credit. This assessment conveys research relevance, never proof authority.",
+                    }
         return result
 
     def before_request(self, job: dict[str, Any]) -> bool:
         with self._atomic():
             current = self.store.job(job["job_id"])
             state = self.controller.snapshot()
+            from .frontier.hooks import bind_research_job, mode_of, prepare_research_claim
+
+            if mode_of(state) == "adaptive":
+                try:
+                    with self.controller._edit() as (live, run):
+                        bind_research_job(self.controller, live, run, current)
+                        prepare_research_claim(self.controller, live, current)
+                except StrategyYield as exc:
+                    if exc.reason not in {"fairness", "suspended"}:
+                        raise
+                    # An already paid response may finish after its native
+                    # grant changes. Preserve that result, then defer its next
+                    # request until its exact target and context are active.
+                    self.handle_yield(current, exc.reason)
+                    return False
+                state = self.controller.snapshot()
+                if (current.get("role") == "research" and current.get("frontier_recovery_settled")
+                        and not current.get("research_control", {}).get("closed")):
+                    # Recovery has already settled the interrupted quantum and
+                    # retained its bounded operational permit. Checkpoint the
+                    # old consumer once so a fresh successor can spend that
+                    # permit without reopening the consumed allocation.
+                    self.handle_yield(current, "provider_failure")
+                    return False
+                if current.get("role") == "research" and current.get("frontier_permit_consumed"):
+                    from .frontier.persist import load_campaign
+
+                    campaign = load_campaign(self.store, state["owner_id"])
+                    approach = campaign["approaches"].get(current.get("frontier_approach_id", ""))
+                    if (approach is not None and not approach.get("admitted_open")
+                            and any(handoff["producer_id"] == current["job_id"] and handoff["status"] == "settled"
+                                    for handoff in campaign.get("proof_handoffs", {}).values())):
+                        # The proof child settled this same consumed quantum.
+                        # Checkpoint its parent before assigning a continuation.
+                        self.handle_yield(current, "research_interval_exhausted")
+                        return False
             reason = _reason(self.store, current, state, self.store.run_record(scheduling=True),
                              self.controller.clock(), self.controller._reservations(state))
             if reason:
@@ -190,6 +266,7 @@ class ResearchControl:
                     if child is not None:
                         current["research_control"]["waiting_for"] = child["job_id"]
                         current["status"] = "waiting"
+                        current["last_error"] = None
                         self.store.save_job(current)
                         return False
                 self.handle_yield(current, reason)
@@ -197,6 +274,27 @@ class ResearchControl:
             return True
 
     def synchronize(self) -> None:
+        from .frontier.hooks import mode_of
+
+        if mode_of(self.controller.snapshot()) == "adaptive":
+            from .frontier.hooks import reconcile_retired_allocations
+
+            with self.controller._edit() as (state, _):
+                reconcile_retired_allocations(self.controller, state)
+            for retired in _focused_jobs(self.store, self.store.run_record(scheduling=True)):
+                if retired.get("frontier_retirement_attention_pending"):
+                    from .frontier.hooks import retire_stale_research_response
+
+                    with self.controller._edit() as (state, _):
+                        retire_stale_research_response(self.controller, state, retired, retired["research_control"]["reason"])
+            # A decision can finish while its final paid tool operation is
+            # still running. Reconcile that same decision after the tail ends;
+            # no second model review or broader receipt coverage is needed.
+            for reviewer in _focused_jobs(self.store, self.store.run_record(scheduling=True)):
+                if reviewer.get("pending_phase_ack"):
+                    with self._atomic():
+                        self._complete_phase(reviewer)
+                        self._acknowledge_adaptive(reviewer)
         # Never close an in-flight/received turn: its response may contain the
         # useful argument earned by the final admitted request.
         for job in _focused_jobs(self.store, self.store.run_record(scheduling=True)):
@@ -220,8 +318,21 @@ class ResearchControl:
             }
             self.store.save_job(job)
             if job["role"] == "review" and job["status"] == "finished":
-                self._complete_phase()
+                from .frontier.hooks import mode_of
+
+                # Strategy, progress, and implication reviews are not the
+                # shared-phase reconciliation. Freezing here would close
+                # attention with nobody assigned to acknowledge the receipts.
+                if mode_of(self.controller.snapshot()) == "adaptive" and not job.get("research_reorientation_for"):
+                    return
+                self._complete_phase(job)
                 return
+            if job["role"] == "research" and job["status"] == "finished":
+                from .frontier.hooks import mode_of
+
+                if mode_of(self.controller.snapshot()) == "adaptive" and job.get("frontier_permit_consumed"):
+                    self.handle_yield(job, "research_result_submitted")
+                    return
             if action["action"] == "submit" and action.get("kind") == "gap":
                 self.handle_yield(job, "research_gap_submitted")
             elif novelty.get("consecutive_repeated_retrievals", 0) >= 3:
@@ -249,24 +360,101 @@ class ResearchControl:
     def handle_yield(self, job: dict[str, Any], reason: str) -> None:
         with self._atomic():
             job = self.store.job(job["job_id"])
-            record = _allocation(job, self.controller.snapshot())
+            state = self.controller.snapshot()
+            record = _allocation(job, state)
+            from .frontier.hooks import mode_of
+
+            adaptive = mode_of(state) == "adaptive"
+            if adaptive and job["role"] == "research":
+                from .frontier.hooks import has_active_proof_allocation
+                from .frontier.persist import load_campaign
+
+                campaign = load_campaign(self.store, state["owner_id"])
+                if campaign is not None and has_active_proof_allocation(state, campaign, job):
+                    return
+            if adaptive and job["role"] == "research" and reason in {
+                "stale_permit_basis", "stale_frontier_scope", "formal_authority_revoked",
+                "permit_expired", "claim_expired", "retry_exhausted",
+            }:
+                if reason == "stale_frontier_scope" and job.get("frontier_permit_consumed"):
+                    from .frontier.hooks import retire_stale_research_response
+
+                    with self.controller._edit() as (live, _):
+                        retire_stale_research_response(self.controller, live, job, "research_scope_changed")
+                    return
+                if reason == "retry_exhausted":
+                    reason = "paused_operational"
+                else:
+                    from .frontier.hooks import _campaign, prepare_research_claim
+                    from .frontier.progress import active_permit
+
+                    with self.controller._edit() as (live, _):
+                        current = _campaign(self.controller, live)
+                        permit = active_permit(current, job.get("frontier_approach_id") or "")
+                        job["frontier_refused_permit_id"] = None if permit is None else permit["permit_id"]
+                        if reason in {"permit_expired", "claim_expired"}:
+                            prepare_research_claim(self.controller, live, job)
+                    job.update(status="waiting", last_error=reason)
+                    self.store.save_job(job)
+                    return
+            if adaptive and job["role"] == "review" and reason == "research_control_deferred":
+                job.update(status="waiting", last_error=reason)
+                self.store.save_job(job)
+                return
+            if adaptive and job["role"] == "research" and reason in {
+                "fairness", "suspended", "frontier_permit_required", "paused_operational"
+            }:
+                if reason == "paused_operational":
+                    from .frontier.hooks import _campaign, _save
+
+                    with self.controller._edit() as (live, run):
+                        current = _campaign(self.controller, live)
+                        approach = current["approaches"].get(job.get("frontier_approach_id") or "", {})
+                        lineage = job.get("frontier_operation_lineage") or approach.get("operation_lineage")
+                        budget = current["retries"].get(lineage or "")
+                        if budget and budget["execution_admissions"] >= current["policy"]["max_operation_execution_admissions"]:
+                            budget["paused"] = True
+                            job["frontier_operation_lineage"] = lineage
+                            _save(self.controller, live, run, current)
+                # A pending job occupies the scheduler. Leave this one waiting so
+                # the approach the queue actually selected can receive a job.
+                job.update(status="waiting", last_error=reason)
+                self.store.save_job(job)
+                return
+            if adaptive and job["role"] == "research" and (
+                reason == "research_phase_deferred"
+                or (reason == "research_phase_exhausted" and record.get("requests_used", 0) == 0)
+            ):
+                from .frontier.hooks import defer_unserved
+
+                with self.controller._edit() as (live, _):
+                    defer_unserved(self.controller, live, job)
+                return
             if record.get("closed"):
                 job["status"] = "finished"
                 self.store.save_job(job)
                 return
+            if adaptive and job["role"] == "research" and job.get("frontier_permit_consumed"):
+                from .frontier.hooks import settle_research_job
+
+                with self.controller._edit() as (live, _):
+                    if not settle_research_job(self.controller, live, job, reason):
+                        return
             checkpoint = self._checkpoint(job, reason)
             record.update(closed=True, reason=reason, checkpoint=checkpoint)
             job.update(status="finished", last_error=None)
             self.store.save_job(job)
             if job["role"] == "review":
                 self._incomplete_review(job, reason)
+                if adaptive and not job.get("research_reorientation_for"):
+                    return
                 self._fallback(job, checkpoint, reason)
             else:
                 existing = next((item for item in _focused_jobs(self.store, self.store.run_record(scheduling=True))
                                  if item.get("research_reorientation_for")
                                  and item["status"] in {"pending", "running", "responded", "tool_running"}
                                  and not item.get("research_control", {}).get("closed")), None)
-                if existing is not None:
+                if existing is not None and not adaptive:
                     existing.setdefault("research_portfolio_checkpoints", []).append(checkpoint)
                     self.store.save_job(existing)
                     job["research_successor"] = existing["job_id"]
@@ -280,12 +468,20 @@ class ResearchControl:
                 reviewer.update(research_reorientation_for=job["job_id"], research_checkpoint=checkpoint,
                                 research_portfolio_checkpoints=[checkpoint])
                 self._carry_memory(job, reviewer)
+                if adaptive and job.get("frontier_approach_id"):
+                    from .frontier.hooks import _campaign, _save, bind_review_job
+
+                    with self.controller._edit() as (live, run):
+                        campaign = _campaign(self.controller, live)
+                        bind_review_job(reviewer, job, campaign)
+                        _save(self.controller, live, run, campaign)
                 self.store.save_job(reviewer)
                 job["research_successor"] = reviewer["job_id"]
                 self.store.save_job(job)
 
     def _fallback(self, reviewer: dict[str, Any], checkpoint: str, reason: str) -> None:
-        self._complete_phase()
+        self._complete_phase(reviewer)
+        self._acknowledge_adaptive(reviewer)
         directive = {
             "decision": "review_inconclusive", "rationale": reason,
             "next_question": "Resolve the first uncertain inference in the prior investigation.",
@@ -295,9 +491,17 @@ class ResearchControl:
         }
         self._followup(reviewer, directive, checkpoint)
 
-    def _complete_phase(self) -> None:
+    def _complete_phase(self, reviewer: dict[str, Any] | None = None) -> None:
         """Independent review work permits new attention, never proof credit."""
         with self.controller._edit() as (state, _):
+            from .frontier.hooks import freeze_shared_phase, mode_of
+
+            if mode_of(state) == "adaptive":
+                producer = None if reviewer is None else reviewer.get("research_reorientation_for")
+                if reviewer is not None and not producer:
+                    return
+                freeze_shared_phase(self.controller, state, producer)
+                return
             run = self.store.run_record(scheduling=True)
             count = _research_count(self.store, state, run)
             target = run.get("native_active_target_claim_id")
@@ -327,6 +531,9 @@ class ResearchControl:
         memory = producer.get("research_memory") or producer.get("research_prior_memory")
         if memory is not None:
             recipient["research_prior_memory"] = memory
+        for key in ("native_context_binding", "native_target_claim_id", "frontier_native_target_claim_id"):
+            if producer.get(key) is not None:
+                recipient[key] = producer[key]
 
     def _fallback_check(self) -> str:
         checks = (
@@ -365,6 +572,25 @@ class ResearchControl:
         child.update(research_directive=directive, research_prior_checkpoint=checkpoint,
                      research_route_signature=signature,
                      research_portfolio_checkpoints=reviewer.get("research_portfolio_checkpoints", []))
+        if reviewer.get("frontier_approach_id"):
+            child["frontier_approach_id"] = reviewer["frontier_approach_id"]
+            from .frontier.hooks import mode_of
+
+            if mode_of(self.controller.snapshot()) == "adaptive":
+                from .frontier.owner import FrontierOwner
+
+                bound = FrontierOwner(self.controller).reorient_report_question(reviewer, directive)
+                if bound is not None:
+                    child["frontier_question_id"] = bound["question_id"]
+                elif directive.get("decision") == "investigate" and reviewer.get("research_reorientation_for"):
+                    producer = self.store.job(reviewer["research_reorientation_for"])
+                    if producer.get("frontier_report_basis"):
+                        # A stale review remains useful history, but cannot
+                        # prescribe work against a newly approved question.
+                        child.update(status="superseded", last_error="stale_frontier_scope")
+        if reviewer.get("frontier_retry_pending") and reviewer.get("frontier_operation_lineage"):
+            child["frontier_operation_lineage"] = reviewer["frontier_operation_lineage"]
+            child["frontier_retry_pending"] = True
         self._carry_memory(reviewer, child)
         self.store.save_job(child)
         reviewer["research_successor"] = child["job_id"]
@@ -377,9 +603,38 @@ class ResearchControl:
         if job.get("research_control", {}).get("closed"):
             raise ValueError("the assigned allocation has already ended")
         directive = {key: action[key] for key in REORIENTATION_FIELDS}
+        from .frontier.hooks import mode_of
+
+        progress_assessment = None
+        if mode_of(self.controller.snapshot()) == "adaptive" and action.get("substantive_progress", False):
+            from .frontier.owner import FrontierOwner
+
+            progress_assessment = FrontierOwner(self.controller).assess_report_progress(
+                job, substantive=action["substantive_progress"], rationale=action["rationale"]
+            )
         directive["decision"] = "investigate"
         job["status"] = "finished"
         job.setdefault("research_control", {})["closed"] = True
-        self._complete_phase()
+        self._complete_phase(job)
+        self._acknowledge_adaptive(job)
         child = self._followup(job, directive, job["research_checkpoint"])
-        return {"program": child["job_id"], "directive": directive, "kernel_verified": False}
+        result = {"program": child["job_id"], "directive": directive, "kernel_verified": False}
+        if progress_assessment is not None:
+            result["progress_assessment"] = progress_assessment
+        return result
+
+    def _acknowledge_adaptive(self, reviewer: dict[str, Any]) -> None:
+        from .frontier.hooks import _research_producer, acknowledge_job, mode_of
+
+        state = self.controller.snapshot()
+        if mode_of(state) != "adaptive":
+            return
+        with self.controller._edit() as (live, _):
+            acknowledge_job(self.controller, live, reviewer)
+            producer = reviewer.get("research_reorientation_for")
+            reviewer["pending_phase_ack"] = bool(producer) and any(
+                _research_producer(live, attempt) == producer
+                and not attempt.get("frontier_phase_acknowledged")
+                for attempt in live["attempts"].values()
+            )
+            self.store.save_job(reviewer)

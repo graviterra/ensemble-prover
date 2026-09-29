@@ -7,6 +7,7 @@ before checking revisions. No submitted experiment command is executed.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -34,6 +35,21 @@ from .model import (
     validate_json_structure,
 )
 
+
+def _contains_frontier_schema(value: Any) -> bool:
+    if isinstance(value, dict):
+        # A removed schema marker cannot make retained policy, allocation, or
+        # admission records safe for a legacy scheduler to reinterpret.
+        if "pending_phase_ack" in value or any(
+            isinstance(key, str) and key.startswith("frontier_") for key in value
+        ):
+            return True
+        return any(_contains_frontier_schema(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_frontier_schema(item) for item in value)
+    return False
+
+
 # Version 4 adds waiting jobs and durable child-result notification semantics.
 # Version 3 adds executable research state in the same transactional database.
 # Version 2 introduced conflict-aware review interpretation.
@@ -41,7 +57,9 @@ from .model import (
 # ledgers there instead of allowing subscription work to become API-billed work.
 # Version 6 adds explicitly authorized, closed-loop formalization jobs. Older
 # schedulers must not silently ignore that authorization or its proof state.
-SCHEMA_VERSION = 7
+# Version 8 adds frontier route, approach, and investigation records. Older
+# binaries must fail closed instead of ignoring approach allocations.
+SCHEMA_VERSION = 8
 APPLICATION_ID = 0x52534348
 
 
@@ -69,6 +87,7 @@ _SCHEMA = {
     "events": "sequence INTEGER PRIMARY KEY AUTOINCREMENT, claim_id TEXT, revision INTEGER, kind TEXT NOT NULL, record TEXT NOT NULL",
     "discovery_runs": "run_id TEXT PRIMARY KEY, record TEXT NOT NULL",
     "discovery_jobs": "job_id TEXT PRIMARY KEY, status TEXT NOT NULL, record TEXT NOT NULL",
+    "frontier_records": "record_id TEXT PRIMARY KEY, kind TEXT NOT NULL, owner_id TEXT NOT NULL, target_id TEXT NOT NULL, status TEXT NOT NULL, revision INTEGER NOT NULL, record TEXT NOT NULL",
 }
 _COLUMNS = {
     "claims": ["claim_id", "revision"],
@@ -89,10 +108,13 @@ _COLUMNS = {
     "events": ["sequence", "claim_id", "revision", "kind", "record"],
     "discovery_runs": ["run_id", "record"],
     "discovery_jobs": ["job_id", "status", "record"],
+    "frontier_records": ["record_id", "kind", "owner_id", "target_id", "status", "revision", "record"],
 }
 _INDEX_SCHEMA = {
     "active_output": "CREATE UNIQUE INDEX active_output ON assignments(owned_output) WHERE status = 'pending'",
     "round_question": "CREATE UNIQUE INDEX round_question ON assignments(round_id, question)",
+    "frontier_owner_target": "CREATE INDEX frontier_owner_target ON frontier_records(owner_id, target_id)",
+    "frontier_kind_status": "CREATE INDEX frontier_kind_status ON frontier_records(kind, status, revision)",
 }
 
 
@@ -183,6 +205,16 @@ class ResearchStore:
         )
         self._connection.row_factory = sqlite3.Row
         try:
+            version = self._connection.execute("PRAGMA user_version").fetchone()[0]
+            if upgrade and version in (1, 2, 3, 4, 5, 6, 7):
+                # Validate before copying or writing. Backup uses a second
+                # connection and must not run inside this writer's transaction,
+                # or SQLite waits on a lock the transaction already holds.
+                with self._transaction():
+                    self._refuse_frontier_downgrade(version)
+                    self._validate_schema(expected_version=version)
+                self._acquire_upgrade_lock()
+                self._backup_ledger(version)
             with self._transaction(write=True):
                 tables = self._tables()
                 if not tables and create:
@@ -195,12 +227,10 @@ class ResearchStore:
                     )
                     self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-                if upgrade and version in (1, 2, 3, 4, 5, 6):
-                    # Validate the entire known legacy schema before changing
-                    # anything. Mathematical records/artifacts stay intact;
-                    # legacy API routing becomes explicit in run metadata.
-                    self._validate_schema(expected_version=version)
-                    if version < 3:
+                if upgrade and version in (1, 2, 3, 4, 5, 6, 7):
+                    # Mathematical records/artifacts stay intact; legacy API
+                    # routing becomes explicit in run metadata.
+                    if version <= 6 and version < 3:
                         for name in ("discovery_runs", "discovery_jobs"):
                             self._connection.execute(
                                 f"CREATE TABLE {name} ({_SCHEMA[name]})"
@@ -208,52 +238,29 @@ class ResearchStore:
                     # Schema 7 may archive immutable configurations as config:*
                     # rows. Older schemas cannot contain them; reject downgrade
                     # tricks. A future migration must handle archives separately.
-                    if self._connection.execute("SELECT 1 FROM discovery_runs WHERE run_id != 'main' LIMIT 1").fetchone():
+                    if version <= 6 and self._connection.execute("SELECT 1 FROM discovery_runs WHERE run_id != 'main' LIMIT 1").fetchone():
                         raise UnknownSchema("legacy ledger contains unsupported configuration archives")
-                    for row in self._connection.execute(
-                        "SELECT run_id, record FROM discovery_runs WHERE run_id = 'main'"
-                    ).fetchall():
-                        record = json.loads(row["record"])
-                        if not isinstance(record, dict) or (
-                            version < 5
-                            and any(
-                                record.get(key, "openai") != "openai"
-                                for key in ("provider", "review_provider")
-                            )
-                        ):
-                            raise UnknownSchema(
-                                "legacy discovery routing is not API-only; upgrade refused"
-                            )
-                        if version < 5:
-                            record.update(provider="openai", review_provider="openai")
-                        elif any(
-                            not isinstance(record.get(key), str)
-                            or record[key] not in {"openai", "codex"}
-                            for key in ("provider", "review_provider")
-                        ):
-                            raise UnknownSchema(
-                                "invalid saved provider routing; upgrade refused"
-                            )
-                        if version < 6 and record.get("closed_loop") is not None:
-                            raise UnknownSchema(
-                                "legacy ledger cannot authorize closed-loop proving"
-                            )
-                        if version < 6:
-                            record["closed_loop"] = None
-                        if record.get("strategy_review") is not None:
-                            raise UnknownSchema("legacy ledger cannot authorize strategy recovery")
-                        record["strategy_review"] = None
-                        self._connection.execute(
-                            "UPDATE discovery_runs SET record = ? WHERE run_id = ?",
-                            (json_text(record), row["run_id"]),
-                        )
+                    if version <= 6:
+                        self._upgrade_legacy_discovery(version)
+                    self._install_frontier_tables()
                     self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    self._upgrade_ready = True
                 self._validate_schema()
+            if getattr(self, "_upgrade_ready", False):
+                self._upgrade_committed = True
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._connection.execute("PRAGMA synchronous = FULL")
         except BaseException:
+            backup = getattr(self, "_upgrade_backup", None)
+            if backup is not None and not getattr(self, "_upgrade_committed", False):
+                try:
+                    Path(backup).unlink()
+                except OSError:
+                    pass
+            self._release_upgrade_lock()
             self._connection.close()
             raise
+        self._release_upgrade_lock()
 
     def __enter__(self) -> ResearchStore:
         return self
@@ -310,11 +317,126 @@ class ResearchStore:
             )
         }
 
+    def _upgrade_legacy_discovery(self, version: int) -> None:
+        for row in self._connection.execute(
+            "SELECT run_id, record FROM discovery_runs WHERE run_id = 'main'"
+        ).fetchall():
+            record = json.loads(row["record"])
+            if not isinstance(record, dict) or (
+                version < 5
+                and any(
+                    record.get(key, "openai") != "openai"
+                    for key in ("provider", "review_provider")
+                )
+            ):
+                raise UnknownSchema(
+                    "legacy discovery routing is not API-only; upgrade refused"
+                )
+            if version < 5:
+                record.update(provider="openai", review_provider="openai")
+            elif any(
+                not isinstance(record.get(key), str)
+                or record[key] not in {"openai", "codex"}
+                for key in ("provider", "review_provider")
+            ):
+                raise UnknownSchema(
+                    "invalid saved provider routing; upgrade refused"
+                )
+            if version < 6 and record.get("closed_loop") is not None:
+                raise UnknownSchema(
+                    "legacy ledger cannot authorize closed-loop proving"
+                )
+            if version < 6:
+                record["closed_loop"] = None
+            if record.get("strategy_review") is not None:
+                raise UnknownSchema("legacy ledger cannot authorize strategy recovery")
+            if record.get("frontier_schema"):
+                raise UnknownSchema(
+                    "cannot downgrade a ledger that contains frontier allocations"
+                )
+            record["strategy_review"] = None
+            self._connection.execute(
+                "UPDATE discovery_runs SET record = ? WHERE run_id = ?",
+                (json_text(record), row["run_id"]),
+            )
+
+    def _release_upgrade_lock(self) -> None:
+        descriptor = getattr(self, "_upgrade_lock", None)
+        if descriptor is None:
+            return
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+        finally:
+            self._upgrade_lock = None
+
+    def _refuse_frontier_downgrade(self, version: int) -> None:
+        if version >= SCHEMA_VERSION:
+            return
+        if "frontier_records" in self._tables():
+            raise UnknownSchema(
+                "cannot downgrade a ledger that contains frontier allocations"
+            )
+        for table in ("discovery_runs", "discovery_jobs"):
+            if table not in self._tables():
+                continue
+            for row in self._connection.execute(f"SELECT record FROM {table}"):
+                if self._record_has_frontier(row["record"]):
+                    raise UnknownSchema(
+                        "cannot downgrade a ledger that contains frontier allocations"
+                    )
+
+    def _backup_ledger(self, version: int) -> None:
+        destination = self.directory / f"ledger.schema-{version}.sqlite3"
+        partial = self.directory / f"ledger.schema-{version}.sqlite3.partial"
+        if partial.exists():
+            partial.unlink()
+        clone = sqlite3.connect(partial)
+        try:
+            self._connection.backup(clone)
+        except BaseException:
+            clone.close()
+            partial.unlink(missing_ok=True)
+            raise
+        clone.close()
+        os.chmod(partial, 0o600)
+        os.replace(partial, destination)
+        self._upgrade_backup = destination
+
+    def _record_has_frontier(self, payload: str) -> bool:
+        try:
+            record = json.loads(payload)
+        except (TypeError, ValueError):
+            return False
+        return _contains_frontier_schema(record)
+
+    def _acquire_upgrade_lock(self) -> None:
+        """Refuse to migrate a ledger whose discovery controller is still running."""
+        lock_path = self.directory / "discovery.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(descriptor)
+            raise UnknownSchema("upgrade requires the research run to be stopped") from exc
+        self._upgrade_lock = descriptor
+
+    def _install_frontier_tables(self) -> None:
+        if "frontier_records" in self._tables():
+            raise UnknownSchema("frontier records already exist; upgrade refused")
+        self._connection.execute(
+            f"CREATE TABLE frontier_records ({_SCHEMA['frontier_records']})"
+        )
+        for name, statement in _INDEX_SCHEMA.items():
+            if name.startswith("frontier_"):
+                self._connection.execute(statement)
+
     def _validate_schema(self, *, expected_version: int = SCHEMA_VERSION) -> None:
         schema = {
             name: fields
             for name, fields in _SCHEMA.items()
-            if expected_version >= 3 or not name.startswith("discovery_")
+            if (expected_version >= 3 or not name.startswith("discovery_"))
+            and (expected_version >= 8 or name != "frontier_records")
         }
         version = self._connection.execute("PRAGMA user_version").fetchone()[0]
         application = self._connection.execute("PRAGMA application_id").fetchone()[0]
@@ -325,7 +447,7 @@ class ResearchStore:
         ):
             raise UnknownSchema(
                 "unrecognized research ledger schema; no migration was attempted. "
-                "For a version 1 through 6 ledger, explicitly run research_claims upgrade DIRECTORY."
+                "For a version 1 through 7 ledger, explicitly run research_claims upgrade DIRECTORY."
             )
         for name, expected in _COLUMNS.items():
             if name not in schema:
@@ -342,7 +464,11 @@ class ResearchStore:
                 name: f"CREATE TABLE {name} ({fields})"
                 for name, fields in schema.items()
             },
-            **_INDEX_SCHEMA,
+            **{
+                name: statement
+                for name, statement in _INDEX_SCHEMA.items()
+                if expected_version >= 8 or not name.startswith("frontier_")
+            },
         }
         definitions = {
             row["name"]: row["sql"]
