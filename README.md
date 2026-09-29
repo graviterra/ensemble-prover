@@ -19,7 +19,7 @@ mathematical retrieval, proof repair, and Lean verification in an autonomous
 proof-search system. Give it a theorem or an English claim, follow the work in
 your browser, and inspect the formal mathematics behind recorded progress.
 
-**257+ Putnam problems with saved solutions—and counting.**
+**380 Putnam problems with saved solutions—and counting.**
 
 [Results and evaluation scope](#results)
 
