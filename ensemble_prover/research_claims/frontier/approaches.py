@@ -9,6 +9,8 @@ from __future__ import annotations
 from typing import Any
 
 from .progress import (
+    _checked_certificate_matches,
+    _checked_fact_matches,
     active_permit,
     add_obligation,
     add_route,
@@ -281,8 +283,106 @@ def eligible(state: dict[str, Any], approach_id: str) -> bool:
     return permit["question_revision"] == question["revision"] and permit["route_revision"] == route["revision"]
 
 
+EXPLORATION_INTERVAL = 5
+
+
+def _checked_closure(facts: set[str], reductions: list[dict[str, Any]]) -> set[str]:
+    established = set(facts)
+    changed = True
+    while changed:
+        changed = False
+        for reduction in reductions:
+            consequent = reduction["consequent"]
+            if consequent not in established and all(item in established for item in reduction["antecedents"]):
+                established.add(consequent)
+                changed = True
+    return established
+
+
+def approach_priority(state: dict[str, Any], approach_id: str) -> dict[str, Any]:
+    """Explain a bounded scheduling heuristic; this is not evidence or authority.
+
+    Each current route is a separate hypergraph. Other premises of a joint
+    reduction must be checked before solving its bottleneck can finish it.
+    Merely proposed edges and detached historical routes give no checked bonus.
+    """
+    approach = _approach(state, approach_id)
+    target = approach.get("bottleneck_obligation")
+    components = dict(root_completion=0, reduction_completion=0, checked_obstruction=0,
+                      shared_obstruction=0, discrimination=0)
+    profile: dict[str, Any] = {"score": 0, "components": components, "obligation_id": target,
+                               "affected_routes": [], "heuristic_only": True}
+    eligible_ids = [item for item in state["service_queue"] if eligible(state, item)]
+    if approach_id not in eligible_ids or not isinstance(target, str) or target not in state["obligations"]:
+        return profile
+    own_route = state["routes"].get(approach.get("route_id"), {})
+    if (own_route.get("root_binding") != state["root"]["binding"]
+            or own_route.get("root_obligation") != state.get("root_obligation")
+            or own_route.get("approach_id") != approach_id):
+        return profile
+    facts = {item for item in state["obligations"] if _checked_fact_matches(state, item)}
+    if target in facts:
+        return profile
+    root = state.get("root_obligation")
+    if root not in state["obligations"]:
+        return profile
+    checked = {}
+    for reduction_id, reduction in state["reductions"].items():
+        antecedents = reduction.get("antecedents") or []
+        consequent = reduction.get("consequent")
+        if (reduction.get("level") == "checked" and not reduction.get("well_founded")
+                and antecedents and consequent in state["obligations"]
+                and all(item in state["obligations"] for item in antecedents)
+                and _checked_certificate_matches(state, reduction.get("certificate"), antecedents, consequent)):
+            checked[reduction_id] = reduction
+    for candidate_id in eligible_ids:
+        candidate = state["approaches"][candidate_id]
+        route = state["routes"].get(candidate.get("route_id"), {})
+        if (route.get("root_binding") != state["root"]["binding"]
+                or route.get("root_obligation") != root
+                or route.get("approach_id") != candidate_id
+                or route.get("viability") in {"held", "blocked", "refuted", "superseded"}):
+            continue
+        reductions = [checked[item] for item in route.get("reductions", []) if item in checked]
+        established = _checked_closure(facts, reductions)
+        if root in established or target in established:
+            continue
+        needed = {root}
+        changed = True
+        while changed:
+            changed = False
+            for reduction in reductions:
+                if reduction["consequent"] not in needed or reduction["consequent"] in established:
+                    continue
+                missing = set(reduction["antecedents"]) - established - needed
+                if missing:
+                    needed.update(missing)
+                    changed = True
+        if target not in needed or target == root:
+            continue
+        profile["affected_routes"].append(route["route_id"])
+        components["checked_obstruction"] = 10
+        hypothetical = _checked_closure(established | {target}, reductions)
+        if root in hypothetical:
+            components["root_completion"] = 40
+        if any(reduction["consequent"] in needed - established
+               and all(item in hypothetical for item in reduction["antecedents"])
+               for reduction in reductions):
+            components["reduction_completion"] = 25
+    components["shared_obstruction"] = min(15, 5 * max(0, len(profile["affected_routes"]) - 1))
+    question = state["questions"].get(approach.get("question_id"), {})
+    scope = question.get("scope") if isinstance(question.get("scope"), dict) else {}
+    competitors = scope.get("competing_approach_ids")
+    if (isinstance(scope.get("discriminating_check"), str) and scope["discriminating_check"].strip()
+            and isinstance(competitors, list)
+            and len(set(item for item in competitors if isinstance(item, str)) & set(eligible_ids)) >= 2):
+        components["discrimination"] = 10
+    profile["score"] = sum(components.values())
+    return profile
+
+
 def select_approach(state: dict[str, Any]) -> tuple[str | None, str]:
-    """Oldest eligible approach, with one capped follow-through for the incumbent."""
+    """Select without mutation, preserving admission fences and bounded fairness."""
     eligible_ids = [approach_id for approach_id in state["service_queue"] if eligible(state, approach_id)]
     if not eligible_ids:
         if any(item["status"] == "waiting" for item in state["approaches"].values()):
@@ -293,6 +393,15 @@ def select_approach(state: dict[str, Any]) -> tuple[str | None, str]:
     current = state["last_served"]
     others_waiting = len(eligible_ids) > 1
     cap = state["policy"]["max_consecutive_quanta"]
+    adaptive = state["policy"].get("mode") == "adaptive"
+    candidates = eligible_ids
+    if adaptive and others_waiting and state["consecutive"].get(current, 0) >= cap:
+        candidates = [item for item in eligible_ids if item != current]
+    profiles = {item: approach_priority(state, item) for item in candidates} if adaptive else {}
+    scheduling = state.get("scheduling", {})
+    if adaptive and scheduling.get("quanta_since_exploration", 0) >= EXPLORATION_INTERVAL - 1:
+        speculative = [item for item in candidates if not profiles[item]["affected_routes"]]
+        return (speculative or candidates)[0], "protected_exploration"
     if (
         others_waiting
         and current in eligible_ids
@@ -300,10 +409,32 @@ def select_approach(state: dict[str, Any]) -> tuple[str | None, str]:
         and state["consecutive"].get(current, 0) < cap
     ):
         return current, "follow_through"
+    if adaptive:
+        unserved = [item for item in candidates if _approach(state, item).get("protect_until_served")]
+        if unserved:
+            return unserved[0], "first_service"
+        waiting = scheduling.get("eligible_wait", {})
+        limit = max(EXPLORATION_INTERVAL, len(eligible_ids) * cap)
+        overdue = [item for item in candidates if waiting.get(item, 0) >= limit]
+        if overdue:
+            return overdue[0], "bounded_wait"
+        best = max(candidates, key=lambda item: profiles[item]["score"])
+        if profiles[best]["score"] > 0:
+            return best, "root_progress"
+        return candidates[0], "oldest_eligible"
     return eligible_ids[0], "oldest_eligible"
 
 
-def mark_served(state: dict[str, Any], approach_id: str) -> None:
+def mark_served(state: dict[str, Any], approach_id: str, *, admitted: bool = False) -> None:
+    """Record service; allocation counters advance only at the admission boundary."""
+    if admitted and state["policy"].get("mode") == "adaptive":
+        scheduling = state.setdefault("scheduling", {})
+        scheduling["quanta_since_exploration"] = (scheduling.get("quanta_since_exploration", 0) + 1) % EXPLORATION_INTERVAL
+        previous = scheduling.get("eligible_wait", {})
+        scheduling["eligible_wait"] = {
+            item: 0 if item == approach_id else previous.get(item, 0) + 1
+            for item in state["service_queue"] if eligible(state, item)
+        }
     if state["last_served"] == approach_id:
         state["consecutive"][approach_id] = state["consecutive"].get(approach_id, 0) + 1
     else:
@@ -516,6 +647,7 @@ def resume_packet(state: dict[str, Any], approach_id: str) -> dict[str, Any]:
         "next_step": approach.get("next_operation", ""),
         "root_binding": state["root"]["binding"],
         "cost": state["history"]["costs_by_approach"].get(approach_id, {}),
+        "scheduling_priority": approach_priority(state, approach_id),
     }
 
 

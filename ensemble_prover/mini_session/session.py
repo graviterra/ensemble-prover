@@ -57,6 +57,12 @@ from typing import (
     Tuple,
 )
 
+from ensemble_prover.root_progress_scheduler import (
+    SPECULATIVE_WORK_TYPES,
+    native_exploration_due,
+    native_service_state,
+    root_blocker_profiles,
+)
 from ensemble_prover.root_finalization import (
     RootFinalizationCandidate,
     _RootProofFinalizationReceiptParticipant,
@@ -25899,6 +25905,12 @@ class MiniSession:
         candidate: RootFinalizationCandidate,
         result: Any,
     ) -> None:
+        from ensemble_prover.helper_utilization import record_runner_helper_utilization
+        record_runner_helper_utilization(
+            self.lean, self.dossier, statement=candidate.target_statement,
+            proof=result.proof, preamble=self.acceptance_preamble(),
+            lemmas=candidate.replay_helpers, consumer_kind="root",
+        )
         route_contract_status = dict(getattr(result, "route_contract_status", {}) or {})
         certificate = dict(getattr(self.dossier, "root_proof_certificate", {}) or {})
         durable_replay_helpers = [
@@ -28999,6 +29011,22 @@ class MiniSession:
         calibrate_action_value = not (
             bool(metadata.get("scheduler_neutral")) or preserve_action_budget
         )
+        # A committed formal-search quantum performs mathematical work even
+        # though its neutral outcome stays out of success-rate calibration.
+        # Debit its exploration slot before the next live context generation
+        # can be promoted again. Acceptance retries carry invocation metrics
+        # too, but do not carry a newly committed quantum generation.
+        formal_generation = metadata.get("formal_quantum_generation")
+        completed_formal_quantum = bool(
+            outcome.action_id == "formal_state_search"
+            and type(formal_generation) is int
+            and formal_generation > 0
+            and metadata.get("formal_invocations") == 1
+        )
+        if calibrate_action_value or (
+            completed_formal_quantum and not preserve_action_budget
+        ):
+            self._record_native_frontier_service(str(outcome.action_id or ""))
         if isinstance(observations, dict) and calibrate_action_value:
             action_observation = observations.setdefault(
                 str(outcome.action_id or "unknown"),
@@ -33682,29 +33710,24 @@ class MiniSession:
         return list(items or [])
 
     def _rank_frontier_items_for_dispatch(self, items: List[Any]) -> List[Any]:
-        """Rank by expected root unlock per measured second.
+        """Rank advisory root blockers and reserve actual service for exploration.
 
-        Ready assembly is always first.  Every eighth scheduler iteration keeps
-        the existing order among non-assembly work as a bounded exploration
-        reserve; all other iterations compare lanes globally instead of letting
-        static work-type order dominate root value.
+        Ranking cannot spend the reserve. Accounting advances only when an
+        executable action consumes its normal budget in ``apply``.
         """
 
         ordered = list(items or [])
         if not ordered:
             return ordered
-        exploration_interval = 8
-        exploration = (
-            int(self.iteration or 0) % exploration_interval == exploration_interval - 1
-        )
-
         dossier = getattr(self, "dossier", None)
+        exploration = native_exploration_due(
+            getattr(dossier, "native_scheduler_state", {})
+        )
         observations = dict(getattr(dossier, "action_value_observations", {}) or {})
         graph = getattr(dossier, "proof_graph", None)
-        graph_nodes = getattr(graph, "nodes", {}) if graph is not None else {}
-        graph_edges = (
-            list(getattr(graph, "edges", ()) or ()) if graph is not None else []
-        )
+        blocker_profiles = root_blocker_profiles(graph)
+        item_profiles: Dict[int, Dict[str, Any]] = {}
+        quoted_actions: Dict[int, Any] = {}
         action_dispatch_order: Dict[int, Tuple[str, int]] = {}
         target_counts: Dict[str, int] = {}
         for item in ordered:
@@ -33718,6 +33741,13 @@ class MiniSession:
                 graph_record["root_value_scheduler"] = dict(payload)
             elif isinstance(item, dict):
                 item["root_value_scheduler"] = dict(payload)
+
+        def finite_number(value: Any, default: float = 0.0) -> float:
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return default
+            return number if math.isfinite(number) else default
 
         def rank(item: Any, stable_index: int) -> Tuple[float, int]:
             work_type = str(self._work_item_field(item, "work_type", "") or "").strip()
@@ -33749,25 +33779,33 @@ class MiniSession:
             if record is None and isinstance(item, dict):
                 record = item
             record = dict(record or {}) if isinstance(record, dict) else {}
-            route_id = str(record.get("route_id") or "").strip()
-            route_open_siblings = 0
-            if route_id and isinstance(graph_nodes, dict):
-                route_open_siblings = sum(
-                    1
-                    for edge in graph_edges
-                    if edge.source == route_id
-                    and str(edge.kind or "").startswith("route_")
-                    and str(getattr(graph_nodes.get(edge.target), "status", "") or "")
-                    != "proved"
-                )
-            try:
-                priority = float(self._work_item_field(item, "priority", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                priority = 0.0
+            node_ids = [
+                str(self._work_item_field(item, field, "") or "")
+                for field in ("node_id", "graph_node_id")
+            ]
+            node_ids.extend(
+                str(record.get(key) or "")
+                for key in ("claim_id", "obligation_id", "variant_id", "node_id")
+            )
+            profile = max(
+                (
+                    blocker_profiles[node_id]
+                    for node_id in node_ids
+                    if node_id in blocker_profiles
+                ),
+                key=lambda value: value["completion_bonus"],
+                default={},
+            )
+            item_profiles[id(item)] = profile
+            quoted_actions[id(item)] = action
+            route_id = str(
+                profile.get("explanation_route_id")
+                or next(iter(profile.get("root_consumer_ids", ())), "")
+            )
+            route_open_siblings = int(profile.get("open_and_siblings", 0))
+            priority = finite_number(self._work_item_field(item, "priority", 0.0))
             root_unlock = max(0.05, min(1.5, priority / 100.0))
-            if route_id:
-                root_unlock += 0.35
-                root_unlock += 0.3 / max(1, route_open_siblings)
+            root_unlock += float(profile.get("completion_bonus", 0.0))
             root_unlock += {
                 "materialize_replay_source": 0.7,
                 "route_replan": 0.45,
@@ -33782,20 +33820,21 @@ class MiniSession:
                 "child_llm_prove": 0.12,
                 "root_repair": 0.1,
             }.get(work_type, 0.1)
-            observed = dict(observations.get(action_id) or {})
-            attempts = max(0.0, float(observed.get("attempts", 0.0) or 0.0))
+            raw_observed = observations.get(action_id)
+            observed = raw_observed if isinstance(raw_observed, dict) else {}
+            attempts = max(0.0, finite_number(observed.get("attempts", 0.0)))
             successes = max(
                 0.0,
-                float(observed.get("root_progress", 0.0) or 0.0),
+                min(attempts, finite_number(observed.get("root_progress", 0.0))),
             )
             measured_seconds = max(
                 0.0,
-                float(observed.get("seconds", 0.0) or 0.0),
+                finite_number(observed.get("seconds", 0.0)),
             )
             success_rate = (successes + 1.0) / (attempts + 2.0)
             fallback_cost = max(
                 0.05,
-                float(getattr(action, "cost_estimate_s", 10.0) or 10.0),
+                finite_number(getattr(action, "cost_estimate_s", 10.0), 10.0),
             )
             expected_cost = (
                 measured_seconds / attempts
@@ -33828,8 +33867,14 @@ class MiniSession:
             annotate(
                 item,
                 {
-                    "schema_version": 1,
-                    "mode": "exploration" if exploration else "root_value",
+                    "schema_version": 2,
+                    "mode": "exploration_due" if exploration else "root_value",
+                    "heuristic_only": True,
+                    "blocker_profile": copy.deepcopy(profile),
+                    "root_connection": "declared_requirement"
+                    if profile
+                    else "unclassified",
+                    "exploration_reserved": False,
                     "action_id": action_id,
                     "root_consumer_id": route_id,
                     "open_and_siblings": route_open_siblings,
@@ -33884,7 +33929,85 @@ class MiniSession:
                 ranked_action_items,
             ):
                 ranked[position] = item
-        if not exploration:
+        exploration_winner = None
+        if exploration:
+            best_dispatch_rank: Dict[str, int] = {}
+            for action_id, dispatch_rank in action_dispatch_order.values():
+                best_dispatch_rank[action_id] = min(
+                    dispatch_rank,
+                    best_dispatch_rank.get(action_id, dispatch_rank),
+                )
+            eligible_speculation = []
+            for item in ranked:
+                action = quoted_actions.get(id(item))
+                if action is None:
+                    continue
+                action_id = str(getattr(action, "id", "") or "")
+                dispatch_order = action_dispatch_order.get(id(item))
+                if (
+                    dispatch_order is not None
+                    and dispatch_order[1] > best_dispatch_rank[action_id]
+                ):
+                    continue
+                work_type = str(self._work_item_field(item, "work_type", "") or "")
+                if work_type not in SPECULATIVE_WORK_TYPES or item_profiles.get(
+                    id(item)
+                ):
+                    continue
+                # Probe/tactic lanes may temporarily own a paid proof awaiting
+                # verifier replay. Servicing that proof is not new exploration.
+                nodes = getattr(getattr(self, "proof_state", None), "nodes", {})
+                node_id = str(self._work_item_field(item, "node_id", "") or "")
+                node = nodes.get(node_id) if isinstance(nodes, dict) else None
+                pending = getattr(node, "pending_helper_acceptance", {})
+                if (
+                    isinstance(pending, dict)
+                    and str(pending.get("helper_block") or "").strip()
+                ):
+                    continue
+                eligible_speculation.append(item)
+            if eligible_speculation:
+                # Round-robin eligible mathematical work across completed
+                # exploration services, so one cheap speculative lane does
+                # not absorb the entire reserve.
+                state = getattr(dossier, "native_scheduler_state", {})
+                raw_count = (
+                    state.get("exploration_services", 0)
+                    if isinstance(state, dict)
+                    else 0
+                )
+                count = (
+                    raw_count
+                    if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+                    else 0
+                )
+                exploration_winner = eligible_speculation[
+                    max(0, count) % len(eligible_speculation)
+                ]
+                record = self._work_item_field(exploration_winner, "graph_record", None)
+                if not isinstance(record, dict) and isinstance(
+                    exploration_winner, dict
+                ):
+                    record = exploration_winner
+                if isinstance(record, dict):
+                    record["root_value_scheduler"]["exploration_reserved"] = True
+                    record["root_value_scheduler"]["mode"] = "exploration"
+                assemblies = [
+                    item
+                    for item in ranked
+                    if str(self._work_item_field(item, "work_type", ""))
+                    in {"assembly", "assemble_route"}
+                ]
+                ranked = [
+                    *assemblies,
+                    exploration_winner,
+                    *[
+                        item
+                        for item in ranked
+                        if item is not exploration_winner and item not in assemblies
+                    ],
+                ]
+        if exploration_winner is None:
 
             def durable_retry_count(value: Any) -> int:
                 if isinstance(value, bool):
@@ -33965,22 +34088,32 @@ class MiniSession:
                         ],
                     ]
             return ranked
-        # Exploration must never starve a Lean-ready root assembly. Preserve
-        # the frontier's prior order only within the two safety classes.
-        return [
-            *[
-                item
-                for item in ordered
-                if str(self._work_item_field(item, "work_type", "") or "").strip()
-                in {"assembly", "assemble_route"}
-            ],
-            *[
-                item
-                for item in ordered
-                if str(self._work_item_field(item, "work_type", "") or "").strip()
-                not in {"assembly", "assemble_route"}
-            ],
-        ]
+        return ranked
+
+    def _record_native_frontier_service(self, action_id: str) -> None:
+        """Debit advisory exploration only after actual normal-budget service."""
+        if str(self.selected_work_item_action_id or "") != str(action_id or ""):
+            return
+        record = dict(self.selected_work_item_record or {})
+        if str(record.get("work_type") or "") in {"assembly", "assemble_route"}:
+            return
+        scheduler = record.get("root_value_scheduler")
+        if not isinstance(scheduler, dict):
+            graph_record = record.get("graph_record")
+            scheduler = (
+                graph_record.get("root_value_scheduler")
+                if isinstance(graph_record, dict)
+                else None
+            )
+        if not isinstance(scheduler, dict) or scheduler.get("action_id") != action_id:
+            return
+        dossier = getattr(self, "dossier", None)
+        if dossier is None:
+            return
+        dossier.native_scheduler_state = native_service_state(
+            getattr(dossier, "native_scheduler_state", {}),
+            exploration=scheduler.get("exploration_reserved") is True,
+        )
 
     def _retire_unserviceable_frontier_prefix(
         self,

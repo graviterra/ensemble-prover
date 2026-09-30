@@ -20093,6 +20093,13 @@ class ConversationTurnAction:
                     graph_native_error_type = ""
                     graph_native_attempt_proof = proof
                     if helper_record is not None:
+                        from ensemble_prover.helper_utilization import record_runner_helper_utilization
+                        from ensemble_prover.proof_state_executor import _proof_state_check_preamble
+                        record_runner_helper_utilization(
+                            session.lean, dossier, statement=graph_native_goal_statement, proof=proof,
+                            preamble=_proof_state_check_preamble(conv), lemmas=check_lemmas,
+                            consumer_kind="helper",
+                        )
                         _stage_verified_helper_receipt(
                             session,
                             helper_record,

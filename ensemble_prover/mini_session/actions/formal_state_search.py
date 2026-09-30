@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import time
+from dataclasses import replace
 from typing import Any, ClassVar, Dict, FrozenSet, Optional, Tuple
 
 from ensemble_prover.lean_parser import LeanGoalState, canonical_error_type
@@ -1543,13 +1544,23 @@ class FormalStateSearchAction:
                     started=started,
                     nodes_expanded=run.result.nodes_expanded,
                 )
-            return await self._accept_child_candidate(
+            outcome = await self._accept_child_candidate(
                 session,
                 key=key,
                 node_id=node_id,
                 node=node,
                 record=solved_record,
                 started=started,
+            )
+            # This acceptance followed fresh mathematical search. Keep the
+            # service receipt on this outcome only: a later verifier replay
+            # of solved_record must not spend another exploration slot.
+            return replace(
+                outcome,
+                metadata={
+                    **outcome.metadata,
+                    "formal_quantum_generation": generation,
+                },
             )
 
         live = bool(

@@ -8050,6 +8050,7 @@ class ProofDossier:
     # Append-only cross-subsystem proof-path events. The proof graph remains
     # authoritative; this ledger makes strategy/route/claim/attempt/fact
     # lineage queryable without reconstructing it from unrelated identifiers.
+    helper_utilization_observations: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     proof_lineage_events: List[Dict[str, Any]] = field(default_factory=list)
     proof_lineage_event_ids: Set[str] = field(default_factory=set)
     # Content-owning, descriptive lifecycle aggregates for mathematical
@@ -8068,6 +8069,8 @@ class ProofDossier:
     action_value_observations: Dict[str, Dict[str, float]] = field(
         default_factory=dict
     )
+    # Advisory native exploration accounting; never proof or budget authority.
+    native_scheduler_state: Dict[str, int] = field(default_factory=dict)
     proposed_helpers: Dict[str, ProposedHelper] = field(default_factory=dict)
     attempts: List[ProofAttemptRecord] = field(default_factory=list)
     scratch: List[ScratchRecord] = field(default_factory=list)
@@ -14550,6 +14553,71 @@ class ProofDossier:
             default=str,
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    def record_helper_utilization(
+        self, observation: Any, *, statement: str, proof: str,
+        consumer_kind: str, environment_hash: str,
+    ) -> bool:
+        """Record checked-term occurrences, never lexical/context participation."""
+        from .helper_utilization import HelperUsageObservation, source_digest
+
+        if (
+            not isinstance(observation, HelperUsageObservation)
+            or not observation.observed or not observation.complete
+            or consumer_kind not in {"root", "helper", "intermediate"}
+            or observation.statement_hash != source_digest(statement)
+            or observation.proof_hash != source_digest(proof)
+            or environment_hash != str(self.current_lean_environment_hash or "")
+        ):
+            return False
+        helpers = {}
+        direct = set(observation.direct_constants)
+        reachable = set(observation.reachable_constants)
+        constants_direct = {canonical_lean_identifier(n) for n in direct}
+        constants_reachable = {canonical_lean_identifier(n) for n in reachable}
+        declarations = {canonical_lean_identifier(n) for n in observation.declarations}
+        bindings = dict(observation.helper_bindings)
+        for block in observation.lemma_sources:
+            name = helper_decl_name(block)
+            if not name:
+                continue
+            helper = self.verified_helpers.get(name)
+            if helper is None or source_digest(helper.source) != source_digest(block):
+                continue
+            resolved = bindings.get(name)
+            if not resolved:
+                continue
+            canonical = canonical_lean_identifier(resolved)
+            # Lean resolves aliases, private declarations and namespace context.
+            # Never guess a binding from a matching suffix or printed short name.
+            if canonical not in declarations:
+                continue
+            helpers[name] = {
+                "source_hash": source_digest(block),
+                "usage": "direct" if canonical in constants_direct else "transitive" if canonical in constants_reachable else "unused",
+            }
+        if not helpers:
+            return False
+        payload = {
+            "schema": 1, "consumer_kind": consumer_kind,
+            "statement_hash": observation.statement_hash,
+            "proof_hash": observation.proof_hash,
+            "preamble_hash": observation.preamble_hash,
+            "lemma_source_hashes": [source_digest(block) for block in observation.lemma_sources],
+            "environment_hash": environment_hash, "helpers": helpers,
+        }
+        consumer = {k: v for k, v in payload.items() if k != "helpers"}
+        key = source_digest(json.dumps(consumer, sort_keys=True, separators=(",", ":")))
+        if self.helper_utilization_observations.get(key) == payload:
+            return False
+        self.helper_utilization_observations[key] = payload
+        while len(self.helper_utilization_observations) > 4096:
+            self.helper_utilization_observations.pop(next(iter(self.helper_utilization_observations)))
+        return True
+
+    def helper_utilization_summary(self) -> Dict[str, Any]:
+        from .helper_utilization import utilization_summary
+        return utilization_summary(self.helper_utilization_observations, self.verified_helpers)
 
     def record_root_proof_finalization_receipt(self) -> str:
         receipt_hash = self.root_proof_finalization_receipt_hash()
@@ -21168,6 +21236,7 @@ class ProofDossier:
                 str(name): asdict(delta)
                 for name, delta in self.verified_helper_progress_deltas.items()
             },
+            "helper_utilization_observations": copy.deepcopy(self.helper_utilization_observations),
             "proof_lineage_events": clone_json_value(
                 self.proof_lineage_events,
                 label="dossier proof lineage events",
@@ -21183,6 +21252,9 @@ class ProofDossier:
             "semantic_fact_registry": clone_json_value(
                 self.semantic_fact_registry,
                 label="dossier semantic fact registry",
+            ),
+            "native_scheduler_state": clone_json_value(
+                self.native_scheduler_state, label="dossier native scheduler state",
             ),
             "action_value_observations": clone_json_value(
                 self.action_value_observations,
@@ -21900,6 +21972,11 @@ class ProofDossier:
                 for delta in [_coerce_verified_helper_progress_delta(raw)]
                 if str(name or "").strip() and delta is not None
             },
+            helper_utilization_observations=(
+                copy.deepcopy(data.get("helper_utilization_observations", {}))
+                if trusted_execution_restore and isinstance(data.get("helper_utilization_observations", {}), dict)
+                else {}
+            ),
             proof_lineage_events=[
                 copy.deepcopy(raw)
                 for raw in list(data.get("proof_lineage_events") or [])
@@ -21922,6 +21999,12 @@ class ProofDossier:
                     data.get("semantic_fact_registry") or {}
                 ).items()
                 if str(key or "").strip() and isinstance(value, dict)
+            },
+            native_scheduler_state={
+                str(key): value for key, value in (
+                    data.get("native_scheduler_state", {}).items()
+                    if isinstance(data.get("native_scheduler_state"), dict) else ()
+                ) if isinstance(value, int) and not isinstance(value, bool) and value >= 0
             },
             action_value_observations={
                 str(key or "").strip(): {

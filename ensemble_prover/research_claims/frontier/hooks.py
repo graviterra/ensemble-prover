@@ -537,7 +537,7 @@ def activate_prepared(
         )
     except FrontierRefusal as exc:
         _yield(exc.reason, allocation_id=allocation["allocation_id"])
-    mark_served(campaign, approach_id)
+    mark_served(campaign, approach_id, admitted=True)
     policy = state["policy"]
     available = (
         run["max_requests"]
@@ -752,7 +752,7 @@ def authorize_control_admission(
         )
     except FrontierRefusal as exc:
         _yield("paused_operational" if exc.reason == "lane_paused" else exc.reason)
-    mark_served(campaign, approach_id)
+    mark_served(campaign, approach_id, admitted=True)
     approach["admitted_consumer_id"] = job["job_id"]
     approach.pop("admitted_allocation_id", None)
     job["frontier_permit_consumed"] = True
@@ -1546,12 +1546,20 @@ def adaptive_context(controller: Any, job: dict[str, Any]) -> dict[str, Any]:
     if mode_of(state) != "adaptive":
         return {}
     approach_id = job.get("frontier_approach_id")
-    if not approach_id:
-        return {"frontier_research": {"mode": "adaptive"}}
     campaign = load_campaign(controller.store, state["owner_id"])
-    if campaign is None or approach_id not in campaign["approaches"]:
+    if campaign is None:
         return {"frontier_research": {"mode": "adaptive", "unavailable": True}}
-    from .approaches import resume_packet
+    from .approaches import eligible, resume_packet
+
+    portfolio = [
+        {"approach_id": item, "method": campaign["approaches"][item].get("method", ""),
+         "question": campaign["questions"][campaign["approaches"][item]["question_id"]]["uncertainty"]}
+        for item in campaign["service_queue"] if eligible(campaign, item)
+    ]
+    if not approach_id:
+        return {"frontier_research": {"mode": "adaptive", "portfolio": portfolio}}
+    if approach_id not in campaign["approaches"]:
+        return {"frontier_research": {"mode": "adaptive", "unavailable": True}}
 
     approach = campaign["approaches"][approach_id]
     question = campaign["questions"][approach["question_id"]]
@@ -1561,6 +1569,7 @@ def adaptive_context(controller: Any, job: dict[str, Any]) -> dict[str, Any]:
     ]
     return {"frontier_research": {
         "mode": "adaptive",
+        "portfolio": portfolio,
         "resume": resume_packet(campaign, approach_id),
         "question": question,
         "tools": campaign["manifest"],

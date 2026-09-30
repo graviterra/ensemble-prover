@@ -229,7 +229,8 @@ class FrontierOwner:
             question = bind_question(
                 campaign, approach_id=approach["approach_id"], uncertainty=directive["first_uncertain_inference"],
                 why=directive["rationale"], scope={**previous["scope"], "next_question": directive["next_question"],
-                                                 "discriminating_check": directive["discriminating_check"]},
+                                                 "discriminating_check": directive["discriminating_check"],
+                                                 "competing_approach_ids": directive.get("competing_approach_ids", [])},
                 operations=previous["admissible_operations"], changed=True,
             )
             approach["next_operation"] = directive["discriminating_check"]

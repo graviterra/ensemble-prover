@@ -31,6 +31,10 @@ checkpoint and conclude with:
  "discriminating_check":"calculation, derivation, or source check to execute",
  "avoid":"unsupported assumptions and exhausted routes to avoid"}.
 This action allocates a new investigation; it cannot establish truth or falsity.
+When the check distinguishes competing approaches, optionally include
+"competing_approach_ids": ["approach-id", "other-approach-id"] from the frontier
+portfolio. Explain how the possible outcomes separate those approaches in the
+rationale. This is a scheduling hint, never evidence of mathematical progress.
 Use inspected source content, precise quantifiers and useful prior work. Do not
 request another generic summary or repeat a prior assignment under a new name.
 """
@@ -603,6 +607,12 @@ class ResearchControl:
         if job.get("research_control", {}).get("closed"):
             raise ValueError("the assigned allocation has already ended")
         directive = {key: action[key] for key in REORIENTATION_FIELDS}
+        if "competing_approach_ids" in action:
+            competitors = action["competing_approach_ids"]
+            if (not isinstance(competitors, list) or len(competitors) > 32
+                    or any(not isinstance(item, str) or not item.strip() for item in competitors)):
+                raise ValueError("competing_approach_ids must contain at most 32 nonempty string IDs")
+            directive["competing_approach_ids"] = list(dict.fromkeys(competitors))
         from .frontier.hooks import mode_of
 
         progress_assessment = None

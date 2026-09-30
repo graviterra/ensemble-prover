@@ -143,6 +143,9 @@ _NON_PROOF_BARE_TYPE_HEADS = frozenset(
 _LOWERCASE_PROOF_APPLICATION_HEADS = frozenset(
     {"absurd", "cast", "congr", "funext", "id", "mp", "propext"}
 )
+_BUILTIN_PROOF_ARGUMENTS = _LOWERCASE_PROOF_APPLICATION_HEADS | {
+    "rfl", "trivial", "pure",
+}
 
 
 def _is_plausible_lean_symbolic_atom(
@@ -188,6 +191,20 @@ def _has_plausible_lean_proof_head(atoms: Sequence[str]) -> bool:
     if not atoms:
         return False
     raw_head = atoms[0]
+    # Case-sensitive keyword dispatch must not let capitalized prose fall
+    # through as a generic application (or a one-word proof such as "Rfl").
+    # This is a conservative fallback filter, not Lean name resolution:
+    # qualified and quoted names remain explicit ways to refer to constants.
+    # By/Do retain their argument-evidence checks below.
+    if (
+        raw_head not in {"By", "Do"}
+        and raw_head != raw_head.lower()
+        and raw_head.lower() in {
+            "by", "fun", "show", "calc", "match", "rfl", "trivial",
+            "have", "if", "let", "nomatch", "do",
+        }
+    ):
+        return False
     unqualified = raw_head.lstrip("@").split(".", 1)[0]
     normalized = unqualified.lower().rstrip("!?;")
     if (
@@ -212,6 +229,16 @@ def _has_plausible_lean_proof_head(atoms: Sequence[str]) -> bool:
 
     if has_proof_evidence(raw_head):
         return True
+    # Capitalized ``By`` and ``Do`` are ordinary Lean names, not keywords.
+    # Their first argument must provide proof evidence: a later proof word
+    # must not rescue English such as "Do not use rfl".
+    if raw_head in {"By", "Do"}:
+        argument = atoms[1]
+        return bool(
+            has_proof_evidence(argument)
+            or argument in _BUILTIN_PROOF_ARGUMENTS
+            or re.fullmatch(r"h(?:[p-z][0-9_]*|[A-Z0-9_].*)?", argument)
+        )
     has_hypothesis_argument = any(
         re.fullmatch(r"h(?:[p-z][0-9_]*|[A-Z0-9_].*)?", atom)
         for atom in atoms[1:]
@@ -600,7 +627,9 @@ def _is_plausible_main_proof(
     if s.startswith("⟨") and s.endswith("⟩"):
         return bool(s[1:-1].strip())
     lowered = s.lower()
-    head = lowered.split(None, 1)[0]
+    # Lean keywords are case-sensitive; English "By contradiction" must not
+    # enter the tactic-body path merely because its first word was lowercased.
+    head = s.split(None, 1)[0]
     if head == "fun":
         return "=>" in s or "↦" in s
     if head == "show":

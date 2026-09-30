@@ -21091,6 +21091,7 @@ async def run_mini_recursive_attempt(
             helpers=attempt_dossier.verified_helper_blocks(),
             success_attempt=success_attempt,
         )
+        usage_root_replay_helpers = list(replay_helpers)
         helper_names = [
             name
             for block in replay_helpers
@@ -21160,6 +21161,7 @@ async def run_mini_recursive_attempt(
                     allow_official_answer_visibility=allow_official_answer_visibility,
                     official_answer_payload_present=official_answer_payload_present,
                 )
+                usage_root_replay_helpers = list(llm_replay_helpers)
                 llm_helper_names = [
                     name
                     for block in llm_replay_helpers
@@ -21309,6 +21311,13 @@ async def run_mini_recursive_attempt(
                             + str(finalization.verdict or "unknown")
                         ),
                     )
+    if final_result.ok and final_result.proof and not suppress_root_solved:
+        from .helper_utilization import record_runner_helper_utilization
+        record_runner_helper_utilization(
+            lean, attempt_dossier, statement=root_statement, proof=final_result.proof,
+            preamble=lean_check_preamble, lemmas=usage_root_replay_helpers,
+            consumer_kind="root",
+        )
     if pending_root_close_promotion is not None:
         pending_statement, pending_proof = pending_root_close_promotion
         if final_result.ok and final_result.proof:
@@ -29554,6 +29563,7 @@ async def run_mini_recursive_driver(
                 deprioritized_claim_keys=(),
                 provisional_root_claim_keys=provisional_root_claim_keys,
                 bottleneck_claim=plan.bottleneck_claim,
+                exploration_slot=pass_index % 8 == 0,
             )
         )
         plan_admission_migrated = False
@@ -32005,6 +32015,12 @@ async def run_mini_recursive_driver(
                         **contract_evidence,
                     )
                     if accepted:
+                        from .helper_utilization import record_runner_helper_utilization
+                        record_runner_helper_utilization(
+                            lean, dossier, statement=variant.statement, proof=tactic_result.proof,
+                            preamble=current_lean_check_preamble(), lemmas=claim_replay_helpers,
+                            consumer_kind="helper",
+                        )
                         stats.claim_tactic_solved += 1
                         stats.helpers_accepted += 1
                         solved_this_claim = True
@@ -32481,6 +32497,12 @@ async def run_mini_recursive_driver(
                         route_environment_hash = route_environment_hash_before_promotion
                         route_identity_lifecycle_context = route_lifecycle_before_promotion
                     if accepted:
+                        from .helper_utilization import record_runner_helper_utilization
+                        record_runner_helper_utilization(
+                            lean, dossier, statement=variant.statement, proof=proof,
+                            preamble=current_lean_check_preamble(), lemmas=claim_replay_helpers,
+                            consumer_kind="helper",
+                        )
                         if claim_environment_promoted:
                             retain_promoted_claim_bindings(
                                 route_environment_hash_before_promotion,
@@ -40314,7 +40336,13 @@ def _prioritize_claims(
     deprioritized_claim_keys: Sequence[str] = (),
     provisional_root_claim_keys: Sequence[str] = (),
     bottleneck_claim: str = "",
+    exploration_slot: bool = False,
 ) -> list[MiniSubgoalClaim]:
+    """Order a fresh queue using declared dependencies, never proof evidence.
+
+    A reserved speculative slot consumes the existing helper cap. Saved queues
+    bypass this function, so resumption cannot replace an admitted prerequisite.
+    """
     items = list(claims or ())
     cap = max(1, int(max_claims or 1))
     deprioritized = {
@@ -40329,6 +40357,24 @@ def _prioritize_claims(
     bottleneck_names = _bottleneck_dependency_names(
         items, bottleneck_claim, root_connected_names=root_connected_names,
     )
+    # Plan-local names describe intended consumers only. These sets confer no
+    # checked reduction, proof credit, or permission to skip a dependency.
+    root_consumers: dict[str, set[str]] = {}
+    provisional = set(provisional_root_claim_keys)
+    for root in items:
+        if root.role != "root_assembly" or _dependency_contract_suspension_key(root) in provisional:
+            continue
+        pending = list(root.dependencies)
+        visited: set[str] = set()
+        while pending:
+            name = pending.pop()
+            if name in visited:
+                continue
+            visited.add(name)
+            if name in name_to_index:
+                root_consumers.setdefault(name, set()).add(root.name)
+                pending.extend(items[name_to_index[name]].dependencies)
+    exploration_pending = bool(exploration_slot)
     remaining = list(enumerate(items))
     scheduled_names: set[str] = set()
     ordered: list[MiniSubgoalClaim] = []
@@ -40352,7 +40398,23 @@ def _prioritize_claims(
         connected_ready = [
             item for item in ready if str(item[1].name or "") in root_connected_names
         ]
-        if connected_ready:
+        ready_roots = [item for item in ready if item[1] is selected_root]
+        speculative_ready = [
+            item for item in ready
+            if item[1].role != "root_assembly"
+            and not root_consumers.get(item[1].name)
+            and helper_count < cap
+        ]
+        # Long fresh queues protect the same opportunity within their own
+        # helper cap; short queues can receive a carried pass-level slot.
+        # Scheduling here allocates positions, not proof credit or new budget.
+        exploration_pending = exploration_pending or helper_count % 8 == 7
+        exploring = exploration_pending and bool(speculative_ready) and not ready_roots
+        if ready_roots:
+            ready = ready_roots
+        elif exploring:
+            ready = speculative_ready
+        elif connected_ready:
             ready = connected_ready
         ready = [
             item
@@ -40380,7 +40442,7 @@ def _prioritize_claims(
             if item[1].name in bottleneck_names
             and _dependency_contract_suspension_key(item[1]) not in deprioritized
         ]
-        if focused_ready:
+        if focused_ready and not exploring:
             candidates = focused_ready
 
         def priority_key(item: tuple[int, MiniSubgoalClaim]) -> tuple[int, int]:
@@ -40388,9 +40450,14 @@ def _prioritize_claims(
             claim_key = _dependency_contract_suspension_key(item[1])
             if claim_key in deprioritized:
                 base_score += 1000
+            # Shared declared prerequisites receive a small bounded preference.
+            # This is deliberately weaker than explicit bottleneck focus.
+            base_score -= min(3, max(0, len(root_consumers.get(item[1].name, ())) - 1)) * 4
             return base_score, base_index
 
         best = min(candidates, key=priority_key)
+        if exploring:
+            exploration_pending = False
         remaining.remove(best)
         ordered.append(best[1])
         if str(getattr(best[1], "role", "helper") or "helper") != "root_assembly":

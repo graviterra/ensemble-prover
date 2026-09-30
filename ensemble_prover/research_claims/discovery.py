@@ -1077,7 +1077,7 @@ class DiscoveryLoop:
             else {"polarity"}
             if kind == "formalize"
             else {"path", "offset", "length"} if kind == "read_artifact"
-            else {"substantive_progress"} if kind == "research_reorientation"
+            else {"substantive_progress", "competing_approach_ids"} if kind == "research_reorientation"
             else set()
         )
         object_fields(

@@ -320,6 +320,9 @@ def _copy_dossier_contents(dst: ProofDossier, src: ProofDossier) -> None:
     dst.tool_metrics = copy.deepcopy(getattr(src, "tool_metrics", {}))
     dst.decl_applications = copy.deepcopy(src.decl_applications)
     dst.mini_recursive_runs = copy.deepcopy(src.mini_recursive_runs)
+    dst.helper_utilization_observations = copy.deepcopy(
+        getattr(src, "helper_utilization_observations", {}) or {}
+    )
     dst.proof_lineage_events = copy.deepcopy(
         getattr(src, "proof_lineage_events", []) or []
     )
@@ -329,6 +332,9 @@ def _copy_dossier_contents(dst: ProofDossier, src: ProofDossier) -> None:
     dst.proof_ideas = copy.deepcopy(getattr(src, "proof_ideas", {}) or {})
     dst.semantic_fact_registry = copy.deepcopy(
         getattr(src, "semantic_fact_registry", {}) or {}
+    )
+    dst.native_scheduler_state = copy.deepcopy(
+        getattr(src, "native_scheduler_state", {}) or {}
     )
     dst.action_value_observations = copy.deepcopy(
         getattr(src, "action_value_observations", {}) or {}

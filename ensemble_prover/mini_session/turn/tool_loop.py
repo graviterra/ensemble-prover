@@ -341,7 +341,9 @@ def _is_structural_finalizer_lean_term(
     if candidate.startswith("⟨") and candidate.endswith("⟩"):
         return bool(candidate[1:-1].strip())
     lowered = candidate.lower()
-    head = lowered.split(None, 1)[0]
+    # Lean keywords are case-sensitive; capitalized prose must not become a
+    # banked tactic proof that can replace a later provider failure.
+    head = candidate.split(None, 1)[0]
     if head == "fun":
         return "=>" in candidate or "↦" in candidate
     if head == "show":

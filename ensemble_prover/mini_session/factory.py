@@ -1536,6 +1536,9 @@ def _clone_dossier_for_session(supplied: ProofDossier) -> ProofDossier:
     dossier.tool_metrics = copy.deepcopy(getattr(supplied, "tool_metrics", {}))
     dossier.decl_applications = copy.deepcopy(supplied.decl_applications)
     dossier.mini_recursive_runs = copy.deepcopy(supplied.mini_recursive_runs)
+    dossier.helper_utilization_observations = copy.deepcopy(
+        getattr(supplied, "helper_utilization_observations", {}) or {}
+    )
     dossier.proof_lineage_events = copy.deepcopy(
         getattr(supplied, "proof_lineage_events", []) or []
     )
@@ -1548,6 +1551,9 @@ def _clone_dossier_for_session(supplied: ProofDossier) -> ProofDossier:
     )
     dossier.semantic_fact_registry = copy.deepcopy(
         getattr(supplied, "semantic_fact_registry", {}) or {}
+    )
+    dossier.native_scheduler_state = copy.deepcopy(
+        getattr(supplied, "native_scheduler_state", {}) or {}
     )
     dossier.action_value_observations = copy.deepcopy(
         getattr(supplied, "action_value_observations", {}) or {}

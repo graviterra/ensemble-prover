@@ -88,6 +88,8 @@ class AcceptanceGate:
     second_accepted_by_s: float = DEFAULT_SECOND_ACCEPTED_BY_S
     accepted: dict[str, float] = field(default_factory=dict)
     earliest_acceptance_monotonic: float | None = None
+    _accepted_monotonic: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _constructor_accepted: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.first_accepted_by_s = _acceptance_seconds(self.first_accepted_by_s)
@@ -95,6 +97,9 @@ class AcceptanceGate:
         if (self.first_accepted_by_s and self.second_accepted_by_s
                 and self.second_accepted_by_s < self.first_accepted_by_s):
             raise ValueError("second acceptance deadline must not precede the first")
+        # Constructor values retain their elapsed-time contract. Converting
+        # them to absolute timestamps could round a late value onto a deadline.
+        self._constructor_accepted = dict(self.accepted)
 
     def observe(self, record: Mapping[str, Any], *, now: float) -> bool:
         """Consume only committed proof receipts belonging to this attempt."""
@@ -120,26 +125,38 @@ class AcceptanceGate:
             valid_timestamp = False
         if not valid_timestamp:
             return False
-        elapsed = max(0.0, float(accepted_at) - self.start_monotonic)
         previous = self.accepted.get(identity)
-        self.accepted[identity] = (
-            elapsed if previous is None else min(previous, elapsed)
+        previous_timestamp = self._accepted_monotonic.get(identity)
+        self._accepted_monotonic[identity] = (
+            float(accepted_at) if previous_timestamp is None
+            else min(previous_timestamp, float(accepted_at))
+        )
+        self.accepted[identity] = min(
+            self._constructor_accepted.get(identity, math.inf),
+            max(0.0, self._accepted_monotonic[identity] - self.start_monotonic),
         )
         return previous is None
 
     def cutoff_reason(self, *, now: float) -> str | None:
-        elapsed = now - self.start_monotonic
-        if self.first_accepted_by_s and elapsed >= self.first_accepted_by_s and not any(
-            value <= self.first_accepted_by_s for value in self.accepted.values()
+        # Subtracting a fractional start can move an exact-deadline timestamp
+        # across the boundary. Keep cutoff and receipt comparisons absolute.
+        def accepted_by(duration: float, deadline: float) -> int:
+            return sum(
+                self._constructor_accepted.get(identity, math.inf) <= duration
+                or self._accepted_monotonic.get(identity, math.inf) <= deadline
+                for identity in self.accepted
+            )
+
+        first_deadline = self.start_monotonic + self.first_accepted_by_s
+        second_deadline = self.start_monotonic + self.second_accepted_by_s
+        if self.first_accepted_by_s and now >= first_deadline and not accepted_by(
+            self.first_accepted_by_s, first_deadline
         ):
             return "first_acceptance_deadline"
         if (
             self.second_accepted_by_s
-            and elapsed >= self.second_accepted_by_s
-            and sum(
-                value <= self.second_accepted_by_s for value in self.accepted.values()
-            )
-            < 2
+            and now >= second_deadline
+            and accepted_by(self.second_accepted_by_s, second_deadline) < 2
         ):
             return "second_acceptance_deadline"
         return None

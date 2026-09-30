@@ -46,6 +46,11 @@ from .domain import (
     get_oracle_domain_specific_tactics,
     get_oracle_family_order_for_domains,
 )
+from .helper_utilization import (
+    HelperUsageObservation,
+    parse_helper_usage_observation,
+    strip_helper_usage_output,
+)
 from .lean_parser import (
     LeanDiagnostic,
     LeanOutput,
@@ -450,6 +455,72 @@ run_cmd do
         + audit_body
     )
     return compiled_audit + before, f"\nrun_cmd _root_.{audit_function}\n"
+
+
+def _check_helper_usage_blocks(
+    identity: str, goal_name: str, helper_names: Sequence[str],
+) -> tuple[str, str]:
+    """Observe the checked proof value without changing proof acceptance.
+
+    Traverse only current-module constants: imported declarations cannot depend
+    on freshly supplied helpers. The cap makes incomplete observations unknown.
+    """
+    from .nl_lean import _lean_string
+
+    function = f"ensemble_helper_usage_{identity}"
+    requested_names = "#[" + ", ".join(_lean_string(name) for name in helper_names) + "]"
+    before = f"""
+private def _root_.{function} : Lean.Elab.Command.CommandElabM Unit := do
+  try
+    let env ← Lean.getEnv
+    let localNames := env.constants.map₂.toList.map (·.1)
+    if localNames.length > 10000 then return
+    let goals := localNames.filter fun name => name.components.any (·.toString == "{goal_name}")
+    let goals := goals.filter fun name => name.getString! == "{goal_name}"
+    if goals.length != 1 then return
+    let some goal := env.checked.get.find? goals.head! | return
+    let value := match goal with
+      | .opaqueInfo v => some v.value
+      | .thmInfo v => some v.value
+      | .defnInfo v => some v.value
+      | _ => none
+    let some value := value | return
+    let direct := value.getUsedConstants
+    let localSet := localNames.foldl (fun set name => set.insert name) ({{}} : Lean.NameSet)
+    let mut pending := direct.toList
+    let mut seen : Lean.NameSet := {{}}
+    let mut reached : Array Lean.Name := #[]
+    let mut fuel := 10000
+    while !pending.isEmpty && fuel > 0 do
+      fuel := fuel - 1
+      let name := pending.head!
+      pending := pending.tail!
+      unless seen.contains name do
+        seen := seen.insert name
+        reached := reached.push name
+        if localSet.contains name then
+          if let some info := env.checked.get.find? name then
+            pending := info.getUsedConstantsAsSet.toList ++ pending
+    let mut bindings : Array Lean.Json := #[]
+    for requested in ({requested_names} : Array String) do
+      try
+        let .ok parsed := Lean.Parser.runParserCategory env `term requested | continue
+        unless parsed.isIdent do continue
+        let resolved ← Lean.resolveGlobalConstNoOverload parsed
+        if localSet.contains resolved then
+          bindings := bindings.push <| Lean.Json.mkObj [
+            ("requested", Lean.toJson requested),
+            ("resolved", Lean.toJson resolved.toString)]
+      catch _ => pure ()
+    Lean.logInfo ("ENSEMBLE_HELPER_USAGE:{identity}:" ++ (Lean.Json.mkObj [
+      ("bindings", Lean.Json.arr bindings),
+      ("complete", Lean.toJson pending.isEmpty),
+      ("declarations", Lean.toJson (localNames.map Lean.Name.toString)),
+      ("direct", Lean.toJson (direct.map Lean.Name.toString)),
+      ("reachable", Lean.toJson (reached.map Lean.Name.toString))]).compress)
+  catch _ => pure ()
+"""
+    return before, f"\nrun_cmd _root_.{function}\n"
 
 
 def _check_goal_audit_block(goal_name: str) -> str:
@@ -2525,6 +2596,7 @@ class LeanResult:
     generated_declaration_name: str = ""
     generated_goal_start_line: int = 0
     generated_lemma_line_spans: Tuple[Tuple[int, int], ...] = ()
+    helper_usage: Optional[HelperUsageObservation] = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -3804,6 +3876,7 @@ class LeanRunner:
 
     def __init__(self, cfg: LeanConfig, *, oracle_max_concurrent: int = 2):
         self.cfg = cfg
+        self._helper_usage_observations: dict[tuple[str, str, str, tuple[str, ...]], HelperUsageObservation] = {}
         self._oracle_max_concurrent = max(1, int(oracle_max_concurrent or 1))
         # Kept only for compatibility with captured pre-indirection runners.
         # New rotations publish through the stable generation ref; teardown
@@ -4338,6 +4411,7 @@ class LeanRunner:
                 async with self._inflight_exec_lock:
                     self._execution_environment_generation += 1
                     self._completed_exec.clear()
+                    getattr(self, "_helper_usage_observations", {}).clear()
             finally:
                 async with self._environment_transition_condition:
                     self._environment_transitioning = False
@@ -5287,6 +5361,12 @@ class LeanRunner:
                 )
             else:
                 delta_after = _check_goal_audit_block(goal_name)
+        usage_before, usage_after = ("", "")
+        if audit_requested and lemma_block:
+            usage_before, usage_after = _check_helper_usage_blocks(
+                hash_text(statement + "\0" + proof_code + "\0" + lemma_block), goal_name,
+                tuple(axiom_audit_names or ()),
+            )
         goal_line = (
             # ``check`` also supports constructive/non-Prop targets, so a
             # theorem declaration is not universally legal. ``opaque`` has
@@ -5351,6 +5431,7 @@ class LeanRunner:
             f"{head_universe_decl}"
             f"{heartbeat_option}"
             f"{target_witness}"
+            f"{usage_before}"
             f"{delta_before}"
         )
         lemma_block_start_line = (
@@ -5374,7 +5455,7 @@ class LeanRunner:
             audit_block = "\n" + "\n".join(
                 f"#print axioms {name}" for name in complete_audit_names
             ) + "\n"
-        content = f"{prefix}{scoped_block}{target_guard}{delta_after}{audit_block}"
+        content = f"{prefix}{scoped_block}{target_guard}{delta_after}{audit_block}{usage_after}"
         # 1-indexed line where the scoped block (set_option wrappers + example)
         # begins. ``Try this:`` suggestions on lines below this are accepted
         # by the parser; suggestions above are rejected as off-block linter
@@ -6025,6 +6106,7 @@ class LeanRunner:
     ) -> LeanResult:
         from .utils import normalize_classical_tactic_prefix
 
+        requested_proof_code = proof_code
         proof_code = normalize_classical_tactic_prefix(proof_code)
         # Stylistic warnings do not invalidate proofs by default. These include
         # suggestions to prefer simp over simpa, unused variables/arguments,
@@ -6045,6 +6127,8 @@ class LeanRunner:
             instance_default = getattr(self, "default_max_heartbeats", None)
             if isinstance(instance_default, int) and instance_default > 0:
                 max_heartbeats = instance_default
+        usage_key_at_start = self._helper_usage_key(statement, requested_proof_code, preamble_override, tuple(lemmas or ()))
+        self._helper_usage_observations.pop(usage_key_at_start, None)
         goal_name = f"goal_{short_id(statement + proof_code)}"
         audited_lemmas: list[str] = []
         anonymous_audit_names: list[str] = []
@@ -6169,6 +6253,15 @@ class LeanRunner:
                 generated_lemma_line_spans=lemma_line_spans,
             )
         returncode, out = execution.returncode, execution.output
+        usage_output = out
+        usage_marker_identity = hash_text(statement + "\0" + proof_code + "\0" + lemma_block)
+        cleaned_output = strip_helper_usage_output(
+            out, marker_identity=usage_marker_identity,
+        )
+        out = (
+            LeanOutput(cleaned_output, runtime_status=out.runtime_status)
+            if isinstance(out, LeanOutput) else cleaned_output
+        )
         parsed = parse_lean_output(
             out, returncode, goal_start_line=built.goal_start_line
         )
@@ -6274,8 +6367,22 @@ class LeanRunner:
                 self._full_check_ok_count += 1
             else:
                 self._full_check_fail_count += 1
+        observation = (
+            parse_helper_usage_observation(
+                usage_output, marker_identity=usage_marker_identity,
+                statement=statement, proof=requested_proof_code, lemmas=tuple(lemmas or ()),
+                preamble=self._resolve_preamble(preamble_override, proof_code=proof_code),
+            ) if ok and axiom_audit_ok is True else None
+        )
+        if observation is not None:
+            usage_key = self._helper_usage_key(statement, requested_proof_code, preamble_override, tuple(lemmas or ()))
+            if usage_key == usage_key_at_start:
+                self._helper_usage_observations[usage_key] = observation
+            while len(self._helper_usage_observations) > 128:
+                self._helper_usage_observations.pop(next(iter(self._helper_usage_observations)))
         return LeanResult(
             ok=ok,
+            helper_usage=observation,
             output=out,
             file_path=str(file_path or ""),
             returncode=int(returncode),
@@ -6287,6 +6394,26 @@ class LeanRunner:
             generated_declaration_name=goal_name,
             generated_goal_start_line=built.goal_start_line,
             generated_lemma_line_spans=lemma_line_spans,
+        )
+
+    def _helper_usage_key(
+        self, statement: str, proof: str, preamble: str | None, lemmas: Sequence[str],
+    ) -> tuple[str, str, str, tuple[str, ...]]:
+        from .helper_utilization import source_digest
+        from .utils import normalize_classical_tactic_prefix
+        checked_proof = normalize_classical_tactic_prefix(proof)
+        return (
+            source_digest(statement), source_digest(proof),
+            source_digest(self._resolve_preamble(preamble, proof_code=checked_proof) + "\0" + str(self._execution_environment_generation) + "\0" + str(LeanREPL._GLOBAL_ENV_EPOCH.get(str(self.project_dir.resolve()), 0))),
+            tuple(source_digest(block) for block in lemmas),
+        )
+
+    def helper_usage_observation(
+        self, *, statement: str, proof: str, preamble: str, lemmas: Sequence[str],
+    ) -> Optional[HelperUsageObservation]:
+        """Retrieve only an exact checked input context; missing means unknown."""
+        return self._helper_usage_observations.get(
+            self._helper_usage_key(statement, proof, preamble, lemmas)
         )
 
     async def run_observation_commands(
