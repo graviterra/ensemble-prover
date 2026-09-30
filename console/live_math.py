@@ -31,10 +31,11 @@ def source_record(value: Any) -> dict:
     row = obj(value)
     commit = text(row.get("git_commit"), 65)
     fingerprint = text(row.get("source_state_sha256"), 65)
+    available = row.get("available") is True and bool(re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit))
     return {
-        "available": row.get("available") is True and bool(re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit)),
+        "available": available,
         "commit": commit if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) else "",
-        "dirty": row.get("worktree_dirty") if type(row.get("worktree_dirty")) is bool else None,
+        "dirty": row.get("worktree_dirty") if available and type(row.get("worktree_dirty")) is bool else None,
         "fingerprint": fingerprint if re.fullmatch(r"[0-9a-f]{64}", fingerprint) else "",
         "partial": row.get("content_hash_truncated") is True,
     }

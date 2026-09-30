@@ -59,14 +59,16 @@ export function parseLiveMath(value: unknown): LiveMathView | undefined {
   const source = object(row.source), health = object(row.health), receipt = object(row.lastCostlyAction);
   const commit = typeof source.commit === "string" ? source.commit.slice(0, 65) : "";
   const fingerprint = typeof source.fingerprint === "string" ? source.fingerprint.slice(0, 65) : "";
+  const validCommit = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit);
+  const sourceAvailable = source.available === true && validCommit;
   return {
     selection: selection(row.selection), activity: selection(row.activity),
     lastCostlyAction: Object.keys(receipt).length ? {
       action: text(receipt.action), dispatchId: text(receipt.dispatchId), scope: scopeText(receipt.scope),
       durationS: number(receipt.durationS), elapsedS: number(receipt.elapsedS), result: text(receipt.result, 1000), leanStatus: text(receipt.leanStatus),
     } : null,
-    source: { commit: /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit) ? commit : "", dirty: typeof source.dirty === "boolean" ? source.dirty : null,
-      available: source.available === true, fingerprint: /^[a-f0-9]{64}$/i.test(fingerprint) ? fingerprint : "", partial: source.partial === true },
+    source: { commit: validCommit ? commit : "", dirty: sourceAvailable && typeof source.dirty === "boolean" ? source.dirty : null,
+      available: sourceAvailable, fingerprint: /^[a-f0-9]{64}$/i.test(fingerprint) ? fingerprint : "", partial: source.partial === true },
     settings: rows(row.settings).map((item) => ({
       role: text(item.role), model: text(item.model), provider: text(item.provider), reasoning: text(item.reasoning),
       requestedReasoning: text(item.requestedReasoning), scope: scopeText(item.scope), requestId: text(item.requestId), transport: text(item.transport), outputTokens: number(item.outputTokens),
