@@ -31,6 +31,8 @@ class AttachedRun:
     tail_events: list[TailEvent] = field(default_factory=list)
     backlog: bool = False
     trace_size: int = 0
+    partial_trace: bool = False
+    trace_available: bool | None = None
     last_summary_read: float = 0.0
     last_liveness_read: float = 0.0
     polls: int = 0
@@ -59,6 +61,8 @@ class AttachedRun:
         self.liveness = ProcessObservation("unknown", [], "target changed")
         self.tail_events.clear()
         self.backlog, self.trace_size = False, 0
+        self.partial_trace = False
+        self.trace_available = None
         self.last_summary_read = self.last_liveness_read = 0.0
         self.polls = 0
 
@@ -70,9 +74,14 @@ class AttachedRun:
         new_records = 0
         for _ in range(MAX_SLICES_PER_POLL):
             tail = self.tailer.poll()
+            self.trace_available = not any(event.kind == "unavailable" for event in tail.events)
             for event in tail.events:
                 if event.kind == "generation_reset":
                     self.state = RunState()
+                    self.partial_trace = False
+                    self.tail_events.clear()
+                elif event.kind in {"invalid_record", "skipped_range"}:
+                    self.partial_trace = True
                 self.tail_events.append(event)
             del self.tail_events[:-MAX_TAIL_EVENTS]
             for rec in tail.records:

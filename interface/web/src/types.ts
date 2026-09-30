@@ -1,3 +1,5 @@
+import type { LiveMathView } from "./liveMath";
+
 export type LibraryRun = {
   id: string;
   label: string;
@@ -36,6 +38,7 @@ export type GraphNode = {
 };
 
 export type RunDetail = {
+  liveMath?: LiveMathView;
   kind: string;
   problem: string;
   exportState: string;

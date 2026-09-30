@@ -19,7 +19,7 @@ mathematical retrieval, proof repair, and Lean verification in an autonomous
 proof-search system. Give it a theorem or an English claim, follow the work in
 your browser, and inspect the formal mathematics behind recorded progress.
 
-**393 Putnam problems with saved solutions—and counting.**
+**433 Putnam problems with saved solutions—and counting.**
 
 [Results and evaluation scope](#results)
 
@@ -31,7 +31,7 @@ The screenshots show the actual interface with illustrative example records.
 The binomial-square export uses a supplied proof checked by the export verifier.
 Click an image to view it at full size.
 
-**Version 1.16 · Research preview** · Linux · MIT license
+**Version 1.17 · Research preview** · Linux · MIT license
 
 <a id="local-browser-interface"></a>
 
@@ -47,6 +47,13 @@ checklist help you get the inputs right.
 [![Launcher with mathematical input, project selection, model settings, and launch guidance](docs/assets/ui-launcher.png)](docs/assets/ui-launcher.png)
 
 ### 2. Follow the mathematics
+
+See the mathematical focus before opening the graph: the selected approach,
+its blocking obligation, the scheduler’s recorded reason, and what the last
+expensive action established. Inspect the formal target and distinguish work
+on a child lemma from work on the original theorem. A nearby runtime view shows
+the recorded source revision, model and reasoning settings, output allowance,
+and infrastructure observations.
 
 Watch recorded progress in the graph and timeline. Select a helper or root to
 inspect its recorded Lean statement and available proof source. Search nodes
@@ -184,8 +191,8 @@ they can support a proof claim.
 
 | Distinct problems with saved solutions | Listed on PutnamBench |
 | :---: | :---: |
-| **393 distinct Putnam problems** | **65 problems** |
-| Cumulative archive · September 29, 2026 | Public metadata checked · September 26, 2026 |
+| **433 distinct Putnam problems** | **65 problems** |
+| Cumulative archive · September 30, 2026 | Public metadata checked · September 26, 2026 |
 
 The cumulative count combines models, configurations, and budgets and does not
 establish a controlled benchmark solve rate. Historical artifacts can have
@@ -213,14 +220,14 @@ independent acceptance.
 
 ## Cite this work
 
-> Reale, M. (2026). *Ensemble Prover* (Version 1.16) [Computer software]. Graviterra.
+> Reale, M. (2026). *Ensemble Prover* (Version 1.17) [Computer software]. Graviterra.
 
 ```bibtex
 @software{reale2026ensembleprover,
   author       = {Reale, M.},
   title        = {{Ensemble Prover}},
   year         = {2026},
-  version      = {1.16},
+  version      = {1.17},
   organization = {Graviterra},
   url          = {https://github.com/graviterra/ensemble-prover}
 }

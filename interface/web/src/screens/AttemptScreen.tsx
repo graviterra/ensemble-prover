@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { failureText, fetchRun } from "../api";
+import { LiveMathPanel } from "../components/LiveMathPanel";
 import { ProofGraph } from "../components/ProofGraph";
 import { StopDialog } from "../components/StopDialog";
 import { PollingControls } from "../components/PollingControls";
@@ -15,7 +16,8 @@ export function AttemptScreen({ id, onLibrary, expanded = false, paused: control
   id: string; onLibrary: () => void; expanded?: boolean;
   paused?: boolean; onPauseChange?: (paused: boolean) => void; onRefreshLibrary?: () => void;
 }) {
-  const [detail, setDetail] = useState<RunDetail | null>(null);
+  const [loadedDetail, setLoadedDetail] = useState<{ id: string; value: RunDetail } | null>(null);
+  const detail = loadedDetail?.id === id ? loadedDetail.value : null;
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
@@ -38,6 +40,10 @@ export function AttemptScreen({ id, onLibrary, expanded = false, paused: control
   useEffect(() => {
     let cancelled = false;
     let initial = true;
+    setLoading(true);
+    setError("");
+    setLastUpdated(null);
+    setMilestone(null);
     const polling = startPolling(async (signal) => {
       setRefreshing(true);
       const first = initial;
@@ -45,7 +51,7 @@ export function AttemptScreen({ id, onLibrary, expanded = false, paused: control
       try {
         const next = await fetchRun(id, signal);
         if (cancelled) return;
-        setDetail(next);
+        setLoadedDetail({ id, value: next });
         setError("");
         setLastUpdated(Date.now());
       } catch (err) {
@@ -127,6 +133,8 @@ export function AttemptScreen({ id, onLibrary, expanded = false, paused: control
         <span><strong>Export:</strong> {humanize(detail?.exportState || "not reported")}</span>
         <span className="meta">Current recorded proof state</span>
       </div>
+
+      <LiveMathPanel value={detail?.liveMath} paused={paused} readFailed={!!error} />
 
       <div className={`proof-workspace${expanded ? " is-expanded" : ""}`}>
         <section className="graph-section" aria-labelledby="graph-heading">

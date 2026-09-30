@@ -33,6 +33,7 @@ from .provider_dispatch_continuation import (
     PROVIDER_PENDING_DISPATCH_RECEIPT as _PROVIDER_PENDING_DISPATCH_RECEIPT,
 )
 
+from .live_math import prepared_request_event
 from .llm_deadline import llm_retry_deadline_record_from_exception
 from .cost_policy import require_cost_budget_usd
 from .proof_lineage import ProofLineageEnvelope
@@ -5442,6 +5443,19 @@ class CostBudgetController:
                 reserved_result = on_reserved(reservation)
                 if inspect.isawaitable(reserved_result):
                     await reserved_result
+            # Resolved envelopes exist before a potentially long provider call.
+            # Publish preparation separately from usage and transport evidence:
+            # a prepared pool is not proof that any particular leaf dispatched.
+            envelopes = reservation.metadata.get("mini_request_envelopes")
+            if envelopes and self.event_sink is not None:
+                try:
+                    prepared_result = self.event_sink(prepared_request_event(reservation))
+                    if inspect.isawaitable(prepared_result):
+                        await prepared_result
+                except Exception:
+                    # This optional status observation cannot deny provider work
+                    # or alter its durable accounting and dispatch authority.
+                    pass
             if not precise_dispatch_marker:
                 for target_id in active_target_ids:
                     await self._record_dispatch_intent(reservation, {

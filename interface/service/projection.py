@@ -361,6 +361,8 @@ def decorate_detail(
     body: dict[str, Any], attached: AttachedRun, record: Any | None, state_root: Path,
     detail_cache: FormalizationDetailCache,
 ) -> None:
+    from .live_math import live_math_view
+    body["liveMath"] = live_math_view(attached)
     body["exportReason"] = attached.summary.export_reason
     body["milestones"] = [
         {"elapsedS": line.elapsed_s, "text": line.text, "kind": line.kind}

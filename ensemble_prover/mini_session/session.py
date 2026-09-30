@@ -9,6 +9,8 @@ representation; recursive work executes inside bounded child sessions.
 
 from __future__ import annotations
 
+from ..live_math import describe_dispatch
+
 import asyncio
 import array
 import ast
@@ -24039,6 +24041,10 @@ class MiniSession:
             self._record_event(
                 {
                     "phase": "session_action_selected",
+                    "mathematical_focus": describe_dispatch(
+                        self.selected_work_item_record,
+                        getattr(self.dossier, "proof_graph", None), action.id, scope=self.scope,
+                    ),
                     "iteration": self.iteration,
                     "action_id": action.id,
                     "action_dispatch_id": action_dispatch_id,

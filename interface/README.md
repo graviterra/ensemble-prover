@@ -186,3 +186,31 @@ it is unnecessary when the Python service serves the built page itself.
 
 For a built-page preview, use `npm --prefix interface/web run preview` and
 start the API with `--web-origin http://127.0.0.1:4173` instead. The build script is in `interface/web/package.json`.
+
+## Mathematical focus and runtime evidence
+
+An attempt’s **Mathematical focus** panel brings the recorded approach and
+selected obligation above the proof graph. Expand the obligation to inspect its
+Lean statement and route identifiers. The selection explains the action actually
+dispatched; completed actions are labelled separately. It does not predict a
+future scheduling decision. Root relevance and scheduling scores are heuristics,
+not Lean proof certificates.
+
+The latest completed action taking at least 20 seconds has its own scoped
+receipt: accepted helpers, proposed obligations, or a finalized session result.
+A child result does not establish the original theorem, and an internal root
+result still requires verified export. Other actions remain in the timeline.
+
+Runtime evidence uses the run’s startup source revision and fingerprint rather
+than the interface server’s current checkout. Role settings identify their
+origin: startup configuration, a prepared request, or a completed request receipt.
+A prepared request is not confirmation of provider execution. Ambiguous model
+pools and missing effective settings remain unknown. The output allowance is a
+per-request token limit, not the remaining run budget.
+
+Infrastructure observations include active deferrals, recent provider failures,
+process observations, trace age, and incomplete trace reads. A quiet trace does
+not establish that a proof is stalled; a lack of recorded deferrals does not
+certify infrastructure health. Pausing updates or a failed read retains the last
+successful view with an explicit notice. Older runs display only what was
+recorded, without reconstructing historical decisions using current code.

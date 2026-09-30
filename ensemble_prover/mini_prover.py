@@ -12792,6 +12792,7 @@ def _reasoning_cli_summary(
         "model": str(getattr(cfg, "model", "") or ""),
         "requested_mode": _normalize_reasoning_cli_mode(requested_mode),
         "requested_effort": str(requested_effort or ""),
+        "configured_max_output_tokens": getattr(cfg, "max_tokens", None),
         "resolved_reasoning_effort": str(getattr(cfg, "reasoning_effort", "") or ""),
         "resolved_thinking_enabled": bool(getattr(cfg, "thinking_enabled", False)),
         "reasoning_control_required": bool(
@@ -12847,8 +12848,10 @@ def _run_reasoning_config_record(
     prover_reasoning_effort: Optional[str],
     refiner_reasoning_mode: str,
     refiner_reasoning_effort: Optional[str],
+    source_provenance: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
+        "run_source_provenance": copy.deepcopy(source_provenance or {}),
         "phase": "run_config",
         "verdict": "config_recorded",
         "reasoning_mode": _normalize_reasoning_cli_mode(
@@ -15346,6 +15349,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         )
 
         run_config_record = _run_reasoning_config_record(
+            source_provenance=run_source_provenance,
             args=args,
             prover_cfg=prover_cfg,
             refiner_cfg=refiner_cfg,

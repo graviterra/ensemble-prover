@@ -1,0 +1,58 @@
+.live-math { margin: 24px 0 30px; border: 1px solid #c3d1dd; border-top: 3px solid var(--accent); background: var(--paper-2); border-radius: 4px; overflow: hidden; }
+.math-focus-header { display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 22px 24px 18px; }
+.math-focus-header h2 { font: 25px/1.2 var(--serif); margin: 0; }
+.math-focus-header .eyebrow { color: var(--accent); margin-bottom: 6px; }
+.math-focus-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); }
+.math-blocker { padding: 6px 24px 24px; min-width: 0; }
+.math-blocker h3 { font: 22px/1.3 var(--serif); margin: 0 0 8px; }
+.math-blocker h4 { margin: 20px 0 8px; font-size: 12px; font-weight: 600; }
+.math-obligation { margin: 8px 0 12px; padding: 16px; border: 1px solid #cbd8e3; border-left: 3px solid var(--accent); border-radius: 3px; background: #f4f7fa; font: 13px/1.7 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow: auto; }
+.math-decision-column { border-left: 1px solid var(--line); min-width: 0; }
+.math-decision, .math-last-action { padding: 6px 24px 18px; }
+.math-last-action { padding-top: 18px; border-top: 1px solid var(--line); }
+.math-decision h3, .math-last-action h3 { margin: 0 0 8px; font-size: 16px; }
+.math-decision p:last-child, .math-last-action p:last-child { margin-bottom: 0; }
+.math-action-title { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.math-child-activity { margin-top: 14px; padding: 12px 14px; background: var(--accent-soft); border-radius: 3px; font-size: 12px; }
+.math-child-activity p { margin: 4px 0; }
+.math-route-details, .math-source-details { font-size: 12px; }
+.live-math dl { margin: 12px 0; }
+.live-math dl > div { display: flex; gap: 12px; justify-content: space-between; margin: 7px 0; }
+.live-math dt { color: var(--ink-soft); flex-shrink: 0; }
+.live-math dd { margin: 0; text-align: right; min-width: 0; overflow-wrap: anywhere; }
+.math-runtime { border-top: 1px solid var(--line); background: #f8f7f3; }
+.math-runtime-summary { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px 30px; padding: 12px 24px; align-items: center; }
+.math-runtime-summary .eyebrow { margin-bottom: 5px; }
+.math-runtime-summary p:last-child { margin: 4px 0 0; }
+.math-runtime-details { border-top: 1px solid var(--line); padding: 14px 24px 16px; }
+.math-runtime-details > summary { font-size: 12px; }
+.runtime-settings { padding: 0 24px; border-top: 1px solid var(--line); }
+.runtime-setting-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, .7fr) minmax(0, .7fr) minmax(0, 1.3fr); gap: 16px; align-items: center; padding: 12px 0; font-size: 12px; }
+.runtime-setting-row + .runtime-setting-row { border-top: 1px solid var(--line); }
+.runtime-setting-row > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+.runtime-setting-row .eyebrow { margin: 0; }
+.runtime-model { font: 13px/1.4 var(--mono); overflow-wrap: anywhere; }
+.runtime-details-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 12px 24px; }
+.runtime-setting-details { font-size: 12px; min-width: 0; }
+.runtime-setting-details h3 { font-size: 12px; margin: 12px 0 4px; }
+.runtime-setting-details dl { margin: 6px 0; }
+.runtime-footnote { margin: 14px 0 0; max-width: 95ch; }
+.runtime-empty { margin: 12px 0; }
+.math-source-details { margin-top: 12px; max-width: 760px; }
+.math-observation-notice { background: var(--amber-bg); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 10px 24px; margin-bottom: 16px; font-size: 12px; }
+.math-observation-notice p { margin: 4px 0; }
+.math-health-events { margin: 0; padding: 0 24px 16px 40px; font-size: 12px; color: var(--amber-ink); overflow-wrap: anywhere; }
+.math-health-events li + li { margin-top: 5px; }
+@media (max-width: 760px) {
+  .math-focus-grid { grid-template-columns: minmax(0, 1fr); }
+  .math-focus-header { align-items: flex-start; flex-direction: column; }
+  .math-decision-column { border-left: 0; border-top: 1px solid var(--line); }
+  .math-decision { padding-top: 18px; }
+  .math-focus-header, .math-blocker, .math-decision, .math-last-action, .math-runtime-summary, .math-runtime-details, .math-observation-notice { padding-left: 16px; padding-right: 16px; }
+  .runtime-settings { padding-left: 16px; padding-right: 16px; }
+  .runtime-setting-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px 16px; }
+  .runtime-receipt-cell { grid-column: 1 / -1; }
+  .math-health-events { padding-left: 32px; padding-right: 16px; }
+  .live-math dl > div { flex-wrap: wrap; gap: 2px 12px; }
+  .live-math dd { text-align: left; }
+}

@@ -1,6 +1,8 @@
 import type { Formalization, GraphNode, Lane, LibraryRun, Milestone, NodeEvidence, RunDetail, StopResult } from "./types";
 import { publicMessage, toNode } from "./words";
 
+import { parseLiveMath } from "./liveMath";
+
 const BLOCKED = new Set(["command", "argv", "args", "shell"]);
 
 export class ApiError extends Error {
@@ -186,6 +188,7 @@ export function asDetail(value: unknown): RunDetail {
     internalSolved: asBool(row.internalSolved),
     rootStatus: asText(row.rootStatus),
     childRootFinalizations: asCount(row.childRootFinalizations),
+    liveMath: parseLiveMath(row.liveMath),
     lastEventS: asCount(row.lastEventS),
     process: { status: asText(process.status), detail: asText(process.detail) },
     lanes: asLanes(row.lanes),

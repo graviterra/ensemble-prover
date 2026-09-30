@@ -22,6 +22,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from .live_math import LiveMathState
+
 PROBLEM_SCOPE = "problem"
 MAX_TRANSCRIPT = 500
 MAX_MILESTONES = 2000
@@ -74,6 +76,7 @@ class Lane:
 
 @dataclass
 class RunState:
+    live_math: LiveMathState = field(default_factory=LiveMathState)
     rows: int = 0
     last_elapsed_s: float = 0.0
     last_turn_index: int = 0
@@ -567,6 +570,7 @@ def reduce(state: RunState, rec: Any) -> RunState:
     if not isinstance(rec, dict):
         state.invalid_rows += 1
         return state
+    state.live_math.consume(rec)
     state.rows += 1
     elapsed = _num(rec.get("elapsed_s"))
     if elapsed is not None:

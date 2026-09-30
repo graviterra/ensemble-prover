@@ -56,6 +56,8 @@ def _load_policy() -> dict[str, Callable[[Any], Any]] | None:
 
 def classify_summary(summary: dict[str, Any], policy: dict[str, Callable[[Any], Any]] | None) -> SummaryView:
     view = SummaryView(present=True, valid=True, raw_keys=len(summary))
+    from .live_math import source_record
+    view.extra["source"] = source_record(summary.get("run_source_provenance"))
     view.problem = str(summary.get("problem") or summary.get("theorem_name") or "")
     view.answer_visibility = str(summary.get("answer_visibility") or "")
     rows = summary.get("total_turns")

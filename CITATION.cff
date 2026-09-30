@@ -5,7 +5,7 @@ message: >-
   release or commit used.
 type: software
 title: Ensemble Prover
-version: "1.16"
+version: "1.17"
 authors:
   - family-names: Reale
     given-names: M.
@@ -16,7 +16,7 @@ license: MIT
 preferred-citation:
   type: software
   title: Ensemble Prover
-  version: "1.16"
+  version: "1.17"
   authors:
     - family-names: Reale
       given-names: M.
