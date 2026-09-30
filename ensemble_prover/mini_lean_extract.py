@@ -233,9 +233,21 @@ def _has_plausible_lean_proof_head(atoms: Sequence[str]) -> bool:
     # Their first argument must provide proof evidence: a later proof word
     # must not rescue English such as "Do not use rfl".
     if raw_head in {"By", "Do"}:
-        argument = atoms[1]
+        argument_index = 1
+        # A builtin prefix is not evidence for an arbitrary prose operand.
+        # Follow it to the first actual operand; a later hypothesis must not
+        # rescue a phrase such as "Do cast doubt on h". A standalone builtin
+        # remains a plausible argument in its own right.
+        while (
+            argument_index < len(atoms) - 1
+            and atoms[argument_index] in _BUILTIN_PROOF_ARGUMENTS
+        ):
+            argument_index += 1
+        argument = atoms[argument_index]
         return bool(
             has_proof_evidence(argument)
+            # The caller has already validated these explicit grouped atoms.
+            or argument.startswith(("[", "{"))
             or argument in _BUILTIN_PROOF_ARGUMENTS
             or re.fullmatch(r"h(?:[p-z][0-9_]*|[A-Z0-9_].*)?", argument)
         )

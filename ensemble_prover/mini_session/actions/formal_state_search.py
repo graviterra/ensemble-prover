@@ -186,6 +186,22 @@ class FormalStateSearchAction:
     def frontier_dispatch_rank(self, session: Any, work_item: Any) -> int:
         return self.frontier_dispatch_rank_probe(session, work_item)
 
+    def frontier_exploration_eligible_probe(self, session: Any, work_item: Any) -> bool:
+        """Reserve mathematical exploration for search, not candidate verification."""
+        # A valid root candidate preempts selected child work in run(). Use
+        # the same observational resolver so stale root records do not hide
+        # genuinely live search and recovered root receipts are recognized.
+        selected = self._select_context(session, mutate=False)
+        if (
+            selected is not None
+            and selected[3]
+            and self._contexts.get(selected[0], {}).get("status") == "acceptance_pending"
+        ):
+            return False
+        identity = self.frontier_context_hash_probe(session, work_item)
+        key = identity.rsplit(":generation=", 1)[0] if identity else ""
+        return str(self._contexts.get(key, {}).get("status") or "") != "acceptance_pending"
+
     def frontier_dispatch_rank_probe(self, session: Any, work_item: Any) -> int:
         """Rotate live typed contexts while prioritizing acceptance receipts."""
 

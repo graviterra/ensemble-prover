@@ -33954,6 +33954,11 @@ class MiniSession:
                     id(item)
                 ):
                     continue
+                exploration_probe = getattr(
+                    action, "frontier_exploration_eligible_probe", None
+                )
+                if callable(exploration_probe) and not exploration_probe(self, item):
+                    continue
                 # Probe/tactic lanes may temporarily own a paid proof awaiting
                 # verifier replay. Servicing that proof is not new exploration.
                 nodes = getattr(getattr(self, "proof_state", None), "nodes", {})
