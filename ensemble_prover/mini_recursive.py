@@ -781,6 +781,10 @@ def _restore_mini_recursive_stats(
                 setattr(stats, stat_name, stat_value)
             except Exception:
                 pass
+    stats.last_child_failure_reason = _child_failure_reason(
+        str(stats.last_child_failure_reason or ""),
+        str(stats.last_child_failure_kind or ""),
+    )
     if "llm_root_speculative_assembly_attempts" not in values:
         # Legacy frames did not distinguish broad ordinary-helper synthesis
         # from route-authoritative assembly.  Treat their assembly subset as
@@ -844,8 +848,19 @@ def _wall_clock_deadline(deadline_monotonic: Optional[float]) -> Optional[float]
     )
 
 
+def _child_failure_reason(reason: str, kind: str) -> str:
+    """Normalize older child-budget receipts without relabeling provider deadlines."""
+
+    if (
+        reason == "llm_retry_deadline_exhausted"
+        and kind == "recursive_claim_elapsed_budget_exhausted"
+    ):
+        return kind
+    return reason
+
+
 def _scoped_failure_reason_from_recursive_stats(stats: Any) -> str:
-    """Return the scoped LLM blocker preserved in recursive stats, if any."""
+    """Return the scoped provider or controller blocker in recursive stats."""
 
     for count_attr, reason_attr in (
         ("child_scoped_failures", "last_child_failure_reason"),
@@ -856,6 +871,10 @@ def _scoped_failure_reason_from_recursive_stats(stats: Any) -> str:
         except Exception:
             count = 0
         reason = str(getattr(stats, reason_attr, "") or "").strip()
+        if reason_attr == "last_child_failure_reason":
+            reason = _child_failure_reason(
+                reason, str(getattr(stats, "last_child_failure_kind", "") or "").strip(),
+            )
         if count > 0 and llm_failure_scope(reason) == "scoped":
             return reason
     return ""
@@ -994,12 +1013,24 @@ def _mini_recursive_result_from_terminal_state_record(
     plan_summaries: Sequence[str],
 ) -> MiniRecursiveResult:
     data = dict(raw or {})
+    failure_reason = str(data.get("failure_reason") or "")
+    if (
+        failure_reason == "llm_retry_deadline_exhausted"
+        and stats.child_scoped_failures > 0
+        and _child_failure_reason(
+            stats.last_child_failure_reason, stats.last_child_failure_kind,
+        ) == "recursive_claim_elapsed_budget_exhausted"
+        and stats.last_planner_failure_reason != failure_reason
+    ):
+        # Legacy terminal receipts lack a kind. Corroborate with the child,
+        # and preserve ambiguity when a real planner deadline also occurred.
+        failure_reason = "recursive_claim_elapsed_budget_exhausted"
     return MiniRecursiveResult(
         ok=bool(data.get("ok")),
         proof=str(data.get("proof") or "") or None,
         stats=stats,
         plan_summaries=tuple(str(item or "") for item in plan_summaries),
-        failure_reason=str(data.get("failure_reason") or ""),
+        failure_reason=failure_reason,
         root_tactic_attempts=tuple(
             copy.deepcopy(item)
             for item in list(data.get("root_tactic_attempts") or [])
@@ -1602,7 +1633,10 @@ def _claim_proof_result_from_state_record(
         invalid_certificate=copy.deepcopy(data.get("invalid_certificate")),
         giveup_cluster=str(data.get("giveup_cluster") or ""),
         giveup_match=str(data.get("giveup_match") or ""),
-        terminal_failure_reason=str(data.get("terminal_failure_reason") or ""),
+        terminal_failure_reason=_child_failure_reason(
+            str(data.get("terminal_failure_reason") or ""),
+            str(data.get("terminal_failure_kind") or ""),
+        ),
         terminal_failure_kind=str(data.get("terminal_failure_kind") or ""),
         child_llm_preamble=str(data.get("child_llm_preamble") or ""),
         child_lean_preamble=str(data.get("child_lean_preamble") or ""),
@@ -19297,17 +19331,18 @@ async def run_mini_recursive_attempt(
                 or getattr(subgoal_dossier, "session_failure_reason", "")
                 or ""
             ).strip()
+            kind = str(
+                getattr(subgoal_conv, "_last_llm_failure_kind", "")
+                or getattr(subgoal_dossier, "session_failure_kind", "")
+                or ""
+            ).strip()
+            reason = _child_failure_reason(reason, kind)
             if not reason:
                 return ClaimProofResult()
             if not (
                 is_terminal_llm_failure_reason(reason) or llm_failure_scope(reason)
             ):
                 return ClaimProofResult()
-            kind = str(
-                getattr(subgoal_conv, "_last_llm_failure_kind", "")
-                or getattr(subgoal_dossier, "session_failure_kind", "")
-                or ""
-            ).strip()
             return ClaimProofResult(
                 proof=None,
                 terminal_failure_reason=reason,
@@ -19330,7 +19365,9 @@ async def run_mini_recursive_attempt(
                 return
             # This is an infrastructure/deadline outcome, not evidence that
             # the recursive claim is mathematically difficult or false.
-            subgoal_conv._last_llm_failure_reason = "llm_retry_deadline_exhausted"
+            subgoal_conv._last_llm_failure_reason = (
+                "recursive_claim_elapsed_budget_exhausted"
+            )
             subgoal_conv._last_llm_failure_kind = (
                 "recursive_claim_elapsed_budget_exhausted"
             )
@@ -19437,7 +19474,7 @@ async def run_mini_recursive_attempt(
                     pass
             if (
                 str(getattr(subgoal_conv, "_last_llm_failure_reason", "") or "")
-                == "llm_retry_deadline_exhausted"
+                in {"llm_retry_deadline_exhausted", "recursive_claim_elapsed_budget_exhausted"}
             ):
                 subgoal_conv._last_llm_failure_reason = ""
                 subgoal_conv._last_llm_failure_kind = ""
@@ -32194,6 +32231,17 @@ async def run_mini_recursive_driver(
                     claim_reported_progress_signatures.add(reported_progress_signature)
                 proof = claim_proof_result.proof
                 if not proof and claim_proof_result.terminal_failure_reason:
+                    claim_proof_result = dataclass_replace(
+                        claim_proof_result,
+                        terminal_failure_reason=_child_failure_reason(
+                            claim_proof_result.terminal_failure_reason,
+                            claim_proof_result.terminal_failure_kind,
+                        ),
+                    )
+                    child_budget_expired = (
+                        claim_proof_result.terminal_failure_reason
+                        == "recursive_claim_elapsed_budget_exhausted"
+                    )
                     child_failure_scope = llm_failure_scope(
                         claim_proof_result.terminal_failure_reason
                     )
@@ -32225,10 +32273,18 @@ async def run_mini_recursive_driver(
                     _record(
                         record_event,
                         {
-                            "phase": "mini_recursive_claim_llm",
+                            "phase": (
+                                "mini_recursive_claim_deadline"
+                                if child_budget_expired else "mini_recursive_claim_llm"
+                            ),
                             "pass_index": pass_index,
                             "claim_index": claim_index,
                             "variant_index": variant_index,
+                            # The child receipt retains its charged ordinal,
+                            # even when admission shifts numeric plan cursors.
+                            "recursive_claim_attempt_id": text_hash(
+                                f"{stats.campaign_id}\n{stats.claims_attempted}"
+                            ),
                             "helper_name": helper_name,
                             "statement": variant.statement,
                             "variant_mode": variant.mode,
@@ -32247,6 +32303,8 @@ async def run_mini_recursive_driver(
                             ),
                             "llm_failure_scope": child_failure_scope or "global",
                             "verdict": (
+                                "claim_elapsed_budget_exhausted"
+                                if child_budget_expired else
                                 "claim_llm_scoped_failure"
                                 if child_failure_scope == "scoped"
                                 else "claim_llm_terminal_failure"
@@ -32255,12 +32313,18 @@ async def run_mini_recursive_driver(
                     )
                     last_failure_diagnostic = claim_proof_result.terminal_failure_reason
                     if child_failure_scope == "scoped":
-                        last_failure_reason = "claim_llm_scoped_failure"
+                        last_failure_reason = (
+                            "claim_elapsed_budget_exhausted"
+                            if child_budget_expired else "claim_llm_scoped_failure"
+                        )
+                        failure_description = (
+                            "exhausted its elapsed-time allowance"
+                            if child_budget_expired else "hit a scoped LLM failure"
+                        )
                         _add_planner_feedback(
                             planner_feedback,
                             (
-                                f"Child proof for `{claim.name}` hit a scoped LLM "
-                                "failure ("
+                                f"Child proof for `{claim.name}` {failure_description} ("
                                 f"{claim_proof_result.terminal_failure_reason or 'transient provider error'}"
                                 ") while trying to prove: "
                                 f"{variant.statement}. Treat this as a failed "

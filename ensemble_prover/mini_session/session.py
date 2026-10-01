@@ -36883,7 +36883,10 @@ class MiniSession:
             # the scheduler explores other deterministic work.
             return True
         if (
-            scoped_reason == "llm_retry_deadline_exhausted"
+            scoped_reason in {
+                "llm_retry_deadline_exhausted",
+                "recursive_claim_elapsed_budget_exhausted",
+            }
             and retryable
             and scope == "scoped"
         ):
@@ -36952,6 +36955,14 @@ class MiniSession:
             return False
         kind = str(metadata.get("llm_failure_kind") or "").strip()
         scoped_reason = str(metadata.get("scoped_failure_reason") or "").strip()
+        if (
+            kind == "recursive_claim_elapsed_budget_exhausted"
+            or scoped_reason == "recursive_claim_elapsed_budget_exhausted"
+        ):
+            # Legacy receipts used a provider-deadline reason for this child
+            # kind. Completed local work must retain bounded, charged recovery
+            # even when no provider completion was recorded during the lease.
+            return False
         permanent_kinds = {
             "llm_cost_budget_reserved_capacity",
             "llm_cost_budget_request_capacity",

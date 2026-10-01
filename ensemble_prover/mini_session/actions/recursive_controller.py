@@ -1509,6 +1509,30 @@ class RecursiveControllerAction:
                 )
                 if isinstance(raw_failure_metadata, dict):
                     nested_scoped_failure_metadata = dict(raw_failure_metadata)
+            if (
+                not nested_scoped_failure_reason
+                and llm_failure_scope(failure_reason) == "scoped"
+                and str(getattr(stats, "last_child_failure_reason", "") or "").strip()
+                == failure_reason
+                and int(getattr(stats, "child_scoped_failures", 0) or 0) > 0
+            ):
+                # Child failures also cross the controller action boundary.
+                # Match this result, rather than cumulative historical stats,
+                # so another funded pass can receive bounded scheduler recovery.
+                nested_scoped_failure_reason = failure_reason
+                nested_scoped_failure_kind = str(
+                    getattr(stats, "last_child_failure_kind", "") or ""
+                ).strip()
+                raw_failure_metadata = getattr(stats, "last_child_failure_metadata", {})
+                if isinstance(raw_failure_metadata, dict):
+                    nested_scoped_failure_metadata = dict(raw_failure_metadata)
+        if (
+            nested_scoped_failure_reason == "recursive_claim_elapsed_budget_exhausted"
+            or nested_scoped_failure_kind == "recursive_claim_elapsed_budget_exhausted"
+        ):
+            # Elapsed proof work consumes its allocation even if no provider
+            # request completed. It is not a provider-free infrastructure wait.
+            nested_scoped_failure_metadata["zero_provider_failure"] = False
         failure_scope = (
             "scoped"
             if (

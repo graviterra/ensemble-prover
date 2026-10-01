@@ -1156,6 +1156,7 @@ class RunRecorder:
         )
         self._mini_recursive_incremental_since_complete: Dict[str, int] = {}
         self._last_mini_recursive_complete_totals: Dict[str, int] = {}
+        self._mini_recursive_child_failure_attempts_seen: Set[str] = set()
         self._formalization_banked_helper_metric_seen: Set[str] = set()
         self._compute_receipt_metric_seen: Set[str] = set()
         self.predecessor_generation: Optional[Dict[str, Any]] = None
@@ -1173,6 +1174,7 @@ class RunRecorder:
     _EXECUTION_SET_FIELDS = (
         "_recovery_event_ids_seen", "_formalization_banked_helper_metric_seen",
         "_compute_receipt_metric_seen",
+        "_mini_recursive_child_failure_attempts_seen",
     )
 
     @staticmethod
@@ -1242,6 +1244,10 @@ class RunRecorder:
             raise ValueError("Invalid recorder metric state")
         if any(type(value) is not dict for value in state["maps"].values()):
             raise ValueError("Invalid recorder metric map")
+        if type(state["sets"]) is dict:
+            # Older schema-one frames precede scoped child-event identities.
+            # Their untagged historical events retain the original counting.
+            state["sets"].setdefault("_mini_recursive_child_failure_attempts_seen", [])
         if type(state["sets"]) is not dict or set(state["sets"]) != set(cls._EXECUTION_SET_FIELDS):
             raise ValueError("Invalid recorder receipt state")
         for value in state["sets"].values():
@@ -1932,8 +1938,20 @@ class RunRecorder:
                 + value
             )
 
-        if phase == "mini_recursive_claim_llm" and verdict == "claim_llm_scoped_failure":
-            add_mini_recursive_stat("child_scoped_failures", 1)
+        if (
+            (phase == "mini_recursive_claim_llm" and verdict == "claim_llm_scoped_failure")
+            or (phase == "mini_recursive_claim_deadline" and verdict == "claim_elapsed_budget_exhausted")
+        ):
+            attempt_id = record.get("recursive_claim_attempt_id")
+            attempt_key = (
+                json.dumps([recursive_campaign_id, attempt_id], separators=(",", ":"))
+                if recursive_campaign_id and isinstance(attempt_id, str) and attempt_id
+                else ""
+            )
+            if not attempt_key or attempt_key not in self._mini_recursive_child_failure_attempts_seen:
+                add_mini_recursive_stat("child_scoped_failures", 1)
+                if attempt_key:
+                    self._mini_recursive_child_failure_attempts_seen.add(attempt_key)
 
         if (
             phase == "mini_recursive_plan"
@@ -3106,6 +3124,7 @@ class RunRecorder:
         prior_metrics = self.metrics
         prior_incremental = self._mini_recursive_incremental_since_complete
         prior_complete_totals = self._last_mini_recursive_complete_totals
+        prior_child_failure_seen = self._mini_recursive_child_failure_attempts_seen
         prior_banked_seen = self._formalization_banked_helper_metric_seen
         prior_compute_seen = self._compute_receipt_metric_seen
         self.metrics = copy.deepcopy(prior_metrics)
@@ -3113,6 +3132,7 @@ class RunRecorder:
         self._last_mini_recursive_complete_totals = dict(
             prior_complete_totals
         )
+        self._mini_recursive_child_failure_attempts_seen = set(prior_child_failure_seen)
         self._formalization_banked_helper_metric_seen = set(prior_banked_seen)
         self._compute_receipt_metric_seen = set(prior_compute_seen)
         append_started = False
@@ -3139,6 +3159,7 @@ class RunRecorder:
             self.metrics = prior_metrics
             self._mini_recursive_incremental_since_complete = prior_incremental
             self._last_mini_recursive_complete_totals = prior_complete_totals
+            self._mini_recursive_child_failure_attempts_seen = prior_child_failure_seen
             self._formalization_banked_helper_metric_seen = prior_banked_seen
             self._compute_receipt_metric_seen = prior_compute_seen
             if append_started:

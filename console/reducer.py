@@ -364,6 +364,17 @@ def _on_claim_llm(state: RunState, rec: dict[str, Any]) -> None:
         _emit(state, rec, "info", f"helper {name}: {verdict}")
 
 
+def _on_claim_deadline(state: RunState, rec: dict[str, Any]) -> None:
+    name = _str(rec.get("helper_name") or rec.get("claim_name"), 100)
+    verdict = _str(rec.get("verdict"), 80)
+    detail = (
+        "child proof attempt exhausted its time allowance"
+        if verdict == "claim_elapsed_budget_exhausted"
+        else verdict
+    )
+    _emit(state, rec, "info", f"helper {name}: {detail}")
+
+
 def _on_helper_accept(state: RunState, rec: dict[str, Any]) -> None:
     name = _str(rec.get("helper_name"), 160)
     elapsed = _num(rec.get("elapsed_s")) or 0.0
@@ -551,6 +562,7 @@ _HANDLERS = {
     "session_planner_job": _on_planner_job,
     "mini_recursive_claim_typecheck": _on_claim_typecheck,
     "mini_recursive_claim_llm": _on_claim_llm,
+    "mini_recursive_claim_deadline": _on_claim_deadline,
     "mini_recursive_helper_accept": _on_helper_accept,
     "session_accepted_proof": _on_accepted_proof,
     "session_root_finalization": _on_root_finalization,

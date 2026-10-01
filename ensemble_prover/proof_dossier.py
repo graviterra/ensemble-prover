@@ -18148,6 +18148,7 @@ class ProofDossier:
             "mini_recursive_claim_sample",
             "mini_recursive_claim_tactic",
             "mini_recursive_claim_llm",
+            "mini_recursive_claim_deadline",
             "mini_recursive_claim_invalidated",
             "mini_recursive_claim_reuse",
         }:
@@ -19683,6 +19684,7 @@ class ProofDossier:
             "mini_recursive_claim_sample",
             "mini_recursive_claim_tactic",
             "mini_recursive_claim_llm",
+            "mini_recursive_claim_deadline",
             "mini_recursive_claim_invalidated",
             "mini_recursive_claim_reuse",
         }:

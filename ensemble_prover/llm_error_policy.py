@@ -205,6 +205,9 @@ _SCOPED_LLM_FAILURE_REASONS = {
     "selected_proof_idea_context_invalidated",
 }
 _SCOPED_CONTROLLER_FAILURE_REASONS = {
+    # A child proof's wall-clock lease includes local Lean and bookkeeping;
+    # exhaustion is scoped to that attempt, not a provider/network failure.
+    "recursive_claim_elapsed_budget_exhausted",
     # An unchanged obligation with sustained helper-only work remains open;
     # its local search intervention is not a mathematical rejection.
     "sustained_helper_progress_stalled",
@@ -1345,9 +1348,10 @@ def projected_scoped_llm_failure_is_retryable(
     if normalized_reason in {
         "llm_retry_deadline_exhausted",
         "provider_dispatch_attempt_limit_exhausted",
+        "recursive_claim_elapsed_budget_exhausted",
     }:
         # The classifier boolean describes retrying inside the composite call.
-        # These two reasons specifically mean that in-call authority is spent;
+        # These reasons specifically mean that in-call authority is spent;
         # their recovery is a later, durably scheduled quantum.
         return True
     if isinstance(metadata, Mapping):
