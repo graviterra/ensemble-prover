@@ -57,7 +57,7 @@ _DIAGNOSTIC_EVENT_NAMES = frozenset({
     "session_state_changed", "turn_starting", "turn_duration", "informational",
     "notification", "model_fallback", "model_consent_fallback", "api_error",
     "permission_denied", "assistant", "user", "result", "rate_limit_event",
-    "stream_event", "control_request", "control_response",
+    "stream_event", "control_request", "control_response", "ui_invalidate",
 })
 
 
@@ -69,6 +69,25 @@ def _event_diagnostic_name(value: Any) -> str:
     return "unknown_sha256_" + hashlib.sha256(
         value.encode("utf-8", errors="surrogatepass")
     ).hexdigest()[:16]
+
+
+def _valid_ui_invalidation(event: dict[str, Any]) -> bool:
+    if event.get("event") != "ui.render" or set(event) - {
+        "type", "subtype", "event", "instances", "session_id", "uuid",
+    }:
+        return False
+    if "instances" not in event:
+        return True
+    instances = event["instances"]
+    if not isinstance(instances, list) or len(instances) > 128:
+        return False
+    return all(
+        isinstance(item, dict)
+        and set(item) == {"surface", "component", "instance_id"}
+        and all(isinstance(value, str) and 0 < len(value) <= 512 for value in item.values())
+        for item in instances
+    )
+
 
 _CLAUDE_INSTRUCTIONS = """You are the Lean theorem prover for the mathematical conversation supplied in the JSON request.
 Respond to that conversation by invoking StructuredOutput directly. Do not first compose or print a separate JSON response.
@@ -678,7 +697,14 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 raise incompatible_event(event)
             if kind == "system":
                 subtype = event.get("subtype")
-                if subtype == "commands_changed":
+                if subtype == "ui_invalidate":
+                    # The CLI can announce a UI redraw before initialization.
+                    # This is inert display telemetry, never session, tool,
+                    # generation-progress, or response authority.
+                    if not _valid_ui_invalidation(event):
+                        raise incompatible_event(event)
+                    report_progress(progress["status"], event)
+                elif subtype == "commands_changed":
                     # CLI discovery can finish before or after init. With slash
                     # commands disabled it may only report an empty inventory;
                     # this is neither initialization nor permission to act.

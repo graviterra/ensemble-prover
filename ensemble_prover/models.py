@@ -13,7 +13,7 @@ import random
 import socket
 import time
 from dataclasses import replace
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
@@ -35,6 +35,7 @@ from .pricing import (
     base_url_matches_provider,
     canonical_openrouter_model_id,
     ensure_openrouter_reasoning_capabilities_async,
+    local_billing_kind,
     lookup_openrouter_reasoning_capabilities,
 )
 from .provider_health import (
@@ -125,11 +126,24 @@ def _provider_serving_fingerprint_for_config(
     cfg = getattr(client, "cfg", None)
     if cfg is None:
         cfg = client
-    base_url = str(
+    base_url_raw = str(
         getattr(cfg, "base_url", "")
         or getattr(client, "base_url", "")
         or ""
-    ).strip().rstrip("/").lower()
+    ).strip().rstrip("/")
+    if local_billing_kind(base_url_raw) is not None:
+        model = str(getattr(cfg, "model", "") or "").strip()
+        payload = {
+            "schema": 1 if legacy_receipt else 2,
+            "lane": "local",
+            "base_url": base_url_raw,
+            "model": model,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    base_url = base_url_raw.lower()
     model = str(getattr(cfg, "model", "") or "").strip().lower()
     if not base_url and not model:
         return ""
@@ -508,6 +522,24 @@ class ProviderCapabilityError(RuntimeError):
     is_provider_capability_conflict = True
 
 
+class LocalProviderCapabilityError(ProviderCapabilityError):
+    """The single admitted local deployment cannot satisfy this request.
+
+    Local roles have no implicit fallback chain, so repeating a deterministic
+    configuration conflict cannot make progress and must stop the run.
+    """
+
+    is_local_provider_capability_conflict = True
+
+
+class LocalProviderResponseError(ProviderCapabilityError):
+    """A local response failed validation, independently of request capability."""
+
+    is_provider_capability_conflict = False
+    is_local_provider_response_invalid = True
+    llm_provider_failure = True
+
+
 class ProviderCapabilityChainExhaustedError(ProviderCapabilityError):
     """Every usable model leaf has a deterministic capability conflict.
 
@@ -518,6 +550,92 @@ class ProviderCapabilityChainExhaustedError(ProviderCapabilityError):
     """
 
     is_provider_capability_chain_exhausted = True
+
+
+def _explicit_local_cfg(cfg: Any) -> bool:
+    base = str(getattr(cfg, "base_url", "") or "").strip()
+    binding = getattr(cfg, "local_inference_binding", None)
+    if local_billing_kind(base) is not None:
+        return True
+    if base.lower().startswith("local://") or binding is not None:
+        raise LocalProviderCapabilityError("local_lane_identity_invalid")
+    return False
+
+
+def _open_local_binding(binding: Any):
+    """Load one JSON binding without creating a coordinator or a ledger."""
+
+    from .local_inference.config import load_private_worker_snapshot
+    from .local_inference.roles import BINDING_KEYS
+
+    if (type(binding) is not dict or not set(BINDING_KEYS) <= set(binding)
+        or set(binding) - set(BINDING_KEYS) - {"coordinator_id", "resource_marker"}):
+        raise LocalProviderCapabilityError("local_inference_binding_invalid")
+    try:
+        frozen = json.loads(json.dumps(binding))
+    except (TypeError, ValueError):
+        raise LocalProviderCapabilityError("local_inference_binding_invalid") from None
+    if (type(frozen) is not dict or not set(BINDING_KEYS) <= set(frozen)
+        or set(frozen) - set(BINDING_KEYS) - {"coordinator_id", "resource_marker"}):
+        raise LocalProviderCapabilityError("local_inference_binding_invalid")
+    for key in ("role", "coordinator_root", "budget_root", "budget_id"):
+        if type(frozen.get(key)) is not str or not frozen[key]:
+            raise LocalProviderCapabilityError("local_inference_binding_invalid")
+    budget_id = frozen["budget_id"]
+    if (
+        len(budget_id) != 32
+        or any(char not in "0123456789abcdef" for char in budget_id)
+    ):
+        raise LocalProviderCapabilityError("local_inference_binding_invalid")
+    try:
+        run = load_private_worker_snapshot(frozen["snapshot"])
+    except Exception:
+        raise LocalProviderCapabilityError("local_inference_binding_invalid") from None
+    role = run.roles.get(frozen["role"])
+    if role is None:
+        raise LocalProviderCapabilityError("local_inference_binding_invalid")
+    try:
+        protocol = run.document.deployments[role.deployment_id].protocol
+    except Exception:
+        raise LocalProviderCapabilityError("local_inference_binding_invalid") from None
+    return frozen, run, role, protocol
+
+
+def _local_public_facts(binding, run, role, protocol):
+    """Budget identity and declared limits. The snapshot's private URL stays out."""
+
+    return MappingProxyType({
+        "billing_kind": role.billing_kind,
+        "budget_root": binding["budget_root"],
+        "budget_id": binding["budget_id"],
+        "profile_hash": run.profile_hash,
+        "max_output_tokens": int(role.max_output_tokens),
+        "context_tokens": int(role.context_tokens),
+        "deployment_fingerprint": role.deployment_fingerprint,
+        "tools": role.tools,
+        "history_replay_fields": tuple(getattr(protocol, "history_replay_fields", ()) or ()),
+        "model": role.model,
+    })
+
+
+def local_public_facts_from_binding(binding: Any) -> Optional[Mapping[str, Any]]:
+    """Public budget identity for one binding, or None when it cannot be opened."""
+
+    try:
+        frozen, run, role, protocol = _open_local_binding(binding)
+    except Exception:
+        return None
+    return _local_public_facts(frozen, run, role, protocol)
+
+
+def clone_role_config(cfg: RoleConfig, **changes: Any) -> RoleConfig:
+    """Copy a role and a JSON copy of its local binding."""
+
+    binding = getattr(cfg, "local_inference_binding", None)
+    cloned = replace(cfg, **changes)
+    if "local_inference_binding" not in changes and binding is not None:
+        cloned.local_inference_binding = json.loads(json.dumps(binding))
+    return cloned
 
 
 def _openai_chat_tools_require_reasoning_effort_none(
@@ -1248,6 +1366,21 @@ def response_reasoning_text(payload: Any) -> str:
     if not isinstance(first, dict):
         return ""
     return message_reasoning_text(first.get("message"))
+
+
+def apply_scoped_reasoning_replay(message: Any, payload: Any) -> bool:
+    """Copy declared local reasoning fields. Cloud payloads stay on their own path."""
+
+    if not isinstance(message, dict) or not isinstance(payload, dict):
+        return False
+    if payload.get("provider_lane") != "local":
+        return False
+    replay = payload.get("local_reasoning_replay")
+    if isinstance(replay, Mapping):
+        for key, value in replay.items():
+            if key in {"reasoning", "reasoning_content"} and isinstance(value, str):
+                message[key] = value
+    return True
 
 
 def response_reasoning_items(payload: Any) -> List[Dict[str, Any]]:
@@ -2705,6 +2838,8 @@ class OpenAICompatClient:
             return [1]
         # chat_n first attempts one native batched request; if it returns no
         # choices, it can then issue one single request per requested choice.
+        if getattr(self, "_local_runtime", None) is not None:
+            return [count]
         return [count + 1]
 
     def reservation_output_multipliers(
@@ -2717,6 +2852,8 @@ class OpenAICompatClient:
         count = max(1, int(candidate_count or 1))
         if "chat_n" not in str(call_kind or "") or count <= 1:
             return [1]
+        if getattr(self, "_local_runtime", None) is not None:
+            return [count]
         return [2 * count]
 
     def __init__(
@@ -2725,6 +2862,16 @@ class OpenAICompatClient:
         *,
         provider_lane_health_registry: Optional[ProviderLaneHealthRegistry] = None,
     ):
+        if _explicit_local_cfg(cfg):
+            self._install_explicit_local_client(
+                cfg,
+                provider_lane_health_registry=provider_lane_health_registry,
+            )
+            return
+        self._local_runtime = None
+        self._local_public_facts = None
+        self._local_role = None
+        self._local_protocol = None
         if base_url_matches_provider(cfg.base_url, "openrouter"):
             # Normalize supported user aliases at the transport boundary too,
             # covering programmatic clients that bypass Mini's CLI builder.
@@ -2837,6 +2984,365 @@ class OpenAICompatClient:
         self.last_reasoning_control_sent: Dict[str, Any] = {}
         self.last_reasoning_control_required: bool = False
         self.last_reasoning_capability_record: Dict[str, Any] = {}
+
+    def _install_explicit_local_client(
+        self,
+        cfg: RoleConfig,
+        *,
+        provider_lane_health_registry: Optional[ProviderLaneHealthRegistry],
+    ) -> None:
+        kind = local_billing_kind(str(cfg.base_url))
+        frozen, run, role, protocol = _open_local_binding(
+            getattr(cfg, "local_inference_binding", None)
+        )
+        if kind is None or kind != role.billing_kind:
+            raise LocalProviderCapabilityError("local_lane_identity_invalid")
+        public = str(cfg.base_url).strip().rstrip("/")
+        if public.rsplit("/", 1)[-1].lower() != str(role.deployment_fingerprint).lower():
+            raise LocalProviderCapabilityError("local_deployment_fingerprint_mismatch")
+        if str(cfg.model) != role.model:
+            raise LocalProviderCapabilityError("local_model_identity_mismatch")
+        try:
+            configured_output = int(cfg.max_tokens)
+            configured_context = (
+                None if cfg.context_window is None else int(cfg.context_window)
+            )
+        except (TypeError, ValueError, OverflowError):
+            raise LocalProviderCapabilityError("local_output_cap_not_declared") from None
+        if type(cfg.max_tokens) is not int or not 1 <= configured_output <= int(role.max_output_tokens):
+            raise LocalProviderCapabilityError("local_output_cap_not_declared")
+        if configured_context is not None and (type(cfg.context_window) is not int or configured_context != int(role.context_tokens)):
+            raise LocalProviderCapabilityError("local_context_not_declared")
+        if role.native_n != "unsupported":
+            raise LocalProviderCapabilityError("local_native_batch_unsupported")
+        facts = _local_public_facts(frozen, run, role, protocol)
+        from .local_inference.runtime import LocalRuntime
+
+        runtime = LocalRuntime(frozen)
+        self.cfg = cfg
+        self.base_url = public
+        self._local_public_facts = facts
+        self._local_role = role
+        self._local_protocol = protocol
+        self.provider_defer_fingerprint = provider_serving_fingerprint(cfg)
+        if not str(getattr(cfg, "provider_defer_fingerprint", "") or "").strip():
+            self._generated_provider_defer_fingerprint = self.provider_defer_fingerprint
+        self._configured_provider_lane_health_registry = (
+            provider_lane_health_registry
+            if isinstance(provider_lane_health_registry, ProviderLaneHealthRegistry)
+            else None
+        )
+        self._provider_lane_health_registry = (
+            self._configured_provider_lane_health_registry
+            or ProviderLaneHealthRegistry()
+        )
+        self.headers = {}
+        self.client = httpx.AsyncClient(
+            timeout=self._httpx_timeout(),
+            trust_env=False,
+            follow_redirects=False,
+        )
+        self._pending_http_tasks = set()
+        self._pending_http_observer_tasks = set()
+        self._pending_http_lane_ownership = {}
+        self._late_receipt_observer_barrier = False
+        self._stop = None
+        self._chat_tools_require_reasoning_effort_none = False
+        self._responses_tools_reasoning_required = False
+        self._reasoning_disable_rejected = False
+        self._reasoning_disable_supported = None
+        self._reasoning_disable_negotiation_future = None
+        self._responses_unsupported_parameters = set()
+        self._request_sem = asyncio.Semaphore(self._MAX_CONCURRENT_REQUESTS)
+        self._chat_request_gate = AsyncSharedExclusiveGate()
+        self.last_used_model = cfg.model
+        self.last_used_base_url = self.base_url
+        self._usage_input_tokens = 0
+        self._usage_output_tokens = 0
+        self._usage_cached_input_tokens = 0
+        self._usage_cache_write_tokens = 0
+        self._usage_prompt_cache_miss_tokens = 0
+        self._usage_reasoning_output_tokens = 0
+        self._usage_cost_valuation_sources = set()
+        self._usage_cost_valuation_assumptions = set()
+        self._usage_cost_usd = 0.0
+        self._usage_cost_usd_authoritative = True
+        self._usage_unpriced_input_tokens = 0
+        self._usage_unpriced_output_tokens = 0
+        self._usage_unpriced_cached_input_tokens = 0
+        self._usage_unpriced_cache_write_tokens = 0
+        self._usage_unpriced_response_count = 0
+        self._usage_missing_responses = 0
+        self._suppressed_unsafe_late_usage_callbacks = 0
+        self._runtime_prompt_budget_cap_tokens = None
+        self.last_truncated = False
+        self.last_truncated_flags = []
+        self.last_raw_response_data = {}
+        self._truncation_count = 0
+        self.last_request_body_sha256 = ""
+        self.last_request_body_bytes = 0
+        self.last_request_payload_summary = {}
+        self.last_request_surrogate_replacements = 0
+        self._tools_capability = facts.get("tools") == "native_required"
+        self._unsupported_payload_parameters = set()
+        self.last_tool_request_effective = False
+        self.last_tool_request_downgraded = False
+        self.last_tool_request_skipped = False
+        self.last_temperature_requested = None
+        self.last_temperature_sent = None
+        self.last_temperature_provider_dropped = False
+        self.last_temperature_provider_drop_reason = ""
+        self.last_reasoning_control_requested = ""
+        self.last_reasoning_control_decision = ""
+        self.last_reasoning_control_sent = {}
+        self.last_reasoning_control_required = False
+        self.last_reasoning_capability_record = {}
+        self.last_request_envelope_receipt = None
+        self._local_runtime = runtime
+
+    def _local_output_limit(self, requested: Any) -> int:
+        declared = int(self._local_public_facts["max_output_tokens"])
+        if requested is None:
+            return min(declared, self.cfg.max_tokens)
+        try:
+            cap = int(requested)
+        except (TypeError, ValueError, OverflowError):
+            raise LocalProviderCapabilityError("local_output_cap_exceeds_declared") from None
+        if type(requested) is not int or cap < 1 or cap > declared:
+            raise LocalProviderCapabilityError("local_output_cap_exceeds_declared")
+        return cap
+
+    def _local_sampling_value(
+        self, axis: Any, override: Any, configured: Any, *, temperature: bool,
+    ) -> Optional[float]:
+        policy = str(getattr(axis, "policy", "") or "")
+        explicit = override is not None and not (
+            temperature and is_api_default_temperature_override(override)
+        )
+        if policy == "forbidden":
+            if explicit:
+                raise LocalProviderCapabilityError("local_sampling_unsupported")
+            return None
+        if policy == "fixed":
+            try:
+                fixed = float(axis.value)
+            except (TypeError, ValueError):
+                raise LocalProviderCapabilityError("local_sampling_unsupported") from None
+            if explicit:
+                try:
+                    requested = float(override)
+                except (TypeError, ValueError):
+                    raise LocalProviderCapabilityError("local_sampling_conflict") from None
+                if requested != fixed:
+                    raise LocalProviderCapabilityError("local_sampling_conflict")
+            return fixed
+        if policy != "unrestricted":
+            raise LocalProviderCapabilityError("local_sampling_unsupported")
+        if not explicit:
+            if temperature and is_api_default_temperature_override(override):
+                return None
+            try:
+                return float(configured)
+            except (TypeError, ValueError):
+                raise LocalProviderCapabilityError("local_sampling_unsupported") from None
+        try:
+            return float(override)
+        except (TypeError, ValueError):
+            raise LocalProviderCapabilityError("local_sampling_unsupported") from None
+
+    def _local_response_format(self, response_format: Optional[str]) -> Optional[Dict[str, str]]:
+        if response_format in (None, ""):
+            return None
+        if response_format not in {"json", "json_object"}:
+            raise LocalProviderCapabilityError("local_json_object_unsupported")
+        formats = getattr(self._local_protocol, "response_formats", ()) or ()
+        if "json_object" not in formats:
+            raise LocalProviderCapabilityError("local_json_object_unsupported")
+        return {"type": "json_object"}
+
+    async def _local_chat_request(
+        self,
+        messages: List[Dict[str, Any]],
+        response_format: Optional[str] = None,
+        *,
+        temperature_override: Any = None,
+        top_p_override: Optional[float] = None,
+        max_tokens_override: Optional[int] = None,
+        reasoning_effort_override: Optional[str] = None,
+        deadline: Optional[float] = None,
+        request_timeout_override_s: Optional[float] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+    ) -> "httpx.Response":
+        cap = self._local_output_limit(max_tokens_override)
+        temperature = self._local_sampling_value(
+            self._local_role.sampling.temperature,
+            temperature_override,
+            self.cfg.temperature,
+            temperature=True,
+        )
+        top_p = self._local_sampling_value(
+            self._local_role.sampling.top_p,
+            top_p_override,
+            self.cfg.top_p,
+            temperature=False,
+        )
+        if tools and self._local_public_facts.get("tools") != "native_required":
+            raise LocalProviderCapabilityError("local_tools_unsupported")
+        translated = self._local_response_format(response_format)
+        effort = (
+            reasoning_effort_override
+            if reasoning_effort_override is not None
+            else getattr(self.cfg, "reasoning_effort", None)
+        )
+        if effort is not None:
+            effort = str(effort).strip() or None
+        # Apply the shared timeout policy, including the planner's zero/inf
+        # sentinel for no additional per-call limit. The local coordinator's
+        # finite request limit remains independently enforced by the runtime.
+        timeout_s = self._configured_request_timeout_s(request_timeout_override_s)
+        holder: Dict[str, Any] = {}
+
+        async def before_dispatch() -> Dict[str, Any]:
+            receipt = await notify_provider_dispatch_observer(
+                candidate_count=1,
+                max_tokens=cap,
+                requested_output_tokens=cap,
+            )
+            holder["receipt"] = dict(receipt)
+            return holder["receipt"]
+
+        def on_dispatched(*args: Any) -> None:
+            supplied = args[0] if args and isinstance(args[0], Mapping) else None
+            mark_provider_dispatched(**dict(supplied or holder.get("receipt") or {}))
+
+        request: Dict[str, Any] = {
+            "http_client": self.client,
+            "messages": list(messages),
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "max_tokens": cap,
+            "temperature": temperature,
+            "top_p": top_p,
+            "reasoning_effort": effort,
+            # Shared chat deadlines are Unix timestamps; the local runtime
+            # uses monotonic time for queueing and transport watchdogs.
+            "deadline": (time.monotonic() + (deadline - time.time())) if deadline is not None else None,
+            "request_timeout_s": timeout_s,
+            "before_dispatch": before_dispatch,
+            "on_dispatched": on_dispatched,
+        }
+        if translated is not None:
+            request["response_format"] = translated
+        response = await self._local_runtime.request(**request)
+        receipt = holder.get("receipt")
+        extensions = getattr(response, "extensions", None)
+        if receipt and isinstance(extensions, dict) and "ensemble_dispatch_authority" not in extensions:
+            extensions["ensemble_dispatch_authority"] = dict(receipt)
+        return response
+
+    def _local_response_body(self, resp: "httpx.Response") -> Dict[str, Any]:
+        try:
+            data = resp.json()
+        except Exception:
+            raise LocalProviderResponseError("local_response_unreadable") from None
+        if not isinstance(data, dict):
+            raise LocalProviderResponseError("local_response_unreadable")
+        return data
+
+    def _nested_sealed_calls(self, sealed: Any) -> List[Dict[str, Any]]:
+        calls: List[Dict[str, Any]] = []
+        for call in sealed.tool_calls:
+            if not isinstance(call, Mapping):
+                raise LocalProviderResponseError("local_tool_batch_invalid")
+            name = call.get("name")
+            encoded = call.get("arguments_json")
+            call_id = call.get("id")
+            if (
+                not isinstance(name, str)
+                or not isinstance(encoded, str)
+                or not isinstance(call_id, str)
+            ):
+                raise LocalProviderResponseError("local_tool_batch_invalid")
+            calls.append({
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": encoded},
+            })
+        return calls
+
+    def _local_sealed_result(
+        self,
+        resp: "httpx.Response",
+        *,
+        usage_callback: Optional[Any],
+    ) -> tuple:
+        from .local_inference.protocol import SealedChat
+
+        data = self._local_response_body(resp)
+        self._publish_response_usage_once(resp, data, usage_callback)
+        self.last_used_model = self.cfg.model
+        self.last_used_base_url = self.base_url
+        sealed = None
+        extensions = getattr(resp, "extensions", None)
+        if isinstance(extensions, dict):
+            sealed = extensions.get("local_sealed_chat")
+        if not isinstance(sealed, SealedChat):
+            raise LocalProviderResponseError("local_response_unsealed")
+        choices = data.get("choices")
+        message = None
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            raw_message = choices[0].get("message")
+            if isinstance(raw_message, dict):
+                message = raw_message
+        raw_calls = message.get("tool_calls") if isinstance(message, dict) else None
+        raw_count = len(raw_calls) if isinstance(raw_calls, list) else 0
+        if raw_count != len(tuple(sealed.tool_calls)):
+            raise LocalProviderResponseError("local_tool_batch_invalid")
+        if sealed.tool_calls and not sealed.arguments_schema_validated:
+            raise LocalProviderResponseError("local_tool_batch_unvalidated")
+        calls = self._nested_sealed_calls(sealed)
+        declared = tuple(self._local_public_facts.get("history_replay_fields") or ())
+        fields = sealed.reasoning_fields if isinstance(sealed.reasoning_fields, Mapping) else {}
+        replay = {
+            key: fields[key]
+            for key in declared
+            if isinstance(key, str) and isinstance(fields.get(key), str)
+        }
+        assistant: Dict[str, Any] = {"role": "assistant", "content": sealed.text}
+        assistant.update(replay)
+        raw_usage = data.get("usage")
+        if isinstance(raw_usage, dict):
+            safe_usage = {
+                key: value
+                for key, value in raw_usage.items()
+                if isinstance(key, str) and type(value) in {int, float}
+            }
+        elif isinstance(sealed.usage, Mapping):
+            safe_usage = {
+                key: value
+                for key, value in sealed.usage.items()
+                if isinstance(key, str) and type(value) in {int, float}
+            }
+        else:
+            safe_usage = None
+        scoped = {
+            "provider_lane": "local",
+            "model": self.cfg.model,
+            "choices": [{
+                "finish_reason": str(sealed.finish_reason or ""),
+                "message": assistant,
+            }],
+            "usage": safe_usage,
+            "local_reasoning_replay": dict(replay),
+        }
+        self.last_truncated = sealed.finish_reason == "length"
+        self.last_truncated_flags = [self.last_truncated]
+        if self.last_truncated:
+            self._truncation_count += 1
+        self.last_raw_response_data = json.loads(json.dumps(scoped))
+        publish_provider_response(self.last_raw_response_data)
+        return sealed.text, self.last_raw_response_data, calls
 
     def _provider_lane_health_registry_for_dispatch(
         self,
@@ -3072,6 +3578,8 @@ class OpenAICompatClient:
 
     def supports_tool_calls(self) -> bool:
         """Return whether tool-call requests should still be attempted."""
+        if getattr(self, "_local_runtime", None) is not None:
+            return (self._local_public_facts or {}).get("tools") == "native_required"
         return self._tools_capability is not False
 
     def _operation_deadline(
@@ -3470,6 +3978,22 @@ class OpenAICompatClient:
         max_tokens_override: Any,
         reasoning_effort_override: Any,
     ) -> tuple[Any, Any]:
+        if getattr(self, "_local_runtime", None) is not None:
+            resolved, receipt = await resolve_mini_request_output_tokens(
+                self, max_tokens_override,
+            )
+            if receipt is None:
+                receipt = current_mini_request_envelope_receipt()
+            if receipt is not None:
+                if not mini_request_envelope_receipt_is_valid_for(
+                    receipt, self, resolved,
+                ):
+                    raise RuntimeError(
+                        "Mini request envelope receipt does not match concrete leaf"
+                    )
+                self.last_request_envelope_receipt = receipt.to_record()
+                reasoning_effort_override = receipt.effective_reasoning_effort or None
+            return self._local_output_limit(resolved), reasoning_effort_override
         resolved, receipt = await resolve_mini_request_output_tokens(
             self, max_tokens_override
         )
@@ -5182,6 +5706,19 @@ class OpenAICompatClient:
         usage_callback: Optional[Any] = None,
     ) -> "httpx.Response":
         """Execute the HTTP request for a chat completion (shared by chat/chat_raw)."""
+        if self._local_runtime is not None:
+            return await self._local_chat_request(
+                messages,
+                response_format,
+                temperature_override=temperature_override,
+                top_p_override=top_p_override,
+                max_tokens_override=max_tokens_override,
+                reasoning_effort_override=reasoning_effort_override,
+                deadline=deadline,
+                request_timeout_override_s=request_timeout_override_s,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
         effective_reasoning_effort = _resolved_reasoning_effort(
             self.cfg,
             reasoning_effort_override,
@@ -5415,6 +5952,11 @@ class OpenAICompatClient:
         usage_callback: Optional[Any] = None,
     ) -> tuple:
         """Parse API response into (content_string, raw_data_dict)."""
+        if self._local_runtime is not None:
+            content, data, _calls = self._local_sealed_result(
+                resp, usage_callback=usage_callback,
+            )
+            return content, data
         data = self._safe_json(resp)
         self._publish_response_usage_once(resp, data, usage_callback)
         self.last_used_model = self.cfg.model
@@ -5537,6 +6079,24 @@ class OpenAICompatClient:
             deadline,
             operation_timeout_override_s=operation_timeout_override_s,
         )
+        if self._local_runtime is not None:
+            resp = await self._chat_request(
+                messages,
+                response_format,
+                temperature_override=temperature_override,
+                top_p_override=top_p_override,
+                max_tokens_override=max_tokens_override,
+                reasoning_effort_override=reasoning_effort_override,
+                deadline=deadline,
+                request_timeout_override_s=request_timeout_override_s,
+                operation_timeout_override_s=operation_timeout_override_s,
+                usage_callback=usage_callback,
+            )
+            return self._process_response(
+                resp,
+                json_mode=(response_format == "json"),
+                usage_callback=usage_callback,
+            )
         effective_reasoning_effort = _resolved_reasoning_effort(
             self.cfg, reasoning_effort_override
         )
@@ -5768,6 +6328,24 @@ class OpenAICompatClient:
             deadline,
             operation_timeout_override_s=operation_timeout_override_s,
         )
+        if self._local_runtime is not None:
+            resp = await self._chat_request(
+                messages,
+                temperature_override=temperature_override,
+                top_p_override=top_p_override,
+                max_tokens_override=max_tokens_override,
+                reasoning_effort_override=reasoning_effort_override,
+                deadline=deadline,
+                request_timeout_override_s=request_timeout_override_s,
+                operation_timeout_override_s=operation_timeout_override_s,
+                tools=tools,
+                tool_choice=tool_choice,
+                usage_callback=usage_callback,
+            )
+            content, _data, calls = self._local_sealed_result(
+                resp, usage_callback=usage_callback,
+            )
+            return content, calls
         effective_reasoning_effort = _resolved_reasoning_effort(
             self.cfg,
             reasoning_effort_override,
@@ -6054,6 +6632,20 @@ class OpenAICompatClient:
             )
         )
         deadline = self._operation_deadline(deadline)
+        if self._local_runtime is not None and n > 1:
+            results: List[str] = []
+            for _choice in range(n):
+                results.append(
+                    await self._chat_unlocked(
+                        messages,
+                        temperature_override=temperature_override,
+                        top_p_override=top_p_override,
+                        max_tokens_override=max_tokens_override,
+                        deadline=deadline,
+                        usage_callback=usage_callback,
+                    )
+                )
+            return results
         if n <= 1:
             return [
                 await self._chat_unlocked(
@@ -6502,8 +7094,10 @@ async def get_json(
                 return _mark_truncated(parsed_obj)
         return _mark_truncated({"_raw": raw_text, "_error": "json_not_object"})
 
+    from .workflow_roles import wire_response_format
+
     chat_kwargs: Dict[str, Any] = {
-        "response_format": "json",
+        "response_format": wire_response_format(client, "json"),
         "temperature_override": temperature_override,
         "top_p_override": top_p_override,
         "max_tokens_override": max_tokens_override,

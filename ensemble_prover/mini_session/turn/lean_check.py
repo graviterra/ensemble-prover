@@ -51,8 +51,9 @@ class LeanVerdict:
     - ``primary_result``: the result object returned by the first
       ``lean.check`` call (against ``conv.lean_preamble``). Always
       present.
-    - ``safe_result``: the result of the answer-safe recheck, if it
-      was run; None otherwise.
+    - ``safe_result``: the non-authoritative conditional answer-safe recheck,
+      if run; None otherwise. Its ``accepted`` field gates visibility only;
+      ``primary_result`` always carries the independent proof authority.
     - ``feedback_result``: the result-shaped object the orchestrator
       should use to render Lean failure feedback to the LLM. Mirrors
       the legacy ``feedback_result`` selection logic at
@@ -242,13 +243,13 @@ def _legacy_imports():
     }
 
 
-def _answer_safe_recheck_lemmas(
+def _answer_safe_recheck_parts(
     *,
     context_helpers: Sequence[str],
     helpers: Sequence[str],
     conv: Any,
     primitives: Mapping[str, Any],
-) -> List[str]:
+) -> tuple[List[str], List[str]]:
     """Build answer-safe lemmas with signature-aware helper replacement.
 
     Same-name helpers with a different statement are model self-corrections
@@ -283,10 +284,13 @@ def _answer_safe_recheck_lemmas(
             fresh_for_feedback.append(fresh_by_key[key])
         else:
             context_for_feedback.append(source)
-    return [
-        *primitives["feedback_lemmas"](context_for_feedback, conv),
-        *fresh_for_feedback,
-    ]
+    rendered_context = list(primitives["feedback_lemmas"](context_for_feedback, conv))
+    return rendered_context, fresh_for_feedback
+
+
+def _answer_safe_recheck_lemmas(**kwargs: Any) -> List[str]:
+    context, fresh = _answer_safe_recheck_parts(**kwargs)
+    return [*context, *fresh]
 
 
 async def verify_with_lean(
@@ -338,6 +342,7 @@ async def verify_with_lean(
             reset_owned_lean_lock,
         )
 
+        conditional_feedback = kwargs.pop("_conditional_feedback", False)
         if deadline_elapsed():
             raise LeanVerificationDeadline(
                 "Lean verification deferred at enclosing action deadline"
@@ -414,7 +419,12 @@ async def verify_with_lean(
             raise LeanVerificationDeadline(
                 "Lean verification deferred after shared-lock wait"
             )
-        awaitable = live.check(*args, **kwargs)
+        try:
+            check_method = lean.check_feedback if conditional_feedback else live.check
+            awaitable = check_method(*args, **kwargs)
+        except BaseException:
+            _safe_release_lean_lock(lock)
+            raise
         release_owned_lock_once = _once_only_lock_release(lock)
 
         async def run_with_owned_lock() -> Any:
@@ -429,7 +439,13 @@ async def verify_with_lean(
                     raise LeanVerificationDeadline(
                         "Lean verification deferred before checker launch"
                     )
-                return await awaitable
+                result = await awaitable
+                if conditional_feedback:
+                    from ...lean_runner import FeedbackLeanResult
+
+                    if not isinstance(result, FeedbackLeanResult):
+                        raise TypeError("invalid conditional feedback result")
+                return result
             finally:
                 reset_owned_lean_lock(token)
                 release_owned_lock_once()
@@ -612,7 +628,7 @@ async def verify_with_lean(
     if answer_safe_recheck_needed:
         feedback_started = time.monotonic()
         try:
-            feedback_lemmas = _answer_safe_recheck_lemmas(
+            feedback_context, feedback_candidates = _answer_safe_recheck_parts(
                 context_helpers=context_helpers,
                 helpers=helpers,
                 conv=conv,
@@ -621,9 +637,11 @@ async def verify_with_lean(
             safe_result = await checked(
                 safe_goal_statement,
                 proof_for_checks,
-                lemmas=feedback_lemmas,
+                lemmas=feedback_context,
                 preamble_override=getattr(conv, "preamble", "") or "",
                 check_kind="full",
+                _conditional_feedback=True,
+                candidate_lemmas=feedback_candidates,
             )
         except LeanVerificationDeadline as exc:
             # Preserve the already accepted primary result for callers that
@@ -642,13 +660,22 @@ async def verify_with_lean(
             ) from exc
         safe_elapsed_s = round(time.monotonic() - feedback_started, 3)
 
+    # A conditional pass gates visibility only. The independent primary result
+    # remains the sole proof authority, including all submitted helper bodies.
+    from ...lean_runner import FeedbackLeanResult
+
+    safe_accepted = (
+        safe_result.accepted if isinstance(safe_result, FeedbackLeanResult)
+        else bool(getattr(safe_result, "ok", False))
+    )
+
     # ---- 3. Acceptance gating (mirrors mini_prover.py:4381-4405). ----
     accepted = bool(primary_result.ok)
     decision_result: Any = primary_result
 
     if primary_result.ok and answer_safe_recheck_needed:
-        if safe_result is not None and safe_result.ok:
-            decision_result = safe_result
+        if safe_result is not None and safe_accepted:
+            decision_result = primary_result
             accepted = True
         else:
             # Hidden-answer leak class: do NOT accept a proof that only
@@ -685,20 +712,20 @@ async def verify_with_lean(
             and active_lift_feedback_result is not None
             and not bool(getattr(primary_result, "ok", False))
         ):
-            if safe_result is not None and not safe_result.ok:
+            if safe_result is not None and not safe_accepted:
                 feedback_result = safe_result
                 feedback_source = "active_root_lift_answer_safe_check"
             else:
                 feedback_result = active_lift_feedback_result
                 feedback_source = "active_root_lift_check"
-        elif safe_result is not None and not safe_result.ok:
+        elif safe_result is not None and not safe_accepted:
             feedback_result = safe_result
             feedback_source = (
                 "active_root_lift_answer_safe_check"
                 if primary_source == "active_root_lift"
                 else "answer_safe_check"
             )
-        elif safe_result is not None and safe_result.ok:
+        elif safe_result is not None and safe_accepted:
             feedback_result = primary_result
             feedback_source = "primary_check_with_answer_safe_pass"
         else:

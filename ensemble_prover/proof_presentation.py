@@ -21,7 +21,7 @@ from typing import Any, Sequence
 
 from .export_dependency_graph import _strip_comments_and_strings
 from .sync_subprocess import run_process_group
-from .subprocess_environment import sanitized_subprocess_environment
+from .local_inference.network_policy import prepare_owned_subprocess
 from .theorem_project import scan_lean_theorems, split_lean_import_header
 
 MAX_PRESENTATION_SECONDS = 60.0
@@ -340,7 +340,7 @@ def _probe(content: str, path: Path, *, project: Path, timeout_s: float,
     proc = run_process_group(
         ["lake", "env", "lean", str(path.resolve())], cwd=project,
         timeout=timeout_s,
-        env=sanitized_subprocess_environment(_export_lean_env(extra_lean_paths)),
+        env=prepare_owned_subprocess(("lake", "env", "lean", str(path.resolve())), project=project, base=_export_lean_env(extra_lean_paths)),
     )
     output = str(proc.stdout or "")
     if len(output.encode()) > MAX_PROBE_BYTES:

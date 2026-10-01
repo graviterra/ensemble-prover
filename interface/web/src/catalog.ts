@@ -1,7 +1,8 @@
 export type CatalogProject = { path: string; name: string };
 export type CatalogProvider = { id: string; label: string; models: string[]; available: boolean; availability: string };
+export type CatalogDeployment = { id: string; model: string; contextTokens: number; maxOutputTokens: number; tools: string; reasoningMode: string; reasoningEffort: string; outputLimitIncludesReasoning: string; execution: string; dialect: string; capability: "declared"; probed: false; availability: string };
 export type CatalogFile = { path: string; name: string };
-export type Catalog = { projects: CatalogProject[]; providers: CatalogProvider[]; roots: CatalogProject[]; control: boolean };
+export type Catalog = { projects: CatalogProject[]; providers: CatalogProvider[]; deployments: CatalogDeployment[]; roots: CatalogProject[]; control: boolean };
 export type ProjectFiles = { path: string; name: string; files: CatalogFile[]; truncated: boolean };
 export type Theorems = { theorems: { name: string; statement: string }[]; truncated: boolean; notice?: string };
 export type Directory = { path: string; parent: string | null; directories: (CatalogProject & { isProject: boolean })[]; isProject: boolean; truncated?: boolean };
@@ -45,11 +46,33 @@ export function catalogError(error: unknown): string {
 }
 
 export function usesCliModel(provider: string): boolean { return provider === "codex" || provider === "claude-code"; }
+export function usesDeployment(provider: string): boolean { return provider === "local"; }
+export function requiresExactModel(provider: string): boolean { return provider === "cursor"; }
+
+function finite(value: unknown): number { return typeof value === "number" && Number.isFinite(value) ? value : 0; }
+
+function deployment(item: Record<string, unknown>): CatalogDeployment | null {
+  const id = string(item.id);
+  const row: CatalogDeployment = {
+    id, model: string(item.model), contextTokens: finite(item.contextTokens), maxOutputTokens: finite(item.maxOutputTokens),
+    tools: string(item.tools), reasoningMode: string(item.reasoningMode), reasoningEffort: string(item.reasoningEffort),
+    outputLimitIncludesReasoning: string(item.outputLimitIncludesReasoning), execution: string(item.execution),
+    dialect: string(item.dialect), capability: "declared", probed: false,
+    availability: string(item.availability) || "Declared in the operator profile and not probed.",
+  };
+  if (!/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(id) || !row.model || row.model.length > 512
+      || !Number.isSafeInteger(row.contextTokens) || row.contextTokens <= 0
+      || !Number.isSafeInteger(row.maxOutputTokens) || row.maxOutputTokens <= 0
+      || !["operator_asserted_local", "hosted_upstream", "unknown"].includes(row.execution)
+      || JSON.stringify(row).includes("://")) return null;
+  return row;
+}
 
 export async function fetchCatalog(signal?: AbortSignal): Promise<Catalog> {
   const body = await read("/api/catalog", signal);
   return {
     projects: paths(body.projects), roots: paths(body.roots), control: body.control === true,
+    deployments: Array.isArray(body.deployments) ? list(body.deployments).map(deployment).filter((item): item is CatalogDeployment => item !== null) : [],
     providers: list(body.providers).map((item) => ({
       id: string(item.id), label: string(item.label),
       models: Array.isArray(item.models) ? item.models.filter((model): model is string => typeof model === "string" && Boolean(model)) : [],

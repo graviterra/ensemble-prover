@@ -590,8 +590,14 @@ async def _run_try_lean_tool_impl(
     require_declaration: bool = False,
     deadline_exhausted: Optional[Callable[[], bool]] = None,
     accepted_code_out: Optional[Dict[str, str]] = None,
+    feedback_context: bool = False,
 ) -> str:
-    """Run one answer-safe scratch proof check and return model-facing text."""
+    """Check scratch code, keeping conditional helper feedback non-authoritative.
+
+    ``feedback_context`` is supplied by orchestration when verified helper bodies
+    were replaced with prompt-visible signatures. Conditional checks never mint
+    accepted-code receipts, proof stubs, or durable successful scratch records.
+    """
     code = _strip_fence(str(args.get("code", "") or ""))
     code, redundant_prelude_normalized = _normalize_redundant_example_prelude(
         code,
@@ -610,7 +616,7 @@ async def _run_try_lean_tool_impl(
             return True
 
     def record_preflight_error(message: str) -> str:
-        if dossier is not None:
+        if dossier is not None and not feedback_context:
             dossier.record_scratch(
                 turn_index=turn_index,
                 tool_call_index=tool_call_index,
@@ -751,6 +757,25 @@ async def _run_try_lean_tool_impl(
 
     async def _check_with_compat(candidate_code: str) -> Any:
         checker = lean
+        if feedback_context:
+            from .lean_runner import FeedbackLeanResult
+
+            check_feedback = getattr(checker, "check_feedback", None)
+            if not callable(check_feedback):
+                raise RuntimeError("conditional feedback checker unavailable")
+            result = await check_feedback(
+                check_goal_statement,
+                candidate_code,
+                list(context_lemmas or ()),
+                candidate_lemmas=check_lemmas[len(context_lemmas or ()):],
+                preamble_override=preamble,
+                timeout_s=timeout_s,
+                max_heartbeats=max_heartbeats,
+                check_kind="full",
+            )
+            if not isinstance(result, FeedbackLeanResult):
+                raise RuntimeError("conditional feedback checker returned an invalid result")
+            return result
         current = getattr(lean, "current_generation", None)
         if callable(current):
             try:
@@ -834,7 +859,7 @@ async def _run_try_lean_tool_impl(
             redact_solution_refs=redact_solution_refs,
         )
         summary = f"try_lean infrastructure error: {safe_exc_type}"
-        if dossier is not None:
+        if dossier is not None and not feedback_context:
             dossier.record_scratch(
                 turn_index=turn_index,
                 tool_call_index=tool_call_index,
@@ -845,10 +870,13 @@ async def _run_try_lean_tool_impl(
             )
         return summary
 
+    def scratch_accepted(candidate: Any) -> bool:
+        return bool(getattr(candidate, "accepted" if feedback_context else "ok", False))
+
     single_line_layout_repaired = False
     repaired_code = (
         None
-        if declaration_mode or example_mode or bool(getattr(result, "ok", False))
+        if declaration_mode or example_mode or scratch_accepted(result)
         else repair_single_line_by_tactic_block(code)
     )
     if (
@@ -869,7 +897,7 @@ async def _run_try_lean_tool_impl(
             )
         except (_LeanAdmissionDeferred, Exception):
             repaired_result = None
-        if repaired_result is not None and bool(getattr(repaired_result, "ok", False)):
+        if repaired_result is not None and scratch_accepted(repaired_result):
             result = repaired_result
             code = repaired_code
             check_code = repaired_code
@@ -910,6 +938,15 @@ async def _run_try_lean_tool_impl(
         submitted_code_line_span=submitted_code_line_span,
         submitted_helper_source_span=submitted_helper_source_span,
     )
+    if feedback_context:
+        if scratch_accepted(result):
+            summary = (
+                "Lean accepted this scratch check conditionally on the prompt-visible "
+                "helper signatures. This is feedback only; the original helper bodies "
+                "must be checked before the proof or a helper can be accepted."
+            )
+            return f"try_lean conditional feedback accepted.\n{summary}"
+        return f"try_lean conditional feedback rejected.\n{outcome.summary}"
     if dossier is not None:
         dossier.record_scratch(
             turn_index=turn_index,

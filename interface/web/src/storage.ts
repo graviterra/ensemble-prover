@@ -6,6 +6,7 @@ const STOP_KEY = "ensemble-prover.stop-sent";
 const START_SUBMISSIONS_KEY = "ensemble-prover.start-submissions";
 
 export type Setup = {
+  proverDeployment?: string;
   projectPath: string;
   prover: string;
   proverModel: string;
@@ -17,6 +18,7 @@ export type LeanDraft = {
   theorem: string;
   prover: string;
   proverModel: string;
+  proverDeployment: string;
 };
 
 export type EnglishDraft = {
@@ -24,7 +26,11 @@ export type EnglishDraft = {
   text: string;
   prover: string;
   proverModel: string;
+  proverDeployment: string;
   formalizeOnly: boolean;
+  formalizer: string;
+  formalizerModel: string;
+  formalizerDeployment: string;
 };
 
 export type NotesDraft = {
@@ -77,6 +83,10 @@ function readObject(key: string): Record<string, unknown> | null {
 function text(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
+function publicText(value: unknown): string {
+  const item = text(value);
+  return item.includes("://") || item.includes("..") || item.includes("\0") ? "" : item;
+}
 
 export function loadSetup(): Setup {
   const row = readObject(SETUP_KEY);
@@ -84,7 +94,8 @@ export function loadSetup(): Setup {
   return {
     projectPath: text(row.projectPath),
     prover: text(row.prover),
-    proverModel: text(row.proverModel),
+    proverModel: publicText(row.proverModel),
+    ...(row.prover === "local" ? { proverDeployment: publicText(row.proverDeployment) } : {}),
   };
 }
 
@@ -94,7 +105,8 @@ export function saveSetup(setup: Setup): void {
     JSON.stringify({
       projectPath: setup.projectPath,
       prover: setup.prover,
-      proverModel: setup.proverModel,
+      proverModel: publicText(setup.proverModel),
+      ...(setup.prover === "local" ? { proverDeployment: publicText(setup.proverDeployment) } : {}),
     }),
   );
 }
@@ -102,8 +114,8 @@ export function saveSetup(setup: Setup): void {
 function blankDrafts(setup: Setup): Drafts {
   return {
     start: null,
-    lean: { projectPath: setup.projectPath, leanFile: "", theorem: "", prover: setup.prover, proverModel: setup.proverModel },
-    english: { projectPath: setup.projectPath, text: "", prover: setup.prover, proverModel: setup.proverModel, formalizeOnly: false },
+    lean: { projectPath: setup.projectPath, leanFile: "", theorem: "", prover: setup.prover, proverModel: setup.proverModel, proverDeployment: setup.proverDeployment ?? "" },
+    english: { projectPath: setup.projectPath, text: "", prover: setup.prover, proverModel: setup.proverModel, proverDeployment: setup.proverDeployment ?? "", formalizeOnly: false, formalizer: "", formalizerModel: "", formalizerDeployment: "" },
     notes: { projectPath: setup.projectPath, sourceFiles: [""], goal: "" },
     question: { projectPath: "", text: "" },
   };
@@ -120,6 +132,13 @@ function draftModel(row: Record<string, unknown>, setup: Setup): string {
     return row.prover === setup.prover ? setup.proverModel : "";
   }
   return fill(text(row.proverModel), setup.proverModel);
+}
+
+function draftDeployment(row: Record<string, unknown>, setup: Setup): string {
+  const provider = text(row.prover).trim();
+  if (provider && provider !== "local") return "";
+  if (provider === "local" && typeof row.proverDeployment === "string") return publicText(row.proverDeployment);
+  return setup.prover === "local" ? publicText(setup.proverDeployment) : "";
 }
 
 export function loadDrafts(setup: Setup): Drafts {
@@ -142,13 +161,18 @@ export function loadDrafts(setup: Setup): Drafts {
       theorem: text(lean.theorem),
       prover: fill(text(lean.prover), setup.prover),
       proverModel: draftModel(lean, setup),
+      proverDeployment: draftDeployment(lean, setup),
     },
     english: {
       projectPath: fill(text(english.projectPath), setup.projectPath),
       text: text(english.text),
       prover: fill(text(english.prover), setup.prover),
       proverModel: draftModel(english, setup),
+      proverDeployment: draftDeployment(english, setup),
       formalizeOnly: english.formalizeOnly === true,
+      formalizer: publicText(english.formalizer),
+      formalizerModel: publicText(english.formalizerModel),
+      formalizerDeployment: publicText(english.formalizerDeployment),
     },
     notes: {
       projectPath: fill(text(notes.projectPath), setup.projectPath),

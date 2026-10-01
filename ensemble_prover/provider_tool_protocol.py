@@ -105,6 +105,8 @@ def mini_reasoning_effort(client: Any, *, minimum: str) -> str:
     cfg = getattr(client, "cfg", None)
     configured = str(getattr(cfg, "reasoning_effort", "") or "").strip().lower()
     floor = str(minimum or "").strip().lower()
+    if str(getattr(client, "base_url", "") or getattr(cfg, "base_url", "")).startswith("local://"):
+        return configured
     if configured == "none":
         return "none"
     if not configured:
@@ -219,6 +221,8 @@ def mini_model_token_defaults(model: Any, *, base_url: str = "") -> tuple[Option
     Claude Code keeps context unspecified and output as a prompt target.
     """
 
+    if str(base_url or "").strip().lower().startswith("local://"):
+        return None, 8192
     return _mini_known_model_token_defaults(model, base_url=base_url) or (None, 8192)
 
 
@@ -228,6 +232,20 @@ def mini_model_output_capacity(client: Any, *, fallback: int = 8192) -> int:
     cfg = getattr(client, "cfg", None)
     configured = _positive_int(getattr(cfg, "max_tokens", None))
     base_url = str(getattr(client, "base_url", "") or getattr(cfg, "base_url", "") or "")
+    if str(base_url).strip().lower().startswith("local://"):
+        facts = getattr(client, "_local_public_facts", None)
+        declared = _positive_int(
+            facts.get("max_output_tokens") if isinstance(facts, Mapping) else None
+        )
+        if declared and configured > declared:
+            from .models import LocalProviderCapabilityError
+            raise LocalProviderCapabilityError("local_output_cap_not_declared")
+        if declared:
+            return min(declared, configured) if configured else declared
+        if configured:
+            return configured
+        from .models import LocalProviderCapabilityError
+        raise LocalProviderCapabilityError("local_output_cap_not_declared")
     capability = lookup_openrouter_reasoning_capabilities(base_url, getattr(cfg, "model", ""))
     advertised = _positive_int(getattr(capability, "max_completion_tokens", None))
     automatic = configured == _positive_int(getattr(cfg, "model_default_max_tokens", None))
@@ -357,6 +375,8 @@ def mini_bounded_visible_output_reasoning_effort(
     configured = str(
         getattr(cfg, "reasoning_effort", "") or ""
     ).strip().lower()
+    if str(getattr(client, "base_url", "") or getattr(cfg, "base_url", "")).startswith("local://"):
+        return configured
     if configured == "none" or _strict_reasoning_off(cfg):
         return "none"
     requested = str(effort or "low").strip().lower()
@@ -526,6 +546,51 @@ class MiniRequestEnvelopePolicy:
             "reasoning_effort": str(self.reasoning_effort or ""),
         }
 
+    def _resolve_explicit_local(
+        self,
+        client: Any,
+        *,
+        cfg: Any,
+        model: str,
+        base_url: str,
+    ) -> MiniRequestEnvelopeReceipt:
+        from .models import LocalProviderCapabilityError
+
+        facts = getattr(client, "_local_public_facts", None)
+        declared = _positive_int(
+            facts.get("max_output_tokens") if isinstance(facts, Mapping) else None
+        )
+        configured = _positive_int(getattr(cfg, "max_tokens", None))
+        if not declared or not configured or configured > declared:
+            raise LocalProviderCapabilityError("local_output_cap_not_declared")
+        explicit = _positive_int(self.session_max_tokens_override) or _positive_int(
+            getattr(cfg, "conversation_max_tokens_override", None)
+        )
+        if explicit > declared:
+            raise LocalProviderCapabilityError("local_output_cap_exceeds_declared")
+        output_tokens = explicit if explicit else configured
+        configured_effort = str(getattr(cfg, "reasoning_effort", "") or "")
+        if self.reasoning_mode == "explicit" and str(self.reasoning_effort or "") != configured_effort:
+            raise LocalProviderCapabilityError("local_reasoning_control_conflict")
+        body = {
+            "schema_version": _MINI_REQUEST_ENVELOPE_SCHEMA_VERSION,
+            "model": model,
+            "base_url": base_url,
+            "work_type": str(self.work_type or ""),
+            "request_kind": str(self.request_kind or ""),
+            "effective_reasoning_effort": configured_effort,
+            "reasoning_transport_mode": "local_declared",
+            "max_output_tokens": int(output_tokens),
+            "cap_source": "local_declared_output_cap",
+            "operator_override": bool(explicit),
+            "reasoning_capability": {},
+            "reasoning_transport_control": {},
+        }
+        digest = hashlib.sha256(json.dumps(
+            body, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return MiniRequestEnvelopeReceipt(**body, digest=digest)
+
     async def resolve_for(
         self, client: Any, *, messages: Optional[Sequence[Dict[str, Any]]] = None,
         tools: Optional[Sequence[Dict[str, Any]]] = None,
@@ -537,6 +602,10 @@ class MiniRequestEnvelopePolicy:
             or getattr(cfg, "base_url", "")
             or ""
         ).strip()
+        if base_url.lower().startswith("local://"):
+            return self._resolve_explicit_local(
+                client, cfg=cfg, model=model, base_url=base_url,
+            )
         explicit_effort = ""
         if self.reasoning_mode == "explicit":
             # A phase-specific operator control is exact. The concrete
@@ -927,6 +996,20 @@ def _resolve_mini_leaf_output_cap(
     session_override: Optional[int],
     capability: Any,
 ) -> tuple[int, str, str, bool]:
+    if str(base_url or "").strip().lower().startswith("local://"):
+        from .models import LocalProviderCapabilityError
+
+        declared = _positive_int(getattr(cfg, "max_tokens", None))
+        if declared <= 0:
+            raise LocalProviderCapabilityError("local_output_cap_not_declared")
+        explicit = _positive_int(session_override) or _positive_int(
+            getattr(cfg, "conversation_max_tokens_override", None)
+        )
+        if explicit > declared:
+            raise LocalProviderCapabilityError("local_output_cap_exceeds_declared")
+        if explicit:
+            return explicit, "local_declared_output_cap", "local_declared", True
+        return declared, "local_declared_output_cap", "local_declared", False
     session_cap = _positive_int(session_override)
     role_cap = _positive_int(
         getattr(cfg, "conversation_max_tokens_override", None)
@@ -1393,6 +1476,23 @@ async def preflight_mini_reasoning_contract(
             "resolution": "not_required",
             "transport_mode": "provider_default",
         }
+        if base_url.startswith("local://"):
+            from .models import LocalProviderCapabilityError
+            from .local_inference.protocol_config import reasoning_request_body
+
+            selected = getattr(leaf, "_local_role", None)
+            protocol = getattr(leaf, "_local_protocol", None)
+            if selected is None or protocol is None:
+                raise LocalProviderCapabilityError("local_inference_binding_invalid")
+            if requested != str(selected.reasoning_effort or "") or mode != selected.reasoning_mode:
+                raise LocalProviderCapabilityError("local_reasoning_control_conflict")
+            # An explicit boolean/template control need not carry an effort label.
+            # Configuration evidence is not observation of the server's behavior.
+            reasoning_request_body(protocol, selected.reasoning_mode, selected.reasoning_effort)
+            record.update(resolution="configured_controls", transport_mode="local_declared")
+            setattr(cfg, "reasoning_preflight_record", dict(record))
+            records.append(record)
+            continue
         if not _strict_reasoning_on(cfg):
             records.append(record)
             continue
@@ -2087,6 +2187,15 @@ def is_deepseek_client(client: Any) -> bool:
     """Whether a client/model is backed by DeepSeek."""
 
     cfg = getattr(client, "cfg", None)
+    primary = (
+        getattr(client, "base_url", ""),
+        getattr(cfg, "base_url", ""),
+    )
+    if any(
+        str(url or "").strip().lower().startswith(("local://", "cursor://"))
+        for url in primary
+    ):
+        return False
     base_urls = (
         getattr(client, "base_url", ""),
         getattr(client, "last_used_base_url", ""),

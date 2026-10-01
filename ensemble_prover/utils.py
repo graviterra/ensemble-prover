@@ -4201,6 +4201,11 @@ def _first_top_level_colon(s: str) -> int:
     return -1
 
 
+_LEAN_CHARACTER_LITERAL = re.compile(
+    r"'(?:[^'\\]|\\(?:[\\\"'rnt]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}))'"
+)
+
+
 def _lean_lexical_skip_end(text: str, idx: int) -> Optional[int]:
     """Return the exclusive end of a Lean lexical atom beginning at *idx*."""
 
@@ -4237,17 +4242,11 @@ def _lean_lexical_skip_end(text: str, idx: int) -> Optional[int]:
     if opener == "'":
         previous = raw[idx - 1] if idx > 0 else ""
         if not (previous.isalnum() or (bool(previous) and previous in "_'»")):
-            i = idx + 1
-            escaped = False
-            while i < len(raw):
-                ch = raw[i]
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == "'":
-                    return i + 1
-                i += 1
+            # Lean's charLitFnAux consumes exactly one character or escape,
+            # never an arbitrary run up to a later notation/identifier prime.
+            literal = _LEAN_CHARACTER_LITERAL.match(raw, idx)
+            if literal is not None:
+                return literal.end()
     if raw.startswith("/-", idx):
         depth = 1
         i = idx + 2

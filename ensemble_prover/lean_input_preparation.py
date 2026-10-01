@@ -109,9 +109,12 @@ def _run_lean(
     timeout_s: float,
     environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    from .local_inference.network_policy import prepare_owned_subprocess
+
+    child_env = prepare_owned_subprocess(command, project=project, base=environment, kind="lean")
     try:
         return run_process_group(
-            command, cwd=project, timeout=timeout_s, env=environment
+            command, cwd=project, timeout=timeout_s, env=child_env
         )
     except subprocess.TimeoutExpired as exc:
         raise PreparationError(

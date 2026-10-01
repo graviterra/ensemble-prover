@@ -1,0 +1,87 @@
+# Configuration example, not certification of a particular server or model.
+# Replace model and the token limits with your actual deployment settings.
+schema: 1
+coordinator:
+  installation_id: workstation
+  scope_id: inference_host
+endpoints:
+  local_chat:
+    base_url: http://127.0.0.1:8000/v1
+    dialect: generic
+    auth:
+      kind: none
+    capacity_group: workstation_gpu
+    max_inflight: 1
+    billing:
+      kind: owned_compute
+deployments:
+  math:
+    endpoint: local_chat
+    model: your-served-model-id
+    context_tokens: 32768
+    max_output_tokens: 8192
+    output_semantics: unknown
+    tools: native_required
+    native_n: unsupported
+    execution: operator_asserted_local
+    reasoning:
+      mode: provider-default
+      output_limit_includes_reasoning: unknown
+    sampling:
+      temperature:
+        policy: unrestricted
+      top_p:
+        policy: unrestricted
+    protocol:
+      schema: 1
+      # No reasoning mappings, response model aliases, or replay extensions
+      # are inferred from the model name.
+      reasoning_controls: {}
+      reasoning_efforts: {}
+      history_replay_fields: []
+      require_history_replay: false
+      model_aliases: []
+      argument_encoding: json_string
+      template_overhead_tokens: 256
+      streaming:
+        enabled: false
+        require_done: true
+        usage_request: omit
+      limits:
+        max_response_bytes: 1048576
+        max_stream_events: 4096
+        max_arguments_bytes: 65536
+        max_argument_depth: 32
+        max_tool_calls: 32
+  # Optional text-only selection for workflows that never request native tools.
+  # It shares the server and capacity group with the proof deployment above.
+  math_text:
+    endpoint: local_chat
+    model: your-served-model-id
+    context_tokens: 32768
+    max_output_tokens: 8192
+    output_semantics: unknown
+    tools: text_only
+    native_n: unsupported
+    execution: operator_asserted_local
+    reasoning:
+      mode: provider-default
+      output_limit_includes_reasoning: unknown
+    sampling:
+      temperature:
+        policy: unrestricted
+      top_p:
+        policy: unrestricted
+    protocol:
+      schema: 1
+      template_overhead_tokens: 256
+capacity_groups:
+  workstation_gpu:
+    max_inflight: 1
+    max_queued: 8
+    queue_timeout_s: 120
+    request_timeout_s: 600
+run_budget:
+  max_local_dispatches: 256
+  max_local_requested_output_tokens: 2097152
+  max_local_observed_request_wall_s: 14400

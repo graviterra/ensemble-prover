@@ -55,12 +55,13 @@ _GRAPH_SELECTED_WORK_SCOPE_KEY = "_graph_selected_work_scope_key"
 _REPAIR_SELF_CHECK_COMPLIANT_NON_VERDICT_STATUSES = frozenset(
     {
         "try_lean_infrastructure_error",
+        "conditional_feedback",
     }
 )
 
 
 def _repair_self_check_non_verdict_is_compliant(status: Any) -> bool:
-    """Whether try_lean was invoked but its harness returned no verdict.
+    """Whether try_lean ran without an authoritative verdict.
 
     This satisfies the behavioral self-check requirement without granting any
     proof authority; the final candidate must still pass the independent Lean

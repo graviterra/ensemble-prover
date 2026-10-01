@@ -51,6 +51,7 @@ from .helper_utilization import (
     parse_helper_usage_observation,
     strip_helper_usage_output,
 )
+from .lean_feedback import FeedbackLeanResult
 from .lean_parser import (
     LeanDiagnostic,
     LeanOutput,
@@ -76,7 +77,7 @@ from .lean_server import LeanREPL
 from .proof_dossier import _contains_solution_ref_for_prompt, helper_decl_name
 from .runtime_context import mark_runtime_owned_callback
 from .subprocess_cleanup import terminate_and_reap_process
-from .subprocess_environment import sanitized_subprocess_environment
+from .local_inference.network_policy import prepare_owned_subprocess
 from .theorem_project import decode_theorem_target_context
 from .utils import (
     hash_text,
@@ -189,17 +190,18 @@ def _name_anonymous_check_roots(
 
 
 _CHECK_SOURCE_BOUNDARY_GUARD = r"""
-private partial def ensembleCheckCommandBoundary (command : Lean.Syntax) : Bool :=
+private partial def ensembleCheckCommandBoundary (command : Lean.Syntax) (allowAxioms : Bool := false) : Bool :=
   if command.isOfKind ``Lean.Parser.Command.declaration then
+    (allowAxioms && command[1].isOfKind ``Lean.Parser.Command.axiom) ||
     [``Lean.Parser.Command.definition, ``Lean.Parser.Command.abbrev,
      ``Lean.Parser.Command.theorem, ``Lean.Parser.Command.opaque,
      ``Lean.Parser.Command.example, ``Lean.Parser.Command.instance,
      ``Lean.Parser.Command.structure, ``Lean.Parser.Command.inductive,
      ``Lean.Parser.Command.classInductive].contains command[1].getKind
   else if command.isOfKind ``Lean.Parser.Command.in then
-    ensembleCheckCommandBoundary command[0] && ensembleCheckCommandBoundary command[2]
+    ensembleCheckCommandBoundary command[0] allowAxioms && ensembleCheckCommandBoundary command[2] allowAxioms
   else if command.isOfKind ``Lean.Parser.Command.mutual then
-    command[1].getArgs.all ensembleCheckCommandBoundary
+    command[1].getArgs.all (fun command => ensembleCheckCommandBoundary command allowAxioms)
   else
     [``Lean.Parser.Command.namespace, ``Lean.Parser.Command.end,
      ``Lean.Parser.Command.section, ``Lean.Parser.Command.open,
@@ -326,6 +328,8 @@ def _check_source_boundary_file(
     preamble: str, statement: str, proof: str, lemmas: str,
     *, goal_name: str, max_heartbeats: Optional[int] = None,
     declaration_prefix: Optional[str] = None,
+    allow_feedback_axioms: bool = False,
+    candidate_lemmas: str = "",
 ) -> str:
     """Parse candidate data before any untrusted command can be elaborated.
 
@@ -356,9 +360,13 @@ def _check_source_boundary_file(
     statement_input = " " * len(declaration_prefix) + statement
     proof_prefix = (declaration_prefix + statement + " := ").rsplit("\n", 1)[-1]
     proof_input = " " * len(proof_prefix) + proof
-    return trusted + "\n\n" + _CHECK_SOURCE_BOUNDARY_GUARD + f"""
+    helper_checks = ""
+    for helper_source, allow_axioms in ((lemmas, allow_feedback_axioms), (candidate_lemmas, False)):
+        if not helper_source and helper_checks:
+            continue
+        helper_checks += f"""
 run_cmd do
-  let input := Lean.Parser.mkInputContext {_lean_string(lemmas)} "scratch-helpers.lean"
+  let input := Lean.Parser.mkInputContext {_lean_string(helper_source)} "scratch-helpers.lean"
   let (parsedHeader, initialState, initialMessages) ← Lean.Parser.parseHeader input
   let header : Lean.Elab.HeaderSyntax := ⟨parsedHeader.raw⟩
   unless (header.imports (includeInit := false)).isEmpty do
@@ -376,7 +384,7 @@ run_cmd do
         Lean.logError (← message.toString)
       Lean.throwError "scratch source boundary: failed to parse helpers"
     if command.isOfKind ``Lean.Parser.Command.eoi then break
-    unless ensembleCheckCommandBoundary command do
+    unless ensembleCheckCommandBoundary command {str(allow_axioms).lower()} do
       Lean.throwError m!"scratch source boundary: unsupported helper command {{command.getKind}}"
     -- Only scope changes are elaborated during admission, never candidate
     -- declarations or command macros. Later syntax sees trusted scoped notation.
@@ -400,6 +408,8 @@ run_cmd do
     else if [``Lean.Parser.Command.namespace, ``Lean.Parser.Command.section,
         ``Lean.Parser.Command.end].contains command.getKind then
       Lean.Elab.Command.elabCommand command
+"""
+    return trusted + "\n\n" + _CHECK_SOURCE_BOUNDARY_GUARD + helper_checks + f"""
 {target_context}
 run_cmd do
   match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(statement_input)} with
@@ -3850,6 +3860,8 @@ class LeanRunner:
             "canonicalize_statement_types",
             "check_statement_type_raw",
             "check_proposition_type_raw",
+            "check_feedback",
+            "check_feedback_proposition_type_raw",
             "apply_decl_to_goal",
             "supports_silence_fast_fail",
             "get_stats",
@@ -4274,11 +4286,11 @@ class LeanRunner:
         async with self._extra_imports_lock:
             if self._extra_imports_ready:
                 return
+            command = ("lake", "build")
             proc = await asyncio.create_subprocess_exec(
-                "lake",
-                "build",
+                *command,
                 cwd=str(self.project_dir),
-                env=sanitized_subprocess_environment(),
+                env=prepare_owned_subprocess(command, project=self.project_dir, kind="lean"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -4329,12 +4341,11 @@ class LeanRunner:
                 # previous success cannot authorize checks if this build
                 # fails or is cancelled.
                 self._project_imports_ready = False
+            command = ("lake", "build", *modules)
             proc = await asyncio.create_subprocess_exec(
-                "lake",
-                "build",
-                *modules,
+                *command,
                 cwd=str(self.project_dir),
-                env=sanitized_subprocess_environment(),
+                env=prepare_owned_subprocess(command, project=self.project_dir, kind="lean"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -4489,12 +4500,11 @@ class LeanRunner:
                 # retain False unless every target below succeeds.
                 self._support_projects_ready = False
             for project, targets in builds:
+                command = ("lake", "build", *targets)
                 proc = await asyncio.create_subprocess_exec(
-                    "lake",
-                    "build",
-                    *targets,
+                    *command,
                     cwd=str(project),
-                    env=sanitized_subprocess_environment(),
+                    env=prepare_owned_subprocess(command, project=project, kind="lean"),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
@@ -5724,10 +5734,11 @@ class LeanRunner:
                     tempfile.TemporaryFile() as stdout_file,
                     tempfile.TemporaryFile() as stderr_file,
                 ):
+                    lake_command = ("lake", "env", *args)
                     proc = subprocess.Popen(
-                        ("lake", "env", *args),
+                        lake_command,
                         cwd=str(self.project_dir),
-                        env=sanitized_subprocess_environment(),
+                        env=prepare_owned_subprocess(lake_command, project=self.project_dir, kind="lean"),
                         stdout=stdout_file,
                         stderr=stderr_file,
                         start_new_session=True,
@@ -5843,7 +5854,7 @@ class LeanRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
-                env=sanitized_subprocess_environment(process_env),
+                env=prepare_owned_subprocess(command, project=self.project_dir, base=process_env, kind="lean"),
             )
             if dispatch_observer is not None:
                 try:
@@ -6065,6 +6076,14 @@ class LeanRunner:
             warning_as_error=warning_as_error,
             dispatch_observer=dispatch_observer,
         )
+
+    async def check_feedback(
+        self, statement: str, proof_code: str, lemmas: List[str], **kwargs: Any,
+    ) -> FeedbackLeanResult:
+        """Check conditional feedback without producing proof authority."""
+        from .lean_feedback import check_feedback
+
+        return await check_feedback(self, statement, proof_code, lemmas, **kwargs)
 
     # Preserve the original wrapper identity even when an integration replaces
     # LeanRunner.check itself; an inherited probe must not bypass that policy.
@@ -9710,13 +9729,33 @@ private def {serializer_prefix}_contractDefeq
             returncode,
         )
 
+    async def check_feedback_proposition_type_raw(
+        self, statement: str, lemmas: Sequence[str], *,
+        preamble_override: str | None = None, timeout_s: Optional[float] = None,
+    ) -> tuple[LeanParseResult, str, int]:
+        """Parse a feedback target under explicit, non-authoritative assumptions."""
+        return await self._check_proposition_type_raw(
+            statement, lemmas, preamble_override=preamble_override,
+            timeout_s=timeout_s, allow_feedback_axioms=True,
+        )
+
     async def check_proposition_type_raw(
+        self, statement: str, lemmas: Sequence[str], *,
+        preamble_override: str | None = None, timeout_s: Optional[float] = None,
+    ) -> tuple[LeanParseResult, str, int]:
+        """Confirm one original closed proposition under ordinary helper policy."""
+        return await self._check_proposition_type_raw(
+            statement, lemmas, preamble_override=preamble_override, timeout_s=timeout_s,
+        )
+
+    async def _check_proposition_type_raw(
         self,
         statement: str,
         lemmas: Sequence[str],
         *,
         preamble_override: str | None = None,
         timeout_s: Optional[float] = None,
+        allow_feedback_axioms: bool = False,
     ) -> tuple[LeanParseResult, str, int]:
         """Confirm one closed proposition in its target scope, without proving it.
 
@@ -9748,6 +9787,7 @@ private def {serializer_prefix}_contractDefeq
             raw_statement, proof, helpers, goal_name=qualified_name,
             max_heartbeats=heartbeat_limit,
             declaration_prefix=f"theorem {qualified_name} : ",
+            allow_feedback_axioms=allow_feedback_axioms,
         )
 
         def finish(
@@ -9774,7 +9814,7 @@ private def {serializer_prefix}_contractDefeq
             return parse_lean_output(output, code, goal_start_line=goal_start_line), output, code
 
         _path, execution, write_error = await self._execute_generated_file(
-            mode="proposition_type_source_boundary", goal_name=f"{name}_boundary",
+            mode="feedback_proposition_type_source_boundary" if allow_feedback_axioms else "proposition_type_source_boundary", goal_name=f"{name}_boundary",
             content=boundary, timeout_s=timeout_s, warning_as_error=False,
             operation_deadline=deadline,
         )
@@ -9796,7 +9836,7 @@ run_cmd Lean.Elab.Command.liftTermElabM do
     Lean.throwError "proposition preflight: statement is not a proposition"
 """
         _path, execution, write_error = await self._execute_generated_file(
-            mode="proposition_type", goal_name=name, content=content,
+            mode="feedback_proposition_type" if allow_feedback_axioms else "proposition_type", goal_name=name, content=content,
             timeout_s=timeout_s, warning_as_error=False, operation_deadline=deadline,
         )
         return finish(execution, write_error, goal_start_line=built.goal_start_line)

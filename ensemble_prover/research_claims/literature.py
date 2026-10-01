@@ -20,7 +20,10 @@ from urllib.parse import urlencode, urljoin, urlsplit
 
 import aiohttp
 
-from ..subprocess_environment import sanitized_subprocess_environment
+from ..local_inference.network_policy import (
+    prepare_owned_subprocess,
+    remote_fetch_allowed,
+)
 from .model import json_text, text, load_json
 
 MAX_BYTES = 16 * 1024 * 1024
@@ -87,10 +90,28 @@ def validate_url(url: str) -> str:
     return url
 
 
+class RemoteLiteratureDisabled(RuntimeError):
+    """Remote scholarly access is off. This is not a mathematical result."""
+
+    def __init__(self) -> None:
+        super().__init__("remote_literature_disabled")
+
+
+def _remote_literature_disabled() -> dict[str, Any]:
+    return {
+        "status": "disabled",
+        "coverage": "none",
+        "reason": "remote_literature_disabled",
+        "kernel_verified": False,
+    }
+
+
 class PublicResolver(aiohttp.abc.AbstractResolver):
     async def resolve(
         self, host: str, port: int = 0, family: int = socket.AF_INET
     ) -> list[dict[str, Any]]:
+        if not remote_fetch_allowed():
+            raise RemoteLiteratureDisabled()
         infos = await asyncio.get_running_loop().getaddrinfo(
             host, port, family=family, type=socket.SOCK_STREAM
         )
@@ -114,6 +135,8 @@ class PublicResolver(aiohttp.abc.AbstractResolver):
 
 
 async def fetch_public(url: str, timeout: float) -> dict[str, Any]:
+    if not remote_fetch_allowed():
+        raise RemoteLiteratureDisabled()
     async with asyncio.timeout(timeout):
         connector = aiohttp.TCPConnector(resolver=PublicResolver(), use_dns_cache=False)
         async with aiohttp.ClientSession(
@@ -170,7 +193,7 @@ def source_context(store: Any, artifact_id: str) -> Any:
 async def _process(argv: list[str], timeout: float) -> None:
     process = await asyncio.create_subprocess_exec(
         *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        env=sanitized_subprocess_environment(),
+        env=prepare_owned_subprocess(argv, kind="local_tool"),
     )
     try:
         await asyncio.wait_for(process.wait(), timeout=timeout)
@@ -197,6 +220,9 @@ class LiteratureTools:
     async def run(
         self, action: dict[str, Any], *, remaining_s: float
     ) -> dict[str, Any]:
+        action_name = action.get("action") if isinstance(action, dict) else None
+        if action_name in ("literature_search", "fetch_source") and not remote_fetch_allowed():
+            return _remote_literature_disabled()
         timeout = min(30, remaining_s)
         if timeout <= 0:
             return {
@@ -267,6 +293,8 @@ class LiteratureTools:
                             raise ValueError("invalid bibliographic results")
                         result["results"] = items
                 return {**result, "kernel_verified": False}
+        except RemoteLiteratureDisabled:
+            return _remote_literature_disabled()
         except (
             OSError,
             ValueError,

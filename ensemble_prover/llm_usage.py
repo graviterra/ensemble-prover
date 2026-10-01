@@ -1356,6 +1356,8 @@ def provider_usage_from_payload(
     if reported_cost is not None:
         source = "provider_reported"
         assumptions = [] if valid_totals else ["provider_token_totals_unavailable"]
+    elif policy.get("rate_source") == "declared_zero_marginal_api_cost":
+        source = "declared_zero_marginal_api_cost"
 
     return ProviderUsageRecord(
         model=response_model,

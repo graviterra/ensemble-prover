@@ -21,6 +21,7 @@ from typing import Any, Mapping, Sequence
 import httpx
 
 from ..codex_subscription import CodexSubscriptionClient
+from ..workflow_roles import wire_response_format
 from ..llm_error_policy import SubscriptionBackendError
 from ..models import (
     REQUIRED_PROMPT_CONTEXT_KEY,
@@ -449,11 +450,12 @@ class Campaign:
         try:
             # Keep the strict subscription envelope/tool boundary, but let this
             # controller persist and repair a completed malformed inner action.
-            # Other transports retain their existing JSON-mode behavior.
+            # Codex keeps this controller-owned repair path; other subscriptions
+            # retain their JSON contract. Local uses prompt JSON and host parsing.
             _, response = await client.chat_raw(
                 messages,
-                response_format=(
-                    None if isinstance(client, CodexSubscriptionClient) else "json"
+                response_format=wire_response_format(
+                    client, None if isinstance(client, CodexSubscriptionClient) else "json"
                 ),
             )
         except (RequiredPromptContextOverflow, SubscriptionBackendError):

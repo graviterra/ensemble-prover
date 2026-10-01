@@ -24,20 +24,56 @@ class AdmissionStopped(RuntimeError):
     """No more external work may be started under the saved authorization."""
 
 
+# Older ledger upgrades still accept only openai and codex.
+RESEARCH_PROVIDERS = ("openai", "codex", "claude-code", "cursor", "local")
+
+
 def provider_routes(record: dict[str, Any]) -> tuple[str, str]:
-    """Schema-5 routing is explicit, including in upgraded API-only ledgers."""
+    """Routing is explicit. Cursor is hosted. local is not an offline claim."""
     provider = record.get("provider")
     review_provider = record.get("review_provider")
     if (
         not isinstance(provider, str)
-        or provider not in ("openai", "codex")
+        or provider not in RESEARCH_PROVIDERS
         or not isinstance(review_provider, str)
-        or review_provider not in ("openai", "codex")
+        or review_provider not in RESEARCH_PROVIDERS
     ):
         raise ValueError(
-            "research provider and review_provider must be openai or codex"
+            "research provider and review_provider must be openai, codex, claude-code, cursor, or local"
+        )
+    policy = record.get("inference_policy", "mixed")
+    if policy not in ("mixed", "local-only"):
+        raise ValueError("invalid research inference policy")
+    if policy == "local-only" and (provider, review_provider) != ("local", "local"):
+        raise ValueError(
+            "local-only research requires local research and review roles. "
+            "Cursor and cloud providers stay hosted. local-only does not mean offline "
+            "and does not by itself stop downloads."
         )
     return provider, review_provider
+
+
+def admit_provider_pair(
+    provider: Any, review: Any, *, inference_policy: str = "mixed",
+) -> tuple[str, str]:
+    review_provider = provider if review is None else review
+    return provider_routes({
+        "provider": provider, "review_provider": review_provider,
+        "inference_policy": inference_policy,
+    })
+
+
+def reject_substituted_model(provider: Any, model: Any) -> None:
+    if provider != "cursor":
+        return
+    if (
+        not isinstance(model, str)
+        or not model.strip()
+        or model.strip().casefold() == "auto"
+    ):
+        raise ValueError(
+            "cursor requires an exact account-visible model id; auto is not substituted"
+        )
 
 
 class DiscoveryStore(ResearchStore):

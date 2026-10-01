@@ -13,6 +13,17 @@ export type RuntimeSetting = {
   role: string; model: string; provider: string; reasoning: string; requestedReasoning: string;
   scope: string; requestId: string; transport: string; outputTokens: number | null; source: string; elapsedS: number | null; workType: string;
 };
+const inferenceStatuses = [
+  "initialized", "requesting", "thinking", "compacting", "idle", "retrying", "responding",
+  "finished", "failed", "cancelled", "timed_out", "queued", "loading", "generating",
+  "validating", "cancelling", "completion_unknown", "paused",
+] as const;
+export type InferenceStatus = typeof inferenceStatuses[number];
+export type InferenceObservation = {
+  role: string; requestId: string; scope: string; backend: string; status: InferenceStatus;
+  elapsedS: number | null; requestElapsedS: number | null; observationAgeS: number | null; stale: boolean;
+  queuePosition: number | null; queuedRequests: number | null; inflightRequests: number | null; unknownRequests: number | null;
+};
 export type LiveMathView = {
   selection: MathSelection | null; activity: MathSelection | null; lastCostlyAction: MathReceipt | null;
   source: { commit: string; dirty: boolean | null; available: boolean; fingerprint: string; partial: boolean };
@@ -20,6 +31,7 @@ export type LiveMathView = {
   health: {
     activeDeferrals: { action: string; reason: string; scope: string }[];
     providerIssues: { role: string; status: string; scope: string; elapsedS: number | null }[];
+    inferenceProgress: InferenceObservation[];
     backlog: boolean; partialTrace: boolean; stale: boolean; traceAgeS: number | null; traceAvailable: boolean | null;
     processStatus: string; omittedDeferrals: number;
   };
@@ -40,6 +52,23 @@ function number(value: unknown): number | null {
 }
 function rows(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value) ? value.slice(0, 16).filter((item) => item && typeof item === "object" && !Array.isArray(item)).map(object) : [];
+}
+function boundedCounter(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 10000 ? value : null;
+}
+function inferenceObservation(row: Record<string, unknown>): InferenceObservation | null {
+  if (typeof row.backend !== "string" || !["local_inference", "cursor_subscription", "codex_subscription", "claude_code_subscription"].includes(row.backend)
+      || typeof row.status !== "string" || !(inferenceStatuses as readonly string[]).includes(row.status)
+      || typeof row.requestId !== "string" || !row.requestId || row.requestId.length > 160 || /[\x00-\x1f\x7f]/.test(row.requestId)) return null;
+  const age = number(row.observationAgeS);
+  return {
+    role: text(row.role, 80), requestId: row.requestId, scope: scopeText(row.scope),
+    backend: row.backend, status: row.status as InferenceStatus,
+    elapsedS: number(row.elapsedS), requestElapsedS: number(row.requestElapsedS), observationAgeS: age,
+    stale: row.stale === true || (age !== null && age > 120),
+    queuePosition: boundedCounter(row.queuePosition), queuedRequests: boundedCounter(row.queuedRequests),
+    inflightRequests: boundedCounter(row.inflightRequests), unknownRequests: boundedCounter(row.unknownRequests),
+  };
 }
 function selection(value: unknown): MathSelection | null {
   const row = object(value);
@@ -76,6 +105,7 @@ export function parseLiveMath(value: unknown): LiveMathView | undefined {
     })),
     health: {
       activeDeferrals: rows(health.activeDeferrals).map((item) => ({ action: text(item.action), reason: text(item.reason), scope: scopeText(item.scope) })),
+      inferenceProgress: rows(health.inferenceProgress).map(inferenceObservation).filter((item): item is InferenceObservation => item !== null),
       providerIssues: rows(health.providerIssues).map((item) => ({ role: text(item.role), status: text(item.status), scope: scopeText(item.scope), elapsedS: number(item.elapsedS) })),
       backlog: health.backlog === true, partialTrace: health.partialTrace === true, stale: health.stale === true,
       traceAvailable: typeof health.traceAvailable === "boolean" ? health.traceAvailable : null,

@@ -27,6 +27,7 @@ from .artifact_versions import (
 from .config import LeanConfig, RetrievalConfig
 from .domain import DomainHint
 from .embeddings import EmbedderConfig, TextEmbedder, make_embedder
+from .local_inference.network_policy import remote_fetch_allowed
 from .lean_decl_parser import find_decl_header_end
 from .math_utils import cosine_sim as _cosine_sim
 from .math_utils import sigmoid as _math_sigmoid
@@ -1022,6 +1023,8 @@ class LemmaRetriever:
         use_fp16: bool,
         device: Optional[str],
     ) -> Tuple[Optional[Any], Optional[BaseException]]:
+        if not remote_fetch_allowed():
+            return None, RuntimeError("layerwise reranker unavailable offline (downloads disabled)")
         timeout_s = max(
             1.0, float(getattr(self.cfg, "cross_encoder_score_timeout_s", 20.0))
         )
@@ -1034,7 +1037,7 @@ class LemmaRetriever:
         done = threading.Event()
         box: Dict[str, Any] = {"model": None, "exc": None}
         want_offline = bool(
-            prefer_local or local_only or is_local_path or not allow_download
+            prefer_local or local_only or is_local_path or not allow_download or not remote_fetch_allowed()
         )
 
         def _worker() -> None:
@@ -1099,6 +1102,11 @@ class LemmaRetriever:
         )
         local_files_only = bool(getattr(self.cfg, "embedding_local_files_only", False))
         allow_download = bool(getattr(self.cfg, "embedding_allow_download", True))
+        offline = not remote_fetch_allowed()
+        if offline:
+            prefer_local_files = True
+            local_files_only = True
+            allow_download = False
         resolved_model = _resolve_hf_snapshot_path(model_name)
         model_target = str(resolved_model) if resolved_model is not None else model_name
         is_local_path = Path(model_target).exists()
@@ -1119,8 +1127,13 @@ class LemmaRetriever:
             try:
                 return CrossEncoder(model_target, **kwargs)
             except TypeError:
-                # Back-compat for older ST versions without local_files_only kwarg.
+                if offline:
+                    raise RuntimeError(
+                        f"cross-encoder local-only load failed for '{model_name}' "
+                        "(downloads disabled): local_files_only_unsupported"
+                    )
                 kwargs.pop("local_files_only", None)
+                # Back-compat for older ST versions without local_files_only kwarg.
                 return CrossEncoder(model_target, **kwargs)
 
         def _run_load(
@@ -1141,7 +1154,7 @@ class LemmaRetriever:
             # always releases the lock (prevents permanent deadlock).
             prev_hf: Optional[str] = None
             prev_tx: Optional[str] = None
-            if local_only:
+            if local_only and not offline:
                 _HF_ENV_LOCK.acquire()
                 prev_hf = os.environ.get("HF_HUB_OFFLINE")
                 prev_tx = os.environ.get("TRANSFORMERS_OFFLINE")
@@ -1157,7 +1170,7 @@ class LemmaRetriever:
                     )
                 return box.get("model"), box.get("exc")
             finally:
-                if local_only:
+                if local_only and not offline:
                     if prev_hf is None:
                         os.environ.pop("HF_HUB_OFFLINE", None)
                     else:
@@ -1181,6 +1194,11 @@ class LemmaRetriever:
                     f"cross-encoder local-only load failed for '{model_name}' "
                     f"(downloads disabled): {local_exc}"
                 )
+        if offline:
+            return None, RuntimeError(
+                f"cross-encoder local-only load failed for '{model_name}' "
+                f"(downloads disabled): {local_exc}"
+            )
 
         model, net_exc = _run_load(False, label="cross-encoder-load-worker")
         if net_exc is None and model is not None:

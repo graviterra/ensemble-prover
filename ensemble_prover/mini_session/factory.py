@@ -1831,7 +1831,7 @@ def _mini_recursive_planner_deadline_kwargs(client: Any) -> Dict[str, Any]:
     cfg = getattr(client, "cfg", None)
     subscription_request_timeout_disabled = bool(
         str(getattr(cfg, "base_url", "")) in {
-            "codex://chatgpt", "claude-code://subscription",
+            "codex://chatgpt", "claude-code://subscription", "cursor://subscription",
         }
         and str(getattr(cfg, "llm_deadline_policy", "hard")) == "soft"
         and getattr(cfg, "request_timeout_disabled", False)

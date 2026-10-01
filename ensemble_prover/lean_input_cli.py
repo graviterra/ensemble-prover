@@ -192,6 +192,23 @@ def _run_path_input(args: argparse.Namespace, argv: Sequence[str],
     from .lean_input_batch import run_prepared_batch
     from .lean_input_preparation import prepare_lean_file
 
+    if getattr(args, "_check_input", False):
+        from .local_inference.roles import resolve_local_inference
+
+        # Read-only provider policy validation: no snapshot, ledger, socket,
+        # capability probe, or provider process belongs in an input check.
+        local = resolve_local_inference(args)
+        if local is not None:
+            print("Local inference profile: statically valid; server availability and capabilities were not tested.", flush=True)
+        if any(getattr(args, name, None) == "cursor" for name in (
+            "prover", "refiner", "planner_escalation",
+        )):
+            print("Cursor generation is unqualified for this build; input checking does not establish provider readiness. No Cursor process was started.", flush=True)
+
+    from .local_inference.roles import resolve_local_inference
+    from .local_inference.network_policy import admit_network_policy
+    admit_network_policy(args, resolve_local_inference(args), _ROOT)
+
     source = Path(getattr(args, "_input_path", None) or args.lean_file).expanduser().resolve(strict=True)
     files = discover_lean_files(source)
     if not files:

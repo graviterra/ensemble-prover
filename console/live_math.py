@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from ensemble_prover.provider_progress import PROGRESS_KEY, progress_snapshot
+
 COSTLY_ACTION_SECONDS = 20.0
 MAX_ROLES = 16
 
@@ -48,6 +50,11 @@ def _put(mapping: dict, key: str, value: Any) -> None:
         del mapping[next(iter(mapping))]
 
 
+def valid_request_id(value: Any) -> bool:
+    return (type(value) is str and 0 < len(value) <= 160
+            and not any(ord(char) < 32 or ord(char) == 127 for char in value))
+
+
 @dataclass
 class LiveMathState:
     selection: dict = field(default_factory=dict)
@@ -56,7 +63,9 @@ class LiveMathState:
     source: dict = field(default_factory=lambda: source_record(None))
     settings: dict = field(default_factory=dict)
     provider_issues: dict = field(default_factory=dict)
+    inference_progress: dict = field(default_factory=dict)
     prepared_requests: dict = field(default_factory=dict)
+    prepared_elapsed: dict = field(default_factory=dict)
     startup_seen: bool = False
 
     def consume(self, row: dict) -> None:
@@ -138,8 +147,30 @@ class LiveMathState:
             return
         role = text(row.get("role"), 80) or "llm"
         request_id = text(row.get("llm_request_id"), 160)
-        if phase == "llm_request_prepared" and request_id:
-            _put(self.prepared_requests, role, request_id)
+        if phase == "llm_request_prepared":
+            raw_id = row.get("llm_request_id")
+            if not valid_request_id(raw_id):
+                # Older traces can still describe model settings without a
+                # request ID. They cannot replace a known request boundary or
+                # contribute transport progress. Explicit malformed IDs fail.
+                if ("llm_request_id" in row or role in self.prepared_requests
+                        or role in self.inference_progress):
+                    return
+            else:
+                last_prepared = self.prepared_elapsed.get(role)
+                previous_observation = self.inference_progress.get(role)
+                last_observed = number(previous_observation.get("elapsedS")) if previous_observation else None
+                prior_times = [value for value in (last_prepared, last_observed) if value is not None]
+                if prior_times and (elapsed is None or elapsed < max(prior_times)):
+                    return
+                _put(self.prepared_requests, role, raw_id)
+                _put(self.prepared_elapsed, role, elapsed)
+                previous = self.inference_progress.get(role)
+                if previous and previous.get("requestId") != request_id:
+                    self.inference_progress.pop(role, None)
+        if phase == PROGRESS_KEY:
+            self._consume_inference_progress(row, role, scope, elapsed)
+            return
         current_request = self.prepared_requests.get(role)
         current = not current_request or not request_id or request_id == current_request
         receipts = row.get("mini_request_envelopes")
@@ -180,3 +211,32 @@ class LiveMathState:
                 _put(self.provider_issues, role, {"role": role, "status": status, "elapsedS": elapsed, "scope": scope, "requestId": request_id})
             elif status in {"ok", "success", "completed"} and (current or request_id == obj(self.provider_issues.get(role)).get("requestId")):
                 self.provider_issues.pop(role, None)
+
+
+    def _consume_inference_progress(self, row: dict, role: str, scope: str, elapsed: float | None) -> None:
+        progress = progress_snapshot(row.get(PROGRESS_KEY))
+        raw_request_id = row.get("llm_request_id")
+        if progress is None or not valid_request_id(raw_request_id):
+            return
+        current_request = self.prepared_requests.get(role)
+        previous = self.inference_progress.get(role)
+        # A retained prepared boundary establishes the current request. Without
+        # one (partial/older traces), do not switch identities on telemetry alone.
+        if current_request and raw_request_id != current_request:
+            return
+        if not current_request and previous and previous.get("requestId") != raw_request_id:
+            return
+        previous_elapsed = number(previous.get("elapsedS")) if previous else None
+        if previous_elapsed is not None and (elapsed is None or elapsed < previous_elapsed):
+            return
+        observation = {
+            "role": role, "requestId": raw_request_id, "scope": scope,
+            "backend": progress["backend"], "status": progress["status"],
+            "elapsedS": elapsed, "requestElapsedS": progress.get("elapsed_s"),
+        }
+        for source, target in (
+            ("queue_position", "queuePosition"), ("queued_requests", "queuedRequests"),
+            ("inflight_requests", "inflightRequests"), ("unknown_requests", "unknownRequests"),
+        ):
+            observation[target] = progress.get(source)
+        _put(self.inference_progress, role, observation)

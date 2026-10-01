@@ -31,7 +31,7 @@ from .promotion_context import (
     lean_name_components, promotion_context_namespace,
 )
 from .store import TheoryStore
-from ..subprocess_environment import sanitized_subprocess_environment
+from ..local_inference.network_policy import prepare_owned_subprocess
 
 
 _DECL_RE = re.compile(
@@ -524,7 +524,7 @@ class TheoryBundleVerifier:
             process = subprocess.Popen(
                 list(command),
                 cwd=cwd or self.lean_project_dir,
-                env=sanitized_subprocess_environment(env),
+                env=prepare_owned_subprocess(command, project=self.lean_project_dir, base=env),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

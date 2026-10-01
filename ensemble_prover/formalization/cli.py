@@ -112,6 +112,25 @@ def _parser() -> argparse.ArgumentParser:
         default="gpt-5.6-luna",
         help="OpenAI API model name",
     )
+    for role in ("formalizer", "reviewer", "prover"):
+        run.add_argument(
+            f"--{role}-provider",
+            choices=("openai", "deepseek", "openrouter", "codex", "claude-code", "cursor", "local"),
+            default=None,
+            help="Explicit provider. local-only does not assume OpenAI and does not mean offline.",
+        )
+        run.add_argument(f"--{role}-deployment", default=None)
+    run.add_argument("--local-inference-config", type=Path, default=None)
+    run.add_argument(
+        "--inference-policy", choices=("mixed", "local-only"), default="mixed",
+        help="local-only requires every role to be an explicit local deployment.",
+    )
+    from ..local_inference.network_policy import add_network_policy_argument
+    add_network_policy_argument(run)
+    run.add_argument("--coordinator-root", type=Path, default=None)
+    run.add_argument("--cursor-bin", default="agent")
+    run.add_argument("--claude-code-bin", default="claude")
+    run.add_argument("--codex-bin", default="codex")
     run.add_argument(
         "--model-timeout-s",
         type=_positive_seconds,
@@ -167,23 +186,137 @@ def _compiler(directory: Path, timeout_s: float) -> tuple[ModuleCompiler, Path]:
     return compiler, project
 
 
+def _campaign_provider(args: argparse.Namespace, role: str) -> str:
+    value = getattr(args, f"{role}_provider")
+    if value:
+        return str(value)
+    if getattr(args, "inference_policy", "mixed") == "local-only":
+        raise ValueError(
+            f"{role} has no explicit provider. local-only cannot assume OpenAI. "
+            "local-only does not mean offline and does not by itself stop downloads."
+        )
+    return "openai"
+
+
+def _inherit_local_campaign(args: argparse.Namespace, directory: Path) -> None:
+    """Resume saved local roles before cloud defaults can take effect."""
+    if not (directory / "local_inference").exists():
+        return
+    from ..local_inference.config import load_private_worker_snapshot
+    from ..local_inference.roles import load_run_bundle
+    from ..local_inference.errors import LocalInferenceError
+
+    saved = load_run_bundle(directory)
+    explicit = set(getattr(args, "explicit_options", ()))
+    if "--inference-policy" in explicit and args.inference_policy != saved.inference_policy:
+        raise LocalInferenceError("profile_conflict")
+    args.inference_policy = saved.inference_policy
+    if "--coordinator-root" in explicit and str(args.coordinator_root.expanduser().resolve()) != saved.coordinator_root:
+        raise LocalInferenceError("profile_conflict")
+    resolved = load_private_worker_snapshot(saved.snapshot)
+    for role, selected in resolved.roles.items():
+        for suffix, expected in (("provider", "local"), ("deployment", selected.deployment_id), ("model", selected.model)):
+            if f"--{role}-{suffix}" in explicit and getattr(args, f"{role}_{suffix}") != expected:
+                raise LocalInferenceError("profile_conflict")
+            setattr(args, f"{role}_{suffix}", expected)
+
+
+def _validate_campaign_providers(args: argparse.Namespace) -> None:
+    providers = [_campaign_provider(args, role) for role in ("formalizer", "reviewer", "prover")]
+    if args.inference_policy == "local-only" and any(item != "local" for item in providers):
+        raise ValueError(
+            "local-only requires explicit local formalizer, reviewer, and prover roles. "
+            "local-only does not mean offline and does not by itself stop downloads."
+        )
+    explicit = set(getattr(args, "explicit_options", ()))
+    for role, provider in zip(("formalizer", "reviewer", "prover"), providers):
+        if provider != "cursor":
+            continue
+        model = getattr(args, f"{role}_model")
+        if f"--{role}-model" not in explicit or not model or str(model).casefold() == "auto":
+            raise ValueError("cursor requires an exact model id; auto is not substituted")
+
+
+def _open_local_campaign(args: argparse.Namespace, directory: Path) -> None:
+    from ..local_inference.config import load_profile_path
+    from ..local_inference.errors import LocalInferenceError
+    from ..workflow_roles import (
+        deployment_of,
+        prepare_auxiliary,
+        resume_workflow,
+        start_workflow,
+    )
+    from ..local_inference.roles import load_run_bundle
+
+    roles = [
+        role for role in ("formalizer", "reviewer", "prover")
+        if _campaign_provider(args, role) == "local"
+    ]
+    explicit = set(getattr(args, "explicit_options", ()))
+    binding = directory / "local_inference" / "run_binding.json"
+    if binding.is_file():
+        bundle = load_run_bundle(directory)
+        if "--local-inference-config" in explicit and args.local_inference_config is not None:
+            if load_profile_path(args.local_inference_config).profile_hash != bundle.profile_hash:
+                raise LocalInferenceError("profile_conflict")
+        for role in roles:
+            if f"--{role}-deployment" in explicit:
+                if deployment_of(bundle, role) != getattr(args, f"{role}_deployment"):
+                    raise LocalInferenceError("profile_conflict")
+        from ..local_inference.network_policy import admit_network_policy
+        admit_network_policy(args, bundle, directory, directory=directory)
+        resume_workflow(directory)
+        return
+    specs = []
+    for role in roles:
+        deployment = getattr(args, f"{role}_deployment")
+        if not deployment or args.local_inference_config is None:
+            raise ValueError(
+                f"{role} requires --{role}-deployment and --local-inference-config"
+            )
+        requested = getattr(args, f"{role}_model") if f"--{role}-model" in explicit else None
+        specs.append((role, deployment, requested))
+    preparation = prepare_auxiliary(
+        specs,
+        inference_policy=args.inference_policy,
+        coordinator=args.coordinator_root,
+        config_path=args.local_inference_config,
+    )
+    from ..local_inference.network_policy import admit_network_policy
+    admit_network_policy(args, preparation, directory, directory=directory)
+    start_workflow(directory, preparation)
+
+
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     from dotenv import load_dotenv
+    from ..workflow_roles import resume_role_client, workflow_client
 
     load_dotenv()
     directory = args.directory.expanduser().resolve(strict=True)
+    _inherit_local_campaign(args, directory)
+    _validate_campaign_providers(args)
+    # Inference-policy local-only is not Campaign.run(local_only=True): that
+    # switch skips model calls and replays saved recovery.
+    if any(_campaign_provider(args, role) == "local" for role in ("formalizer", "reviewer", "prover")):
+        _open_local_campaign(args, directory)
+    else:
+        from ..local_inference.network_policy import admit_network_policy
+        admit_network_policy(args, None, directory, directory=directory)
     async with AsyncExitStack() as stack:
         compiler, project = _compiler(directory, args.lean_timeout_s)
         stack.push_async_callback(compiler.close)
         clients = []
-        for role, model in (
-            ("formalizer", args.formalizer_model),
-            ("reviewer", args.reviewer_model),
-            ("prover", args.prover_model),
-        ):
+        for role in ("formalizer", "reviewer", "prover"):
+            provider = _campaign_provider(args, role)
+            model = getattr(args, f"{role}_model")
+            if provider == "local":
+                client = resume_role_client(directory, role, timeout_s=args.model_timeout_s or 300.0)
+                stack.push_async_callback(client.close)
+                clients.append(client)
+                continue
             try:
                 config = _make_role_cfg(
-                    "openai",
+                    provider,
                     model,
                     role_name=role,
                     llm_deadline_policy="hard",
@@ -196,7 +329,17 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             # Do not replace it with a smaller campaign-specific output cap.
             if args.model_timeout_s is not None:
                 config.operation_timeout_s = args.model_timeout_s
-            client = OpenAICompatClient(config)
+            if provider == "cursor":
+                config.cursor_binary = args.cursor_bin
+            elif provider == "claude-code":
+                config.claude_code_binary = args.claude_code_bin
+            elif provider == "codex":
+                config.codex_binary = args.codex_bin
+            client = (
+                workflow_client(config)
+                if provider in {"codex", "claude-code", "cursor"}
+                else OpenAICompatClient(config)
+            )
             stack.push_async_callback(client.close)
             clients.append(client)
         prover = MiniProver(
@@ -249,7 +392,9 @@ async def _export(directory: Path, output: Path) -> dict[str, Any]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
     args = _parser().parse_args(argv)
+    args.explicit_options = {item.split("=", 1)[0] for item in raw if item.startswith("--")}
     try:
         if args.command == "init":
             documents = {}

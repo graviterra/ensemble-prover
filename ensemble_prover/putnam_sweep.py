@@ -31,11 +31,12 @@ from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
 from .llm_error_policy import is_provider_infrastructure_failure
 from .solved_export_policy import effective_solved, export_boundary_present
 from .subprocess_environment import (
-    sanitized_subprocess_environment,
     trusted_provider_worker_environment,
 )
 from .sweep_control import CONTROL_ENV, SweepControl
 
+
+from .local_inference.network_policy import prepare_owned_subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_FIRST_ACCEPTED_BY_S = 1200.0
@@ -282,7 +283,7 @@ def prewarm_shared_mathlib_runtime(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env=sanitized_subprocess_environment(),
+            env=prepare_owned_subprocess(("lake", "env", "lean", str(snippet)), project=project),
             start_new_session=True,
         )
         returncode = proc.wait(timeout=timeout_s)
@@ -1311,6 +1312,12 @@ def run_sweep(
     manifest_path = Path(manifest_path).resolve()
     with _manifest_lock(manifest_path):
         manifest = load_manifest(manifest_path)
+        from .mini_prover import _build_argparser
+        from .local_inference.roles import resolve_local_inference
+        from .local_inference.network_policy import admit_network_policy, persist_network_policy
+        network_args = _build_argparser().parse_args(["--lean-file", "probe.lean", *manifest["mini_args"]])
+        admit_network_policy(network_args, resolve_local_inference(network_args), ROOT, directory=manifest_path.parent)
+        persist_network_policy(manifest_path.parent)
         if _reconcile_dead_running_attempts(manifest):
             save_manifest(manifest_path, manifest)
         if manifest.get("prewarm_cleanup_unconfirmed"):
@@ -1442,6 +1449,20 @@ def run_sweep(
         return exit_code
 
 
+def _freeze_sweep_args(mini_args: Sequence[str], directory: Path) -> list[str]:
+    """Freeze a local profile before children are created. Restore the parent environment."""
+
+    saved = dict(os.environ)
+    try:
+        from .local_inference.roles import freeze_invocation_args
+        return freeze_invocation_args(
+            mini_args, directory, allocate_budget=False, probe_input=True,
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--sweep-dir", "--output-dir", type=Path)
@@ -1544,6 +1565,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             with _manifest_lock(manifest_path):
                 if manifest_path.exists():
                     raise ValueError("sweep manifest already exists; use --resume")
+                mini_args = _freeze_sweep_args(mini_args, manifest_path.parent)
                 manifest = build_manifest(
                     source_dir=args.putnam_dir
                     or ROOT / "external/PutnamBench/lean4/src",

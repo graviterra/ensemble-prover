@@ -19,7 +19,7 @@ from .subprocess_cleanup import (
     request_process_termination_nowait,
     terminate_and_reap_process,
 )
-from .subprocess_environment import sanitized_subprocess_environment
+from .local_inference.network_policy import owned_worker_environment, current_network_policy
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +254,9 @@ class PersistentVerifierWorker:
 
     async def start(self) -> bool:
         async with self._lock:
-            if self._proc is not None and self.state in {"idle", "busy"}:
+            policy_id = current_network_policy().policy_id
+            if (self._proc is not None and self.state in {"idle", "busy"}
+                    and getattr(self, "_network_policy_id", None) == policy_id):
                 return True
             await self._kill_process()
             self.generation += 1
@@ -281,12 +283,13 @@ class PersistentVerifierWorker:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
-                    env=sanitized_subprocess_environment(
+                    env=owned_worker_environment(
                         os.environ,
                         overrides={"PYTHONUNBUFFERED": "1"},
                     ),
                 )
                 self._proc = proc
+                self._network_policy_id = policy_id
                 self._stderr_task = asyncio.create_task(self._drain_stderr())
                 hello = await self._read_message(
                     float(self.cfg.persistent_worker_start_timeout_s)

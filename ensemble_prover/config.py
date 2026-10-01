@@ -306,12 +306,25 @@ class RoleConfig:
     codex_binary: str = "codex"
     # Executable used only by the claude-code://subscription transport.
     claude_code_binary: str = "claude"
+    # Executable used only by the cursor://subscription transport.
+    # Recorded for diagnostics. An unqualified CLI is not launched.
+    cursor_binary: str = "agent"
     # The original automatic allowance, not an operator cap. Catalog evidence
     # may replace it only while max_tokens still equals this value.
     model_default_max_tokens: Optional[int] = None
+    # Copyable JSON for one resolved local role. Cloud roles leave this empty.
+    # Keys are snapshot, role, coordinator_root, budget_root, and budget_id.
+    # The snapshot holds the private HTTP URL; base_url stays a local:// label.
+    local_inference_binding: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if self.max_tokens is _AUTOMATIC_ROLE_MAX_TOKENS:
+            if str(self.base_url or "").strip() == "cursor://subscription":
+                # Account-catalog ids do not inherit a familiar API window.
+                # 1024 is the historical unknown-capacity allowance, not a Cursor flag.
+                self.max_tokens = 1024
+                self.model_default_max_tokens = self.max_tokens
+                return
             from .provider_tool_protocol import mini_model_token_defaults
 
             context, output = mini_model_token_defaults(self.model, base_url=self.base_url)

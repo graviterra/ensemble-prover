@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { failureText, postAttempt, readId } from "../api";
-import { catalogError, fetchOptions, fetchProject, fetchTheorems, usesCliModel } from "../catalog";
-import type { OptionField, ProjectFiles, Theorems } from "../catalog";
+import { catalogError, fetchOptions, fetchProject, fetchTheorems, requiresExactModel, usesCliModel, usesDeployment } from "../catalog";
+import type { CatalogDeployment, OptionField, ProjectFiles, Theorems } from "../catalog";
 import { LaunchReadiness } from "../components/LaunchReadiness";
 import type { LaunchIssue } from "../components/LaunchReadiness";
 import { ModelPicker } from "../components/ModelPicker";
@@ -27,7 +27,7 @@ export function NewWorkScreen({ onOpen, onLibrary }: { onOpen: (id: string) => v
   const [sourceError, setSourceError] = useState("");
   const [sourceRevision, setSourceRevision] = useState(0);
   const [filter, setFilter] = useState("");
-  const [profile, setProfile] = useState(loadProfile);
+  const [profile, setProfile] = useState(() => { const loaded = loadProfile(); saveProfile(loaded); return loaded; });
   const [fields, setFields] = useState<OptionField[]>([]);
   const [optionError, setOptionError] = useState("");
   const [optionRevision, setOptionRevision] = useState(0);
@@ -46,7 +46,7 @@ export function NewWorkScreen({ onOpen, onLibrary }: { onOpen: (id: string) => v
   function update(change: (previous: Drafts) => Drafts) {
     setDrafts((previous) => { const next = change(previous); persist(next); return next; });
   }
-  function patchCurrent(patch: { projectPath?: string; prover?: string; proverModel?: string }) {
+  function patchCurrent(patch: { projectPath?: string; prover?: string; proverModel?: string; proverDeployment?: string }) {
     update((previous) => mode === "lean" ? { ...previous, lean: { ...previous.lean, ...patch } } : { ...previous, english: { ...previous.english, ...patch } });
   }
   function chooseProject(projectPath: string) {
@@ -128,12 +128,20 @@ export function NewWorkScreen({ onOpen, onLibrary }: { onOpen: (id: string) => v
       const payload: Record<string, unknown> = mode === "lean"
         ? { kind: "lean", projectPath: current.projectPath.trim(), leanFile: drafts.lean.leanFile.trim(), theorem: drafts.lean.theorem.trim() }
         : { kind: "english", projectPath: current.projectPath.trim(), text: drafts.english.text.trim(), formalizeOnly: drafts.english.formalizeOnly };
+      if (mode === "english" && drafts.english.formalizer.trim()) {
+        payload.formalizer = drafts.english.formalizer.trim();
+        if (usesDeployment(drafts.english.formalizer.trim())) payload.formalizerDeployment = drafts.english.formalizerDeployment.trim();
+        else if (drafts.english.formalizerModel.trim()) payload.formalizerModel = drafts.english.formalizerModel.trim();
+      }
+      if (profile.inferencePolicy) payload.inferencePolicy = profile.inferencePolicy;
       if (!translateOnly) {
         payload.prover = current.prover.trim();
-        if (current.proverModel.trim()) payload.proverModel = current.proverModel.trim();
+        if (usesDeployment(current.prover.trim())) payload.proverDeployment = current.proverDeployment.trim();
+        else if (current.proverModel.trim()) payload.proverModel = current.proverModel.trim();
         if (profile.customRefiner) {
           payload.refiner = profile.refiner.trim();
-          if (profile.refinerModel.trim()) payload.refinerModel = profile.refinerModel.trim();
+          if (usesDeployment(profile.refiner.trim())) payload.refinerDeployment = profile.refinerDeployment.trim();
+          else if (profile.refinerModel.trim()) payload.refinerModel = profile.refinerModel.trim();
         }
         if (Object.keys(launchOptions).length) payload.options = launchOptions;
       }
@@ -157,6 +165,11 @@ export function NewWorkScreen({ onOpen, onLibrary }: { onOpen: (id: string) => v
   }
 
   const selectedProvider = catalog?.providers.find((provider) => provider.id === current.prover);
+  const deployments = catalog?.deployments ?? [];
+  const formalizerProvider = drafts.english.formalizer.trim() || "openai";
+  const cursorReason = catalog?.providers.find((provider) => provider.id === "cursor")?.availability
+    || "The installed Cursor CLI is unqualified for prover generation. Startup hooks are not suppressed, and context preservation is not established.";
+  function declared(id: string): CatalogDeployment | undefined { return deployments.find((item) => item.id === id); }
   const selectedTheorem = theorems?.theorems.find((theorem) => theorem.name === drafts.lean.theorem);
   const shownFiles = files?.files.filter((file) => file.path === drafts.lean.leanFile || file.path.toLocaleLowerCase().includes(filter.toLocaleLowerCase())) ?? [];
   const explicitOptions = Object.entries(profile.options).filter(([, value]) => value !== "");
@@ -187,12 +200,33 @@ export function NewWorkScreen({ onOpen, onLibrary }: { onOpen: (id: string) => v
     if (!drafts.lean.leanFile.trim()) needs("file", "Choose a Lean file.", "Choose Lean file", "lean-file");
     if (!drafts.lean.theorem.trim()) needs("source", "Choose a theorem to prove.", "Choose theorem", "theorem-choice");
   }
+  function checkRole(kind: string, provider: string, model: string, deployment: string, noun: string) {
+    if (!provider.trim()) return;
+    if (profile.inferencePolicy === "local-only" && provider !== "local") needs(`${kind}-policy`, `Local-only inference requires a local ${noun}.`, `Choose ${noun}`, `${kind}-provider`);
+    if (provider === "local" && profile.inferencePolicy === "local-only" && declared(deployment)?.execution !== "operator_asserted_local") needs(`${kind}-execution`, `Choose an operator-asserted local deployment for the ${noun}.`, `Choose ${noun}`, `${kind}-deployment`);
+    if (usesDeployment(provider)) {
+      if (!declared(deployment.trim())) needs(kind, `Choose a registered local deployment for the ${noun}.`, `Choose ${noun}`, `${kind}-deployment`);
+      return;
+    }
+    if (requiresExactModel(provider)) {
+      if (!model.trim() || model.trim().toLowerCase() === "auto") needs(kind, "Enter the exact Cursor model name. Auto and the CLI default are not used.", `Choose ${noun} model`, `${kind}-model`);
+      needs(`${kind}-cursor`, cursorReason, `Review ${noun}`, `${kind}-provider`);
+      return;
+    }
+    if (!usesCliModel(provider) && !model.trim()) needs(kind, `Choose the ${noun} model.`, `Choose ${noun} model`, `${kind}-model`);
+  }
+  if (mode === "english") {
+    checkRole("formalizer", drafts.english.formalizer.trim(), drafts.english.formalizerModel, drafts.english.formalizerDeployment, "formalizer");
+    if (profile.inferencePolicy === "local-only" && (formalizerProvider !== "local" || !drafts.english.formalizerDeployment.trim())) {
+      needs("formalizer-policy", "English with local-only inference requires a local formalizer deployment.", "Choose formalizer", "formalizer-provider");
+    }
+  }
   if (!translateOnly) {
     if (!current.prover.trim()) needs("provider", "Choose the provider that will search for a proof.", "Choose prover", "prover-provider");
-    else if (!usesCliModel(current.prover.trim()) && !current.proverModel.trim()) needs("provider", "Choose the prover model.", "Choose prover model", "prover-model");
+    else checkRole("prover", current.prover.trim(), current.proverModel, current.proverDeployment, "prover");
     if (profile.customRefiner) {
       if (!profile.refiner.trim()) needs("refiner", "Choose the separate refiner provider.", "Choose refiner", "refiner-provider");
-      else if (!usesCliModel(profile.refiner.trim()) && !profile.refinerModel.trim()) needs("refiner", "Choose the refiner model.", "Choose refiner model", "refiner-model");
+      else checkRole("refiner", profile.refiner.trim(), profile.refinerModel, profile.refinerDeployment, "refiner");
     }
   }
   let launchOptions: Record<string, string | number | boolean> = {};
@@ -258,14 +292,22 @@ export function NewWorkScreen({ onOpen, onLibrary }: { onOpen: (id: string) => v
           </> : <label className="check" htmlFor="formalize-only"><input id="formalize-only" type="checkbox" checked={drafts.english.formalizeOnly} onChange={(event) => update((previous) => ({ ...previous, english: { ...previous.english, formalizeOnly: event.target.checked } }))} /><span>Translate only, do not search for a proof yet</span></label>}
         </section>
         <section className="panel"><h2>Provider roles</h2>
-          {mode === "english" ? <div className="role"><p className="role-name">Translation · OpenAI</p><p className="meta">{catalog?.providers.find((item) => item.id === "openai")?.availability || "Uses the translation provider configured in the service environment."}</p></div> : null}
+          <label className="field" htmlFor="inference-policy"><span>Inference policy</span>
+            <select aria-label="Inference policy" id="inference-policy" value={profile.inferencePolicy} onChange={(event) => changeProfile({ ...profile, inferencePolicy: event.target.value })}>
+              <option value="">Mixed (default)</option>
+              <option value="mixed">Mixed</option>
+              <option value="local-only">Local only</option>
+            </select>
+            <span className="hint">Local-only requires a local formalizer for English. The prover enforces every enabled role.</span>
+          </label>
+          {mode === "english" ? <div className="role"><h3>Formalizer</h3><ModelPicker autoSelect={false} id="formalizer" labels={{ provider: "Formalizer provider", model: "Formalizer model", deployment: "Formalizer deployment" }} providers={catalog?.providers ?? []} deployments={deployments} provider={formalizerProvider} model={drafts.english.formalizerModel} deployment={drafts.english.formalizerDeployment} onChange={(formalizer, formalizerModel, formalizerDeployment = "") => update((previous) => ({ ...previous, english: { ...previous.english, formalizer, formalizerModel: usesDeployment(formalizer) ? "" : formalizerModel, formalizerDeployment: usesDeployment(formalizer) ? formalizerDeployment : "" } }))} error={errors.formalizer || errors["formalizer-policy"]} /></div> : null}
           {!translateOnly ? <>
-            <div className="role"><h3>Prover</h3><ModelPicker id="prover" providers={catalog?.providers ?? []} provider={current.prover} model={current.proverModel} onChange={(prover, proverModel) => patchCurrent({ prover, proverModel })} error={errors.provider} /></div>
+            <div className="role"><h3>Prover</h3><ModelPicker id="prover" providers={catalog?.providers ?? []} deployments={deployments} provider={current.prover} model={current.proverModel} deployment={current.proverDeployment} onChange={(prover, proverModel, proverDeployment = "") => patchCurrent({ prover, proverModel: usesDeployment(prover) ? "" : proverModel, proverDeployment: usesDeployment(prover) ? proverDeployment : "" })} error={errors.provider || errors["prover-cursor"]} /></div>
             <div className="role"><label className="check"><input type="checkbox" checked={profile.customRefiner} onChange={(event) => changeProfile({ ...profile, customRefiner: event.target.checked })} /><span>Choose a separate refiner</span></label>
-              {profile.customRefiner ? <ModelPicker id="refiner" providers={catalog?.providers ?? []} provider={profile.refiner} model={profile.refinerModel} onChange={(refiner, refinerModel) => changeProfile({ ...profile, refiner, refinerModel })} error={errors.refiner} /> : <p className="meta">Refiner settings are omitted; the CLI resolves its defaults.</p>}
+              {profile.customRefiner ? <ModelPicker id="refiner" labels={{ provider: "Refiner provider", model: "Refiner model", deployment: "Refiner deployment" }} providers={catalog?.providers ?? []} deployments={deployments} provider={profile.refiner} model={profile.refinerModel} deployment={profile.refinerDeployment} onChange={(refiner, refinerModel, refinerDeployment = "") => changeProfile({ ...profile, refiner, refinerModel: usesDeployment(refiner) ? "" : refinerModel, refinerDeployment: usesDeployment(refiner) ? refinerDeployment : "" })} error={errors.refiner || errors["refiner-cursor"]} /> : <p className="meta">Refiner settings are omitted; the CLI resolves its defaults.</p>}
             </div>
             <button type="button" className="text-button" onClick={() => {
-              try { saveSetup({ projectPath: current.projectPath, prover: current.prover, proverModel: current.proverModel }); setNotice("Project and prover saved as browser defaults."); }
+              try { saveSetup({ projectPath: current.projectPath, prover: current.prover, proverModel: current.proverModel, proverDeployment: current.proverDeployment }); setNotice("Project and prover saved as browser defaults."); }
               catch { setNotice("The browser could not save these defaults."); }
             }}>Save project and prover as defaults</button>
           </> : <p className="meta">Translation produces a Lean statement for inspection. It does not establish a proof.</p>}
@@ -282,7 +324,7 @@ export function NewWorkScreen({ onOpen, onLibrary }: { onOpen: (id: string) => v
             <div className="row"><dt>Project</dt><dd>{catalog?.projects.find((project) => project.path === current.projectPath)?.name || (current.projectPath ? current.projectPath.split("/").filter(Boolean).at(-1) : "Not selected")}</dd></div>
             <div className="row"><dt>Source metadata</dt><dd>{mode === "lean" ? files ? files.files.length + " Lean files found" : fileLoading ? "Reading…" : "Not read" : "Statement will be translated"}</dd></div>
             <div className="row"><dt>Toolchain check</dt><dd>Not executed</dd></div>
-            <div className="row"><dt>Provider</dt><dd>{translateOnly ? "OpenAI translation" : selectedProvider?.label || current.prover || "Not selected"}</dd></div>
+            <div className="row"><dt>Provider</dt><dd>{translateOnly ? (catalog?.providers.find((item) => item.id === formalizerProvider)?.label || formalizerProvider) : selectedProvider?.label || current.prover || "Not selected"}</dd></div>
             <div className="row"><dt>Output directory</dt><dd>Allocated when this run starts</dd></div>
           </dl>
           <p className="hint">Project discovery reads metadata. Starting a run executes the selected Lake project and may make paid provider requests.</p>
@@ -290,11 +332,19 @@ export function NewWorkScreen({ onOpen, onLibrary }: { onOpen: (id: string) => v
         <section className="panel"><h2>Launch configuration</h2>
           <dl className="configuration-summary">
             <div className="row"><dt>Work</dt><dd>{translateOnly ? "Translation only" : mode === "lean" ? drafts.lean.theorem || "Choose a theorem" : "Translation and proof search"}</dd></div>
-            {!translateOnly ? <><div className="row"><dt>Prover model</dt><dd>{current.proverModel || (usesCliModel(current.prover) ? "CLI default" : "Not selected")}</dd></div>
-              <div className="row"><dt>Refiner</dt><dd>{profile.customRefiner ? profile.refiner + (profile.refinerModel ? " · " + profile.refinerModel : " · CLI default") : "Omitted · CLI default"}</dd></div>
+            <div className="row"><dt>Inference</dt><dd>{profile.inferencePolicy === "local-only" ? "Local only" : profile.inferencePolicy === "mixed" ? "Mixed" : "Mixed (default)"}</dd></div>
+            {mode === "english" ? <div className="row"><dt>Formalizer</dt><dd>{usesDeployment(formalizerProvider) ? (drafts.english.formalizerDeployment || "Deployment not selected") : requiresExactModel(formalizerProvider) ? (drafts.english.formalizerModel || "Exact model required") : formalizerProvider === "openai" && !drafts.english.formalizer ? "OpenAI" : formalizerProvider}</dd></div> : null}
+            {!translateOnly ? <><div className="row"><dt>Prover model</dt><dd>{usesDeployment(current.prover) ? (declared(current.proverDeployment)?.model || "Deployment not selected") : requiresExactModel(current.prover) ? (current.proverModel || "Exact model required") : current.proverModel || (usesCliModel(current.prover) ? "CLI default" : "Not selected")}</dd></div>
+              <div className="row"><dt>Refiner</dt><dd>{profile.customRefiner ? profile.refiner + (usesDeployment(profile.refiner) ? " · " + (profile.refinerDeployment || "deployment not selected") : profile.refinerModel ? " · " + profile.refinerModel : requiresExactModel(profile.refiner) ? " · exact model required" : " · CLI default") : "Omitted · CLI default"}</dd></div>
               {explicitOptions.map(([key, value]) => <div className="row" key={key}><dt>{fields.find((field) => field.key === key)?.label || key}</dt><dd>{value}</dd></div>)}
               {!explicitOptions.length ? <div className="row"><dt>Search and budgets</dt><dd>Omitted · CLI defaults</dd></div> : null}
             </> : null}
+            {([ ["Formalizer", mode === "english" && formalizerProvider === "local" ? drafts.english.formalizerDeployment : ""], ["Prover", !translateOnly && current.prover === "local" ? current.proverDeployment : ""], ["Refiner", !translateOnly && profile.customRefiner && profile.refiner === "local" ? profile.refinerDeployment : ""] ] as const).map(([role, id]) => {
+              const item = id ? declared(id) : undefined;
+              if (!item) return null;
+              const reasoning = item.reasoningEffort ? `${item.reasoningMode} · ${item.reasoningEffort}` : item.reasoningMode;
+              return <div className="row" key={role}><dt>{role} declared</dt><dd>{item.model} · context {item.contextTokens} · {item.tools} · {reasoning} · declared, not probed</dd></div>;
+            })}
           </dl>
           {!translateOnly && explicitOptions.length ? <button type="button" className="text-button" onClick={() => changeProfile({ ...profile, options: {} })}>Reset launch settings</button> : null}
           <div className="composer-actions"><button type="submit" className="button button-primary" disabled={readinessIssues.length > 0 || busy}>{busy ? "Starting…" : "Start"}</button><button type="button" className="button" onClick={onLibrary}>Results</button></div>

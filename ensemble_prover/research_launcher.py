@@ -187,7 +187,11 @@ def _parser() -> argparse.ArgumentParser:
     new.add_argument("--hours", type=float, help="Total time limit (default: 4 hours)")
     new.add_argument("--requests", type=int, help="Total model call limit (default: 200)")
     new.add_argument("--model", help="Override the saved model for research and reviews")
-    new.add_argument("--provider", choices=("codex", "openai"), help="Override saved provider")
+    new.add_argument(
+        "--provider",
+        choices=("codex", "openai", "claude-code", "cursor", "local"),
+        help="Override saved provider. The saved provider is not rewritten.",
+    )
     new.add_argument("--source", type=Path, action="append", default=[],
                      help="Add a complete UTF-8 finding or source document (repeatable)")
     return parser
@@ -206,6 +210,34 @@ def _instructions(directory: Path) -> None:
     print(f"Research directory: {directory}", flush=True)
     print(f"Start/resume: {command}", flush=True)
     print(f"Check progress: {command} --status", flush=True)
+
+
+def _adoption_network_mode(config: dict, directory: Path) -> str:
+    """Validate the source policy before adopting its mathematical work."""
+    from types import SimpleNamespace
+    from .local_inference.network_policy import (
+        NetworkPolicyError, admit_network_policy, current_network_policy,
+        network_policy_scope,
+    )
+    from .local_inference.roles import load_run_bundle
+
+    declared = config.get("network_policy")
+    if declared not in (None, "default", "offline"):
+        raise NetworkPolicyError("network_policy_marker_mismatch")
+    if not (directory / "network_policy.json").exists():
+        if declared == "offline":
+            raise NetworkPolicyError("network_policy_marker_mismatch")
+        return "default"
+    # A saved record remains authoritative when older public metadata omits
+    # the field. Re-admission checks its endpoint fingerprints against the
+    # immutable source bundle; contradictory metadata is rejected.
+    preparation = load_run_bundle(directory)
+    with network_policy_scope(current_network_policy()):
+        policy = admit_network_policy(
+            SimpleNamespace(network_policy=declared), preparation, directory,
+            directory=directory,
+        )
+    return policy.mode
 
 
 def _start(args: argparse.Namespace) -> int:
@@ -256,11 +288,18 @@ def _start(args: argparse.Namespace) -> int:
     config = json.loads(adopted["metadata"])["identity"]["cli_config"]
     provider = args.provider if args.provider is not None else config.get("prover")
     model = args.model if args.model is not None else config.get("prover_model")
-    if provider not in ("codex", "openai"):
-        raise ValueError("The saved provider is not supported by research. "
-                         "Select --provider codex or --provider openai explicitly.")
+    from .research_claims.discovery_store import admit_provider_pair, reject_substituted_model
+    from .workflow_roles import saved_local_adoption
+
+    policy = config.get("inference_policy") or "mixed"
+    admit_provider_pair(provider, provider, inference_policy=policy)
+    reject_substituted_model(provider, model)
     if not isinstance(model, str) or not model.strip():
         raise ValueError("The saved run has no model name. Supply --model MODEL.")
+    adoption_info = None
+    if provider == "local":
+        adoption_info = saved_local_adoption(config, directory, model)
+    network_mode = _adoption_network_mode(config, directory)
     # Fail before preparing a ledger if a supplied finding cannot be ingested.
     for source in args.source:
         source.read_bytes().decode("utf-8")
@@ -285,6 +324,19 @@ def _start(args: argparse.Namespace) -> int:
         "--max-requests", str(requests), "--max-seconds", str(seconds),
         "--strategy-recovery",
     ]
+    if network_mode == "offline":
+        init.extend(["--network-policy", "offline"])
+    if provider == "claude-code":
+        init.extend(["--claude-code-bin", config.get("claude_code_bin") or "claude"])
+    elif provider == "cursor":
+        init.extend(["--cursor-bin", config.get("cursor_bin") or "agent"])
+    elif provider == "local" and adoption_info is not None:
+        init.extend([
+            "--local-private-snapshot", str(adoption_info["snapshot"]),
+            "--research-deployment", adoption_info["deployment_id"],
+            "--review-deployment", adoption_info["deployment_id"],
+            "--inference-policy", adoption_info["policy"],
+        ])
     for source in args.source:
         init.extend(["--source", str(source.resolve())])
     result = research_main(init)

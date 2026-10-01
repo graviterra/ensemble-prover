@@ -23,7 +23,7 @@ from .persistent_verifier import (
     _protocol_major,
 )
 from .subprocess_cleanup import terminate_and_reap_process
-from .subprocess_environment import sanitized_subprocess_environment
+from .local_inference.network_policy import prepare_owned_subprocess, restore_owned_worker_network_policy
 from .utils import has_sorry_or_admit
 
 logger = logging.getLogger(__name__)
@@ -216,7 +216,7 @@ class LeanLspSession:
             "lean",
             "--server",
             cwd=str(self.project_dir),
-            env=sanitized_subprocess_environment(),
+            env=prepare_owned_subprocess(("lake", "env", "lean", "--server"), project=self.project_dir),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -752,6 +752,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 async def _async_main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
+    restore_owned_worker_network_policy()
     server = PersistentVerifierServer(args.worker_id, args.generation)
     return await server.run()
 

@@ -98,13 +98,13 @@ def register(commands: Any) -> None:
     init.add_argument("--domain", default="As specified in the original problem")
     init.add_argument(
         "--provider",
-        choices=("openai", "codex"),
+        choices=("openai", "codex", "claude-code", "cursor", "local"),
         default="openai",
-        help="Research transport: OpenAI API or Codex ChatGPT subscription",
+        help="Research transport. cursor is hosted. local is not an offline claim.",
     )
     init.add_argument(
         "--review-provider",
-        choices=("openai", "codex"),
+        choices=("openai", "codex", "claude-code", "cursor", "local"),
         help="Review transport (defaults to --provider; no automatic API fallback)",
     )
     init.add_argument(
@@ -121,6 +121,19 @@ def register(commands: Any) -> None:
         "--codex-bin",
         default="codex",
         help="Codex CLI executable; saved at initialization for resume",
+    )
+    init.add_argument("--claude-code-bin", default="claude")
+    init.add_argument("--cursor-bin", default="agent")
+    init.add_argument("--local-inference-config", type=Path, default=None)
+    init.add_argument("--local-private-snapshot", type=Path, default=None)
+    init.add_argument("--research-deployment", default=None)
+    init.add_argument("--review-deployment", default=None)
+    from ..local_inference.network_policy import add_network_policy_argument
+    add_network_policy_argument(init)
+    init.add_argument("--coordinator-root", type=Path, default=None)
+    init.add_argument(
+        "--inference-policy", choices=("mixed", "local-only"), default="mixed",
+        help="local-only requires both roles to be local and does not mean offline.",
     )
     init.add_argument(
         "--max-requests",
@@ -208,10 +221,91 @@ def register(commands: Any) -> None:
     handoff.add_argument("--import", dest="imports", action="append", default=[])
 
 
-async def _run(directory: Path) -> dict[str, Any]:
-    from ..codex_subscription import CodexSubscriptionClient
-    from ..mini_prover import _make_role_cfg
+def make_discovery_client(run: dict[str, Any], role: str, directory: Path) -> Any:
+    """Build one worker client. Cursor is constructed and still fails before spawn."""
+    from ..mini_prover import _make_mini_role_client, _make_role_cfg
+
+    provider = run["review_provider"] if role == "review" else run["provider"]
+    model = run["review_model"] if role == "review" else run["model"]
+    timeout = run["request_timeout_s"]
+    if provider == "local":
+        from ..workflow_roles import resume_role_client
+
+        return resume_role_client(directory, role, timeout_s=float(timeout))
+    try:
+        cfg = _make_role_cfg(
+            provider, model, role_name=role, llm_deadline_policy="hard", timeout_s=timeout,
+        )
+    except SystemExit as exc:
+        raise ValueError(str(exc)) from exc
+    setattr(cfg, "operation_timeout_s", timeout)
+    if provider == "codex":
+        cfg.codex_binary = run.get("codex_binary", "codex")
+    elif provider == "claude-code":
+        cfg.claude_code_binary = run.get("claude_code_binary", "claude")
+    elif provider == "cursor":
+        cfg.cursor_binary = run.get("cursor_binary", "agent")
+    if provider in {"codex", "claude-code", "cursor"}:
+        return _make_mini_role_client(cfg)
     from ..models import OpenAICompatClient
+
+    return OpenAICompatClient(cfg)
+
+
+def _research_preparation(args: argparse.Namespace, review: str) -> Any:
+    from ..local_inference.errors import LocalInferenceError
+    from ..workflow_roles import prepare_auxiliary, rebind_saved_roles
+
+    specs = []
+    if args.provider == "local":
+        specs.append(("research", args.research_deployment, args.model))
+    if review == "local":
+        specs.append(("review", args.review_deployment or args.research_deployment, args.review_model))
+    if args.local_private_snapshot is not None and args.local_inference_config is not None:
+        raise LocalInferenceError("profile_conflict")
+    if args.local_private_snapshot is not None:
+        path = args.local_private_snapshot.expanduser()
+        if path.name == "private_snapshot.json" and path.parent.name == "local_inference":
+            path = path.parent.parent
+        return rebind_saved_roles(path, specs, inference_policy=args.inference_policy)
+    if args.local_inference_config is None:
+        raise ValueError("local research requires --local-inference-config or --local-private-snapshot")
+    if any(not deployment for _role, deployment, _model in specs):
+        raise ValueError("local research requires a deployment id; a cloud provider was not selected")
+    return prepare_auxiliary(
+        specs,
+        inference_policy=args.inference_policy,
+        coordinator=args.coordinator_root,
+        config_path=args.local_inference_config,
+    )
+
+
+def _stamp_transport(directory: Path, args: argparse.Namespace, preparation: Any) -> None:
+    review = args.review_provider or args.provider
+    extra: dict[str, Any] = {}
+    if preparation is not None:
+        extra["local_public"] = preparation.manifest
+        extra["inference_policy"] = preparation.inference_policy
+        from ..local_inference.network_policy import current_network_policy
+        extra["offline"] = current_network_policy().mode == "offline"
+    if "cursor" in {args.provider, review}:
+        extra["cursor_binary"] = args.cursor_bin
+    if "claude-code" in {args.provider, review}:
+        extra["claude_code_binary"] = args.claude_code_bin
+    if not extra:
+        return
+    encoded = json.dumps(extra)
+    if "http://" in encoded or "https://" in encoded:
+        raise ValueError("research record would contain a private URL and was refused")
+    from .discovery_store import DiscoveryStore
+
+    with DiscoveryStore(directory) as store:
+        record = store.run_record()
+        record.update(extra)
+        store.save_run(record)
+
+
+async def _run(directory: Path) -> dict[str, Any]:
     from .discovery import DiscoveryLoop
     from .discovery_store import DiscoveryStore, provider_routes
     from .proof_bridge import ProofBridge, configuration
@@ -222,35 +316,16 @@ async def _run(directory: Path) -> dict[str, Any]:
     with DiscoveryStore(directory) as store:
         run = store.run_record()
         research_provider, review_provider = provider_routes(run)
+        if "local" in {research_provider, review_provider}:
+            from ..workflow_roles import resume_workflow
+
+            preparation = resume_workflow(directory)
+            from .discovery_store import admit_provider_pair
+            admit_provider_pair(research_provider, review_provider, inference_policy=preparation.inference_policy)
         closed_loop = configuration(run)
-        # Construct distinct clients per worker: provider response metadata is
-        # mutable, and concurrent operations must not share that state.
         def factory(role: str):
             def make(_worker: str):
-                try:
-                    cfg = _make_role_cfg(
-                        review_provider if role == "review" else research_provider,
-                        run["review_model"] if role == "review" else run["model"],
-                        role_name=role,
-                        llm_deadline_policy="hard",
-                        timeout_s=run["request_timeout_s"],
-                    )
-                except SystemExit as exc:
-                    # The legacy config helper is CLI-oriented. Never let
-                    # its SystemExit escape an asynchronous worker task.
-                    raise ValueError(str(exc)) from exc
-                # This optional shared-client setting predates a declared
-                # RoleConfig field and is read dynamically by the transport.
-                setattr(cfg, "operation_timeout_s", run["request_timeout_s"])
-                client: Any
-                if (
-                    review_provider if role == "review" else research_provider
-                ) == "codex":
-                    cfg.codex_binary = run.get("codex_binary", "codex")
-                    client = CodexSubscriptionClient(cfg)
-                else:
-                    client = OpenAICompatClient(cfg)
-                return client
+                return make_discovery_client(run, role, directory)
 
             return make
 
@@ -307,6 +382,23 @@ def dispatch(args: argparse.Namespace) -> Any:
             if not args.lean_file or not args.theorem or not args.project_path:
                 raise ValueError("pinning requires --lean-file, --theorem and --project-path")
             original = resolve_theorem_project(TheoremProjectRequest(args.lean_file, args.theorem, args.project_path, imports=tuple(args.imports)))
+        from .discovery_store import admit_provider_pair, reject_substituted_model
+        from ..workflow_roles import start_workflow
+
+        review = args.review_provider or args.provider
+        admit_provider_pair(args.provider, review, inference_policy=args.inference_policy)
+        reject_substituted_model(args.provider, args.model)
+        reject_substituted_model(review, args.review_model)
+        preparation = None
+        if "local" in {args.provider, review}:
+            preparation = _research_preparation(args, review)
+            args.inference_policy = preparation.inference_policy
+            # A saved bundle may impose a stricter policy than the CLI default.
+            # Check every route, including hosted companion roles, before setup.
+            admit_provider_pair(args.provider, review, inference_policy=args.inference_policy)
+        from ..local_inference.network_policy import admit_network_policy
+        admit_network_policy(args, preparation, args.project_path or args.directory)
+
         if original:
             if not args.strategy_recovery:
                 raise ValueError("an original Lean target requires strategy recovery")
@@ -364,6 +456,9 @@ def dispatch(args: argparse.Namespace) -> Any:
                              "max_no_progress": args.strategy_max_no_progress,
                              "frontier_research": {"mode": args.frontier_research}},
         )
+        if preparation is not None:
+            start_workflow(args.directory, preparation)
+        _stamp_transport(args.directory, args, preparation)
         if adoption:
             from .adoption import import_artifacts
             with DiscoveryStore(args.directory) as store:
@@ -374,8 +469,13 @@ def dispatch(args: argparse.Namespace) -> Any:
             "model_calls": 0,
         }
     if args.discovery_command == "run":
+        from ..local_inference.network_policy import restore_network_policy
         with DiscoveryStore(args.directory) as store:
-            strategy_enabled = store.run_record().get("strategy_review") is not None
+            saved_run = store.run_record()
+            if saved_run.get("offline") is True and not (args.directory / "network_policy.json").is_file():
+                raise ValueError("network_policy_marker_mismatch")
+            strategy_enabled = saved_run.get("strategy_review") is not None
+        restore_network_policy(args.directory)
         if strategy_enabled:
             return _run_strategy_cli(args.directory)
         return asyncio.run(_run(args.directory))

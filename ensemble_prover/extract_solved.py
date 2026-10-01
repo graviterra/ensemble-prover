@@ -81,6 +81,7 @@ from ensemble_prover.solved_export_policy import (  # noqa: E402
     solved_export_verified_payload as policy_solved_export_verified_payload,
 )
 from ensemble_prover.sync_subprocess import run_process_group  # noqa: E402
+from ensemble_prover.local_inference.network_policy import prepare_owned_subprocess  # noqa: E402
 from ensemble_prover.subprocess_environment import (  # noqa: E402
     sanitized_subprocess_environment,
 )
@@ -1761,9 +1762,7 @@ def _verify_exported_lean(
             ["lake", "env", "lean", str(Path(lean_path).resolve())],
             cwd=str(project_dir),
             timeout=max(1.0, float(timeout_s or 180.0)),
-            env=sanitized_subprocess_environment(
-                _export_lean_env(extra_lean_paths)
-            ),
+            env=prepare_owned_subprocess(("lake", "env", "lean", str(Path(lean_path).resolve())), project=project_dir, base=_export_lean_env(extra_lean_paths)),
         )
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
@@ -1793,7 +1792,7 @@ def _build_export_project_imports(
         build = run_process_group(
             ["lake", "build", *build_targets],
             cwd=str(Path(lean_project_dir)),
-            env=sanitized_subprocess_environment(),
+            env=prepare_owned_subprocess(("lake", "build", *build_targets), project=Path(lean_project_dir)),
             timeout=max(1.0, float(timeout_s or 180.0)),
         )
     except Exception as exc:
@@ -1823,7 +1822,7 @@ def _build_export_support_projects(
             build = run_process_group(
                 ["lake", "build", *targets],
                 cwd=str(project),
-                env=sanitized_subprocess_environment(),
+                env=prepare_owned_subprocess(("lake", "build", *targets), project=project),
                 timeout=max(1.0, float(timeout_s or 180.0)),
             )
         except Exception as exc:

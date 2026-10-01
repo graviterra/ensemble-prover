@@ -11878,10 +11878,66 @@ class MiniSession:
             self.max_iterations = target
         return int(self.max_iterations or 0)
 
+    def _local_compute_remainder_available(self) -> bool:
+        """Return whether every local role still has conserved allocation."""
+
+        from ..local_inference.budget import LocalComputeLedger
+        from ..local_inference.seams import local_allocation_allows_continuation
+        from ..models import local_public_facts_from_binding
+        from ..pricing import local_billing_kind
+        from ..provider_tool_protocol import mini_request_concrete_leaves
+
+        for owner in (
+            getattr(self, "prover_client", None),
+            getattr(self, "refiner_client", None),
+        ):
+            if owner is None:
+                continue
+            try:
+                leaves = mini_request_concrete_leaves(owner)
+            except Exception:
+                leaves = [owner]
+            for leaf in leaves:
+                facts = getattr(leaf, "_local_public_facts", None)
+                cfg = getattr(leaf, "cfg", None)
+                binding = (
+                    getattr(cfg, "local_inference_binding", None)
+                    if cfg is not None else None
+                )
+                base = str(
+                    getattr(leaf, "base_url", "")
+                    or getattr(cfg, "base_url", "")
+                    or ""
+                )
+                if (
+                    facts is None
+                    and binding is None
+                    and local_billing_kind(base) is None
+                    and not base.lower().startswith("local://")
+                ):
+                    continue
+                if facts is None:
+                    facts = local_public_facts_from_binding(binding)
+                if facts is None or not hasattr(facts, "get"):
+                    return False
+                try:
+                    ledger = LocalComputeLedger.open(facts.get("budget_root"))
+                    ledger.require_resume_identity(
+                        ledger_id=str(facts.get("budget_id") or ""),
+                        profile_hash=str(facts.get("profile_hash") or ""),
+                    )
+                except Exception:
+                    return False
+                if not local_allocation_allows_continuation(ledger):
+                    return False
+        return True
+
     def _cost_budget_continuation_enabled(self) -> bool:
         """Whether local scheduler ceilings should yield to the dollar budget."""
 
         if not bool(self.conversation_budget_topups_enabled):
+            return False
+        if not MiniSession._local_compute_remainder_available(self):
             return False
         controller = getattr(self, "cost_controller", None)
         if controller is None:
@@ -11897,6 +11953,8 @@ class MiniSession:
     def _cost_budget_immediate_capacity_available(self) -> bool:
         """Return whether a cost-governed continuation can dispatch now."""
 
+        if not MiniSession._local_compute_remainder_available(self):
+            return False
         controller = getattr(self, "cost_controller", None)
         if controller is None:
             return False
@@ -12191,6 +12249,8 @@ class MiniSession:
     ) -> bool:
         """Top up local scheduler budgets while the cost budget is authoritative."""
 
+        if not MiniSession._local_compute_remainder_available(self):
+            return False
         if not self._cost_budget_continuation_enabled():
             return False
         if not self._cost_budget_immediate_capacity_available():

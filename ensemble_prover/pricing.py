@@ -171,8 +171,30 @@ def _base_url_hostname(base_url: str) -> str:
     return str(parsed.hostname or "").strip().lower().strip(".")
 
 
+def local_billing_kind(base_url: str) -> Optional[str]:
+    """Return owned_compute or metered for a public local:// lane label."""
+
+    text = str(base_url or "").strip()
+    prefix = "local://"
+    if not text.startswith(prefix):
+        return None
+    kind, slash, fingerprint = text[len(prefix):].partition("/")
+    hex_digits = "0123456789abcdefABCDEF"
+    if (
+        slash != "/"
+        or kind not in {"owned-compute", "metered"}
+        or "/" in fingerprint
+        or len(fingerprint) != 64
+        or any(char not in hex_digits for char in fingerprint)
+    ):
+        return None
+    return "owned_compute" if kind == "owned-compute" else "metered"
+
+
 def provider_for_base_url(base_url: str) -> Optional[str]:
     """Return the known provider for *base_url* based on its normalized hostname."""
+    if local_billing_kind(base_url) is not None:
+        return "local"
     hostname = _base_url_hostname(base_url)
     for provider, hosts in _KNOWN_PROVIDER_HOSTS.items():
         if hostname in hosts:
@@ -424,6 +446,9 @@ def _fetch_openrouter_pricing_catalog(
     *,
     timeout_s: float = 10.0,
 ) -> dict[str, PricingTuple]:
+    from .local_inference.network_policy import remote_fetch_allowed, NetworkPolicyError
+    if not remote_fetch_allowed():
+        raise NetworkPolicyError("pricing_download_forbidden")
     headers = {
         "Accept": "application/json",
         "User-Agent": "automated-ensemble-theorem-prover/mini-prover",
@@ -458,6 +483,11 @@ def refresh_openrouter_pricing_cache(
     global _OPENROUTER_REASONING_CAPABILITY_CACHE
     global _OPENROUTER_REASONING_CAPABILITY_FETCHED_AT
     global _OPENROUTER_REFRESH_IN_FLIGHT, _OPENROUTER_REFRESH_ERROR
+    from .local_inference.network_policy import remote_fetch_allowed
+    if not remote_fetch_allowed():
+        with _OPENROUTER_PRICING_LOCK:
+            return dict(_OPENROUTER_PRICING_CACHE)
+
     now = time.time()
     with _OPENROUTER_PRICING_LOCK:
         if (
@@ -537,6 +567,13 @@ def _openrouter_async_refresh_future(
     performs (or waits for) the synchronous refresh operation.
     """
 
+    from .local_inference.network_policy import remote_fetch_allowed
+    if not remote_fetch_allowed():
+        offline_future: concurrent.futures.Future[dict[str, PricingTuple]] = concurrent.futures.Future()
+        with _OPENROUTER_PRICING_LOCK:
+            offline_future.set_result(dict(_OPENROUTER_PRICING_CACHE))
+        return offline_future
+
     global _OPENROUTER_ASYNC_REFRESH_FUTURE
     with _OPENROUTER_PRICING_LOCK:
         current = _OPENROUTER_ASYNC_REFRESH_FUTURE
@@ -602,6 +639,11 @@ def lookup_known_token_pricing(
     conservative: bool = False,
 ) -> Optional[PricingTuple]:
     """Return known pricing for shipped API models, or ``None`` when unknown."""
+    kind = local_billing_kind(base_url)
+    if kind == "owned_compute":
+        return (0.0, 0.0, 0.0)
+    if kind == "metered":
+        return None
     name = str(model or "").strip().lower()
     provider = provider_for_base_url(base_url)
     if provider == "openai":
@@ -846,6 +888,40 @@ def compute_model_cost_usd(
     )
 
 
+def _local_marginal_api_quote(
+    kind: str, model: str, *, at_date: Optional[date], conservative: bool,
+) -> dict[str, object]:
+    """Marginal API USD only. Owned hardware and energy are not this quote."""
+
+    owned = kind == "owned_compute"
+    return {
+        "schema_version": 1,
+        "policy_version": "local_marginal_api",
+        "valuation_date": _valuation_date(at_date).isoformat(),
+        "source_url": "",
+        "rate_source": "declared_zero_marginal_api_cost" if owned else "unknown",
+        "rates_observed_at": None,
+        "model": str(model or ""),
+        "provider": "local",
+        "pricing_known": owned,
+        "service_tier": "default",
+        "service_tier_multiplier": 1.0 if owned else 0.0,
+        "long_context": False,
+        "long_context_threshold": 0,
+        "rates_per_million": {
+            "input": 0.0,
+            "cached_input": 0.0,
+            "cache_write": 0.0,
+            "output": 0.0,
+        } if owned else {},
+        "assumptions": [
+            "marginal_api_usd_only",
+            "excludes_hardware_energy_rental_and_total_operating_cost",
+        ] if owned else ["metered_tariff_not_configured"],
+        "conservative_reservation": bool(conservative),
+    }
+
+
 def quote_model_pricing(
     base_url: str,
     model: str,
@@ -863,6 +939,11 @@ def quote_model_pricing(
     when a later software version adds prices. Missing OpenAI service tier is
     an explicit Standard assumption, never an assertion about account settings.
     """
+    kind = local_billing_kind(base_url)
+    if kind is not None:
+        return _local_marginal_api_quote(
+            kind, model, at_date=at_date, conservative=conservative,
+        )
     provider = provider_for_base_url(base_url)
     tier = str(service_tier or "").strip().lower()
     assumptions: list[str] = []

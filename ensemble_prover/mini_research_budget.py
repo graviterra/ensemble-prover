@@ -49,6 +49,7 @@ def pending_research_reservation(session: Any, action_id: str) -> tuple[int, flo
 def _supported_client(client: Any) -> bool:
     from .claude_code_subscription import ClaudeCodeSubscriptionClient
     from .codex_subscription import CodexSubscriptionClient
+    from .cursor_subscription import CursorSubscriptionClient
     from .models import OpenAICompatClient
 
     try:
@@ -60,6 +61,7 @@ def _supported_client(client: Any) -> bool:
     # the underlying transport must still match the exact supported type.
     return type(client) in {
         OpenAICompatClient, CodexSubscriptionClient, ClaudeCodeSubscriptionClient,
+        CursorSubscriptionClient,
     } and bool(getattr(client, "supports_transport_dispatch_authorization", False))
 
 
@@ -78,6 +80,7 @@ def clone_research_client(client: Any) -> Any:
 def _clone_research_transport(client: Any) -> Any:
     """Clone one concrete supported leaf before restoring its lease chain."""
     from .models import OpenAICompatClient
+    from .workflow_roles import freeze_binding
 
     if not _supported_client(client):
         raise ValueError("native research cannot clone this unsupported transport")
@@ -86,11 +89,14 @@ def _clone_research_transport(client: Any) -> Any:
     ):
         raise ValueError("native research cannot clone a closed transport")
     config = copy.deepcopy(client.cfg)
+    if getattr(config, "local_inference_binding", None) is not None:
+        config.local_inference_binding = freeze_binding(config.local_inference_binding)
     if type(client) is not OpenAICompatClient:
-        return type(client)(
+        clone = type(client)(
             config,
             provider_lane_health_registry=client._provider_lane_health_registry_for_dispatch(),
         )
+        return _share_local_resources(client, clone)
     clone = OpenAICompatClient(
         config,
         provider_lane_health_registry=client._provider_lane_health_registry_for_dispatch(),
@@ -107,6 +113,14 @@ def _clone_research_transport(client: Any) -> Any:
     ):
         if hasattr(client, name):
             setattr(clone, name, copy.deepcopy(getattr(client, name)))
+    return _share_local_resources(client, clone)
+
+
+def _share_local_resources(donor: Any, clone: Any) -> Any:
+    """Keep the parent ledger and coordinator. Cloning does not grant allowance."""
+    for name in ("_local_ledger", "_local_coordinator", "_local_budget_identity"):
+        if hasattr(donor, name):
+            setattr(clone, name, getattr(donor, name))
     return clone
 
 

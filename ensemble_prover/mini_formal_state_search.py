@@ -938,7 +938,9 @@ class FormalStateSearchConfig:
     max_zero_yield_quanta: int = 2
     value_weight: float = 0.25
     novelty_weight: float = 0.15
-    model_temperature: float = 0.25
+    # None is an automatic phase choice. Explicit numbers remain strict even
+    # when equal to the ordinary cloud default of 0.25.
+    model_temperature: Optional[float] = None
 
     def normalized(self) -> "FormalStateSearchConfig":
         total = max(0.0, float(self.total_timeout_s or 0.0))
@@ -991,9 +993,10 @@ class FormalStateSearchConfig:
             ),
             value_weight=max(0.0, float(self.value_weight or 0.0)),
             novelty_weight=max(0.0, float(self.novelty_weight or 0.0)),
-            model_temperature=clamp_probability(
-                self.model_temperature,
-                default=0.25,
+            model_temperature=(
+                None if self.model_temperature is None else clamp_probability(
+                    self.model_temperature, default=0.25,
+                )
             ),
         )
 
@@ -1267,6 +1270,14 @@ def _context_hash(
     ).hexdigest()
 
 
+def _formal_policy_temperature(client: Any, cfg: FormalStateSearchConfig) -> Any:
+    from .mini_temperature import mini_automatic_temperature_override
+
+    if cfg.model_temperature is not None:
+        return cfg.model_temperature
+    return mini_automatic_temperature_override(client, 0.25)
+
+
 def _formal_policy_identity(client: Any, cfg: FormalStateSearchConfig) -> str:
     """Bind retry memory to the concrete provider policy that created it."""
 
@@ -1336,8 +1347,14 @@ def _formal_policy_identity(client: Any, cfg: FormalStateSearchConfig) -> str:
         "max_zero_yield_quanta": int(cfg.max_zero_yield_quanta),
         "value_weight": float(cfg.value_weight),
         "novelty_weight": float(cfg.novelty_weight),
-        "model_temperature": float(cfg.model_temperature),
+        "model_temperature": _formal_policy_temperature(client, cfg),
     }
+    # Preserve existing cloud retry keys exactly. Local deployments need the
+    # source distinction because automatic defaults defer to frozen controls.
+    if getattr(client, "_local_role", None) is not None:
+        payload["model_temperature_source"] = (
+            "automatic" if cfg.model_temperature is None else "explicit"
+        )
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -1687,7 +1704,7 @@ async def run_goal_conditioned_formal_search(
                 client.chat,
                 messages,
                 usage_callback=usage_callback,
-                temperature_override=cfg.model_temperature,
+                temperature_override=_formal_policy_temperature(client, cfg),
                 max_tokens_override=provider_output_policy,
                 reasoning_effort_override=(
                     None if cfg.provider_reasoning_effort in {"auto", "provider-default"}

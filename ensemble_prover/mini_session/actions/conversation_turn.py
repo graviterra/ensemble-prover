@@ -13991,7 +13991,7 @@ class ConversationTurnAction:
                                 ),
                                 proof_cache=turn_proof_cache,
                                 temperature_override=(
-                                    temperature_decision.provider_temperature_override()
+                                    temperature_decision.provider_temperature_override(client)
                                 ),
                                 temperature_metadata=temperature_metadata,
                                 trace_prefix=session.trace_prefix,

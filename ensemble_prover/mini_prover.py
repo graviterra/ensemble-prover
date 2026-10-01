@@ -348,6 +348,11 @@ from .codex_subscription import CODEX_SUBSCRIPTION_BASE_URL, CodexSubscriptionCl
 from .claude_code_subscription import (
     CLAUDE_CODE_SUBSCRIPTION_BASE_URL, ClaudeCodeSubscriptionClient,
 )
+from .cursor_subscription import (
+    CURSOR_SUBSCRIPTION_BASE_URL,
+    CursorSubscriptionClient,
+    cursor_unqualified_explanation,
+)
 from .models import (
     OpenAICompatClient,
     response_output_items,
@@ -3472,6 +3477,8 @@ def _init_mathematical_retrieval_service(
             continue
         root_key = hashlib.sha256(str(project_root).encode("utf-8")).hexdigest()[:16]
         source_cache = cache_root / root_key
+        from .local_inference.roles import auxiliary_devices
+        embedding_device, cross_encoder_device = auxiliary_devices(args)
         retrieval_cfg = RetrievalConfig(
             index_path=str(source_cache / "project_index.jsonl"),
             meta_path=str(source_cache / "project_index.meta.json"),
@@ -3491,6 +3498,8 @@ def _init_mathematical_retrieval_service(
                 30,
                 int(getattr(args, "premise_retrieval_top_k", 64) or 64),
             ),
+            embedding_device=embedding_device,
+            cross_encoder_device=cross_encoder_device,
         )
         # Dense construction is intentionally allowed to run for a long time
         # across many batches, but one hung embedding-provider call must not
@@ -5855,7 +5864,7 @@ async def run_conversation(
             ),
         )
         effective_temperature_override = (
-            temperature_decision.provider_temperature_override()
+            temperature_decision.provider_temperature_override(client)
         )
         temperature_call_metadata = mini_temperature_metadata(
             temperature_decision,
@@ -5959,6 +5968,8 @@ async def run_conversation(
                 repair_self_check_budget_exhausted = True
             if repair_self_check_seen:
                 repair_self_check_status = "accepted"
+            elif _repair_self_check_non_verdict_is_compliant(repair_self_check_status):
+                pass
             elif repair_self_check_attempted:
                 repair_self_check_status = "no_accepted_try_lean"
             elif repair_self_check_status in non_verdict_repair_self_check_statuses:
@@ -6872,9 +6883,10 @@ async def run_conversation(
                                 redact_solution_refs=redact_solution_refs,
                             )
                         elif name == "try_lean" and effective_try_lean_tool_enabled:
+                            authoritative_tool_lemmas = _current_verified_helper_blocks() if dossier is not None else []
                             context_lemmas = (
                                 _feedback_lemmas_for_answer_safe_recheck(
-                                    _current_verified_helper_blocks(),
+                                    authoritative_tool_lemmas,
                                     conv,
                                 )
                                 if dossier is not None
@@ -6897,6 +6909,10 @@ async def run_conversation(
                                 preamble=conv.preamble,
                                 args=args,
                                 context_lemmas=context_lemmas,
+                                feedback_context=(
+                                    context_lemmas != authoritative_tool_lemmas
+                                    or _needs_answer_safe_feedback_check(conv)
+                                ),
                                 dossier=dossier,
                                 turn_index=turn,
                                 tool_call_index=tool_calls_used + 1,
@@ -6909,6 +6925,14 @@ async def run_conversation(
                                 repair_self_check_codes.append(
                                     str(args.get("code", "") or "")
                                 )
+                            elif result_text.startswith("try_lean conditional feedback "):
+                                repair_self_check_attempted = True
+                                if not repair_self_check_seen:
+                                    repair_self_check_status = (
+                                        "conditional_feedback"
+                                        if result_text.startswith("try_lean conditional feedback accepted.")
+                                        else "no_accepted_try_lean"
+                                    )
                             elif result_text.startswith("try_lean rejected."):
                                 repair_self_check_attempted = True
                                 repair_self_check_status = "no_accepted_try_lean"
@@ -9906,6 +9930,7 @@ async def run_conversation(
             result = (
                 lean_verdict.safe_result
                 if accepted and lean_verdict.safe_result is not None
+                and bool(getattr(lean_verdict.safe_result, "ok", False))
                 else lean_verdict.primary_result
             )
             proof_for_checks = lean_verdict.accepted_proof or proof_for_checks
@@ -12428,7 +12453,7 @@ def _mini_dossier_structural_metric_record(
 
 
 # ---------------------------------------------------------------------------
-# Provider config. API transports and the locally authenticated Codex CLI.
+# Provider config. API transports and saved-login subscription CLIs.
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MODELS = {
@@ -12437,6 +12462,7 @@ _DEFAULT_MODELS = {
     "openrouter": "",
     "codex": "",
     "claude-code": "",
+    "cursor": "",
 }
 
 _PROVIDER_BASE_URLS = {
@@ -12445,6 +12471,7 @@ _PROVIDER_BASE_URLS = {
     "openrouter": "https://openrouter.ai/api/v1",
     "codex": CODEX_SUBSCRIPTION_BASE_URL,
     "claude-code": CLAUDE_CODE_SUBSCRIPTION_BASE_URL,
+    "cursor": CURSOR_SUBSCRIPTION_BASE_URL,
 }
 
 _PROVIDER_ENV_VARS = {
@@ -12534,16 +12561,32 @@ def _make_role_cfg(
     llm_deadline_policy: str = "soft",
     request_timeout_s: Optional[float] = None,
     request_timeout_disabled: Optional[bool] = None,
+    cli_args: Any = None,
 ) -> RoleConfig:
     provider = provider.lower()
+    if provider == "local":
+        from .local_inference.errors import LocalInferenceError
+        from .local_inference.roles import local_role_config
+
+        preparation = getattr(cli_args, "_local_preparation", None)
+        if preparation is None:
+            raise SystemExit("local_inference_unresolved")
+        try:
+            return local_role_config(
+                preparation, role_name=role_name, model=model, timeout_s=timeout_s,
+                request_timeout_s=request_timeout_s,
+                request_timeout_disabled=request_timeout_disabled, cli_args=cli_args,
+            )
+        except LocalInferenceError as exc:
+            raise SystemExit(str(exc)) from None
     role_timeout_explicit = timeout_s is not None
     if provider not in _DEFAULT_MODELS:
         raise SystemExit(f"Unknown provider: {provider}")
     api_key = (
         os.environ.get(_PROVIDER_ENV_VARS[provider], "").strip()
-        if provider not in {"codex", "claude-code"} else None
+        if provider not in {"codex", "claude-code", "cursor"} else None
     )
-    if provider not in {"codex", "claude-code"} and not api_key:
+    if provider not in {"codex", "claude-code", "cursor"} and not api_key:
         raise SystemExit(
             f"{_PROVIDER_ENV_VARS[provider]} is not set in the environment."
         )
@@ -12555,7 +12598,18 @@ def _make_role_cfg(
         )
     if provider == "openrouter":
         resolved_model = _canonical_openrouter_model_id(resolved_model)
-    context_window, max_out = _model_token_defaults(resolved_model, provider=provider)
+    if provider == "cursor" and resolved_model.casefold() == "auto":
+        raise SystemExit(
+            "cursor requires an exact account-visible model id for "
+            f"{role_name}; auto is not a model and is not substituted. "
+            f"Pass --{role_name}-model with the id from the Cursor account catalog."
+        )
+    if provider == "cursor":
+        # Familiar API names do not establish a Cursor context window or output cap.
+        # 1024 is the historical unknown-capacity allowance, not a Cursor flag.
+        context_window, max_out = None, 1024
+    else:
+        context_window, max_out = _model_token_defaults(resolved_model, provider=provider)
     if timeout_s is None:
         timeout_s = _model_timeout_default(resolved_model, provider=provider)
     try:
@@ -12588,7 +12642,7 @@ def _make_role_cfg(
             )
     subscription_inactivity_timeout_s = (
         timeout_f
-        if provider in {"codex", "claude-code"}
+        if provider in {"codex", "claude-code", "cursor"}
         and clean_deadline_policy == "soft"
         and not role_timeout_explicit
         and request_timeout_s is None
@@ -12635,6 +12689,10 @@ def _make_mini_role_client(
         return CodexSubscriptionClient(cfg, provider_lane_health_registry=provider_lane_health_registry)
     if getattr(cfg, "base_url", "") == CLAUDE_CODE_SUBSCRIPTION_BASE_URL:
         return ClaudeCodeSubscriptionClient(cfg, provider_lane_health_registry=provider_lane_health_registry)
+    if getattr(cfg, "base_url", "") == CURSOR_SUBSCRIPTION_BASE_URL:
+        return CursorSubscriptionClient(
+            cfg, provider_lane_health_registry=provider_lane_health_registry,
+        )
     return OpenAICompatClient(
         cfg, provider_lane_health_registry=provider_lane_health_registry,
     )
@@ -12642,7 +12700,11 @@ def _make_mini_role_client(
 
 def _apply_subscription_control_requirements(args: Any, cfg: RoleConfig, *, role_name: str) -> None:
     """Carry explicit user controls to the CLI transport capability check."""
-    if cfg.base_url not in {CODEX_SUBSCRIPTION_BASE_URL, CLAUDE_CODE_SUBSCRIPTION_BASE_URL}:
+    if cfg.base_url not in {
+        CODEX_SUBSCRIPTION_BASE_URL,
+        CLAUDE_CODE_SUBSCRIPTION_BASE_URL,
+        CURSOR_SUBSCRIPTION_BASE_URL,
+    }:
         return
     explicit = set(getattr(args, "_explicit_cli_destinations", ()) or ())
     phase_controls = {
@@ -12955,6 +13017,10 @@ def _build_argparser() -> argparse.ArgumentParser:
             "status and retry messages do not. Explicit role/request timeouts "
             "and hard mode use absolute deadlines, including thinking. "
             "A killed CLI generation cannot resume.\n"
+            "  Cursor selection uses the same 300s soft-mode inactivity "
+            "watchdog. The installed Cursor CLI is unqualified: startup hooks "
+            "outside CURSOR_CONFIG_DIR and undetected context compaction refuse "
+            "generation before a model call, and preflight keeps that provider.\n"
             "  Use --llm-deadline-policy hard for fail-fast experiments that "
             "reject a late LLM/tool-loop operation at the role or phase "
             "deadline; it does not cap the overall MiniSession run.\n"
@@ -13029,18 +13095,25 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--prover",
         default="deepseek",
-        choices=["openai", "deepseek", "openrouter", "codex", "claude-code"],
-        help="Provider for the prover role.",
+        choices=["openai", "deepseek", "openrouter", "codex", "claude-code", "cursor", "local"],
+        help=(
+            "Provider for the prover role. cursor selects cursor://subscription, "
+            "requires --prover-model, and stops in preflight while the installed "
+            "CLI is unqualified for generation. The preflight report names that "
+            "selected provider."
+        ),
     )
     p.add_argument("--prover-model", default=None)
     p.add_argument(
         "--refiner",
         default=None,
-        choices=["openai", "deepseek", "openrouter", "codex", "claude-code"],
+        choices=["openai", "deepseek", "openrouter", "codex", "claude-code", "cursor", "local"],
         help=(
             "Optional refiner provider. When set, the refiner role takes over "
             "the transcript after prover stalls; it may use the same provider "
-            "and model as the prover."
+            "and model as the prover. cursor uses cursor://subscription, "
+            "requires --refiner-model, and stops in preflight while the "
+            "installed CLI is unqualified for generation."
         ),
     )
     p.add_argument("--refiner-model", default=None)
@@ -13053,9 +13126,38 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Claude Code executable for --prover/--refiner claude-code (saved Claude.ai subscription).",
     )
     p.add_argument(
+        "--cursor-bin",
+        default="agent",
+        help=(
+            "Cursor CLI executable recorded for --prover/--refiner cursor. "
+            "The examined build is not launched for generation."
+        ),
+    )
+    p.add_argument(
+        "--local-inference-config", default=None, metavar="FILE",
+        help="Operator endpoint profile for --prover/--refiner/--planner-escalation local.",
+    )
+    p.add_argument("--local-inference-snapshot", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--local-inference-snapshot-hash", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--local-inference-budget-id", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--prover-deployment", default=None, help="Deployment id for --prover local.")
+    p.add_argument("--refiner-deployment", default=None, help="Deployment id for --refiner local.")
+    p.add_argument(
+        "--planner-escalation-deployment", default=None,
+        help="Deployment id for --planner-escalation local.",
+    )
+    p.add_argument(
+        "--inference-policy", choices=("mixed", "local-only"), default="mixed",
+        help="mixed allows declared cloud roles; local-only rejects them and disables auto escalation.",
+    )
+    from .local_inference.network_policy import add_network_policy_argument
+    add_network_policy_argument(p)
+    p.add_argument("--embedding-device", default=None, help="Auxiliary embedding device. Local runs default to cpu.")
+    p.add_argument("--cross-encoder-device", default=None, help="Auxiliary reranker device. Local runs default to cpu.")
+    p.add_argument(
         "--planner-escalation",
         default="off",
-        choices=["auto", "openai", "deepseek", "openrouter", "off"],
+        choices=["auto", "openai", "deepseek", "openrouter", "off", "local"],
         help=(
             "Escalation provider for the recursive planner. After a "
             "degenerate (empty/unparseable) planning response, the next "
@@ -14590,11 +14692,17 @@ async def _validate_cost_budget_pricing(
         if client is None:
             continue
         for model, base_url in reservation_pricing_targets(client):
-            if base_url in {CODEX_SUBSCRIPTION_BASE_URL, CLAUDE_CODE_SUBSCRIPTION_BASE_URL}:
-                backend = "Codex" if base_url == CODEX_SUBSCRIPTION_BASE_URL else "Claude Code"
+            subscription_budget_label = {
+                CODEX_SUBSCRIPTION_BASE_URL: "Codex",
+                CLAUDE_CODE_SUBSCRIPTION_BASE_URL: "Claude Code",
+                CURSOR_SUBSCRIPTION_BASE_URL: "Cursor",
+            }.get(base_url)
+            if subscription_budget_label is not None:
                 raise ValueError(
-                    f"--cost-budget-usd cannot price {backend} subscription allowance; "
-                    f"use --cost-budget-usd 0. {backend} usage is still recorded."
+                    "--cost-budget-usd cannot price "
+                    f"{subscription_budget_label} subscription allowance; "
+                    "use --cost-budget-usd 0. "
+                    f"{subscription_budget_label} usage is still recorded."
                 )
             identity = (str(role or "llm"), str(model or ""), str(base_url or ""))
             if identity in seen:
@@ -15024,6 +15132,10 @@ async def _main_async(args: argparse.Namespace) -> int:
     worker_started_monotonic = time.monotonic()
     worker_admitted_elapsed_s = None
     args = resolve_resume_args(args)
+    from .local_inference.roles import resolve_local_inference
+    from .local_inference.network_policy import admit_network_policy
+    resolved_local = getattr(args, "_local_preparation", None) or resolve_local_inference(args)
+    admit_network_policy(args, resolved_local, Path(__file__).resolve().parent.parent)
     if not hasattr(args, "autonomous_research"):
         # Programmatic namespaces must persist the same effective policy as
         # parsed fresh launches; legacy resume has already supplied False.
@@ -15059,8 +15171,10 @@ async def _main_async(args: argparse.Namespace) -> int:
         output_dir = Path(args.output_dir).resolve()
     else:
         output_dir = _allocate_default_mini_run_dir(problem.artifact_slug)
+    from .local_inference.roles import activate_local_inference, initialize_local_resources, prepare_local_inference
     checkpoint_registry = None
     try:
+        prepare_local_inference(args)
         startup_artifacts = {}
         if bool(getattr(args, "checkpoint_enabled", True)):
             from .mini_generation_artifacts import startup_artifact_receipts
@@ -15149,6 +15263,12 @@ async def _main_async(args: argparse.Namespace) -> int:
     provider_lane_health_registry = ProviderLaneHealthRegistry()
 
     try:
+        activate_local_inference(args, output_dir)
+        from .local_inference.network_policy import persist_network_policy
+        persist_network_policy(output_dir)
+        initialize_local_resources(
+            args, allow_create=not bool(getattr(args, "resume_from", None) or getattr(args, "_local_inherited_budget", False) or getattr(args, "local_inference_budget_id", None)),
+        )
         print("=== mini_prover run ===")
         if checkpoint_registry is not None and checkpoint_registry.source_transition:
             recorder.record_turn({
@@ -15215,19 +15335,25 @@ async def _main_async(args: argparse.Namespace) -> int:
             llm_deadline_policy=getattr(args, "llm_deadline_policy", "soft"),
             request_timeout_s=prover_request_timeout_s,
             request_timeout_disabled=prover_request_timeout_disabled,
+            cli_args=args,
         )
-        _apply_subscription_control_requirements(args, prover_cfg, role_name="prover")
-        prover_reasoning_mode, prover_reasoning_effort = _reasoning_role_cli_settings(
-            args,
-            "prover",
-        )
-        _apply_reasoning_cli_override(
-            prover_cfg,
-            mode=prover_reasoning_mode,
-            effort=prover_reasoning_effort,
-        )
-        prover_cfg.codex_binary = getattr(args, "codex_bin", "codex")
-        prover_cfg.claude_code_binary = getattr(args, "claude_code_bin", "claude")
+        if prover_cfg.local_inference_binding is None:
+            _apply_subscription_control_requirements(args, prover_cfg, role_name="prover")
+            prover_reasoning_mode, prover_reasoning_effort = _reasoning_role_cli_settings(
+                args,
+                "prover",
+            )
+            _apply_reasoning_cli_override(
+                prover_cfg,
+                mode=prover_reasoning_mode,
+                effort=prover_reasoning_effort,
+            )
+            prover_cfg.codex_binary = getattr(args, "codex_bin", "codex")
+            prover_cfg.claude_code_binary = getattr(args, "claude_code_bin", "claude")
+            prover_cfg.cursor_binary = getattr(args, "cursor_bin", "agent")
+        else:
+            prover_reasoning_mode = str(getattr(prover_cfg, "reasoning_requested_mode", _REASONING_PROVIDER_DEFAULT))
+            prover_reasoning_effort = prover_cfg.reasoning_effort
         prover_client = _make_mini_role_client(
             prover_cfg,
             provider_lane_health_registry=provider_lane_health_registry,
@@ -15241,27 +15367,45 @@ async def _main_async(args: argparse.Namespace) -> int:
                 llm_deadline_policy=getattr(args, "llm_deadline_policy", "soft"),
                 request_timeout_s=refiner_request_timeout_s,
                 request_timeout_disabled=refiner_request_timeout_disabled,
+                cli_args=args,
             )
-            _apply_subscription_control_requirements(args, refiner_cfg, role_name="refiner")
-            refiner_reasoning_mode, refiner_reasoning_effort = (
-                _reasoning_role_cli_settings(
-                    args,
-                    "refiner",
+            if refiner_cfg.local_inference_binding is None:
+                _apply_subscription_control_requirements(args, refiner_cfg, role_name="refiner")
+                refiner_reasoning_mode, refiner_reasoning_effort = (
+                    _reasoning_role_cli_settings(
+                        args,
+                        "refiner",
+                    )
                 )
-            )
-            _apply_reasoning_cli_override(
-                refiner_cfg,
-                mode=refiner_reasoning_mode,
-                effort=refiner_reasoning_effort,
-            )
-            refiner_cfg.codex_binary = getattr(args, "codex_bin", "codex")
-            refiner_cfg.claude_code_binary = getattr(args, "claude_code_bin", "claude")
+                _apply_reasoning_cli_override(
+                    refiner_cfg,
+                    mode=refiner_reasoning_mode,
+                    effort=refiner_reasoning_effort,
+                )
+                refiner_cfg.codex_binary = getattr(args, "codex_bin", "codex")
+                refiner_cfg.claude_code_binary = getattr(args, "claude_code_bin", "claude")
+                refiner_cfg.cursor_binary = getattr(args, "cursor_bin", "agent")
+            else:
+                refiner_reasoning_mode = str(getattr(refiner_cfg, "reasoning_requested_mode", _REASONING_PROVIDER_DEFAULT))
+                refiner_reasoning_effort = refiner_cfg.reasoning_effort
             refiner_client = _make_mini_role_client(
                 refiner_cfg,
                 provider_lane_health_registry=provider_lane_health_registry,
             )
         for role_client in (prover_client, refiner_client):
-            if isinstance(role_client, (CodexSubscriptionClient, ClaudeCodeSubscriptionClient)):
+            if isinstance(role_client, CursorSubscriptionClient):
+                print(
+                    "[mini_prover] "
+                    f"{role_client.cfg.name}: "
+                    + cursor_unqualified_explanation(
+                        executable=str(role_client.cfg.cursor_binary),
+                        model=str(role_client.cfg.model),
+                    ),
+                    flush=True,
+                )
+                role_client.validate_requested_controls()
+                await role_client.preflight()
+            elif isinstance(role_client, (CodexSubscriptionClient, ClaudeCodeSubscriptionClient)):
                 role_client.validate_requested_controls()
                 await role_client.preflight()
                 print(
@@ -15283,7 +15427,9 @@ async def _main_async(args: argparse.Namespace) -> int:
         planner_escalation_choice = str(
             getattr(args, "planner_escalation", "off") or "off"
         ).strip().lower()
-        if planner_escalation_choice == "auto" and {"codex", "claude-code"} & {args.prover, args.refiner}:
+        if planner_escalation_choice == "auto" and str(getattr(args, "inference_policy", "mixed") or "mixed") == "local-only":
+            planner_escalation_choice = "off"
+        if planner_escalation_choice == "auto" and {"codex", "claude-code", "cursor"} & {args.prover, args.refiner}:
             # Subscription selection must not silently activate an API-billed
             # escalation role because an unrelated API key is in the shell.
             planner_escalation_choice = ""
@@ -15333,8 +15479,12 @@ async def _main_async(args: argparse.Namespace) -> int:
                 llm_deadline_policy=getattr(args, "llm_deadline_policy", "soft"),
                 request_timeout_s=prover_request_timeout_s,
                 request_timeout_disabled=prover_request_timeout_disabled,
+                cli_args=args,
             )
-            planner_escalation_client = OpenAICompatClient(
+            planner_escalation_factory = (
+                _make_mini_role_client if planner_escalation_choice == "local" else OpenAICompatClient
+            )
+            planner_escalation_client = planner_escalation_factory(
                 planner_escalation_cfg,
                 provider_lane_health_registry=provider_lane_health_registry,
             )
@@ -16023,6 +16173,11 @@ async def _main_async(args: argparse.Namespace) -> int:
         failure_reason, failure_reason_detail = _mini_prover_exception_failure(exc)
         infrastructure_aborted = True
         print(f"\nSETUP FAILED: {failure_reason}", flush=True)
+        if (
+            failure_reason == "provider_protocol_incompatible"
+            and "[cursor:compatibility]" in str(failure_reason_detail or "")
+        ):
+            print(failure_reason_detail, flush=True)
     except BaseException as exc:
         failure_reason, failure_reason_detail = _mini_prover_external_stop_reason(exc)
         print(f"\nABORTED: {failure_reason}", flush=True)
@@ -17228,6 +17383,8 @@ async def _main_async(args: argparse.Namespace) -> int:
                             print("Checkpointing was disabled. Restore API account access or credits, then start a new run.")
                     elif effective_failure_reason == "provider_protocol_incompatible":
                         print("Correct the provider CLI compatibility, then start a new run.")
+                        if "[cursor:compatibility]" in str(failure_reason_detail or ""):
+                            print(failure_reason_detail)
                     elif effective_failure_reason == "provider_transport_unavailable":
                         print("Repeated incomplete provider responses paused this run; no quota or account cause was confirmed.")
                         print("After checking provider availability, resume from this run directory." if checkpoint_registry is not None
@@ -17951,6 +18108,11 @@ def main() -> int:
     )
 
     try:
+        parsed_args = resolve_resume_args(parsed_args)
+        from .local_inference.roles import resolve_local_inference
+        from .local_inference.network_policy import admit_network_policy
+        resolved_local = getattr(parsed_args, "_local_preparation", None) or resolve_local_inference(parsed_args)
+        admit_network_policy(parsed_args, resolved_local, Path(__file__).resolve().parent.parent)
         if not is_watchdog_worker() and should_prepare(parsed_args):
             return run_path_input(parsed_args, sys.argv[1:], parser)
     except KeyboardInterrupt:

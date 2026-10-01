@@ -21,7 +21,7 @@ from .subprocess_cleanup import (
     communicate_with_hard_timeout,
     terminate_and_reap_process,
 )
-from .subprocess_environment import sanitized_subprocess_environment
+from .local_inference.network_policy import prepare_owned_subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -707,7 +707,7 @@ class LeanREPL:
             "printenv",
             "LEAN_PATH",
             cwd=str(self.project_dir),
-            env=sanitized_subprocess_environment(),
+            env=prepare_owned_subprocess(("lake", "env", "printenv", "LEAN_PATH"), project=self.project_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -739,7 +739,7 @@ class LeanREPL:
             "which",
             "lean",
             cwd=str(self.project_dir),
-            env=sanitized_subprocess_environment(),
+            env=prepare_owned_subprocess(("lake", "env", "which", "lean"), project=self.project_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -797,7 +797,7 @@ class LeanREPL:
             lean_bin,
             str(file_path),
             cwd=str(self.project_dir),
-            env=sanitized_subprocess_environment(process_env),
+            env=prepare_owned_subprocess((lean_bin, "--stdin"), project=self.project_dir, base=process_env),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

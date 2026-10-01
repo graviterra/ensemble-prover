@@ -48,6 +48,7 @@ from ...mini_lean_extract import (
     _strip_lean_comments,
 )
 from ...models import (
+    apply_scoped_reasoning_replay,
     normalize_tool_calls,
     provider_defer_record_from_exception,
     response_output_items,
@@ -3764,6 +3765,8 @@ async def _call_llm_with_tools_one_round_impl(
             repair_self_check_budget_exhausted = True
         if repair_self_check_seen:
             repair_self_check_status = "accepted"
+        elif _repair_self_check_non_verdict_is_compliant(repair_self_check_status):
+            pass
         elif repair_self_check_attempted:
             repair_self_check_status = "no_accepted_try_lean"
         elif repair_self_check_status in non_verdict_repair_self_check_statuses:
@@ -5341,23 +5344,26 @@ async def _call_llm_with_tools_one_round_impl(
                         in response_data["choices"][0]["message"]
                     )
                 )
-                reasoning_content = response_reasoning_text(response_data)
-                if reasoning_content and not raw_openrouter_message:
-                    # Direct DeepSeek requires this exact field on every
-                    # continuation of a thinking-mode tool-call turn. An
-                    # incomplete OpenRouter batch cannot reuse structured
-                    # reasoning: flattening it onto reconstructed calls would
-                    # forge a continuation the provider never authored.
-                    assistant_message["reasoning_content"] = reasoning_content
-                reasoning_items = response_reasoning_items(response_data)
-                if reasoning_items:
-                    assistant_message["_responses_reasoning_items"] = reasoning_items
-                output_items = response_output_items(response_data)
-                if output_items and _responses_output_matches_advertised_tool_calls(
-                    output_items,
-                    advertised_tool_calls,
+                if not apply_scoped_reasoning_replay(
+                    assistant_message, response_data
                 ):
-                    assistant_message["_responses_output_items"] = output_items
+                    reasoning_content = response_reasoning_text(response_data)
+                    if reasoning_content and not raw_openrouter_message:
+                        # Direct DeepSeek requires this exact field on every
+                        # continuation of a thinking-mode tool-call turn. An
+                        # incomplete OpenRouter batch cannot reuse structured
+                        # reasoning: flattening it onto reconstructed calls would
+                        # forge a continuation the provider never authored.
+                        assistant_message["reasoning_content"] = reasoning_content
+                    reasoning_items = response_reasoning_items(response_data)
+                    if reasoning_items:
+                        assistant_message["_responses_reasoning_items"] = reasoning_items
+                    output_items = response_output_items(response_data)
+                    if output_items and _responses_output_matches_advertised_tool_calls(
+                        output_items,
+                        advertised_tool_calls,
+                    ):
+                        assistant_message["_responses_output_items"] = output_items
             _bind_provider_continuation_policy_receipt(assistant_message, conv)
             conv.history.append(assistant_message)
 
@@ -5794,9 +5800,10 @@ async def _call_llm_with_tools_one_round_impl(
                             )
                         )
                     elif name == "try_lean" and try_lean_tool_enabled:
+                        authoritative_tool_lemmas = tool_helper_blocks() if dossier is not None else []
                         context_lemmas = (
                             primitives["feedback_lemmas"](
-                                tool_helper_blocks(),
+                                authoritative_tool_lemmas,
                                 conv,
                             )
                             if dossier is not None
@@ -5811,6 +5818,10 @@ async def _call_llm_with_tools_one_round_impl(
                                 preamble=conv.preamble,
                                 args=args,
                                 context_lemmas=context_lemmas,
+                                feedback_context=(
+                                    context_lemmas != authoritative_tool_lemmas
+                                    or primitives.get("needs_answer_safe_feedback_check", lambda _: False)(conv)
+                                ),
                                 dossier=dossier,
                                 turn_index=turn,
                                 tool_call_index=tool_calls_used + 1,
@@ -6061,6 +6072,14 @@ async def _call_llm_with_tools_one_round_impl(
                             repair_self_check_codes.append(
                                 accepted_try_lean_code
                             )
+                        elif result_text.startswith("try_lean conditional feedback "):
+                            repair_self_check_attempted = True
+                            if not repair_self_check_seen:
+                                repair_self_check_status = (
+                                    "conditional_feedback"
+                                    if result_text.startswith("try_lean conditional feedback accepted.")
+                                    else "no_accepted_try_lean"
+                                )
                         elif result_text.startswith("try_lean rejected."):
                             repair_self_check_attempted = True
                             # Batch order is not authority. Once any verifier

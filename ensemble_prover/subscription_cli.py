@@ -346,6 +346,10 @@ class SubscriptionCLIClient:
             self._process_owners.pop(owner, None)
             settled.set_result(None)
 
+    def _decode_stream_event(self, line: bytes) -> Any:
+        """Decode a stdout record; providers may supply a stricter decoder."""
+        return json.loads(line, parse_constant=_reject_json_constant)
+
     async def _run_process(
         self,
         argv: list[str],
@@ -413,7 +417,7 @@ class SubscriptionCLIClient:
                     )
                 if on_event is not None or on_progress is not None:
                     try:
-                        event = json.loads(line, parse_constant=_reject_json_constant)
+                        event = self._decode_stream_event(line)
                     except (ValueError, UnicodeDecodeError, RecursionError):
                         raise self.backend_error(
                             f"{self.backend_name} emitted invalid JSONL"

@@ -56,3 +56,15 @@
   .live-math dl > div { flex-wrap: wrap; gap: 2px 12px; }
   .live-math dd { text-align: left; }
 }
+
+.inference-activity { padding: 14px 24px; border-top: 1px solid var(--line); }
+.inference-activity h3 { margin: 0 0 6px; font-size: 14px; }
+.inference-activity > p { margin: 0 0 12px; }
+.inference-activity > ul { list-style: none; padding: 0; margin: 0; }
+.inference-observation { padding: 10px 0; font-size: 12px; overflow-wrap: anywhere; }
+.inference-observation + .inference-observation { border-top: 1px solid var(--line); }
+.inference-observation-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; justify-content: space-between; }
+.inference-observation p { margin: 6px 0 0; }
+.inference-warning { color: var(--amber-ink); }
+.inference-capacity { color: var(--ink-soft); }
+@media (max-width: 760px) { .inference-activity { padding-left: 16px; padding-right: 16px; } }

@@ -556,6 +556,7 @@ class DiscoveryLoop:
 
     async def _request(self, job: dict[str, Any]) -> dict[str, Any]:
         from ..codex_subscription import CodexSubscriptionClient
+        from ..workflow_roles import wire_response_format
         from ..llm_error_policy import SubscriptionBackendError
         from ..llm_usage import (
             call_with_optional_usage_callback,
@@ -701,7 +702,9 @@ class DiscoveryLoop:
                     # discovery parser owns the inner action. Persist malformed
                     # action text/refusals before giving correction feedback.
                     response_format = (
-                        None if isinstance(client, CodexSubscriptionClient) else "json"
+                        None
+                        if isinstance(client, CodexSubscriptionClient)
+                        else wire_response_format(client, "json")
                     )
                     # Native research borrows Mini's model roles, whose raw
                     # capacity is not a request budget. Keep one unresolved
@@ -2491,8 +2494,10 @@ def create_formalization_handoff(
 
     Execution has its own explicit authorization. We do not claim the research
     request cap meters nested Mini Prover requests, whose hooks are different.
+    Local continuations retain their deployments and shared compute allowance.
     """
     from ..formalization.campaign import initialize_project
+    from ..local_inference.handoffs import formalization_handoff_scope
 
     with DiscoveryStore(directory) as store:
         run = store.run_record()
@@ -2544,10 +2549,11 @@ def create_formalization_handoff(
             documents[name] = rendered
             artifact_index.append({**metadata, "document": name, "encoding": encoding})
         documents["artifact-index.json"] = json_text(artifact_index)
-        initialize_project(
-            output,
-            project_path=project_path,
-            documents=documents,
-            goal=json_text(claim["spec"]["contract"]),
-            imports=imports,
-        )
+        with formalization_handoff_scope(directory, run, output, project_path):
+            initialize_project(
+                output,
+                project_path=project_path,
+                documents=documents,
+                goal=json_text(claim["spec"]["contract"]),
+                imports=imports,
+            )

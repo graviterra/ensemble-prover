@@ -11,6 +11,7 @@ falsified without that certificate.
 from __future__ import annotations
 
 import textwrap
+import time
 from typing import Any, Callable, Optional, Sequence, Tuple
 
 from ensemble_prover.mini_falsification import (
@@ -35,11 +36,115 @@ from ensemble_prover.proof_dossier import (
     text_hash,
 )
 from ensemble_prover.utils import _lean_lexical_skip_end
+from ensemble_prover.deadline_guard import invoke_with_strict_deadline
+from ensemble_prover.lean_parser import canonical_error_type
 
 # Bounded replay window for the negation certificate. A ``¬statement`` replay may
 # need omega/decide, so allow more than the 8s certifier default, but keep it
 # capped so a pathological body cannot stall the (already-failed) prove path.
 _CERTIFY_TIMEOUT_S = 30.0
+
+
+def _original_target_parser(lean: Any, *, feedback: bool = False) -> Any:
+    from ensemble_prover.lean_runner import LeanRunner
+    from ensemble_prover.mini_session.recursive_helper_prover import (
+        _RevocableRecursiveHelperCapability,
+    )
+
+    # Inspect only the known host fence for eligibility. Execute through the
+    # original object so revocation before/after an await still takes effect.
+    target = lean
+    seen: set[int] = set()
+    while type(target) is _RevocableRecursiveHelperCapability:
+        if id(target) in seen:
+            return None
+        seen.add(id(target))
+        target = _RevocableRecursiveHelperCapability._dispatch_capability_identity_token(target)
+    if (
+        not isinstance(target, LeanRunner)
+        and getattr(target, "_mini_falsification_trusted_audit", False) is not True
+    ):
+        return None
+    name = "check_feedback_proposition_type_raw" if feedback else "check_proposition_type_raw"
+    parser = getattr(lean, name, None)
+    if parser is None and feedback and not isinstance(target, LeanRunner):
+        # Explicit trusted test adapters may retain the original parser API.
+        parser = getattr(lean, "check_proposition_type_raw", None)
+    return parser if callable(parser) else None
+
+
+async def _admit_original_refutation_target(
+    lean: Any,
+    statement: str,
+    preamble: str,
+    helpers: Sequence[str],
+    timeout_s: float,
+    *,
+    filter_authority_helpers: bool = True,
+) -> Optional[CertificationResult]:
+    """Parse the original Prop before adding any textual negation wrapper.
+
+    Apostrophes are environment-dependent notation tokens as well as literal
+    delimiters. The existing Lean preflight safely quotes the original source,
+    parses it completely in the target scope, then checks its proposition type.
+    This grants no disproof authority; independent replay and audit still follow.
+    """
+    try:
+        parser = _original_target_parser(lean, feedback=not filter_authority_helpers) if "'" in statement else None
+    except Exception as exc:
+        return CertificationResult(
+            CertificationStatus.RETRYABLE_INFRASTRUCTURE,
+            reason=f"original target preflight unavailable: {type(exc).__name__}",
+        )
+    if parser is None:
+        if "'" in statement:
+            return CertificationResult(
+                CertificationStatus.RETRYABLE_INFRASTRUCTURE,
+                reason="original target requires unavailable Lean proposition preflight",
+            )
+        if _statement_is_interpolation_safe(statement):
+            return None
+        return CertificationResult(
+            CertificationStatus.DEFINITIVE_REJECTION,
+            reason="target contains unbalanced delimiters, comments, or an unterminated literal",
+        )
+    try:
+        parsed, output, code = await invoke_with_strict_deadline(
+            parser,
+            statement,
+            safe_helper_sources(helpers) if filter_authority_helpers else list(helpers),
+            preamble_override=preamble,
+            timeout_s=timeout_s,
+            guard_timeout_s=timeout_s,
+            operation_ownership="result_only",
+        )
+    except Exception as exc:
+        return CertificationResult(
+            CertificationStatus.RETRYABLE_INFRASTRUCTURE,
+            reason=f"original target preflight infrastructure failed: {type(exc).__name__}",
+        )
+    if code == 0 and not getattr(parsed, "infra_failure", False):
+        return None
+    error_kind = canonical_error_type(parsed)
+    infrastructure = (
+        getattr(parsed, "infra_failure", False)
+        or getattr(parsed, "timeout", False)
+        or error_kind == "timeout"
+        or not (error_kind or getattr(parsed, "diagnostics", ()))
+    )
+    return CertificationResult(
+        (
+            CertificationStatus.RETRYABLE_INFRASTRUCTURE
+            if infrastructure
+            else CertificationStatus.DEFINITIVE_REJECTION
+        ),
+        reason=(
+            "original target preflight infrastructure failed: "
+            if infrastructure
+            else "Lean rejected the original proposition: "
+        )
+        + str(output)[:1000],
+    )
 
 
 def answer_safe_negation_feedback_context(
@@ -493,8 +598,6 @@ async def record_authoritative_negation_artifact(
         admission_failure = "counterexample admission requires an active proof dossier"
     elif not statement:
         admission_failure = "counterexample admission requires a nonempty target"
-    elif not _statement_is_interpolation_safe(statement):
-        admission_failure = "target contains unbalanced delimiters, comments, or an unterminated literal"
     elif not target_environment_hash:
         admission_failure = "counterexample admission requires a bound Lean environment"
     if admission_failure:
@@ -565,11 +668,32 @@ async def record_authoritative_negation_artifact(
             != tuple(safe_helper_sources(helpers))
         )
     )
-    policy = FalsificationPolicy(
-        operation_timeout_s=_CERTIFY_TIMEOUT_S,
-        engine_timeout_s=_CERTIFY_TIMEOUT_S,
-    )
     lean = getattr(parent_session, "lean", None)
+    admission_started = time.monotonic()
+    admission = await _admit_original_refutation_target(
+        lean, statement, acceptance_preamble, helpers, _CERTIFY_TIMEOUT_S,
+    )
+    remaining = _CERTIFY_TIMEOUT_S - (time.monotonic() - admission_started)
+    if admission is None and visible_replay_required and remaining > 0:
+        assert visible_preamble is not None
+        admission = await _admit_original_refutation_target(
+            lean, statement, visible_preamble, visible_helpers, remaining,
+            filter_authority_helpers=False,
+        )
+        remaining = _CERTIFY_TIMEOUT_S - (time.monotonic() - admission_started)
+    if admission is None and remaining <= 0:
+        admission = CertificationResult(
+            CertificationStatus.RETRYABLE_INFRASTRUCTURE,
+            reason="original target preflight exhausted the certification allowance",
+        )
+    if admission is not None:
+        if certification_results is not None:
+            certification_results.append(admission)
+        return False, "", ()
+    policy = FalsificationPolicy(
+        operation_timeout_s=remaining,
+        engine_timeout_s=remaining,
+    )
     environment_hash = falsification_environment_hash(
         preamble=acceptance_preamble,
         helpers=helpers,
@@ -988,7 +1112,8 @@ def _statement_is_interpolation_safe(statement: str) -> bool:
     still refuse comments, unterminated literals, and unbalanced brackets.
     Local ``let``/``have`` assignments are ordinary term syntax: ``:=`` cannot
     close the surrounding parenthesis, so rejecting it blocks valid targets.
-    Lean replay remains responsible for validating the expression's grammar.
+    Apostrophe-bearing targets bypass this context-free check: their original
+    proposition must first pass Lean's environment-aware parser.
     """
 
     text = str(statement or "")
@@ -1035,7 +1160,7 @@ def _statement_is_interpolation_safe(statement: str) -> bool:
         ch = text[index]
         if ch == "'":
             previous = text[index - 1] if index else ""
-            if not (previous.isalnum() or (previous and previous in "_'»")):
+            if not previous or not (previous.isalnum() or previous in "_'»"):
                 return False  # An unfinished character literal was not skipped.
         if ch in openers:
             stack.append(ch)
@@ -1079,7 +1204,8 @@ async def maybe_falsify_child_goal_from_child_transcript(
         or getattr(node, "falsified", False)
         or dossier is None
         or not statement
-        or not _statement_is_interpolation_safe(statement)
+        # The central admission checks the original target with Lean before
+        # wrapping it; a Python lexer must not preempt that authority.
     ):
         return False, ""
 

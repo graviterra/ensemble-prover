@@ -36,6 +36,7 @@ class Option:
 
 
 _MODES = ("provider-default", "auto", "on", "off")
+_INFERENCE_POLICIES = ("mixed", "local-only")
 _EFFORTS = ("none", "low", "medium", "high", "max")
 _FIELDS = (
     Option("mini-recursive-passes", "Recursive passes", "number", "Search",
@@ -78,6 +79,9 @@ _FIELDS = (
            "Positive wall-clock cap for each Lean check.", minimum=1),
     Option("llm-deadline-policy", "LLM deadline policy", "select", "Budgets",
            "Soft waits across local phase deadlines. Hard bounds an individual model/tool operation.", ("soft", "hard")),
+    Option("inference-policy", "Inference policy", "select", "Locality",
+           "Mixed allows cloud and local roles. Local-only requires every enabled role to be operator-local. The prover enforces prover and refiner roles. English local-only also requires a local formalizer.",
+           _INFERENCE_POLICIES),
 )
 _BY_KEY = {field.key: field for field in _FIELDS}
 
@@ -119,6 +123,10 @@ class OptionValidationError(ValueError):
 def option_schema() -> dict[str, list[dict[str, Any]]]:
     """Metadata only: no project or provider execution."""
     return {"fields": [field.schema() for field in _FIELDS]}
+
+
+def inference_policies() -> tuple[str, ...]:
+    return _INFERENCE_POLICIES
 
 
 def _validate_reasoning(options: dict[str, Any], *, refiner_enabled: bool) -> None:

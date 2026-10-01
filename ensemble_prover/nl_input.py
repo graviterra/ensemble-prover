@@ -162,7 +162,7 @@ def _preamble(context: str, imports: Sequence[str]) -> str:
 async def formalize_nl(
     text: str,
     *,
-    client: OpenAICompatClient,
+    client: Any,
     lean: LeanRunner,
     output_dir: Path,
     max_attempts: int = 3,
@@ -197,6 +197,17 @@ async def formalize_nl(
     preamble = _preamble(context, imports)
     directory = Path(output_dir).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=False)
+    from .workflow_roles import (
+        attach_local_resources,
+        start_workflow,
+        transport_record,
+        wire_response_format,
+    )
+
+    preparation = getattr(client, "_local_preparation", None)
+    if preparation is not None:
+        start_workflow(directory, preparation)
+    attach_local_resources(client, allow_create=preparation is None)
     input_bytes = text.encode("utf-8")
     (directory / "problem.txt").write_bytes(input_bytes)
     context_hash = _sha256(context.encode("utf-8")) if context else ""
@@ -213,7 +224,7 @@ async def formalize_nl(
         "semantic_status": "machine_proposed",
         "input_sha256": _sha256(input_bytes),
         "model": str(getattr(cfg, "model", "")),
-        "base_url": str(getattr(cfg, "base_url", "")),
+        **transport_record(cfg),
         "max_attempts": max_attempts,
         "preamble": preamble,
         "project_path": str(project),
@@ -270,7 +281,9 @@ async def formalize_nl(
             attempt: dict[str, Any] = {"messages": list(messages)}
             record["attempts"].append(attempt)
             save()
-            _, response = await client.chat_raw(messages, response_format="json")
+            _, response = await client.chat_raw(
+                messages, response_format=wire_response_format(client, "json"),
+            )
             attempt.update(
                 response=response,
                 truncated=bool(getattr(client, "last_truncated", False)),
@@ -452,12 +465,27 @@ def _parser() -> argparse.ArgumentParser:
         help="New directory for input, transcript and generated theorem",
     )
     parser.add_argument(
-        "--formalizer", choices=["openai", "deepseek", "openrouter"], default="openai"
+        "--formalizer",
+        choices=["openai", "deepseek", "openrouter", "codex", "claude-code", "cursor", "local"],
+        default="openai",
+        help="Formalizer provider. local reads a deployment. cursor needs an exact model.",
     )
+    parser.add_argument("--formalizer-deployment", default=None)
+    parser.add_argument("--local-inference-config", type=Path, default=None)
+    parser.add_argument(
+        "--inference-policy", choices=("mixed", "local-only"), default="mixed",
+        help="local-only refuses hosted roles. It does not mean the process is offline.",
+    )
+    from .local_inference.network_policy import add_network_policy_argument
+    add_network_policy_argument(parser)
+    parser.add_argument("--coordinator-root", type=Path, default=None)
+    parser.add_argument("--cursor-bin", default="agent")
+    parser.add_argument("--claude-code-bin", default="claude")
+    parser.add_argument("--codex-bin", default="codex")
     parser.add_argument(
         "--formalizer-model",
         default=None,
-        help="Default: gpt-5.6-terra for OpenAI; other providers use Mini defaults",
+        help="Exact model. OpenAI defaults to gpt-5.6-terra. cursor rejects auto. local uses the deployment model.",
     )
     parser.add_argument(
         "--context-file",
@@ -512,29 +540,103 @@ def _positive_timeout(value: str) -> float:
     return timeout
 
 
+def _explicit_model(args: argparse.Namespace) -> str | None:
+    if "--formalizer-model" not in getattr(args, "explicit_options", ()):
+        return None
+    return args.formalizer_model
+
+
+def _admit_formalizer(args: argparse.Namespace) -> None:
+    """Refuse a hidden hosted formalizer before a client exists."""
+    from .workflow_roles import prepare_auxiliary
+
+    if args.inference_policy == "local-only" and args.formalizer != "local":
+        raise ValueError(
+            "local-only needs an explicit --formalizer local deployment. "
+            "OpenAI is not assumed. local-only does not mean offline "
+            "and does not by itself stop downloads."
+        )
+    if args.formalizer == "cursor" and (
+        "--formalizer-model" not in args.explicit_options
+        or not args.formalizer_model
+        or str(args.formalizer_model).casefold() == "auto"
+    ):
+        raise ValueError("cursor requires an exact model id; auto is not substituted")
+    if args.formalizer == "local":
+        if not args.formalizer_deployment or args.local_inference_config is None:
+            raise ValueError(
+                "local formalizer requires --formalizer-deployment and --local-inference-config"
+            )
+        args._local_preparation = prepare_auxiliary(
+            [("formalizer", args.formalizer_deployment, _explicit_model(args))],
+            inference_policy=args.inference_policy,
+            coordinator=args.coordinator_root,
+            config_path=args.local_inference_config,
+        )
+
+
+def _prepare_handoff(args: argparse.Namespace, extra: Sequence[str]) -> list[str]:
+    from .workflow_roles import handoff_arguments, handoff_is_local, reject_nonlocal_handoff
+    from .local_inference.network_policy import network_handoff_arguments
+    extra = network_handoff_arguments(args, extra)
+
+    if args.inference_policy == "local-only":
+        reject_nonlocal_handoff(extra)
+    if args.inference_policy == "local-only" or handoff_is_local(extra):
+        return handoff_arguments(extra, policy=args.inference_policy)
+    return list(extra)
+
+
 async def _translate(args: argparse.Namespace, text: str, directory: Path) -> NLResult:
     from dotenv import load_dotenv
     from .mini_prover import _make_role_cfg
+    from .workflow_roles import auxiliary_role_config, prepare_auxiliary, workflow_client
 
     load_dotenv()
     model = args.formalizer_model or (
         "gpt-5.6-terra" if args.formalizer == "openai" else None
     )
-    cfg = _make_role_cfg(
-        args.formalizer,
-        model,
-        role_name="formalizer",
-        llm_deadline_policy="hard",
-        timeout_s=args.formalizer_timeout_s,
-    )
-    if args.formalizer_timeout_s is not None:
-        cfg.operation_timeout_s = args.formalizer_timeout_s
+    timeout = args.formalizer_timeout_s
+    if args.formalizer == "local":
+        preparation = getattr(args, "_local_preparation", None) or prepare_auxiliary(
+            [("formalizer", args.formalizer_deployment, _explicit_model(args))],
+            inference_policy=args.inference_policy,
+            coordinator=args.coordinator_root,
+            config_path=args.local_inference_config,
+        )
+        cfg = auxiliary_role_config(
+            preparation, "formalizer", timeout_s=timeout, model=_explicit_model(args),
+        )
+        from .workflow_roles import LocalRuntime
+
+        cfg.local_inference_binding = LocalRuntime.prepare_resources(
+            cfg.local_inference_binding, allow_create=True,
+        )
+        client = workflow_client(cfg)
+        client._local_preparation = preparation
+    else:
+        cfg = _make_role_cfg(
+            args.formalizer, model, role_name="formalizer",
+            llm_deadline_policy="hard", timeout_s=timeout,
+        )
+        if timeout is not None:
+            cfg.operation_timeout_s = timeout
+        if args.formalizer == "cursor":
+            cfg.cursor_binary = args.cursor_bin
+        elif args.formalizer == "claude-code":
+            cfg.claude_code_binary = args.claude_code_bin
+        elif args.formalizer == "codex":
+            cfg.codex_binary = args.codex_bin
+        client = (
+            workflow_client(cfg)
+            if args.formalizer in {"cursor", "claude-code", "codex"}
+            else OpenAICompatClient(cfg)
+        )
     context = (
         args.context_file.expanduser().read_bytes().decode("utf-8")
         if args.context_file
         else ""
     )
-    client = OpenAICompatClient(cfg)
     try:
         lean = LeanRunner(
             LeanConfig(
@@ -579,10 +681,16 @@ async def _translate(args: argparse.Namespace, text: str, directory: Path) -> NL
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
+    raw = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
+    args.explicit_options = {item.split("=", 1)[0] for item in raw if item.startswith("--")}
     extra = args.prover_args[1:] if args.prover_args[:1] == ["--"] else args.prover_args
     try:
         _validate_prover_args(extra)
+        if not args.prove_existing:
+            _admit_formalizer(args)
+            from .local_inference.network_policy import admit_network_policy
+            admit_network_policy(args, getattr(args, "_local_preparation", None), args.project_path or Path.cwd())
         if args.formalize_only and extra:
             raise ValueError(
                 "--formalize-only cannot be combined with prover arguments"
@@ -600,7 +708,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = load_result(args.prove_existing)
             project = args.project_path or result.project_path
             assert project is not None
-            command = prover_command(result, project_path=project, extra_args=extra)
+            from .local_inference.roles import load_run_bundle, persist_local_inference
+            from .workflow_roles import prepare_handoff_snapshot
+
+            parent = None
+            if (result.output_dir / "local_inference").exists():
+                parent = load_run_bundle(result.output_dir)
+                if "--inference-policy" in args.explicit_options and args.inference_policy != parent.inference_policy:
+                    raise ValueError("saved inference policy cannot change on handoff")
+                args.inference_policy = parent.inference_policy
+            elif (result.output_dir / "proof_handoff" / "local_inference").exists():
+                parent = load_run_bundle(result.output_dir / "proof_handoff")
+                if "--inference-policy" in args.explicit_options and args.inference_policy != parent.inference_policy:
+                    raise ValueError("saved inference policy cannot change on handoff")
+                args.inference_policy = parent.inference_policy
+            from .local_inference.network_policy import admit_network_policy
+            args.project_path = project
+            admit_network_policy(args, parent, project, directory=result.output_dir)
+            extra = _prepare_handoff(args, extra)
+            extra, handoff_preparation = prepare_handoff_snapshot(extra, result.output_dir, parent=parent)
+            if handoff_preparation is not None:
+                persist_local_inference(result.output_dir / "proof_handoff", handoff_preparation, include_binding=True)
+            command = prover_command(
+                result, project_path=project, extra_args=extra,
+            )
             print(
                 f"Reusing {result.lean_file}; Mini will recheck it before proof search.",
                 flush=True,
@@ -631,6 +762,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if directory.exists():
             raise ValueError(f"output directory already exists: {directory}")
+        handoff_preparation = None
+        if not args.formalize_only:
+            from .workflow_roles import prepare_handoff_snapshot
+
+            extra = _prepare_handoff(args, extra)
+            extra, handoff_preparation = prepare_handoff_snapshot(
+                extra, directory, parent=getattr(args, "_local_preparation", None),
+            )
         print(f"Formalizing; artifacts: {directory}", flush=True)
         result = asyncio.run(_translate(args, text, directory))
         if result.status != "formalized":
@@ -644,6 +783,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Review the complete context and {len(result.definitions)} generated definition(s): {result.lean_file}",
             flush=True,
         )
+        if args.formalize_only and args.inference_policy == "local-only":
+            print(
+                "Formalized. No prover command was saved because local-only has no explicit local prover arguments. "
+                "local-only does not mean offline and does not by itself stop downloads.",
+                flush=True,
+            )
+            return 0
+        if handoff_preparation is not None:
+            from .local_inference.roles import persist_local_inference
+
+            persist_local_inference(directory / "proof_handoff", handoff_preparation, include_binding=True)
+        if args.formalize_only:
+            extra = _prepare_handoff(args, extra)
         command = prover_command(
             result, project_path=args.project_path, extra_args=extra
         )

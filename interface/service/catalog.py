@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from console.launcher import read_launches
+from .local_registry import CURSOR_UNAVAILABLE, OperatorLocalRegistry
 from ensemble_prover.theorem_project import scan_lean_theorems
 
 MAX_DIRECTORY_ENTRIES = 1000
@@ -37,8 +38,11 @@ _PROVIDERS = (
     ("openrouter", "OpenRouter", "OPENROUTER_API_KEY", ()),
     ("codex", "Codex", "", ()),
     ("claude-code", "Claude Code", "", ()),
+    ("local", "Local", "", ()),
+    ("cursor", "Cursor", "", ()),
 )
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,159}\Z")
+_NO_HISTORY = frozenset({"local", "cursor"})
 
 
 _CATALOG_MESSAGES = {
@@ -249,7 +253,7 @@ class ProjectCatalog:
             raise CatalogError("project_missing")
         return directory
 
-    def workspace(self, *, control: bool) -> dict[str, Any]:
+    def workspace(self, *, control: bool, local_registry: OperatorLocalRegistry | None = None) -> dict[str, Any]:
         records = read_launches(self.state_root)[:1000]
         projects: dict[Path, dict[str, str]] = {}
         models: dict[str, list[str]] = {provider: [] for provider, *_rest in _PROVIDERS}
@@ -264,7 +268,7 @@ class ProjectCatalog:
             for role in ("prover", "refiner"):
                 provider = _flag(record.argv, f"--{role}")
                 model = _flag(record.argv, f"--{role}-model")
-                if provider in models and _MODEL_NAME.fullmatch(model) and model not in models[provider]:
+                if provider in models and provider not in _NO_HISTORY and _MODEL_NAME.fullmatch(model) and model not in models[provider]:
                     if len(models[provider]) < 12:
                         models[provider].append(model)
         # Linked worktrees often omit ignored Lake build artifacts. Prefer the
@@ -308,22 +312,38 @@ class ProjectCatalog:
                 queue.append((child, depth + 1, next_depth))
             if entry_count >= MAX_WALK_ENTRIES:
                 break
+        declared = local_registry.public_deployments() if local_registry is not None and local_registry.loaded else []
         providers = []
         for provider, label, env_key, defaults in _PROVIDERS:
-            if env_key:
+            if provider == "cursor":
+                available = False
+                availability = CURSOR_UNAVAILABLE
+            elif provider == "local":
+                available = bool(declared)
+                if local_registry is not None and local_registry.loaded:
+                    noun = "deployment" if len(declared) == 1 else "deployments"
+                    availability = (
+                        f"{len(declared)} {noun} declared in the operator profile. "
+                        "Availability is configured, not probed."
+                    )
+                else:
+                    availability = "No operator local profile is configured. Deployments are not probed."
+            elif env_key:
                 available = bool(os.environ.get(env_key, "").strip())
                 availability = f"{env_key} is {'present' if available else 'not set'} in the service environment; authentication is not checked."
             else:
                 executable = "claude" if provider == "claude-code" else "codex"
                 available = shutil.which(executable) is not None
                 availability = f"{executable} CLI is {'available' if available else 'not found'} on PATH; authentication is not checked."
+            history = [] if provider in _NO_HISTORY else models[provider]
             providers.append({
                 "id": provider, "label": label,
-                "models": list(dict.fromkeys([*models[provider], *defaults])),
+                "models": list(dict.fromkeys([*history, *defaults])),
                 "available": available, "availability": availability,
             })
         return {
             "projects": list(projects.values()), "providers": providers,
+            "deployments": declared,
             "roots": [{"path": str(root), "name": "This repository" if root == self.repo_root else "Main repository" if root in self.repository_roots else "Home" if root == Path.home() else root.name} for root in self.roots],
             "control": control,
             "notice": "Projects are discovered nearby. Browse folders to select another project.",

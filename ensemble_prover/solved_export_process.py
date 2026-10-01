@@ -19,7 +19,7 @@ import time
 import uuid
 from typing import Any, Sequence
 
-from .subprocess_environment import sanitized_subprocess_environment
+from .local_inference.network_policy import owned_worker_environment, restore_owned_worker_network_policy
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CLEANUP_TIMEOUT_S = 10.0
@@ -78,7 +78,7 @@ def _supervise(command: Sequence[str]) -> int:
 
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGHUP, interrupted)
-    proc = subprocess.Popen(list(command), env=sanitized_subprocess_environment())
+    proc = subprocess.Popen(list(command), env=owned_worker_environment())
     known: dict[int, int] = {}
     try:
         while True:
@@ -181,7 +181,7 @@ def _run_process(command: Sequence[str], *, cwd: Path) -> subprocess.CompletedPr
     with tempfile.TemporaryFile() as output_file:
         proc = subprocess.Popen(
             list(command), cwd=cwd,
-            env=sanitized_subprocess_environment(overrides={_OWNERSHIP_ENV: nonce}),
+            env=owned_worker_environment(overrides={_OWNERSHIP_ENV: nonce}),
             stdout=output_file, stderr=subprocess.STDOUT, start_new_session=True,
         )
         identity = _proc_identity(proc.pid)
@@ -255,6 +255,7 @@ def export_solved_run_in_fresh_process(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    restore_owned_worker_network_policy()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--lean-project-dir", type=Path, required=True)

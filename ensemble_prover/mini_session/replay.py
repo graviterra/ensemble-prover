@@ -3904,6 +3904,7 @@ _REPAIR_SELF_CHECK_POLICY_STATUSES = {
 }
 _REPAIR_SELF_CHECK_NON_POLICY_STATUSES = {
     "accepted",
+    "conditional_feedback",
     "helper_only_decomposition",
     "try_lean_infrastructure_error",
     "try_lean_malformed_arguments",

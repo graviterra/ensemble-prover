@@ -9,6 +9,7 @@ from typing import Any, Optional, Protocol, Sequence
 
 from ..llm_usage import call_with_optional_usage_callback, metered_or_plain_call
 from ..deadline_guard import await_with_strict_deadline
+from ..mini_temperature import mini_automatic_temperature_override
 from ..provider_tool_protocol import (
     mini_model_output_capacity,
     mini_reasoning_effort,
@@ -190,7 +191,7 @@ class LLMTheoryCandidateBuilder:
             call = call_with_optional_usage_callback(
                 self.client.chat_raw,
                 messages,
-                temperature_override=0.15,
+                temperature_override=mini_automatic_temperature_override(self.client, 0.15),
                 reasoning_effort_override=mini_reasoning_effort(
                     self.client, minimum=self.reasoning_effort
                 ),

@@ -10,7 +10,7 @@ import time
 from typing import Mapping, Sequence
 
 from .sync_subprocess import run_process_group
-from .subprocess_environment import sanitized_subprocess_environment
+from .local_inference.network_policy import prepare_owned_subprocess
 
 
 # This program is elaborated in its own process, importing only trusted Lean
@@ -64,7 +64,7 @@ def audit_compiled_source(
                 raise TimeoutError("compiled axiom audit deadline exhausted")
             return run_process_group(
                 ["lake", "env", "lean", *arguments], cwd=project_dir,
-                env=sanitized_subprocess_environment(env),
+                env=prepare_owned_subprocess(("lake", "env", "lean", *arguments), project=project_dir, base=env),
                 timeout=remaining,
             )
 

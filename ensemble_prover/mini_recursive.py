@@ -28,6 +28,7 @@ from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from typing import AbstractSet, Any, Awaitable, Callable, Mapping, Optional, Sequence
+from .workflow_roles import wire_response_format
 
 from .mini_falsification import (
     DEFAULT_FALSIFICATION_ENGINE_TIMEOUT_S,
@@ -106,6 +107,7 @@ from .tactic_attempt_telemetry import (
 from .mini_temperature import (
     MiniTemperatureContext,
     MiniTemperatureDecision,
+    mini_automatic_temperature_override,
     resolve_mini_temperature,
 )
 from .llm_error_policy import (
@@ -14625,7 +14627,7 @@ async def _repair_contract_identity_statements(
                     call_kind="chat_contract_identity_statement_repair",
                     max_tokens_override=repair_envelope,
                     metadata={
-                        "temperature": 0.0,
+                        "temperature": mini_automatic_temperature_override(client, 0.0),
                         "phase": "contract_identity_statement_repair",
                         "claim_index": index,
                     },
@@ -14638,9 +14640,11 @@ async def _repair_contract_identity_statements(
                                 "reasoning_effort_override",
                                 "operation_timeout_override_s",
                             ),
-                            temperature_override=0.0,
+                            temperature_override=mini_automatic_temperature_override(client, 0.0),
                             max_tokens_override=repair_envelope,
-                            reasoning_effort_override=repair_envelope.reasoning_effort,
+                            reasoning_effort_override=mini_bounded_visible_output_reasoning_effort(
+                                client, effort=repair_envelope.reasoning_effort,
+                            ),
                             operation_timeout_override_s=repair_timeout_s,
                             usage_callback=usage_callback,
                         )
@@ -34559,7 +34563,7 @@ async def _request_planner_deliberation(
             max_tokens=current_max_tokens,
             output_limit=current_output_limit,
             reasoning_effort=reasoning_effort,
-            temperature=0.0,
+            temperature=mini_automatic_temperature_override(request_client, 0.0),
             provider_dispatch_max_attempts=provider_dispatch_max_attempts,
             request_timeout_s=request_timeout_s,
             operation_timeout_s=operation_timeout_s,
@@ -35063,7 +35067,7 @@ async def _request_plan_parse_repair(
         client,
         effort="low",
     )
-    repair_temperature_override = repair_temperature.provider_temperature_override()
+    repair_temperature_override = repair_temperature.provider_temperature_override(client)
     repair_io_policy = _planner_io_policy_record(
         max_tokens=repair_max_tokens,
         output_limit=repair_output_limit,
@@ -35123,7 +35127,7 @@ async def _request_plan_parse_repair(
                     "request_timeout_override_s",
                     "operation_timeout_override_s",
                 ),
-                response_format="json",
+                response_format=wire_response_format(client, "json"),
                 temperature_override=repair_temperature_override,
                 max_tokens_override=repair_output_limit,
                 reasoning_effort_override=repair_reasoning_effort,
@@ -36195,7 +36199,7 @@ async def _request_plan(
         planner_io_action_id = "mini_recursive_plan"
         planner_io_call_kind = "chat_raw_json_plan"
         planner_io_reasoning_effort = planner_reasoning_effort
-        planner_io_temperature = temperature_decision.provider_temperature_override()
+        planner_io_temperature = temperature_decision.provider_temperature_override(plan_request_client)
         planner_io_max_tokens = planner_max_tokens
         planner_io_output_limit = planner_output_limit
         if planner_io_stage == "reasoning_recovery":
@@ -36217,7 +36221,7 @@ async def _request_plan(
                 plan_request_client,
                 effort="none",
             )
-            planner_io_temperature = 0.0
+            planner_io_temperature = mini_automatic_temperature_override(plan_request_client, 0.0)
             planner_io_max_tokens, planner_io_output_limit = await _prepare_planner_output_request(
                 plan_request_client,
                 _planner_request_envelope(
@@ -36292,7 +36296,7 @@ async def _request_plan(
             saved_planner_io_temperature = planner_io_policy["temperature"]
             if (
                 planner_io_stage == "visibility_recovery"
-                and saved_planner_io_temperature != 0.0
+                and saved_planner_io_temperature != mini_automatic_temperature_override(plan_request_client, 0.0)
             ):
                 # Visibility recovery is a deterministic protocol stage. A
                 # checkpoint claiming different request bytes is not that
@@ -36403,7 +36407,7 @@ async def _request_plan(
                             "request_timeout_override_s",
                             "operation_timeout_override_s",
                         ),
-                        response_format="json",
+                        response_format=wire_response_format(plan_request_client, "json"),
                         temperature_override=planner_io_temperature,
                         # Structured planning is a reasoning task. Preserve the
                         # role's configured effort and enforce a high floor.
@@ -36700,8 +36704,8 @@ async def _request_plan(
                             "request_timeout_override_s",
                             "operation_timeout_override_s",
                         ),
-                        response_format="json",
-                        temperature_override=0.0,
+                        response_format=wire_response_format(plan_request_client, "json"),
+                        temperature_override=mini_automatic_temperature_override(plan_request_client, 0.0),
                         reasoning_effort_override=visibility_reasoning_effort,
                         max_tokens_override=visibility_envelope,
                         request_timeout_override_s=planner_request_timeout_s,
@@ -36726,7 +36730,7 @@ async def _request_plan(
                 max_tokens=visibility_max_tokens,
                 output_limit=visibility_envelope,
                 reasoning_effort=visibility_reasoning_effort,
-                temperature=0.0,
+                temperature=mini_automatic_temperature_override(plan_request_client, 0.0),
                 provider_dispatch_max_attempts=(planner_dispatch_max_attempts),
                 request_timeout_s=planner_request_timeout_s,
                 operation_timeout_s=planner_operation_timeout_s,
@@ -36871,9 +36875,9 @@ async def _request_plan(
                                 "request_timeout_override_s",
                                 "operation_timeout_override_s",
                             ),
-                            response_format="json",
+                            response_format=wire_response_format(plan_request_client, "json"),
                             temperature_override=(
-                                temperature_decision.provider_temperature_override()
+                                temperature_decision.provider_temperature_override(plan_request_client)
                             ),
                             reasoning_effort_override=planner_reasoning_effort,
                             max_tokens_override=reasoning_output_limit,
@@ -36917,7 +36921,7 @@ async def _request_plan(
                     max_tokens=reasoning_max_tokens,
                     output_limit=reasoning_output_limit,
                     reasoning_effort=planner_reasoning_effort,
-                    temperature=(temperature_decision.provider_temperature_override()),
+                    temperature=(temperature_decision.provider_temperature_override(plan_request_client)),
                     provider_dispatch_max_attempts=(planner_dispatch_max_attempts),
                     request_timeout_s=planner_request_timeout_s,
                     operation_timeout_s=planner_operation_timeout_s,
@@ -37115,8 +37119,8 @@ async def _request_plan(
                                         "request_timeout_override_s",
                                         "operation_timeout_override_s",
                                     ),
-                                    response_format="json",
-                                    temperature_override=0.0,
+                                    response_format=wire_response_format(plan_request_client, "json"),
+                                    temperature_override=mini_automatic_temperature_override(plan_request_client, 0.0),
                                     reasoning_effort_override=visibility_reasoning_effort,
                                     max_tokens_override=visibility_envelope,
                                     request_timeout_override_s=planner_request_timeout_s,
@@ -37155,7 +37159,7 @@ async def _request_plan(
                         max_tokens=visibility_max_tokens,
                         output_limit=visibility_envelope,
                         reasoning_effort=visibility_reasoning_effort,
-                        temperature=0.0,
+                        temperature=mini_automatic_temperature_override(plan_request_client, 0.0),
                         provider_dispatch_max_attempts=(planner_dispatch_max_attempts),
                         request_timeout_s=planner_request_timeout_s,
                         operation_timeout_s=planner_operation_timeout_s,

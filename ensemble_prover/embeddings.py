@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Optional, Protocol
 
 from .math_utils import l2_normalize
+from .local_inference.network_policy import remote_fetch_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,8 @@ def _run_with_timeout(fn, *, timeout_s: float, label: str):
 
 
 def _can_resolve_host(host: str, timeout_s: float = 1.5) -> bool:
+    if not remote_fetch_allowed():
+        return False
     slots = _DNS_WORKER_SLOTS
     if not slots.acquire(blocking=False):
         return False
@@ -169,7 +172,9 @@ class SentenceTransformerEmbedder:
                 "Install with: pip install sentence-transformers"
             ) from exc
 
-        _set_hf_hub_timeouts()
+        offline = not remote_fetch_allowed()
+        if not offline:
+            _set_hf_hub_timeouts()
 
         def _load(local_only: bool):
             kwargs: dict[str, object] = {}
@@ -179,6 +184,8 @@ class SentenceTransformerEmbedder:
             try:
                 return SentenceTransformer(model_name, **kwargs)  # type: ignore[arg-type]
             except TypeError:
+                if offline:
+                    raise RuntimeError("downloads disabled: local_files_only_unsupported") from None
                 # Back-compat for older ST versions without local_files_only kwarg.
                 kwargs.pop("local_files_only", None)
                 return SentenceTransformer(model_name, **kwargs)  # type: ignore[arg-type]
@@ -194,7 +201,15 @@ class SentenceTransformerEmbedder:
         local_exc: Optional[BaseException] = None
 
         model = None
-        if want_local_first:
+        if offline:
+            try:
+                model = _run_with_timeout(
+                    lambda: _load(True), timeout_s=timeout_s,
+                    label="sentence-transformers offline load",
+                )
+            except BaseException as exc:
+                raise RuntimeError("sentence-transformers local-only load failed (downloads disabled)") from exc
+        elif want_local_first:
             # Env-var manipulation happens in the calling thread so the
             # finally block runs even when _run_with_timeout times out,
             # preventing _ENV_LOCK from being held indefinitely.
@@ -292,13 +307,14 @@ def make_embedder(cfg: EmbedderConfig) -> TextEmbedder:
     backend = (cfg.backend or "sentence_transformers").lower().strip()
     if backend == "sentence_transformers":
         logger.info("Using sentence-transformers embedder: %s", cfg.model)
+        offline = not remote_fetch_allowed()
         return _cached_sentence_transformer_embedder(
             cfg.model,
             device=cfg.device,
             normalize=cfg.normalize,
-            prefer_local_files=bool(cfg.prefer_local_files),
-            local_files_only=bool(cfg.local_files_only),
-            allow_download=bool(cfg.allow_download),
+            prefer_local_files=bool(cfg.prefer_local_files) or offline,
+            local_files_only=bool(cfg.local_files_only) or offline,
+            allow_download=bool(cfg.allow_download) and not offline,
             init_timeout_s=float(cfg.init_timeout_s),
         )
     if backend == "hashed":

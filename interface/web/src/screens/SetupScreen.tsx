@@ -30,7 +30,7 @@ export function SetupScreen() {
           <ProjectPicker value={setup.projectPath} projects={catalog?.projects ?? []} roots={catalog?.roots ?? []} onChange={(projectPath) => { setSetup((current) => ({ ...current, projectPath })); setNotice(""); }} />
         </section>
         <section className="panel"><h2>Default prover</h2>
-          <ModelPicker id="setup" providers={catalog?.providers ?? []} provider={setup.prover} model={setup.proverModel} onChange={(prover, proverModel) => { setSetup((current) => ({ ...current, prover, proverModel })); setNotice(""); }} />
+          <ModelPicker id="setup" providers={catalog?.providers ?? []} deployments={catalog?.deployments ?? []} provider={setup.prover} model={setup.proverModel} deployment={setup.proverDeployment ?? ""} onChange={(prover, proverModel, proverDeployment = "") => { setSetup((current) => ({ ...current, prover, proverModel: prover === "local" ? "" : proverModel, proverDeployment: prover === "local" ? proverDeployment : "" })); setNotice(""); }} />
           <div className="composer-actions"><button type="submit" className="button button-primary">Save defaults</button></div>
           {notice ? <p role="status">{notice}</p> : null}
         </section>

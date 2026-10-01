@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from contextvars import copy_context
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -44,8 +45,9 @@ async def run_cancellable_worker(
         finally:
             completed.set()
 
+    context = copy_context()
     worker = threading.Thread(
-        target=invoke,
+        target=lambda: context.run(invoke),
         name="mini-theory-cancellable-worker",
         daemon=False,
     )

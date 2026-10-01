@@ -128,10 +128,14 @@ are supplied separately.
 
 For browser launches, export provider credentials in the service shell, or use
 an existing supported subscription CLI sign-in. The service does not load `.env`.
-The browser's English-to-Lean translator uses the OpenAI API and needs
-`OPENAI_API_KEY`, including when proof search uses a subscription backend.
-Mini supports API providers and Codex or Claude Code subscription backends;
-available transports vary across formalization and research workflows.
+Choose a formalizer separately for English-to-Lean translation; its default is
+the OpenAI API. Mini supports API providers, Codex and Claude Code subscription
+backends, and operator-configured local inference servers. Local deployments
+use one adapter for generic compatible chat servers, vLLM, Ollama, and
+llama.cpp. Register a profile with `ENSEMBLE_LOCAL_INFERENCE_CONFIG` to select
+its deployments in the browser. A declared deployment is not a live
+compatibility check. Cursor CLI generation currently remains unavailable and
+is rejected before spawning the agent.
 
 The workspace runs on localhost with trusted users, projects, and state
 directories. Keep it local; it is not a shared network service.
@@ -139,7 +143,8 @@ directories. Keep it local; it is not a shared network service.
 [Browser setup and controls](interface/README.md) ·
 [CLI quick start](docs/CLI_QUICKSTART.md) ·
 [Codex setup](docs/CODEX_SUBSCRIPTION_BACKEND.md) ·
-[Claude Code setup](docs/CLAUDE_CODE_SUBSCRIPTION_BACKEND.md)
+[Claude Code setup](docs/CLAUDE_CODE_SUBSCRIPTION_BACKEND.md) ·
+[Local inference, budgets, and readiness](docs/local-inference.md)
 
 <a id="run-the-prover"></a>
 
@@ -165,6 +170,24 @@ To select a particular theorem in an existing project:
   --project-path /path/to/lake-project \
   --import Mathlib --prover openai
 ```
+
+For a local server, replace the provider selection with a registered deployment:
+
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover \
+  --lean-file /path/to/Target.lean --theorem-name MyNamespace.target \
+  --project-path /path/to/lake-project \
+  --local-inference-config examples/local-inference.yaml \
+  --prover local --prover-deployment math \
+  --refiner local --refiner-deployment math --inference-policy local-only
+```
+
+Edit the [example profile](examples/local-inference.yaml) for the model actually
+served. Local compute has its own finite dispatch, output, and request-time
+budgets; zero marginal API cost does not mean unlimited compute. See the
+[local inference guide](docs/local-inference.md) for browser registration,
+bounded compatibility probes, and uncertain-completion recovery. `local-only`
+selects inference locality; it does not make the whole application offline.
 
 Use `--help` for the options in your checkout. For a CLI-only installation and
 examples covering natural language, campaigns, research, and sweeps, see the
@@ -205,6 +228,11 @@ independent acceptance.
 [Results, problem identifiers, and evaluation scope](docs/RESULTS.md) ·
 [PutnamBench leaderboard](https://trishullab.github.io/PutnamBench/leaderboard.html)
 
+Our Putnam evaluation uses the formalized problems provided by
+[PutnamBench](https://github.com/trishullab/PutnamBench). We thank its authors
+and contributors for making this benchmark available. See
+[the paper](https://arxiv.org/abs/2407.11214) and the citation below.
+
 ## Documentation
 
 | Learn about | Start here |
@@ -235,5 +263,21 @@ independent acceptance.
 
 Identify the version or commit used for reproducibility.
 [CITATION.cff](CITATION.cff) provides machine-readable citation metadata.
+
+### PutnamBench
+
+When reporting results using PutnamBench, please also cite the benchmark:
+
+```bibtex
+@misc{tsoukalas2024putnambenchevaluatingneuraltheoremprovers,
+  title={PutnamBench: Evaluating Neural Theorem-Provers on the Putnam Mathematical Competition},
+  author={George Tsoukalas and Jasper Lee and John Jennings and Jimmy Xin and Michelle Ding and Michael Jennings and Amitayush Thakur and Swarat Chaudhuri},
+  year={2024},
+  eprint={2407.11214},
+  archivePrefix={arXiv},
+  primaryClass={cs.AI},
+  url={https://arxiv.org/abs/2407.11214},
+}
+```
 
 Ensemble Prover is licensed under the MIT License. See [LICENSE](LICENSE).

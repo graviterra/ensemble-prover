@@ -1,5 +1,5 @@
 import { useId } from "react";
-import type { LiveMathView, RuntimeSetting } from "../liveMath";
+import type { InferenceObservation, InferenceStatus, LiveMathView, RuntimeSetting } from "../liveMath";
 import { formatElapsed, humanize } from "../words";
 import "./liveMath.css";
 
@@ -35,6 +35,35 @@ function SettingDetails({ item }: { item: RuntimeSetting }) {
   </dl></article>;
 }
 
+const inferenceLabels: Record<InferenceStatus, string> = {
+  initialized: "Initialized", requesting: "Sending request", thinking: "Reasoning",
+  compacting: "Compacting context", idle: "Idle", retrying: "Retrying", responding: "Receiving response",
+  finished: "Response received", failed: "Request failed", cancelled: "Request cancelled",
+  timed_out: "Request timed out", queued: "Waiting for inference capacity", loading: "Loading model",
+  generating: "Generating", validating: "Validating response", cancelling: "Cancellation requested",
+  completion_unknown: "Remote completion unknown", paused: "Inference paused",
+};
+function InferenceActivity({ item }: { item: InferenceObservation }) {
+  const backend = item.backend === "local_inference" ? "Local server"
+    : item.backend === "cursor_subscription" ? "Cursor CLI"
+    : item.backend === "codex_subscription" ? "Codex CLI" : "Claude Code";
+  const uncertain = ["completion_unknown", "paused", "timed_out", "failed"].includes(item.status);
+  return <li className="inference-observation">
+    <div className="inference-observation-title"><strong>{humanize(item.role) || "Role not recorded"} · {backend}</strong>
+      <span className={`mark ${uncertain ? "mark-unresolved" : "mark-plain"}`}>{inferenceLabels[item.status]}</span></div>
+    <p className="meta">{scope(item.scope)} · {at(item.elapsedS)}{item.requestElapsedS != null ? ` · Request observed for ${formatElapsed(item.requestElapsedS)}` : ""}</p>
+    {item.queuePosition != null || item.queuedRequests != null || item.inflightRequests != null || item.unknownRequests != null ? <p className="inference-capacity">
+      {[item.queuePosition != null ? `Queue position ${item.queuePosition}` : "",
+        item.queuedRequests != null ? `${item.queuedRequests} queued` : "",
+        item.inflightRequests != null ? `${item.inflightRequests} in flight` : "",
+        item.unknownRequests != null ? `${item.unknownRequests} with unknown completion` : ""].filter(Boolean).join(" · ")}
+    </p> : null}
+    {item.status === "completion_unknown" ? <p className="inference-warning">The remote request may still be running. This observation does not confirm completion or release of capacity.</p> : null}
+    {item.stale ? <p className="inference-warning">Older observation; current inference state is unknown.</p>
+      : item.observationAgeS == null ? <p className="meta">Observation freshness not recorded.</p> : null}
+  </li>;
+}
+
 export function LiveMathPanel({ value, paused = false, readFailed = false }: {
   value?: LiveMathView; paused?: boolean; readFailed?: boolean;
 }) {
@@ -44,7 +73,9 @@ export function LiveMathPanel({ value, paused = false, readFailed = false }: {
   const scopedActivity = activity && activity.scope !== "problem" && (activity.dispatchId !== selected?.dispatchId || activity.scope !== selected?.scope);
   const receipt = value?.lastCostlyAction;
   const health = value?.health;
-  const alerts = Boolean(health?.activeDeferrals.length || health?.providerIssues.length || health?.omittedDeferrals || health?.backlog || health?.partialTrace || health?.traceAvailable === false);
+  const inference = health?.inferenceProgress ?? [];
+  const inferenceAttention = inference.some((item) => ["completion_unknown", "paused", "timed_out", "failed"].includes(item.status));
+  const alerts = Boolean(inferenceAttention || health?.activeDeferrals.length || health?.providerIssues.length || health?.omittedDeferrals || health?.backlog || health?.partialTrace || health?.traceAvailable === false);
   const source = value?.source;
   return <section className="live-math" aria-labelledby={heading}>
     <header className="math-focus-header">
@@ -104,6 +135,10 @@ export function LiveMathPanel({ value, paused = false, readFailed = false }: {
         {health.providerIssues.map((item, index) => <li key={`provider-${index}`}><strong>{humanize(item.role) || "Provider"}</strong> · {humanize(item.status) || "Issue recorded"}<span className="meta"> · {scope(item.scope)} · {at(item.elapsedS)}</span></li>)}
         {health.omittedDeferrals > 0 ? <li className="meta">{health.omittedDeferrals} deferral observations are not displayed. Active status may be incomplete.</li> : null}
       </ul> : null}
+      {inference.length ? <section className="inference-activity" aria-label="Inference activity">
+        <h3>Inference activity</h3><p className="meta">Last recorded infrastructure state. Generation and response validation do not establish mathematical progress.</p>
+        <ul>{inference.map((item) => <InferenceActivity key={`${item.role}-${item.requestId}`} item={item} />)}</ul>
+      </section> : null}
       <div className="runtime-settings" aria-label="Recorded model settings">
         {value?.settings.length ? value.settings.map((item, index) => <Setting item={item} key={`${item.role}-${index}`} />) : <p className="meta runtime-empty">Not recorded. Older runs may not include effective request settings.</p>}
       </div>

@@ -98,6 +98,24 @@ class ClaudeCodeBackendError(SubscriptionBackendError):
     backend = "claude-code"
 
 
+class CursorBackendError(SubscriptionBackendError):
+    """Cursor wire failure. Envelope validation stays on the subscription client."""
+
+    backend = "cursor"
+
+    def __init__(
+        self, message: str, *, kind: str = "protocol",
+        validation_stage: str = "", tool_index: int | None = None,
+        ambiguous_provider_completion: bool = False,
+    ) -> None:
+        if type(ambiguous_provider_completion) is not bool:
+            raise ValueError("Invalid Cursor completion flag")
+        super().__init__(
+            message, kind=kind, validation_stage=validation_stage, tool_index=tool_index,
+        )
+        self.ambiguous_provider_completion = ambiguous_provider_completion
+
+
 def _restore_codex_backend_error(message: str, kind: str) -> CodexBackendError:
     return CodexBackendError(message, kind=kind)
 
@@ -176,6 +194,7 @@ _TERMINAL_LLM_FAILURE_REASONS = {
     "provider_transport_unavailable",
     "llm_required_prompt_context_overflow",
     "llm_local_resource_error",
+    "llm_local_configuration_error",
 }
 _SCOPED_LLM_FAILURE_REASONS = {
     "llm_network_error",
@@ -606,11 +625,64 @@ def _exception_chain(exc: BaseException) -> Iterable[BaseException]:
         current = next_exc
 
 
+
+def _local_client_failure(code: str, *, response_invalid: bool) -> LLMErrorClassification:
+    if re.fullmatch(r"local_[a-z0-9_]{1,58}", code) is None:
+        code = "local_response_invalid" if response_invalid else "local_capability_conflict"
+    reason = "provider_response_invalid" if response_invalid else "llm_local_configuration_error"
+    return LLMErrorClassification(
+        kind=reason, failure_reason=reason, retryable=False,
+        terminal=not response_invalid, message=f"Local inference: {code}.",
+    )
+
+
 def classify_llm_exception(
     exc: BaseException,
     _seen: Optional[set[int]] = None,
 ) -> LLMErrorClassification:
     """Classify one exception for mini-prover retry and termination policy."""
+
+    # Local transport failures must not become mathematical failures or trigger
+    # an unadmitted replay. Import lazily so cloud-only startup is unchanged.
+    from .local_inference.errors import LocalInferenceError
+    from .local_inference.protocol import LocalProtocolError
+
+    if isinstance(exc, (LocalInferenceError, LocalProtocolError)):
+        code = exc.code
+        if not isinstance(code, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None:
+            code = "invalid_local_error"
+        if code in {"context_capacity_insufficient", "protected_context_lost"}:
+            reason = "llm_required_prompt_context_overflow"
+        elif code == "credential_unavailable":
+            reason = "llm_auth_error"
+        elif code in {
+            "allocation_exhausted", "queue_overflow", "budget_unavailable",
+            "corrupt_ledger", "corrupt_coordinator", "ledger_lost",
+            "coordinator_unavailable", "queue_timeout", "rate_limited",
+        }:
+            reason = "llm_local_resource_error"
+        elif code == "deadline_exceeded":
+            reason = "llm_retry_deadline_exhausted"
+        elif code == "completion_unknown":
+            reason = "llm_network_error"
+        elif isinstance(exc, LocalProtocolError):
+            reason = (
+                "llm_local_configuration_error"
+                if code in {"unsupported_control", "unsupported_schema", "unsupported_dialect", "invalid_request"}
+                else "provider_response_invalid"
+            )
+        else:
+            reason = "provider_protocol_incompatible"
+        return LLMErrorClassification(
+            kind=reason, failure_reason=reason, retryable=False,
+            terminal=reason != "provider_response_invalid",
+            message=f"Local inference: {code}.",
+        )
+
+    if bool(getattr(exc, "is_local_provider_response_invalid", False)):
+        return _local_client_failure(str(exc), response_invalid=True)
+    if bool(getattr(exc, "is_local_provider_capability_conflict", False)):
+        return _local_client_failure(str(exc), response_invalid=False)
 
     if isinstance(exc, SubscriptionRequestDeadlineExceeded):
         return LLMErrorClassification(
@@ -750,6 +822,15 @@ def classify_llm_exception(
         (projection.original_module if trusted_projection else "")
         or cls.__module__
     )
+
+    if (
+        trusted_projection
+        and module == "ensemble_prover.models"
+        and name in {"LocalProviderCapabilityError", "LocalProviderResponseError"}
+    ):
+        return _local_client_failure(
+            str(exc), response_invalid=name == "LocalProviderResponseError",
+        )
 
     if isinstance(exc, CostBudgetExceeded) or (
         module == CostBudgetExceeded.__module__
@@ -914,9 +995,30 @@ def classify_llm_error_text(error_text: str) -> LLMErrorClassification:
     """Classify a rendered LLM error after the original exception is gone."""
 
     text = _lower_text(error_text)
-    codex_error = re.search(r"(?:^|:\s*)\[(codex|claude-code):(auth|quota|rate_limit|capability|compatibility|transport|protocol|response|context|local_resource)\]", text)
+    local_client = re.search(
+        r"(?:^|:\s*)localprovider(capability|response)error:\s*"
+        r"(local_[a-z0-9_]{1,58})(?=[:\s]|$)", text,
+    )
+    if local_client:
+        return _local_client_failure(
+            local_client.group(2), response_invalid=local_client.group(1) == "response",
+        )
+    local_protocol = re.search(r"(?:^|:\s*)\[local_protocol:([a-z][a-z0-9_]{0,63})\]", text)
+    if local_protocol:
+        from .local_inference.protocol import LocalProtocolError
+
+        return classify_llm_exception(LocalProtocolError(local_protocol.group(1), ""))
+    local_error = re.search(
+        r"(?:^|:\s*)(?:localinferenceerror|contextcapacityinsufficient):\s*"
+        r"([a-z][a-z0-9_]{0,63})(?=[:\s]|$)", text,
+    )
+    if local_error:
+        from .local_inference.errors import LocalInferenceError
+
+        return classify_llm_exception(LocalInferenceError(local_error.group(1)))
+    codex_error = re.search(r"(?:^|:\s*)\[(codex|claude-code|cursor):(auth|quota|rate_limit|capability|compatibility|transport|protocol|response|context|local_resource)\]", text)
     if codex_error:
-        error_type = CodexBackendError if codex_error.group(1) == "codex" else ClaudeCodeBackendError
+        error_type = {"codex": CodexBackendError, "claude-code": ClaudeCodeBackendError, "cursor": CursorBackendError}[codex_error.group(1)]
         stage = (
             "output_limit"
             if codex_error.group(2) == "response"
@@ -928,7 +1030,7 @@ def classify_llm_error_text(error_text: str) -> LLMErrorClassification:
         ))
     if not text:
         return LLMErrorClassification(kind="empty", retryable=False, terminal=False)
-    if text in {"provider_protocol_incompatible", "provider_transport_unavailable"}:
+    if text in {"provider_protocol_incompatible", "provider_transport_unavailable", "llm_local_configuration_error"}:
         return LLMErrorClassification(
             kind=text,
             retryable=False,
@@ -1095,7 +1197,9 @@ def is_provider_infrastructure_failure(reason: str) -> bool:
     not establish such an attempt-wide infrastructure failure.
     """
 
-    return is_resumable_provider_failure(reason) or reason == "provider_protocol_incompatible"
+    return is_resumable_provider_failure(reason) or reason in {
+        "provider_protocol_incompatible", "llm_local_configuration_error",
+    }
 
 
 def is_resumable_provider_failure(reason: str) -> bool:

@@ -10,15 +10,26 @@ from typing import Any, Mapping
 
 
 PROGRESS_KEY = "llm_provider_progress"
+_BACKENDS = frozenset({
+    "claude_code_subscription", "codex_subscription", "cursor_subscription",
+    "local_inference",
+})
 _STATUSES = {
     "initialized", "requesting", "thinking", "compacting", "idle",
     "retrying", "responding", "finished", "failed", "cancelled", "timed_out",
+    "queued", "loading", "generating", "validating", "cancelling",
+    "completion_unknown", "paused",
 }
 _COUNTERS = {
     "event_count", "thinking_event_count", "retry_event_count",
     "assistant_event_count", "current_block_estimated_tokens",
     "retry_attempt", "max_retries", "retry_delay_ms", "error_status",
 }
+# Counts for the selected capacity group, never host-wide activity estimates.
+# They are observations, not allocation grants or completion evidence.
+_QUEUE_COUNTERS = frozenset({
+    "queue_position", "queued_requests", "inflight_requests", "unknown_requests",
+})
 
 
 def progress_snapshot(value: Any) -> dict[str, Any] | None:
@@ -26,7 +37,7 @@ def progress_snapshot(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
     backend = value.get("backend")
-    if backend not in ("claude_code_subscription", "codex_subscription"):
+    if type(backend) is not str or backend not in _BACKENDS:
         return None
     status = value.get("status")
     if not isinstance(status, str) or status not in _STATUSES:
@@ -38,6 +49,10 @@ def progress_snapshot(value: Any) -> dict[str, Any] | None:
     for key in _COUNTERS:
         number = value.get(key)
         if type(number) is int and 0 <= number <= 2**63 - 1:
+            clean[key] = number
+    for key in _QUEUE_COUNTERS:
+        number = value.get(key)
+        if type(number) is int and 0 <= number <= 10000:
             clean[key] = number
     elapsed = value.get("elapsed_s")
     if (isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
@@ -65,6 +80,12 @@ class ProviderProgressForwarder:
     def publish(self, snapshot: dict[str, Any]) -> None:
         if not self.active or self.sink is None:
             return
+        # Enforce the boundary here too: a new transport must not leak a raw
+        # provider event merely because its caller omitted normalization.
+        clean = progress_snapshot(snapshot)
+        if clean is None:
+            return
+        snapshot = clean
         now = time.monotonic()
         retry_count = snapshot.get("retry_event_count", 0)
         status = snapshot["status"]

@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from ..subprocess_environment import trusted_provider_worker_environment
+from ..local_inference.network_policy import propagate_owned_network_policy, restore_owned_worker_network_policy
 
 
 _WATCHDOG_FD_ENV = "ENSEMBLE_MINI_WATCHDOG_FD"
@@ -2554,7 +2555,7 @@ def _run_cli_worker_in_dedicated_supervisor(
     try:
         proc = subprocess.Popen(
             command,
-            env=trusted_provider_worker_environment(env),
+            env=propagate_owned_network_policy(trusted_provider_worker_environment(env)),
             pass_fds=(write_fd,),
             start_new_session=True,
         )
@@ -2871,7 +2872,7 @@ def run_cli_worker_under_watchdog(
             spec_path = handle.name
         supervisor_proc = subprocess.Popen(
             [sys.executable, "-m", __name__, "--supervisor-spec", spec_path],
-            env=trusted_provider_worker_environment(),
+            env=propagate_owned_network_policy(trusted_provider_worker_environment()),
             pass_fds=(parent_read_fd,),
         )
         return _wait_for_supervisor(supervisor_proc)
@@ -2890,6 +2891,7 @@ def run_cli_worker_under_watchdog(
 
 
 def _dedicated_supervisor_main(argv: Sequence[str]) -> int:
+    restore_owned_worker_network_policy()
     if len(argv) != 2 or argv[0] != "--supervisor-spec":
         print("invalid Mini watchdog supervisor invocation", file=sys.stderr)
         return 125

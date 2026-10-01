@@ -23,6 +23,7 @@ from .answer_input import (
     load_candidate,
 )
 from .config import LeanConfig
+from .workflow_roles import wire_response_format
 from .lean_runner import LeanRunner
 from .lean_parser import has_infra_failure, has_timeout
 from .llm_error_policy import (
@@ -472,6 +473,12 @@ async def _prepare(
         ),
         role_name="prover",
     )
+    from .local_inference.roles import activate_local_inference, initialize_local_resources
+    activate_local_inference(args, directory)
+    from .local_inference.network_policy import admit_network_policy, persist_network_policy
+    admit_network_policy(args, getattr(args, "_local_preparation", None), request.project_path, directory=directory)
+    persist_network_policy(directory)
+    initialize_local_resources(args, allow_create=True)
     cfg = _make_role_cfg(
         args.prover,
         args.prover_model,
@@ -484,11 +491,14 @@ async def _prepare(
         llm_deadline_policy=args.llm_deadline_policy,
         request_timeout_s=request_timeout,
         request_timeout_disabled=disabled,
+        cli_args=args,
     )
-    mode, effort = _reasoning_role_cli_settings(args, "prover")
-    _apply_reasoning_cli_override(cfg, mode=mode, effort=effort)
-    cfg.codex_binary = args.codex_bin
-    cfg.claude_code_binary = args.claude_code_bin
+    if getattr(cfg, "local_inference_binding", None) is None:
+        mode, effort = _reasoning_role_cli_settings(args, "prover")
+        _apply_reasoning_cli_override(cfg, mode=mode, effort=effort)
+        cfg.codex_binary = args.codex_bin
+        cfg.claude_code_binary = args.claude_code_bin
+        cfg.cursor_binary = getattr(args, "cursor_bin", "agent")
     client = _make_mini_role_client(cfg)
     events = directory / "usage.jsonl"
 
@@ -619,7 +629,7 @@ async def _prepare(
                     invoke=lambda callback: call_with_optional_usage_callback(
                         client.chat_raw,
                         messages,
-                        response_format="json",
+                        response_format=wire_response_format(client, "json"),
                         max_tokens_override=policy,
                         usage_callback=callback,
                         required_keywords=("response_format", "max_tokens_override"),
@@ -864,6 +874,8 @@ def run_cli(args: argparse.Namespace, argv: Sequence[str]) -> int:
         remaining = limit - (time.monotonic() - started) if limit else 0
         if limit and remaining <= 0:
             raise ValueError("run budget exhausted before answer preparation")
+        from .local_inference.roles import freeze_invocation_args
+        argv = freeze_invocation_args(list(argv), directory, allocate_budget=True)
         worker_args = [*argv, "--output-dir", str(directory)]
         worker_code = run_cli_worker_under_watchdog(
             worker_args,
@@ -959,6 +971,9 @@ def preparation_worker_main(argv: Sequence[str] | None = None) -> int:
     if not is_watchdog_worker():
         raise RuntimeError("answer preparation requires the Mini process supervisor")
     args = _build_argparser().parse_args(argv)
+    from .local_inference.roles import resolve_local_inference
+    from .local_inference.network_policy import admit_network_policy
+    admit_network_policy(args, resolve_local_inference(args), Path(__file__).resolve().parent.parent)
     request = _request(args)
     template = _template(args, request)
     if template is None:

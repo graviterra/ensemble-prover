@@ -511,9 +511,18 @@ async def _call_check(
     timeout_s: float,
     filter_authority_helpers: bool = True,
 ) -> tuple[bool, str, str]:
-    check = getattr(lean, "check", None)
+    from ensemble_prover.lean_feedback import FeedbackLeanResult
+
+    conditional_feedback = not filter_authority_helpers
+    check = getattr(lean, "check_feedback" if conditional_feedback else "check", None)
+    legacy_test_adapter = (
+        conditional_feedback and check is None
+        and getattr(lean, "_mini_falsification_trusted_audit", False) is True
+    )
+    if legacy_test_adapter:
+        check = getattr(lean, "check", None)
     if check is None:
-        return False, "lean object has no check method", "infrastructure"
+        return False, "Lean checking capability unavailable", "infrastructure"
     kwargs = {
         "preamble_override": preamble,
         "timeout_s": timeout_s,
@@ -552,7 +561,12 @@ async def _call_check(
     )
     output = str(getattr(result, "output", "") or "")
     parsed = getattr(result, "parsed", None)
-    ok = bool(getattr(result, "ok", False))
+    if conditional_feedback and not legacy_test_adapter:
+        if not isinstance(result, FeedbackLeanResult):
+            return False, "invalid conditional feedback result", "infrastructure"
+        ok = result.accepted
+    else:
+        ok = bool(getattr(result, "ok", False))
     if ok:
         return True, output, ""
     if bool(getattr(parsed, "infra_failure", False)):

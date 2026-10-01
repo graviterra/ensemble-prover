@@ -40,11 +40,35 @@ DEFAULT_INTERPRETER = ".venv/bin/python3"
 MINI_MODULE = "ensemble_prover.mini_prover"
 NL_MODULE = "ensemble_prover.nl_input"
 _FORBIDDEN_USER_FLAGS = {"--output-dir", "--resume-from", "--resume-accept-source-hash"}
+_SAFE_VALIDATE_ERRORS = frozenset({
+    "profile_unconfigured", "unknown_deployment", "model_conflict", "reasoning_conflict",
+    "hosted_upstream_forbidden", "redaction_failed", "invalid_field", "unknown_role",
+    "role_required", "duplicate_role",
+})
 _VALIDATE_SCRIPT = r"""
 import json, sys
 argv = json.load(sys.stdin)
 from ensemble_prover.mini_prover import _build_argparser
 parser = _build_argparser()
+
+def _preview(ns):
+    from ensemble_prover.local_inference.roles import resolve_local_inference
+    from ensemble_prover.local_inference.errors import LocalInferenceError
+    try:
+        preparation = resolve_local_inference(ns)
+    except LocalInferenceError as exc:
+        return exc.code
+    if preparation is None:
+        return None
+    roles = {}
+    for name, role in preparation.manifest["roles"].items():
+        roles[name] = {key: role[key] for key in (
+            "deployment_id", "model", "context_tokens", "max_output_tokens",
+            "tools", "reasoning_mode", "reasoning_effort",
+        )}
+        roles[name].update(capability="declared", probed=False)
+    return {"capability": "declared", "probed": False,
+            "inference_policy": preparation.inference_policy, "roles": roles}
 try:
     ns = parser.parse_args(argv)
 except SystemExit as exc:
@@ -53,8 +77,16 @@ except SystemExit as exc:
 keys = ("putnam_file", "lean_file", "theorem_name", "prover", "prover_model", "refiner", "refiner_model",
         "planner_escalation", "reasoning_mode", "opaque_mode", "allow_official_answer_visibility",
         "mini_recursive_passes", "mini_recursive_claims", "mini_recursive_turns_per_claim",
-        "max_prove_turns", "max_refine_turns", "cost_budget_usd", "llm_deadline_policy", "answer_attempts")
-print(json.dumps({"ok": True, "parsed": {k: getattr(ns, k, None) for k in keys}}, default=str))
+        "max_prove_turns", "max_refine_turns", "cost_budget_usd", "llm_deadline_policy", "answer_attempts",
+        "inference_policy")
+parsed = {k: getattr(ns, k, None) for k in keys}
+preview = _preview(ns)
+if isinstance(preview, str):
+    print(json.dumps({"ok": False, "error": preview}))
+    raise SystemExit(0)
+if isinstance(preview, dict):
+    parsed["local_preview"] = preview
+print(json.dumps({"ok": True, "parsed": parsed}, default=str))
 """
 
 
@@ -449,7 +481,10 @@ class LaunchRegistry:
         except ValueError:
             return ValidationResult(False, f"validator produced no verdict (exit {completed.returncode}): {completed.stderr.strip()[-400:]}")
         if not payload.get("ok"):
-            return ValidationResult(False, f"{payload.get('error', 'rejected')}: {completed.stderr.strip()[-400:]}")
+            error = str(payload.get("error") or "rejected")
+            if error in _SAFE_VALIDATE_ERRORS:
+                return ValidationResult(False, error)
+            return ValidationResult(False, f"{error}: {completed.stderr.strip()[-400:]}")
         parsed = payload.get("parsed") if isinstance(payload.get("parsed"), dict) else {}
         return ValidationResult(True, "", parsed)
 
@@ -554,15 +589,19 @@ class LaunchRegistry:
         idempotency_key: str,
         slug: str = "nl",
         formalize_only: bool = False,
+        formalizer_args: list[str] | None = None,
     ) -> tuple[Launch | None, str]:
         if not text.strip():
             return None, "empty theorem text"
         project_path = Path(project_path).expanduser().resolve()
         if not any((project_path / f).is_file() for f in ("lakefile.toml", "lakefile.lean")):
             return None, "project path must contain a Lake project (lakefile.toml or lakefile.lean)"
+        typed_formalizer = list(formalizer_args or [])
+        if any(token == "--" for token in typed_formalizer):
+            return None, "formalizer arguments cannot include a prover separator"
         if formalize_only and user_args:
             return None, "translate-only does not accept prover arguments"
-        problem = self.check_user_args(user_args)
+        problem = self.check_user_args([*typed_formalizer, *user_args])
         if problem:
             return None, problem
         with self._locked():
@@ -577,11 +616,13 @@ class LaunchRegistry:
                 launch_id=launch_id,
                 idempotency_key=idempotency_key,
                 kind="nl",
-                argv=(
-                    [*self.nl_command_prefix, "--text", text, "--project-path", str(project_path), "--output-dir", str(nl_dir), "--formalize-only"]
+                argv=(lambda prefix: (
+                    [*prefix, *typed_formalizer, "--formalize-only"]
                     if formalize_only
-                    else [*self.nl_command_prefix, "--text", text, "--project-path", str(project_path), "--output-dir", str(nl_dir), "--", *user_args, "--output-dir", str(output_dir)]
-                ),
+                    else [*prefix, *typed_formalizer, "--", *user_args, "--output-dir", str(output_dir)]
+                ))([
+                    *self.nl_command_prefix, "--text", text, "--project-path", str(project_path), "--output-dir", str(nl_dir),
+                ]),
                 cwd=str(self.repo_root),
                 output_dir=str(output_dir),
                 console_log=str(self.state_root / "logs" / f"{launch_id}.log"),

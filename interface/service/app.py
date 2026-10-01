@@ -9,6 +9,7 @@ shell command or a free-form argument vector.
 
 from __future__ import annotations
 
+import os
 import json
 import secrets
 import threading
@@ -39,8 +40,9 @@ from .projection import (
     library_run,
 )
 from .catalog import CatalogError, ProjectCatalog
+from .local_registry import CURSOR_BIN, CURSOR_UNAVAILABLE, ENV_CONFIG, LocalRegistryError, OperatorLocalRegistry, cursor_flags
 from .security import LocalBoundary, browser_boundary
-from .options import OptionValidationError, option_args, option_schema
+from .options import OptionValidationError, inference_policies, option_args, option_schema
 
 _STOP_TOKEN_TTL_S = 60.0
 _STOP_MESSAGES = {
@@ -52,12 +54,22 @@ _STOP_MESSAGES = {
 }
 _LIBRARY_LIMIT = 500
 _FORBIDDEN_KEYS = frozenset({"command", "argv", "args", "shell"})
+_PRIVATE_KEYS = frozenset({
+    "baseurl", "url", "endpoint", "localinferenceconfig", "configpath",
+    "apikey", "authorization", "token", "secret", "auth", "authname",
+    "password", "privatesnapshot",
+})
 _ROLE_FLAGS = (
     ("prover", "--prover"),
     ("proverModel", "--prover-model"),
     ("refiner", "--refiner"),
     ("refinerModel", "--refiner-model"),
 )
+_ROLE_FIELDS = {
+    "prover": ("prover", "proverModel", "proverDeployment"),
+    "refiner": ("refiner", "refinerModel", "refinerDeployment"),
+    "formalizer": ("formalizer", "formalizerModel", "formalizerDeployment"),
+}
 # mini_prover's parser flag. The request field is ``theorem``.
 _THEOREM_FLAG = "--theorem-name"
 _UI_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
@@ -73,6 +85,7 @@ def create_app(
     port: int = 8765,
     web_origin: str | None = None,
     serve_ui: bool = True,
+    local_inference_config: str | Path | None = None,
     project_roots: list[Path] | None = None,
 ) -> FastAPI:
     """Build the loopback service.
@@ -81,6 +94,8 @@ def create_app(
     registry is supplied, one is created for ``state_root``. When control is
     off, no registry is created and launch or stop handlers do not call one.
     """
+    if local_inference_config is None:
+        local_inference_config = os.environ.get(ENV_CONFIG)
     run_root = Path(run_root)
     state_root = Path(state_root)
     repo_root = Path(repo_root)
@@ -109,6 +124,9 @@ def create_app(
     app.state.stop_grants = {}
     app.state.stop_lock = threading.Lock()
     app.state.catalog = ProjectCatalog(repo_root, state_root, roots=project_roots)
+    app.state.local_registry = OperatorLocalRegistry.load(
+        local_inference_config, snapshot_directory=state_root / "local_profiles",
+    )
     allowed_hosts, allowed_origins = browser_boundary(port, web_origin)
     app.add_middleware(
         LocalBoundary,
@@ -146,7 +164,9 @@ def create_app(
 
     @app.get("/api/catalog")
     def catalog_home() -> JSONResponse:
-        return JSONResponse(app.state.catalog.workspace(control=app.state.control))
+        return JSONResponse(app.state.catalog.workspace(
+            control=app.state.control, local_registry=app.state.local_registry,
+        ))
 
     @app.get("/api/browse")
     def catalog_browse(path: str = "") -> JSONResponse:
@@ -199,6 +219,9 @@ def create_app(
                 {"error": "command is not accepted; this service does not run a shell"},
                 status_code=400,
             )
+        private = _reject_private_payload(payload)
+        if private is not None:
+            return private
         if not app.state.control or app.state.registry is None:
             return JSONResponse({"error": "control_disabled"}, status_code=403)
         validate_state = getattr(app.state.registry, "validate_state", None)
@@ -449,15 +472,169 @@ def _line(payload: dict[str, Any], key: str, *, required: bool = False) -> str |
     return value
 
 
-def _role_args(payload: dict[str, Any]) -> list[str] | JSONResponse:
-    args: list[str] = []
-    for key, flag in _ROLE_FLAGS:
+def _flat_key(key: object) -> str:
+    return "".join(ch for ch in str(key).lower() if ch.isalnum())
+
+
+def _reject_private_payload(payload: dict[str, Any]) -> JSONResponse | None:
+    def contains(value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(_flat_key(key) in _PRIVATE_KEYS or contains(item) for key, item in value.items())
+        if isinstance(value, list):
+            return any(contains(item) for item in value)
+        return False
+
+    if contains(payload):
+        return JSONResponse(
+            {"error": "Launch settings cannot include a URL, filesystem path, or credential."},
+            status_code=400,
+        )
+    return None
+
+
+def _unsafe(value: str) -> bool:
+    if not value:
+        return False
+    return "://" in value.lower() or value.startswith(("/", "\\")) or ".." in value
+
+
+def _inference_policy(payload: dict[str, Any]) -> str | JSONResponse:
+    options = payload.get("options")
+    option_value: Any = ""
+    if isinstance(options, dict) and options.get("inference-policy") not in (None, ""):
+        option_value = options.get("inference-policy")
+    top = payload.get("inferencePolicy", "")
+    if top in (None, ""):
+        top = ""
+    if option_value and top and option_value != top:
+        return JSONResponse({"error": "inferencePolicy must be mixed or local-only"}, status_code=400)
+    value = top or option_value
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str) or value not in inference_policies():
+        return JSONResponse({"error": "inferencePolicy must be mixed or local-only"}, status_code=400)
+    return value
+
+
+def _append_policy(args: list[str], policy: str) -> list[str]:
+    if not policy or "--inference-policy" in args:
+        return args
+    return [*args, "--inference-policy", policy]
+
+
+def _role_values(payload: dict[str, Any], role: str) -> tuple[str, str, str] | JSONResponse:
+    values: list[str] = []
+    for key in _ROLE_FIELDS[role]:
         value = _line(payload, key)
         if isinstance(value, JSONResponse):
             return value
-        if value:
-            args.extend([flag, value])
+        values.append(value)
+    return values[0], values[1], values[2]
+
+
+def _provider_flags(
+    registry: OperatorLocalRegistry, role: str, provider: str, model: str, deployment: str,
+) -> tuple[list[str], bool, bool] | JSONResponse:
+    if _unsafe(provider) or _unsafe(model) or _unsafe(deployment):
+        return JSONResponse(
+            {"error": "Launch settings cannot include a URL, filesystem path, or credential."},
+            status_code=400,
+        )
+    if provider == "local":
+        try:
+            return registry.local_flags(role, deployment, model), True, False
+        except LocalRegistryError as exc:
+            return JSONResponse({"error": exc.public_message}, status_code=400)
+    if provider == "cursor":
+        if deployment:
+            return JSONResponse({"error": LocalRegistryError("deployment_forbidden").public_message}, status_code=400)
+        try:
+            cursor_flags(role, model)
+            return JSONResponse({"error": CURSOR_UNAVAILABLE}, status_code=400)
+        except LocalRegistryError as exc:
+            return JSONResponse({"error": exc.public_message}, status_code=400)
+    if deployment:
+        return JSONResponse({"error": LocalRegistryError("deployment_forbidden").public_message}, status_code=400)
+    flag = f"--{role}"
+    model_flag = f"--{role}-model"
+    args = [flag, provider] if provider else []
+    if model:
+        if not args:
+            return JSONResponse({"error": f"{role} model requires a provider"}, status_code=400)
+        args.extend([model_flag, model])
+    return args, False, False
+
+
+def _finish_role_args(
+    registry: OperatorLocalRegistry, pieces: list[tuple[list[str], bool, bool]],
+) -> list[str] | JSONResponse:
+    args: list[str] = []
+    local = False
+    cursor = False
+    for flags, used_local, used_cursor in pieces:
+        args.extend(flags)
+        local = local or used_local
+        cursor = cursor or used_cursor
+    if local:
+        try:
+            args = [*registry.config_flags(), *args]
+        except LocalRegistryError as exc:
+            return JSONResponse({"error": exc.public_message}, status_code=400)
+    if cursor:
+        args.extend(["--cursor-bin", CURSOR_BIN])
     return args
+
+
+def _proof_args(registry: OperatorLocalRegistry, payload: dict[str, Any], policy: str = "") -> list[str] | JSONResponse:
+    pieces: list[tuple[list[str], bool, bool]] = []
+    for role in ("prover", "refiner"):
+        fields = _role_values(payload, role)
+        if isinstance(fields, JSONResponse):
+            return fields
+        provider, model, deployment = fields
+        if policy == "local-only" and (provider not in {"", "local"} or role == "prover" and not provider):
+            return JSONResponse({"error": LocalRegistryError("local_only_provider").public_message}, status_code=400)
+        if policy == "local-only" and provider == "local":
+            try:
+                registry.assert_local_execution(deployment)
+            except LocalRegistryError as exc:
+                return JSONResponse({"error": exc.public_message}, status_code=400)
+        if not provider:
+            if model or deployment:
+                return JSONResponse({"error": f"{role} model requires a provider"}, status_code=400)
+            continue
+        piece = _provider_flags(registry, role, provider, model, deployment)
+        if isinstance(piece, JSONResponse):
+            return piece
+        pieces.append(piece)
+    return _finish_role_args(registry, pieces)
+
+
+def _formalizer_args(
+    registry: OperatorLocalRegistry, payload: dict[str, Any], policy: str,
+) -> list[str] | JSONResponse:
+    fields = _role_values(payload, "formalizer")
+    if isinstance(fields, JSONResponse):
+        return fields
+    provider, model, deployment = fields
+    if policy == "local-only" and provider != "local":
+        return JSONResponse({"error": LocalRegistryError("local_only_formalizer").public_message}, status_code=400)
+    if not provider:
+        if model or deployment:
+            return JSONResponse({"error": "formalizer model or deployment requires a provider"}, status_code=400)
+        return _append_policy([], policy)
+    piece = _provider_flags(registry, "formalizer", provider, model, deployment)
+    if isinstance(piece, JSONResponse):
+        return piece
+    if policy == "local-only":
+        try:
+            registry.assert_local_execution(deployment)
+        except LocalRegistryError as exc:
+            return JSONResponse({"error": exc.public_message}, status_code=400)
+    flags = _finish_role_args(registry, [piece])
+    if isinstance(flags, JSONResponse):
+        return flags
+    return _append_policy(flags, policy)
 
 
 def _idempotency_key(payload: dict[str, Any]) -> str | JSONResponse:
@@ -507,6 +684,11 @@ def _public_launch_rejection(detail: object) -> str:
     """Keep validator stderr and exception details in the local console only."""
     messages = {
         "invalid provider choice": "invalid provider choice",
+        "unknown_deployment": "Choose a registered local deployment.",
+        "model_conflict": "A local deployment supplies its model. Remove the conflicting model override.",
+        "profile_unconfigured": "No operator local profile is configured.",
+        "reasoning_conflict": "The requested reasoning control conflicts with the local deployment.",
+        "hosted_upstream_forbidden": "Local-only inference requires an operator-asserted local deployment.",
         "empty theorem text": "The theorem text must not be empty.",
         "project path must contain a Lake project (lakefile.toml or lakefile.lean)":
             "Choose a Lake project containing lakefile.toml or lakefile.lean.",
@@ -537,6 +719,9 @@ def _start_english(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
     formalize_only = payload.get("formalizeOnly", False)
     if not isinstance(formalize_only, bool):
         return JSONResponse({"error": "formalizeOnly must be true or false"}, status_code=400)
+    policy = _inference_policy(payload)
+    if isinstance(policy, JSONResponse):
+        return policy
     try:
         settings_args = option_args(
             payload.get("options", {}), refiner_enabled=bool(payload.get("refiner")),
@@ -546,11 +731,14 @@ def _start_english(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
         return JSONResponse({"error": exc.public_message}, status_code=400)
     except ValueError:
         return JSONResponse({"error": "Invalid launch options. Choose settings from the available options."}, status_code=400)
-    user_args = [] if formalize_only else _role_args(payload)
+    formalizer_args = _formalizer_args(app.state.local_registry, payload, policy)
+    if isinstance(formalizer_args, JSONResponse):
+        return formalizer_args
+    user_args: list[str] | JSONResponse = [] if formalize_only else _proof_args(app.state.local_registry, payload, policy)
     if isinstance(user_args, JSONResponse):
         return user_args
     if not formalize_only:
-        user_args.extend(settings_args)
+        user_args = _append_policy([*user_args, *settings_args], policy)
         verdict = app.state.registry.validate_args([
             "--lean-file", "Problem.lean", "--theorem-name", "formalized_problem",
             "--project-path", str(project_path), *user_args,
@@ -563,6 +751,7 @@ def _start_english(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
     record, detail = app.state.registry.launch_nl(
         text,
         project_path=project_path,
+        formalizer_args=formalizer_args,
         user_args=user_args,
         idempotency_key=idempotency_key,
         formalize_only=formalize_only,
@@ -591,17 +780,21 @@ def _start_lean(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
         fields["leanFile"] = str(lean_file.resolve())
     except (OSError, RuntimeError, ValueError):
         return JSONResponse({"error": "projectPath and leanFile must identify valid local paths"}, status_code=400)
-    user_args = _role_args(payload)
+    policy = _inference_policy(payload)
+    if isinstance(policy, JSONResponse):
+        return policy
+    user_args = _proof_args(app.state.local_registry, payload, policy)
     if isinstance(user_args, JSONResponse):
         return user_args
     try:
-        user_args.extend(option_args(
+        settings_args = option_args(
             payload.get("options", {}), refiner_enabled=bool(payload.get("refiner")),
-        ))
+        )
     except OptionValidationError as exc:
         return JSONResponse({"error": exc.public_message}, status_code=400)
     except ValueError:
         return JSONResponse({"error": "Invalid launch options. Choose settings from the available options."}, status_code=400)
+    user_args = _append_policy([*user_args, *settings_args], policy)
     idempotency_key = _idempotency_key(payload)
     if isinstance(idempotency_key, JSONResponse):
         return idempotency_key

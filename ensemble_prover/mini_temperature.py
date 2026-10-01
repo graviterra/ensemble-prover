@@ -85,21 +85,59 @@ class MiniTemperatureDecision:
     sample_temperature: Optional[float] = None
     api_default: bool = False
 
-    def provider_temperature_override(self) -> Any:
-        return API_DEFAULT_TEMPERATURE if self.api_default else self.value
+    def provider_temperature_override(self, client: Any = None) -> Any:
+        requested = API_DEFAULT_TEMPERATURE if self.api_default else self.value
+        return mini_automatic_temperature_override(client, requested)
 
     def metadata(self, client: Any = None) -> dict[str, Any]:
+        effective = self.provider_temperature_override(client)
+        effective_value = (
+            None if is_api_default_temperature_override(effective) else effective
+        )
+        constrained = _local_temperature_policy(client) in {"fixed", "forbidden"}
         return {
             "temperature_requested": self.value,
-            "effective_temperature": self.value,
-            "temperature_api_default": bool(self.api_default),
+            "effective_temperature": effective_value,
+            "temperature_api_default": bool(self.api_default) and not constrained,
             "temperature_phase_key": self.phase_key,
             "temperature_phase": self.phase_key,
-            "temperature_source": self.source,
-            "temperature_reason": self.reason,
+            "temperature_source": (
+                "local_deployment_policy" if constrained else self.source
+            ),
+            "temperature_reason": (
+                "local_" + _local_temperature_policy(client) + "_sampling"
+                if constrained
+                else self.reason
+            ),
             "sample_temperature": self.sample_temperature,
-            **_static_provider_sampling_metadata(client, self.value),
+            **_static_provider_sampling_metadata(client, effective_value),
         }
+
+
+def _local_temperature_policy(client: Any) -> str:
+    role = getattr(client, "_local_role", None)
+    return str(
+        getattr(
+            getattr(getattr(role, "sampling", None), "temperature", None), "policy", ""
+        )
+    )
+
+
+def mini_automatic_temperature_override(client: Any, requested: Any) -> Any:
+    """Adapt an orchestration default to a frozen local deployment's policy.
+
+    Phase strategy suggestions, including custom programmatic phase policies,
+    are subordinate to the deployment policy. Explicit CLI controls are validated
+    during role admission and direct adapter overrides remain strict. The
+    concrete local client holds the immutable resolved role; wrappers delegate
+    this attribute alongside their request methods.
+    """
+    policy = _local_temperature_policy(client)
+    if policy == "forbidden":
+        return None
+    if policy == "fixed":
+        return float(client._local_role.sampling.temperature.value)
+    return requested
 
 
 _FORMALIZATION_WORK_TYPES = frozenset(
@@ -128,11 +166,7 @@ def _finite_temperature(value: Any) -> Optional[float]:
 
 def _client_base_url(client: Any) -> str:
     cfg = getattr(client, "cfg", None)
-    return str(
-        getattr(client, "base_url", "")
-        or getattr(cfg, "base_url", "")
-        or ""
-    )
+    return str(getattr(client, "base_url", "") or getattr(cfg, "base_url", "") or "")
 
 
 def _client_model(client: Any) -> str:
@@ -166,11 +200,22 @@ def _sampling_controls_support_static(client: Any) -> Optional[bool]:
             _sampling_controls_support_static(getattr(member, "client", None))
             for member in members
         ]
-        return support[0] if support and all(item == support[0] for item in support) else None
+        return (
+            support[0]
+            if support and all(item == support[0] for item in support)
+            else None
+        )
     clients = getattr(client, "clients", None)
     if isinstance(clients, list) and clients:
         support = [_sampling_controls_support_static(child) for child in clients]
-        return support[0] if support and all(item == support[0] for item in support) else None
+        return (
+            support[0]
+            if support and all(item == support[0] for item in support)
+            else None
+        )
+    local_policy = _local_temperature_policy(client)
+    if local_policy in {"unrestricted", "fixed", "forbidden"}:
+        return local_policy != "forbidden"
     if _client_thinking_enabled(client):
         return False
     base_url = _client_base_url(client)
@@ -240,7 +285,9 @@ def resolve_mini_temperature(
         return MiniTemperatureDecision(
             value=sample_temperature,
             phase_key="legacy_sample",
-            source="parallel_sample" if sample_temperature is not None else "api_default",
+            source=(
+                "parallel_sample" if sample_temperature is not None else "api_default"
+            ),
             reason="phase_policy_disabled",
             sample_temperature=sample_temperature,
             api_default=sample_temperature is None,
@@ -304,10 +351,9 @@ def resolve_mini_temperature(
             reason="route_assembly",
             sample_temperature=sample_temperature,
         )
-    near_stagnation_limit = (
-        int(context.max_stagnation or 0) > 0
-        and int(context.stagnation_counter or 0) >= int(context.max_stagnation or 0)
-    )
+    near_stagnation_limit = int(context.max_stagnation or 0) > 0 and int(
+        context.stagnation_counter or 0
+    ) >= int(context.max_stagnation or 0)
     if (
         "stagnation" in record_text
         or phase_hint == "stagnation_escape"
@@ -329,7 +375,9 @@ def resolve_mini_temperature(
             reason="refine_turn",
             sample_temperature=sample_temperature,
         )
-    if sample_temperature is not None and bool(policy.use_sample_temperature_for_initial):
+    if sample_temperature is not None and bool(
+        policy.use_sample_temperature_for_initial
+    ):
         return MiniTemperatureDecision(
             value=sample_temperature,
             phase_key="initial_proof",

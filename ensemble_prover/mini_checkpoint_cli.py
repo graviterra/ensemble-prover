@@ -22,7 +22,11 @@ _GENERATION_OPTIONS = frozenset({
     "answer_attempts",
 })
 
-_SUBSCRIPTION_BINARY_OPTIONS = {"codex": ("codex_bin", "codex"), "claude-code": ("claude_code_bin", "claude")}
+_SUBSCRIPTION_BINARY_OPTIONS = {
+    "codex": ("codex_bin", "codex"),
+    "claude-code": ("claude_code_bin", "claude"),
+    "cursor": ("cursor_bin", "agent"),
+}
 
 
 class CheckpointArgumentParser(argparse.ArgumentParser):
@@ -67,6 +71,10 @@ def public_cli_config(args: argparse.Namespace) -> dict[str, Any]:
         config.pop("frontier_research", None)
     if getattr(args, "_legacy_output_limit_policy", False):
         config.pop("require_output_token_limit", None)
+    if config.get("network_policy") in (None, "default"):
+        config.pop("network_policy", None)
+    from .local_inference.roles import project_local_public_config
+    config = project_local_public_config(config, args)
     return clone_json_value(config, label="checkpoint CLI configuration")
 
 
@@ -112,14 +120,22 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
             # Bare resume inherits the saved transport schema, but explicit
             # binary/provider overrides must still pass compatibility checks.
             current[option] = getattr(args, option, default)
+    from .local_inference.roles import align_local_checkpoint_schema
+    align_local_checkpoint_schema(args, saved, current, explicit)
+    if "network_policy" in saved and "network_policy" not in current and "network_policy" not in explicit:
+        current["network_policy"] = saved["network_policy"]
     if set(saved) != set(current):
         raise ValueError("Checkpoint CLI configuration schema has changed")
     for name in explicit - _GENERATION_OPTIONS:
+        if name == "network_policy" and name not in saved and getattr(args, name, None) in (None, "default"):
+            continue
         if legacy_research and name == "autonomous_research":
             continue
         if legacy_frontier and name == "frontier_research":
             continue
         if legacy_output_limit and name == "require_output_token_limit":
+            continue
+        if name in getattr(args, "_local_resume_skip", ()):
             continue
         if name not in saved or current[name] != saved[name]:
             raise ValueError(f"Resume configuration override is incompatible: {name}")
