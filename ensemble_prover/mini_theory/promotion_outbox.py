@@ -24,7 +24,8 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 from ..proof_dossier import VerifiedHelper, text_hash
 from .model import THEORY_POLICY_VERSION, TheoryBundleCandidate
-from .promotion_context import helper_promotion_context, validate_promotion_context, split_promotion_context
+from .promotion_context import helper_promotion_context, lean_name_components, validate_promotion_context, split_promotion_context
+from .promotion import DECLARATION_EXTRACTION_POLICY_VERSION, VerifiedHelperPromoter, _used_problem_constants
 
 
 PROMOTION_OUTBOX_SCHEMA_VERSION = 3
@@ -1418,6 +1419,7 @@ class PromotionOutbox:
                             "diagnostic": str(
                                 getattr(result, "diagnostic", "") or ""
                             ),
+                            "declaration_extraction_policy_version": DECLARATION_EXTRACTION_POLICY_VERSION,
                             "environment_key": self.environment_key,
                             "policy_version": self.policy_version,
                             "settled_ts": time.time(),
@@ -1942,8 +1944,10 @@ class PromotionOutbox:
         exact_names = [
             str(getattr(item, "fq_name", "") or "").strip()
             for item in declarations
-            if str(getattr(item, "fq_name", "") or "").strip().split(".")[-1]
-            == entry.helper_name
+            if self._declaration_matches_helper(
+                str(getattr(item, "fq_name", "") or "").strip(),
+                entry.helper_name,
+            )
         ]
         fq_name = exact_names[0] if len(exact_names) == 1 else ""
         if not fq_name:
@@ -2719,7 +2723,22 @@ class PromotionOutbox:
         ):
             return False
         if payload.get("status") == "terminal_rejected":
+            if (
+                payload.get("diagnostic") == "helper_declaration_not_extractable"
+                and "declaration_extraction_policy_version" not in payload
+                and VerifiedHelperPromoter._extract_declaration(
+                    entry.source, entry.helper_name,
+                ) is not None
+            ):
+                return False
             return True
+        # A legacy publication may have passed an incomplete lexical guard.
+        # Reconsider only its receipt under the protected names recorded for
+        # that source; independently compiled bundles remain intact.
+        if entry.forbidden_problem_constants and _used_problem_constants(
+            entry.source, entry.forbidden_problem_constants,
+        ):
+            return False
         context = _context or self._result_validation_context()
         cancellation_event = context.cancellation_event
         if cancellation_event is not None and cancellation_event.is_set():
@@ -2761,8 +2780,9 @@ class PromotionOutbox:
             exact = [
                 str(getattr(item, "fq_name", "") or "")
                 for item in tuple(getattr(bundle, "declarations", ()) or ())
-                if str(getattr(item, "fq_name", "") or "").split(".")[-1]
-                == entry.helper_name
+                if self._declaration_matches_helper(
+                    str(getattr(item, "fq_name", "") or ""), entry.helper_name,
+                )
             ]
             if (
                 bundle.domain != entry.domain
@@ -2839,6 +2859,16 @@ class PromotionOutbox:
             )
         except Exception:
             return False
+
+    @staticmethod
+    def _declaration_matches_helper(fq_name: str, helper_name: str) -> bool:
+        helper_components = lean_name_components(helper_name)
+        full_components = lean_name_components(fq_name)
+        return bool(
+            helper_components
+            and len(full_components) >= len(helper_components)
+            and full_components[-len(helper_components):] == helper_components
+        )
 
     @staticmethod
     def _cancellable_bundle_snapshot(

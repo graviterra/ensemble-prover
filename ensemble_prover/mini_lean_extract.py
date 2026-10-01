@@ -13,6 +13,7 @@ from .helper_salvage import (
 )
 from .lean_decl_parser import find_decl_header_end
 from .lean_syntax import normalize_nat_factorial_notation
+from .math_utils import _LEAN_ID_REST_RE
 from .proof_dossier import (
     helper_decl_body,
     helper_decl_kind,
@@ -815,6 +816,12 @@ def _append_lean_padding(out: List[str], ch: str) -> None:
 def _lean_char_literal_end(src: str, start: int) -> int:
     if start >= len(src) or src[start] != "'":
         return start
+    if start > 0 and (
+        src[start - 1].isalnum()
+        or _LEAN_ID_REST_RE.fullmatch(src[start - 1])
+        or src[start - 1] == "»"
+    ):
+        return start
     if start + 2 < len(src) and src[start + 2] == "'":
         return start + 3
     if start + 3 < len(src) and src[start + 1] == "\\" and src[start + 3] == "'":
@@ -1387,10 +1394,24 @@ def _helper_referenced_names(
     )
 
 
+def _helper_registers_implicit_dependencies(helper: str) -> bool:
+    """Attributes and instances can affect proofs without a named reference."""
+
+    declaration, _open_commands = _partition_scoped_open_prefix(
+        _strip_lean_comments_and_strings(helper, preserve_interpolations=True)
+    )
+    header = _helper_decl_header(declaration)
+    return bool(
+        header is not None
+        and (header[0] == "instance" or declaration.lstrip().startswith("@["))
+    )
+
+
 def _helpers_referenced_by_proof(helpers: List[str], proof: str) -> List[str]:
-    """Keep only cross-fence helpers whose declared names the proof mentions."""
+    """Keep explicit dependencies and declarations used implicitly by Lean."""
     if not helpers or not proof:
         return []
+    helpers = _dedupe_helpers_by_name_last_wins(helpers)
     names_in_order: List[str] = []
     latest_helper_by_name: Dict[str, str] = {}
     for helper in helpers:
@@ -1399,9 +1420,6 @@ def _helpers_referenced_by_proof(helpers: List[str], proof: str) -> List[str]:
             continue
         names_in_order.append(name)
         latest_helper_by_name[name] = helper
-    if not names_in_order:
-        return []
-
     # Duplicate helper names across fences otherwise produce duplicate Lean
     # declarations. Use the last definition the model wrote, but dependency-sort
     # the selected helper set before returning so a later correction of ``h_a``
@@ -1418,6 +1436,20 @@ def _helpers_referenced_by_proof(helpers: List[str], proof: str) -> List[str]:
         return _helper_referenced_names(src, unique_names, skip=skip)
 
     selected = referenced_names(proof)
+    # Lean elaboration and automation consult the environment: an instance,
+    # simp lemma, or other attributed declaration may be used without its name
+    # appearing in the proof. Keep the latest registration and its dependencies.
+    selected.update(
+        name for name in unique_names
+        if _helper_registers_implicit_dependencies(latest_helper_by_name[name])
+    )
+    unnamed_implicit_helpers = [
+        helper for helper in helpers
+        if not _helper_decl_name(helper)
+        and _helper_registers_implicit_dependencies(helper)
+    ]
+    for helper in unnamed_implicit_helpers:
+        selected.update(referenced_names(helper))
     changed = True
     while changed:
         changed = False
@@ -1431,10 +1463,13 @@ def _helpers_referenced_by_proof(helpers: List[str], proof: str) -> List[str]:
                 selected.update(new_deps)
                 changed = True
 
-    out: List[str] = []
-    for name in unique_names:
-        if name in selected:
-            out.append(latest_helper_by_name[name])
+    # Anonymous instances remain at their original position; the shared sorter
+    # treats them as environment context while ordering named dependencies.
+    out = [
+        helper for helper in helpers
+        if _helper_decl_name(helper) in selected
+        or helper in unnamed_implicit_helpers
+    ]
     return _dedupe_helpers_by_name_last_wins(out)
 
 
@@ -2849,9 +2884,8 @@ def _extract_helpers_and_main(
                     main_proof = decl_body
             if main_proof is None:
                 # The last chunk was a helper, not a main proof. Keep helper-only
-                # blocks available for a later proof fence, but only the helpers
-                # whose names appear in proof code (comments ignored) will be
-                # carried forward.
+                # blocks available for a later proof fence. Explicit dependencies
+                # and implicit environment registrations are carried forward.
                 helper_only_chunks.extend(scoped_chunks)
                 continue
 

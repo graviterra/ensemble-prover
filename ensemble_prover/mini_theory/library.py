@@ -501,6 +501,8 @@ class MiniTheoryLibrary:
     ) -> Optional[TheoryPublishResult]:
         """Return an exact durable bundle without invoking Lean again."""
 
+        from .promotion_context import lean_name_components
+
         if self.mode != "build":
             raise TheoryStoreError("theory publication requires mode='build'")
         assert self.store is not None
@@ -513,10 +515,13 @@ class MiniTheoryLibrary:
         if bundle is None:
             return None
         declarations = tuple(bundle.declarations)
+        helper_components = lean_name_components(helper_name)
         exact_declarations = tuple(
             declaration
             for declaration in declarations
-            if declaration.fq_name.rsplit(".", 1)[-1] == helper_name
+            if helper_components
+            and lean_name_components(declaration.fq_name)[-len(helper_components):]
+            == helper_components
         )
         if not (
             bundle.bundle_id == candidate.bundle_id

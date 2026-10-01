@@ -24,6 +24,7 @@ from .contract_identity import (
 )
 from .lean_syntax import lean_relation_binder_parts
 from .lean_parser import sanitize_goal_hypothesis, split_goal_definition_binding
+from .math_utils import _strip_lean_comments_and_strings as _executable_lean_code
 from .proof_dossier import (
     ProofDossier,
     _prompt_safe_inline_text,
@@ -31,6 +32,12 @@ from .proof_dossier import (
     _redact_split_prompt_control_text,
     is_answer_unsafe_statement_text,
     text_hash,
+)
+from .lean_names import (
+    LEAN_NAME_COMPONENT_PATTERN as _LEAN_NAME_SEGMENT_PATTERN,
+    LEAN_PLAIN_NAME_PATTERN,
+    lean_constant_name_components,
+    lean_name_components,
 )
 from .proof_graph import (
     FORMALIZATION_BRIDGE_OPEN_PREMISE_TRUST,
@@ -51,7 +58,6 @@ from .utils import (
     normalize_subgoal_statement,
 )
 
-_LEAN_NAME_SEGMENT_PATTERN = r"(?:«[^»]+»|[A-Za-z_][A-Za-z0-9_']*)"
 _LEAN_QUALIFIED_NAME_PATTERN = (
     rf"{_LEAN_NAME_SEGMENT_PATTERN}(?:\.{_LEAN_NAME_SEGMENT_PATTERN})*"
 )
@@ -101,9 +107,9 @@ _TYPED_TRANSITION_POLICY_SOURCES = frozenset(
         "falsification",
     }
 )
-_LEAN_LOCAL_IDENT_RE = re.compile(r"^(?:[^\W\d]|_)[\w']*$", flags=re.UNICODE)
+_LEAN_LOCAL_IDENT_RE = re.compile(rf"^{LEAN_PLAIN_NAME_PATTERN}$", flags=re.UNICODE)
 _LEAN_LOCAL_TOKEN_RE = re.compile(
-    r"«[^»]+»|(?:[^\W\d]|_)[\w'✝]*",
+    rf"{_LEAN_NAME_SEGMENT_PATTERN}✝*",
     flags=re.UNICODE,
 )
 _LEAN_IDENTIFIER_RE = re.compile(_LEAN_QUALIFIED_NAME_PATTERN)
@@ -1606,58 +1612,11 @@ def _proof_state_prompt_safe_code(
 
 
 def _strip_lean_comments_and_strings(src: str) -> str:
-    text = str(src or "")
-    out: List[str] = []
-    index = 0
-    block_depth = 0
-    in_string = False
-    while index < len(text):
-        ch = text[index]
-        nxt = text[index + 1] if index + 1 < len(text) else ""
-        if in_string:
-            out.append("\n" if ch in "\r\n" else " ")
-            if ch == "\\" and index + 1 < len(text):
-                index += 2
-                out.append(" ")
-                continue
-            if ch == '"':
-                in_string = False
-            index += 1
-            continue
-        if block_depth > 0:
-            if ch == "/" and nxt == "-":
-                block_depth += 1
-                out.extend("  ")
-                index += 2
-                continue
-            if ch == "-" and nxt == "/":
-                block_depth -= 1
-                out.extend("  ")
-                index += 2
-                continue
-            out.append("\n" if ch in "\r\n" else " ")
-            index += 1
-            continue
-        if ch == '"':
-            in_string = True
-            out.append(" ")
-            index += 1
-            continue
-        if ch == "-" and nxt == "-":
-            out.extend("  ")
-            index += 2
-            while index < len(text) and text[index] not in "\r\n":
-                out.append(" ")
-                index += 1
-            continue
-        if ch == "/" and nxt == "-":
-            block_depth = 1
-            out.extend("  ")
-            index += 2
-            continue
-        out.append(ch)
-        index += 1
-    return "".join(out)
+    # Both reference tokens and binder ranges use this same sanitized source,
+    # so their offsets agree even when literal text is shortened. Executable
+    # interpolation bodies and complete quoted names remain visible.
+    code, _lexically_complete = _executable_lean_code(str(src or ""))
+    return code
 
 
 def _line_indent(text: str) -> int:
@@ -2410,34 +2369,40 @@ def lean_referenced_helper_names(
     skip: Optional[str] = None,
     allow_arbitrary_dot_methods: bool = False,
 ) -> Set[str]:
+    skip_components = lean_constant_name_components(str(skip or ""))
     name_set = {
         str(name or "").strip()
         for name in list(names or ())
-        if str(name or "").strip() and str(name or "").strip() != skip
+        if str(name or "").strip()
+        and lean_constant_name_components(str(name or "").strip()) != skip_components
     }
     if not name_set:
         return set()
 
-    def helper_prefix(raw: str) -> str:
+    name_components = {name: lean_constant_name_components(name) for name in name_set}
+
+    def helper_prefix(parts: Tuple[str, ...]) -> str:
         matches = [
             name
-            for name in name_set
-            if raw == name
+            for name, components in name_components.items()
+            if components and (parts == components
             or (
-                raw.startswith(f"{name}.")
+                len(parts) > len(components)
+                and parts[:len(components)] == components
                 and (
                     allow_arbitrary_dot_methods
-                    or raw[len(name) + 1 :].split(".", 1)[0]
-                    in _LEAN_KNOWN_DOT_METHOD_SUFFIXES
+                    or parts[len(components)] in _LEAN_KNOWN_DOT_METHOD_SUFFIXES
                 )
-            )
+            ))
         ]
         if not matches:
             return ""
-        return max(matches, key=len)
+        return max(matches, key=lambda name: len(name_components[name]))
 
     scan_text = _strip_lean_comments_and_strings(str(src or ""))
-    local_ranges = _lean_local_binder_ranges_in_proof(str(src or ""))
+    local_ranges: Dict[Tuple[str, ...], List[Tuple[int, int]]] = {}
+    for local_name, ranges in _lean_local_binder_ranges_in_proof(str(src or "")).items():
+        local_ranges.setdefault(lean_name_components(local_name), []).extend(ranges)
     lines = scan_text.splitlines(keepends=True)
     line_starts: List[int] = []
     offset = 0
@@ -2454,7 +2419,7 @@ def lean_referenced_helper_names(
                 return line_starts[next_index]
         return len(scan_text)
 
-    open_namespace_ranges: List[Tuple[str, int, int]] = []
+    open_namespace_ranges: List[Tuple[Tuple[str, ...], int, int]] = []
     for line_index, line in enumerate(lines):
         for open_match in re.finditer(
             r"(?<![A-Za-z0-9_'.])open\s+(.+?)\s+in\b",
@@ -2472,7 +2437,7 @@ def lean_referenced_helper_names(
             ):
                 open_namespace_ranges.append(
                     (
-                        namespace,
+                        lean_name_components(namespace),
                         line_starts[line_index] + open_match.end(),
                         end,
                     )
@@ -2485,60 +2450,32 @@ def lean_referenced_helper_names(
             continue
         if _lean_identifier_is_projection_field(scan_text, match.start()):
             continue
-        token = raw_token
+        parts = lean_name_components(raw_token)
+        rooted = bool(parts and parts[0] == "_root_")
+        if rooted:
+            parts = parts[1:]
+        token = helper_prefix(parts)
         token_start = match.start()
-        if token not in name_set:
-            terminal = raw_token.rsplit(".", 1)[-1]
-            receiver = helper_prefix(raw_token)
-            if raw_token.startswith("_root_."):
-                root_name = raw_token[len("_root_.") :]
-                rooted_receiver = helper_prefix(root_name)
-                if rooted_receiver:
-                    token = rooted_receiver
-                    token_start = match.start() + len("_root_.")
-                elif root_name in name_set:
-                    token = root_name
-                    token_start = match.start() + len("_root_.")
-                elif "." not in root_name and terminal in name_set:
-                    token = terminal
-                    token_start = match.end() - len(terminal)
-                else:
-                    continue
-            elif receiver in name_set:
-                receiver_head = receiver.split(".", 1)[0]
-                if any(
-                    start <= match.start() < end
-                    for start, end in local_ranges.get(receiver_head, ())
-                ):
-                    continue
-                token = receiver
-                token_start = match.start()
-            else:
-                opened = ""
-                for namespace, start, end in open_namespace_ranges:
-                    candidate = helper_prefix(f"{namespace}.{raw_token}")
-                    if start <= match.start() < end and candidate:
-                        opened = candidate
-                        break
-                if opened:
-                    token = opened
-                    token_start = match.start()
-                else:
-                    continue
-        elif "." in token and not token.startswith("_root_."):
-            token_head = token.split(".", 1)[0]
+        if not token and not rooted:
+            for namespace, start, end in open_namespace_ranges:
+                candidate = helper_prefix(namespace + parts)
+                if start <= match.start() < end and candidate:
+                    token = candidate
+                    break
+        if not token:
+            continue
+        if not rooted and len(parts) > 1:
             if any(
                 start <= match.start() < end
-                for start, end in local_ranges.get(token_head, ())
+                for start, end in local_ranges.get(parts[:1], ())
             ):
                 continue
-        if token not in name_set:
-            continue
         if (
-            not _lean_identifier_has_root_qualifier(scan_text, token_start)
+            not rooted
+            and not _lean_identifier_has_root_qualifier(scan_text, token_start)
             and any(
                 start <= token_start < end
-                for start, end in local_ranges.get(token, ())
+                for start, end in local_ranges.get(parts, ())
             )
         ):
             continue

@@ -6,77 +6,84 @@ import re
 import threading
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence
+from ..math_utils import _strip_lean_comments_and_strings as _executable_lean_code
 
 from .library import MiniTheoryLibrary, TheoryPublishResult
 from .model import TheoryBundleCandidate
 from .store import TheoryStorePublicationCommitted
-from .promotion_context import helper_promotion_context, is_promotion_context_command, split_promotion_context
+from .promotion_context import (
+    _DOTTED_IDENT,
+    _mask_lean_noncode,
+    helper_promotion_context,
+    is_promotion_context_command,
+    lean_name_components,
+    split_promotion_context,
+)
 
 
 _DECLARATION_HEAD_RE = re.compile(
     r"^(?:@\[[^\]\n]+\]\s*)*(?:protected\s+)?"
-    r"(?P<kind>theorem|lemma)\s+(?P<name>[A-Za-z_][A-Za-z0-9_']*)\b"
+    rf"(?P<kind>theorem|lemma)(?=\s|«)\s*(?P<name>{_DOTTED_IDENT})(?=\.\{{|\s|:|\(|\{{|⦃|\[|$)"
 )
-_IDENTIFIER_RE = re.compile(
-    r"\b[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*\b"
-)
+# Quoted identifiers delimit themselves and may immediately follow a keyword
+# or another token. Greedy token consumption preserves entire ordinary names
+# and quoted components without imposing Python-style word boundaries.
+_IDENTIFIER_RE = re.compile(_DOTTED_IDENT)
 _ATTRIBUTE_LINE_RE = re.compile(r"^@\[[^\]\n]+\]$")
+
+# Persisted refusals predating complete Lean-name extraction can be retried
+# without invalidating independently verified publications or other refusals.
+DECLARATION_EXTRACTION_POLICY_VERSION = 2
 
 
 def _lean_code_without_comments_or_strings(source: str) -> str:
     """Mask non-code text before conservative identifier policy checks."""
 
-    text = str(source or "")
-    output: list[str] = []
-    index = 0
-    block_depth = 0
-    in_string = False
-    while index < len(text):
-        pair = text[index : index + 2]
-        char = text[index]
-        if block_depth:
-            if pair == "/-":
-                block_depth += 1
-                output.extend("  ")
-                index += 2
-            elif pair == "-/":
-                block_depth -= 1
-                output.extend("  ")
-                index += 2
-            else:
-                output.append("\n" if char == "\n" else " ")
-                index += 1
-            continue
-        if in_string:
-            if char == "\\" and index + 1 < len(text):
-                output.extend("  ")
-                index += 2
-            else:
-                if char == '"':
-                    in_string = False
-                output.append("\n" if char == "\n" else " ")
-                index += 1
-            continue
-        if pair == "--":
-            end = text.find("\n", index)
-            if end < 0:
-                output.extend(" " * (len(text) - index))
-                break
-            output.extend(" " * (end - index))
-            output.append("\n")
-            index = end + 1
-        elif pair == "/-":
-            block_depth = 1
-            output.extend("  ")
-            index += 2
-        elif char == '"':
-            in_string = True
-            output.append(" ")
-            index += 1
-        else:
-            output.append(char)
-            index += 1
-    return "".join(output)
+    return _mask_lean_noncode(str(source or ""))
+
+
+def _problem_constant_name_components(name: str) -> tuple[str, ...]:
+    """Absolute and relative spellings identify the same protected constant."""
+
+    components = lean_name_components(name)
+    if len(components) > 1 and components[0] == "_root_":
+        return components[1:]
+    return components
+
+
+def _used_problem_constants(source: str, forbidden_constants: Iterable[str]) -> tuple[str, ...]:
+    """Apply the same protected-name check to fresh and persisted helpers."""
+
+    forbidden = {
+        str(item or "").strip()
+        for item in forbidden_constants
+        if str(item or "").strip()
+    }
+    if not forbidden:
+        return ()
+    # Interpolation bodies elaborate as Lean terms. Strip literal text while
+    # retaining executable bodies, including nested interpolations.
+    executable_source, _lexically_complete = _executable_lean_code(source)
+    referenced_names = {
+        _problem_constant_name_components(identifier)
+        for identifier in _IDENTIFIER_RE.findall(
+            executable_source
+        )
+    }
+    forbidden_names = {
+        name: _problem_constant_name_components(name) for name in forbidden
+    }
+    return tuple(sorted(
+        forbidden_name
+        for forbidden_name, forbidden_components in forbidden_names.items()
+        if forbidden_components
+        if any(
+            identifier == forbidden_components
+            or len(forbidden_components) == 1
+            and identifier[-1:] == forbidden_components
+            for identifier in referenced_names
+        )
+    ))
 
 
 @dataclass(frozen=True)
@@ -191,24 +198,8 @@ class VerifiedHelperPromoter:
                 verification=None,
                 diagnostic="helper_declaration_not_extractable",
             )
-        forbidden = {
-            str(item or "").strip()
-            for item in forbidden_problem_constants
-            if str(item or "").strip()
-        }
-        referenced_identifiers = set(
-            _IDENTIFIER_RE.findall(
-                _lean_code_without_comments_or_strings(declaration)
-            )
-        )
-        used_forbidden = sorted(
-            forbidden_name
-            for forbidden_name in forbidden
-            if any(
-                identifier == forbidden_name
-                or identifier.rsplit(".", 1)[-1] == forbidden_name
-                for identifier in referenced_identifiers
-            )
+        used_forbidden = _used_problem_constants(
+            declaration, forbidden_problem_constants,
         )
         if used_forbidden:
             return HelperPromotionPreparation(
@@ -368,40 +359,27 @@ class VerifiedHelperPromoter:
     @staticmethod
     def _extract_declaration(source: str, helper_name: str) -> Optional[str]:
         declaration = str(source or "").strip()
-        lines = declaration.splitlines()
+        # Split physical lines identically before and after masking. Python's
+        # splitlines also treats Unicode separators inside comments/literals
+        # as line breaks, but masking replaces those characters with spaces.
+        lines = declaration.split("\n")
+        masked_lines = _lean_code_without_comments_or_strings(declaration).split("\n")
         if not lines:
             return None
         declaration_index = 0
         while declaration_index < len(lines):
-            stripped = lines[declaration_index].strip()
+            stripped = masked_lines[declaration_index].strip()
             if (
                 not stripped
-                or stripped.startswith("--")
                 or is_promotion_context_command(stripped)
                 or _ATTRIBUTE_LINE_RE.fullmatch(stripped)
             ):
                 declaration_index += 1
                 continue
-            if stripped.startswith("/-"):
-                depth = 0
-                while declaration_index < len(lines):
-                    comment_line = lines[declaration_index].strip()
-                    depth += comment_line.count("/-")
-                    depth -= comment_line.count("-/")
-                    declaration_index += 1
-                    if depth <= 0:
-                        # Accept only comment-only leading lines. Code after a
-                        # closing delimiter would widen the parser boundary.
-                        if comment_line.rsplit("-/", 1)[-1].strip():
-                            return None
-                        break
-                if depth != 0:
-                    return None
-                continue
             break
         if declaration_index >= len(lines):
             return None
-        head = _DECLARATION_HEAD_RE.match(lines[declaration_index])
+        head = _DECLARATION_HEAD_RE.match(masked_lines[declaration_index].lstrip())
         if head is None or head.group("name") != helper_name:
             return None
         # A promoted helper must be exactly one top-level declaration. Lean

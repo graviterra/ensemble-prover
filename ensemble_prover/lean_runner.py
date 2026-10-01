@@ -3491,6 +3491,9 @@ def _residual_batch_receipt_from_payload(
 def _axiom_report_name_matches(reported: str, requested: str) -> bool:
     reported_name = str(reported or "").strip()
     requested_name = str(requested or "").strip()
+    # Lean prints the resolved name, without the source's root qualifier.
+    reported_name = re.sub(r"^(?:_root_|«_root_»)\.", "", reported_name)
+    requested_name = re.sub(r"^(?:_root_|«_root_»)\.", "", requested_name)
     # `#print axioms` may pretty-print an escaped identifier without its
     # guillemets when the surrounding qualified name makes it unambiguous
     # (for example `MiniQuoted.«lemma»` is reported as

@@ -23,6 +23,7 @@ from .proof_dossier import (
     verified_helper_semantic_statement_changed,
 )
 from .contract_identity import parse_lean_contract_identity
+from .lean_names import lean_name_key
 from .proof_graph import helper_decl_statement
 from .proof_state import lean_referenced_helper_names
 from .proof_state_cache import (
@@ -1459,7 +1460,7 @@ def dedupe_helpers_by_name_last_wins(helpers: Sequence[str]) -> List[str]:
     names_in_first_order: List[str] = []
     unnamed_helpers: List[Tuple[int, str]] = []
     for index, helper in enumerate(helper_list):
-        name = helper_decl_name(helper)
+        name = lean_name_key(helper_decl_name(helper) or "")
         if name:
             if name not in first_index_by_name:
                 first_index_by_name[name] = index
@@ -1491,7 +1492,7 @@ def dedupe_helpers_by_name_last_wins(helpers: Sequence[str]) -> List[str]:
     # so nothing moves unless a dependency forces it.
     latest_index_by_name: Dict[str, int] = {}
     for index, helper in enumerate(helper_list):
-        name = helper_decl_name(helper)
+        name = lean_name_key(helper_decl_name(helper) or "")
         if name:
             latest_index_by_name[name] = index
     nodes: List[Tuple[int, str, str]] = [
@@ -1499,6 +1500,7 @@ def dedupe_helpers_by_name_last_wins(helpers: Sequence[str]) -> List[str]:
         for name in names_in_first_order
     ] + [(index, "", helper) for index, helper in unnamed_helpers]
     node_deps: List[Set[int]] = []
+    hard_node_deps: List[Set[int]] = []
     node_index_by_name = {name: position for position, name in enumerate(names_in_first_order)}
     def is_scope_barrier(text: str) -> bool:
         # Scope commands change the names of everything after them, so no
@@ -1507,8 +1509,10 @@ def dedupe_helpers_by_name_last_wins(helpers: Sequence[str]) -> List[str]:
 
     for position, (index, name, text) in enumerate(nodes):
         deps: Set[int] = set()
+        hard_deps: Set[int] = set()
         if name:
-            deps.update(node_index_by_name[dep] for dep in deps_by_name.get(name, set()))
+            hard_deps.update(node_index_by_name[dep] for dep in deps_by_name.get(name, set()))
+            deps.update(hard_deps)
             # Soft context (``open``, instances, options) before the winning
             # copy may be needed by it; scope barriers bind by first position.
             anchor = latest_index_by_name[name]
@@ -1521,23 +1525,30 @@ def dedupe_helpers_by_name_last_wins(helpers: Sequence[str]) -> List[str]:
                     else other_index < anchor
                 )
             )
+            hard_deps.update(
+                other for other, (other_index, other_name, other_text) in enumerate(nodes)
+                if not other_name and is_scope_barrier(other_text)
+                and other_index < first
+            )
         elif is_scope_barrier(text):
             deps.update(
                 other for other, (other_index, _other_name, _t) in enumerate(nodes)
                 if other_index < index
             )
+            hard_deps.update(deps)
         else:
-            deps.update(
+            hard_deps.update(
                 node_index_by_name[dep]
                 for dep in _helper_referenced_names(text, names_in_first_order)
                 & selected_names
-                if first_index_by_name[dep] < index
             )
+            deps.update(hard_deps)
             deps.update(
                 other for other, (other_index, other_name, _t) in enumerate(nodes)
                 if not other_name and other_index < index
             )
         node_deps.append(deps)
+        hard_node_deps.append(hard_deps)
 
     emitted_nodes: Set[int] = set()
     order: List[int] = []
@@ -1547,6 +1558,16 @@ def dedupe_helpers_by_name_last_wins(helpers: Sequence[str]) -> List[str]:
             (position for position in remaining if not node_deps[position] - emitted_nodes),
             None,
         )
+        if ready is None:
+            # A corrected declaration can require a forward dependency that
+            # originally followed an anonymous instance. Prefer explicit
+            # dependencies over soft positional context when those edges form
+            # a cycle; namespace/section barriers remain hard constraints.
+            ready = next(
+                (position for position in remaining
+                 if not hard_node_deps[position] - emitted_nodes),
+                None,
+            )
         if ready is None:
             # A cycle cannot be made valid by reordering. Release only its
             # earliest block and keep ordering the rest, so unrelated forward

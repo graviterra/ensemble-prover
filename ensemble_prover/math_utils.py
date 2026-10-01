@@ -312,7 +312,11 @@ _LEAN_ID_REST_RE = re.compile(rf"[{_LEAN_ID_REST_CHARS}]")
 def _raw_string_end(text: str, start: int) -> tuple[int, bool] | None:
     if start >= len(text) or text[start] != "r":
         return None
-    if start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_'»"):
+    if start > 0 and (
+        text[start - 1].isalnum()
+        or _LEAN_ID_REST_RE.fullmatch(text[start - 1])
+        or text[start - 1] == "»"
+    ):
         return None
     quote = start + 1
     while quote < len(text) and text[quote] == "#":
@@ -542,7 +546,11 @@ def _skip_plain_string(text: str, start: int) -> tuple[int, bool]:
 def _char_literal_end(text: str, start: int) -> int:
     if start >= len(text) or text[start] != "'":
         return start
-    if start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_'»"):
+    if start > 0 and (
+        text[start - 1].isalnum()
+        or _LEAN_ID_REST_RE.fullmatch(text[start - 1])
+        or text[start - 1] == "»"
+    ):
         return start
     if start + 2 < len(text) and text[start + 2] == "'":
         return start + 3

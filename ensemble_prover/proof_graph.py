@@ -21,6 +21,7 @@ from threading import Lock, local
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .lean_decl_parser import find_decl_header_end
+from .lean_names import LEAN_NAME_COMPONENT_PATTERN as _SCOPED_OPEN_NAME_COMPONENT_RE
 from .math_utils import (
     _LEAN_ID_FIRST_CHARS as _GRAPH_LEAN_ID_FIRST_CHARS,
     _LEAN_ID_REST_CHARS as _GRAPH_LEAN_ID_REST_CHARS,
@@ -10170,7 +10171,6 @@ def _graph_root_conclusion_candidates(
     return tuple(candidates)
 
 
-_SCOPED_OPEN_NAME_COMPONENT_RE = r"(?:«[^»\r\n]+»|[^\W\d][\w']*)"
 _SCOPED_OPEN_NAME_RE = (
     _SCOPED_OPEN_NAME_COMPONENT_RE
     + r"(?:\."
@@ -10190,29 +10190,39 @@ def _helper_decl_header(src: str) -> Optional[Tuple[str, str, str]]:
     text = str(src or "").strip()
     if not text:
         return None
+    # Parse comments as whitespace without changing offsets. Names must agree
+    # across replay/deduplication, while the returned tail remains original
+    # source (including strings and proof comments).
+    scan = _strip_lean_decl_comments_preserving_strings(
+        text, preserve_positions=True
+    )
     # Extracted fenced blocks retain leading ``open`` semantics by wrapping
     # each helper in Lean's command-local ``open ... in`` syntax.  Peel only
     # that conservative generated prefix for declaration metadata parsing;
     # the stored helper source itself remains scoped and is what Lean checks.
     while True:
-        scoped_open = _SCOPED_OPEN_DECL_PREFIX_RE.match(text)
+        scoped_open = _SCOPED_OPEN_DECL_PREFIX_RE.match(scan)
         if scoped_open is None:
             break
-        text = text[scoped_open.end() :].lstrip()
+        text = text[scoped_open.end() :]
+        scan = scan[scoped_open.end() :]
+        leading_space = len(scan) - len(scan.lstrip())
+        text = text[leading_space:]
+        scan = scan[leading_space:]
     decl = re.match(
         r"^\s*"
         r"(?:@\[[^\]]*\]\s*)*"
         r"(?:(?:private|protected|noncomputable|unsafe|partial)\s+)*"
         r"(?P<kind>theorem|lemma|def|abbrev|instance)\b"
         r"(?P<after>[\s\S]*)$",
-        text,
+        scan,
     )
     if decl is None:
         return None
     kind = str(decl.group("kind") or "").strip()
     after = str(decl.group("after") or "")
     named = re.match(
-        r"^\s+"
+        r"^\s*"
         r"(?P<name>"
         + _SCOPED_OPEN_NAME_RE
         + r")"
@@ -10222,12 +10232,12 @@ def _helper_decl_header(src: str) -> Optional[Tuple[str, str, str]]:
     )
     if named is not None:
         return kind, str(named.group("name") or "").strip(), str(
-            named.group("tail") or ""
+            text[decl.start("after") + named.start("tail") :]
         )
     if kind == "instance":
         stripped = after.lstrip()
         if stripped and stripped[0] in ":({[":
-            return kind, "", after
+            return kind, "", text[decl.start("after") :]
     return None
 
 
@@ -10366,21 +10376,29 @@ def _skip_lean_block_comment(text: str, index: int) -> int:
     return len(s)
 
 
-def _strip_lean_decl_comments_preserving_strings(text: str) -> str:
+def _strip_lean_decl_comments_preserving_strings(
+    text: str, *, preserve_positions: bool = False
+) -> str:
     s = str(text or "")
     out: List[str] = []
     index = 0
     while index < len(s):
         if s.startswith("--", index):
             newline = s.find("\n", index)
-            if newline < 0:
-                break
-            out.append("\n")
-            index = newline + 1
+            end = len(s) if newline < 0 else newline + 1
+            out.append(
+                "".join(char if char in "\r\n" else " " for char in s[index:end])
+                if preserve_positions else ("\n" if newline >= 0 else "")
+            )
+            index = end
             continue
         if s.startswith("/-", index):
-            index = _skip_lean_block_comment(s, index)
-            out.append(" ")
+            end = _skip_lean_block_comment(s, index)
+            out.append(
+                "".join(char if char in "\r\n" else " " for char in s[index:end])
+                if preserve_positions else " "
+            )
+            index = end
             continue
         end = _graph_lexical_island_end(s, index)
         if end is not None:
