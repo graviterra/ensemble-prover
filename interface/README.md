@@ -11,6 +11,24 @@ run and launch support. Build the browser assets locally before starting the
 service; Node.js is needed for installation and rebuilding, not while serving
 the built page.
 
+[All documentation](../docs/README.md) · [Provider roles](../docs/providers.md) ·
+[Search behavior](../docs/proof-search.md) · [Operations](../docs/operations.md)
+
+## Workspace map
+
+| View | Use it to |
+| --- | --- |
+| Launcher and Setup | Choose mathematical input, project, providers, search policy, and budgets |
+| Mathematical focus | Read the active approach, blocking obligation, last expensive result, and recorded scheduling reason |
+| Runtime evidence | Inspect source provenance, model/reasoning settings, output allowance, and infrastructure observations |
+| Graph and Formal mathematics | Select a root or helper and inspect its recorded Lean statement, proof, and relationships |
+| Mathematical memory | Inspect eligible candidates and application history; submit supported requests on owned runs |
+| Results | Find attempts, separate proof and process outcomes, and follow sequential sweeps |
+
+Browser controls cover individual proof and translation launches. Use the CLI
+for multi-file formalization campaigns, open-ended research, and starting sweeps.
+The interface can inspect runs independently of whether it owns their processes.
+
 ## Setup
 
 Use Linux, standard CPython 3.11 or 3.12, and Node.js 22.20+ (22.x),
@@ -101,6 +119,8 @@ catalog root, configured with `--memory-root` on the service. The default is
 `~/.local/share/ensemble-prover/mathematical-memory`; the browser cannot supply
 an arbitrary catalog path. Owned browser launches use the service's configured
 root automatically.
+See the [memory guide](../docs/mathematical-memory.md) for the difference between
+retrieval, verified-helper caching, Mini theory, and application history.
 Portable records also require a trusted live source-authority adapter. Without
 one, the default local service hides portable evidence; recorded provenance
 alone cannot authorize disclosure. Session-local eligible records remain

@@ -1,6 +1,12 @@
 # Ensemble Prover User Guide
 
-Last updated: 2026-09-26.
+Last updated: 2026-10-01.
+
+For a map of all workflows and subsystems, start with the
+[documentation home](README.md). Focused guides explain
+[proof search](proof-search.md), [provider roles](providers.md),
+[mathematical memory](mathematical-memory.md), and [run operations](operations.md).
+This page is the detailed command and behavior reference.
 
 Start with a Lean theorem, a natural-language claim, or mathematical notes for
 a longer project. Mini Prover searches for proofs and checks them with Lean.
@@ -16,9 +22,9 @@ gap. Supply a built Lake project to let the same discovery run formalize candida
 arguments, search for proofs with Mini, independently check exports, and return
 feedback to research. A research assessment is not a Lean proof certificate.
 
-This guide covers version 1.17, including the local browser workspace, both experimental NL frontends,
-Codex and Claude Code subscription backends for Mini, and the OpenAI API or
-Codex subscription backend for autonomous research. Older
+This guide covers version 1.17, including the local browser workspace, both
+experimental NL frontends, hosted APIs, Codex and Claude Code subscription
+transports, local inference, research control, and opt-in mathematical memory. Older
 release snapshots may not include the research modules; Mini-only releases also lack the NL
 frontends. Check the help in your installed checkout.
 Run commands from the repository root containing `.venv/` and `ensemble_prover/`,
@@ -61,12 +67,16 @@ Choose the entry point that matches your input:
 | Claims and arguments being investigated by you or external workers | `ensemble_prover.research_claims` | [Coordinated research](#20-coordinate-mathematical-research) |
 | A natural-language problem to investigate autonomously, without choosing proof or disproof in advance | `ensemble_prover.research_claims discovery` | [Autonomous research](#21-run-autonomous-mathematical-research) |
 
-Every proof run needs a trusted, working Lean/Lake project and credentials for
-the selected model provider. For direct Mini Prover input, also supply:
+Every proof run needs a trusted, working Lean/Lake project and access to the
+selected model provider or configured local server. For direct Mini Prover input, supply:
 
 - a Lean source file containing the target theorem; and
-- the target theorem's fully qualified name, except when using the optional
-  PutnamBench adapter.
+- the target theorem's fully qualified name when selecting one specific target.
+
+Without an explicit theorem name, a file or directory input can discover and
+prepare unfinished declarations for sequential proving. Use `--check-input` to
+inspect preparation without model calls. The PutnamBench adapter supplies its
+own target selection.
 
 The NL frontends do not require you to write the target Lean declaration first.
 They do still need an existing, built Lake project with Mathlib. Mini's
@@ -172,6 +182,8 @@ that file.
 | OpenRouter | `openrouter` | none; specify one | `OPENROUTER_API_KEY` |
 | Codex subscription (Mini prover/refiner) | `codex` | none; specify one | `codex login` using ChatGPT |
 | Claude Code subscription (Mini prover/refiner) | `claude-code` | none; specify one | `claude auth login` using Claude.ai |
+| Operator-managed inference | `local` | exact model from deployment profile | endpoint's configured authentication |
+| Cursor subscription | `cursor` | exact model required | generation currently unavailable |
 
 The default prover provider is DeepSeek. Select `--prover openai` explicitly
 if only `OPENAI_API_KEY` is configured. OpenRouter always requires an explicit
@@ -196,15 +208,21 @@ An API key is not required for a subscription-only Mini run.
 Claude Code setup and controls are documented in the
 [Claude Code subscription guide](CLAUDE_CODE_SUBSCRIPTION_BACKEND.md).
 
-The standalone NL frontends have their own API-backed formalizer settings. The
-standalone campaign CLI uses the OpenAI API for all three of its roles:
+The standalone NL frontends have their own formalizer settings. The
+standalone campaign CLI defaults to the OpenAI API for all three of its roles:
 `gpt-5.6-terra` for formalization and independent review, and `gpt-5.6-luna` for
 proof search. See
 [campaign model and budget controls](#campaign-models-and-budgets); Mini's
-provider defaults above do not select the campaign's models.
+provider defaults above do not select the campaign's models. Explicit
+`--formalizer-provider`, `--reviewer-provider`, and `--prover-provider` settings
+also support other API, Codex, Claude Code, and local transports. Single-claim
+translation selects its provider with `--formalizer`. See the
+[workflow routing table](providers.md#roles-and-routing); Cursor generation
+remains unavailable.
 
 Autonomous research defaults to the OpenAI API; `--provider codex` selects the
-Codex subscription backend. `--review-provider` defaults to `--provider` and can
+Codex subscription backend; Claude Code and local deployments are also supported.
+`--review-provider` defaults to `--provider` and can
 explicitly select a different transport. Choose both `--model` and
 `--review-model` at initialization. When a project is configured, the formalizer,
 Mini prover, and refiner inherit `--provider`/`--model`; argument and semantic
@@ -660,6 +678,9 @@ Parallel sampling can multiply cost approximately with the number of samples.
 
 ## 8. Control search breadth
 
+For how these lanes interact, including route contracts, root blockers, helper
+use, and certified refutation, see [proof search](proof-search.md).
+
 The ordinary defaults enable recursive planning, recursive helper proving,
 proof-state scheduling, falsification, verified-helper caching, API search, and
 federated mathematical retrieval. Start with the defaults and change one
@@ -740,6 +761,18 @@ are disabled in automatic recovery; the separate `./research` workflow remains
 available for a dedicated investigation.
 
 ### Direct turns and recursive work
+
+The scheduler prefers eligible work connected to the original theorem while
+retaining exploratory opportunities. Route requirements guide priority but do
+not prove the proposed assembly. Lean-observed use of helpers in accepted
+consumers is distinct from simply having helpers available.
+
+Frontier research adds an independent opt-in allocation policy:
+`--frontier-research observe` records hypothetical decisions;
+`--frontier-research adaptive` changes research allocation across explicit
+approaches and questions. Its default is `off`, even though automatic research
+is enabled. It preserves the existing budget and does not enable formal-state
+search or experiments. See [research policies](proof-search.md#research-and-alternative-approaches).
 
 | Option | Default | Meaning |
 | --- | ---: | --- |
@@ -894,6 +927,10 @@ originating session is unavailable, the helper must be checked and staged again
 in its original theorem context.
 
 ### Mathematical memory
+
+For examples, storage maintenance, the distinction between failed applications
+and false claims, and the limits of cross-problem transfer, see the
+[mathematical memory guide](mathematical-memory.md).
 
 Mathematical memory is an opt-in advisory catalog of reusable mathematical
 results and their application history. It preserves the existing Mini theory,
@@ -1219,6 +1256,11 @@ signals may escalate before all terminal artifacts are flushed.
 
 ## 14. Troubleshooting
 
+Use the [operations guide](operations.md#diagnose-a-slow-or-failed-attempt) to
+interpret mathematical focus, runtime evidence, export delays, local inference
+capacity, and cleanup warnings together. A quiet trace or replaced Lean process
+generation alone does not establish that a run is hung.
+
 ### The selected provider key is missing
 
 Symptom:
@@ -1413,29 +1455,50 @@ CLI.
 
 `--lean-file`, `--putnam-file`, `--theorem-name`, `--project-path`,
 `--lean-project-dir`, `--import`, `--supporting-source-dir`, `--source-dir`,
-`--description`, `--description-file`
+`--description`, `--description-file`, `--input`, `--check-input`,
+`--answer-attempts`, `--rediscover-from`
+
+### Checkpoints and resume
+
+`--resume-from`, `--resume-accept-source-hash`, `--no-checkpoint`
 
 ### Providers, roles, and reasoning
 
 `--prover`, `--prover-model`, `--refiner`, `--refiner-model`,
-`--codex-bin`, `--claude-code-bin`,
+`--codex-bin`, `--claude-code-bin`, `--cursor-bin`,
 `--planner-escalation`, `--planner-escalation-model`, `--reasoning-mode`,
 `--enable-reasoning`, `--disable-reasoning`, `--reasoning-effort`,
 `--prover-reasoning-mode`, `--prover-reasoning-effort`,
 `--refiner-reasoning-mode`, `--refiner-reasoning-effort`
+
+### Local inference and network policy
+
+`--local-inference-config`, `--prover-deployment`, `--refiner-deployment`,
+`--planner-escalation-deployment`, `--inference-policy`, `--network-policy`,
+`--embedding-device`, `--cross-encoder-device`
+
+Profiles define finite compute budgets separately from API cost controls. See
+[local inference](local-inference.md) for compatibility probes, browser
+registration, and unknown-completion recovery. Cursor's presence in parser
+choices does not make generation available.
 
 ### Provider, Lean, wall-clock, and dollar budgets
 
 `--llm-timeout-s`, `--prover-timeout-s`, `--refiner-timeout-s`,
 `--llm-request-timeout-s`, `--prover-request-timeout-s`,
 `--refiner-request-timeout-s`, `--llm-deadline-policy`,
+`--require-output-token-limit`,
 `--max-prove-turns`, `--max-refine-turns`, `--autonomous-research`,
-`--no-autonomous-research`, `--cost-budget-usd`,
+`--no-autonomous-research`, `--frontier-research`, `--cost-budget-usd`,
 `--cost-budget-reserve-output-tokens`, `--lean-timeout-s`,
 `--lean-max-heartbeats`, `--mini-worker-timeout-s`,
 `--mini-run-wall-clock-budget-s`, `--mini-no-strong-progress-budget-s`,
 `--mini-worker-startup-timeout-s`, `--mini-worker-shutdown-timeout-s`,
 `--mini-hard-operation-watchdog`
+
+`--require-output-token-limit` requires an enforceable total output-token bound
+per provider invocation. Subscription transports that cannot provide it fail
+before generation; internal retry request caps are insufficient.
 
 ### Output and trace
 
@@ -1534,6 +1597,12 @@ Instance checks also fit within the remaining engine and aggregate deadlines.
 `--mini-theory-bundle`, `--mini-theory-verifier-timeout-s`,
 `--mini-theory-operation-timeout-s`,
 `--mini-theory-promote-verified-helpers`
+
+### Mathematical memory
+
+`--mathematical-memory`, `--mathematical-memory-root`,
+`--mathematical-memory-seconds`, `--mathematical-memory-research-seconds`,
+`--mathematical-memory-campaign`, `--mathematical-memory-family`
 
 ## 17. A practical first-run checklist
 
@@ -1665,8 +1734,8 @@ start a new campaign to use a changed source collection.
 
 ### Campaign models and budgets
 
-The campaign CLI currently routes all roles through the OpenAI API. These are
-its defaults, independent of the Mini provider defaults:
+The campaign CLI defaults to the OpenAI API. These model defaults are independent
+of the Mini provider defaults:
 
 ```bash
 .venv/bin/python -m ensemble_prover.formalization run \
@@ -1676,6 +1745,12 @@ its defaults, independent of the Mini provider defaults:
   --prover-model gpt-5.6-luna \
   --max-steps 20 --max-model-calls 60
 ```
+
+Set `--formalizer-provider`, `--reviewer-provider`, and `--prover-provider`
+explicitly to use other supported transports. Each role also accepts a
+`--ROLE-deployment` for local inference. See [provider routing](providers.md)
+for subscription and local examples; selecting a Mini provider in another
+command does not configure these roles.
 
 | Option | Meaning |
 | --- | --- |
@@ -1866,7 +1941,9 @@ roles and Codex reviewers. Only API roles need `OPENAI_API_KEY`; there is no
 automatic API fallback. `--codex-bin /path/to/codex` saves a custom executable
 for resume.
 See [Codex setup and limits](CODEX_SUBSCRIPTION_BACKEND.md#autonomous-research).
-Claude Code is not currently a discovery provider.
+Claude Code and local deployments can also supply discovery roles. Use the
+[provider guide](providers.md#roles-and-routing) for the workflow-specific flags
+and [local inference guide](local-inference.md) for profile and budget setup.
 
 Status is JSON; live execution events go to stderr. Inspect the mathematical
 assessment separately from the operational status:

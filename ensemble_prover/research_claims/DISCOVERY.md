@@ -1,6 +1,6 @@
 # Autonomous mathematical research — experimental
 
-Last updated: 2026-09-15.
+Last updated: 2026-10-01.
 
 This executable loop investigates a mathematical problem, starts alternative
 research programs, shares complete arguments, commissions fresh reviews, and
@@ -55,9 +55,12 @@ and never falls back to API billing. `--codex-bin` selects a saved CLI executabl
 The saved `--provider`/`--model` select research, formalizer, Mini prover, and
 refiner roles. `--review-provider`/`--review-model` select both argument and
 semantic statement reviewers. No additional model flags or run commands are
-needed for the integrated loop. The standalone NL and formalization CLIs remain
-API-backed; discovery injects its clients into the formalization core. Claude
-Code is supported by Mini only.
+needed for the integrated loop. Claude Code and configured local deployments
+can also supply research and review roles. Standalone translation and campaign
+CLIs have their own explicit provider settings; discovery injects its saved
+clients into the formalization core. Cursor generation remains unavailable.
+See [provider routing](../../docs/providers.md#roles-and-routing) and
+[local inference](../../docs/local-inference.md) for role flags and limitations.
 See [subscription setup](../../docs/CODEX_SUBSCRIPTION_BACKEND.md#autonomous-research).
 
 Progress events go to stderr; final structured status goes to stdout. Inspect
@@ -70,6 +73,23 @@ python -m ensemble_prover.research_claims read-artifact runs/research/example SH
 ```
 
 ## Automatic formalization, proof, and feedback
+
+### Optional frontier research allocation
+
+New discovery runs accept `--frontier-research observe` or
+`--frontier-research adaptive` at initialization. The default is `off`;
+strategy recovery must remain enabled. Observe records hypothetical allocation
+decisions without changing work. Adaptive maintains approaches and explicit
+questions, gives bounded follow-through to useful reviewed findings, and
+preserves exploratory allocation within the existing budget.
+
+Formal priority depends on current checked reductions and revalidated exports.
+Source observations, experiments, and informal approaches retain their own
+evidence status. These modes do not enable experiments or change the global
+formal-state-search default. Resume retains the saved mode. See
+[proof and research scheduling](../../docs/proof-search.md#research-and-alternative-approaches).
+
+### Formalization handoff
 
 When the project is configured, a written proof with a `supported` review or a
 counterexample with a `refuted` review automatically queues a formalization
@@ -256,9 +276,10 @@ Formalization still requires its own statement review and Lean admission.
 
 Running that campaign through `python -m ensemble_prover.formalization run ...`
 is a separate authorization. Its nested prover requests are **not** covered by
-the research request cap. This separate campaign uses the standalone CLI's API
-model settings. Automatic proof work inside `discovery run` uses the saved
-discovery providers and shares its global cap instead.
+the research request cap. This separate campaign uses the standalone CLI's
+explicit provider/model settings, defaulting to OpenAI. Automatic proof work
+inside `discovery run` uses the saved discovery providers and shares its global
+cap instead.
 
 Recovery workers and reviewers can search Crossref metadata, fetch public sources,
 and inspect original PDF pages. Coverage is not comprehensive; unavailable or

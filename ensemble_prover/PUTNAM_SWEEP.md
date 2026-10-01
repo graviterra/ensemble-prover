@@ -1,5 +1,7 @@
 # Random unsolved Putnam sweep
 
+[Documentation home](../docs/README.md) · [Operating long runs](../docs/operations.md)
+
 From the repository root, run:
 
 ```bash
@@ -98,6 +100,11 @@ Override the deadlines before `--`, if needed:
   -- --prover openai --parallel-samples 2
 ```
 
+Use `--no-acceptance-cutoffs` before `--` to leave proof progress timing to Mini's
+own limits. Alternatively, set either acceptance deadline to `0` to disable that
+individual gate. These choices are saved in the manifest and cannot be changed
+by overriding flags on resume. Startup and cleanup supervision remain separate.
+
 ## Preview and resume
 
 Preview the complete queue without making provider calls:
@@ -116,8 +123,12 @@ Start that exact saved queue:
 ```
 
 Use the same resume command after Ctrl-C. Resume preserves the queue, seed,
-provider arguments, selection policy, and deadlines. Completed failed/cutoff attempts are skipped;
-a cleanly interrupted problem gets a new attempt and fresh clock. A fresh sweep
+provider arguments, selection policy, and deadlines. Completed failed/cutoff attempts are skipped.
+A cleanly interrupted problem gets a new attempt directory. When its latest
+checkpoint matches the current executor and saved policy and has remaining
+authorization, the sweep resumes that Mini state automatically; otherwise it
+starts a fresh attempt. Check `resumed_from` and the saved command in the manifest
+to distinguish these cases. Resumed Mini work retains its spent budgets. A fresh sweep
 reconsiders all problems still unsolved. Pass `--seed INTEGER` when creating a
 sweep to reproduce its shuffle over the same unsolved set.
 
@@ -128,6 +139,15 @@ A sweep lock prevents two owners from running the same queue. Resume refuses an
 attempt left running or with unconfirmed cleanup after a crash; inspect its
 recorded PID and logs before recovering it. It also refuses changed problem
 sources. Do not edit the manifest to bypass these checks while work is active.
+
+Terminal provider protocol or account failures pause the sweep instead of
+advancing through more problems with an unavailable provider. Repair the
+configuration and explicitly resume. Inspect the saved failure reason and
+cleanup status before retrying.
+
+The browser's **Follow sweep** control follows recorded attempt order within one
+sweep. It does not launch the sweep or change its saved policy. The Results view
+is bounded; use the manifest for complete sweep accounting.
 
 ## Results
 

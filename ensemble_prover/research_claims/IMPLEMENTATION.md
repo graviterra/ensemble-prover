@@ -1,6 +1,6 @@
 # Research claim ledger and discovery implementation
 
-Last updated: 2026-09-10.
+Last updated: 2026-10-01.
 
 The maintained prover runs through `mini_prover` → `mini_session.factory` →
 `MiniSession`. `ProofDossier`, `ProofGraph`, and `ProofState` record formal search;
@@ -39,6 +39,12 @@ See
   exact required downstream context, injected model clients, Mini execution,
   full feedback, independently checked exports, and validated receipts.
 - `experiments.py`: optional fail-closed namespace-isolated Python observations.
+- `strategy.py`, `strategy_runtime.py`, `strategy_discovery.py`: scoped
+  objections, bounded recovery allocations, and integration with proof work.
+- `literature.py`, `research_memory.py`: source acquisition, reading coverage,
+  and retained evidence for research decisions.
+- `frontier/`: approach identity, root-contribution evidence, bounded
+  investigations, allocation, and persistence for the optional frontier policy.
 
 Correctness is `proposed`, `supported`, `refuted`, or `unresolved`. Verification
 lists written arguments, independent reviews, finite computations, source
@@ -62,8 +68,9 @@ and all diagnostic artifacts are retained for feedback.
 
 Research, formalizer, prover, and refiner inherit the saved `provider`/`model`;
 argument and semantic reviewers inherit `review_provider`/`review_model`.
-The integrated loop supports OpenAI API and Codex subscription clients. Standalone
-NL/formalization CLIs remain API-backed, and Claude Code remains Mini-only.
+The integrated loop supports OpenAI API, Codex, Claude Code, and configured
+local inference clients. Standalone NL/formalization CLIs select their providers
+separately. Cursor configuration is recognized but generation is unavailable.
 An additive transport dispatch guard charges every nested concrete dispatch to
 the discovery ledger without replacing Mini's own observer. Request limits span
 roles and resumes; the wall-clock limit includes downtime. Default proof intervals
@@ -90,7 +97,10 @@ compatibility fence: older clients cannot misroute subscription discovery runs
 through the API. Version 6 adds explicit closed-loop authorization. Record-preserving
 upgrades from versions 1–5 require operator action and retain providers and budgets.
 They leave automatic proving disabled; a new run with a configured project is
-required to authorize it.
+required to authorize it. Schema 7 records strategy recovery authorization;
+explicit upgrades also accept schema 6 and preserve existing closed-loop
+settings. New initialization is required to enable the integrated recovery
+workflow on older research-only runs.
 
 Changing a claim increments its revision and invalidates dependent claims and
 their assessments transitively. Old evidence, reviews, failed routes and
@@ -116,12 +126,13 @@ arrives without a statement change.
 - Reject stale bindings, modified exports, missing receipts, and manual kernel
   reports as proof authority; enforce shared admission at nested dispatches.
 
-## Follow-on work
+## Current limits
 
-Automatic literature/source lookup, learned portfolio allocation, a cross-run
-method library, and distributed execution remain unimplemented. Discovery
+Literature/source lookup and optional frontier allocation are available, but
+source coverage is not comprehensive. Learned portfolio allocation, a cross-run
+research-method library, and distributed execution remain unimplemented. Discovery
 performance and literature novelty have not been established. Research-only runs
 remain available without a project; manually launched formalization campaigns
-keep separate authorization and budgets. The manual ledger records human/agent
+keep separate authorization and budgets. The manual ledger records human/model
 assertions and provenance; reviewer identity there is asserted locally, not
 authenticated.

@@ -14,12 +14,13 @@
   <a href="#documentation">Documentation</a>
 </p>
 
-Ensemble Prover coordinates language models, recursive lemma planning,
-mathematical retrieval, proof repair, and Lean verification in an autonomous
-proof-search system. Give it a theorem or an English claim, follow the work in
-your browser, and inspect the formal mathematics behind recorded progress.
+Ensemble Prover is a mathematical research and proof workspace built around
+Lean 4. It coordinates language models, recursive lemma planning, mathematical
+retrieval, proof repair, and research into alternative approaches. Give it a
+theorem or an English claim, follow the work in your browser, and inspect the
+formal mathematics behind recorded progress.
 
-**433 Putnam problems with saved solutions—and counting.**
+**500 distinct Putnam problems with saved solutions—and counting.**
 
 [Results and evaluation scope](#results)
 
@@ -83,21 +84,35 @@ helpers back into work on the original theorem.
 
 | Capability | What it enables |
 | --- | --- |
-| **Recursive proof search** | Decompose difficult work into scoped helper lemmas, explore alternatives, and assemble a root proof. |
-| **Lean feedback and repair** | Check candidate terms and tactics against the target project, then use concrete failures to guide the next attempt. |
-| **Retrieval and reuse** | Find relevant declarations and recover checked helpers from compatible saved work. |
-| **Research when work stalls** | Investigate alternative arguments, formalize candidates, and return proof feedback within the configured workflow and budgets. |
-| **Model coordination** | Configure prover, refiner, and planner roles; use parallel proof samples and explicit time, call, and API cost controls. |
-| **Persistent work** | Retain checkpoints, artifacts, and recorded progress for inspection and supported recovery workflows. |
+| **Recursive proof search** | Develop scoped helper lemmas, track route dependencies, and assemble a proof of the original theorem. |
+| **Progress toward the root** | Prefer blocking obligations and ready assemblies while preserving opportunities for speculative mathematics. |
+| **Lean feedback and formal search** | Repair candidates from concrete errors; optionally explore a persistent frontier of tactic states. |
+| **Counterexample certification** | Investigate doubtful claims and require an audited Lean proof before treating a claim as refuted. |
+| **Retrieval and reusable theory** | Find declarations, test applications, recheck cached helpers, and build compatible verified theory bundles. |
+| **Mathematical memory** | Optionally record applicability, successful use, failed applications, and independently checked generalization work. |
+| **Research and alternatives** | Investigate obstructions, inspect sources, sustain alternative approaches, and return findings to proof work under existing budgets. |
+| **Formalization and answer discovery** | Translate claims, develop multi-file projects, or propose an explicit answer before proving the instantiated question. |
+| **Model coordination** | Select prover, refiner, planner, and workflow-specific roles across API, subscription, and configured local inference transports. |
+| **Persistent work** | Retain checkpoints, accounting, source provenance, and evidence for inspection and supported recovery. |
+| **Verified exports** | Reconstruct source, replay it in Lean, audit axioms, and produce readable proofs and dependency graphs. |
 
 English input first passes through formalization. Longer developments can use
 resumable campaigns to build definitions and supporting theorems across files.
 Autonomous research can investigate arguments and counterexamples before
 handing candidates to formalization and proof search.
 
+The search controls are independent. Recursive proving and automatic research
+are enabled for new Mini runs; formal-state search, adaptive frontier allocation,
+mathematical memory, and helper promotion require their own opt-ins. Memory's
+portable application history additionally requires a trusted source-authority
+integration; the standard CLI does not automatically transfer that history
+between problems. [Explore the system and its defaults →](docs/proof-search.md)
+
 **The proof certificate is a verified export.** A helper or internal solve is
 progress toward it. Lean verifies the formal statement; review generated
 statements and definitions to check that they express your intended mathematics.
+The system supports work on open problems, but does not promise autonomous
+solutions, complete literature coverage, or novelty certification.
 
 ## Quick start
 
@@ -144,7 +159,8 @@ directories. Keep it local; it is not a shared network service.
 [CLI quick start](docs/CLI_QUICKSTART.md) ·
 [Codex setup](docs/CODEX_SUBSCRIPTION_BACKEND.md) ·
 [Claude Code setup](docs/CLAUDE_CODE_SUBSCRIPTION_BACKEND.md) ·
-[Local inference, budgets, and readiness](docs/local-inference.md)
+[Local inference, budgets, and readiness](docs/local-inference.md) ·
+[Provider and workflow compatibility](docs/providers.md)
 
 <a id="run-the-prover"></a>
 
@@ -214,8 +230,8 @@ they can support a proof claim.
 
 | Distinct problems with saved solutions | Listed on PutnamBench |
 | :---: | :---: |
-| **433 distinct Putnam problems** | **65 problems** |
-| Cumulative archive · September 30, 2026 | Public metadata checked · September 26, 2026 |
+| **500 distinct Putnam problems** | **65 problems** |
+| Cumulative archive · October 1, 2026 | Public metadata checked · September 26, 2026 |
 
 The cumulative count combines models, configurations, and budgets and does not
 establish a controlled benchmark solve rate. Historical artifacts can have
@@ -235,14 +251,20 @@ and contributors for making this benchmark available. See
 
 ## Documentation
 
+[Documentation home: workflows, subsystems, and feature availability →](docs/README.md)
+
 | Learn about | Start here |
 | --- | --- |
 | Browser installation, controls, storage, and limitations | [Interface guide](interface/README.md) |
 | Terminal commands for proving, formalization, and research | [CLI quick start](docs/CLI_QUICKSTART.md) |
 | Providers, project setup, search, and troubleshooting | [User Guide](docs/USER_GUIDE.md) |
+| Model roles, hosted APIs, subscriptions, and local inference | [Providers](docs/providers.md) |
+| Root blockers, recursive helpers, formal search, and refutation | [Proof search](docs/proof-search.md) |
+| Retrieval, reusable theory, application history, and generalization | [Mathematical memory](docs/mathematical-memory.md) |
 | Time, provider-call, and API cost controls | [Budgets](docs/USER_GUIDE.md#7-set-time-and-cost-boundaries) |
 | Proof status, exports, and inspection | [Reading results](docs/USER_GUIDE.md#11-determine-whether-a-run-succeeded) · [Exports](docs/USER_GUIDE.md#12-standalone-exports-and-proof-graphs) |
 | Checkpoints, interruption, and resumption | [Recovery guide](docs/USER_GUIDE.md#13-replay-and-interruption-behavior) |
+| Monitoring, diagnosing slow work, and managing long runs | [Operations](docs/operations.md) |
 | Research execution and formalization handoffs | [Research guide](ensemble_prover/research_claims/DISCOVERY.md) |
 | Local execution, privacy, and vulnerability reporting | [Security](SECURITY.md) |
 

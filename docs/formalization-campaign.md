@@ -4,6 +4,16 @@ This guide covers advanced operation beyond the
 [User Guide's campaign walkthrough](USER_GUIDE.md#19-run-a-multi-file-formalization-campaign).
 Start there for initialization, model selection, budgets, task revision, and export.
 
+A campaign develops definitions and supporting theorems as a dependency-ordered
+project. Formalization, independent semantic review, Mini proving, and checked
+module admission have distinct responsibilities. A reviewed statement or a
+paused campaign is not a verified root export.
+
+The CLI defaults to OpenAI models but accepts explicit API, Codex, Claude Code,
+and local role selections. Use the [provider guide](providers.md#roles-and-routing)
+for the exact role flags. Local deployments carry their finite shared compute
+allocation through child proof work. Cursor generation is currently unavailable.
+
 ## Replay an exported project
 
 Use the command in the exported bundle's `README.md`. Its form is:

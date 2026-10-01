@@ -1,8 +1,8 @@
 # Codex subscription backend
 
-Last updated: 2026-09-29.
+Last updated: 2026-10-01.
 
-Mini and autonomous discovery can use your saved **ChatGPT Codex subscription
+Mini, formalization, and autonomous discovery can use your saved **ChatGPT Codex subscription
 sign-in** for their model roles. Select `codex` as the provider and explicitly select a model
 available to your Codex account. API providers remain available independently.
 
@@ -45,10 +45,12 @@ role uses Codex, automatic planner escalation is disabled so an API key elsewher
 in the environment cannot silently activate an API-billed planner. Explicit
 planner provider selections retain their usual behavior.
 
-This backend applies to Mini's prover/refiner and every model role in discovery's
-integrated research-to-proof loop. The standalone `nl_input` and `formalization`
-CLIs retain their API-backed model settings; the discovery loop injects its saved
-clients into the formalization core. Claude Code is supported by Mini only.
+This backend applies to Mini's prover/refiner, standalone translation and
+campaign roles, and discovery's integrated research-to-proof loop. Select
+`--formalizer codex` for `nl_input`, or the campaign's explicit
+`--formalizer-provider`, `--reviewer-provider`, and `--prover-provider` flags.
+Each role needs its own appropriate model selection. See
+[provider routing](providers.md#roles-and-routing).
 
 ## Autonomous research
 

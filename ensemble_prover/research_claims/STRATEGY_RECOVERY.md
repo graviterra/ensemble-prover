@@ -11,10 +11,16 @@ The saved overall request and time authorization, user cancellation, verified
 original-root completion, and existing integrity/operational failures still apply.
 This does not promise unlimited provider access or indefinite execution.
 
-Recovery is enabled by default for **new discovery CLI runs**. Standalone Mini
-runs acquire these controls when orchestrated by discovery. An existing Mini
-process does not acquire them through a code change; stopped runs can be adopted
-into a fresh discovery ledger.
+Recovery is enabled by default for **new discovery CLI runs**. New standalone
+Mini runs also have their own automatic research coordinator, which returns
+advice to the existing proof session under its budgets. Discovery adds the
+separate research ledger and integrated formalization workflow described here.
+An existing process does not acquire new settings through a source update;
+stopped Mini runs can be adopted into a fresh discovery ledger.
+
+For the optional `--frontier-research` policy, root-oriented allocation, and the
+difference between checked progress and useful research observations, see
+[proof search](../../docs/proof-search.md#research-and-alternative-approaches).
 
 ## Recognize a blocked proof route
 
@@ -63,8 +69,11 @@ and starts research. It defaults to 4 hours and 200 model calls; optional
 `--hours` and `--requests` set a different initial budget. Add `--source finding.txt`
 to include an outside finding, or `--prepare` to set up without model calls.
 The same command with the printed research directory resumes within its saved
-budget; adding `--status` inspects progress. Only saved Codex/OpenAI transports
-can be inherited. Other transports need an explicit supported `--provider`.
+budget; adding `--status` inspects progress. Saved OpenAI, Codex, Claude Code,
+and local transports can be inherited. Local adoption requires the original
+private deployment snapshot and matching model; it preserves local-only policy
+and does not substitute a hosted provider. Other transports need an explicit
+supported `--provider`. Cursor generation remains unavailable.
 
 For full control over individual settings, use the underlying discovery CLI:
 

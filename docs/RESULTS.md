@@ -5,13 +5,19 @@ listing. They have different evidence and evaluation scopes.
 
 | Record | Problems | Date | Evidence |
 | --- | ---: | --- | --- |
-| Cumulative saved solutions | **433 distinct problems** | September 30, 2026 | Distinct Putnam problem identifiers in the project’s local solved archive |
+| Cumulative saved solutions | **500 distinct problems** | October 1, 2026 | Distinct Putnam problem identifiers in the project’s local solved archive |
 | PutnamBench listing | **65 problems** | Public data checked September 26, 2026 | [Leaderboard](https://trishullab.github.io/PutnamBench/leaderboard.html) and [results metadata](https://trishullab.github.io/PutnamBench/results.json) |
 
 The archive count combines models, configurations, and budgets and
 counts each problem once, consolidating multiple proof files or filename
 variants for the same problem. The archive continues to grow. It is not a
 controlled benchmark solve rate. The listed 65 are included in the cumulative total; the figures should not be added.
+
+The dated archive count uses distinct `putnam_YEAR_aN` / `putnam_YEAR_bN`
+identifiers in top-level saved `.lean` filenames. It excludes graph files,
+presentation backups, and duplicate proofs. These private archive files are not
+bundled with this repository. The public listing has its own last-checked date;
+the archive update does not imply that the leaderboard was updated or rechecked.
 
 Historical saved solutions have differing verification and axiom-policy records.
 Some artifacts use axioms outside the current export policy; the presence of a

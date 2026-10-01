@@ -6,6 +6,8 @@ workspace, start with the [homepage](../README.md#quick-start) or
 
 Run commands from the repository root. The [User Guide](USER_GUIDE.md) explains
 providers, budgets, project setup, exports, and recovery in detail.
+Use the [documentation map](README.md) to find every subsystem, or the
+[operations guide](operations.md) when supervising a long attempt.
 
 ## Install the CLI
 
@@ -14,11 +16,12 @@ providers, budgets, project setup, exports, and recovery in detail.
 - Linux
 - Standard CPython 3.11 or 3.12
 - Lean toolchain compatible with the target Lake project
-- An API key for the selected provider, or a ChatGPT Codex / Claude Code
-  subscription sign-in for Mini's prover and refiner
+- An API key, a compatible Codex / Claude Code subscription sign-in, or an
+  operator-configured local inference deployment for each enabled model role
 
 The manual research ledger needs neither Lean nor provider credentials.
-Autonomous research uses the OpenAI API or Codex subscription sign-in and does not need Lean until the
+Autonomous research supports OpenAI, Codex, Claude Code, and configured local
+inference and does not need Lean until the
 formalization handoff. Optional Python experiments require Linux bubblewrap
 with usable unprivileged user namespaces; there is no unsandboxed fallback.
 
@@ -123,6 +126,45 @@ Each attempt must commit one distinct accepted proof by 1,200 seconds and two by
 have a separate 1,200-second cap. After two timely acceptances, normal
 budgets apply. See the [sweep guide](../ensemble_prover/PUTNAM_SWEEP.md) for a
 no-provider-call preview, resume commands, and counting/cleanup rules.
+
+## Choose optional search features
+
+Start with the ordinary proof command, then add controls deliberately. They
+operate inside the run's existing authorization:
+
+| Add to a new Mini command | Purpose |
+| --- | --- |
+| `--refiner claude-code --refiner-model YOUR_MODEL --cost-budget-usd 0` | Give a subscription refiner the stalled prover transcript |
+| `--parallel-samples 2` | Run two independent proof samples |
+| `--formal-state-search` | Enable bounded persistent tactic-state search |
+| `--frontier-research observe` | Record hypothetical research allocation decisions |
+| `--frontier-research adaptive` | Allocate research among explicit approaches and questions |
+| `--mathematical-memory assist --mathematical-memory-seconds 90` | Permit bounded memory retrieval and application probes |
+| `--mini-theory-promote-verified-helpers` | Independently check eligible generic helpers for theory publication |
+
+These options are not a recommended all-on preset. Formal-state search,
+frontier research, mathematical memory, and promotion are independent opt-ins.
+Automatic research recovery is already enabled in new Mini runs. See
+[proof search](proof-search.md) and [memory](mathematical-memory.md) for their
+evidence boundaries, defaults, and current limitations.
+
+For a local model, follow the complete
+[deployment example](local-inference.md#launch-a-proof-or-translation).
+Local inference has finite compute budgets even when marginal API cost is zero.
+
+## Continue a stopped proof attempt
+
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover \
+  --resume-from /path/to/previous-attempt \
+  --output-dir /path/to/new-attempt
+```
+
+Resume keeps the saved settings and spent budgets. Preserve the attempt
+directories and shared checkpoint registry. For changed executor code, exhausted
+limits, or missing checkpoints, use the [recovery guide](operations.md#stop-and-resume).
+Answer preparation itself is not resumable; an admitted answer's proof checkpoint
+is. Sweeps, campaigns, and discovery use their own resume commands.
 
 ## Start from natural language
 

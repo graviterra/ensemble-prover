@@ -1,5 +1,8 @@
 # Local inference and Cursor availability
 
+[Provider and role map](providers.md) · [Operations](operations.md) ·
+[All documentation](README.md)
+
 Local inference uses an operator-managed server through an OpenAI-compatible
 chat interface. A deployment profile identifies the exact served model, its
 limits, the wire protocol, and the resources shared with other requests. The
@@ -305,6 +308,14 @@ without refunding consumed allocation or asserting successful completion.
 and requires a wall-time receipt. Each command has `--help` for its required
 identity and ledger arguments. The prover does not stop an externally managed
 inference server to release a slot.
+
+The same operator entry point exposes these recovery commands:
+
+```bash
+.venv/bin/python -m ensemble_prover.local_inference.readiness_cli inspect --help
+.venv/bin/python -m ensemble_prover.local_inference.readiness_cli reconcile --help
+.venv/bin/python -m ensemble_prover.local_inference.readiness_cli settle-wall --help
+```
 
 ## Local inference is not an offline guarantee
 

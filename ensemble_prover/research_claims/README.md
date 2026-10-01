@@ -1,6 +1,12 @@
 # Research claim ledger
 
-Last updated: 2026-09-10.
+Last updated: 2026-10-01.
+
+For choosing a workflow, start with the [documentation map](../../docs/README.md).
+This guide describes the manual ledger and its evidence semantics. Use
+[discovery](DISCOVERY.md) for autonomous execution and
+[strategy recovery](STRATEGY_RECOVERY.md) for pinned targets, source evidence,
+and adoption of stopped proof attempts.
 
 This package implements durable claims, evidence, independent review, and bounded
 assignments for coordinated mathematical research.

@@ -2,7 +2,7 @@
 
 The `ensemble_prover.nl_input` module translates a text or LaTeX mathematical
 claim to Lean definitions and a proposition, checks them with Lean, and starts Mini Prover.
-It is included in release 1.09; older Mini-only releases do not include it.
+It is included in version 1.17 alongside the multi-file campaign workflow.
 Run the commands below from the repository
 root containing `.venv/`, not from inside the `ensemble_prover/` package.
 
@@ -10,8 +10,8 @@ For resumable, multi-file development with independent model review, use the
 [formalization campaign](formalization-campaign.md). For setup and a comparison
 of input workflows, start with the [User Guide](USER_GUIDE.md#1-what-you-supply).
 
-Use the same Python environment and API-key environment variables as Mini
-Prover. Supply an existing, built Lake project with Mathlib available. Replace
+Use the same Python environment and the chosen provider's credentials or local
+deployment configuration. Supply an existing, built Lake project with Mathlib available. Replace
 `lean_project` below with its path; no Lean project is bundled with the release.
 
 ```bash
@@ -35,6 +35,12 @@ Mini Prover's existing defaults. Configure these roles separately:
 Arguments after `--` go to Mini Prover. Input-selection and environment options
 cannot replace the generated theorem. All normal proof budgets and model
 options remain available through that handoff.
+
+The formalizer also supports the other API providers, Codex, Claude Code, and
+configured local inference. Cursor generation remains unavailable. See
+[providers](providers.md) for role flags and [local inference](local-inference.md)
+for deployments, shared compute budgets, and network policy. Subscription-only
+Mini handoffs require `--cost-budget-usd 0` after the separator.
 
 To translate and inspect without starting a proof search:
 

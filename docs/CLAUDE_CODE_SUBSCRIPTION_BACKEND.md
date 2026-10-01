@@ -1,7 +1,7 @@
 # Claude Code subscription backend
 
-Mini can use your saved Claude.ai subscription login for the prover and refiner
-roles through the installed Claude Code CLI. Select provider `claude-code` and
+Mini, formalization, and autonomous discovery can use your saved Claude.ai
+subscription login through the installed Claude Code CLI. Select provider `claude-code` and
 an explicit model available to your account. The transport runs the official
 `claude -p` interface; it does not extract tokens or call private endpoints.
 
@@ -52,8 +52,11 @@ behavior. Codex and Claude Code executable choices are saved only for runs that
 use those providers. Bare `--resume-from /path/to/run` inherits both choices and
 rejects explicitly conflicting replacements.
 
-This backend applies to Mini's prover and refiner roles. The natural-language
-frontends' formalizer and campaign model settings remain API-backed.
+For single-claim translation, use `--formalizer claude-code` with an explicit
+formalizer model. Campaigns select each role with `--formalizer-provider`,
+`--reviewer-provider`, and `--prover-provider`; discovery uses `--provider` and
+`--review-provider`. See the [routing table](providers.md#roles-and-routing).
+These workflows keep their own budget and resume semantics.
 
 ## Request behavior and isolation
 
