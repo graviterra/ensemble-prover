@@ -231,7 +231,7 @@ independent acceptance.
 Our Putnam evaluation uses the formalized problems provided by
 [PutnamBench](https://github.com/trishullab/PutnamBench). We thank its authors
 and contributors for making this benchmark available. See
-[the paper](https://arxiv.org/abs/2407.11214) and the citation below.
+[the paper](https://arxiv.org/abs/2407.11214).
 
 ## Documentation
 
@@ -263,21 +263,5 @@ and contributors for making this benchmark available. See
 
 Identify the version or commit used for reproducibility.
 [CITATION.cff](CITATION.cff) provides machine-readable citation metadata.
-
-### PutnamBench
-
-When reporting results using PutnamBench, please also cite the benchmark:
-
-```bibtex
-@misc{tsoukalas2024putnambenchevaluatingneuraltheoremprovers,
-  title={PutnamBench: Evaluating Neural Theorem-Provers on the Putnam Mathematical Competition},
-  author={George Tsoukalas and Jasper Lee and John Jennings and Jimmy Xin and Michelle Ding and Michael Jennings and Amitayush Thakur and Swarat Chaudhuri},
-  year={2024},
-  eprint={2407.11214},
-  archivePrefix={arXiv},
-  primaryClass={cs.AI},
-  url={https://arxiv.org/abs/2407.11214},
-}
-```
 
 Ensemble Prover is licensed under the MIT License. See [LICENSE](LICENSE).
