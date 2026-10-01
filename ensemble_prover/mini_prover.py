@@ -11098,6 +11098,9 @@ async def prove_problem(
     recorder: Optional[RunRecorder] = None,
     searcher: Optional[MathlibApiSearcher] = None,
     mathematical_retrieval_enabled: bool = True,
+    mathematical_memory_config: Optional[Any] = None,
+    mathematical_memory_policy: Optional[Any] = None,
+    mathematical_memory_provenance_registry: Optional[Any] = None,
     lean_check_tool_enabled: bool = True,
     try_lean_tool_enabled: bool = True,
     compute_examples_tool_enabled: Optional[bool] = None,
@@ -11391,6 +11394,9 @@ async def prove_problem(
         mathematical_retrieval_enabled=bool(
             mathematical_retrieval_enabled
         ),
+        mathematical_memory_config=mathematical_memory_config,
+        mathematical_memory_policy=mathematical_memory_policy,
+        mathematical_memory_provenance_registry=mathematical_memory_provenance_registry,
         lean_check_tool_enabled=lean_check_tool_enabled,
         try_lean_tool_enabled=try_lean_tool_enabled,
         compute_examples_tool_enabled=compute_examples_tool_enabled,
@@ -12006,6 +12012,18 @@ def _auto_export_solved_run(
         "Solved Lean exported: "
         f"{record['output_path']} ({', '.join(visibility_bits)})"
     )
+    try:
+        from .mathematical_memory.export_observer import observe_verified_export
+
+        observe_verified_export(Path(output_dir), result)
+    except Exception as exc:
+        # Memory is advisory; source/callback unavailability cannot change the
+        # independently checked ordinary solved-export outcome.
+        import logging
+
+        logging.getLogger(__name__).debug(
+            "Mathematical memory export observation unavailable: %s", type(exc).__name__
+        )
     return _mini_solved_export_status(
         "verified", path=record["output_path"], diagnostic=diagnostic,
     )
@@ -12481,6 +12499,21 @@ _PROVIDER_ENV_VARS = {
 }
 _REASONING_PROVIDER_DEFAULT = "provider-default"
 _MINI_THEORY_MODE_DEFAULT = "build"
+
+
+def _effective_mathematical_memory_config(args: argparse.Namespace) -> Any:
+    from .mathematical_memory.config import MemoryConfig
+    mode = str(getattr(args, "mathematical_memory", "off"))
+    research = float(getattr(args, "mathematical_memory_research_seconds", 0.0))
+    seconds = float(getattr(args, "mathematical_memory_seconds", 90.0))
+    if research > seconds:
+        raise ValueError("memory research allocation must fit inside the memory action allowance")
+    return MemoryConfig(mode=mode,
+        root=str(Path(getattr(args, "mathematical_memory_root", Path.home() / ".local" / "share" / "ensemble-prover" / "mathematical-memory")).expanduser()),
+        theory_mode=_effective_mini_theory_mode(args), action_seconds=seconds,
+        research_seconds=research, research_allocation_id="mathematical_memory_research" if research > 0 else "",
+        campaign_id=str(getattr(args, "mathematical_memory_campaign", "")),
+        family_id=str(getattr(args, "mathematical_memory_family", "")))
 
 
 def _effective_mini_theory_mode(args: argparse.Namespace) -> str:
@@ -13466,6 +13499,12 @@ def _build_argparser() -> argparse.ArgumentParser:
             "Disable Mathlib API search. The CLI default is --api-search on."
         ),
     )
+    p.add_argument("--mathematical-memory", choices=("off", "observe", "assist", "develop"), default="off", help="Persist mathematical experience; assist enables bounded probes, develop enables allocated theory research.")
+    p.add_argument("--mathematical-memory-root", default=str(Path.home() / ".local" / "share" / "ensemble-prover" / "mathematical-memory"))
+    p.add_argument("--mathematical-memory-seconds", type=float, default=90.0, help="Total memory action allowance shared by this attempt and its children.")
+    p.add_argument("--mathematical-memory-research-seconds", type=float, default=0.0, help="Research allowance within the memory action allowance; requires theory build.")
+    p.add_argument("--mathematical-memory-campaign", default="")
+    p.add_argument("--mathematical-memory-family", default="")
     p.add_argument(
         "--mathematical-retrieval",
         dest="mathematical_retrieval",
@@ -15759,6 +15798,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 mathematical_retrieval_enabled=bool(
                     getattr(args, "mathematical_retrieval", True)
                 ),
+                mathematical_memory_config=_effective_mathematical_memory_config(args),
                 lean_check_tool_enabled=bool(args.lean_check_tool),
                 try_lean_tool_enabled=bool(getattr(args, "try_lean_tool", True)),
                 compute_examples_tool_enabled=bool(
@@ -16755,6 +16795,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                         cost_budget_pricing_preflight
                     ),
                     **usage_summary,
+                    "mathematical_memory_config": _effective_mathematical_memory_config(args).to_record(),
                     "mini_theory_mode": str(
                         _effective_mini_theory_mode(args)
                     ),

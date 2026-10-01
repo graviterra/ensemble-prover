@@ -52,10 +52,17 @@ def _export_one(output_dir: Path, project_dir: Path, solved_dir: Path | None) ->
         "diagnostic": record.export_verification_output,
         "record": {
             "output_path": record.output_path,
+            "verified_output_path": str(
+                (Path(record.output_path) if Path(record.output_path).is_absolute()
+                 else _PROJECT_ROOT / record.output_path).absolute()
+            ),
             "answer_visibility": record.answer_visibility,
             "opaque_mode": record.opaque_mode,
             "allow_official_answer_visibility": record.allow_official_answer_visibility,
             "official_answer_payload_present": record.official_answer_payload_present,
+            "verified_source_digest": getattr(record, "verified_source_digest", ""),
+            "accepted_root_proof_hash": getattr(record, "accepted_root_proof_hash", ""),
+            "export_occurrence_id": uuid.uuid4().hex,
         },
     }
 

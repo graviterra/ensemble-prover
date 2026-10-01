@@ -6,6 +6,7 @@ import os
 import hashlib
 import hmac
 import json
+import math
 import re
 import secrets
 import signal
@@ -14,6 +15,8 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextvars import ContextVar
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
@@ -32,6 +35,10 @@ from .promotion_context import (
 )
 from .store import TheoryStore
 from ..local_inference.network_policy import prepare_owned_subprocess
+
+_VERIFY_RESOURCES: ContextVar[tuple[float | None, int | None, int | None]] = ContextVar(
+    "mini_theory_verify_resources", default=(None, None, None)
+)
 
 
 _DECL_RE = re.compile(
@@ -71,7 +78,6 @@ def _audit_markers(output: str, marker: str, arity: int) -> tuple[tuple[str, ...
             raise ValueError("malformed theory audit marker")
         results.append(tuple(payload))
     return tuple(dict.fromkeys(results))
-
 
 
 @dataclass(frozen=True)
@@ -115,6 +121,83 @@ class TheoryBundleVerifier:
         self,
         candidate: TheoryBundleCandidate,
         *,
+        cancellation_event: Optional[threading.Event] = None,
+        forbidden_target_statements: Sequence[str] = (),
+        deadline_monotonic: float | None = None,
+        max_heartbeats: int | None = None,
+        memory_mb: int | None = None,
+    ) -> TheoryVerificationResult:
+        from ensemble_prover.lean_runner import (
+            current_lean_deadline,
+            current_lean_memory_limit,
+            current_lean_heartbeat_limit,
+            lean_resource_scope,
+        )
+
+        if current_lean_deadline() is not None:
+            deadline_monotonic = (
+                min(deadline_monotonic, current_lean_deadline())
+                if deadline_monotonic is not None
+                else current_lean_deadline()
+            )
+        if current_lean_memory_limit() is not None:
+            memory_mb = (
+                min(memory_mb, current_lean_memory_limit())
+                if memory_mb is not None
+                else current_lean_memory_limit()
+            )
+        if current_lean_heartbeat_limit() is not None:
+            max_heartbeats = (
+                min(max_heartbeats, current_lean_heartbeat_limit())
+                if max_heartbeats is not None
+                else current_lean_heartbeat_limit()
+            )
+        if memory_mb is not None and (type(memory_mb) is not int or memory_mb <= 0):
+            return self._rejected(candidate, "verification_memory_allocation_exhausted")
+        if max_heartbeats is not None and (
+            type(max_heartbeats) is not int or max_heartbeats <= 0
+        ):
+            return self._rejected(
+                candidate, "verification_heartbeat_allocation_exhausted"
+            )
+        if max_heartbeats is not None:
+            from ensemble_prover.lean_runner import clamp_lean_heartbeat_options
+            if clamp_lean_heartbeat_options(candidate.source, max_heartbeats) != candidate.source:
+                return self._rejected(candidate, "resource_option_exceeds_owner")
+        if deadline_monotonic is not None and (not math.isfinite(deadline_monotonic)
+                or deadline_monotonic <= time.monotonic()):
+            return self._rejected(candidate, "verification_deadline_exhausted")
+        token = _VERIFY_RESOURCES.set((deadline_monotonic, max_heartbeats, memory_mb))
+        try:
+            from .environment import environment_fingerprint_scope
+
+            resources = (
+                lean_resource_scope(
+                    memory_mb=memory_mb,
+                    max_heartbeats=max_heartbeats,
+                    deadline_monotonic=deadline_monotonic,
+                )
+                if memory_mb is not None else nullcontext()
+            )
+            fingerprints = (
+                environment_fingerprint_scope(
+                    cancellation_event=cancellation_event or threading.Event(),
+                    deadline_monotonic=(
+                        deadline_monotonic if deadline_monotonic is not None
+                        else time.monotonic() + self.timeout_s
+                    ),
+                )
+                if memory_mb is not None or deadline_monotonic is not None
+                else nullcontext()
+            )
+            with resources, fingerprints:
+                return self._verify(candidate, cancellation_event=cancellation_event,
+                                    forbidden_target_statements=forbidden_target_statements)
+        finally:
+            _VERIFY_RESOURCES.reset(token)
+
+    def _verify(
+        self, candidate: TheoryBundleCandidate, *,
         cancellation_event: Optional[threading.Event] = None,
         forbidden_target_statements: Sequence[str] = (),
     ) -> TheoryVerificationResult:
@@ -492,16 +575,24 @@ class TheoryBundleVerifier:
         """Retry heartbeat exhaustion once without extending the wall budget."""
 
         deadline = time.monotonic() + self.timeout_s
+        owner_deadline, heartbeat_cap, memory_cap = _VERIFY_RESOURCES.get()
+        if owner_deadline is not None:
+            deadline = min(deadline, owner_deadline)
         result: Optional[subprocess.CompletedProcess[str]] = None
-        for heartbeats in (200_000, 800_000):
+        portfolio = tuple(dict.fromkeys(min(limit, heartbeat_cap) if heartbeat_cap is not None
+                                       else limit for limit in (200_000, 800_000)))
+        for heartbeats in portfolio:
             remaining = deadline - time.monotonic()
-            if result is not None and (
+            if (
                 remaining <= 0
                 or (cancellation_event is not None and cancellation_event.is_set())
             ):
+                if result is None:
+                    return subprocess.CompletedProcess(list(command), 124, stdout="", stderr="verification allocation exhausted")
                 break
             result = self._run(
-                [command[0], f"-DmaxHeartbeats={heartbeats}", *command[1:]],
+                [command[0], f"-DmaxHeartbeats={heartbeats}",
+                 *((f"--memory={memory_cap}",) if memory_cap is not None else ()), *command[1:]],
                 env=env,
                 cancellation_event=cancellation_event,
                 timeout_s=max(0.0, remaining),
@@ -520,11 +611,119 @@ class TheoryBundleVerifier:
         cwd: Optional[Path] = None,
         timeout_s: Optional[float] = None,
     ) -> subprocess.CompletedProcess[str]:
+        from ensemble_prover.lean_runner import (
+            lean_process_slot,
+            lean_resource_scope,
+            current_lean_deadline,
+            current_lean_memory_limit,
+        )
+
+        deadline, _heartbeat, memory = _VERIFY_RESOURCES.get()
+        if current_lean_deadline() is not None:
+            deadline = (
+                min(deadline, current_lean_deadline())
+                if deadline is not None
+                else current_lean_deadline()
+            )
+        if current_lean_memory_limit() is not None:
+            memory = (
+                min(memory, current_lean_memory_limit())
+                if memory is not None
+                else current_lean_memory_limit()
+            )
+        effective = self.timeout_s if timeout_s is None else max(0.0, timeout_s)
+        if deadline is not None:
+            effective = min(effective, max(0.0, deadline - time.monotonic()))
+        if cancellation_event is not None and cancellation_event.is_set():
+            return subprocess.CompletedProcess(
+                list(command), 130, "", "verification cancelled"
+            )
+        if effective <= 0:
+            return subprocess.CompletedProcess(
+                list(command), 124, "", "verification owner allocation exhausted"
+            )
+        bounded_command = list(command)
+        bounded_lean = bool(
+            command
+            and Path(command[0]).name == "lean"
+            and f"--memory={memory}" in command
+        )
+        if memory is not None and not bounded_lean:
+            import shutil
+
+            limiter = shutil.which("prlimit")
+            if limiter is None:
+                return subprocess.CompletedProcess(
+                    list(command), 127, "", "verification OS memory limiter unavailable"
+                )
+            bounded_command = [
+                limiter,
+                f"--as={memory * 1024 * 1024}",
+                "--",
+                *bounded_command,
+            ]
+        from .environment import _check_fingerprint_owner, environment_fingerprint_scope
+
+        operation_deadline = time.monotonic() + effective
+        if deadline is not None:
+            operation_deadline = min(operation_deadline, deadline)
+        resource_scope = (
+            lean_resource_scope(
+                memory_mb=memory,
+                max_heartbeats=_heartbeat,
+                deadline_monotonic=operation_deadline,
+            )
+            if memory is not None
+            else nullcontext()
+        )
+        try:
+            with resource_scope, environment_fingerprint_scope(
+                cancellation_event=cancellation_event or threading.Event(),
+                deadline_monotonic=operation_deadline,
+            ), lean_process_slot(
+                deadline=operation_deadline, cancellation_event=cancellation_event
+            ):
+                # Validate the original command before adding the resource
+                # wrapper. Offline preflight shares this operation's deadline.
+                child_env = prepare_owned_subprocess(
+                    command, project=self.lean_project_dir, base=env
+                )
+                _check_fingerprint_owner()
+                effective = operation_deadline - time.monotonic()
+                if effective <= 0:
+                    raise TimeoutError("verification allocation exhausted")
+                return self._run_owned(
+                    bounded_command,
+                    env=child_env,
+                    cancellation_event=cancellation_event,
+                    cwd=cwd,
+                    timeout_s=effective,
+                )
+        except TimeoutError:
+            if cancellation_event is not None and cancellation_event.is_set():
+                return subprocess.CompletedProcess(
+                    list(command), 130, "", "verification cancelled"
+                )
+            return subprocess.CompletedProcess(
+                list(command), 124, "", "verification owner allocation exhausted"
+            )
+
+    def _run_owned(
+        self,
+        command: Sequence[str],
+        *,
+        env: Mapping[str, str],
+        cancellation_event: Optional[threading.Event] = None,
+        cwd: Optional[Path] = None,
+        timeout_s: Optional[float] = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if cancellation_event is not None and cancellation_event.is_set():
+            return subprocess.CompletedProcess(list(command), 130, "", "verification cancelled")
         try:
             process = subprocess.Popen(
                 list(command),
                 cwd=cwd or self.lean_project_dir,
-                env=prepare_owned_subprocess(command, project=self.lean_project_dir, base=env),
+                env=dict(env),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -539,39 +738,48 @@ class TheoryBundleVerifier:
             )
         effective_timeout_s = self.timeout_s if timeout_s is None else max(0.0, timeout_s)
         deadline = time.monotonic() + effective_timeout_s
-        while True:
-            cancelled = bool(cancellation_event and cancellation_event.is_set())
-            remaining = deadline - time.monotonic()
-            if cancelled or remaining <= 0:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except (OSError, ProcessLookupError):
-                    pass
-                try:
-                    stdout, stderr = process.communicate(timeout=1.0)
-                except subprocess.TimeoutExpired:
+        try:
+            while True:
+                cancelled = bool(cancellation_event and cancellation_event.is_set())
+                remaining = deadline - time.monotonic()
+                if cancelled or remaining <= 0:
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        os.killpg(process.pid, signal.SIGTERM)
                     except (OSError, ProcessLookupError):
                         pass
-                    stdout, stderr = process.communicate()
-                reason = "cancelled" if cancelled else f"timeout after {effective_timeout_s}s"
+                    try:
+                        stdout, stderr = process.communicate(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except (OSError, ProcessLookupError):
+                            pass
+                        stdout, stderr = process.communicate()
+                    reason = "cancelled" if cancelled else f"timeout after {effective_timeout_s}s"
+                    return subprocess.CompletedProcess(
+                        list(command),
+                        130 if cancelled else 124,
+                        stdout=stdout or "",
+                        stderr=f"{reason}\n{stderr or ''}",
+                    )
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
                 return subprocess.CompletedProcess(
                     list(command),
-                    130 if cancelled else 124,
+                    process.returncode,
                     stdout=stdout or "",
-                    stderr=f"{reason}\n{stderr or ''}",
+                    stderr=stderr or "",
                 )
+        finally:
+            # The session created this process group. Background helpers remain
+            # owned even when the direct compiler or environment process exits.
             try:
-                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
-            except subprocess.TimeoutExpired:
-                continue
-            return subprocess.CompletedProcess(
-                list(command),
-                process.returncode,
-                stdout=stdout or "",
-                stderr=stderr or "",
-            )
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
 
     @staticmethod
     def _combined_output(run: subprocess.CompletedProcess[str]) -> str:

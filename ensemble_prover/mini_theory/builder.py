@@ -59,6 +59,7 @@ class LLMTheoryCandidateBuilder:
     operation_timeout_s: Optional[float] = None
     reasoning_effort: str = _THEORY_REASONING_EFFORT
     max_output_tokens: Optional[int] = None
+    owned_operation: bool = False
 
     def __post_init__(self) -> None:
         if self.operation_timeout_s is not None:
@@ -131,6 +132,15 @@ class LLMTheoryCandidateBuilder:
         """Return a session-local meter binding without mutating this builder."""
 
         return replace(self, cost_controller=cost_controller)
+
+    def with_operation_timeout(self, timeout_s: float) -> "LLMTheoryCandidateBuilder":
+        """Bind a provider request to the smaller existing owner watchdog."""
+        cap = (
+            min(timeout_s, self.operation_timeout_s)
+            if self.operation_timeout_s is not None
+            else timeout_s
+        )
+        return replace(self, operation_timeout_s=cap, owned_operation=True)
 
     async def build(
         self,
@@ -214,7 +224,9 @@ class LLMTheoryCandidateBuilder:
                 call,
                 timeout_s=self.operation_timeout_s,
                 operation_label="mini_theory_candidate_build",
-                operation_ownership="result_only",
+                operation_ownership=(
+                    "transaction_state" if self.owned_operation else "result_only"
+                ),
             )
 
         # An explicitly requested watchdog stays inside the meter so a legacy

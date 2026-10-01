@@ -11,12 +11,15 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import re
 import secrets
 import unicodedata
 from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+
+_LOGGER = logging.getLogger(__name__)
 
 from .state_data import clone_json_value
 from .falsification_cursor_identity import (
@@ -14596,8 +14599,6 @@ class ProofDossier:
                 "source_hash": source_digest(block),
                 "usage": "direct" if canonical in constants_direct else "transitive" if canonical in constants_reachable else "unused",
             }
-        if not helpers:
-            return False
         payload = {
             "schema": 1, "consumer_kind": consumer_kind,
             "statement_hash": observation.statement_hash,
@@ -14605,12 +14606,26 @@ class ProofDossier:
             "preamble_hash": observation.preamble_hash,
             "lemma_source_hashes": [source_digest(block) for block in observation.lemma_sources],
             "environment_hash": environment_hash, "helpers": helpers,
+            "direct_constants": list(observation.direct_constants),
+            "reachable_constants": list(observation.reachable_constants),
         }
+        if not helpers:
+            try:
+                from .mathematical_memory.service import observe_use
+                observe_use(self, payload)
+            except Exception:
+                _LOGGER.debug("Mathematical memory use observation unavailable", exc_info=True)
+            return False
         consumer = {k: v for k, v in payload.items() if k != "helpers"}
         key = source_digest(json.dumps(consumer, sort_keys=True, separators=(",", ":")))
         if self.helper_utilization_observations.get(key) == payload:
             return False
         self.helper_utilization_observations[key] = payload
+        try:
+            from .mathematical_memory.service import observe_use
+            observe_use(self, payload)
+        except Exception:
+            _LOGGER.debug("Mathematical memory use observation unavailable", exc_info=True)
         while len(self.helper_utilization_observations) > 4096:
             self.helper_utilization_observations.pop(next(iter(self.helper_utilization_observations)))
         return True
@@ -17121,6 +17136,15 @@ class ProofDossier:
         # also updates the proof graph to the corrected statement.
         existing = self.verified_helpers.get(name)
         if existing is not None:
+            # Rechecking or correcting a declaration cannot silently discard
+            # its obligation to revisit memory source permission. This marker
+            # grants no ownership or verification authority to the replacement.
+            memory_owner_tag = "mathematical_memory_owned_context"
+            if (
+                existing.phase.startswith("mathematical_memory")
+                or memory_owner_tag in existing.provenance_tags
+            ) and memory_owner_tag not in item.provenance_tags:
+                item.provenance_tags.append(memory_owner_tag)
             old_hash = str(getattr(existing, "source_hash", "") or "").strip()
             new_hash = str(getattr(item, "source_hash", "") or "").strip()
             statement_changed = verified_helper_semantic_statement_changed(
@@ -17785,6 +17809,16 @@ class ProofDossier:
                 error_text=prompt_safe_error_text,
                 decl_type=prompt_safe_decl_type,
             )
+
+        try:
+            from .mathematical_memory.service import observe_application
+            observe_application(self, statement=prompt_safe_statement_preview,
+                decl_name=prompt_safe_decl_name, applicable=bool(applicable),
+                proof_stub=prompt_safe_proof_stub, remaining_goals=prompt_safe_goals,
+                error_kind=error_kind, error_text=prompt_safe_error_text,
+                decl_type=prompt_safe_decl_type)
+        except Exception:
+            _LOGGER.debug("Mathematical memory application observation unavailable", exc_info=True)
 
     def _persist_solved_artifact(
         self,

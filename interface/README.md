@@ -85,6 +85,63 @@ resuming automatic following; **Resume updates** restores automatic reads.
 The retained event log can be searched by text and filtered by scope. Its
 search covers the displayed recent events, not the complete run history.
 
+The **Mathematical memory** panel shows eligible prior theorem candidates,
+application observations, unresolved conditions and campaign notes for runs with
+memory enabled. An elaborated application can still await proof acceptance.
+Historical checked reports retain their assumptions and environment; they do
+not certify the currently selected target. Empty or partial views do not prove
+that no applicable theorem exists.
+
+Memory is off by default. Select a memory mode in the launcher: **observe**
+records existing outcomes, **assist** permits bounded application work, and
+**develop** additionally requires Mini theory build permission and a positive
+generalization allocation within the total memory action allocation (90 seconds
+by default). The local service and worker must use the same trusted
+catalog root, configured with `--memory-root` on the service. The default is
+`~/.local/share/ensemble-prover/mathematical-memory`; the browser cannot supply
+an arbitrary catalog path. Owned browser launches use the service's configured
+root automatically.
+Portable records also require a trusted live source-authority adapter. Without
+one, the default local service hides portable evidence; recorded provenance
+alone cannot authorize disclosure. Session-local eligible records remain
+available under their recorded scope.
+
+Applications that maintain a trusted source registry can configure the local
+controller through `create_app(memory_backend=...)`. For example:
+
+```python
+from interface.service.app import create_app
+from interface.service.memory import MemoryBackend
+from ensemble_prover.mathematical_memory.catalog import MemoryCatalog
+
+def controller(run_root, state_root, repo_root, catalog_root, source_is_current):
+    backend = MemoryBackend(catalog_root, catalog_factory=lambda root: MemoryCatalog(
+        root, read_only=True, current_authority=source_is_current))
+    return create_app(run_root=run_root, state_root=state_root, repo_root=repo_root,
+                      memory_backend=backend)
+```
+
+`source_is_current(provenance, event_id)` must validate the full current source
+ancestry, revocations and reconciliation against the application's trusted
+registry. It must return `False` when that authority is unavailable. This adapter
+does not bypass the catalog's scope, chronology or artifact-integrity checks.
+
+With control enabled, pins and notebook notes are durable requests. Retries and
+generalizations use existing run allocations. A retry identifies a prior
+application and repeats its recorded operation under current eligibility.
+**Pending** means stored, while
+admitted/running/completed describe job execution; none is a proof badge. An
+interrupted dispatch with uncertain effects stays unresolved until its receipts
+are reconciled. Retrying an uncertain submission in the same view retains its
+request identity.
+
+**Prepare evidence for inspection** copies authorized immutable evidence into
+the owned run before offering an artifact link. Copied evidence preserves its
+source restrictions. Permission checks continue while observation updates are
+paused; expired or unavailable eligibility checks hide restricted memory
+content. Retained artifact links recheck current eligibility on every read.
+Previously disclosed or copied information cannot be retracted.
+
 For a sequential sweep, **Follow sweep** advances to the next recorded problem
 or retry within that sweep. Other sweeps cannot change this selection.
 Following uses sweep order rather than file modification times. Selecting a

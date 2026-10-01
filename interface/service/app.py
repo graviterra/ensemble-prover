@@ -12,13 +12,14 @@ from __future__ import annotations
 import os
 import json
 import secrets
+import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
@@ -43,6 +44,9 @@ from .catalog import CatalogError, ProjectCatalog
 from .local_registry import CURSOR_BIN, CURSOR_UNAVAILABLE, ENV_CONFIG, LocalRegistryError, OperatorLocalRegistry, cursor_flags
 from .security import LocalBoundary, browser_boundary
 from .options import OptionValidationError, inference_policies, option_args, option_schema
+from .memory import DEFAULT_MEMORY_ROOT, MemoryBackend
+from ensemble_prover.mathematical_memory.evidence import EvidenceUnavailable
+from ensemble_prover.mathematical_memory.requests import MemoryRequestError, MemoryRequestStore
 
 _STOP_TOKEN_TTL_S = 60.0
 _STOP_MESSAGES = {
@@ -87,6 +91,8 @@ def create_app(
     serve_ui: bool = True,
     local_inference_config: str | Path | None = None,
     project_roots: list[Path] | None = None,
+    memory_root: Path | None = None,
+    memory_backend: MemoryBackend | None = None,
 ) -> FastAPI:
     """Build the loopback service.
 
@@ -124,6 +130,7 @@ def create_app(
     app.state.stop_grants = {}
     app.state.stop_lock = threading.Lock()
     app.state.catalog = ProjectCatalog(repo_root, state_root, roots=project_roots)
+    app.state.memory_backend = memory_backend or MemoryBackend(memory_root or DEFAULT_MEMORY_ROOT)
     app.state.local_registry = OperatorLocalRegistry.load(
         local_inference_config, snapshot_directory=state_root / "local_profiles",
     )
@@ -208,6 +215,121 @@ def create_app(
             lambda attached: _run_detail_body(app, run_dir, record, attached),
         )
         return JSONResponse(body)
+
+    def memory_run(run_id: str, *, owned: bool = False) -> Path | None:
+        run_dir = _resolve_contained(app.state.run_root, run_id)
+        if run_dir is None:
+            return None
+        if owned and (app.state.registry is None or app.state.registry.owned(run_dir) is None):
+            return None
+        return run_dir
+
+    def memory_request_receipt(item: dict) -> dict:
+        return {
+            "payload": {
+                "kind": item["payload"]["kind"],
+                "request_id": item["payload"]["request_id"],
+            },
+            "status": item["status"],
+            "detail": {
+                "pending": "Awaiting scheduler admission.",
+                "admitted": "Dispatch intent recorded.",
+                "running": "Command in progress.",
+                "unresolved": "Receipt reconciliation required.",
+                "completed": "Command completed; mathematical outcome is separate.",
+                "rejected": "Command was rejected.",
+                "cancelled": "Command was cancelled.",
+            }.get(item["status"], "Status unavailable."),
+        }
+
+    @app.post("/api/memory/{run_id:path}/requests")
+    async def memory_request(run_id: str, request: Request) -> JSONResponse:
+        if not app.state.control:
+            return JSONResponse({"error": "control_disabled"}, status_code=403)
+        run_dir = await run_in_threadpool(memory_run, run_id, owned=True)
+        if run_dir is None:
+            return JSONResponse({"error": "not_owned"}, status_code=403)
+        payload = await _json_object(request)
+        if isinstance(payload, JSONResponse):
+            return payload
+        def submit(attached: AttachedRun) -> dict:
+            catalog, policy = app.state.memory_backend.context(attached)
+            if payload.get("policy_id") != policy.policy_id:
+                raise MemoryRequestError("stale_policy")
+            current = attached.state.live_math.memory
+            if payload.get("goal_id") != current.get("goal_id") or payload.get("environment_id", "") != current.get("environment_id", ""):
+                raise MemoryRequestError("stale_target")
+            deadline = time.monotonic() + 1
+            if payload.get("kind") == "retry":
+                from ensemble_prover.mathematical_memory.applications import OperationRecipe
+                from ensemble_prover.mathematical_memory.model import GenerationPin
+                from ensemble_prover.mathematical_memory.requests import validate_request
+                validated = validate_request(payload)
+                pin = GenerationPin.from_record(current.get("generation", {}))
+                prior = catalog.get_event(validated["retry_of"], policy, pinned_generation=pin, deadline_monotonic=deadline)
+                if (prior is None or prior.kind != "application"
+                    or prior.payload.get("goal_id") != validated["goal_id"]
+                    or prior.payload.get("environment_id") != validated["environment_id"]
+                    or prior.payload.get("candidate_id") != validated["candidate_id"]):
+                    raise MemoryRequestError("prior_application_unavailable")
+                OperationRecipe.from_record(prior.payload["recipe"])
+            return MemoryRequestStore(run_dir).submit(payload, deadline_monotonic=deadline)
+        try:
+            record = await run_in_threadpool(app.state.sessions.project, run_dir, submit)
+            return JSONResponse({"request": memory_request_receipt(record)}, status_code=202)
+        except (MemoryRequestError, EvidenceUnavailable, sqlite3.Error, OSError, ValueError, RuntimeError, KeyError, TypeError):
+            return JSONResponse({"error": "memory_request_unavailable_or_conflicting"}, status_code=409)
+
+    @app.get("/api/memory/{run_id:path}/requests")
+    def memory_requests(run_id: str) -> JSONResponse:
+        run_dir = memory_run(run_id, owned=True)
+        if run_dir is None:
+            return JSONResponse({"error": "not_owned"}, status_code=403)
+        def read(attached: AttachedRun) -> dict:
+            _catalog, policy = app.state.memory_backend.context(attached)
+            return {"requests": [memory_request_receipt(item)
+                                  for item in MemoryRequestStore(run_dir).list()
+                                  if item["payload"].get("policy_id") == policy.policy_id]}
+        try:
+            return JSONResponse(app.state.sessions.project(run_dir, read))
+        except (MemoryRequestError, EvidenceUnavailable, sqlite3.Error, OSError, ValueError, RuntimeError):
+            return JSONResponse({"error": "memory_unavailable"}, status_code=503)
+
+    @app.post("/api/memory/{run_id:path}/evidence")
+    async def materialize_memory_evidence(run_id: str, request: Request) -> JSONResponse:
+        run_dir = await run_in_threadpool(memory_run, run_id, owned=True)
+        if not app.state.control or run_dir is None:
+            return JSONResponse({"error": "not_owned_or_control_disabled"}, status_code=403)
+        payload = await _json_object(request)
+        if isinstance(payload, JSONResponse):
+            return payload
+        if set(payload) != {"event_id", "digest"} or not all(isinstance(value, str) and len(value) <= 128 for value in payload.values()):
+            return JSONResponse({"error": "invalid_evidence_reference"}, status_code=400)
+        try:
+            binding = await run_in_threadpool(app.state.sessions.project, run_dir,
+                lambda attached: app.state.memory_backend.materialize(attached, payload["event_id"], payload["digest"]))
+            return JSONResponse({"artifact_id": binding["artifact_id"], "complete": binding["complete"]})
+        except (EvidenceUnavailable, sqlite3.Error, OSError, ValueError, KeyError, RuntimeError):
+            return JSONResponse({"error": "evidence_unavailable"}, status_code=503)
+
+    @app.get("/api/memory/{run_id:path}/artifacts/{artifact_id}")
+    def memory_artifact(run_id: str, artifact_id: str) -> Response:
+        run_dir = memory_run(run_id, owned=True)
+        if run_dir is None:
+            return JSONResponse({"error": "not_owned"}, status_code=403)
+        try:
+            _binding, data = app.state.sessions.project(run_dir,
+                lambda attached: app.state.memory_backend.read_artifact(attached, artifact_id, deadline=time.monotonic() + 1))
+            return Response(data, media_type="text/plain; charset=utf-8", headers={"Content-Disposition": "inline"})
+        except (EvidenceUnavailable, sqlite3.Error, OSError, ValueError, KeyError, RuntimeError):
+            return JSONResponse({"error": "evidence_unavailable"}, status_code=503)
+
+    @app.get("/api/memory/{run_id:path}")
+    def memory_view(run_id: str) -> JSONResponse:
+        run_dir = memory_run(run_id)
+        if run_dir is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        return JSONResponse(app.state.sessions.project(run_dir, app.state.memory_backend.project))
 
     @app.post("/api/attempts")
     async def start_attempt(request: Request) -> JSONResponse:
@@ -355,6 +477,7 @@ def _run_detail_body(
         ],
     }
     decorate_detail(body, attached, record, app.state.state_root, app.state.formalization_details)
+    body["liveMath"]["memory"] = app.state.memory_backend.project(attached)
     return body
 
 
@@ -739,6 +862,8 @@ def _start_english(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
         return user_args
     if not formalize_only:
         user_args = _append_policy([*user_args, *settings_args], policy)
+        if payload.get("options", {}).get("mathematical-memory", "off") != "off":
+            user_args.extend(["--mathematical-memory-root", str(app.state.memory_backend.root)])
         verdict = app.state.registry.validate_args([
             "--lean-file", "Problem.lean", "--theorem-name", "formalized_problem",
             "--project-path", str(project_path), *user_args,
@@ -790,6 +915,8 @@ def _start_lean(app: FastAPI, payload: dict[str, Any]) -> JSONResponse:
         settings_args = option_args(
             payload.get("options", {}), refiner_enabled=bool(payload.get("refiner")),
         )
+        if payload.get("options", {}).get("mathematical-memory", "off") != "off":
+            user_args.extend(["--mathematical-memory-root", str(app.state.memory_backend.root)])
     except OptionValidationError as exc:
         return JSONResponse({"error": exc.public_message}, status_code=400)
     except ValueError:

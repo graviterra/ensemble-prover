@@ -1,4 +1,6 @@
 /** Read-only presentation of bounded, recorded runtime evidence. */
+import { parseMemory } from "./memory";
+import type { MemoryView } from "./memory";
 export type MathSelection = {
   approach: string; approachId: string; obligationId: string; statement: string;
   action: string; dispatchId: string; scope: string; elapsedS: number | null;
@@ -25,6 +27,7 @@ export type InferenceObservation = {
   queuePosition: number | null; queuedRequests: number | null; inflightRequests: number | null; unknownRequests: number | null;
 };
 export type LiveMathView = {
+  memory?: MemoryView;
   selection: MathSelection | null; activity: MathSelection | null; lastCostlyAction: MathReceipt | null;
   source: { commit: string; dirty: boolean | null; available: boolean; fingerprint: string; partial: boolean };
   settings: RuntimeSetting[];
@@ -91,6 +94,7 @@ export function parseLiveMath(value: unknown): LiveMathView | undefined {
   const validCommit = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit);
   const sourceAvailable = source.available === true && validCommit;
   return {
+    memory: parseMemory(row.memory),
     selection: selection(row.selection), activity: selection(row.activity),
     lastCostlyAction: Object.keys(receipt).length ? {
       action: text(receipt.action), dispatchId: text(receipt.dispatchId), scope: scopeText(receipt.scope),

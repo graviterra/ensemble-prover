@@ -893,6 +893,54 @@ retries. Older incompatible bundles remain unavailable for reuse. If the
 originating session is unavailable, the helper must be checked and staged again
 in its original theorem context.
 
+### Mathematical memory
+
+Mathematical memory is an opt-in advisory catalog of reusable mathematical
+results and their application history. It preserves the existing Mini theory,
+helper acceptance and root-export proof boundaries. Its default mode is `off`.
+
+```bash
+--mathematical-memory observe
+--mathematical-memory assist
+--mathematical-memory-root /path/to/memory
+--mathematical-memory-seconds 90
+```
+
+`observe` records existing operations and outcomes without starting extra
+application work. `assist` allocates bounded retrieval and application probes
+inside the existing run governor. A probe that leaves no goals is still an
+elaborated result until ordinary complete-proof acceptance succeeds. Residual
+goal text is advisory unless accompanied by a checked continuation certificate.
+
+`develop` also requires `--mini-theory-mode build` and a positive
+`--mathematical-memory-research-seconds` allocation. The research allocation
+is part of, and must not exceed, the total memory action allocation (90 seconds
+by default). Generalization statements
+and specialization links receive independent checks; examples or use counts
+cannot publish a theorem. Modes do not widen benchmark source restrictions,
+visibility policy, model restrictions or remaining run budgets.
+
+The default catalog is `~/.local/share/ensemble-prover/mathematical-memory`.
+Use distinct roots to separate experiments or private campaigns. Catalog events
+and copied evidence contain mathematical source material. Incomplete provenance
+remains session-local discovery data; it cannot become a clean cross-problem
+transfer record. Restored history remains unavailable for reuse or disclosure
+until current eligibility and invalidation authority are reconciled.
+Portable records require a trusted live source-authority adapter; the default
+local catalog refuses portable disclosure when that authority is unavailable.
+The standard CLI does not install that adapter, so learned application history
+does not automatically transfer between problems or process restarts. Existing
+Mini theory and verified-helper retrieval remain available.
+
+The browser's memory panel distinguishes candidates, application observations,
+obstructions, proposals and notes. Control-enabled owned runs accept durable
+pin/note/retry/generalization requests.
+Retries bind to a prior application and replay its recorded recipe under current
+eligibility and remaining allocation. Pending/admitted/completed requests
+describe command execution independently of mathematical outcomes. Eligibility
+leases refresh even when observation updates are paused, and copied artifact
+links revalidate the original source's permissions on every read.
+
 ## 10. Terminal output and run files
 
 For the direct `mini_prover` CLI, without `--output-dir`, a run is written to:

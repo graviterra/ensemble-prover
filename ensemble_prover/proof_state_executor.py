@@ -373,6 +373,7 @@ async def _await_serialized_lean_operation(
         mark_runtime_owned_callback(release_owned_lock)
     )
     try:
+        from .lean_runner import current_lean_deadline
         completed, value = await await_with_strict_deadline(
             operation_task,
             # Admission reserves the complete operation capability. Keep that
@@ -382,7 +383,7 @@ async def _await_serialized_lean_operation(
             # the child, so an equal timeout could discard a completed verdict
             # while leaving the child alive and holding the lock.
             timeout_s=outer_guard_timeout_s(admitted),
-            deadline_monotonic=0.0,
+            deadline_monotonic=current_lean_deadline() or 0.0,
             operation_label=operation_label,
             operation_ownership="result_only",
         )
@@ -2254,6 +2255,9 @@ async def _extract_and_spawn_typed_residual_goals(
     timeout_s: float,
     max_goals: int,
     deadline_monotonic: float = 0.0,
+    max_heartbeats: int | None = None,
+    owner_timeout_s: float | None = None,
+    admission_guard: Optional[Callable[[], bool]] = None,
     deadline_exhausted: Optional[Callable[[], bool]] = None,
     origin_metadata: Optional[Mapping[str, Any]] = None,
     action_metadata: Optional[Mapping[str, Any]] = None,
@@ -2372,7 +2376,10 @@ async def _extract_and_spawn_typed_residual_goals(
     if proof_state.verifier_retry_status(parent_node, retry_key) == "cooling":
         return remember_deferred("residual_attestation_cooldown_deferred")
 
-    timeout = _typed_residual_operation_timeout(lean, timeout_s)
+    timeout = (_typed_residual_operation_timeout(lean, timeout_s)
+               if owner_timeout_s is None else float(owner_timeout_s))
+    if not math.isfinite(timeout) or timeout <= 0:
+        return remember_deferred("residual_attestation_deadline_deferred")
     admitted = _fully_funded_operation_timeout(timeout, deadline_monotonic)
     if admitted <= 0.0:
         return remember_deferred("residual_attestation_deadline_deferred")
@@ -2388,6 +2395,7 @@ async def _extract_and_spawn_typed_residual_goals(
             list(lemmas or ()),
             preamble_override=str(preamble or ""),
             timeout_s=admitted,
+            **({"max_heartbeats": max_heartbeats} if max_heartbeats is not None else {}),
         )
 
     try:
@@ -2547,6 +2555,19 @@ async def _extract_and_spawn_typed_residual_goals(
             )
         except Exception:
             checkpoint_id = ""
+    if admission_guard is not None:
+        try:
+            allowed = admission_guard() is True
+        except Exception:
+            allowed = False
+        except BaseException:
+            if checkpoint_id and callable(rollback):
+                rollback(checkpoint_id)
+            raise
+        if not allowed:
+            if checkpoint_id and callable(rollback):
+                rollback(checkpoint_id)
+            return [], goal_count, "residual_attestation_current_policy_rejected"
     try:
         spawned = admission(
             receipt,

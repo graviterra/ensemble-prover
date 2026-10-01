@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -14,6 +15,8 @@ import tempfile
 import time
 import uuid
 from contextvars import ContextVar
+from contextlib import contextmanager, asynccontextmanager
+import threading
 from dataclasses import dataclass, field, replace as dataclass_replace
 from pathlib import Path
 from typing import (
@@ -86,14 +89,202 @@ from .utils import (
     short_id,
 )
 
+_OPERATION_MEMORY_MB: ContextVar[int | None] = ContextVar("lean_operation_memory_mb", default=None)
+_OPERATION_HEARTBEATS: ContextVar[int | None] = ContextVar("lean_operation_heartbeats", default=None)
+_OPERATION_DEADLINE: ContextVar[float | None] = ContextVar(
+    "lean_operation_deadline", default=None
+)
+
+
+class _LeanProcessAllowance:
+    def __init__(self, limit: int, parent: Any = None):
+        self.limit, self.parent = limit, parent
+        self.semaphore = threading.BoundedSemaphore(limit)
+
+    def acquire(self) -> bool:
+        if not self.semaphore.acquire(blocking=False):
+            return False
+        if self.parent is not None and not self.parent.acquire():
+            self.semaphore.release()
+            return False
+        return True
+
+    def release(self) -> None:
+        if self.parent is not None:
+            self.parent.release()
+        self.semaphore.release()
+
+
+_OPERATION_PROCESSES: ContextVar[_LeanProcessAllowance | None] = ContextVar(
+    "lean_operation_processes", default=None
+)
+
+
+def current_lean_deadline() -> float | None:
+    return _OPERATION_DEADLINE.get()
+
+
+def bounded_lean_process_command(command: Sequence[str]) -> tuple[str, ...]:
+    memory = _OPERATION_MEMORY_MB.get()
+    if memory is None:
+        return tuple(command)
+    # Lean's own heap limit preserves large read-only OLean mappings. An
+    # address-space limit on the compiler would reject valid Mathlib imports.
+    is_lean = Path(command[0]).name == "lean" or tuple(command[:3]) == (
+        "lake",
+        "env",
+        "lean",
+    )
+    if is_lean and f"--memory={memory}" in command:
+        return tuple(command)
+    import shutil
+
+    limiter = shutil.which("prlimit")
+    if limiter is None:
+        raise TimeoutError("Owned Lean OS memory limiter unavailable")
+    return (limiter, f"--as={memory * 1024 * 1024}", "--", *command)
+
+
+def _check_lean_owner_deadline(deadline: float | None = None) -> None:
+    deadlines = [
+        value for value in (deadline, current_lean_deadline()) if value is not None
+    ]
+    if deadlines and min(deadlines) <= time.monotonic():
+        raise TimeoutError("Lean owner allocation exhausted")
+
+
+@contextmanager
+def lean_process_slot(*, deadline: float | None = None, cancellation_event: Any = None):
+    owner = _OPERATION_PROCESSES.get()
+    _check_lean_owner_deadline(deadline)
+    if owner is not None:
+        while not owner.acquire():
+            _check_lean_owner_deadline(deadline)
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise TimeoutError("Lean owner cancelled")
+            time.sleep(0.005)
+    try:
+        _check_lean_owner_deadline(deadline)
+        yield
+    finally:
+        if owner is not None:
+            owner.release()
+
+
+@asynccontextmanager
+async def lean_process_slot_async():
+    owner = _OPERATION_PROCESSES.get()
+    _check_lean_owner_deadline()
+    if owner is not None:
+        while not owner.acquire():
+            _check_lean_owner_deadline()
+            await asyncio.sleep(0.005)
+    try:
+        _check_lean_owner_deadline()
+        yield
+    finally:
+        if owner is not None:
+            owner.release()
+
+
+def current_lean_memory_limit() -> int | None:
+    return _OPERATION_MEMORY_MB.get()
+
+
+def current_lean_heartbeat_limit() -> int | None:
+    return _OPERATION_HEARTBEATS.get()
+
+
+def _effective_heartbeat_limit(
+    value: int | None, inherited_limit: int | None = None
+) -> int | None:
+    outer = _OPERATION_HEARTBEATS.get()
+    if (
+        _OPERATION_MEMORY_MB.get() is not None
+        and type(inherited_limit) is int
+        and inherited_limit > 0
+    ):
+        outer = min(outer, inherited_limit) if outer is not None else inherited_limit
+    if outer is None:
+        return value
+    return min(outer, value) if type(value) is int else outer
+
+
+@contextmanager
+def lean_resource_scope(
+    *,
+    memory_mb: int,
+    concurrency: int = 1,
+    max_heartbeats: int | None = None,
+    deadline_monotonic: float | None = None,
+):
+    """Bound new Lean processes; nested owners cannot increase their allowance."""
+    if type(memory_mb) is not int or memory_mb <= 0 or type(concurrency) is not int or concurrency <= 0:
+        raise TimeoutError("Lean operation resource allocation exhausted")
+    if max_heartbeats is not None and (type(max_heartbeats) is not int or max_heartbeats <= 0):
+        raise TimeoutError("Lean operation heartbeat allocation exhausted")
+    outer = _OPERATION_MEMORY_MB.get()
+    token = _OPERATION_MEMORY_MB.set(min(outer, memory_mb) if outer is not None else memory_mb)
+    heartbeat_token = _OPERATION_HEARTBEATS.set(_effective_heartbeat_limit(max_heartbeats))
+    outer_deadline = current_lean_deadline()
+    deadlines = [
+        value for value in (outer_deadline, deadline_monotonic) if value is not None
+    ]
+    if any(not math.isfinite(value) for value in deadlines):
+        _OPERATION_MEMORY_MB.reset(token)
+        _OPERATION_HEARTBEATS.reset(heartbeat_token)
+        raise ValueError("Lean owner deadline must be finite")
+    deadline_token = _OPERATION_DEADLINE.set(min(deadlines) if deadlines else None)
+    parent = _OPERATION_PROCESSES.get()
+    allowance = (
+        parent
+        if parent is not None and concurrency >= parent.limit
+        else _LeanProcessAllowance(concurrency, parent)
+    )
+    process_token = _OPERATION_PROCESSES.set(allowance)
+    try:
+        yield
+    finally:
+        _OPERATION_MEMORY_MB.reset(token)
+        _OPERATION_HEARTBEATS.reset(heartbeat_token)
+        _OPERATION_DEADLINE.reset(deadline_token)
+        _OPERATION_PROCESSES.reset(process_token)
+
+
+def clamp_lean_heartbeat_options(source: str, cap: int | None) -> str:
+    """Instrument only resource options; keep original proof/source records intact."""
+    if cap is None:
+        return source
+    from .mini_theory.promotion_context import _mask_lean_noncode
+    from .utils import canonical_lean_identifier
+    lexical = _mask_lean_noncode(source)
+    segment = r"(?:«[^»\r\n]*»|[A-Za-z_][\w']*)"
+    pattern = re.compile(
+        rf"(?<![\w.'])set_option\s+(?P<option>{segment}(?:\.{segment})*)\s+"
+        r"(?P<limit>0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|[0-9][0-9_]*)(?![\w'])"
+    )
+    for match in reversed(tuple(pattern.finditer(lexical))):
+        if canonical_lean_identifier(match.group("option")) not in {
+            "maxHeartbeats",
+            "synthInstance.maxHeartbeats",
+        }:
+            continue
+        raw = match.group("limit").replace("_", "")
+        base = {"0x": 16, "0b": 2, "0o": 8}.get(raw[:2].lower(), 10)
+        value = int(raw, base)
+        if value == 0 or value > cap:
+            start, end = match.span("limit")
+            source = source[:start] + str(cap) + source[end:]
+    return source
+
 if TYPE_CHECKING:
     from .config import TacticOracleConfig
 
 logger = logging.getLogger(__name__)
 
-_LEAN_OPERATION_OWNER: ContextVar[
-    tuple[asyncio.Task[Any], asyncio.Lock] | None
-] = ContextVar("ensemble_prover_lean_operation_owner", default=None)
+_LEAN_OPERATION_OWNER: ContextVar[tuple[asyncio.Task[Any], asyncio.Lock] | None] = (
+    ContextVar("ensemble_prover_lean_operation_owner", default=None)
+)
 
 _LEAN_ENVIRONMENT_OPERATION_TIMEOUT_FLOOR_S = 300.0
 
@@ -108,6 +299,7 @@ def termination_signal_from_returncode(returncode: int) -> int:
     if 0 < shell_signal < int(getattr(signal, "NSIG", 65)):
         return shell_signal
     return 0
+
 
 # Mini's trusted proof boundary matches the independent theory and
 # falsification verifiers.  In particular, compiler-backed native reduction
@@ -1714,7 +1906,6 @@ def _validate_observation_commands(
     return safe_commands, ""
 
 
-
 def _captured_output_text(
     stdout_chunks: Sequence[bytes], stderr_chunks: Sequence[bytes]
 ) -> str:
@@ -2661,6 +2852,14 @@ class LeanStatementContractAnalysis:
     semantic_dependencies_version: int = 0
     binder_dependencies: tuple[tuple[int, ...], ...] = ()
     conclusion_dependencies: tuple[int, ...] = ()
+    # Complete memory profiles keep the original Lean expression separately
+    # from the head-reduced expression used by existing structural identities.
+    profile_format_version: int = 0
+    exact_expr_json: str = ""
+    binder_kinds: tuple[str, ...] = ()
+    universe_parameters: tuple[str, ...] = ()
+    resolved_constants: tuple[str, ...] = ()
+    profile_complete: bool = False
     # Per-invocation timings are carried with the returned structural receipt
     # instead of sampled from LeanRunner's process-wide cumulative counters.
     # This keeps overlapping contract batches from charging each other's work.
@@ -3767,6 +3966,33 @@ def _contract_analysis_from_payload(
                         ensure_ascii=True,
                     )
                 )
+    exact_expr = payload.get("originalExpr")
+    profile_complete = (
+        type(payload.get("profileFormat")) is int
+        and payload.get("profileFormat") == 1
+        and semantic_format == 1
+        and exact_expr is not None
+        and _lean_serialized_expr_is_closed(exact_expr)
+        and all(binder.get("kind") in {
+            "default", "implicit", "strictImplicit", "instImplicit"
+        } for binder in binders)
+    )
+    universe_parameters: set[str] = set()
+    resolved_constants: set[str] = set()
+    def collect_profile(node: Any) -> None:
+        if not isinstance(node, list):
+            return
+        tag = node[0] if node and isinstance(node[0], str) else None
+        if len(node) >= 2 and tag == "param" and isinstance(node[1], str):
+            universe_parameters.add(node[1])
+        if len(node) >= 2 and tag in {"const", "proj"} and isinstance(node[1], str):
+            resolved_constants.add(node[1])
+        for child in node:
+            if isinstance(child, list):
+                collect_profile(child)
+    if profile_complete:
+        exact_expr = _canonical_contract_expr_payload(exact_expr)
+        collect_profile(exact_expr)
     return LeanStatementContractAnalysis(
         display_type=str(display_type or "").strip(),
         structural_identity=make_lean_contract_identity(
@@ -3785,6 +4011,13 @@ def _contract_analysis_from_payload(
         semantic_dependencies_version=semantic_format,
         binder_dependencies=tuple(binder_dependencies),
         conclusion_dependencies=conclusion_dependencies,
+        profile_format_version=1 if profile_complete else 0,
+        exact_expr_json=(json.dumps(exact_expr, separators=(",", ":"), ensure_ascii=True)
+                         if profile_complete else ""),
+        binder_kinds=tuple(binder["kind"] for binder in binders) if profile_complete else (),
+        universe_parameters=tuple(sorted(universe_parameters)),
+        resolved_constants=tuple(sorted(resolved_constants)),
+        profile_complete=profile_complete,
         contract_conclusion_structural_hash=(
             contract_conclusion_structural_hash
         ),
@@ -4016,9 +4249,13 @@ class LeanRunner:
         return "env_cached_subprocess" if self._legacy_use_repl() else "lake"
 
     def _configured_use_repl(self) -> bool:
+        if _OPERATION_MEMORY_MB.get() is not None:
+            return False
         return self._configured_backend_mode() == "env_cached_subprocess"
 
     def _preferred_backend_key(self) -> str:
+        if _OPERATION_MEMORY_MB.get() is not None:
+            return "lake"
         mode = self._configured_backend_mode()
         if mode == "persistent_process":
             return "persistent"
@@ -4092,7 +4329,12 @@ class LeanRunner:
             timeout = 1.0
         if timeout <= 0.0:
             timeout = 1.0
-        return time.monotonic() + timeout
+        deadline = time.monotonic() + timeout
+        return (
+            min(deadline, current_lean_deadline())
+            if current_lean_deadline() is not None
+            else deadline
+        )
 
     @staticmethod
     def _execution_time_remaining(deadline_monotonic: float) -> float:
@@ -4277,12 +4519,38 @@ class LeanRunner:
                 communicate_task.cancel()
                 communicate_task.add_done_callback(_consume_future_exception)
 
+    def _owned_imports_prebuilt(self, modules: Sequence[str]) -> bool:
+        roots = [
+            self.project_dir / ".lake/build/lib/lean",
+            *tuple(getattr(self.cfg, "module_search_paths", ()) or ()),
+        ]
+        packages = self.project_dir / ".lake/packages"
+        if packages.is_dir():
+            roots.extend(
+                package / ".lake/build/lib/lean"
+                for package in list(packages.iterdir())[:128]
+            )
+        return all(
+            any(
+                (Path(root) / (module.replace(".", "/") + ".olean")).is_file()
+                for root in roots
+            )
+            for module in modules
+        )
+
     async def _ensure_extra_imports_built(self, modules: Sequence[str]) -> None:
         modules = tuple(
             str(mod or "").strip() for mod in modules if str(mod or "").strip()
         )
         if not modules or self._extra_imports_ready:
             return
+        if current_lean_memory_limit() is not None:
+            _check_lean_owner_deadline()
+            if self._owned_imports_prebuilt(modules):
+                return
+            raise TimeoutError(
+                "Owned Lean imports require prebuilt modules; unbounded Lake bootstrap refused"
+            )
         async with self._extra_imports_lock:
             if self._extra_imports_ready:
                 return
@@ -4333,6 +4601,13 @@ class LeanRunner:
         )
         if not modules or (self._project_imports_ready and not force):
             return
+        if current_lean_memory_limit() is not None:
+            _check_lean_owner_deadline()
+            if not force and self._owned_imports_prebuilt(modules):
+                return
+            raise TimeoutError(
+                "Owned Lean imports require prebuilt modules; unbounded Lake bootstrap refused"
+            )
         async with self._project_imports_lock:
             if self._project_imports_ready and not force:
                 return
@@ -4870,7 +5145,23 @@ class LeanRunner:
         finally:
             self._unregister_execution_request(execution_task)
 
-    async def _execute_content(
+    async def _execute_content(self, **kwargs: Any) -> tuple[tuple[int, str], str, str]:
+        if current_lean_memory_limit() is None:
+            return await self._execute_content_owned(**kwargs)
+        cap = _effective_heartbeat_limit(
+            current_lean_heartbeat_limit(),
+            getattr(self, "default_max_heartbeats", None),
+        )
+        with lean_resource_scope(
+            memory_mb=current_lean_memory_limit(),
+            concurrency=_OPERATION_PROCESSES.get().limit,
+            max_heartbeats=cap,
+            deadline_monotonic=current_lean_deadline(),
+        ):
+            kwargs["content"] = clamp_lean_heartbeat_options(kwargs["content"], cap)
+            return await self._execute_content_owned(**kwargs)
+
+    async def _execute_content_owned(
         self,
         *,
         mode: str,
@@ -4947,6 +5238,7 @@ class LeanRunner:
         deadline_monotonic: float,
         dispatch_observer: Optional[Callable[[], None]] = None,
     ) -> tuple[tuple[int, str], str, str]:
+        content = clamp_lean_heartbeat_options(content, _OPERATION_HEARTBEATS.get())
         if self._closed or self._quiesced:
             raise RuntimeError(
                 "LeanRunner is closed"
@@ -5690,7 +5982,22 @@ class LeanRunner:
             intercepted_cancellation = asyncio.CancelledError()
         return intercepted_cancellation
 
-    async def _run_via_lake(
+    async def _run_via_lake(self, file_path: Path, **kwargs: Any) -> tuple[int, str]:
+        async with lean_process_slot_async():
+            if current_lean_deadline() is not None:
+                configured = kwargs.get("timeout_s")
+                requested = (
+                    float(configured)
+                    if configured is not None
+                    else float(self.cfg.timeout_s)
+                )
+                kwargs["timeout_s"] = min(
+                    requested, current_lean_deadline() - time.monotonic()
+                )
+                _check_lean_owner_deadline()
+            return await self._run_via_lake_owned(file_path, **kwargs)
+
+    async def _run_via_lake_owned(
         self,
         file_path: Path,
         *,
@@ -5736,7 +6043,7 @@ class LeanRunner:
                 ):
                     lake_command = ("lake", "env", *args)
                     proc = subprocess.Popen(
-                        lake_command,
+                        bounded_lean_process_command(lake_command),
                         cwd=str(self.project_dir),
                         env=prepare_owned_subprocess(lake_command, project=self.project_dir, kind="lean"),
                         stdout=stdout_file,
@@ -5836,6 +6143,8 @@ class LeanRunner:
                     (*module_paths, resolved_lean_path)
                 ).rstrip(os.pathsep)
             lean_args = (
+                *((f"--memory={_OPERATION_MEMORY_MB.get()}",) if _OPERATION_MEMORY_MB.get() is not None else ()),
+                *((f"-DmaxHeartbeats={_OPERATION_HEARTBEATS.get()}",) if _OPERATION_HEARTBEATS.get() is not None else ()),
                 *(("-R", str(extra_module_paths[0])) if extra_module_paths else ()),
                 *(("-o", str(output_path)) if output_path is not None else ()),
                 str(file_path),
@@ -5849,7 +6158,7 @@ class LeanRunner:
                 else ("lake", "env", "lean", *lean_args)
             )
             proc = await asyncio.create_subprocess_exec(
-                *command,
+                *bounded_lean_process_command(command),
                 cwd=str(self.project_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -6146,6 +6455,9 @@ class LeanRunner:
             instance_default = getattr(self, "default_max_heartbeats", None)
             if isinstance(instance_default, int) and instance_default > 0:
                 max_heartbeats = instance_default
+        max_heartbeats = _effective_heartbeat_limit(
+            max_heartbeats, getattr(self, "default_max_heartbeats", None)
+        )
         usage_key_at_start = self._helper_usage_key(statement, requested_proof_code, preamble_override, tuple(lemmas or ()))
         self._helper_usage_observations.pop(usage_key_at_start, None)
         goal_name = f"goal_{short_id(statement + proof_code)}"
@@ -6590,6 +6902,9 @@ class LeanRunner:
             instance_default = getattr(self, "default_max_heartbeats", None)
             if isinstance(instance_default, int) and instance_default > 0:
                 max_heartbeats = instance_default
+        max_heartbeats = _effective_heartbeat_limit(
+            max_heartbeats, getattr(self, "default_max_heartbeats", None)
+        )
         goal_name = f"sorry_{short_id(statement + proof_code)}"
         lemma_block = "\n".join(lemmas) if lemmas else ""
         built = self._build_file(
@@ -7692,6 +8007,9 @@ class LeanRunner:
         *,
         timeout_s: float = 60.0,
         preamble_override: str | None = None,
+        max_heartbeats: int | None = None,
+        independent_expected_context: bool = False,
+        require_proposition: bool = False,
     ) -> tuple[LeanParseResult, str, int]:
         """Prove that a rendered type is still the source declaration's type.
 
@@ -7702,14 +8020,28 @@ class LeanRunner:
         kernel type using ``Meta.isDefEq``. Universe schemas are alpha-renamed
         to a shared rigid parameter list first, preventing both coercion-based
         conversions and silent specialization of polymorphic declarations.
+
+        With independent_expected_context, elaborate the expected type in a
+        separate module containing only the caller preamble. Source-local names,
+        notation and instances then cannot reinterpret an external claim.
+        require_proposition also rejects data-valued declarations as theorems.
         """
 
+        max_heartbeats = _effective_heartbeat_limit(
+            max_heartbeats, getattr(self, "default_max_heartbeats", None)
+        )
         sanitized, error = self._normalize_check_term_name(theorem_name)
+        if max_heartbeats is not None and (type(max_heartbeats) is not int or max_heartbeats <= 0):
+            output = "Lean heartbeat allocation exhausted during source type comparison"
+            return parse_lean_output(output, 124), output, 124
         candidate = str(rendered_type or "").strip()
         if error or not candidate:
             output = str(error or "rendered source type is empty")
             return parse_lean_output(output, 1), output, 1
-        operation_timeout = max(1.0, float(timeout_s))
+        operation_timeout = float(timeout_s)
+        if not math.isfinite(operation_timeout) or operation_timeout <= 0:
+            output = "source type comparison allocation exhausted"
+            return parse_lean_output(output, 124), output, 124
         operation_deadline = time.monotonic() + operation_timeout
         resolved_preamble = self._resolve_preamble(preamble_override)
         _clean_preamble, target_scoped_prefix, target_omit_variables = (
@@ -7727,7 +8059,10 @@ class LeanRunner:
             )
         if target_scoped_prefix:
             candidate_command = f"{target_scoped_prefix}\n{candidate_command}"
-        source_text = str(source or "").rstrip()
+        original_source = str(source or "").rstrip()
+        source_text = (
+            _clean_preamble.rstrip() if independent_expected_context else original_source
+        )
         trailing_closers = re.search(
             r"(?ms)(?P<closers>(?:^\s*end(?:\s+[^\s]+)?\s*$\n?)+)\s*\Z",
             source_text,
@@ -7741,7 +8076,8 @@ class LeanRunner:
             candidate, declared_in=source_text[:insertion]
         )
         candidate_block = "\n".join(
-            part for part in (universe_decl, candidate_command) if part
+            part for part in (f"set_option maxHeartbeats {max_heartbeats}" if max_heartbeats is not None else "",
+                              universe_decl, candidate_command) if part
         )
         module_content = (
             source_text[:insertion].rstrip()
@@ -7751,6 +8087,11 @@ class LeanRunner:
             + source_text[insertion:]
             + "\n"
         )
+        if max_heartbeats is not None:
+            from .lean_source_lexing import _scan_lean_header
+            _, body_start = _scan_lean_header(module_content)
+            module_content = (module_content[:body_start] + f"\nset_option maxHeartbeats {max_heartbeats}\n"
+                              + module_content[body_start:])
         source_literal = json.dumps(f"@_root_.{sanitized}", ensure_ascii=False)
         # Compile the identity before comparing types. Direct elabType leaves
         # let-rec auxiliaries as opaque metavariables until a declaration is
@@ -7765,6 +8106,9 @@ class LeanRunner:
   let some sourceName := sourceTerm.getAppFn.constName?
     | Lean.throwError "source theorem did not elaborate to a constant"
   let sourceInfo ← Lean.getConstInfo sourceName
+  if {str(require_proposition).lower()} then
+    unless ← Lean.Meta.isProp sourceInfo.type do
+      Lean.throwError "source declaration is not proposition-valued"
   let .defnInfo candidateDef ← Lean.getConstInfo (Lean.Name.mkSimple "{candidate_name}")
     | Lean.throwError "candidate type witness is not a definition"
   let candidateType ← Lean.Meta.lambdaTelescope candidateDef.value fun params body => do
@@ -7781,21 +8125,25 @@ class LeanRunner:
   unless ← Lean.Meta.isDefEq sourceType candidateType do
     Lean.throwError "rendered type is not definitionally equal to the source declaration type"
 """
-        _path, execution, write_error = await self._execute_generated_file(
-            goal_name=f"source_type_equiv_{short_id(module_content + probe)}",
-            content=module_content + "\n" + probe,
-            timeout_s=max(1.0, min(15.0, operation_timeout * 0.4)),
-            fast_fail_timeout_s=None,
-            semaphore=self.sem,
-        )
-        if execution is None:
-            output = str(write_error or "source type equivalence probe unavailable")
-            return parse_lean_output(output, 1), output, 1
-        output = execution.output
-        returncode = int(execution.returncode)
-        parsed = parse_lean_output(output, returncode)
-        if returncode == 0 and parsed.ok:
-            return parsed, output, returncode
+        if max_heartbeats is not None:
+            probe = f"set_option maxHeartbeats {max_heartbeats} in\n" + probe
+        module_content = clamp_lean_heartbeat_options(module_content, max_heartbeats)
+        if not independent_expected_context:
+            _path, execution, write_error = await self._execute_generated_file(
+                goal_name=f"source_type_equiv_{short_id(module_content + probe)}",
+                content=module_content + "\n" + probe,
+                timeout_s=min(15.0, operation_timeout * 0.4),
+                fast_fail_timeout_s=None,
+                semaphore=self.sem,
+            )
+            if execution is None:
+                output = str(write_error or "source type equivalence probe unavailable")
+                return parse_lean_output(output, 1), output, 1
+            output = execution.output
+            returncode = int(execution.returncode)
+            parsed = parse_lean_output(output, returncode)
+            if returncode == 0 and parsed.ok:
+                return parsed, output, returncode
 
         # Core-only projects need not import Lean's command meta API. Compile
         # the source and candidate in their original environment first, then
@@ -7806,6 +8154,28 @@ class LeanRunner:
         ilean_path = self.temp_dir / f"{module_name}.ilean"
         probe_path = self.temp_dir / f"{module_name}Probe.lean"
         module_probe = f"import Lean.Elab.Command\nimport {module_name}\n\n{probe}"
+        compile_units = [(module_path, olean_path, module_content)]
+        cleanup_paths = [module_path, olean_path, ilean_path, probe_path]
+        if independent_expected_context:
+            source_module_name = f"MiniSourceOriginal{uuid.uuid4().hex}"
+            source_path = self.temp_dir / f"{source_module_name}.lean"
+            source_olean = self.temp_dir / f"{source_module_name}.olean"
+            source_ilean = self.temp_dir / f"{source_module_name}.ilean"
+            bounded_source = clamp_lean_heartbeat_options(original_source, max_heartbeats)
+            if max_heartbeats is not None:
+                from .lean_source_lexing import _scan_lean_header
+                _, body_start = _scan_lean_header(bounded_source)
+                bounded_source = (
+                    bounded_source[:body_start]
+                    + f"\nset_option maxHeartbeats {max_heartbeats}\n"
+                    + bounded_source[body_start:]
+                )
+            compile_units.append((source_path, source_olean, bounded_source))
+            cleanup_paths.extend((source_path, source_olean, source_ilean))
+            module_probe = (
+                f"import Lean.Elab.Command\nimport {module_name}\n"
+                f"import {source_module_name}\n\n{probe}"
+            )
         lifecycle_task: Optional[asyncio.Task[Any]] = None
         sem_acquired = False
         remaining = operation_deadline - time.monotonic()
@@ -7856,14 +8226,12 @@ class LeanRunner:
                     raise cleanup_cancellation
                 raise
 
-            write_module_error = self._write_temp_lean_file(
-                module_path,
-                module_content,
-            )
-            if write_module_error is not None:
-                fallback_output = f"disk write failed: {write_module_error}"
-                return parse_lean_output(fallback_output, 1), fallback_output, 1
-            self._owned_temp_files.add(module_path)
+            for unit_path, _unit_output, unit_content in compile_units:
+                write_module_error = self._write_temp_lean_file(unit_path, unit_content)
+                if write_module_error is not None:
+                    fallback_output = f"disk write failed: {write_module_error}"
+                    return parse_lean_output(fallback_output, 1), fallback_output, 1
+                self._owned_temp_files.add(unit_path)
             write_probe_error = self._write_temp_lean_file(
                 probe_path,
                 module_probe,
@@ -7917,19 +8285,23 @@ class LeanRunner:
             if remaining <= 0:
                 timeout_output = "Lean timeout during source type equivalence"
                 return parse_lean_output(timeout_output, 1), timeout_output, 1
-            compile_remaining = remaining * 0.65
-            compile_returncode, compile_output = await self._run_via_lake(
-                module_path,
-                timeout_s=compile_remaining,
-                output_path=olean_path,
-                extra_module_paths=(self.temp_dir,),
-            )
-            if int(compile_returncode) != 0:
-                return (
-                    parse_lean_output(compile_output, int(compile_returncode)),
-                    compile_output,
-                    int(compile_returncode),
+            for unit_path, unit_output, _unit_content in compile_units:
+                remaining = operation_deadline - time.monotonic()
+                if remaining <= 0:
+                    timeout_output = "Lean timeout during source type equivalence"
+                    return parse_lean_output(timeout_output, 1), timeout_output, 1
+                compile_returncode, compile_output = await self._run_via_lake(
+                    unit_path,
+                    timeout_s=remaining * 0.65,
+                    output_path=unit_output,
+                    extra_module_paths=(self.temp_dir,),
                 )
+                if int(compile_returncode) != 0:
+                    return (
+                        parse_lean_output(compile_output, int(compile_returncode)),
+                        compile_output,
+                        int(compile_returncode),
+                    )
             probe_remaining = operation_deadline - time.monotonic()
             if probe_remaining <= 0:
                 timeout_output = "Lean timeout during source type equivalence"
@@ -7947,7 +8319,7 @@ class LeanRunner:
         finally:
             if sem_acquired:
                 self.sem.release()
-            for path in (module_path, olean_path, ilean_path, probe_path):
+            for path in cleanup_paths:
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
@@ -8817,6 +9189,8 @@ private def {serializer_prefix}_elabType
         defeq_anchor_indices: Sequence[int] = (),
         defeq_candidate_indices: Sequence[int] = (),
         _operation_deadline: float | None = None,
+        _preamble_resolved: bool = False,
+        max_heartbeats: int | None = None,
     ) -> tuple[tuple[LeanStatementContractAnalysis, ...], str, int]:
         """Elaborate propositions and return structural contract evidence.
 
@@ -8827,6 +9201,11 @@ private def {serializer_prefix}_elabType
         """
 
         operation_started = time.monotonic()
+        max_heartbeats = _effective_heartbeat_limit(
+            max_heartbeats, getattr(self, "default_max_heartbeats", None)
+        )
+        if max_heartbeats is not None and (type(max_heartbeats) is not int or max_heartbeats <= 0):
+            return (), "Lean heartbeat allocation exhausted during contract analysis", 124
         operation_deadline = (
             float(_operation_deadline)
             if _operation_deadline is not None
@@ -8849,7 +9228,7 @@ private def {serializer_prefix}_elabType
             if 0 <= int(index) < len(raw_statements)
             and raw_statements[int(index)]
         )
-        preamble = self._resolve_preamble(preamble_override)
+        preamble = str(preamble_override or "") if _preamble_resolved else self._resolve_preamble(preamble_override)
         nonce = short_id("\n".join(raw_statements) + str(time.monotonic_ns()))
         names = tuple(
             f"mini_contract_identity_{nonce}_{index}"
@@ -8967,6 +9346,7 @@ private def {serializer_prefix}_binders (type : Lean.Expr) :
         Lean.withOptions {serializer_prefix}_printerOptions do
           Lean.Meta.ppExpr normalizedDomain
       binders := binders.push <| Lean.Json.mkObj [
+          ("kind", {serializer_prefix}_binderInfo localDecl.binderInfo),
           ("sort", Lean.Json.str (if proof then "proof" else "data")),
           ("type", Lean.Json.str rendered.pretty),
           ("normalizedType", Lean.Json.str normalizedRendered.pretty),
@@ -9166,6 +9546,8 @@ private def {serializer_prefix}_contractDefeq
                     "    let payload := Lean.Json.mkObj [",
                     f'      ("format", Lean.ToJson.toJson {_CONTRACT_ANALYSIS_FORMAT_VERSION}),',
                     '      ("semanticFormat", Lean.ToJson.toJson (1 : Nat)),',
+                    '      ("profileFormat", Lean.ToJson.toJson (1 : Nat)),',
+                    f'      ("originalExpr", {serializer_prefix}_expr type),',
                     f'      ("expr", {serializer_prefix}_expr normalizedType),',
                     '      ("binders", Lean.Json.arr binders),',
                     '      ("contractExpr", contractExpr),',
@@ -9204,6 +9586,7 @@ private def {serializer_prefix}_contractDefeq
             part
             for part in (
                 preamble.strip(),
+                f"set_option maxHeartbeats {max_heartbeats}" if max_heartbeats is not None else "",
                 universe_decl,
                 "open Lean Elab Command Meta",
                 serializer,
@@ -9236,6 +9619,12 @@ private def {serializer_prefix}_contractDefeq
                 )
             next_line += line_count + 1  # ``\n\n`` separator
         content = "\n\n".join(content_parts)
+        if max_heartbeats is not None:
+            from .lean_source_lexing import _scan_lean_header
+            _, body_start = _scan_lean_header(content)
+            content = content[:body_start] + f"\nset_option maxHeartbeats {max_heartbeats}\n" + content[body_start:]
+            probe_line_ranges = [(start + 2, end + 2, index)
+                                 for start, end, index in probe_line_ranges]
         content_built_at = time.monotonic()
         execution_started = content_built_at
         remaining_operation_s = operation_deadline - time.monotonic()
@@ -9490,6 +9879,8 @@ private def {serializer_prefix}_contractDefeq
                                 defeq_anchor_indices=local_anchors,
                                 defeq_candidate_indices=local_candidates,
                                 _operation_deadline=operation_deadline,
+                                _preamble_resolved=True,
+                                max_heartbeats=max_heartbeats,
                             ),
                             timeout=remaining_timeout_s,
                         )
@@ -9937,6 +10328,107 @@ run_cmd Lean.Elab.Command.liftTermElabM do
                     seen.add(stub)
                     stubs.append(stub)
         return stubs
+
+    async def probe_decl_application_recipe(
+        self, statement: str, decl_name: str, *, kind: str = "exact",
+        arguments: Sequence[str] = (), direction: str = "forward",
+        hypothesis: str = "", introduce_binders: bool = False,
+        intro_names: Sequence[str] = (),
+        preamble_override: str | None = None, lemmas: Sequence[str] = (),
+        timeout_s: float = 10.0, max_heartbeats: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Execute exactly one identified recipe in an isolated Lean check.
+
+        This deliberately does not call the legacy application portfolio. A
+        zero-residual result is elaboration evidence; complete proof acceptance
+        and axiom auditing still belong to public ``check`` and its caller.
+        """
+        result: Dict[str, Any] = {
+            "outcome": "unavailable", "error_kind": "", "proof_code": "",
+            "remaining_goals": [], "supplied_premises_complete": False,
+            "substitutions_complete": False, "operation_count": 0,
+        }
+        name, error = self._normalize_check_term_name(decl_name)
+        if error or not str(statement).strip():
+            result["error_kind"] = "invalid_recipe"
+            return result
+        if kind not in {"exact", "apply", "forward", "rewrite"}:
+            result["error_kind"] = "unsupported_operation"
+            return result
+        if direction not in {"forward", "backward"} or (
+            kind != "rewrite" and direction != "forward"
+        ):
+            result["error_kind"] = "unsupported_direction"
+            return result
+        args = tuple(str(argument).strip() for argument in arguments)
+        if any(not arg or "\n" in arg or "\r" in arg or not
+               lean_expression_delimiters_balanced(arg) for arg in args):
+            result["error_kind"] = "invalid_arguments"
+            return result
+        term = name + "".join(f" ({argument})" for argument in args)
+        if kind == "forward":
+            local, local_error = self._normalize_check_term_name(hypothesis)
+            if local_error or not local:
+                result["error_kind"] = "invalid_scoped_hypothesis"
+                return result
+            tactic = f"have memory_forward := {term} {local}\n  skip"
+        elif kind == "rewrite":
+            tactic = f"rw [{'← ' if direction == 'backward' else ''}{term}]"
+        else:
+            tactic = f"{kind} {term}"
+        if introduce_binders:
+            intro_identifiers = []
+            for identifier in intro_names:
+                clean_identifier, intro_error = self._normalize_check_term_name(identifier)
+                if intro_error or not clean_identifier:
+                    result["error_kind"] = "invalid_intro_identifier"
+                    return result
+                intro_identifiers.append(clean_identifier)
+            intro_tactic = "intro " + " ".join(intro_identifiers) if intro_identifiers else "intros"
+            tactic = intro_tactic + "\n  " + tactic
+        proof = "by\n  " + tactic + "\n"
+        result["proof_code"] = proof
+        if timeout_s <= 0:
+            raise TimeoutError("memory probe allocation exhausted")
+        started = time.monotonic()
+        result["operation_count"] = 1
+        try:
+            parsed, output, returncode = await self.check_with_sorry_raw(
+                statement, proof, list(lemmas), preamble_override=preamble_override,
+                timeout_s=timeout_s, fast_fail_timeout_s=timeout_s,
+                max_heartbeats=max_heartbeats,
+            )
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            result.update(outcome="probe_inconclusive", error_kind="runner_exception",
+                          diagnostic=str(exc), elapsed_s=time.monotonic() - started)
+            return result
+        result.update(elapsed_s=time.monotonic() - started, returncode=returncode,
+                      diagnostic=str(output))
+        remaining = [self._render_goal_state(goal) for goal in
+                     (getattr(parsed, "remaining_goals", ()) or ())]
+        error_kind = canonical_error_type(parsed)
+        result["remaining_goals"] = remaining
+        if current_lean_memory_limit() is not None:
+            if error_kind == "timeout" or returncode == 124:
+                raise TimeoutError("memory probe process exceeded its allocation")
+            if returncode < 0 or error_kind == "infra_failure":
+                raise OSError("memory probe process did not complete")
+        # Process/backend failures are never semantic rejections, regardless
+        # of text that happens to resemble a type error.
+        if returncode < 0 or error_kind in {"timeout", "infra_failure"}:
+            result.update(outcome="probe_inconclusive", error_kind=error_kind or "process_failure")
+        elif remaining and error_kind in {"", "unsolved_goals"}:
+            result.update(outcome="elaborated_partial", error_kind="")
+        elif returncode == 0 and not error_kind and not remaining and not getattr(parsed, "sorry_count", 0):
+            result.update(outcome="elaborated_closed", error_kind="")
+        elif error_kind in {"type_mismatch", "unknown_identifier", "tactic_failed",
+                            "application_type_mismatch", "unknown_constant", "unsolved_goals"}:
+            result.update(outcome="probe_rejected", error_kind=error_kind)
+        else:
+            result.update(outcome="probe_inconclusive", error_kind=error_kind or "unknown_result")
+        return result
 
     async def apply_decl_to_goal(
         self,

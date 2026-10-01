@@ -121,6 +121,9 @@ class VerifiedHelperPromoter:
         source_theorem: str = "",
         forbidden_problem_constants: Iterable[str] = (),
         cancellation_event: Optional[threading.Event] = None,
+        deadline_monotonic: float | None = None,
+        max_heartbeats: int | None = None,
+        memory_mb: int | None = None,
     ) -> HelperPromotionResult:
         preparation = self.prepare(
             helper,
@@ -133,10 +136,27 @@ class VerifiedHelperPromoter:
             source_theorem=source_theorem,
             forbidden_problem_constants=forbidden_problem_constants,
             cancellation_event=cancellation_event,
+            **{
+                key: value
+                for key, value in {
+                    "deadline_monotonic": deadline_monotonic,
+                    "max_heartbeats": max_heartbeats,
+                    "memory_mb": memory_mb,
+                }.items()
+                if value is not None
+            },
         )
+        from ensemble_prover.lean_runner import _check_lean_owner_deadline
+
+        _check_lean_owner_deadline(deadline_monotonic)
         return self.publish_prepared(
             preparation,
             cancellation_event=cancellation_event,
+            **(
+                {"deadline_monotonic": deadline_monotonic}
+                if deadline_monotonic is not None
+                else {}
+            ),
         )
 
     def prepare(
@@ -152,6 +172,9 @@ class VerifiedHelperPromoter:
         source_theorem: str = "",
         forbidden_problem_constants: Iterable[str] = (),
         cancellation_event: Optional[threading.Event] = None,
+        deadline_monotonic: float | None = None,
+        max_heartbeats: int | None = None,
+        memory_mb: int | None = None,
     ) -> HelperPromotionPreparation:
         helper_name = str(getattr(helper, "name", "") or "").strip()
         source = str(getattr(helper, "source", "") or "").strip()
@@ -231,6 +254,15 @@ class VerifiedHelperPromoter:
         verification = self.library.verify_candidate(
             candidate,
             cancellation_event=cancellation_event,
+            **{
+                key: value
+                for key, value in {
+                    "deadline_monotonic": deadline_monotonic,
+                    "max_heartbeats": max_heartbeats,
+                    "memory_mb": memory_mb,
+                }.items()
+                if value is not None
+            },
         )
         diagnostic = str(verification.receipt.diagnostic or "")
         return HelperPromotionPreparation(
@@ -246,6 +278,7 @@ class VerifiedHelperPromoter:
         preparation: HelperPromotionPreparation,
         *,
         cancellation_event: Optional[threading.Event] = None,
+        deadline_monotonic: float | None = None,
     ) -> HelperPromotionResult:
         candidate = preparation.candidate
         verification = preparation.verification
@@ -266,6 +299,11 @@ class VerifiedHelperPromoter:
                     candidate,
                     verification,
                     cancellation_event=cancellation_event,
+                    **(
+                        {"deadline_monotonic": deadline_monotonic}
+                        if deadline_monotonic is not None
+                        else {}
+                    ),
                 )
             except TheoryStorePublicationCommitted as exc:
                 if exc.verification is None:

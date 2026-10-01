@@ -393,6 +393,7 @@ def validate_durable_session_scalar_state(state: Mapping[str, Any]) -> None:
             )
 
 _SESSION_MAPPING_STATE_KEYS: tuple[str, ...] = (
+    "mathematical_memory_state",
     "deterministic_dispatch_failures",
     "_conversation_role_turn_counts",
     "local_repair_quota_used_by_signature",
@@ -2211,6 +2212,11 @@ def scheduler_snapshot(
         )
     for key in _SESSION_MAPPING_STATE_KEYS:
         value = getattr(session, key, None)
+        if key == "mathematical_memory_state":
+            memory = getattr(session, "mathematical_memory", None)
+            if memory is not None:
+                from ..mathematical_memory.service import snapshot_memory_source_obligations
+                value = snapshot_memory_source_obligations(memory)
         if isinstance(value, Mapping):
             if key == "policy_repair_redirect_selected_record" and not value:
                 continue

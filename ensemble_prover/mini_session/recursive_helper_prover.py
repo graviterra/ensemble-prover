@@ -1478,6 +1478,14 @@ async def prove_helper_in_subsession(
         0.0,
         float(action_deadline_epoch_s or 0.0),
     )
+    parent_memory = getattr(parent_session, "mathematical_memory", None)
+    if parent_memory is not None:
+        from .factory import _install_child_mathematical_memory
+        _install_child_mathematical_memory(child_session, parent_memory.config,
+            parent_memory.allocation, parent_memory.policy, parent_memory.provenance_registry)
+    else:
+        from .factory import _inherit_child_memory_source_obligations
+        _inherit_child_memory_source_obligations(child_session)
     child_session.configure_no_applicable_recovery(total_turn_budget)
     if child_searcher is not None and parent_premise_retrieval_enabled:
         # Mathematical retrieval is target-specific.  Inheriting only the

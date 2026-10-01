@@ -1,6 +1,7 @@
 """Governed facade for reading, verifying, and publishing Mini theory."""
 
 from __future__ import annotations
+import time
 
 import json
 import subprocess
@@ -44,8 +45,31 @@ def _serialized_library_operation(
 
     @wraps(method)
     def wrapped(self: "MiniTheoryLibrary", *args: Any, **kwargs: Any) -> _T:
-        with self.operation_lock:
+        from ensemble_prover.lean_runner import (
+            current_lean_deadline,
+            _check_lean_owner_deadline,
+        )
+
+        deadlines = [
+            value
+            for value in (current_lean_deadline(), kwargs.get("deadline_monotonic"))
+            if value is not None
+        ]
+        deadline = min(deadlines) if deadlines else None
+        if deadline is None:
+            with self.operation_lock:
+                return method(self, *args, **kwargs)
+        while True:
+            _check_lean_owner_deadline(deadline)
+            if self.operation_lock.acquire(
+                timeout=min(0.01, max(0.0, deadline - time.monotonic()))
+            ):
+                break
+        try:
+            _check_lean_owner_deadline(deadline)
             return method(self, *args, **kwargs)
+        finally:
+            self.operation_lock.release()
 
     return wrapped
 
@@ -379,17 +403,37 @@ class MiniTheoryLibrary:
         candidate: TheoryBundleCandidate,
         *,
         cancellation_event: Optional[Event] = None,
+        deadline_monotonic: float | None = None,
+        max_heartbeats: int | None = None,
+        memory_mb: int | None = None,
     ) -> TheoryPublishResult:
         if self.mode != "build":
             raise TheoryStoreError("theory publication requires mode='build'")
         verification = self.verify_candidate(
             candidate,
             cancellation_event=cancellation_event,
+            **{
+                key: value
+                for key, value in {
+                    "deadline_monotonic": deadline_monotonic,
+                    "max_heartbeats": max_heartbeats,
+                    "memory_mb": memory_mb,
+                }.items()
+                if value is not None
+            },
         )
+        from ensemble_prover.lean_runner import _check_lean_owner_deadline
+
+        _check_lean_owner_deadline(deadline_monotonic)
         return self.publish_verified(
             candidate,
             verification,
             cancellation_event=cancellation_event,
+            **(
+                {"deadline_monotonic": deadline_monotonic}
+                if deadline_monotonic is not None
+                else {}
+            ),
         )
 
     def verify_candidate(
@@ -398,6 +442,9 @@ class MiniTheoryLibrary:
         *,
         cancellation_event: Optional[Event] = None,
         forbidden_target_statements: Iterable[str] = (),
+        deadline_monotonic: float | None = None,
+        max_heartbeats: int | None = None,
+        memory_mb: int | None = None,
     ) -> TheoryVerificationResult:
         if self.mode != "build":
             raise TheoryStoreError("theory verification requires mode='build'")
@@ -420,6 +467,12 @@ class MiniTheoryLibrary:
         )
         if clean_forbidden_targets:
             verify_kwargs["forbidden_target_statements"] = clean_forbidden_targets
+        if deadline_monotonic is not None:
+            verify_kwargs["deadline_monotonic"] = deadline_monotonic
+        if max_heartbeats is not None:
+            verify_kwargs["max_heartbeats"] = max_heartbeats
+        if memory_mb is not None:
+            verify_kwargs["memory_mb"] = memory_mb
         verification = self.verifier.verify(candidate, **verify_kwargs)
         if not verification.accepted:
             return verification
@@ -517,9 +570,13 @@ class MiniTheoryLibrary:
         verification: TheoryVerificationResult,
         *,
         cancellation_event: Optional[Event] = None,
+        deadline_monotonic: float | None = None,
     ) -> TheoryPublishResult:
         if self.mode != "build":
             raise TheoryStoreError("theory publication requires mode='build'")
+        from ensemble_prover.lean_runner import _check_lean_owner_deadline
+
+        _check_lean_owner_deadline(deadline_monotonic)
         assert self.verifier is not None
         assert self._store is not None
         assert self.retriever is not None
@@ -543,6 +600,7 @@ class MiniTheoryLibrary:
                 "theory verification environment does not match library storage bucket"
             )
         try:
+            _check_lean_owner_deadline(deadline_monotonic)
             bundle = self._store.publish_verified(
                 candidate,
                 verification,

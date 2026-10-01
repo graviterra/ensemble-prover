@@ -147,6 +147,8 @@ class SolvedRecord:
     module_search_paths: Tuple[str, ...] = ()
     project_imports: Tuple[str, ...] = ()
     support_project_builds: Dict[str, List[str]] = field(default_factory=dict)
+    verified_source_digest: str = ""
+    accepted_root_proof_hash: str = ""
 
 
 @dataclass
@@ -1843,6 +1845,7 @@ def _install_exported_lean(
     extra_lean_paths: Sequence[Path] = (),
     project_imports: Sequence[str] = (),
     support_project_builds: Optional[Mapping[str, Sequence[str]]] = None,
+    verified_source_digests: Optional[List[str]] = None,
 ) -> Tuple[bool, str, str, Tuple[str, ...]]:
     """Write ``content`` to ``out_path`` only after optional kernel checking.
 
@@ -1980,6 +1983,7 @@ def _install_exported_lean(
     presentation = PresentationResult(content)
     candidate_path: Optional[Path] = None
     publish_path = temp_path
+    published_content = content
     try:
         presentation = present_export(
             content, theorem_name, scratch_dir=out_path.parent,
@@ -2013,6 +2017,7 @@ def _install_exported_lean(
             presentation.axioms = list(candidate_axioms)
             archive_original(out_path, content, presentation)
             publish_path = candidate_path
+            published_content = presentation.content
     except Exception as exc:
         presentation = PresentationResult(content, "fallback", f"{type(exc).__name__}: {exc}")
     if out_path.exists():
@@ -2031,6 +2036,7 @@ def _install_exported_lean(
             presentation = PresentationResult(content, "fallback", f"{type(exc).__name__}: {exc}")
             os.chmod(temp_path, publish_mode)
             temp_path.replace(out_path)
+            published_content = content
     finally:
         for leftover in (temp_path, candidate_path):
             if leftover is not None:
@@ -2052,6 +2058,8 @@ def _install_exported_lean(
         write_report(out_path, content, presentation)
     except Exception as exc:
         verification_output += f"\n[presentation] report unavailable: {type(exc).__name__}: {exc}"
+    if verified_source_digests is not None:
+        verified_source_digests.append(hashlib.sha256(published_content.encode("utf-8")).hexdigest())
     return True, "verified", verification_output, axioms
 
 
@@ -2775,6 +2783,7 @@ def _export_solved_run_locked(
                 if value:
                     project_module_paths.append(Path(value))
     all_lean_paths = tuple(dict.fromkeys((*theory_lean_paths, *project_module_paths)))
+    verified_source_digests: List[str] = []
     export_verified, verification_status, verification_output, export_axioms = (
         _install_exported_lean(
             out_path,
@@ -2788,6 +2797,7 @@ def _export_solved_run_locked(
             support_project_builds=dict(
                 theorem_project_record.get("support_project_builds") or {}
             ),
+            verified_source_digests=verified_source_digests,
         )
     )
     if verify_lean and not export_verified:
@@ -2843,6 +2853,13 @@ def _export_solved_run_locked(
         proof_chars=len(proof),
         answer_visibility=visibility,
         **visibility_flags,
+        verified_source_digest=(
+            verified_source_digests[-1] if export_verified and verified_source_digests else ""
+        ),
+        accepted_root_proof_hash=(
+            hashlib.sha256(proof.strip().encode("utf-8")).hexdigest()
+            if export_verified else ""
+        ),
         export_verified=export_verified,
         export_verification_status=verification_status,
         export_verification_output=verification_output[:4000],

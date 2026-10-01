@@ -15,6 +15,7 @@ import uvicorn
 from .app import create_app
 from .catalog import default_run_root
 from .security import browser_boundary
+from .memory import DEFAULT_MEMORY_ROOT
 
 DEFAULT_PORT = 8765
 LOOPBACK_HOST = "127.0.0.1"
@@ -53,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PORT,
         help=f"loopback TCP port (default: {DEFAULT_PORT})",
     )
+    parser.add_argument("--memory-root", type=Path, default=DEFAULT_MEMORY_ROOT,
+                        help="trusted mathematical-memory catalog; must match the run's recorded configuration")
     parser.add_argument(
         "--control",
         action="store_true",
@@ -96,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
         web_origin=args.web_origin,
         serve_ui=not args.api_only,
+        memory_root=args.memory_root,
     )
     uvicorn.run(app, host=LOOPBACK_HOST, port=args.port)
     return 0

@@ -50,6 +50,70 @@ def _put(mapping: dict, key: str, value: Any) -> None:
         del mapping[next(iter(mapping))]
 
 
+def memory_detail(value: Any) -> str:
+    """Keep specialization details as bounded report text, never live authority."""
+    if isinstance(value, str):
+        return text(value, 2048)
+    if not isinstance(value, dict):
+        return ""
+    import json
+    detail = {}
+    for key in ("generalized_name", "instance_statement", "instantiation", "kind", "checked",
+                "transfer_credit", "reason", "environment_id", "proof_digest", "source_ancestry", "diagnostic"):
+        item = value.get(key)
+        if isinstance(item, str):
+            detail[key] = text(item, 1200)
+        elif type(item) is bool:
+            detail[key] = item
+        elif isinstance(item, list):
+            detail[key] = [text(part, 160) for part in item[:16] if isinstance(part, str)]
+    return text(json.dumps(detail, sort_keys=True), 2048) if detail else ""
+
+
+def memory_record(value: Any, *, scope: str = "problem") -> dict:
+    """Bound trace text before retaining it; this does not validate eligibility."""
+    source = obj(value)
+    result = {key: text(source.get(key), 160) for key in
+              ("mode", "status", "goal_id", "environment_id", "policy_id", "allocation_id", "research_allocation_id")}
+    generation = obj(source.get("generation"))
+    result.update(scope=scope, partial=source.get("partial") is True,
+                  omitted=number(source.get("omitted")), generation={
+                      "lineage": text(generation.get("lineage"), 160),
+                      "epoch": text(generation.get("epoch"), 160),
+                      "sequence": generation.get("sequence") if type(generation.get("sequence")) is int and generation["sequence"] >= 0 else None,
+                  },
+                  eligibility_lease_until=number(source.get("eligibility_lease_until")))
+    for group in ("candidates", "applications", "obstructions", "proposals", "notes"):
+        rows = source.get(group)
+        rows = rows if isinstance(rows, list) else []
+        result[group] = []
+        for raw in rows[:16]:
+            row = obj(raw)
+            if not row:
+                continue
+            record = {key: text(row.get(key), 160) for key in
+                      ("id", "event_id", "candidate_id", "name", "outcome", "operation", "direction", "scope", "environment_id", "artifact_id", "freshness")}
+            for key in ("statement", "text", "reason", "conditions", "retry_conditions", "assumptions", "expected_use", "observed_use"):
+                record[key] = text(row.get(key), 4096 if key in {"statement", "text"} else 1200)
+            for key in ("remaining_goals", "supplied_premises", "consumers", "instance_ids", "source_instances", "changed_assumptions", "intended_consumers"):
+                items = row.get(key)
+                record[key] = [text(item, 2048) for item in items[:16]] if isinstance(items, list) else []
+            links = row.get("specialization_links")
+            record["specialization_links"] = [memory_detail(item) for item in links[:16]] if isinstance(links, list) else []
+            record["artifact_available"] = row.get("artifact_available") is True
+            record["partial"] = row.get("partial") is True or any(
+                isinstance(row.get(key), list) and len(row[key]) > 16
+                for key in ("remaining_goals", "supplied_premises", "consumers", "instance_ids", "source_instances",
+                            "changed_assumptions", "specialization_links", "intended_consumers"))
+            record["statement_truncated"] = isinstance(row.get("statement"), str) and len(row["statement"]) > 4096
+            result[group].append(record)
+            result["partial"] = result["partial"] or record["partial"]
+        if len(rows) > 16:
+            result["partial"] = True
+            result["omitted"] = None
+    return result
+
+
 def valid_request_id(value: Any) -> bool:
     return (type(value) is str and 0 < len(value) <= 160
             and not any(ord(char) < 32 or ord(char) == 127 for char in value))
@@ -67,11 +131,24 @@ class LiveMathState:
     prepared_requests: dict = field(default_factory=dict)
     prepared_elapsed: dict = field(default_factory=dict)
     startup_seen: bool = False
+    memory: dict = field(default_factory=dict)
+    memory_config: dict = field(default_factory=dict)
+    memory_policy: dict = field(default_factory=dict)
+    memory_owner_selected: bool = False
 
     def consume(self, row: dict) -> None:
         phase = row.get("phase")
         scope = text(row.get("session_scope"), 120) or "not recorded"
         elapsed = number(row.get("elapsed_s"))
+        owner = row.get("mathematical_memory_request_owner")
+        owner_scope = scope in {"problem", "sample", "not recorded"}
+        memory_config_row = phase in {"mathematical_memory_config", "run_config"}
+        elected = owner is True and owner_scope
+        legacy = owner is None and scope in {"problem", "not recorded"} and not self.memory_owner_selected
+        if memory_config_row and (elected or legacy):
+            self.memory_config = dict(obj(row.get("mathematical_memory_config")))
+            self.memory_policy = dict(obj(row.get("mathematical_memory_policy")))
+            self.memory_owner_selected = self.memory_owner_selected or elected
         if phase == "run_config" and scope in {"problem", "not recorded"}:
             self.startup_seen = True
             self.source = source_record(row.get("run_source_provenance"))
@@ -90,6 +167,13 @@ class LiveMathState:
                     "outputTokens": number(cfg.get("configured_max_output_tokens")),
                     "source": "startup", "elapsedS": elapsed, "workType": "",
                 })
+        if phase == "mathematical_memory":
+            payload = obj(row.get("mathematical_memory"))
+            elected_view = payload.get("request_owner") is True and owner_scope
+            legacy_view = (payload.get("request_owner") is None and not self.memory_owner_selected
+                           and scope in {"problem", "not recorded"})
+            if elected_view or legacy_view:
+                self.memory = memory_record(payload, scope=scope)
         if phase == "session_action_selected":
             focus = obj(row.get("mathematical_focus"))
             work = obj(row.get("selected_work_item"))

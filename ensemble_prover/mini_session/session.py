@@ -11049,6 +11049,8 @@ class MiniSession:
     # theory above. The library owns verified immutable artifacts; the session
     # owns only this run's needs and exact imported bundle snapshot.
     theory_library: Optional[Any] = None
+    mathematical_memory: Optional[Any] = None
+    mathematical_memory_state: Dict[str, Any] = field(default_factory=dict)
     theory_candidate_builder: Optional[Any] = None
     theory_context_pair: Optional[Any] = None
     theory_domain: str = "general mathematics"
@@ -26295,6 +26297,18 @@ class MiniSession:
                 "root_finalization_verdict": "root_finalization_dossier_api_missing",
             }
         candidate = self._hydrate_root_candidate_from_existing_finalization(candidate)
+        memory = getattr(self, "mathematical_memory", None)
+        from ..mathematical_memory.service import finalization_without_memory_eligible
+        memory_eligible = (
+            memory.finalization_eligible(candidate) if memory is not None
+            else finalization_without_memory_eligible(self, candidate)
+        )
+        if not memory_eligible:
+            self._clear_root_finalized_for_rejected_attempt()
+            return {
+                "root_finalization_accepted": False,
+                "root_finalization_verdict": "memory_source_policy_no_longer_current",
+            }
         candidate_raw_proof = str(candidate.proof or "").strip()
         candidate_artifact_proof = sanitize_lean_artifact_text(candidate.proof)
         already_recorded = str(
@@ -40983,4 +40997,10 @@ class MiniSession:
                 if not has_recorder:
                     delivered = False
                 _LOGGER.exception("MiniSession on_event raised")
+        memory = self.mathematical_memory
+        if memory is not None and memory.session() is self:
+            try:
+                memory.observe_session_event(record)
+            except Exception:
+                _LOGGER.debug("Advisory memory observation unavailable", exc_info=True)
         return delivered

@@ -78,6 +78,8 @@ keys = ("putnam_file", "lean_file", "theorem_name", "prover", "prover_model", "r
         "planner_escalation", "reasoning_mode", "opaque_mode", "allow_official_answer_visibility",
         "mini_recursive_passes", "mini_recursive_claims", "mini_recursive_turns_per_claim",
         "max_prove_turns", "max_refine_turns", "cost_budget_usd", "llm_deadline_policy", "answer_attempts",
+        "mathematical_memory", "mathematical_memory_root", "mathematical_memory_seconds",
+        "mathematical_memory_research_seconds", "mathematical_memory_campaign", "mathematical_memory_family",
         "inference_policy")
 parsed = {k: getattr(ns, k, None) for k in keys}
 preview = _preview(ns)

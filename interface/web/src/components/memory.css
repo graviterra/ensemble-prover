@@ -1,0 +1,8 @@
+.memory-panel { margin-block: 1.5rem; padding: 1.2rem; border: 1px solid var(--line, #ddd); border-radius: .7rem; }
+.memory-panel .field { margin-block: .8rem; }
+.memory-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 23rem), 1fr)); gap: 1rem; margin-block: 1rem; }
+.memory-cards article { min-width: 0; padding: 1rem; background: var(--surface, #fafafa); border: 1px solid var(--line, #ddd); border-radius: .5rem; }
+.memory-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16rem; overflow: auto; font-size: .85rem; }
+.memory-actions { display: flex; flex-wrap: wrap; gap: .7rem; margin-block-start: 1rem; }
+.memory-panel textarea { width: 100%; min-height: 5rem; resize: vertical; }
+.memory-notebook { margin-block-start: 1rem; max-width: 50rem; }

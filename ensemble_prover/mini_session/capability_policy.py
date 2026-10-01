@@ -28,6 +28,7 @@ RUNTIME_CAPABILITY_FIELD_NAMES = frozenset(
         "recorder",
         "proof_cache",
         "theory_library",
+        "mathematical_memory",
         "theory_candidate_builder",
         "theory_verified_helper_accept_callback",
         "theory_verified_helper_reconcile_callback",

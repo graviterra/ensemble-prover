@@ -22,6 +22,8 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import threading
+import time
 from typing import Any, Iterator, Mapping, Sequence
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -530,14 +532,12 @@ def _require_cached_package(project: Path, packages_root: Path, package: Any) ->
         if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
             raise NetworkPolicyError("unsupported_preflight", "lean_manifest")
         try:
-            checked = subprocess.run(
-                ["git", "--no-replace-objects", "-C", str(checkout), "rev-parse", "--verify", "HEAD"],
-                capture_output=True, text=True, timeout=5, check=False,
-                env={key: value for key, value in sanitized_subprocess_environment().items() if not key.startswith("GIT_")},
-            )
+            actual_revision = _cached_git_revision(checkout)
+        except TimeoutError:
+            raise
         except (OSError, subprocess.TimeoutExpired):
             raise NetworkPolicyError("lean_cache_missing", "package") from None
-        if checked.returncode or checked.stdout.strip().lower() != revision.lower():
+        if actual_revision is None or actual_revision.lower() != revision.lower():
             raise NetworkPolicyError("lean_cache_missing", "package_revision")
         return
     if kind != "path" or type(package.get("dir")) is not str or not str(package.get("dir")).strip():
@@ -547,6 +547,35 @@ def _require_cached_package(project: Path, packages_root: Path, package: Any) ->
         candidate = project / candidate
     if not candidate.is_dir():
         raise NetworkPolicyError("lean_cache_missing", "package")
+
+
+def _cached_git_revision(checkout: Path) -> str | None:
+    from ..mini_theory.environment import (
+        _check_fingerprint_owner,
+        _owned_git_output,
+        environment_fingerprint_scope,
+    )
+
+    args = ("--no-replace-objects", "-C", str(checkout), "rev-parse", "--verify", "HEAD")
+    environment = {
+        key: value for key, value in sanitized_subprocess_environment().items()
+        if not key.startswith("GIT_")
+    }
+    owner_deadline = _check_fingerprint_owner()
+    if owner_deadline is not None:
+        deadline = min(owner_deadline, time.monotonic() + 5)
+        with environment_fingerprint_scope(
+            cancellation_event=threading.Event(), deadline_monotonic=deadline
+        ):
+            return _owned_git_output(
+                checkout, args, deadline, environment=environment,
+                acquire_process_slot=False,
+            )
+    checked = subprocess.run(
+        ["git", *args], capture_output=True, text=True, timeout=5, check=False,
+        env=environment,
+    )
+    return checked.stdout.strip() if checked.returncode == 0 else None
 
 
 def _argv(argv: Sequence[str]) -> tuple[str, ...]:

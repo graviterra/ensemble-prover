@@ -39,6 +39,16 @@ _MODES = ("provider-default", "auto", "on", "off")
 _INFERENCE_POLICIES = ("mixed", "local-only")
 _EFFORTS = ("none", "low", "medium", "high", "max")
 _FIELDS = (
+    Option("mathematical-memory", "Mathematical memory", "select", "Search",
+           "Off preserves ordinary retrieval. Observe records outcomes; assist probes eligible prior results; develop also runs explicitly allocated generalization jobs.",
+           ("off", "observe", "assist", "develop")),
+    Option("mathematical-memory-seconds", "Memory action allocation (seconds)", "number", "Budgets",
+           "Total allocation inside the existing run governor for memory actions. Zero starts no memory jobs.", integer=False),
+    Option("mathematical-memory-research-seconds", "Generalization allocation (seconds)", "number", "Budgets",
+           "Explicit research allocation required by develop mode; existing run cost/time limits still apply.", integer=False),
+    Option("mini-theory-mode", "Mini theory permission", "select", "Search",
+           "Read imports compatible published bundles; build also permits checked publication. Develop memory requires build.",
+           ("off", "read", "build")),
     Option("mini-recursive-passes", "Recursive passes", "number", "Search",
            "Recursive plan, prove and integrate passes. Zero uses the CLI default; it does not disable recursion."),
     Option("mini-recursive-claims", "Recursive claims", "number", "Search",
@@ -177,5 +187,8 @@ def option_args(
                 raise OptionValidationError("integer", key=field.key)
             args.extend([flag, str(int(value) if field.integer else value)])
     if proof_search:
+        if options.get("mathematical-memory") == "develop":
+            if options.get("mini-theory-mode", "build") != "build" or options.get("mathematical-memory-research-seconds", 0) <= 0:
+                raise ValueError("develop memory requires theory build and a positive research allocation")
         _validate_reasoning(options, refiner_enabled=refiner_enabled)
     return args

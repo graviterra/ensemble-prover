@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { failureText, fetchRun } from "../api";
 import { LiveMathPanel } from "../components/LiveMathPanel";
+import { MemoryPanel } from "../components/MemoryPanel";
 import { ProofGraph } from "../components/ProofGraph";
 import { StopDialog } from "../components/StopDialog";
 import { PollingControls } from "../components/PollingControls";
@@ -135,6 +136,7 @@ export function AttemptScreen({ id, onLibrary, expanded = false, paused: control
       </div>
 
       <LiveMathPanel value={detail?.liveMath} paused={paused} readFailed={!!error} />
+      <MemoryPanel key={id} runId={id} value={detail?.liveMath?.memory} paused={paused} />
 
       <div className={`proof-workspace${expanded ? " is-expanded" : ""}`}>
         <section className="graph-section" aria-labelledby="graph-heading">

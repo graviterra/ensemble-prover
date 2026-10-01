@@ -10,16 +10,19 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 import math
 import threading
 import time
 import uuid
 import weakref
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from functools import partial, update_wrapper
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+
+_LOGGER = logging.getLogger(__name__)
 
 from ..config import LeanConfig, RetrievalConfig, RoleConfig  # noqa: F401  (parity with mini_prover imports)
 from ..lean_runner import LeanRunner
@@ -2020,6 +2023,11 @@ def build_session_for_prove_problem(
     recorder: Optional[Any] = None,
     searcher: Optional[MathlibApiSearcher] = None,
     mathematical_retrieval_enabled: bool = True,
+    mathematical_memory_config: Optional[Any] = None,
+    mathematical_memory_allocation: Optional[Any] = None,
+    mathematical_memory_request_owner: bool = True,
+    mathematical_memory_policy: Optional[Any] = None,
+    mathematical_memory_provenance_registry: Optional[Any] = None,
     cost_controller: Optional[Any] = None,
     lean_check_tool_enabled: bool = True,
     try_lean_tool_enabled: bool = True,
@@ -3402,6 +3410,8 @@ def build_session_for_prove_problem(
                 durable_parent_fingerprints=supplied_promotion_fingerprints,
             )
             _stage_all_session_verified_helpers(session, force=True)
+    from ..mathematical_memory.service import install_session_memory
+    install_session_memory(session, mathematical_memory_config, allocation=mathematical_memory_allocation, request_owner=mathematical_memory_request_owner, policy=mathematical_memory_policy, provenance_registry=mathematical_memory_provenance_registry)
     session.expand_max_iterations_to_action_budgets(headroom=5)
     from .durable_session_record import initialize_theory_checkpoint_context
 
@@ -3505,6 +3515,29 @@ async def prove_problem_via_session(
         raise TypeError("prove_problem_via_session requires problem")
     _validate_supplied_dossier_problem_identity(problem, kwargs.get("dossier"))
     sample_count = max(1, int(kwargs.get("parallel_samples", 1) or 1))
+    memory_config = kwargs.get("mathematical_memory_config")
+    if memory_config is None:
+        from ..mathematical_memory.service import persist_disabled_memory_owner
+        persist_disabled_memory_owner(SimpleNamespace(recorder=kwargs.get("recorder"), parent=None),
+            policy=kwargs.get("mathematical_memory_policy"),
+            request_owner=kwargs.get("mathematical_memory_request_owner", True))
+    if memory_config is not None:
+        from ..mathematical_memory.config import MemoryConfig
+        from ..mathematical_memory.budget import MemoryAllocation
+        if isinstance(memory_config, Mapping):
+            memory_config = MemoryConfig.from_record(dict(memory_config))
+        kwargs["mathematical_memory_config"] = memory_config
+        if not memory_config.enabled:
+            from ..mathematical_memory.service import persist_disabled_memory_owner
+            persist_disabled_memory_owner(SimpleNamespace(recorder=kwargs.get("recorder"), parent=None),
+                memory_config, kwargs.get("mathematical_memory_policy"),
+                request_owner=kwargs.get("mathematical_memory_request_owner", True))
+        actual_theory_mode = str(getattr(kwargs.get("theory_library"), "mode", "off"))
+        if memory_config.mode == "develop" and actual_theory_mode != "build":
+            raise ValueError("develop memory requires the actual theory build capability before startup")
+        if memory_config.enabled and kwargs.get("mathematical_memory_allocation") is None:
+            kwargs["mathematical_memory_allocation"] = MemoryAllocation(memory_config.action_seconds, run_dir=Path(getattr(kwargs.get("recorder"), "output_dir")) if getattr(kwargs.get("recorder"), "output_dir", None) is not None else None)
+
 
     # Bind once for the entire container, including post-sample MiniRecursive
     # controllers and child sessions that read the outer kwargs directly.
@@ -3788,6 +3821,8 @@ async def prove_problem_via_session(
             1,
         )
         _signal_worker_ready_once()
+        _observe_startup_mathematical_memory(kwargs, dossier, problem, lean_preamble,
+                                            visible_answer_root_proof, "visible_answer_active_target")
         return True, visible_answer_root_proof
     premise_goal_statement = (
         active_root_target_statement(
@@ -4004,6 +4039,8 @@ async def prove_problem_via_session(
         if not ok:
             await _commit_outer_phase("startup_root_fast_lane_exhausted", True)
     if ok:
+        _observe_startup_mathematical_memory(kwargs, dossier, problem, lean_preamble,
+                                            str(proof or ""), "startup_root_fast_lane")
         return True, proof
     # The one-shot lane has finished. Drop its knobs from the shared kwargs so
     # every later sample / post-fanin ``build_session_for_prove_problem`` call
@@ -4427,6 +4464,10 @@ async def prove_problem_via_session(
                 # The recursive driver must replay the child proof before it
                 # commits any newly built theory bundle into this attempt.
                 conv_kwargs["defer_theory_promotion"] = True
+                for memory_key in ("mathematical_memory_config", "mathematical_memory_allocation",
+                                   "mathematical_memory_policy", "mathematical_memory_provenance_registry"):
+                    conv_kwargs.setdefault(memory_key, kwargs.get(memory_key))
+                conv_kwargs["mathematical_memory_request_owner"] = False
                 if conv_kwargs.get("temperature_override") is None:
                     conv_kwargs["temperature_override"] = kwargs.get(
                         "sample_temperature"
@@ -4857,6 +4898,7 @@ async def prove_problem_via_session(
                         adaptive_recursive_pass_budget_remaining
                     ),
                     "session_scope": "parallel_fanin_recursive",
+                    "mathematical_memory_request_owner": False,
                 }
             )
             for key in ("parallel_late_sample_grace_s",):
@@ -5079,6 +5121,10 @@ async def prove_problem_via_session(
             )
 
             session_kwargs = dict(kwargs)
+            session_kwargs["mathematical_memory_request_owner"] = (
+                bool(kwargs.get("mathematical_memory_request_owner", True))
+                and sample_index == 0
+            )
             sample_searcher = searcher
             if sample_count > 1:
                 from .searcher_context import fork_searcher_context
@@ -6913,6 +6959,123 @@ _RECURSIVE_CHILD_REPORTING_METRICS = frozenset({
 })
 
 
+def _observe_startup_mathematical_memory(kwargs: Mapping[str, Any], dossier: Any,
+                                        problem: Any, preamble: str, proof: str, stage: str) -> None:
+    """Capture pre-session acceptance without launching a new proof allocation."""
+    config = kwargs.get("mathematical_memory_config")
+    if config is None or not config.enabled:
+        return
+    from ..mathematical_memory.service import MathematicalMemoryService, persist_memory_owner
+    from ..mathematical_memory.model import content_digest
+
+    class Observer:
+        def acceptance_preamble(self) -> str:
+            return preamble
+
+        def _record_event(self, record: Mapping[str, Any]) -> None:
+            if self.recorder is not None and hasattr(self.recorder, "record_turn"):
+                self.recorder.record_turn(dict(record))
+            callback = kwargs.get("on_event")
+            if callable(callback):
+                callback(dict(record))
+
+    owner = Observer()
+    owner.problem, owner.dossier = problem, dossier
+    owner.conv = SimpleNamespace(goal_statement=problem.statement_type)
+    owner.recorder = kwargs.get("recorder")
+    owner.scope, owner.parent = "problem", None
+    owner.session_activation_id = "startup:" + content_digest({"target": problem.statement_type,
+                                                              "stage": stage, "proof": proof})
+    owner.mathematical_memory_state = {}
+    try:
+        memory = MathematicalMemoryService(owner, config, kwargs.get("mathematical_memory_policy"),
+            allocation=kwargs.get("mathematical_memory_allocation"), request_owner=False,
+            provenance_registry=kwargs.get("mathematical_memory_provenance_registry"))
+        if kwargs.get("mathematical_memory_request_owner", True):
+            persist_memory_owner(memory, elected_startup_owner=True)
+        accepted = dossier.has_root_proof_finalization_receipt()
+        payload = {"stage": stage, "statement": problem.statement_type,
+                   "outcome": "checked_solution" if accepted else "elaborated_closed",
+                   "proof": proof, "configuration": config.to_record(),
+                   "acceptance_receipt": dossier.root_proof_finalization_receipt_hash() if accepted else ""}
+        event = memory.record("root_acceptance", payload,
+            event_id=content_digest({"run": memory.run_id, "stage": stage, "proof": proof}))
+        if accepted:
+            from ..helper_utilization import source_digest
+            for observation in dossier.helper_utilization_observations.values():
+                if (observation.get("consumer_kind") == "root"
+                        and observation.get("proof_hash") == source_digest(proof)
+                        and observation.get("environment_hash") == dossier.current_lean_environment_hash):
+                    memory.record_use(observation, root_export=False)
+        if event is not None:
+            memory.emit(applications=[{**payload, "event_id": event.event_id,
+                "evidence_digest": event.evidence[0].digest if event.evidence else ""}])
+    except Exception:
+        # Historical observation never changes an already accepted proof.
+        _LOGGER.debug("Startup mathematical memory observation unavailable", exc_info=True)
+
+
+
+def _inherit_child_memory_source_obligations(session: Any, *, parent: Any = None) -> None:
+    """Retain inherited environment obligations without copying live admission."""
+    if parent is None:
+        parent = getattr(session, "parent", None)
+    if parent is None:
+        return
+    from ..mathematical_memory.service import snapshot_memory_source_obligations
+
+    memory = getattr(parent, "mathematical_memory", None)
+    try:
+        inherited = (
+            snapshot_memory_source_obligations(memory)
+            if memory is not None
+            else getattr(parent, "mathematical_memory_state", {})
+        )
+    except (OSError, ValueError, RuntimeError):
+        session.mathematical_memory_state["retired_support_incomplete"] = True
+        return
+    state = session.mathematical_memory_state
+    if not isinstance(inherited, dict):
+        state["retired_support_incomplete"] = True
+        return
+    if inherited.get("retired_support_incomplete") is True:
+        state["retired_support_incomplete"] = True
+    for key in (
+        "retired_support_names", "retired_bundle_obligations", "retired_import_owners"
+    ):
+        combined = set()
+        for values in (state.get(key, ()), inherited.get(key, ())):
+            if (
+                not isinstance(values, (list, tuple))
+                or len(values) > 4096
+                or any(not isinstance(value, str) for value in values)
+            ):
+                state["retired_support_incomplete"] = True
+                continue
+            combined.update(values)
+        if len(combined) > 4096:
+            state["retired_support_incomplete"] = True
+        if combined:
+            state[key] = sorted(combined)[:4096]
+
+
+def _install_child_mathematical_memory(session: Any, config: Any, allocation: Any,
+                                       policy: Any, registry: Any, *, parent: Any = None) -> None:
+    """Give an authorized child its own history inside its ancestor allocation."""
+    _inherit_child_memory_source_obligations(session, parent=parent)
+    from ..mathematical_memory.service import install_session_memory
+    if policy is not None:
+        from ..mathematical_memory.model import content_digest
+        run_id = str(getattr(getattr(session, "recorder", None), "output_dir", "")
+                     or session.session_activation_id)
+        scope_id = content_digest({"run": run_id, "scope": session.scope,
+                                  "target": str(getattr(session.problem, "statement_type", ""))})
+        policy = replace(policy, visible_scopes=tuple(dict.fromkeys(
+            (*policy.visible_scopes, ("session", scope_id)))))
+    install_session_memory(session, config, allocation=allocation, request_owner=False,
+                           policy=policy, provenance_registry=registry)
+
+
 async def _mini_session_run_conversation_callback(
     **kwargs: Any,
 ) -> Tuple[bool, Optional[str]]:
@@ -7694,6 +7857,15 @@ async def _mini_session_run_conversation_callback(
         f"conversation_turn_{role}",
         ActionBudget(max_invocations=max_turns, max_total_seconds=0.0),
     )
+    parent_memory = getattr(theory_parent_session, "mathematical_memory", None)
+    if parent_memory is not None:
+        _install_child_mathematical_memory(session, parent_memory.config, parent_memory.allocation,
+                                          parent_memory.policy, parent_memory.provenance_registry,
+                                          parent=theory_parent_session)
+    else:
+        _install_child_mathematical_memory(session, kwargs.get("mathematical_memory_config"),
+            kwargs.get("mathematical_memory_allocation"), kwargs.get("mathematical_memory_policy"),
+            kwargs.get("mathematical_memory_provenance_registry"), parent=theory_parent_session)
     session.expand_max_iterations_to_action_budgets(headroom=4)
     deadline_epoch_s = max(
         0.0,

@@ -310,3 +310,14 @@ and model conversations.
 Persistent Mini theory defaults to `~/.cache/mini_prover/theory`. Use
 `--mini-theory-root` to isolate experiments, `--mini-theory-mode read` for
 retrieval-only operation, or `--mini-theory-mode off` to disable it.
+
+Mathematical memory defaults to off. Add `--mathematical-memory observe` to
+record existing outcomes or `--mathematical-memory assist` for bounded prior
+theorem applications. Set `--mathematical-memory-root /path/to/catalog` to
+isolate a campaign and `--mathematical-memory-seconds 90` for its action
+allocation inside the run's existing governor. Developing generalizations
+requires `--mathematical-memory develop --mini-theory-mode build` with a positive
+`--mathematical-memory-research-seconds` allocation that does not exceed the
+total memory action allocation (90 seconds by default). Reports and rankings cannot
+replace ordinary proof acceptance. The default catalog root is
+`~/.local/share/ensemble-prover/mathematical-memory`.

@@ -2,6 +2,8 @@ import type { Formalization, GraphNode, Lane, LibraryRun, Milestone, NodeEvidenc
 import { publicMessage, toNode } from "./words";
 
 import { parseLiveMath } from "./liveMath";
+import { parseMemory, parseMemoryRequest } from "./memory";
+import type { MemoryRequest, MemoryView } from "./memory";
 
 const BLOCKED = new Set(["command", "argv", "args", "shell"]);
 
@@ -288,6 +290,27 @@ async function mutation(path: string, payload: unknown, action: "start" | "stop"
   const { response, body } = await mutationResponse(path, payload, signal);
   if (!response.ok) throw asApiError(response, body, action);
   return body;
+}
+
+export async function fetchMemory(runId: string, signal?: AbortSignal): Promise<MemoryView | undefined> {
+  return parseMemory(await request(`/api/memory/${encodeURIComponent(runId)}`, { signal }, "read"));
+}
+export async function submitMemoryRequest(runId: string, payload: Record<string, string | number>): Promise<MemoryRequest> {
+  const body: unknown = await mutation(`/api/memory/${encodeURIComponent(runId)}/requests`, payload, "start");
+  const record = parseMemoryRequest(body && typeof body === "object" ? (body as Record<string, unknown>).request : undefined);
+  if (!record || record.payload.request_id !== payload.request_id || record.payload.kind !== payload.kind) throw new ApiError(502, "The request receipt was unusable. Its storage and execution are uncertain.", "memory_response_unusable");
+  return record;
+}
+export async function fetchMemoryRequests(runId: string, signal?: AbortSignal): Promise<MemoryRequest[]> {
+  const body: unknown = await request(`/api/memory/${encodeURIComponent(runId)}/requests`, { signal }, "read");
+  const records = body && typeof body === "object" ? (body as Record<string, unknown>).requests : undefined;
+  return Array.isArray(records) ? records.slice(0, 64).map(parseMemoryRequest).filter((record): record is MemoryRequest => !!record) : [];
+}
+export async function materializeMemoryEvidence(runId: string, eventId: string, digest: string): Promise<string> {
+  const body: unknown = await mutation(`/api/memory/${encodeURIComponent(runId)}/evidence`, { event_id: eventId, digest }, "start");
+  const artifactId = body && typeof body === "object" ? (body as Record<string, unknown>).artifact_id : undefined;
+  if (typeof artifactId !== "string" || !/^[a-f0-9]{64}$/.test(artifactId)) throw new ApiError(502, "The evidence-copy receipt was unusable.", "memory_response_unusable");
+  return artifactId;
 }
 
 export async function fetchLibrary(signal?: AbortSignal): Promise<LibraryRun[]> {
