@@ -6,24 +6,17 @@ the benchmark's opaque axiom. Ordinary Lean verification must still prove it.
 
 from __future__ import annotations
 
-import dataclasses
-import hashlib
-import json
 import re
-from pathlib import Path
 
-from .answer_input import AnswerTemplate, _answer_code, load_candidate
+from .answer_input import AnswerTemplate, _answer_code
 from .mini_lean_extract import _strip_lean_comments
-from .nl_input import _unique_fields
 from .theorem_project import (
     PUTNAMBENCH_ADAPTER_ID,
     TheoremProblem,
     TheoremProjectRequest,
-    _resolve_theorem_project,
     scan_lean_theorems,
     select_lean_theorem,
     theorem_reusable_preamble,
-    with_theorem_execution_context,
 )
 
 PUTNAM_ANSWER_MARKER = "-- ensemble-putnam-answer-input: source-bound candidate"
@@ -171,62 +164,9 @@ def load_putnam_answer_project(
     request: TheoremProjectRequest,
 ) -> TheoremProblem:
     """Validate the discovery receipt on every startup/resume, then load Lean."""
-    request = request.normalized()
-    directory = request.lean_file.parent
-    record = json.loads(
-        (directory / "answer_discovery.json").read_bytes(),
-        object_pairs_hook=_unique_fields,
-    )
-    origin = record["input_request"]
-    original_request = TheoremProjectRequest(
-        lean_file=Path(origin["lean_file"]),
-        theorem_name=origin["theorem_name"],
-        project_path=Path(origin["project_path"]),
-        imports=tuple(origin["imports"]),
-        source_dirs=tuple(Path(path) for path in origin["source_dirs"]),
-        description=origin["description"],
-    ).normalized()
-    if (
-        original_request.lean_file == request.lean_file
-        or original_request.theorem_name != request.theorem_name
-        or original_request.project_path != request.project_path
-        or original_request.imports != request.imports
-        or original_request.source_dirs != request.source_dirs
-    ):
-        raise ValueError(
-            "Putnam candidate execution context differs from its discovery receipt"
-        )
-    source = original_request.lean_file.read_bytes().decode("utf-8")
-    template = find_putnam_answer_template(source, request.theorem_name)
-    if template is None:
-        raise ValueError("Putnam candidate has no original answer question")
-    candidate = load_candidate(directory, template, original_request)
-    if candidate.lean_file.resolve() != request.lean_file:
-        raise ValueError("Putnam candidate is not the admitted answer file")
-    problem = _resolve_theorem_project(
-        dataclasses.replace(
-            request, description=candidate.description_path.read_text(encoding="utf-8")
-        ),
-        adapter_id=PUTNAMBENCH_ADAPTER_ID,
-    )
-    return with_theorem_execution_context(
-        problem,
-        preamble=problem.preamble,
-        lean_preamble=problem.lean_preamble,
-        adapter_metadata={
-            "machine_proposed_answer": True,
-            "answer_original_source_path": str(original_request.lean_file),
-            "answer_original_source_sha256": hashlib.sha256(
-                template.original_bytes
-            ).hexdigest(),
-            "answer_template_sha256": hashlib.sha256(
-                template.source.encode("utf-8")
-            ).hexdigest(),
-            "answer_candidate_sha256": candidate.source_sha256,
-            "excluded_source_paths": [
-                str(original_request.lean_file),
-                str(directory / "original.lean"),
-            ],
-            "exclude_entire_source_from_retrieval": True,
-        },
+    from .answer_project import load_answer_project
+
+    return load_answer_project(
+        request, template_finder=find_putnam_answer_template,
+        adapter_id=PUTNAMBENCH_ADAPTER_ID, label="Putnam",
     )

@@ -9,7 +9,8 @@ import threading
 from typing import Any
 from weakref import WeakKeyDictionary
 
-from ensemble_prover.formalization.environment import _SnapshotBuilder, _imports
+from ensemble_prover.formalization.environment import _SnapshotBuilder, _imports, _module_file
+from ensemble_prover.theorem_project import _lean_name_components
 
 _CACHE: WeakKeyDictionary[Any, dict[str, str]] = WeakKeyDictionary()
 _CAPTURE_LOCKS: WeakKeyDictionary[Any, Any] = WeakKeyDictionary()
@@ -35,12 +36,15 @@ def _local_inputs(project: Path, imports: list[str], sources: dict[str, str]) ->
         if module in seen:
             continue
         seen.add(module)
-        relative = Path(*module.split("."))
-        source = Path(sources.get(module, str(project / relative.with_suffix(".lean"))))
+        components = _lean_name_components(module)
+        if not components:
+            raise ValueError(f"invalid Lean module path: {module}")
+        relative = Path(*components)
+        source = Path(sources.get(module, str(_module_file(project, relative, ".lean"))))
         if not source.is_absolute():
             source = project / source
-        for path in (source, project / ".lake/build/lib/lean" / relative.with_suffix(".olean"),
-                     project / ".lake/build/lib" / relative.with_suffix(".olean")):
+        for path in (source, _module_file(project / ".lake/build/lib/lean", relative, ".olean"),
+                     _module_file(project / ".lake/build/lib", relative, ".olean")):
             result[str(path.resolve())] = (
                 hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "missing"
             )

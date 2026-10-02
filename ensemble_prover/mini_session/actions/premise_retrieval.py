@@ -6,8 +6,8 @@ import time
 from typing import Any, ClassVar, FrozenSet
 
 from ...proof_dossier import text_hash
-from ...theorem_project import merge_imports
 from ..action import MiniOutcome
+from ..source_imports import apply_source_import, prepare_source_import
 
 
 class PremiseRetrievalAction:
@@ -257,16 +257,9 @@ class PremiseRetrievalAction:
                     if import_key in attempted_imports:
                         continue
                     attempted_imports.add(import_key)
-                    current_lean_preamble = str(
-                        getattr(session.conv, "lean_preamble", "")
-                        or getattr(session.conv, "preamble", "")
-                        or ""
-                    )
-                    proposed_preamble = merge_imports(
-                        current_lean_preamble,
-                        (module_name,),
-                    )
                     try:
+                        proposed_context = prepare_source_import(session, module_name)
+                        proposed_preamble = proposed_context.lean.render()
                         from ensemble_prover.proof_state_executor import (
                             _await_serialized_lean_operation,
                         )
@@ -318,7 +311,10 @@ class PremiseRetrievalAction:
                             f"project import {module_name}: action deadline exhausted"
                         )
                         break
-                    session.conv.lean_preamble = proposed_preamble
+                    apply_source_import(
+                        session, proposed_context, module=module_name,
+                        declaration=declaration_name, statement=declaration_type,
+                    )
                     if session.dossier is not None:
                         previous_environment_hash = str(
                             getattr(
@@ -356,11 +352,6 @@ class PremiseRetrievalAction:
                             session.dossier.current_lean_environment_hash = (
                                 next_environment_hash
                             )
-                    llm_preamble = str(getattr(session.conv, "preamble", "") or "")
-                    session.conv.preamble = merge_imports(
-                        llm_preamble,
-                        (module_name,),
-                    )
                     source_kind = str(
                         getattr(hit, "source_kind", "") or ""
                     )

@@ -165,11 +165,15 @@ def _theory_checkpoint_context(session: Any) -> dict[str, Any] | None:
             or session.conv.preamble != pair.llm.render()
             or session.conv.lean_preamble != pair.lean.render()):
         raise ValueError("Theory context differs from its live session binding")
-    return {
+    result = {
         "initial_context_hash": session._checkpoint_initial_theory_context_hash,
         "bundle_ids": list(pair.lean.bundle_ids),
         "snapshot": clone_json_value(list(session.theory_snapshot)),
     }
+    imports = getattr(session, "_checked_source_imports", ())
+    if imports:
+        result["source_imports"] = clone_json_value(imports)
+    return result
 
 
 async def _prepare_theory_checkpoint_context(
@@ -180,7 +184,10 @@ async def _prepare_theory_checkpoint_context(
     if saved is None:
         return session
     if (type(saved) is not dict
-            or set(saved) != {"initial_context_hash", "bundle_ids", "snapshot"}
+            or set(saved) not in (
+                {"initial_context_hash", "bundle_ids", "snapshot"},
+                {"initial_context_hash", "bundle_ids", "snapshot", "source_imports"},
+            )
             or type(saved["initial_context_hash"]) is not str
             or type(saved["bundle_ids"]) is not list
             or any(type(item) is not str or not item for item in saved["bundle_ids"])
@@ -188,14 +195,42 @@ async def _prepare_theory_checkpoint_context(
             or type(saved["snapshot"]) is not list):
         raise ValueError("Invalid durable theory context")
     pair = getattr(session, "theory_context_pair", None)
+    if pair is not None and (pair.llm.render() != session.conv.preamble
+                             or pair.lean.render() != session.conv.lean_preamble):
+        raise ValueError("Fresh theory context differs from its live session binding")
+    source_imports = saved.get("source_imports", [])
+    if (type(source_imports) is not list
+            or source_imports != values.get("_checked_source_imports", [])
+            or any(type(item) is not dict
+                   or set(item) != {"module", "declaration", "statement"}
+                   or any(type(value) is not str or not value for value in item.values())
+                   for item in source_imports)):
+        raise ValueError("Invalid durable source import admissions")
+    if pair is None and source_imports:
+        from ensemble_prover.mini_theory.context import TheoryContextPair
+
+        pair = TheoryContextPair.from_preambles(
+            llm_preamble=session.conv.preamble,
+            lean_preamble=session.conv.lean_preamble,
+        )
     initial_hash = getattr(session, "_checkpoint_initial_theory_context_hash", None)
-    if (pair is None or getattr(session, "theory_library", None) is None
+    if (pair is None
+            or (saved["bundle_ids"] and getattr(session, "theory_library", None) is None)
             or saved["initial_context_hash"] != (initial_hash or pair.snapshot_hash)
             or saved["bundle_ids"] != data["scheduler"]["session_state"].get("theory_imported_bundle_ids")
             or saved["snapshot"] != list(values.get("theory_snapshot", ()))):
         raise ValueError("Theory checkpoint differs from its configured initial context")
+    from .source_imports import source_import_context
+
+    view = copy.copy(session)
+    view.conv = copy.copy(session.conv)
+    # Reconstruct only checked import commands; saved preamble text never
+    # supplies declarations, options or other commands to the fresh verifier.
+    for receipt in source_imports:
+        pair = source_import_context(pair, receipt["module"])
+    view.theory_context_pair = pair
     prepared = (
-        await asyncio.to_thread(session.prepare_theory_bundles, saved["bundle_ids"])
+        await asyncio.to_thread(view.prepare_theory_bundles, saved["bundle_ids"])
         if saved["bundle_ids"]
         else ((), pair, pair, ())
     )
@@ -205,8 +240,6 @@ async def _prepare_theory_checkpoint_context(
     if (list(selected.lean.bundle_ids) != saved["bundle_ids"]
             or clone_json_value(list(snapshot)) != saved["snapshot"]):
         raise ValueError("Theory checkpoint source differs from the fresh verified snapshot")
-    view = copy.copy(session)
-    view.conv = copy.copy(session.conv)
     view.conv.preamble = selected.llm.render()
     view.conv.lean_preamble = selected.lean.render()
     view.theory_context_pair = selected
@@ -462,6 +495,16 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
     verifier_view = await _prepare_theory_checkpoint_context(session, data, values)
     if expected_identity != session_checkpoint_identity(verifier_view):
         raise ValueError("checkpoint identity differs from the fresh target, environment or policy")
+    # The identity above includes fresh source/compiled inputs for the complete
+    # import closure. Re-establish each declaration admission independently,
+    # before publishing any context or retrieval availability to the session.
+    for receipt in values.get("_checked_source_imports", ()):
+        admitted = await verifier_view.lean.check(
+            receipt["statement"], f"by exact @{receipt['declaration']}", [],
+            preamble_override=verifier_view.conv.lean_preamble,
+        )
+        if not getattr(admitted, "ok", False) or getattr(admitted, "axiom_audit_ok", None) is not True:
+            raise ValueError("saved source import failed fresh Lean admission")
     clock = data.get("clock")
     if (type(clock) is not dict or set(clock) != {"epoch_s", "monotonic_s"}
             or any(type(value) not in {int, float} or not math.isfinite(value)
@@ -602,7 +645,8 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
     session.__dict__.update(published_values)
     session.budgets = published_budgets
     if verifier_view is not session:
-        initialize_theory_checkpoint_context(session)
+        if not hasattr(session, "_checkpoint_initial_theory_context_hash"):
+            session._checkpoint_initial_theory_context_hash = data["theory_context"]["initial_context_hash"]
         session.theory_context_pair = verifier_view.theory_context_pair
         session.theory_snapshot = verifier_view.theory_snapshot
     session._run_governor_last_tick_monotonic = time.monotonic()

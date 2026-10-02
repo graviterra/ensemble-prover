@@ -823,6 +823,10 @@ class NativeResearchCoordinator:
                         or job.get("frontier_permit_consumed")
                         or native_job_context(job, jobs, recorded_contexts=recorded) not in reachable):
                     continue
+                # A verified import does not renew an assignment invalidated
+                # by an independent claim or dependency revision.
+                if self.store.get_claim(job["claim_id"])["revision"] != job["revision"]:
+                    continue
                 target = native_job_target(job, jobs)
                 if canonical_dossier_statement_key(
                     self.store.get_claim(target)["spec"]["contract"]["statement"]

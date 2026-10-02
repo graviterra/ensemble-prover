@@ -2209,12 +2209,20 @@ def _tool_argument_repair_notice_text(exc: BaseException) -> str:
         if kind not in {"array", "string", "number", "boolean", "null"}:
             kind = "non-object"
         problem = f"decoded as a JSON {kind}, not an object"
+    encoding_guidance = (
+        "Encode the argument object as JSON text, then encode that text as the "
+        "envelope's arguments string. Escape control characters, quotes and "
+        "backslashes at both JSON layers. Preserve the intended Lean code; "
+        "correct its serialization."
+        if repair.get("wire_format") == "subscription_json_envelope"
+        else "Call the tool again with arguments as a single JSON object. "
+             "Do not repeat the previous argument text."
+    )
     return (
         "The previous tool call was not executed. "
         f"{name} arguments must be one JSON object. "
         f"The argument text ({char_text}) {problem}. "
-        "Call the tool again with arguments as a single JSON object. "
-        "Do not repeat the previous argument text."
+        + encoding_guidance
     )
 
 

@@ -28,7 +28,7 @@ from ..theorem_project import (
     _project_module_source_roots,
     normalize_imports,
 )
-from ..utils import strip_lean_comments_and_string_literals
+from ..lean_source_lexing import _scan_lean_header
 
 
 _CONFIG_FILES = (
@@ -92,6 +92,12 @@ def _file(path: Path, scope: str, *, data: bytes | None = None) -> dict[str, Any
 def _module_file(root: Path, relative: Path, suffix: str) -> Path:
     # A dot inside a quoted Lean name belongs to the filename, not its suffix.
     return root / relative.parent / (relative.name + suffix)
+
+
+def _toolchain_source_roots(origin: Path) -> tuple[Path, ...]:
+    # Lake ships its sources under a separate source tree, while its compiled
+    # modules share lib/lean with Init, Lean, and Std.
+    return origin / "src/lean", origin / "src/lean/lake"
 
 
 def _compiled_tree_identity(
@@ -239,19 +245,13 @@ def _runtime_selection(project: Path) -> dict[str, Any]:
 
 
 def _imports(source: str) -> tuple[str, ...]:
-    # A Lean import command can list several modules on the same line.
-    masked = strip_lean_comments_and_string_literals(source)
-    result: list[str] = []
-    for line in masked.splitlines():
-        match = re.match(r"^\s*(?:(?:public|private)\s+)?import\s+(.+?)\s*$", line)
-        if match:
-            names = match.group(1).split()
-            if names and names[0] == "all":
-                names = names[1:]
-            if not names:
-                raise ValueError("unsupported empty Lean import")
-            result.extend(normalize_imports(names))
-    return tuple(dict.fromkeys(result))
+    # Lean's header has one name per import command. Lexical command spans
+    # preserve quoted newlines and stop before declarations or syntax quotations.
+    commands, _ = _scan_lean_header(source)
+    return normalize_imports(
+        source[command.module_start:command.end]
+        for command in commands if command.kind == "import"
+    )
 
 
 @dataclass(frozen=True)
@@ -490,8 +490,8 @@ class EnvironmentSnapshot:
         if toolchain:
             origin = Path(toolchain["resolved_origin"])
             roots.extend(
-                (origin, origin / path, namespace == "Lean")
-                for path in ("src/lean", "lib/lean")
+                (origin, root, namespace == "Lean")
+                for root in (*_toolchain_source_roots(origin), origin / "lib/lean")
             )
         configured = {root.resolve() for _, root, _ in roots}
         search_paths = (
@@ -711,7 +711,9 @@ class _SnapshotBuilder:
         )
         for runtime in sorted(library.glob("*.so")):
             self._record(runtime, "toolchain")
-        self.roots.append((resolved, "toolchain", (resolved / "src/lean",), (library,)))
+        self.roots.append(
+            (resolved, "toolchain", _toolchain_source_roots(resolved), (library,))
+        )
 
     def _module(self, module: str) -> tuple[bytes, str]:
         components = _lean_name_components(module)

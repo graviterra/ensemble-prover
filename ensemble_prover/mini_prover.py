@@ -11520,6 +11520,7 @@ async def _preflight_theorem_project_input(
     problem: TheoremProblem,
     *,
     timeout_s: float,
+    pp_notation: bool = True,
 ) -> TheoremProblem:
     """Elaborate the exact source declaration and return its canonical type.
 
@@ -11550,6 +11551,7 @@ async def _preflight_theorem_project_input(
     validate_theorem_project_source(problem)
 
     source_type_probe = getattr(runner, "check_source_declaration_type", None)
+    printer_options = {} if pp_notation else {"pp_notation": False}
     source_bound_problem = problem
     if callable(source_type_probe) and str(problem.elaboration_source or "").strip():
         exact_source = str(problem.elaboration_source)
@@ -11557,6 +11559,7 @@ async def _preflight_theorem_project_input(
             exact_source,
             problem.theorem_name,
             timeout_s=max(1.0, float(timeout_s)),
+            **printer_options,
         )
         if not ok:
             raise ValueError(
@@ -11566,7 +11569,10 @@ async def _preflight_theorem_project_input(
         mark_ready = getattr(runner, "mark_project_imports_ready", None)
         if callable(mark_ready):
             mark_ready()
-        problem = with_elaborated_statement_type(problem, elaborated_type)
+        problem = with_elaborated_statement_type(
+            problem, elaborated_type,
+            rendering="" if pp_notation else "lean_pp_no_notation",
+        )
         validate_theorem_project_source(problem)
     elif callable(ensure_imports):
         await ensure_imports()
@@ -11681,13 +11687,14 @@ async def _preflight_theorem_project_input(
         source_bound_problem.theorem_name,
         timeout_s=max(1.0, float(timeout_s)),
         pp_explicit=True,
+        **printer_options,
     )
     explicit_failure = str(explicit_probe_output or "")[:4000]
     if explicit_ok:
         explicit_problem = with_elaborated_statement_type(
             source_bound_problem,
             explicit_type,
-            rendering="lean_pp_explicit",
+            rendering="lean_pp_explicit" if pp_notation else "lean_pp_explicit_no_notation",
         )
         explicit_valid, explicit_failure = await validate_rendered_candidate(
             explicit_problem,
@@ -11696,6 +11703,14 @@ async def _preflight_theorem_project_input(
         if explicit_valid:
             validate_theorem_project_source(explicit_problem)
             return refresh_theorem_project_environment(explicit_problem)
+
+    if not pp_notation:
+        raise RuntimeError(
+            "fresh Lean semantic grounding unavailable: the exact source compiled, "
+            "but its notation-free statement failed source-bound validation. "
+            f"Compact rendering: {compact_output[:2000]}\n"
+            f"Explicit rendering: {explicit_failure[:2000]}"
+        )
 
     source_statement = str(
         dict(source_bound_problem.input_spec or {}).get("source_statement_type")
@@ -16676,6 +16691,11 @@ async def _main_async(args: argparse.Namespace) -> int:
                             None,
                         )
                     ),
+                    "disproof_subject": (
+                        "machine_proposed_answer"
+                        if problem.adapter_metadata.get("machine_proposed_answer") is True
+                        else "input_theorem"
+                    ) if getattr(proof_dossier, "root_disproof_certificate", None) else None,
                     "root_disproof_certificate": (
                         copy.deepcopy(proof_dossier.root_disproof_certificate)
                         if proof_dossier
@@ -17406,8 +17426,13 @@ async def _main_async(args: argparse.Namespace) -> int:
                     print("Proof:")
                     print(proof)
                 elif bool(summary_payload.get("disproved")):
-                    print(f"DISPROVED: {problem.theorem_name}")
-                    print("Lean verified an axiom-audited proof of the negation.")
+                    if problem.adapter_metadata.get("machine_proposed_answer") is True:
+                        print(f"GENERATED ANSWER REFUTED: {problem.theorem_name}")
+                        print("Lean verified the negation of the theorem with the generated answer substituted.")
+                        print("This rejects that answer candidate; it does not refute the original question.")
+                    else:
+                        print(f"DISPROVED: {problem.theorem_name}")
+                        print("Lean verified an axiom-audited proof of the negation.")
                     print("=" * 64)
                 elif infrastructure_aborted:
                     print(f"INFRASTRUCTURE ABORTED: {problem.theorem_name}")

@@ -40,6 +40,18 @@ def check_subscription_transport_admission() -> None:
     if check is not None:
         check()
 
+_TOOL_ENCODING_EXAMPLE = json.dumps({
+    "arguments": json.dumps({"code": "by\n  exact True.intro"}),
+})
+
+_TOOL_ARGUMENT_ENCODING_GUIDANCE = """Tool arguments have TWO JSON layers: serialize the argument object to JSON text,
+then serialize that text as the envelope's arguments string. Escape control
+characters, quotation marks and backslashes at each layer. A newline inside
+Lean code must survive both JSON decodes as the original newline; it must not
+appear as an unescaped control character in the inner JSON text. Preserve the
+intended Lean code; correct its serialization rather than changing the proof.
+"""
+
 _INSTRUCTIONS = """You are the language-model backend for an automated Lean theorem prover.
 Produce exactly ONE assistant response to the supplied conversation, obeying its
 system and developer instructions. The JSON request contains the conversation in
@@ -52,7 +64,11 @@ tools yourself, inspect files, search the web, or claim unobserved tool results.
 If no tool is needed, return your answer in content with an empty tool_calls list.
 If response_format is json, content must itself be a JSON object encoded as a
 string. The requested output token count is a target for your response.
-"""
+""" + _TOOL_ARGUMENT_ENCODING_GUIDANCE + (
+    "Illustrative arguments field encoding only (other fields omitted; "
+    "use the supplied tool's actual schema):\n"
+    + _TOOL_ENCODING_EXAMPLE + "\n"
+)
 
 
 def _reject_json_constant(value: str) -> None:
@@ -107,7 +123,10 @@ def _tool_argument_repair(
     to echo it.
     """
 
-    repair: dict[str, Any] = {"validation_stage": stage}
+    repair: dict[str, Any] = {
+        "validation_stage": stage,
+        "wire_format": "subscription_json_envelope",
+    }
     tool_name = _safe_tool_name(name)
     if tool_name:
         repair["tool_name"] = tool_name

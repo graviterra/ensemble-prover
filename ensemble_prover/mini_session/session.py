@@ -11629,6 +11629,8 @@ class MiniSession:
                 active_bundle_ids = tuple(self.theory_imported_bundle_ids or ())
         return {
             "theory_context_pair": self.theory_context_pair,
+            "checked_source_imports": copy.deepcopy(getattr(self, "_checked_source_imports", None)),
+            "initial_theory_context_hash": getattr(self, "_checkpoint_initial_theory_context_hash", None),
             # Extension receipts use replacement lists; retain the live grant
             # and budget objects shared with an in-flight research allocation.
             "native_research_state": copy.copy(getattr(self, "native_research_state", None)),
@@ -11667,6 +11669,12 @@ class MiniSession:
         """Restore a prior theory view after a failed/aborted commit."""
 
         self.theory_context_pair = state.get("theory_context_pair")
+        for field_name, key in (("_checked_source_imports", "checked_source_imports"),
+                                ("_checkpoint_initial_theory_context_hash", "initial_theory_context_hash")):
+            if state.get(key) is None:
+                self.__dict__.pop(field_name, None)
+            else:
+                setattr(self, field_name, copy.deepcopy(state[key]))
         if state.get("native_research_state") is None:
             if hasattr(self, "native_research_state"):
                 del self.native_research_state

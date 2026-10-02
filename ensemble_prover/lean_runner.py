@@ -7945,6 +7945,7 @@ class LeanRunner:
         timeout_s: float = 60.0,
         pp_explicit: bool = False,
         pp_universes: bool = False,
+        pp_notation: bool = True,
     ) -> tuple[bool, str, str]:
         """Compile an exact input module and return its elaborated root type.
 
@@ -7954,6 +7955,9 @@ class LeanRunner:
         disappearing from the rendered expression. ``pp_explicit`` is the
         fail-safe serialization used only after the compact rendering fails an
         independent elaboration check.
+
+        ``pp_notation=False`` exposes resolved operators and quantifiers for
+        semantic review without changing the declaration being elaborated.
         """
 
         sanitized, error = self._normalize_check_term_name(theorem_name)
@@ -7973,6 +7977,8 @@ class LeanRunner:
         )
         if pp_explicit:
             printer_prefix += "set_option pp.explicit true in\n"
+        if not pp_notation:
+            printer_prefix += "set_option pp.notation false in\n"
         content = (
             str(source or "").rstrip()
             + "\n\n"

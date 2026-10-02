@@ -113,7 +113,7 @@ def native_context_predecessors(run: dict[str, Any], context: Any, statement: st
     if not isinstance(context, str) or not run.get("native_target_binding"):
         return set()
     key = canonical_dossier_statement_key(statement)
-    valid = []
+    predecessors: dict[str, set[str]] = {}
     for receipt in run.get("native_verified_context_extensions", {}).values():
         body = {k: v for k, v in receipt.items() if k != "receipt_id"}
         digest = hashlib.sha256(json.dumps(
@@ -124,14 +124,17 @@ def native_context_predecessors(run: dict[str, Any], context: Any, statement: st
                 and receipt.get("receipt_id") == digest
                 and all(isinstance(receipt.get(field), str) and receipt[field]
                         for field in ("from_context_binding", "to_context_binding"))):
-            valid.append(receipt)
+            predecessors.setdefault(receipt["to_context_binding"], set()).add(
+                receipt["from_context_binding"]
+            )
     reachable = {context}
-    while True:
-        predecessors = {receipt["from_context_binding"] for receipt in valid
-                        if receipt["to_context_binding"] in reachable}
-        if predecessors <= reachable:
-            return reachable - {context}
-        reachable.update(predecessors)
+    pending = [context]
+    while pending:
+        for predecessor in predecessors.get(pending.pop(), ()):
+            if predecessor not in reachable:
+                reachable.add(predecessor)
+                pending.append(predecessor)
+    return reachable - {context}
 
 
 def _native_attention_key(state: dict[str, Any], run: dict[str, Any]) -> str:

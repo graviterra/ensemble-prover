@@ -13,6 +13,7 @@ import logging
 import math
 import time
 import uuid
+from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -285,6 +286,7 @@ class DiscoveryLoop:
         self._native_recovered = False
         self._native_advancing = False
         self._native_target_claim_id: str | None = None
+        self._notification_queue: deque[tuple[str, dict[str, Any], bool]] | None = None
         from .strategy_discovery import StrategyIntegration
 
         self.strategy = StrategyIntegration(self) if store.run_record().get("strategy_review") is not None else None
@@ -1180,16 +1182,17 @@ class DiscoveryLoop:
             history, "prior-context-notifications.json",
         )
 
-    def _context_notification_successor(self, predecessor: dict[str, Any]) -> dict[str, Any]:
+    def _context_notification_successor(
+        self, predecessor: dict[str, Any], *,
+        jobs: dict[str, dict[str, Any]], run: dict[str, Any],
+    ) -> dict[str, Any]:
         """Follow only a reciprocal transfer within verified root extensions."""
         from ..proof_dossier import canonical_dossier_statement_key
         from .research_control import native_context_predecessors, native_job_context, native_job_target
 
-        jobs = {job["job_id"]: job for job in self.store.jobs()}
         successor = jobs.get(predecessor["native_context_successor_job_id"])
         if successor is None:
             raise ValueError("missing native context notification successor")
-        run = self.store.run_record(scheduling=True)
         recorded = run.get("native_job_contexts", {})
         before = native_job_context(predecessor, jobs, recorded_contexts=recorded)
         after = native_job_context(successor, jobs, recorded_contexts=recorded)
@@ -1211,8 +1214,24 @@ class DiscoveryLoop:
         """Deliver the complete route atomically, joining an action transaction."""
         if job_id is None:
             return
+        active_queue = getattr(self, "_notification_queue", None)
+        if active_queue is not None:
+            # Stale assignments notify their parents, which may themselves be
+            # stale. Queue that propagation inside the current transaction so
+            # a long investigation hierarchy does not consume Python frames.
+            active_queue.append((job_id, payload, requires_response))
+            return
         with nullcontext() if self.store._applying else self.store.atomic():
-            self._deliver_notification(job_id, payload, requires_response=requires_response)
+            pending = deque([(job_id, payload, requires_response)])
+            self._notification_queue = pending
+            try:
+                while pending:
+                    recipient_id, content, response_due = pending.popleft()
+                    self._deliver_notification(
+                        recipient_id, content, requires_response=response_due,
+                    )
+            finally:
+                self._notification_queue = None
 
     def _deliver_notification(
         self, job_id: str, payload: dict[str, Any], *, requires_response: bool,
@@ -1225,13 +1244,28 @@ class DiscoveryLoop:
         deliveries = []
         original_payload = payload
         transfers = []
+        context_jobs = None
+        context_run = None
         while True:
             if recipient["job_id"] in visited:
                 raise ValueError("cyclic research successor chain")
             visited.add(recipient["job_id"])
             deliveries.append((recipient, payload))
+            # Historical revisions invalidate their assignment, not the paid
+            # child result being delivered. Keep the observation at that
+            # boundary instead of forwarding it through an obsolete transfer.
+            if self.store.get_claim(recipient["claim_id"])["revision"] != recipient["revision"]:
+                break
             if recipient.get("native_context_successor_job_id"):
-                successor = self._context_notification_successor(recipient)
+                # This transaction cannot change the route during validation.
+                # Load its job history once: each saved inbox can itself hold
+                # the full transfer history, making per-hop reloads costly.
+                if context_jobs is None:
+                    context_jobs = {job["job_id"]: job for job in self.store.jobs()}
+                    context_run = self.store.run_record(scheduling=True)
+                successor = self._context_notification_successor(
+                    recipient, jobs=context_jobs, run=context_run,
+                )
                 transfers.append({
                     "from_job_id": recipient["job_id"], "to_job_id": successor["job_id"],
                     **{field: successor["native_context_transfer"][field]
@@ -1256,21 +1290,20 @@ class DiscoveryLoop:
                 {**content, "requires_response": requires_response}
             )})
             self.store.save_job(destination)
-        if recipient.get("research_control", {}).get("closed"):
-            return
         if (
             self.store.get_claim(recipient["claim_id"])["revision"]
             != recipient["revision"]
         ):
             self._mark_stale(recipient)
             return
-        else:
-            from .frontier.hooks import mode_of
+        if recipient.get("research_control", {}).get("closed"):
+            return
+        from .frontier.hooks import mode_of
 
-            adaptive = mode_of(self.store.run_record(scheduling=True).get("strategy_review") or {}) == "adaptive"
-            if (requires_response and recipient["status"] in {"waiting", "finished"}
-                    or not adaptive and recipient["status"] == "waiting"):
-                recipient["status"] = "pending"
+        adaptive = mode_of(self.store.run_record(scheduling=True).get("strategy_review") or {}) == "adaptive"
+        if (requires_response and recipient["status"] in {"waiting", "finished"}
+                or not adaptive and recipient["status"] == "waiting"):
+            recipient["status"] = "pending"
         self.store.save_job(recipient)
 
     def _mark_stale(self, job: dict[str, Any]) -> None:

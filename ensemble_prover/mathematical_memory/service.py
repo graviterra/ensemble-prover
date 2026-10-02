@@ -913,43 +913,15 @@ class MathematicalMemoryService:
                 origin.availability == "importable"
                 or readmit_import and origin.availability == "already_imported"
             ):
-                from ensemble_prover.theorem_project import merge_imports
                 from ensemble_prover.proof_dossier import text_hash
                 from ensemble_prover.proof_state_executor import (
                     _await_serialized_lean_operation,
                 )
-                from ensemble_prover.mini_theory import TheoryContext, TheoryContextPair
-
-                pair = getattr(session, "theory_context_pair", None)
-                if pair is None:
-                    pair = TheoryContextPair.from_preambles(
-                        llm_preamble=session.conv.preamble,
-                        lean_preamble=self.context()[1],
-                    )
-
-                # Keep published theory imports and their source ancestry
-                # separate from newly admitted project imports.
-                def with_current_source(previous: Any, current: str) -> Any:
-                    parsed = TheoryContext.from_preamble(
-                        merge_imports(current, (origin.module_name,))
-                    )
-                    return replace(
-                        parsed,
-                        base_imports=tuple(
-                            module
-                            for module in parsed.base_imports
-                            if module not in previous.theory_imports
-                        ),
-                        theory_imports=previous.theory_imports,
-                        bundle_ids=previous.bundle_ids,
-                        theory_inventory=previous.theory_inventory,
-                    )
-
-                pair = replace(
-                    pair,
-                    llm=with_current_source(pair.llm, session.conv.preamble),
-                    lean=with_current_source(pair.lean, self.context()[1]),
+                from ensemble_prover.mini_session.source_imports import (
+                    apply_source_import, prepare_source_import,
                 )
+
+                pair = prepare_source_import(session, origin.module_name)
                 preamble = pair.lean.render()
                 result = await _await_serialized_lean_operation(
                     session.lean,
@@ -969,24 +941,25 @@ class MathematicalMemoryService:
                 if result.ok and result.axiom_audit_ok is True:
                     if not self.candidate_eligible(candidate, budget=budget):
                         return False
+                    previous = session.dossier.current_lean_environment_hash
+                    apply_source_import(
+                        session, pair, module=origin.module_name,
+                        declaration=candidate.declaration_name,
+                        statement=candidate.type_text,
+                    )
                     # Import admission itself creates the source obligation;
-                    # a later profile timeout cannot erase it.
+                    # a later profile timeout cannot erase it. Commit only
+                    # after confirming the checked context is still current.
                     self._memory_support_names[candidate.declaration_name] = (
                         candidate.candidate_id
                     )
-                    # An import exposes sibling declarations and transitive
-                    # modules too. Without a complete module-origin inventory,
-                    # retain its owner for the entire admitted environment.
+                    # Imports expose siblings and transitive modules too.
                     self._memory_import_owners.add(candidate.candidate_id)
-                    previous = session.dossier.current_lean_environment_hash
-                    session.conv.lean_preamble = preamble
-                    session.conv.preamble = pair.llm.render()
                     session.dossier.record_lean_environment(
                         text_hash(preamble),
                         extends_environment_hash=previous,
                         environment_source_text=preamble,
                     )
-                    session.theory_context_pair = pair
                     if origin.source_kind == "project":
                         session.searcher.mark_source_declaration_imported(
                             origin.source_id,

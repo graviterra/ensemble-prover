@@ -38,7 +38,7 @@ _LEAN_LETTERLIKE = (
 _LEAN_SUBSCRIPT_ALNUM = r"\u2080-\u2089\u2090-\u209c\u1d62-\u1d6a\u2c7c"
 # ! and ? are continuation characters, including within namespace components.
 _IDENT_COMPONENT = (
-    rf"(?:«[^»\r\n]+»|(?:[^\W\d]|_|[{_LEAN_LETTERLIKE}])"
+    rf"(?:«[^»]+»|(?:[^\W\d]|_|[{_LEAN_LETTERLIKE}])"
     rf"[\w'!?{_LEAN_LETTERLIKE}{_LEAN_SUBSCRIPT_ALNUM}]*)"
 )
 _DOTTED_IDENT = rf"(?:_root_\.)?{_IDENT_COMPONENT}(?:\.{_IDENT_COMPONENT})*"
@@ -1776,7 +1776,17 @@ def _resolve_theorem_project(
 
 def resolve_theorem_project(request: TheoremProjectRequest) -> TheoremProblem:
     """Resolve a sound, semantics-preserving generic theorem-project input."""
+    from .answer_input import ANSWER_CONTEXT_MARKER
+    from .answer_project import has_answer_candidate_receipt, load_answer_project
 
+    if (str(request.description or "").startswith(ANSWER_CONTEXT_MARKER + "\n")
+            or has_answer_candidate_receipt(request)):
+        from .putnam_answer_input import PUTNAM_ANSWER_MARKER, load_putnam_answer_project
+
+        with Path(request.lean_file).expanduser().open(encoding="utf-8") as source:
+            if source.readline() == PUTNAM_ANSWER_MARKER + "\n":
+                return load_putnam_answer_project(request)
+        return load_answer_project(request)
     return _resolve_theorem_project(request, adapter_id=GENERIC_ADAPTER_ID)
 
 

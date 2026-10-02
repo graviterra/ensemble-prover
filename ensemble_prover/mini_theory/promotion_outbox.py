@@ -975,7 +975,21 @@ class PromotionOutbox:
                     or (entry.workspace_id or entry.owner_id)
                     == clean_workspace_id
                 )
+                and (
+                    not entry.supersedes_entry_id
+                    and not os.path.lexists(self._authority_path(
+                        helper_name=entry.helper_name,
+                        owner_id=entry.owner_id,
+                        workspace_id=entry.workspace_id or entry.owner_id,
+                        origin_environment_key=entry.origin_environment_key,
+                    ))
+                )
             )
+            # Immutable producer metadata supplies implicit authority only for
+            # an original receipt without a sidecar. A shared consumer can keep
+            # a revoked producer's receipt globally authoritative, but cannot
+            # re-attest that producer's ownership. Explicit live references are
+            # checked independently against the requested owner/workspace.
             referenced_workspace_authority = (
                 entry.entry_id in referenced_authority_ids
             )
@@ -2558,12 +2572,20 @@ class PromotionOutbox:
         for lineage in legacy_lineages.values():
             if cancellation_event is not None and cancellation_event.is_set():
                 return authoritative
-            authoritative.add(
-                max(
-                    lineage,
-                    key=lambda item: (item.created_ts, item.entry_id),
-                ).entry_id
+            newest = max(
+                lineage,
+                key=lambda item: (item.created_ts, item.entry_id),
             )
+            # Legacy receipts use the owner as their implicit workspace. Once
+            # a sidecar exists, only a valid live reference can authorize them.
+            # The shared-reference pass below also handles legacy entries.
+            if not os.path.lexists(self._authority_path(
+                helper_name=newest.helper_name,
+                owner_id=newest.owner_id,
+                workspace_id=newest.owner_id,
+                origin_environment_key=newest.origin_environment_key,
+            )):
+                authoritative.add(newest.entry_id)
         for (
             origin_environment_key,
             owner_id,

@@ -1082,24 +1082,34 @@ def _stage_all_session_verified_helpers(
                 outbox = PromotionOutbox(session.theory_library)
                 session._theory_promotion_outbox = outbox
             metadata = _session_promotion_metadata(session)
-            attested_names = outbox.durably_attested_helpers(
-                helpers,
-                domain=str(metadata.get("domain") or ""),
-                imports=tuple(metadata.get("imports") or ()),
-                context_commands=tuple(metadata.get("context_commands") or ()),
-                owner_id=str(metadata.get("owner_id") or ""),
-                workspace_id=str(metadata.get("workspace_id") or ""),
-                source_theorem=str(metadata.get("source_theorem") or ""),
-                forbidden_problem_constants=tuple(
-                    metadata.get("forbidden_problem_constants") or ()
-                ),
-                # Only helpers carrying a parent durability fingerprint reach
-                # this query. Their immutable source predates this recursive
-                # obligation, so a receipt guarded against the same root
-                # theorem remains authoritative even though child metadata
-                # adds the child's theorem constants to newly staged helpers.
-                allow_inherited_root_policy=True,
-            )
+            inherited_names = {
+                name for name in claimed_durable_names
+                if inherited_fingerprints.get(name)
+                == _helper_promotion_fingerprint(helpers[name], context_commands)
+            }
+            attested_names = set()
+            for inherited, names in (
+                (False, claimed_durable_names - inherited_names),
+                (True, inherited_names),
+            ):
+                if not names:
+                    continue
+                # Parent fingerprints may inherit the parent's root policy
+                # and workspace. A restored local receipt must establish its
+                # own workspace reference before reconciliation succeeds.
+                attested_names.update(names & outbox.durably_attested_helpers(
+                    helpers,
+                    domain=str(metadata.get("domain") or ""),
+                    imports=tuple(metadata.get("imports") or ()),
+                    context_commands=tuple(metadata.get("context_commands") or ()),
+                    owner_id=str(metadata.get("owner_id") or ""),
+                    workspace_id=str(metadata.get("workspace_id") or ""),
+                    source_theorem=str(metadata.get("source_theorem") or ""),
+                    forbidden_problem_constants=tuple(
+                        metadata.get("forbidden_problem_constants") or ()
+                    ),
+                    allow_inherited_root_policy=inherited,
+                ))
         except Exception:
             attested_names = set()
         # Fan-in can add a durable child receipt after the session baseline was

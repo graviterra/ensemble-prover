@@ -49,7 +49,8 @@ from .theorem_project import (
     _active_command_scope_closers,
     merge_imports,
     infer_lake_project,
-    resolve_theorem_project,
+    GENERIC_ADAPTER_ID,
+    _resolve_theorem_project,
     scan_lean_theorems,
     select_lean_theorem,
     theorem_artifact_slug,
@@ -137,7 +138,11 @@ def _runner(
     scratch_dir: Path,
     theory_library: MiniTheoryLibrary | None = None,
 ):
-    problem = resolve_theorem_project(dataclasses.replace(request, lean_file=path))
+    # A proposal has no admitted discovery receipt yet. Resolve its Lean source
+    # for validation without assigning machine-answer handoff provenance.
+    problem = _resolve_theorem_project(
+        dataclasses.replace(request, lean_file=path), adapter_id=GENERIC_ADAPTER_ID
+    )
     cfg = LeanConfig(
         project_dir=str(request.project_path),
         scratch_dir=str(scratch_dir),
@@ -224,8 +229,8 @@ async def validate_answers(
     timeout_s: float,
     scratch_dir: Path,
     theory_library: MiniTheoryLibrary | None = None,
-) -> None:
-    """Parse untrusted terms before elaborating the exact substituted theorem."""
+) -> str:
+    """Validate the candidate and return its fresh Lean-elaborated statement."""
     from .mini_prover import _preflight_theorem_project_input
 
     # The project was checked independently before any proposal. A term can
@@ -310,7 +315,7 @@ async def validate_answers(
             )
         try:
             problem = await _preflight_theorem_project_input(
-                runner, problem, timeout_s=timeout_s
+                runner, problem, timeout_s=timeout_s, pp_notation=False,
             )
         except ValueError as exc:
             detail = str(exc)
@@ -329,6 +334,10 @@ async def validate_answers(
                 raise AnswerValidationError(detail) from exc
             raise
         await _reject_refuted_candidate(runner, problem, timeout_s=timeout_s)
+        elaborated = problem.input_spec.get("elaborated_statement_type")
+        if not isinstance(elaborated, str) or not elaborated.strip():
+            raise RuntimeError("answer validation produced no fresh Lean elaboration")
+        return elaborated
     finally:
         await runner.aclose()
 
@@ -705,8 +714,8 @@ async def _prepare(
             raise RuntimeError(error or "answer response was truncated")
         return text
 
-    async def validate(path: Path, answers: list[str]) -> None:
-        await validate_answers(
+    async def validate(path: Path, answers: list[str]) -> str:
+        return await validate_answers(
             request,
             template,
             path,
@@ -783,6 +792,7 @@ async def _prepare(
                     max_attempts=args.answer_attempts,
                     prior_refutation=prior_refutation,
                     refuted_answers=refuted_answers,
+                    require_semantic_grounding=True,
                 )
         except TimeoutError as exc:
             if not discovery_deadline.expired() or capability_cancelled is None:
