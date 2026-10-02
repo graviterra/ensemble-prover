@@ -194,14 +194,14 @@ def _command_matches(
             yield match
 
 
-def _identifier_token_end(masked: str, *, quote_open: bool = False) -> int:
+def _identifier_token_end(masked: str, *, quote_open: bool = False, start: int = 0) -> int:
     """End of a name token, including qualified and escaped components.
 
     The caller supplies an offset-preserving mask so comments cannot become
     part of a name. An unfinished escaped component includes the entire line.
     """
 
-    index = 0
+    index = start
     while index < len(masked):
         if quote_open or masked[index] == "«":
             close = masked.find("»", index if quote_open else index + 1)
@@ -235,16 +235,79 @@ class _HeaderCommand:
     decorated: bool = False
 
 
-def _scan_lean_header(source: str) -> tuple[list[_HeaderCommand], int]:
+def _lean_header_prefix_end(source: str) -> int:
+    """Bound masking to header tokens and their comments, before module code."""
+
+    def skip(index: int) -> int:
+        while index < len(source):
+            if source[index].isspace():
+                index += 1
+            elif source.startswith("--", index):
+                end = source.find("\n", index + 2)
+                index = len(source) if end < 0 else end
+            elif source.startswith("/-", index) and not source.startswith(("/--", "/-!"), index):
+                depth = 1
+                index += 2
+                while index < len(source) and depth:
+                    if source.startswith("/-", index):
+                        depth += 1
+                        index += 2
+                    elif source.startswith("-/", index):
+                        depth -= 1
+                        index += 2
+                    else:
+                        index += 1
+            else:
+                break
+        return index
+
+    def word(index: int) -> tuple[str, int]:
+        end = _identifier_token_end(source, start=index)
+        return source[index:end], end
+
+    index = skip(0)
+    while index < len(source):
+        start = index
+        token, end = word(index)
+        if token in {"module", "prelude"}:
+            if token == "module":
+                label = skip(end)
+                if (label < len(source) and source[label] == "«"
+                        and "\n" not in source[end:label]):
+                    _, end = word(label)
+            index = skip(end)
+            continue
+        for modifier in ("public", "meta"):
+            if token == modifier:
+                token, end = word(skip(end))
+        if token != "import":
+            return start
+        token, end = word(skip(end))
+        if token == "all":
+            token, end = word(skip(end))
+        if not token:
+            return start
+        index = skip(end)
+    return index
+
+
+def _scan_lean_header(source: str, *, header_only: bool = False) -> tuple[list[_HeaderCommand], int]:
     """Locate header commands using Lean tokens, independently of physical lines.
 
     Offsets refer to the original source. Comments remain outside code spans,
     including comments between an import keyword and its module. The optional
     quoted module label preserves incomplete editor preambles accepted by the
     existing source consumers.
+
+    ``header_only`` stops lexical masking before module code. Unexpected
+    literal tokens in a malformed header end the scan rather than being
+    skipped to discover later imports.
     """
 
-    masked = _mask_noncode(source, preserve_doc_comments=True)
+    masked = _mask_noncode(
+        source[:_lean_header_prefix_end(source)] if header_only else source,
+        preserve_doc_comments=True,
+    )
     commands: list[_HeaderCommand] = []
 
     def skip(index: int) -> int:
@@ -253,7 +316,7 @@ def _scan_lean_header(source: str) -> tuple[list[_HeaderCommand], int]:
         return index
 
     def word(index: int) -> tuple[str, int]:
-        end = index + _identifier_token_end(masked[index:])
+        end = _identifier_token_end(masked, start=index)
         return masked[index:end], end
 
     index = skip(0)

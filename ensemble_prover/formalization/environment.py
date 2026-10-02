@@ -247,7 +247,7 @@ def _runtime_selection(project: Path) -> dict[str, Any]:
 def _imports(source: str) -> tuple[str, ...]:
     # Lean's header has one name per import command. Lexical command spans
     # preserve quoted newlines and stop before declarations or syntax quotations.
-    commands, _ = _scan_lean_header(source)
+    commands, _ = _scan_lean_header(source, header_only=True)
     return normalize_imports(
         source[command.module_start:command.end]
         for command in commands if command.kind == "import"

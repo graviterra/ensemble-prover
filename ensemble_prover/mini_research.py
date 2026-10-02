@@ -773,6 +773,23 @@ class NativeResearchCoordinator:
             job["native_context_binding"] = context_binding
             self.store.save_job(job)
 
+    def _assignment_lineage_current(self, job: dict[str, Any], jobs: dict[str, dict[str, Any]]) -> bool:
+        """Keep a prescribed task fenced by its producer and reviewer revisions."""
+        seen: set[str] = set()
+        while job["job_id"] not in seen:
+            seen.add(job["job_id"])
+            if (job["status"] == "stale"
+                    or self.store.get_claim(job["claim_id"])["revision"] != job["revision"]):
+                return False
+            parent_id = job.get("parent_job")
+            if parent_id is None:
+                return True
+            parent = jobs.get(parent_id)
+            if parent is None:
+                return False
+            job = parent
+        return False
+
     def _carry_untouched_followups(self, session: Any, checkpoint: str, claim_id: str) -> None:
         """Create new-context assignments while preserving immutable paid history."""
         from .research_claims.research_control import (
@@ -825,7 +842,7 @@ class NativeResearchCoordinator:
                     continue
                 # A verified import does not renew an assignment invalidated
                 # by an independent claim or dependency revision.
-                if self.store.get_claim(job["claim_id"])["revision"] != job["revision"]:
+                if not self._assignment_lineage_current(job, jobs):
                     continue
                 target = native_job_target(job, jobs)
                 if canonical_dossier_statement_key(

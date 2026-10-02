@@ -9,12 +9,38 @@ import re
 from pathlib import Path
 from typing import Callable
 
-from .answer_input import AnswerTemplate, find_answer_template, load_candidate
+from .answer_input import ANSWER_CONTEXT_MARKER, AnswerTemplate, find_answer_template, load_candidate
 from .nl_input import _unique_fields
 from .theorem_project import (
     GENERIC_ADAPTER_ID, TheoremProblem, TheoremProjectRequest,
     _resolve_theorem_project, with_theorem_execution_context,
 )
+
+
+def _starts_with_marker(path: Path, marker: str) -> bool:
+    """Recognize a leading provenance marker through harmless whitespace."""
+    try:
+        with path.open(encoding="utf-8") as source:
+            for line in source:
+                if line.strip():
+                    return line.lstrip().startswith(marker)
+    except (OSError, UnicodeError):
+        pass
+    return False
+
+
+def _has_generated_answer_markers(path: Path, *, reserved_name: bool) -> bool:
+    original = path.parent / "original.lean"
+    plan = path.parent / "proof_plan.txt"
+    if reserved_name:
+        if ((original.exists() or original.is_symlink())
+                and (plan.exists() or plan.is_symlink())):
+            return True
+        if _starts_with_marker(plan, ANSWER_CONTEXT_MARKER):
+            return True
+    from .putnam_answer_input import PUTNAM_ANSWER_MARKER
+
+    return _starts_with_marker(path, PUTNAM_ANSWER_MARKER)
 
 
 def has_answer_candidate_receipt(request: TheoremProjectRequest) -> bool:
@@ -27,26 +53,32 @@ def has_answer_candidate_receipt(request: TheoremProjectRequest) -> bool:
     """
     path = Path(request.lean_file).expanduser().resolve()
     receipt_path = path.parent / "answer_discovery.json"
-    if not receipt_path.exists() and not receipt_path.is_symlink():
-        return False
     reserved_name = re.fullmatch(r"candidate_[0-9]+\.lean", path.name) is not None
+    generated_markers = _has_generated_answer_markers(path, reserved_name=reserved_name)
+    if not receipt_path.exists() and not receipt_path.is_symlink():
+        # The output layout and explicit Putnam marker survive a missing
+        # receipt. They identify a generated bundle, without assigning answer
+        # provenance to an ordinary file solely because of its name.
+        if generated_markers:
+            raise ValueError("missing adjacent answer candidate receipt")
+        return False
     try:
         record = json.loads(receipt_path.read_bytes(), object_pairs_hook=_unique_fields)
         if not isinstance(record, dict):
             raise ValueError("invalid answer discovery receipt")
     except (OSError, ValueError, UnicodeError, RecursionError):
-        if reserved_name:
+        if reserved_name or generated_markers:
             raise ValueError("cannot verify the adjacent answer candidate receipt") from None
         return False
     attempts = record.get("attempts")
     last = attempts[-1] if isinstance(attempts, list) and attempts else None
-    return (reserved_name or record.get("candidate_file") == path.name
+    return (reserved_name or generated_markers or record.get("candidate_file") == path.name
             or isinstance(last, dict) and last.get("candidate_file") == path.name)
 
 
 def load_answer_project(
     request: TheoremProjectRequest, *,
-    template_finder: Callable[[str, str | None], AnswerTemplate | None] = find_answer_template,
+    template_finder: Callable[[str, str], AnswerTemplate | None] = find_answer_template,
     adapter_id: str = GENERIC_ADAPTER_ID,
     label: str = "Answer",
 ) -> TheoremProblem:
