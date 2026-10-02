@@ -12,6 +12,7 @@ from typing import Any
 from ...mini_falsification.model import content_hash
 from ...proof_dossier import canonical_dossier_statement_key
 from ...research_claims.model import json_text
+from ...research_claims.native_guidance import is_proof_candidate
 from ...state_data import clone_json_value
 from ..action import MiniOutcome
 from ..planner_jobs import PlannerJobLaunch
@@ -420,6 +421,15 @@ class GraphRootReplanAction(RecursiveControllerAction):
         # A plain refusal is deferred. Only acceptance, or an exact advice
         # and helper context that is already reserved, is consumed.
         self._last_research_replan_disposition = "deferred"
+        _, _, action = self._research_advice_parts(advice)
+        archived_action = _validated_archive_pointer(action, "action")
+        candidate = is_proof_candidate(action) or bool(
+            archived_action
+            and advice.get("proof_candidate_action_id") == archived_action
+        )
+        if not candidate:
+            self._last_research_replan_disposition = "context_only"
+            return False
         budget = session.budgets.get(self.id)
         if (session.root_finalized or session.terminal_failure_reason
                 or session._run_governor_exhausted()

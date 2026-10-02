@@ -21,7 +21,7 @@ from .proof_graph import (
 )
 
 
-HELPER_ADMISSION_QUALITY_SCHEMA_VERSION = 3
+HELPER_ADMISSION_QUALITY_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -207,17 +207,16 @@ def _top_level_reflexive_relation(statement: str) -> bool:
 
 def _structurally_tautological_proposition(statement: str) -> bool:
     from .finite_claim_check import (
-        _split_top_level_token,
         _unwrap_transparent_parens,
     )
 
     raw = _unwrap_transparent_parens(str(statement or "").strip())
     if raw == "True":
         return True
-    conjunction = _split_top_level_token(raw, ("∧", "/\\"))
+    conjunction = _split_top_level_connective(raw, ("∧", "/\\"))
     if conjunction is not None:
         return all(_structurally_tautological_proposition(item) for item in conjunction)
-    disjunction = _split_top_level_token(raw, ("∨", "\\/"))
+    disjunction = _split_top_level_connective(raw, ("∨", "\\/"))
     if disjunction is not None:
         return any(_structurally_tautological_proposition(item) for item in disjunction)
     return False
@@ -237,7 +236,6 @@ def _conclusion_is_projection_of_premise(
     """
 
     from .finite_claim_check import (
-        _split_top_level_token,
         _unwrap_transparent_parens,
     )
 
@@ -249,7 +247,7 @@ def _conclusion_is_projection_of_premise(
         return True
     if raw == "True":
         return True
-    conjunction = _split_top_level_token(raw, ("∧", "/\\"))
+    conjunction = _split_top_level_connective(raw, ("∧", "/\\"))
     if conjunction is not None:
         return all(
             _conclusion_is_projection_of_premise(
@@ -258,7 +256,7 @@ def _conclusion_is_projection_of_premise(
             )
             for item in conjunction
         )
-    disjunction = _split_top_level_token(raw, ("∨", "\\/"))
+    disjunction = _split_top_level_connective(raw, ("∨", "\\/"))
     if disjunction is not None:
         return any(
             _conclusion_is_projection_of_premise(
@@ -275,6 +273,27 @@ _PROPOSITIONAL_RECURSION_LIMIT = 12
 _PROPOSITIONAL_ATOM_LIMIT = 10
 
 
+def _has_unparenthesized_binder(statement: str) -> bool:
+    """Decline surface decomposition when a binder owns the remaining body.
+
+    Bracket depth alone cannot distinguish ``∀ n, P n ∨ Q n`` from a
+    disjunction. Leave these expressions opaque; Lean owns their semantics.
+    The conservative guard also covers binders after an outer connective.
+    """
+    from .lean_source_lexing import _mask_noncode
+
+    masked = _mask_noncode(statement, mask_quoted_identifiers=True)
+    depth = 0
+    for token in re.findall(r"[()\[\]{}⟨⟩]|[∀∃λ]|[^\W\d]\w*|\S", masked):
+        if token in {"(", "[", "{", "⟨"}:
+            depth += 1
+        elif token in {")", "]", "}", "⟩"}:
+            depth = max(0, depth - 1)
+        elif depth == 0 and token in {"∀", "∃", "λ", "forall", "fun", "let", "match", "if"}:
+            return True
+    return False
+
+
 def _split_top_level_connective(
     statement: str,
     tokens: tuple[str, ...],
@@ -284,10 +303,10 @@ def _split_top_level_connective(
         _unwrap_transparent_parens,
     )
 
-    return _split_top_level_token(
-        _unwrap_transparent_parens(str(statement or "").strip()),
-        tokens,
-    )
+    raw = _unwrap_transparent_parens(str(statement or "").strip())
+    if _has_unparenthesized_binder(raw):
+        return None
+    return _split_top_level_token(raw, tokens)
 
 
 def _as_implication(statement: str) -> tuple[str, str] | None:
@@ -297,6 +316,8 @@ def _as_implication(statement: str) -> tuple[str, str] | None:
     )
 
     raw = _unwrap_transparent_parens(str(statement or "").strip())
+    if _has_unparenthesized_binder(raw):
+        return None
     arrow = _split_top_level_arrow(raw)
     if arrow is not None:
         return arrow

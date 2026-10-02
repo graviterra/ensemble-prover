@@ -122,9 +122,7 @@ def _bind_native_job(controller: Any, state: dict[str, Any], run: dict[str, Any]
     fixed = job.get("frontier_native_target_claim_id", effective)
     if fixed != effective or effective != target:
         _yield("fairness")
-    context = native_job_context(job, jobs)
-    if context is None:
-        context = run.get("native_job_contexts", {}).get(job["job_id"])
+    context = native_job_context(job, jobs, recorded_contexts=run.get("native_job_contexts", {}))
     if context is None and run.get("native_active_target_context_binding") is not None and any(
         attempt.get("consumer_id") == job["job_id"] for attempt in state["attempts"].values()
     ):
@@ -216,6 +214,19 @@ def _approach_id(job: dict[str, Any]) -> str:
     return approach_id
 
 
+def scoped_research_mechanism(controller: Any, job: dict[str, Any], value: dict[str, Any]) -> dict[str, Any]:
+    """Use identical mathematical and formal scope identity in binding and forks."""
+    from .approaches import normalize_mechanism
+    from ..strategy import _digest
+
+    mechanism = normalize_mechanism(value)
+    scope_object = ("native-context:" + str(job.get("native_context_binding"))
+                    if job.get("frontier_native_target_claim_id") is not None
+                    else _digest(controller.store.get_claim(job["claim_id"])["spec"]["contract"]))
+    mechanism["objects"] = sorted(set([*mechanism["objects"], scope_object]))
+    return mechanism
+
+
 def bind_research_job(
     controller: Any,
     state: dict[str, Any],
@@ -265,12 +276,12 @@ def bind_research_job(
         )
         controller._refresh_dispositions(state)
     question = str(job.get("question") or statement).strip()
-    mechanism = {
-        "reduction": "Investigate the exact active native target" if native_target is not None else question,
-        "objects": [_digest(claim["spec"]["contract"]), *([job.get("native_context_binding")] if native_target is not None else [])],
+    mechanism = scoped_research_mechanism(controller, job, job.get("research_mechanism") or {
+        "reduction": question,
+        "objects": [],
         "hypotheses": [],
         "quantitative_target": statement,
-    }
+    })
     # Reissued identical work shares its existing allowance. A new job ID is
     # not evidence of a different mathematical approach.
     approach = next((
@@ -1125,37 +1136,39 @@ def grant_alternative(
         raise ValueError("unknown frontier approach")
     if approach.get("subject_id") and approach["subject_id"] != subject_id:
         raise ValueError("alternative approach is not bound to this subject")
+    assessment = state["reviews"][job["alternative_assessment"]]
+    reviewer_id = assessment.get("reviewer_job_id")
+    if not reviewer_id:
+        return
+    reviewer = controller.store.job(reviewer_id)
+    if (reviewer["role"] != "review" or reviewer["worker"] == job["worker"]
+            or reviewer.get("strategy_review_id") != job["alternative_assessment"]):
+        raise ValueError("assigned independent alternative reviewer required")
+    from ..research_findings import assess_delta
+
     try:
-        apply_contribution(
-            campaign,
-            approach_id=approach_id,
-            obligation_id=approach.get("bottleneck_obligation"),
-            proposed_class="research_advance",
-            subject=subject_id,
-            context=campaign["root"]["context"],
-            operation_id=job["job_id"],
-            artifacts=[artifact_id],
-            claim=artifact_id,
-            explanation="substantive alternative for the named approach",
-            now=controller.clock(),
+        assessment["progress_assessment"] = assess_delta(
+            controller, campaign, job, reviewer_id=reviewer_id, subject=subject_id,
+            delta=assessment.get("progress_delta"), rationale=assessment["rationale"],
         )
     except FrontierRefusal as exc:
         raise ValueError(exc.reason) from exc
     _save(controller, state, run, campaign)
 
 
-def defer_unserved(controller: Any, state: dict[str, Any], job: dict[str, Any]) -> None:
+def defer_unserved(controller: Any, state: dict[str, Any], job: dict[str, Any], *,
+                   reason: str = "research_phase_deferred") -> None:
     run = controller.store.run_record(scheduling=True)
     record = job.setdefault("research_control", {})
     if record.get("closed"):
         return
     approach_id = job.get("frontier_approach_id")
-    if approach_id:
+    if approach_id and reason != "research_review_reserve":
         campaign = _campaign(controller, state)
         if approach_id in campaign["approaches"]:
             note_deferral(campaign, approach_id)
             _save(controller, state, run, campaign)
-    record["phase_deferred"] = True
+    record["budget_deferred" if reason == "research_review_reserve" else "phase_deferred"] = True
     record["closed"] = False
     job["status"] = "waiting"
     controller.store.save_job(job)

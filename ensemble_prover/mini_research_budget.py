@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 import math
+import uuid
 from typing import Any
 
 from .mini_session.action import ActionBudget
@@ -232,7 +233,7 @@ def select_donor(session: Any) -> Donor | None:
     return None
 
 
-def debit_donor(session: Any, donor: Donor) -> Donor:
+def debit_donor(session: Any, donor: Donor, *, grant_id: str | None = None) -> Donor:
     """Debit once and return refreshed bounds; checkpoint before dispatch.
 
     The caller must use the returned offer, because time may have passed since
@@ -254,6 +255,10 @@ def debit_donor(session: Any, donor: Donor) -> Donor:
            or not math.isfinite(value) or value <= 0 for value in bounds):
         raise ValueError("native research donor time limit is invalid")
     budget = session.budgets[donor.action_id]
+    if grant_id is not None and (not isinstance(grant_id, str) or not grant_id):
+        raise ValueError("native research grant id must be nonempty")
+    if grant_id in budget.research_invocation_debits:
+        raise ValueError("native research grant was already debited")
     cost_continuation = getattr(session, "_cost_budget_continuation_enabled", None)
     money_governed = callable(cost_continuation) and cost_continuation()
     if budget.max_invocations >= 0 and not money_governed:
@@ -264,13 +269,58 @@ def debit_donor(session: Any, donor: Donor) -> Donor:
         limits = [budget.max_invocations]
         if budget.max_aggregate_invocations >= 0:
             limits.append(budget.max_aggregate_invocations)
-        budget.max_aggregate_invocations = min(limits)
+        seal = copy.deepcopy(budget.research_invocation_seal) or {
+            "previous_cap": budget.max_aggregate_invocations,
+            "cap": min(limits), "grants": {},
+        }
+        seal["cap"] = min(limits)
+        # Direct callers without fenced grant identity cannot establish zero
+        # exposure later, so their donation remains conservatively retained.
+        seal["grants"][grant_id or uuid.uuid4().hex] = {
+            "cap": budget.max_invocations, "retained": grant_id is None,
+        }
+        budget.max_aggregate_invocations = seal["cap"]
+        budget.research_invocation_seal = seal
     budget.consume(0.0)
+    if grant_id is not None:
+        budget.research_invocation_debits.append(grant_id)
     # Research occupies a real scheduler quantum. Transcript turn identities
     # are separate and remain untouched.
     if hasattr(session, "iteration"):
         session.iteration += 1
     return replace(current, remaining_seconds=min(bounds) if bounds else None)
+
+
+def settle_invocation_seal(budget: ActionBudget, grant_id: str, *, empty: bool) -> None:
+    """Release only this grant's ownership of an unchanged research ceiling."""
+    seal = copy.deepcopy(budget.research_invocation_seal)
+    if seal is None or grant_id not in seal["grants"]:
+        return
+    if not empty:
+        seal["grants"][grant_id]["retained"] = True
+    elif not seal["grants"][grant_id]["retained"]:
+        del seal["grants"][grant_id]
+    if seal["grants"]:
+        limits = [value["cap"] for value in seal["grants"].values()]
+        if seal["previous_cap"] >= 0:
+            limits.append(seal["previous_cap"])
+        seal["cap"] = min(limits)
+        budget.max_aggregate_invocations = seal["cap"]
+        budget.research_invocation_seal = seal
+    else:
+        # Any subsequent explicit cap assignment already revoked ownership.
+        budget.max_aggregate_invocations = seal["previous_cap"]
+
+
+def settle_invocation_debit(budget: ActionBudget, grant_id: str, *, empty: bool) -> bool:
+    """Settle a durable debit token, independently of other grants' order."""
+    if grant_id not in budget.research_invocation_debits:
+        return False
+    budget.research_invocation_debits.remove(grant_id)
+    if empty and budget.invocations > 0:
+        budget.invocations -= 1
+        return True
+    return False
 
 
 def charge_elapsed(session: Any, donor: Donor, seconds: float) -> None:

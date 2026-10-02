@@ -713,10 +713,32 @@ budget. Results enter the proof conversation at a scheduler boundary. Finishing
 the proof cancels outstanding research. If proof work cannot proceed, the scheduler
 can wait for the funded research result.
 
+Reports, gaps, and reviews update the prover's context without automatically
+reopening root planning. An explicit `formalize` plan or a submitted proof or
+counterexample argument can request another attempt within the existing budget.
+These candidates remain unverified until the appropriate Lean checks succeed.
+If the planner is busy, the latest candidate for the exact target and formal
+context survives subsequent status reports and checkpoint restore. Fresh
+checkpoints also preserve the researcher's assigned follow-up question.
+
 Each research phase borrows one remaining conversation invocation and one
 scheduler iteration, preserving capacity for another proof turn. It uses the
 same provider settings and cost budget, with at most six provider dispatches
-per phase. Each phase receives 600 seconds, or the provider's larger configured
+per phase. Research can use up to five calls before independent review, within
+the available grant. An untouched follow-up waits for the next allocation;
+only executed work creates a review checkpoint. A grant with durably confirmed
+zero dispatches releases its borrowed conversation invocation. Elapsed time
+remains charged, and uncertain exposure retains its debit. An empty allocation
+also releases a count ceiling installed solely for that donation, preserving
+the prior repair allowance policy. Funded donations and later explicit count
+ceilings retain their limits.
+
+Repeated objections to the same theorem in the same formal context continue
+the existing investigation. Each objection keeps its own delivery receipt;
+an older response does not automatically answer a later request. Changed
+formal assumptions retain separate work and advice.
+
+Each phase receives 600 seconds, or the provider's larger configured
 time allowance, further limited by the parent's remaining time and applicable
 hard deadlines. The research request timeout uses that same funded allowance;
 there is no separate 120-second cutoff. Cancelled or failed research emits an
@@ -772,7 +794,12 @@ Frontier research adds an independent opt-in allocation policy:
 `--frontier-research adaptive` changes research allocation across explicit
 approaches and questions. Its default is `off`, even though automatic research
 is enabled. It preserves the existing budget and does not enable formal-state
-search or experiments. See [research policies](proof-search.md#research-and-alternative-approaches).
+search or experiments. Independent reviewers can continue a mechanism or
+prescribe an alternative with explicit objects, hypotheses, and quantitative
+targets. Progress assessments compare a precise new conclusion with the
+supplied brief and earlier reports. Rewording an already recorded conclusion
+does not renew its allowance. These comparisons are advisory model judgments;
+Lean retains proof authority. See [research policies](proof-search.md#research-and-alternative-approaches).
 
 | Option | Default | Meaning |
 | --- | ---: | --- |

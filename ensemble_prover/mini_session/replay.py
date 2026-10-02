@@ -682,6 +682,8 @@ def _budget_to_record(budget: ActionBudget) -> JSONDict:
         "max_aggregate_invocations": int(budget.max_aggregate_invocations),
         "max_aggregate_seconds": float(budget.max_aggregate_seconds),
         "unproductive_seconds": float(budget.unproductive_seconds),
+        "research_invocation_seal": copy.deepcopy(budget.research_invocation_seal),
+        "research_invocation_debits": list(budget.research_invocation_debits),
     }
 
 
@@ -725,6 +727,8 @@ def _budget_from_record(record: Any) -> ActionBudget:
                 record.get("unproductive_seconds"),
                 field="unproductive_seconds",
             ),
+            research_invocation_seal=copy.deepcopy(record.get("research_invocation_seal")),
+            research_invocation_debits=copy.deepcopy(record.get("research_invocation_debits", [])),
         )
     except InvalidActionBudgetRecord:
         raise

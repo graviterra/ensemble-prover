@@ -439,7 +439,7 @@ class DiscoveryLoop:
                 "experiments_enabled": run["experiments"],
                 "closed_loop_enabled": run["closed_loop"] is not None and not self.native_mode,
                 **({"native_proof_owner": {
-                    "policy": "The original Mini session owns proof acceptance. Submit complete plans with formalize to return candidate guidance to it. Research and review never establish the root theorem or change its assumptions.",
+                    "policy": "The original Mini session owns proof acceptance. Submit complete plans with formalize to return candidate guidance to it. Investigation reports, gaps and reviews provide context but do not reopen root planning. Research and review never establish the root theorem or change its assumptions.",
                     "kernel_verified": False,
                 }} if self.native_mode else {}),
                 "requests_remaining": run["max_requests"] - run["requests_used"],
@@ -1080,7 +1080,10 @@ class DiscoveryLoop:
             else {"polarity"}
             if kind == "formalize"
             else {"path", "offset", "length"} if kind == "read_artifact"
-            else {"substantive_progress", "competing_approach_ids"} if kind == "research_reorientation"
+            else {"substantive_progress", "competing_approach_ids", "progress_delta",
+                  "approach_decision", "approach_mechanism", "approach_difference"}
+            if kind == "research_reorientation"
+            else {"progress_delta"} if kind == "alternative_review"
             else set()
         )
         object_fields(
@@ -2220,7 +2223,8 @@ class DiscoveryLoop:
                                  and (target_claim_id is None or self.native_job_target(
                                      job, jobs_by_id
                                  ) == target_claim_id)
-                                 and (not adaptive or native_job_context(job, jobs_by_id)
+                                 and (not adaptive or native_job_context(
+                                     job, jobs_by_id, recorded_contexts=run.get("native_job_contexts", {}))
                                       == run.get("native_active_target_context_binding"))
                                  and (job["status"] == "responded" or (
                                      job["status"] == "pending" and not stop
@@ -2236,6 +2240,13 @@ class DiscoveryLoop:
                             if not ready:
                                 if stop or admitted >= max_requests:
                                     reason = stop or "quantum_exhausted"
+                                    break
+                                if any(job["status"] == "waiting"
+                                       and (job.get("research_control", {}).get("budget_deferred")
+                                            or job.get("research_control", {}).get("phase_deferred"))
+                                       and (target_claim_id is None or self.native_job_target(job, jobs_by_id) == target_claim_id)
+                                       for job in jobs):
+                                    reason = "research_allocation_deferred"
                                     break
                                 if (target_claim_id is None and self.strategy is not None
                                         and self.strategy.ensure_work()):
@@ -2347,11 +2358,20 @@ class DiscoveryLoop:
             primary_failure = False
             try:
                 self._closing_clients = False
+                no_service_transitions = 0
+                last_requests_used = self.store.run_record()["requests_used"]
+                transition_limit = 32 + 4 * min(self.store.run_record()["max_requests"], 32)
                 while True:
+                    # Scheduling and SQLite work can complete synchronously.
+                    # Always allow cancellation and other owners to run.
+                    await asyncio.sleep(0)
                     await self._retire_clients(set(tasks.values()))
                     if self.strategy is not None:
                         self.strategy.synchronize()
                     run = self.store.run_record(scheduling=True)
+                    if run["requests_used"] != last_requests_used:
+                        no_service_transitions = 0
+                        last_requests_used = run["requests_used"]
                     reason = self.store.stop_reason(run)
                     active = set(tasks.values())
                     jobs = self.store.jobs()
@@ -2395,7 +2415,9 @@ class DiscoveryLoop:
                         if self.strategy is not None and not reason and any(job.get("retry_after", 0) > time.time() for job in ready):
                             await asyncio.sleep(.1)
                             continue
-                        if self.strategy is not None and self.strategy.ensure_work():
+                        no_service_transitions += 1
+                        if (self.strategy is not None and no_service_transitions < transition_limit
+                                and self.strategy.ensure_work()):
                             continue
                         pending = any(
                             job["status"] in {"pending", "responded", "waiting"}

@@ -35,6 +35,17 @@ When the check distinguishes competing approaches, optionally include
 "competing_approach_ids": ["approach-id", "other-approach-id"] from the frontier
 portfolio. Explain how the possible outcomes separate those approaches in the
 rationale. This is a scheduling hint, never evidence of mathematical progress.
+For continuation use approach_decision:"continue". For a genuine alternative,
+use approach_decision:"alternative", explain approach_difference and supply
+approach_mechanism:{"reduction":"mathematical mechanism","objects":[],
+"hypotheses":[],"quantitative_target":"exact desired estimate"}. Changing
+wording alone does not justify a new approach or allowance.
+To claim substantive_progress:true, supply progress_delta:{"conclusion":"precise
+new conclusion","new_inference":"what the argument adds to the baseline and
+earlier reports","kind":"derivation|formalization|source_verification|obstruction",
+"assumptions":[],"baseline_artifact_ids":[],"prior_report_artifact_ids":[]}.
+Inspect the cumulative_research_comparison packet and explicitly compare every
+listed baseline and prior report. Omit progress credit when novelty is uncertain.
 Use inspected source content, precise quantifiers and useful prior work. Do not
 request another generic summary or repeat a prior assignment under a new name.
 """
@@ -74,13 +85,16 @@ def native_job_target(job: dict[str, Any], jobs: dict[str, dict[str, Any]]) -> s
     raise ValueError("cyclic native research job lineage")
 
 
-def native_job_context(job: dict[str, Any], jobs: dict[str, dict[str, Any]]) -> Any:
+def native_job_context(job: dict[str, Any], jobs: dict[str, dict[str, Any]], *,
+                       recorded_contexts: dict[str, Any] | None = None) -> Any:
     """Resolve immutable owner context through the same native job lineage."""
     seen: set[str] = set()
     while job["job_id"] not in seen:
         seen.add(job["job_id"])
         if job.get("native_context_binding") is not None:
             return job["native_context_binding"]
+        if recorded_contexts is not None and recorded_contexts.get(job["job_id"]) is not None:
+            return recorded_contexts[job["job_id"]]
         parent = jobs.get(job.get("parent_job"))
         if parent is None:
             return None
@@ -108,7 +122,8 @@ def _focused_jobs(store: Any, run: dict[str, Any]) -> list[dict[str, Any]]:
     context = run.get("native_active_target_context_binding")
     adaptive = mode_of(run.get("strategy_review") or {}) == "adaptive"
     return [job for job in jobs if native_job_target(job, by_id) == target
-            and (not adaptive or context is None or native_job_context(job, by_id) == context)]
+            and (not adaptive or context is None
+                 or native_job_context(job, by_id, recorded_contexts=run.get("native_job_contexts", {})) == context)]
 
 
 def _reviewed_through(state: dict[str, Any], run: dict[str, Any]) -> int:
@@ -142,16 +157,23 @@ def _reason(store: Any, job: dict[str, Any], state: dict[str, Any], run: dict[st
     if record.get("started_at") is not None and now >= record["started_at"] + state["policy"]["interval_seconds"]:
         return "research_interval_expired"
     if job["role"] == "research":
-        reviewed = _reviewed_through(state, run)
-        if _research_count(store, state, run) - reviewed >= state["policy"]["interval_requests"]:
-            return "research_phase_exhausted"
-        reserve = _review_reserve(state, run)
-        if run["requests_used"] + reservations >= run["max_requests"] - reserve:
-            return "research_review_reserve"
-        if record.get("requests_used") and now >= run["deadline"] - min(
-            state["policy"]["reserve_seconds"], run["max_seconds"] / 2
-        ):
-            return "research_review_reserve"
+        return _research_capacity_reason(store, state, run, now, reservations,
+                                         requests_used=record["requests_used"])
+    return None
+
+
+def _research_capacity_reason(store: Any, state: dict[str, Any], run: dict[str, Any],
+                              now: float, reservations: int = 0, *, requests_used: int = 0) -> str | None:
+    reviewed = _reviewed_through(state, run)
+    if _research_count(store, state, run) - reviewed >= state["policy"]["interval_requests"]:
+        return "research_phase_exhausted"
+    reserve = _review_reserve(state, run)
+    if run["requests_used"] + reservations >= run["max_requests"] - reserve:
+        return "research_review_reserve"
+    if (requests_used or "native_grant_requests" in run) and now >= run["deadline"] - min(
+        state["policy"]["reserve_seconds"], run["max_seconds"] / 2
+    ):
+        return "research_review_reserve"
     return None
 
 
@@ -175,6 +197,14 @@ class ResearchControl:
 
     def _atomic(self):
         return nullcontext() if self.store._applying else self.store.atomic()
+
+    def can_start_investigation(self) -> bool:
+        """Preflight a new assignment against the same global dispatch limits."""
+        state = self.controller.snapshot()
+        run = self.store.run_record(scheduling=True)
+        return (run["status"] == "running" and not self.store.stop_reason(run)
+                and _research_capacity_reason(self.store, state, run, self.controller.clock(),
+                                              self.controller._reservations(state)) is None)
 
     def context(self, job: dict[str, Any]) -> dict[str, Any]:
         state = self.controller.snapshot()
@@ -201,6 +231,26 @@ class ResearchControl:
             "prior_checkpoint_artifact": job.get("research_prior_checkpoint"),
             "portfolio_checkpoint_artifacts": job.get("research_portfolio_checkpoints", []),
         }}
+        from .research_findings import comparison_packet
+
+        producer_id = job.get("research_reorientation_for")
+        if job.get("strategy_review_id"):
+            review = state["reviews"].get(job["strategy_review_id"], {})
+            if review.get("kind") == "alternative":
+                producer_id = review.get("producer_job")
+        comparison_producer = self.store.job(producer_id) if producer_id else job
+        result["cumulative_research_comparison"] = comparison_packet(self.store, comparison_producer)
+        # The assigned task and compact current context should be usable on
+        # the first request; complete histories remain addressable artifacts.
+        checkpoint = job.get("native_proof_checkpoint")
+        if checkpoint:
+            from .model import load_json
+
+            packet = load_json(self.store.read_artifact(checkpoint).decode())
+            result["native_current_context"] = {
+                key: packet.get(key) for key in (
+                    "active_target", "formal_context", "first_uncertain_inference", "objections", "failure")
+            }
         if job.get("research_reorientation_for"):
             from .model import load_json
 
@@ -215,6 +265,14 @@ class ResearchControl:
                     result["assigned_report_progress_assessment"] = {
                         "report_artifact": producer["investigation_artifact"],
                         "basis": producer["frontier_report_basis"]["binding"],
+                        "required_progress_delta": {
+                            "conclusion": "Precise new mathematical conclusion with quantifiers",
+                            "new_inference": "Difference from the supplied baseline and every earlier report",
+                            "kind": "derivation|formalization|source_verification|obstruction",
+                            "assumptions": [],
+                            "baseline_artifact_ids": result["cumulative_research_comparison"]["baseline_artifact_ids"],
+                            "prior_report_artifact_ids": result["cumulative_research_comparison"]["prior_report_artifact_ids"],
+                        },
                         "instruction": "Independently inspect this completed report for substantive NEW evidence advancing its exact assigned inference. You may add substantive_progress:true to research_reorientation only for an actual new derivation, check or useful source application; repeated facts, plans and revised wording do not qualify. Missing/false means no progress credit. This assessment conveys research relevance, never proof authority.",
                     }
         return result
@@ -280,6 +338,18 @@ class ResearchControl:
     def synchronize(self) -> None:
         from .frontier.hooks import mode_of
 
+        # Budget deferral outlives the grant, not its mathematical assignment.
+        # Direct native callers may renew capacity without a coordinator inbox.
+        for deferred in _focused_jobs(self.store, self.store.run_record(scheduling=True)):
+            record = deferred.get("research_control", {})
+            if deferred["status"] == "waiting" and record.get("budget_deferred") and not record.get("closed"):
+                state = self.controller.snapshot()
+                run = self.store.run_record(scheduling=True)
+                if _reason(self.store, deferred, state, run, self.controller.clock()) is None:
+                    record["budget_deferred"] = False
+                    deferred["status"] = "pending"
+                    self.store.save_job(deferred)
+
         if mode_of(self.controller.snapshot()) == "adaptive":
             from .frontier.hooks import reconcile_retired_allocations
 
@@ -304,6 +374,36 @@ class ResearchControl:
         for job in _focused_jobs(self.store, self.store.run_record(scheduling=True)):
             if job["role"] in {"research", "review"} and job["status"] == "pending":
                 self.before_request(job)
+        self._review_finished_phase()
+
+    def _review_finished_phase(self) -> None:
+        """Review paid completed work when no investigator remains to yield it."""
+        from .frontier.hooks import mode_of
+
+        with self._atomic():
+            state = self.controller.snapshot()
+            run = self.store.run_record(scheduling=True)
+            if mode_of(state) == "adaptive" or run["status"] != "running" or self.store.stop_reason(run):
+                return
+            if _research_count(self.store, state, run) <= _reviewed_through(state, run):
+                return
+            reason = _research_capacity_reason(
+                self.store, state, run, self.controller.clock(),
+                self.controller._reservations(state), requests_used=1,
+            )
+            if reason is None:
+                return
+            jobs = _focused_jobs(self.store, run)
+            # Finish publishing paid responses before assembling the portfolio.
+            # In particular, never extend a review that is already in flight.
+            if any(job["status"] in {"running", "responded", "tool_running"} for job in jobs):
+                return
+            for job in jobs:
+                if job["role"] != "research" or job["status"] != "finished":
+                    continue
+                record = _allocation(job, state)
+                if record["requests_used"] and not record.get("closed"):
+                    self.handle_yield(job, reason)
 
     def after_action(self, job: dict[str, Any], action: dict[str, Any], result: Any,
                      novelty: dict[str, Any]) -> None:
@@ -334,7 +434,8 @@ class ResearchControl:
             if job["role"] == "research" and job["status"] == "finished":
                 from .frontier.hooks import mode_of
 
-                if mode_of(self.controller.snapshot()) == "adaptive" and job.get("frontier_permit_consumed"):
+                if ((mode_of(self.controller.snapshot()) == "adaptive" and job.get("frontier_permit_consumed"))
+                        or (self.loop.native_mode and job.get("investigation_artifact") and not job.get("alternative_for"))):
                     self.handle_yield(job, "research_result_submitted")
                     return
             if action["action"] == "submit" and action.get("kind") == "gap":
@@ -425,14 +526,22 @@ class ResearchControl:
                 job.update(status="waiting", last_error=reason)
                 self.store.save_job(job)
                 return
-            if adaptive and job["role"] == "research" and (
+            if job["role"] == "research" and (
                 reason == "research_phase_deferred"
-                or (reason == "research_phase_exhausted" and record.get("requests_used", 0) == 0)
+                or (reason in {"research_phase_exhausted", "research_review_reserve"}
+                    and record.get("requests_used", 0) == 0
+                    and not job.get("research_last_action") and not job.get("response"))
             ):
-                from .frontier.hooks import defer_unserved
+                if adaptive:
+                    from .frontier.hooks import defer_unserved
 
-                with self.controller._edit() as (live, _):
-                    defer_unserved(self.controller, live, job)
+                    with self.controller._edit() as (live, _):
+                        defer_unserved(self.controller, live, job, reason=reason)
+                else:
+                    record["closed"] = False
+                    record["budget_deferred" if reason == "research_review_reserve" else "phase_deferred"] = True
+                    job["status"] = "waiting"
+                    self.store.save_job(job)
                 return
             if record.get("closed"):
                 job["status"] = "finished"
@@ -513,6 +622,13 @@ class ResearchControl:
                 state.setdefault("native_research_attention", {})[target] = count
             else:
                 state["research_attention"] = {"reviewed_through": count}
+            for job in _focused_jobs(self.store, run):
+                record = job.get("research_control", {})
+                if record.get("phase_deferred") and not record.get("closed"):
+                    record["phase_deferred"] = False
+                    if job["status"] == "waiting":
+                        job["status"] = "pending"
+                    self.store.save_job(job)
 
     def _incomplete_review(self, job: dict[str, Any], reason: str) -> None:
         review_id = job.get("strategy_review_id")
@@ -535,7 +651,7 @@ class ResearchControl:
         memory = producer.get("research_memory") or producer.get("research_prior_memory")
         if memory is not None:
             recipient["research_prior_memory"] = memory
-        for key in ("native_context_binding", "native_target_claim_id", "frontier_native_target_claim_id"):
+        for key in ("native_context_binding", "native_target_claim_id", "frontier_native_target_claim_id", "native_proof_checkpoint"):
             if producer.get(key) is not None:
                 recipient[key] = producer[key]
 
@@ -552,7 +668,16 @@ class ResearchControl:
     def _followup(self, reviewer: dict[str, Any], directive: dict[str, Any], checkpoint: str) -> dict[str, Any]:
         signature = hashlib.sha256(json_text({key: " ".join(str(directive.get(key, "")).casefold().split())
                                             for key in ("next_question", "discriminating_check")}).encode()).hexdigest()
-        if any(job.get("research_route_signature") == signature for job in self.store.jobs()):
+        from .research_findings import comparison_packet
+
+        scope = comparison_packet(self.store, reviewer)
+        jobs = {job["job_id"]: job for job in self.store.jobs()}
+        recorded_contexts = self.store.run_record(scheduling=True).get("native_job_contexts", {})
+        if any(job.get("research_route_signature") == signature
+               and native_job_target(job, jobs) == scope["target_claim_id"]
+               and native_job_context(job, jobs, recorded_contexts=recorded_contexts) == scope["context_binding"]
+               and job.get("research_control", {}).get("requests_used", 0) > 0
+               for job in jobs.values()):
             directive = {**directive, "repeated_assignment": True,
                          "discriminating_check": self._fallback_check(),
                          "avoid": directive["avoid"] + " The proposed assignment repeats archived work; perform this new check before returning to it."}
@@ -576,7 +701,16 @@ class ResearchControl:
         child.update(research_directive=directive, research_prior_checkpoint=checkpoint,
                      research_route_signature=signature,
                      research_portfolio_checkpoints=reviewer.get("research_portfolio_checkpoints", []))
-        if reviewer.get("frontier_approach_id"):
+        if reviewer.get("frontier_approach_id") and directive.get("approach_decision") == "alternative":
+            from .frontier.owner import FrontierOwner
+
+            approach = FrontierOwner(self.controller).reorient_alternative(reviewer, directive)
+            if approach is None:
+                child.update(status="superseded", last_error="stale_frontier_scope")
+            else:
+                child["frontier_approach_id"] = approach["approach_id"]
+                child["frontier_question_id"] = approach["question_id"]
+        elif reviewer.get("frontier_approach_id"):
             child["frontier_approach_id"] = reviewer["frontier_approach_id"]
             from .frontier.hooks import mode_of
 
@@ -607,6 +741,18 @@ class ResearchControl:
         if job.get("research_control", {}).get("closed"):
             raise ValueError("the assigned allocation has already ended")
         directive = {key: action[key] for key in REORIENTATION_FIELDS}
+        from .frontier.approaches import normalize_mechanism
+
+        decision = action.get("approach_decision", "continue")
+        if decision not in {"continue", "alternative"}:
+            raise ValueError("approach_decision must be continue or alternative")
+        directive["approach_decision"] = decision
+        if decision == "alternative":
+            difference = action.get("approach_difference")
+            if not isinstance(difference, str) or not difference.strip():
+                raise ValueError("an alternative requires approach_difference")
+            directive["approach_difference"] = difference
+            directive["approach_mechanism"] = normalize_mechanism(action.get("approach_mechanism"))
         if "competing_approach_ids" in action:
             competitors = action["competing_approach_ids"]
             if (not isinstance(competitors, list) or len(competitors) > 32
@@ -620,7 +766,8 @@ class ResearchControl:
             from .frontier.owner import FrontierOwner
 
             progress_assessment = FrontierOwner(self.controller).assess_report_progress(
-                job, substantive=action["substantive_progress"], rationale=action["rationale"]
+                job, substantive=action["substantive_progress"], rationale=action["rationale"],
+                delta=action.get("progress_delta"),
             )
         directive["decision"] = "investigate"
         job["status"] = "finished"

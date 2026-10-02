@@ -177,7 +177,8 @@ class FrontierOwner:
     def project(self) -> dict[str, Any]:
         return project(self.campaign())
 
-    def assess_report_progress(self, reviewer: dict[str, Any], *, substantive: bool, rationale: str) -> dict[str, Any]:
+    def assess_report_progress(self, reviewer: dict[str, Any], *, substantive: bool, rationale: str,
+                               delta: dict[str, Any] | None = None) -> dict[str, Any]:
         """Use the assigned independent checkpoint review, never the producer's vote."""
         if type(substantive) is not bool:
             raise ValueError("substantive_progress must be boolean")
@@ -193,17 +194,46 @@ class FrontierOwner:
             producer = self.store.job(producer_id)
             if producer["worker"] == reviewer["worker"]:
                 raise FrontierRefusal("independent_report_reviewer_required")
-            if not report_scope_current(self.controller, campaign, producer):
-                return {"status": "stale", "credit_minted": False}
-            artifact = producer["investigation_artifact"]
-            state = self.controller.snapshot()
-            approach = campaign["approaches"][producer["frontier_approach_id"]]
-            self.store.read_artifact(artifact)
-            return apply_contribution(campaign, approach_id=approach["approach_id"],
-                                      obligation_id=approach["bottleneck_obligation"], proposed_class="research_advance",
-                                      subject=approach.get("subject_id") or state["root_id"], context=campaign["root"]["context"],
-                                      operation_id=reviewer["job_id"], artifacts=[artifact], claim=artifact,
-                                      explanation=rationale, now=self.controller.clock())
+            from ..research_findings import assess_delta
+
+            return assess_delta(self.controller, campaign, producer, reviewer_id=reviewer["job_id"],
+                                delta=delta, rationale=rationale)
+
+        return self._edit(run)
+
+    def reorient_alternative(self, reviewer: dict[str, Any], directive: dict[str, Any]) -> dict[str, Any] | None:
+        """An independent review can fork a mechanism with bounded exploration."""
+        from .hooks import scoped_research_mechanism
+
+        def run(campaign: dict[str, Any]) -> dict[str, Any] | None:
+            producer_id = reviewer.get("research_reorientation_for")
+            if reviewer.get("role") != "review" or not producer_id:
+                return None
+            producer = self.store.job(producer_id)
+            if producer["worker"] == reviewer["worker"] or not report_scope_current(self.controller, campaign, producer):
+                return None
+            parent = campaign["approaches"][producer["frontier_approach_id"]]
+            mechanism = scoped_research_mechanism(self.controller, producer, directive["approach_mechanism"])
+            for existing in campaign["approaches"].values():
+                if existing["mechanism"] == mechanism and existing["status"] != "superseded":
+                    if existing["approach_id"] == parent["approach_id"]:
+                        raise ValueError("an alternative must change the mathematical mechanism")
+                    return existing
+            child = fork_approach(
+                campaign, parent["approach_id"], mechanism=mechanism,
+                first_uncertain_inference=directive["first_uncertain_inference"],
+                first_investigation=directive["discriminating_check"],
+                quantitative_target=mechanism["quantitative_target"],
+                key_obligations=[parent["bottleneck_obligation"]],
+                now=self.controller.clock(), parent_grant_remaining=1,
+                difference=directive["approach_difference"],
+            )
+            for field in ("native_context_binding", "native_target_claim_ids", "native_scope_bindings"):
+                if field in parent:
+                    from copy import deepcopy
+
+                    child[field] = deepcopy(parent[field])
+            return child
 
         return self._edit(run)
 

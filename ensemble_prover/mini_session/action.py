@@ -427,8 +427,43 @@ class ActionBudget:
     max_aggregate_invocations: int = -1
     max_aggregate_seconds: float = 0.0
     unproductive_seconds: float = 0.0
+    research_invocation_seal: Optional[Dict[str, Any]] = None
+    research_invocation_debits: list[str] = field(default_factory=list)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "max_aggregate_invocations":
+            # An explicit policy assignment supersedes a research-owned seal,
+            # even when the new ceiling happens to have the same value.
+            object.__setattr__(self, "research_invocation_seal", None)
+        object.__setattr__(self, name, value)
 
     def __post_init__(self) -> None:
+        debits = self.research_invocation_debits
+        if (not isinstance(debits, list)
+                or any(not isinstance(token, str) or not token for token in debits)
+                or len(set(debits)) != len(debits)):
+            raise ValueError("invalid research invocation debit ownership")
+        seal = self.research_invocation_seal
+        if seal is not None:
+            if (not isinstance(seal, dict)
+                    or set(seal) != {"previous_cap", "cap", "grants"}
+                    or type(seal["previous_cap"]) is not int
+                    or seal["previous_cap"] < -1
+                    or type(seal["cap"]) is not int or seal["cap"] < 0
+                    or seal["cap"] != self.max_aggregate_invocations
+                    or (seal["previous_cap"] != -1 and seal["previous_cap"] < seal["cap"])
+                    or not isinstance(seal["grants"], dict) or not seal["grants"]
+                    or any(not isinstance(key, str) or not key or not isinstance(value, dict)
+                           or set(value) != {"cap", "retained"}
+                           or type(value["cap"]) is not int or value["cap"] < 0
+                           or type(value["retained"]) is not bool
+                           for key, value in seal["grants"].items())):
+                raise ValueError("invalid research invocation seal")
+            limits = [value["cap"] for value in seal["grants"].values()]
+            if seal["previous_cap"] >= 0:
+                limits.append(seal["previous_cap"])
+            if seal["cap"] != min(limits):
+                raise ValueError("invalid research invocation seal limits")
         if self.scope not in {
             "session",
             "theory_need",

@@ -132,6 +132,8 @@ alternative_for in the job context), an independent reviewer uses
 only when the report actually investigates a different approach with a concrete
 derivation/check and precise gap. A promised plan or renamed method earns no
 renewal. This assessment grants exploration credit, not mathematical proof.
+In adaptive mode, alternative_review needs the same progress_delta and
+cumulative comparison as research_reorientation before it grants credit.
 """
 
 
@@ -313,6 +315,14 @@ class StrategyIntegration:
             for job in jobs
         ):
             return False
+        if any(job["status"] == "waiting"
+               and not job.get("research_control", {}).get("closed")
+               and (job.get("research_control", {}).get("budget_deferred")
+                    or job.get("research_control", {}).get("phase_deferred"))
+               for job in jobs):
+            return False
+        if not self.research.can_start_investigation():
+            return False
         with self.store.atomic():
             # Waiting investigations with no runnable dependencies have no
             # reason to block a fresh research program.
@@ -380,6 +390,10 @@ class StrategyIntegration:
                 name="complete-investigation.json",
             )
             with self.store.atomic() if not self.store._applying else nullcontext():
+                run = self.store.run_record()
+                run["research_report_sequence"] = run.get("research_report_sequence", 0) + 1
+                job["research_report_sequence"] = run["research_report_sequence"]
+                self.store.save_run(run)
                 state = self.controller.snapshot()
                 if self.controller._frontier_mode(state) == "adaptive":
                     from copy import deepcopy
@@ -449,6 +463,7 @@ class StrategyIntegration:
                     review.update(
                         status="substantive" if action["substantive"] else "unresolved",
                         rationale=text(action["rationale"], "assessment rationale"),
+                        reviewer_job_id=job["job_id"], progress_delta=action.get("progress_delta"),
                     )
             if review["status"] == "substantive":
                 try:

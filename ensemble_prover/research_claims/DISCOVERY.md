@@ -83,6 +83,25 @@ decisions without changing work. Adaptive maintains approaches and explicit
 questions, gives bounded follow-through to useful reviewed findings, and
 preserves exploratory allocation within the existing budget.
 
+An independent `research_reorientation` reviewer can set `approach_decision`
+to `continue` or `alternative`. An alternative requires `approach_difference`
+and `approach_mechanism` with `reduction`, `objects`, `hypotheses`, and
+`quantitative_target`. The mechanism receives persistent obligations and a
+bounded exploratory allocation; changing a task's wording alone does not
+establish a mathematical alternative.
+
+Research credit from `research_reorientation` or `alternative_review` requires
+a `progress_delta` containing `conclusion`, `new_inference`, `kind`,
+`assumptions`, `baseline_artifact_ids`, and `prior_report_artifact_ids`.
+The kind is `derivation`, `formalization`, `source_verification`, or
+`obstruction`. The comparison packet lists the initial sources and prior
+reports for the same mathematical context. The reviewer identifies what the
+report newly establishes and explicitly compares those artifacts. Missing or
+incomplete comparison keeps novelty unresolved. A recorded conclusion under
+the same assumptions and contribution kind receives credit once. Semantic
+comparison remains advisory and can be mistaken; formalization still requires
+the existing verifier before it has proof authority.
+
 Formal priority depends on current checked reductions and revalidated exports.
 Source observations, experiments, and informal approaches retain their own
 evidence status. These modes do not enable experiments or change the global
@@ -169,6 +188,14 @@ from this path; verified discovery exports are reported separately.
   New programs and continuing turns join the queue tail. Repeated
   delegation cannot continually jump ahead of older waiting research turns.
   This is single-host, not a distributed fleet runtime.
+- When remaining capacity is reserved for review, untouched investigations stay
+  deferred. The scheduler stops instead of replacing them with new jobs that
+  cannot run, and yields between scheduling turns so cancellation remains
+  responsive even when no provider request is active.
+- Completed investigations still receive phase review when every researcher
+  has finished before reaching a per-worker limit. The reviewer receives the
+  completed work together, and any resulting investigation uses the remaining
+  research allowance or waits for renewed funding.
 - Provider failures are operational pauses, not mathematical verdicts. Changing
   the original target stops execution instead of silently changing the problem.
   Changing a child claim retires that child's stale invocation and notifies its

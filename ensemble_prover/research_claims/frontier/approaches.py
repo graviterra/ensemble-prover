@@ -54,6 +54,26 @@ def _fingerprint(root_binding: str, mechanism: dict[str, Any], obligations: list
     })
 
 
+def normalize_mechanism(mechanism: Any) -> dict[str, Any]:
+    """Normalize structured scheduling identity without equating mathematics."""
+    fields = {"reduction", "objects", "hypotheses", "quantitative_target"}
+    if not isinstance(mechanism, dict) or set(mechanism) != fields:
+        raise ValueError("approach mechanism requires reduction, objects, hypotheses and quantitative_target")
+    result: dict[str, Any] = {}
+    for field in ("reduction", "quantitative_target"):
+        value = mechanism[field]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"approach mechanism {field} must be nonempty text")
+        result[field] = " ".join(value.split())
+    for field in ("objects", "hypotheses"):
+        value = mechanism[field]
+        if (not isinstance(value, list) or len(value) > 64
+                or any(not isinstance(item, str) or not item.strip() for item in value)):
+            raise ValueError(f"approach mechanism {field} must be an array of nonempty strings")
+        result[field] = sorted({" ".join(item.split()) for item in value})
+    return result
+
+
 def _join_service_tail(state: dict[str, Any], approach_id: str) -> None:
     queue = state["service_queue"]
     if approach_id in queue:

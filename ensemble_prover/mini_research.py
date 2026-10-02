@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+from copy import deepcopy
 from functools import wraps
 import hashlib
 import json
@@ -24,6 +25,7 @@ from typing import Any
 import uuid
 
 from .proof_dossier import canonical_dossier_statement_key
+from .research_claims.native_guidance import is_proof_candidate
 
 _CURRENT: contextvars.ContextVar[Any] = contextvars.ContextVar("native_research_owner", default=None)
 _SCOPED = contextvars.ContextVar("native_research_scoped", default=False)
@@ -218,19 +220,24 @@ class NativeResearchCoordinator:
         binding = self._target_context_binding(conv)
         for guidance in (self.guidance, self.guidance_by_target.get(binding),
                          self.guidance_by_target.get(key)):
-            if guidance is None:
-                continue
-            target = guidance.get("target_statement", self.pin["statement"])
-            context = guidance.get("target_context_binding")
-            # Legacy root advice has an original-context identity. Contextless
-            # child advice remains readable as history, never as a current answer.
-            if context is None:
-                if canonical_dossier_statement_key(target) != canonical_dossier_statement_key(self.pin["statement"]):
-                    continue
-                context = self._target_context_binding(None)
-            if canonical_dossier_statement_key(target) == key and context == binding:
+            if self._guidance_matches(conv, guidance):
                 return guidance
         return None
+
+    def _guidance_matches(self, conv: Any, guidance: Any) -> bool:
+        if not isinstance(guidance, dict):
+            return False
+        target = guidance.get("target_statement", self.pin["statement"])
+        context = guidance.get("target_context_binding")
+        # Legacy root advice has an original-context identity. Contextless
+        # child advice remains readable as history, never as a current answer.
+        if context is None:
+            if canonical_dossier_statement_key(target) != canonical_dossier_statement_key(self.pin["statement"]):
+                return False
+            context = self._target_context_binding(None)
+        return (canonical_dossier_statement_key(target)
+                == canonical_dossier_statement_key(self._target(conv))
+                and context == self._target_context_binding(conv))
 
     def _objections_for(self, conv: Any) -> list[dict[str, Any]]:
         key = canonical_dossier_statement_key(self._target(conv))
@@ -515,14 +522,16 @@ class NativeResearchCoordinator:
                 self.pin["statement"], "Original Lean theorem; exact formal context in original-target.json"), "native-mini"),
                 sources={"original-target.json": _json(self._visible_target(session))}, model=model, review_model=model,
                 max_requests=1, max_seconds=120, concurrency=1, strategy_recovery=True,
-                strategy_policy={"interval_requests": 3, "interval_seconds": 3600,
+                strategy_policy={"interval_requests": 5, "interval_seconds": 3600,
                                  "reserve_requests": 1, "reserve_seconds": 1,
                                  **({"frontier_research": self.frontier_research}
                                     if self.frontier_research["mode"] != "off" else {})})
             with DiscoveryStore(directory) as created:
                 run = created.run_record()
                 run.update(native_target_binding=self.binding, native_grants={}, native_guidance=None,
-                           native_parent_authorization=True, max_requests=0, status="paused")
+                           native_ledger_identity=uuid.uuid4().hex,
+                           native_parent_authorization=True, native_research_allocation_version=2,
+                           max_requests=0, status="paused")
                 created.save_run(run)
         self.store = DiscoveryStore(directory)
         record = self.store.run_record()
@@ -530,6 +539,16 @@ class NativeResearchCoordinator:
             self.store.close()
             self.store = None
             raise ValueError("native research ledger belongs to a different original target")
+        identity = record.get("native_ledger_identity")
+        if identity is None and state.get("ledger_identity") is None:
+            identity = record["native_ledger_identity"] = uuid.uuid4().hex
+            self.store.save_run(record)
+        if (not isinstance(identity, str) or not identity
+                or state.get("ledger_identity", identity) != identity):
+            self.store.close()
+            self.store = None
+            raise ValueError("saved native research ledger identity differs")
+        state["ledger_identity"] = identity
         strategy = record.get("strategy_review") or {}
         saved_frontier = strategy.get("frontier_research") or {"mode": "off"}
         compatible = saved_frontier.get("mode", "off") == self.frontier_research["mode"]
@@ -579,29 +598,53 @@ class NativeResearchCoordinator:
         return self.store.put_artifact(_json(context).encode(), name="native-proof-checkpoint.json")
 
     def _research_claim(self, session: Any) -> str:
-        """Bind the exact question; older reviewers cannot answer a new request."""
+        """Keep mathematical work stable while grants account for each request."""
         from .research_claims.model import ClaimSpec, MathematicalContract
 
         statement = self._target(session.conv)
         key = canonical_dossier_statement_key(statement)
-        objections = self._objections_for(session.conv)
         context = self._target_context_binding(session.conv)
-        if (not objections and key == canonical_dossier_statement_key(self.pin["statement"])
-                and context == self._target_context_binding(None)):
-            return "native-root"
-        request_keys = sorted(item.get("request_id") or _hash(item) for item in objections)
         claim_id = "native-target-" + _hash({
-            "context": context, "requests": request_keys,
+            "context": context, "statement": key,
         })
         with self.store.atomic():
+            # Select a compatible legacy queue once, then preserve its identity
+            # even when different request receipts or jobs arrive later.
+            run = self.store.run_record()
+            targets = run.setdefault("native_mathematical_targets", {})
+            selected = targets.get(context)
+            if selected is None:
+                candidates = {grant["target_claim_id"] for grant in run.get("native_grants", {}).values()
+                              if grant.get("target_context_binding") == context
+                              and canonical_dossier_statement_key(grant.get("target_statement", "")) == key}
+                from .research_claims.research_control import native_job_target
+
+                jobs = {job["job_id"]: job for job in self.store.jobs()}
+                compatible = [job for job in jobs.values()
+                              if native_job_target(job, jobs) in candidates
+                              and job["status"] in {"pending", "waiting", "responded"}
+                              and not job.get("research_control", {}).get("closed")]
+                if compatible:
+                    preferred = min(compatible, key=lambda job: (
+                        0 if job.get("research_directive") else 1, job.get("queue_order", 0)))
+                    selected = native_job_target(preferred, jobs)
+                elif candidates:
+                    selected = min(candidates)
+                elif (key == canonical_dossier_statement_key(self.pin["statement"])
+                      and context == self._target_context_binding(None)):
+                    selected = "native-root"
+                else:
+                    selected = claim_id
+                targets[context] = selected
+                self.store.save_run(run)
             known = {claim["claim_id"] for claim in self.store.list_claims()}
-            if claim_id not in known:
+            if selected not in known:
                 self.store.create_claim(ClaimSpec(
-                    claim_id, MathematicalContract(
+                    selected, MathematicalContract(
                         statement, "Active Mini obligation; formal context is in its native proof checkpoint."
                     ), "native-mini",
                 ))
-        return claim_id
+        return selected
 
     def _queue_target_work(self, session: Any, checkpoint: str, claim_id: str) -> None:
         statement = self._target(session.conv)
@@ -611,38 +654,46 @@ class NativeResearchCoordinator:
             f"{statement} and reported obstacle, and give a discriminating next inference."
         )
         jobs = {job["job_id"]: job for job in self.store.jobs()}
-        recorded_contexts = self.store.run_record().get("native_job_contexts", {})
+        run = self.store.run_record()
+        baselines = run.setdefault("native_research_baselines", {})
+        baselines.setdefault(context_binding, checkpoint)
+        self.store.save_run(run)
+        recorded_contexts = run.get("native_job_contexts", {})
         available = False
         for job in jobs.values():
             if (job["role"] not in {"research", "review"}
                     or job["status"] not in {"pending", "waiting", "responded"}
                     or self.loop.native_job_target(job, jobs) != claim_id):
                 continue
-            if self.frontier_research["mode"] == "adaptive":
-                previous_context = job.get("native_context_binding") or recorded_contexts.get(job["job_id"])
-                if (previous_context is not None and previous_context != context_binding
-                        or previous_context is None and job.get("turn", 0) > 0):
-                    # Previously paid work must retain its original context;
-                    # a new grant cannot reinterpret an unstamped response.
-                    continue
-                job["native_context_binding"] = context_binding
-                job["native_target_claim_id"] = claim_id
-                self.store.save_job(job)
+            previous_context = job.get("native_context_binding") or recorded_contexts.get(job["job_id"])
+            if (previous_context is not None and previous_context != context_binding
+                    or previous_context is None and job.get("turn", 0) > 0):
+                # Previously paid work must retain its original context;
+                # a new grant cannot reinterpret an unstamped response.
+                continue
+            job["native_context_binding"] = context_binding
+            job["native_target_claim_id"] = claim_id
+            self.store.save_job(job)
             self.loop._notify(job["job_id"], {
                 "native_proof_checkpoint": checkpoint,
                 "active_target": statement,
                 "instruction": "Read the exact checkpoint and answer its active target and objections. Audit the route, constants, hypotheses and ancestors. Search original sources for the bottleneck or counterexamples when relevant. Execute a discriminating check or a substantively different derivation. A proof, refuted strengthening, corrected intermediate statement, or precise unresolved obstruction is useful; a renamed plan is insufficient. Never weaken the original theorem or treat a refuted strengthening as a refutation of it.",
             }, requires_response=True)
             updated = self.store.job(job["job_id"])
-            if updated["role"] == "research" and updated["claim_id"] == claim_id:
-                updated["question"] = question
-                self.store.save_job(updated)
+            updated["native_proof_checkpoint"] = checkpoint
+            self.store.save_job(updated)
+            # Refresh evidence through the inbox, preserving the assigned
+            # investigation (including a reviewer's discriminating follow-up).
             available = available or updated["status"] in {"pending", "responded"}
         if not available:
             job = self.store.add_job(claim_id, question)
             job["native_target_claim_id"] = claim_id
-            if self.frontier_research["mode"] == "adaptive":
-                job["native_context_binding"] = context_binding
+            job["native_proof_checkpoint"] = checkpoint
+            job["research_mechanism"] = {
+                "reduction": "Investigate the exact active native target",
+                "objects": [], "hypotheses": [], "quantitative_target": statement,
+            }
+            job["native_context_binding"] = context_binding
             self.store.save_job(job)
 
     async def _investigate(self, session: Any, reason: str, *, background: bool = False) -> bool:
@@ -706,8 +757,13 @@ class NativeResearchCoordinator:
                  "target_claim_id": claim_id,
                  "objections": self._objections_for(session.conv),
                  "expires_at": time.time() + timeout,
+                 "invocation_debit_tracked": True,
+                 "funding_phase": "precommit",
+                 "funding_ledger_identity": run["native_ledger_identity"],
+                 "funding_requests_used": run["requests_used"],
+                 "funding_grant_ids": sorted(run["native_grants"]),
                  "source_invocations": donor.initial_invocations + 1}
-        donor = debit_donor(session, donor)
+        donor = debit_donor(session, donor, grant_id=grant["id"])
         timeout = min(timeout, _native_quantum_seconds(donor))
         grant["expires_at"] = time.time() + timeout
         grant["seconds"] = timeout
@@ -721,6 +777,16 @@ class NativeResearchCoordinator:
             grants = run["native_grants"]
             if grant["id"] in grants:
                 raise ValueError("native grant was already funded")
+            if run.get("native_research_allocation_version") is None:
+                policy = run["strategy_review"]["policy"]
+                if all(policy.get(key) == value for key, value in {
+                    "interval_requests": 3, "interval_seconds": 3600,
+                    "reserve_requests": 1, "reserve_seconds": 1,
+                }.items()):
+                    # Upgrade the former native default at a funding boundary;
+                    # spent receipts and closed allocations stay spent.
+                    policy["interval_requests"] = 5
+                run["native_research_allocation_version"] = 2
             # A different restored lane can reach this boundary before the
             # owner of an interrupted grant. Freeze the old usage while this
             # ledger still ends at its last request, so later reconciliation
@@ -739,9 +805,13 @@ class NativeResearchCoordinator:
                        native_active_target_context_binding=grant["target_context_binding"],
                        native_grant_requests=grant["requests"])
             grants[grant["id"]] = {**grant, "start_requests": run["requests_used"],
-                                  "ordinal": len(grants), "closed": False}
+                                  "ordinal": len(grants), "closed": False,
+                                  "funding_phase": "committed"}
             self.store.save_run(run)
             self._queue_target_work(session, checkpoint, claim_id)
+        # Cross-store funding becomes durable before any provider task exists.
+        grant["funding_phase"] = "committed"
+        await _checkpoint(session)
         state["rounds"] += 1
         _event(session, "research_started", reason=reason, grant_id=grant["id"],
                requests=grant["requests"], timeout_s=timeout, ledger=str(self.store.directory))
@@ -917,6 +987,29 @@ class NativeResearchCoordinator:
         with self.store.atomic():
             run = self.store.run_record()
             saved = run["native_grants"].get(grant["id"])
+            if saved is None:
+                budget = session.budgets[grant["action_id"]]
+                uncommitted = (
+                    grant.get("invocation_debit_tracked") is True
+                    and (grant["id"] in budget.research_invocation_debits
+                         or (grant.get("cancelled_before_funding") is True
+                             and grant.get("invocation_released") is True))
+                    and grant.get("funding_phase") == "precommit"
+                    and grant.get("funding_ledger_identity") == run.get("native_ledger_identity")
+                    and bool(run.get("native_ledger_identity"))
+                    and grant.get("funding_requests_used") == run["requests_used"]
+                    and grant.get("funding_grant_ids") == sorted(run["native_grants"])
+                )
+                if not uncommitted:
+                    raise ValueError("missing native grant cannot establish zero exposure")
+                # This intact ledger never admitted this precommitted grant.
+                # Preserve an empty settlement receipt for checkpoint retries.
+                grant["cancelled_before_funding"] = True
+                saved = {**grant, "used": 0, "elapsed_s": 0.0,
+                         "start_requests": run["requests_used"],
+                         "ordinal": len(run["native_grants"]),
+                         "cancelled_before_funding": True}
+                run["native_grants"][grant["id"]] = saved
             if saved is not None:
                 used, ambiguous = _grant_usage(run, saved)
                 if ambiguous:
@@ -943,6 +1036,32 @@ class NativeResearchCoordinator:
                     session.run_governor_elapsed_s = current_elapsed + max(0.0, uncharged - overlap)
                     grant["elapsed_accounted"] = elapsed
                 saved.update(used=used, closed=True)
+                # Release only a modern, fenced grant with authoritative zero
+                # exposure. The session checkpoint records the release too;
+                # retries after a failed checkpoint must be idempotent.
+                source = saved.get("source_invocations")
+                from .mini_research_budget import settle_invocation_debit, settle_invocation_seal
+                budget = session.budgets[grant["action_id"]]
+                empty = (used == 0 and not ambiguous and "ordinal" in saved
+                         and type(source) is int and source > 0)
+                if empty and not grant.get("invocation_released"):
+                    if saved.get("invocation_debit_tracked"):
+                        released = settle_invocation_debit(budget, grant["id"], empty=True)
+                    else:
+                        released = budget.invocations >= source
+                        if released:
+                            budget.invocations -= 1
+                    if released:
+                        grant["invocation_released"] = True
+                        saved["invocation_released"] = True
+                if not empty:
+                    settle_invocation_debit(budget, grant["id"], empty=False)
+                if grant.get("invocation_released"):
+                    saved["invocation_released"] = True
+                settle_invocation_seal(
+                    budget, grant["id"],
+                    empty=bool(grant.get("invocation_released")),
+                )
                 run.update(max_requests=run["requests_used"], status="paused")
                 self.store.save_run(run)
             self.guidance = run.get("native_guidance")
@@ -985,7 +1104,8 @@ class NativeResearchCoordinator:
         target = run.get("native_job_targets", {}).get(job["job_id"], self.pin["statement"])
         context = run.get("native_job_contexts", {}).get(job["job_id"])
         target_key = context or canonical_dossier_statement_key(target)
-        previous = list(self.guidance_by_target.get(target_key, {}).get("recent_arguments", []))
+        previous_guidance = self.guidance_by_target.get(target_key, {})
+        previous = list(previous_guidance.get("recent_arguments", []))
         previous.append({"artifact_id": artifact, "role": job["role"],
                          "action": action["action"], "job_id": job["job_id"]})
         self.guidance = {"artifact_id": artifact, "job_id": job["job_id"], "role": job["role"],
@@ -998,6 +1118,13 @@ class NativeResearchCoordinator:
                          "action": action, "native_handoffs": handoffs,
                          "recent_arguments": previous[-6:], "kernel_verified": False,
                          "instruction": "Apply this investigation to its exact target_statement. Preserve the original theorem and audit the relationship to its ancestors. Choose a concrete alternative or discriminating check, then resume Lean proof work. This is untrusted advisory material, never an added assumption or a proof certificate."}
+        # Status reports must not erase a candidate waiting for a planner slot.
+        # Retain only the latest explicit candidate for this exact context;
+        # a newer candidate may revise it, while paid planner ownership is separate.
+        candidate = (previous_guidance if is_proof_candidate(previous_guidance.get("action"))
+                     else previous_guidance.get("proof_candidate_guidance"))
+        if not is_proof_candidate(action) and isinstance(candidate, dict):
+            self.guidance["proof_candidate_guidance"] = deepcopy(candidate)
         from .research_claims.frontier.hooks import native_projection
 
         projection = native_projection(self.store)
@@ -1023,6 +1150,15 @@ class NativeResearchCoordinator:
             try:
                 self.prepare(conv, getattr(session, "dossier", None))
                 state = session.native_research_state
+                if not is_proof_candidate(guidance.get("action")):
+                    candidate = guidance.get("proof_candidate_guidance")
+                    if not self._guidance_matches(conv, candidate):
+                        candidate = state.get("proof_candidate_guidance")
+                    if (not self._guidance_matches(conv, candidate)
+                            or not is_proof_candidate(candidate.get("action"))):
+                        return False
+                    guidance = candidate
+                state["proof_candidate_guidance"] = deepcopy(guidance)
                 # Bind prompt novelty to substantive content and the exact
                 # target context, never to a newly assigned job/artifact id.
                 advice_key = research_advice_identity(guidance)
@@ -1044,6 +1180,12 @@ class NativeResearchCoordinator:
                     from .research_claims.context_window import window
                     advice = {"artifact_id": artifact, "kernel_verified": False,
                               "advice": window(self.store, guidance, limit=12000)}
+                    # Windowing can archive the whole action. Bind candidate
+                    # intent to that exact field, not to a lossy text summary.
+                    from .research_claims.model import json_text
+                    advice["proof_candidate_action_id"] = hashlib.sha256(
+                        json_text({"action": guidance["action"]}).encode()
+                    ).hexdigest()
                     binder = getattr(planner, "research_delivery_binding", None)
                     if callable(binder):
                         kind, key, evidence = binder(session, advice)
