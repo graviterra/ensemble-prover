@@ -13,6 +13,7 @@ import logging
 import math
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -443,6 +444,11 @@ class DiscoveryLoop:
                     "kernel_verified": False,
                 }} if self.native_mode else {}),
                 "requests_remaining": run["max_requests"] - run["requests_used"],
+                **({"prior_context_notifications": {
+                    "artifact_id": job["native_context_notifications_artifact"],
+                    "read_with": "read_artifact", "context_reaudit_required": True,
+                    "authority": "advisory_prior_context_history",
+                }} if job.get("native_context_notifications_artifact") else {}),
                 # Explicit inventory, not replacement summaries of arguments.
                 # Complete artifacts remain addressable across every program.
                 "claims": self.store.list_claims(),
@@ -598,10 +604,15 @@ class DiscoveryLoop:
                     memory_limit = max(400, min(12000, limit // 2))
                     memory = memory_context(self.store, job, limit=memory_limit)
                     memory_size = len(json_text({"research_memory": memory})) - 1
-                    context = window(self.store, context, limit=limit - memory_size)
+                    notifications = context.pop("prior_context_notifications", None)
+                    retained = ({"prior_context_notifications": notifications}
+                                if notifications is not None else {})
+                    retained_size = len(json_text(retained)) - 1 if retained else 0
+                    context = window(self.store, context, limit=limit - memory_size - retained_size)
                     # Do not archive the durable working memory again: that
                     # recreates the very rereading cycle it exists to prevent.
                     context["research_memory"] = memory
+                    context.update(retained)
                     history = [{**item, "content": json_text(window(self.store, {"message": item["content"]}, limit=2500))}
                                if len(json_text(item["content"])) > 2500 and not item.get("_retrieval_page") else item for item in history[-4:]]
                 messages = [
@@ -1146,37 +1157,107 @@ class DiscoveryLoop:
             "dismissed",
         }
 
+    @staticmethod
+    def _prior_context_notification(
+        payload: dict[str, Any], predecessor: dict[str, Any], successor: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Preserve earlier observations without importing their authority."""
+        return {
+            "prior_context_notification": payload,
+            "from_job_id": predecessor["job_id"],
+            "from_context_binding": successor["native_context_transfer"]["from_context_binding"],
+            "to_context_binding": successor["native_context_transfer"]["to_context_binding"],
+            "context_reaudit_required": True,
+            "authority": "Advisory prior-context history; re-audit the current target and hypotheses. This is not current evidence, proof authority, or authorization.",
+        }
+
+    def _retain_context_notification(self, job: dict[str, Any], payload: dict[str, Any]) -> None:
+        """Keep advisory observations addressable outside the rolling transcript."""
+        artifact = job.get("native_context_notifications_artifact")
+        history = self._read_json(artifact) if artifact else []
+        history.append(payload)
+        job["native_context_notifications_artifact"] = self._blob(
+            history, "prior-context-notifications.json",
+        )
+
+    def _context_notification_successor(self, predecessor: dict[str, Any]) -> dict[str, Any]:
+        """Follow only a reciprocal transfer within verified root extensions."""
+        from ..proof_dossier import canonical_dossier_statement_key
+        from .research_control import native_context_predecessors, native_job_context, native_job_target
+
+        jobs = {job["job_id"]: job for job in self.store.jobs()}
+        successor = jobs.get(predecessor["native_context_successor_job_id"])
+        if successor is None:
+            raise ValueError("missing native context notification successor")
+        run = self.store.run_record(scheduling=True)
+        recorded = run.get("native_job_contexts", {})
+        before = native_job_context(predecessor, jobs, recorded_contexts=recorded)
+        after = native_job_context(successor, jobs, recorded_contexts=recorded)
+        statement = self.store.get_claim(native_job_target(successor, jobs))["spec"]["contract"]["statement"]
+        old_statement = self.store.get_claim(native_job_target(predecessor, jobs))["spec"]["contract"]["statement"]
+        transfer = successor.get("native_context_transfer", {})
+        if (predecessor["status"] != "superseded"
+                or successor.get("native_context_predecessor_job_id") != predecessor["job_id"]
+                or transfer.get("from_context_binding") != before
+                or transfer.get("to_context_binding") != after
+                or canonical_dossier_statement_key(statement) != canonical_dossier_statement_key(old_statement)
+                or before not in native_context_predecessors(run, after, statement)):
+            raise ValueError("invalid native context notification successor")
+        return successor
+
     def _notify(
         self, job_id: str | None, payload: dict[str, Any], *, requires_response: bool
     ) -> None:
-        """Deliver inside the same transaction that accepts the child's result."""
+        """Deliver the complete route atomically, joining an action transaction."""
         if job_id is None:
             return
+        with nullcontext() if self.store._applying else self.store.atomic():
+            self._deliver_notification(job_id, payload, requires_response=requires_response)
+
+    def _deliver_notification(
+        self, job_id: str, payload: dict[str, Any], *, requires_response: bool,
+    ) -> None:
         recipient = self.store.job(job_id)
         # Closed researchers retain a copy for provenance; useful late results
         # continue to their current reviewer/investigator instead of reopening
         # the exhausted worker. Traverse defensively without recursive calls.
         visited: set[str] = set()
-        while recipient.get("research_control", {}).get("closed"):
+        deliveries = []
+        original_payload = payload
+        transfers = []
+        while True:
             if recipient["job_id"] in visited:
                 raise ValueError("cyclic research successor chain")
             visited.add(recipient["job_id"])
-            recipient["inbox"].append({"role": "user", "content": json_text(
-                {**payload, "requires_response": requires_response}
+            deliveries.append((recipient, payload))
+            if recipient.get("native_context_successor_job_id"):
+                successor = self._context_notification_successor(recipient)
+                transfers.append({
+                    "from_job_id": recipient["job_id"], "to_job_id": successor["job_id"],
+                    **{field: successor["native_context_transfer"][field]
+                       for field in ("from_context_binding", "to_context_binding")},
+                })
+                payload = self._prior_context_notification(original_payload, recipient, successor)
+                payload["context_transfers"] = list(transfers)
+                recipient = successor
+            elif recipient.get("research_control", {}).get("closed"):
+                successor_id = recipient.get("research_successor")
+                if not successor_id:
+                    break
+                recipient = self.store.job(successor_id)
+            else:
+                break
+        # Validate the whole route before writing, including for callers that
+        # have not already opened an enclosing transaction.
+        for destination, content in deliveries:
+            if "prior_context_notification" in content:
+                self._retain_context_notification(destination, content)
+            destination["inbox"].append({"role": "user", "content": json_text(
+                {**content, "requires_response": requires_response}
             )})
-            self.store.save_job(recipient)
-            successor = recipient.get("research_successor")
-            if not successor:
-                return
-            recipient = self.store.job(successor)
-        recipient["inbox"].append(
-            {
-                "role": "user",
-                "content": json_text(
-                    {**payload, "requires_response": requires_response}
-                ),
-            }
-        )
+            self.store.save_job(destination)
+        if recipient.get("research_control", {}).get("closed"):
+            return
         if (
             self.store.get_claim(recipient["claim_id"])["revision"]
             != recipient["revision"]

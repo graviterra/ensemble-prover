@@ -7,6 +7,7 @@ remain the accounting authority, including retries and interrupted old owners.
 from __future__ import annotations
 
 import hashlib
+import json
 from contextlib import nullcontext
 from typing import Any
 
@@ -23,6 +24,9 @@ Research and review have bounded allocations, including transport retries.
 The research_allocation packet gives the remaining calls. Reading is information
 collection, not mathematical progress. Before an allocation ends, submit your
 actual argument or exact gap; record_note preserves useful intermediate work.
+When context_reaudit_required is true, re-audit the current target and hypotheses
+before executing the carried assignment. Prior-context arguments are advisory
+history, not current evidence or proof authority; inspect context_transfer.
 An assigned research_reorientation reviewer must independently inspect the
 checkpoint and conclude with:
 {"action":"research_reorientation","rationale":"what failed and why",
@@ -100,6 +104,34 @@ def native_job_context(job: dict[str, Any], jobs: dict[str, dict[str, Any]], *,
             return None
         job = parent
     raise ValueError("cyclic native research context lineage")
+
+
+def native_context_predecessors(run: dict[str, Any], context: Any, statement: str) -> set[str]:
+    """Validated root extension history, without equating its claims or results."""
+    from ..proof_dossier import canonical_dossier_statement_key
+
+    if not isinstance(context, str) or not run.get("native_target_binding"):
+        return set()
+    key = canonical_dossier_statement_key(statement)
+    valid = []
+    for receipt in run.get("native_verified_context_extensions", {}).values():
+        body = {k: v for k, v in receipt.items() if k != "receipt_id"}
+        digest = hashlib.sha256(json.dumps(
+            body, ensure_ascii=False, sort_keys=True, allow_nan=False,
+        ).encode()).hexdigest()
+        if (receipt.get("owner_binding") == run["native_target_binding"]
+                and receipt.get("target_statement_key") == key
+                and receipt.get("receipt_id") == digest
+                and all(isinstance(receipt.get(field), str) and receipt[field]
+                        for field in ("from_context_binding", "to_context_binding"))):
+            valid.append(receipt)
+    reachable = {context}
+    while True:
+        predecessors = {receipt["from_context_binding"] for receipt in valid
+                        if receipt["to_context_binding"] in reachable}
+        if predecessors <= reachable:
+            return reachable - {context}
+        reachable.update(predecessors)
 
 
 def _native_attention_key(state: dict[str, Any], run: dict[str, Any]) -> str:
@@ -230,6 +262,8 @@ class ResearchControl:
             "directive": job.get("research_directive"),
             "prior_checkpoint_artifact": job.get("research_prior_checkpoint"),
             "portfolio_checkpoint_artifacts": job.get("research_portfolio_checkpoints", []),
+            **({"context_transfer": job["native_context_transfer"],
+                "context_reaudit_required": True} if job.get("native_context_transfer") else {}),
         }}
         from .research_findings import comparison_packet
 

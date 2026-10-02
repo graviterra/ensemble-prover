@@ -11594,6 +11594,15 @@ class MiniSession:
                         "verdict": "verified_theory_context_installed",
                     }
                 )
+                from ensemble_prover.mini_research import current_native_research
+
+                research_owner = current_native_research()
+                if research_owner is not None:
+                    research_owner.note_verified_context_extension(
+                        self, previous=pair, selected=selected,
+                        before_preamble=before["conv_preamble"],
+                        before_lean_preamble=before["conv_lean_preamble"],
+                    )
         except BaseException as install_error:
             try:
                 self._restore_theory_installation_state(before)
@@ -11620,6 +11629,9 @@ class MiniSession:
                 active_bundle_ids = tuple(self.theory_imported_bundle_ids or ())
         return {
             "theory_context_pair": self.theory_context_pair,
+            # Extension receipts use replacement lists; retain the live grant
+            # and budget objects shared with an in-flight research allocation.
+            "native_research_state": copy.copy(getattr(self, "native_research_state", None)),
             "theory_imported_bundle_ids": tuple(self.theory_imported_bundle_ids or ()),
             "theory_snapshot": copy.deepcopy(tuple(self.theory_snapshot or ())),
             "conv_preamble": str(getattr(conv, "preamble", "") or ""),
@@ -11655,6 +11667,16 @@ class MiniSession:
         """Restore a prior theory view after a failed/aborted commit."""
 
         self.theory_context_pair = state.get("theory_context_pair")
+        if state.get("native_research_state") is None:
+            if hasattr(self, "native_research_state"):
+                del self.native_research_state
+        else:
+            native_state = getattr(self, "native_research_state", None)
+            if isinstance(native_state, dict):
+                native_state.clear()
+                native_state.update(state["native_research_state"])
+            else:
+                self.native_research_state = dict(state["native_research_state"])
         self.theory_imported_bundle_ids = tuple(
             state.get("theory_imported_bundle_ids") or ()
         )

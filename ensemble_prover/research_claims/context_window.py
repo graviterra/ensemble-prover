@@ -14,7 +14,8 @@ def research_view(store: Any, key: str, value: dict[str, Any], *, limit: int) ->
     reference = {"artifact_id": artifact, "path": [key], "read_with": "read_artifact"}
     result: dict[str, Any] = {"complete_packet": reference, "coverage": "partial"}
     if key == "research_allocation":
-        fields = [name for name in ("requests_remaining", "must_conclude", "requests_used",
+        fields = [name for name in ("requests_remaining", "must_conclude",
+                                    "context_reaudit_required", "context_transfer", "requests_used",
                                     "job_requests_remaining", "phase_requests_remaining",
                                     "global_requests_available", "reading_is_not_mathematical_progress")
                   if name in value]

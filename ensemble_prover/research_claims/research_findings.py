@@ -5,31 +5,45 @@ from __future__ import annotations
 from typing import Any
 
 from .model import load_json
-from .research_control import native_job_context, native_job_target
+from .research_control import native_context_predecessors, native_job_context, native_job_target
 
 
 def comparison_packet(store: Any, producer: dict[str, Any]) -> dict[str, Any]:
-    """Index complete prior reports and the supplied baseline in this exact scope."""
+    """Index prior work, labeling verified predecessor contexts as advisory history."""
     run = store.run_record(scheduling=True)
     jobs = {job["job_id"]: job for job in store.jobs()}
     target = native_job_target(producer, jobs)
     recorded_contexts = run.get("native_job_contexts", {})
     context = native_job_context(producer, jobs, recorded_contexts=recorded_contexts)
+    predecessors = native_context_predecessors(
+        run, context, store.get_claim(target)["spec"]["contract"]["statement"],
+    )
+    comparison_contexts = {context, *predecessors}
     baseline = list(run["sources"].values())
     initial = run.get("native_research_baselines", {}).get(context)
     if initial:
         baseline.append(initial)
+    historical_baselines = []
+    for predecessor in sorted(predecessors):
+        artifact = run.get("native_research_baselines", {}).get(predecessor)
+        if artifact:
+            baseline.append(artifact)
+            historical_baselines.append({"artifact_id": artifact, "context_binding": predecessor,
+                                         "requires_context_reaudit": True})
     prior = []
     for job in jobs.values():
         artifact = job.get("investigation_artifact")
+        job_context = native_job_context(job, jobs, recorded_contexts=recorded_contexts)
         if (not artifact or job["job_id"] == producer["job_id"]
                 or (context is None and native_job_target(job, jobs) != target)
-                or native_job_context(job, jobs, recorded_contexts=recorded_contexts) != context
+                or job_context not in comparison_contexts
                 or (producer.get("research_report_sequence") is not None
                     and job.get("research_report_sequence", 0) >= producer["research_report_sequence"])):
             continue
         report = load_json(store.read_artifact(artifact).decode())
         prior.append({"artifact_id": artifact, "job_id": job["job_id"],
+                      "context_binding": job_context,
+                      "requires_context_reaudit": job_context != context,
                       "method": report.get("method", "")[:160],
                       "derivation_excerpt": report.get("derivation", "")[:400],
                       "remaining_gap_excerpt": report.get("remaining_gap", "")[:250],
@@ -41,17 +55,20 @@ def comparison_packet(store: Any, producer: dict[str, Any]) -> dict[str, Any]:
 
         campaign = load_campaign(store, strategy["owner_id"])
         if campaign:
-            findings = [{key: item[key] for key in (
-                "finding_id", "conclusion", "assumptions", "kind", "report_artifact")}
+            findings = [{**{key: item[key] for key in (
+                "finding_id", "conclusion", "assumptions", "kind", "report_artifact")},
+                "context_binding": item["context_binding"],
+                "requires_context_reaudit": item["context_binding"] != context}
                 for item in campaign.get("research_findings", {}).values()
-                if item["context_binding"] == context
+                if item["context_binding"] in comparison_contexts
                 and (context is not None or item["target_claim_id"] == target)]
     return {"target_claim_id": target, "context_binding": context,
             "baseline_artifact_ids": list(dict.fromkeys(baseline)),
             "prior_reports": prior,
             "prior_report_artifact_ids": list(dict.fromkeys(item["artifact_id"] for item in prior)),
             "reviewed_findings": findings,
-            "authority": "Research comparison is advisory; formal truth requires the existing verifier."}
+            "historical_baselines": historical_baselines,
+            "authority": "Research comparison is advisory; formal truth requires the existing verifier. Prior-context history requires re-audit; its claims and progress credit are not transferred."}
 
 
 def validate_delta(delta: Any) -> dict[str, Any]:
@@ -74,6 +91,14 @@ def validate_delta(delta: Any) -> dict[str, Any]:
     return delta
 
 
+def _conclusion_signature(finding: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "conclusion": " ".join(finding["conclusion"].split()),
+        "assumptions": sorted({" ".join(item.split()) for item in finding["assumptions"]}),
+        "kind": finding["kind"],
+    }
+
+
 def assess_delta(controller: Any, campaign: dict[str, Any], producer: dict[str, Any], *,
                  reviewer_id: str, delta: dict[str, Any] | None, rationale: str,
                  subject: str | None = None) -> dict[str, Any]:
@@ -91,16 +116,22 @@ def assess_delta(controller: Any, campaign: dict[str, Any], producer: dict[str, 
     for field in ("baseline_artifact_ids", "prior_report_artifact_ids"):
         if set(finding[field]) != set(comparison[field]):
             return {"status": "cumulative_comparison_required", "credit_minted": False}
+    signature = _conclusion_signature(finding)
     identity = digest({
         "target": comparison["context_binding"] or comparison["target_claim_id"],
         "context": comparison["context_binding"],
-        "conclusion": " ".join(finding["conclusion"].split()),
-        "assumptions": sorted({" ".join(item.split()) for item in finding["assumptions"]}),
-        "kind": finding["kind"],
+        **signature,
     })
     findings = campaign.setdefault("research_findings", {})
     if identity in findings:
         return {"status": "repeated_conclusion", "credit_minted": False, "finding_id": identity}
+    # Verified imports retain earlier research as advisory comparison history.
+    # Restating its exact conclusion does not earn another exploration allowance;
+    # this comparison neither imports proof authority nor equates formal claims.
+    for prior in comparison["reviewed_findings"]:
+        if prior["requires_context_reaudit"] and _conclusion_signature(prior) == signature:
+            return {"status": "repeated_conclusion", "credit_minted": False,
+                    "finding_id": prior["finding_id"]}
     artifact = producer["investigation_artifact"]
     state = controller.snapshot()
     approach = campaign["approaches"][producer["frontier_approach_id"]]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+from contextlib import nullcontext
 from copy import deepcopy
 from functools import wraps
 import hashlib
@@ -86,6 +87,14 @@ def _json(value: Any) -> str:
 
 def _hash(value: Any) -> str:
     return hashlib.sha256(_json(value).encode()).hexdigest()
+
+
+def _context_binding(statement: str, preamble: str, checker: str) -> str:
+    return _hash({
+        "statement": canonical_dossier_statement_key(statement),
+        "model_preamble_sha256": hashlib.sha256(preamble.encode()).hexdigest(),
+        "checker_preamble_sha256": hashlib.sha256(checker.encode()).hexdigest(),
+    })
 
 
 def research_advice_identity(guidance: Any) -> str:
@@ -209,11 +218,77 @@ class NativeResearchCoordinator:
         checker = str(getattr(conv, "lean_preamble", getattr(
             self.problem, "lean_preamble", preamble,
         )))
-        return _hash({
-            "statement": canonical_dossier_statement_key(self._target(conv)),
-            "model_preamble_sha256": hashlib.sha256(preamble.encode()).hexdigest(),
-            "checker_preamble_sha256": hashlib.sha256(checker.encode()).hexdigest(),
-        })
+        return _context_binding(self._target(conv), preamble, checker)
+
+    def note_verified_context_extension(
+        self, session: Any, *, previous: Any, selected: Any,
+        before_preamble: str, before_lean_preamble: str,
+    ) -> bool:
+        """Retain task intentions across a committed root theory extension.
+
+        This receipt permits a fresh investigation of an untouched assignment.
+        It does not equate claims, reuse paid responses, or establish progress.
+        """
+        statement = self._target(session.conv)
+        key = canonical_dossier_statement_key(statement)
+        if (getattr(session, "scope", "problem") != "problem"
+                or getattr(session, "recursion_depth", 0) != 0
+                or key != canonical_dossier_statement_key(self.pin["statement"])):
+            return False
+        if (previous.llm.render() != before_preamble
+                or previous.lean.render() != before_lean_preamble
+                or selected.llm.render() != session.conv.preamble
+                or selected.lean.render() != session.conv.lean_preamble):
+            return False
+        for old, new in ((previous.llm, selected.llm), (previous.lean, selected.lean)):
+            if any(getattr(old, field) != getattr(new, field) for field in (
+                "base_header", "base_preamble", "base_imports",
+            )):
+                return False
+            for field in ("theory_imports", "bundle_ids", "theory_inventory"):
+                before, after = getattr(old, field), getattr(new, field)
+                if after[:len(before)] != before:
+                    return False
+        snapshot = tuple(getattr(session, "theory_snapshot", ()) or ())
+        if (not set(selected.lean.bundle_ids) - set(previous.lean.bundle_ids)
+                or not snapshot
+                or selected.llm.theory_imports != selected.lean.theory_imports
+                or selected.llm.bundle_ids != selected.lean.bundle_ids):
+            return False
+        for bundle in snapshot:
+            if not isinstance(bundle, dict):
+                return False
+            for field in ("source_hash", "compiled_artifact_hash"):
+                value = bundle.get(field)
+                if (not isinstance(value, str) or len(value) != 64
+                        or any(char not in "0123456789abcdef" for char in value)):
+                    return False
+            if (not bundle.get("lean_toolchain") or not bundle.get("mathlib_revision")
+                    or not isinstance(bundle.get("policy_version"), int)
+                    or isinstance(bundle.get("policy_version"), bool)
+                    or bundle["policy_version"] <= 0):
+                return False
+        if ({bundle.get("bundle_id") for bundle in snapshot} != set(selected.lean.bundle_ids)
+                or {bundle.get("module_name") for bundle in snapshot} != set(selected.lean.theory_imports)):
+            return False
+        before = _context_binding(statement, before_preamble, before_lean_preamble)
+        after = self._target_context_binding(session.conv)
+        if before == after:
+            return False
+        receipt = {
+            "owner_binding": self.binding, "target_statement_key": key,
+            "from_context_binding": before, "to_context_binding": after,
+            "from_theory_snapshot_hash": previous.snapshot_hash,
+            "to_theory_snapshot_hash": selected.snapshot_hash,
+            "bundle_ids": list(selected.lean.bundle_ids),
+            "provenance_snapshot_hash": _hash(snapshot),
+        }
+        receipt["receipt_id"] = _hash(receipt)
+        state = self._state(session)
+        receipts = state.get("verified_context_extensions", [])
+        if receipt not in receipts:
+            state["verified_context_extensions"] = [*receipts, receipt]
+        return True
 
     def _guidance_for(self, conv: Any) -> dict[str, Any] | None:
         key = canonical_dossier_statement_key(self._target(conv))
@@ -653,6 +728,7 @@ class NativeResearchCoordinator:
             f"Read checkpoint {checkpoint}; investigate its exact active target "
             f"{statement} and reported obstacle, and give a discriminating next inference."
         )
+        self._carry_untouched_followups(session, checkpoint, claim_id)
         jobs = {job["job_id"]: job for job in self.store.jobs()}
         run = self.store.run_record()
         baselines = run.setdefault("native_research_baselines", {})
@@ -674,6 +750,7 @@ class NativeResearchCoordinator:
             job["native_context_binding"] = context_binding
             job["native_target_claim_id"] = claim_id
             self.store.save_job(job)
+
             self.loop._notify(job["job_id"], {
                 "native_proof_checkpoint": checkpoint,
                 "active_target": statement,
@@ -695,6 +772,93 @@ class NativeResearchCoordinator:
             }
             job["native_context_binding"] = context_binding
             self.store.save_job(job)
+
+    def _carry_untouched_followups(self, session: Any, checkpoint: str, claim_id: str) -> None:
+        """Create new-context assignments while preserving immutable paid history."""
+        from .research_claims.research_control import (
+            native_context_predecessors, native_job_context, native_job_target,
+        )
+
+        key = canonical_dossier_statement_key(self._target(session.conv))
+        if (getattr(session, "scope", "problem") != "problem"
+                or getattr(session, "recursion_depth", 0) != 0
+                or key != canonical_dossier_statement_key(self.pin["statement"])):
+            return
+        context = self._target_context_binding(session.conv)
+        transaction = nullcontext() if self.store._applying else self.store.atomic()
+        with transaction:
+            run = self.store.run_record()
+            receipts = run.setdefault("native_verified_context_extensions", {})
+            for receipt in self._state(session).get("verified_context_extensions", []):
+                body = {k: v for k, v in receipt.items() if k != "receipt_id"}
+                if (receipt.get("owner_binding") == self.binding
+                        and receipt.get("target_statement_key") == key
+                        and receipt.get("receipt_id") == _hash(body)):
+                    receipts[receipt["receipt_id"]] = receipt
+            reachable = native_context_predecessors(run, context, self._target(session.conv))
+            jobs = {job["job_id"]: job for job in self.store.jobs()}
+            recorded = run.get("native_job_contexts", {})
+            strategy = run.get("strategy_review") or {}
+            admitted = set()
+            for attempt in strategy.get("attempts", {}).values():
+                # Legacy or interrupted allocations may lack the handoff map.
+                # An explicit consumer receipt still forbids treating that job
+                # as untouched, even when its producer cannot be reconstructed.
+                admitted.add(attempt.get("consumer_id"))
+                allocation = strategy.get("allocations", {}).get(attempt.get("allocation_id"), {})
+                admitted.update((allocation.get("consumer_id"),
+                                 allocation.get("frontier_handoff_producer")))
+            for job in jobs.values():
+                if (job["role"] != "research" or job["status"] not in {"pending", "waiting"}
+                        or not job.get("research_directive") or job.get("turn", 0) != 0
+                        or job.get("messages") or job["job_id"] in recorded
+                        or job["job_id"] in admitted
+                        or job.get("research_control", {}).get("closed")
+                        or job.get("research_control", {}).get("requests_used", 0)
+                        or any(job.get(field) is not None for field in (
+                            "request", "response", "tool_result", "evidence_id",
+                            "research_report_artifact", "investigation_artifact",
+                            "research_last_action", "frontier_response_attempt_id",
+                        ))
+                        or job.get("frontier_permit_consumed")
+                        or native_job_context(job, jobs, recorded_contexts=recorded) not in reachable):
+                    continue
+                target = native_job_target(job, jobs)
+                if canonical_dossier_statement_key(
+                    self.store.get_claim(target)["spec"]["contract"]["statement"]
+                ) != key:
+                    continue
+                child = self.store.add_job(claim_id, job["question"], parent_job=job["parent_job"])
+                for field in ("research_directive", "research_prior_checkpoint",
+                              "research_route_signature", "research_portfolio_checkpoints",
+                              "research_mechanism", "research_prior_memory"):
+                    if field in job:
+                        child[field] = deepcopy(job[field])
+                child.update(
+                    native_target_claim_id=claim_id, native_context_binding=context,
+                    native_proof_checkpoint=checkpoint,
+                    native_context_predecessor_job_id=job["job_id"],
+                    native_context_transfer={
+                        "from_context_binding": native_job_context(job, jobs, recorded_contexts=recorded),
+                        "to_context_binding": context,
+                        "instruction": "Re-audit the current target and hypotheses before executing this carried assignment. Prior-context arguments are advisory history, not current evidence or proof authority.",
+                    },
+                )
+                if job.get("inbox") or job.get("native_context_notifications_artifact"):
+                    history = self.store.put_artifact(
+                        _json(job["inbox"]).encode(), name="prior-context-notifications.json",
+                    )
+                    prior = {"messages_artifact": history, "message_count": len(job["inbox"]),
+                             "read_with": "read_artifact"}
+                    if job.get("native_context_notifications_artifact"):
+                        prior["earlier_notifications_artifact"] = job["native_context_notifications_artifact"]
+                    notification = self.loop._prior_context_notification(prior, job, child)
+                    self.loop._retain_context_notification(child, notification)
+                    child["inbox"].append({"role": "user", "content": _json(notification)})
+                self.store.save_job(child)
+                job.update(status="superseded", native_context_successor_job_id=child["job_id"])
+                self.store.save_job(job)
+            self.store.save_run(run)
 
     async def _investigate(self, session: Any, reason: str, *, background: bool = False) -> bool:
         from .mini_research_budget import select_donor, debit_donor

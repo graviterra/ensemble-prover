@@ -378,6 +378,10 @@ class PromotionOutbox:
         self._active_authority_index_generation: Optional[
             tuple[int, int]
         ] = None
+        self._active_authority_entries_by_lineage: Optional[dict[str, str]] = None
+        self._authority_read_cache: dict[
+            Path, tuple[tuple[int, ...], dict[str, Any]]
+        ] = {}
 
     def enqueue(
         self,
@@ -2198,6 +2202,19 @@ class PromotionOutbox:
         promotable: bool,
         reason: str,
     ) -> None:
+        path = self._authority_path(
+            helper_name=helper_name,
+            owner_id=owner_id,
+            workspace_id=workspace_id,
+            origin_environment_key=origin_environment_key,
+        )
+        index = self._active_authority_index
+        lineages = self._active_authority_entries_by_lineage
+        index_was_current = (
+            index is not None
+            and lineages is not None
+            and self._active_authority_index_generation == self._authority_generation()
+        )
         payload = {
             "schema_version": PROMOTION_OUTBOX_SCHEMA_VERSION,
             "origin_environment_key": origin_environment_key,
@@ -2212,17 +2229,58 @@ class PromotionOutbox:
             "reason": str(reason or ""),
             "updated_ts": time.time(),
         }
-        self._atomic_json(
-            self._authority_path(
-                helper_name=helper_name,
-                owner_id=owner_id,
-                workspace_id=workspace_id,
-                origin_environment_key=origin_environment_key,
-            ),
-            payload,
-        )
+        # Invalidate before persistence so a partial write or failed fsync cannot
+        # leave cached permission behind. Only a current index can absorb this
+        # local replacement; foreign directory changes require another scan.
         self._active_authority_index = None
         self._active_authority_index_generation = None
+        self._active_authority_entries_by_lineage = None
+        self._atomic_json(path, payload)
+        if not index_was_current or index is None or lineages is None:
+            return
+        try:
+            # Readers may still hold the previous snapshot. Replace dictionaries
+            # and tuples rather than mutating their view during a local write.
+            index = dict(index)
+            lineages = dict(lineages)
+            previous_entry_id = lineages.pop(path.stem, "")
+            if previous_entry_id:
+                remaining = tuple(
+                    authority for authority in index.get(previous_entry_id, ())
+                    if self._authority_key(
+                        helper_name=str(authority["helper_name"]),
+                        owner_id=str(authority["owner_id"]),
+                        workspace_id=str(authority["workspace_id"]),
+                        origin_environment_key=str(authority["origin_environment_key"]),
+                    ) != path.stem
+                )
+                if remaining:
+                    index[previous_entry_id] = remaining
+                else:
+                    index.pop(previous_entry_id, None)
+            # Apply the same validation used by directory scans. Invalid or
+            # revoked sidecars must never add an active reference.
+            written = self._read_authority_path(path)
+            if written is not None and written.get("promotable"):
+                written_entry_id = str(written["active_entry_id"])
+                lineages[path.stem] = written_entry_id
+                index[written_entry_id] = tuple(sorted(
+                    (*index.get(written_entry_id, ()), written),
+                    key=lambda item: (
+                        str(item.get("owner_id") or ""),
+                        str(item.get("workspace_id") or ""),
+                        str(item.get("authority_id") or ""),
+                    ),
+                ))
+            self._active_authority_index_generation = self._authority_generation()
+            self._active_authority_entries_by_lineage = lineages
+            self._active_authority_index = index
+        except Exception:
+            # The durable authority remains usable even if its optional cache
+            # cannot be updated. A subsequent read rebuilds from disk.
+            self._active_authority_index = None
+            self._active_authority_index_generation = None
+            self._active_authority_entries_by_lineage = None
 
     def _read_authority(
         self,
@@ -2253,6 +2311,8 @@ class PromotionOutbox:
     def _read_authority_path(self, path: Path) -> Optional[dict[str, Any]]:
         """Read one self-addressed workspace authority sidecar."""
 
+        fingerprint = self._authority_file_fingerprint(path)
+        self._authority_read_cache.pop(path, None)
         if path.is_symlink() or not path.is_file():
             return None
         try:
@@ -2292,7 +2352,33 @@ class PromotionOutbox:
             )
         ):
             return None
+        if (fingerprint is not None
+                and fingerprint == self._authority_file_fingerprint(path)):
+            self._authority_read_cache[path] = (fingerprint, dict(payload))
         return payload
+
+    @staticmethod
+    def _authority_file_fingerprint(path: Path) -> Optional[tuple[int, ...]]:
+        try:
+            stat = path.lstat()
+        except OSError:
+            return None
+        return (
+            stat.st_dev, stat.st_ino, stat.st_mode, stat.st_size,
+            stat.st_mtime_ns, stat.st_ctime_ns,
+        )
+
+    def _current_authority(self, authority: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+        path = self._authority_path(
+            helper_name=str(authority.get("helper_name") or ""),
+            owner_id=str(authority.get("owner_id") or ""),
+            workspace_id=str(authority.get("workspace_id") or ""),
+            origin_environment_key=str(authority.get("origin_environment_key") or ""),
+        )
+        cached = self._authority_read_cache.get(path)
+        if cached is not None and cached[0] == self._authority_file_fingerprint(path):
+            return dict(cached[1])
+        return self._read_authority_path(path)
 
     def _all_authorities(self) -> tuple[dict[str, Any], ...]:
         return tuple(
@@ -2317,6 +2403,7 @@ class PromotionOutbox:
             or self._active_authority_index_generation != generation
         ):
             index: dict[str, list[dict[str, Any]]] = {}
+            lineages: dict[str, str] = {}
             for authority in self._all_authorities():
                 if not authority.get("promotable"):
                     continue
@@ -2324,6 +2411,12 @@ class PromotionOutbox:
                 if not _HEX_64_RE.fullmatch(entry_id):
                     continue
                 index.setdefault(entry_id, []).append(authority)
+                lineages[self._authority_key(
+                    helper_name=str(authority["helper_name"]),
+                    owner_id=str(authority["owner_id"]),
+                    workspace_id=str(authority["workspace_id"]),
+                    origin_environment_key=str(authority["origin_environment_key"]),
+                )] = entry_id
             self._active_authority_index = {
                 entry_id: tuple(
                     sorted(
@@ -2337,6 +2430,7 @@ class PromotionOutbox:
                 )
                 for entry_id, authorities in index.items()
             }
+            self._active_authority_entries_by_lineage = lineages
             self._active_authority_index_generation = generation
         return self._active_authority_index
 
@@ -2369,14 +2463,19 @@ class PromotionOutbox:
                 else self._active_authorities_by_entry_id()
             )
         return tuple(
-            authority
+            current
             for authority in index.get(entry.entry_id, ())
-            if authority.get("origin_environment_key")
+            # Directory generations detect atomic replacements, but not an
+            # in-place damaged or revoked sidecar. The index selects candidates;
+            # only the durable sidecar can grant publication or reuse rights.
+            if (current := self._current_authority(authority)) is not None
+            and current.get("promotable")
+            and current.get("origin_environment_key")
             == entry.origin_environment_key
-            and authority.get("helper_name") == entry.helper_name
-            and authority.get("active_entry_id") == entry.entry_id
-            and authority.get("source_hash") == entry.source_hash
-            and authority.get("source_sha256") == entry.source_sha256
+            and current.get("helper_name") == entry.helper_name
+            and current.get("active_entry_id") == entry.entry_id
+            and current.get("source_hash") == entry.source_hash
+            and current.get("source_sha256") == entry.source_sha256
         )
 
     def _entry_is_authoritative(
@@ -2526,19 +2625,14 @@ class PromotionOutbox:
             if lock_held
             else self._active_authorities_by_entry_id()
         )
-        for active_id, authorities in authority_index.items():
+        for active_id in authority_index:
             if cancellation_event is not None and cancellation_event.is_set():
                 return authoritative
             active = entries_by_id.get(active_id)
             if active is None:
                 continue
-            if any(
-                authority.get("origin_environment_key")
-                == active.origin_environment_key
-                and authority.get("helper_name") == active.helper_name
-                and authority.get("source_hash") == active.source_hash
-                and authority.get("source_sha256") == active.source_sha256
-                for authority in authorities
+            if self._active_authorities_for_entry(
+                active, authority_index=authority_index,
             ):
                 # An authority may intentionally reference an immutable entry
                 # from another producer/workspace. This is how equivalent work
