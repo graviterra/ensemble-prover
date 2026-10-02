@@ -37,6 +37,10 @@ class SweepCutoffCommitted(RuntimeError):
     """The sweep closed this attempt before this action could commit."""
 
 
+class SweepAuthorityBusy(TimeoutError):
+    """Another authority transaction still owns the journal lock."""
+
+
 class SweepControl:
     """A capability for one attempt's independently locked authority journal."""
 
@@ -74,17 +78,21 @@ class SweepControl:
         return cls(Path(value[0]), value[1])
 
     @contextmanager
-    def locked(self) -> Iterator[ControlTransaction]:
+    def locked(self, *, timeout_s: float | None = None) -> Iterator[ControlTransaction]:
+        """Acquire authority; a zero timeout permits a responsive monitor retry."""
+        timeout_s = _LOCK_TIMEOUT_S if timeout_s is None else timeout_s
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            raise ValueError("authority lock timeout must be nonnegative finite seconds")
         fd = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW)
         with os.fdopen(fd, "r+", encoding="utf-8") as handle:
-            deadline = time.monotonic() + _LOCK_TIMEOUT_S
+            deadline = time.monotonic() + timeout_s
             while True:
                 try:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("sweep acceptance authority lock unavailable")
+                        raise SweepAuthorityBusy("sweep acceptance authority lock unavailable")
                     time.sleep(.01)
             try:
                 lines = handle.read().splitlines(keepends=True)

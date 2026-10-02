@@ -33,7 +33,7 @@ from .solved_export_policy import effective_solved, export_boundary_present
 from .subprocess_environment import (
     trusted_provider_worker_environment,
 )
-from .sweep_control import CONTROL_ENV, SweepControl
+from .sweep_control import CONTROL_ENV, SweepAuthorityBusy, SweepControl
 
 
 from .local_inference.network_policy import prepare_owned_subprocess
@@ -43,6 +43,9 @@ DEFAULT_FIRST_ACCEPTED_BY_S = 1200.0
 DEFAULT_SECOND_ACCEPTED_BY_S = 1800.0
 DEFAULT_STARTUP_LIVENESS_S = 180.0
 DEFAULT_STARTUP_TIMEOUT_S = 1200.0
+# Contention is recoverable while a writer finishes, but cannot suspend the
+# monitor indefinitely. This window never changes proof admission deadlines.
+_AUTHORITY_CONTENTION_TIMEOUT_S = 120.0
 _MATHLIB_PREWARM_SOURCE = "import Mathlib\nexample : True := by trivial\n"
 _PROBLEM = re.compile(r"putnam_\d{4}_[ab][1-6]")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -962,6 +965,7 @@ def run_attempt(
     cutoff = ""
     interrupted = False
     monitor_error = ""
+    authority_busy_since: float | None = None
     console_path = console_log_path(output_dir)
     worker_env = trusted_provider_worker_environment()
     worker_env["PYTHONUNBUFFERED"] = "1"
@@ -987,28 +991,45 @@ def run_attempt(
                     break
                 tail.read()
                 interrupted = bool(should_stop())
-                with control.locked() as transaction:
-                    now = time.monotonic()
-                    ready_at = transaction.ready_at
-                    if ready_at is not None:
-                        gate.start_monotonic = ready_at
-                    for record in transaction.accepted_records():
-                        gate.observe(record, now=now)
-                    if transaction.pending:
-                        raise RuntimeError("sweep_acceptance_authority_unavailable")
-                    if ready_at is None:
-                        if startup_timeout_s and now - start >= startup_timeout_s:
-                            cutoff = "startup_deadline"
-                        elif startup.expired(now=now, proof_alive=tail.alive):
-                            cutoff = "startup_liveness_deadline"
+                if interrupted:
+                    break
+                try:
+                    with control.locked(timeout_s=0) as transaction:
+                        authority_busy_since = None
+                        now = time.monotonic()
+                        ready_at = transaction.ready_at
+                        if ready_at is not None:
+                            gate.start_monotonic = ready_at
+                        for record in transaction.accepted_records():
+                            gate.observe(record, now=now)
+                        if transaction.pending:
+                            raise RuntimeError("sweep_acceptance_authority_unavailable")
+                        if ready_at is None:
+                            if startup_timeout_s and now - start >= startup_timeout_s:
+                                cutoff = "startup_deadline"
+                            elif startup.expired(now=now, proof_alive=tail.alive):
+                                cutoff = "startup_liveness_deadline"
+                            else:
+                                cutoff = ""
+                        else:
+                            cutoff = gate.cutoff_reason(now=now) or ""
+                        if cutoff and not _summary_solved(output_dir):
+                            transaction.append({"event": "cutoff", "reason": cutoff, "monotonic_s": now})
                         else:
                             cutoff = ""
-                    else:
-                        cutoff = gate.cutoff_reason(now=now) or ""
-                    if cutoff and not interrupted and not _summary_solved(output_dir):
-                        transaction.append({"event": "cutoff", "reason": cutoff, "monotonic_s": now})
-                    else:
-                        cutoff = ""
+                except SweepAuthorityBusy:
+                    now = time.monotonic()
+                    if authority_busy_since is None:
+                        authority_busy_since = now
+                    if now - authority_busy_since >= _AUTHORITY_CONTENTION_TIMEOUT_S:
+                        raise SweepAuthorityBusy(
+                            "sweep acceptance authority lock unavailable after "
+                            f"{_AUTHORITY_CONTENTION_TIMEOUT_S:g}s of contention"
+                        ) from None
+                    # Keep console relay and stop polling active while the
+                    # writer owns ordering; never infer authority from telemetry.
+                    time.sleep(min(poll_interval_s, .1))
+                    continue
                 if interrupted or cutoff:
                     break
                 time.sleep(poll_interval_s)
@@ -1022,7 +1043,8 @@ def run_attempt(
             )
             try:
                 console.write(
-                    f"\n[sweep] stop requested: {stop_reason}; sending SIGINT to this attempt\n".encode()
+                    (f"\n[sweep] stop requested: {stop_reason}; sending SIGINT to this attempt"
+                     f"; monitor_error={monitor_error or 'none'}\n").encode()
                 )
                 console.flush()
                 relay.copy_available()
@@ -1105,7 +1127,8 @@ def run_attempt(
                 f"\n[sweep] result={status}; cutoff_reason={cutoff or 'none'}; "
                 f"answer_preparation_reason={prep_reason or 'none'}; "
                 f"failure_reason={failure_reason or 'none'}; "
-                f"accepted={len(gate.accepted)}; cleanup_confirmed={cleaned}\n".encode()
+                f"accepted={len(gate.accepted)}; cleanup_confirmed={cleaned}; "
+                f"monitor_error={monitor_error or 'none'}\n".encode()
             )
             console.flush()
 

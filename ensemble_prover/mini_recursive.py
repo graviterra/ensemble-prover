@@ -277,8 +277,17 @@ FinalizeClaimEnvironmentFn = Callable[..., Any]
 # root-close turn: the model supplies the bridging proof and Lean verifies it --
 # the harness never injects a closing tactic. Called with
 # keyword args (root_statement, certificate_names, helper_blocks, pass_index,
-# after_helper) and returns the verified root proof text, or None on failure.
-ProveRootCloseFn = Callable[..., Awaitable[Optional[str]]]
+# after_helper) and returns the verified root proof text, None on rejection,
+# or an operational outcome when no completed proof attempt is available.
+@dataclass(frozen=True)
+class RootCloseOperationalFailure:
+    """A root-close attempt ended without a mathematical verdict."""
+
+    reason: str
+    kind: str = ""
+
+
+ProveRootCloseFn = Callable[..., Awaitable[Optional[str] | RootCloseOperationalFailure]]
 
 
 def _falsification_event_verdict(
@@ -19959,7 +19968,7 @@ async def run_mini_recursive_attempt(
         max_conversation_turns: Optional[int] = None,
         speculative_operational_probe: bool = False,
         max_elapsed_s: Optional[float] = None,
-    ) -> Optional[str]:
+    ) -> Optional[str] | RootCloseOperationalFailure:
         """Honest root close: run a conversational proof attempt against the
         canonical root with a route-local verified helper context. The model
         writes the bridging proof (for example applying a root-equivalent
@@ -20328,6 +20337,21 @@ async def run_mini_recursive_attempt(
                 return None
             pending_root_close_promotion = (root_statement, proof)
             return proof
+        if getattr(close_conv, "_mini_recursive_child_elapsed_budget_exhausted", False):
+            return RootCloseOperationalFailure("recursive_claim_elapsed_budget_exhausted")
+        failure_reason = str(
+            getattr(close_conv, "_last_llm_failure_reason", "")
+            or getattr(close_dossier, "session_failure_reason", "")
+            or ""
+        ).strip()
+        failure_kind = str(
+            getattr(close_conv, "_last_llm_failure_kind", "")
+            or getattr(close_dossier, "session_failure_kind", "")
+            or ""
+        ).strip()
+        failure_reason = _child_failure_reason(failure_reason, failure_kind)
+        if llm_failure_scope(failure_reason):
+            return RootCloseOperationalFailure(failure_reason, failure_kind)
         return None
 
     llm_root_close_enabled = (
@@ -24552,6 +24576,23 @@ async def run_mini_recursive_driver(
             return None
         llm_root_close_pending_keys.discard(attempt_key)
         llm_root_close_attempted_keys.add(attempt_key)
+        if isinstance(proof_text, RootCloseOperationalFailure):
+            _record(
+                record_event,
+                {
+                    "phase": "mini_recursive_llm_root_close",
+                    "pass_index": pass_index,
+                    "after_helper": after_helper,
+                    "root_close_mode": root_close_mode,
+                    "certificate_names": list(certificate_names),
+                    "assembly_helper_names": list(assembly_helper_names),
+                    "assembly_reason": assembly_reason,
+                    "verdict": "llm_root_close_incomplete",
+                    "failure_reason": proof_text.reason,
+                    "failure_kind": proof_text.kind,
+                },
+            )
+            return None
         proof_text = str(proof_text or "").strip()
         if proof_text:
             stats.llm_root_close_solved += 1
