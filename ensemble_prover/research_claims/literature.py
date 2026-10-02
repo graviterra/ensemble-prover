@@ -19,6 +19,8 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import urlencode, urljoin, urlsplit
 
 import aiohttp
+from aiohttp.helpers import is_ip_address
+from yarl import URL
 
 from ..local_inference.network_policy import (
     prepare_owned_subprocess,
@@ -63,16 +65,21 @@ def validate_url(url: str) -> str:
     text(url, "source URL")
     if len(url) > 8192 or any(ord(char) < 32 for char in url):
         raise ValueError("invalid source URL")
-    parts = urlsplit(url)
+    # Use the connector's canonical wire hostname. IDNA normalization can turn
+    # a supplied Unicode hostname into an IP literal before DNS resolution.
+    parts = URL(url)
+    supplied = urlsplit(url)
     if (
         parts.scheme not in {"https", "http"}
-        or not parts.hostname
-        or parts.username
-        or parts.password
+        or not parts.raw_host
+        or supplied.username is not None
+        or supplied.password is not None
+        or parts.user is not None
+        or parts.password is not None
         or parts.port not in {None, 80, 443}
     ):
         raise ValueError("source URL must be public HTTP(S) without credentials")
-    host = parts.hostname.lower().rstrip(".")
+    host = parts.raw_host.lower().rstrip(".")
     if (
         host == "localhost"
         or host.endswith((".localhost", ".local", ".internal"))
@@ -80,11 +87,13 @@ def validate_url(url: str) -> str:
         and ":" not in host
     ):
         raise ValueError("non-public source hostname")
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        pass
-    else:
+    if is_ip_address(host):
+        # aiohttp skips its resolver for heuristic literals, including numeric
+        # shorthand and leading-zero forms which strict ipaddress rejects.
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            raise ValueError("source address must use an unambiguous IP literal") from None
         if not _public(str(address)):
             raise ValueError("non-public source address")
     return url

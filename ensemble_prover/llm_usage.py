@@ -728,6 +728,8 @@ _PROTECTED_USAGE_EVENT_KEYS = {
     "recovered_unknown_reversed_cost_usd",
     "pricing_known",
     "usage_missing",
+    "token_usage_status",
+    "reasoning_output_tokens_unknown",
     "missing_provider_target_ids",
     "provider_exposed_target_counts",
     "provider_observations",
@@ -4043,6 +4045,18 @@ class CostBudgetController:
             for record in records
         )
         usage_missing = usage_receipts_missing or partial_usage_observed
+        token_totals_available = [
+            "provider_token_totals_unavailable" not in record.cost_valuation_assumptions
+            for record in records
+        ]
+        # A monetary receipt can establish the charge while leaving token
+        # counters unavailable. Keep token completeness independent from
+        # receipt presence so an unavailable total never becomes reported zero.
+        token_usage_status = (
+            "unknown" if not any(token_totals_available) else
+            "partial" if usage_missing or not all(token_totals_available) else
+            "reported"
+        )
         missing_unknown_cost = 0.0
         charge_missing_usage = (
             usage_receipts_missing and status not in _MISSING_USAGE_NO_CHARGE_STATUSES
@@ -4509,10 +4523,7 @@ class CostBudgetController:
                 "usage_missing": usage_missing,
                 # Numeric counters remain additive observed totals. A zero
                 # with no receipt is unknown consumption, never a free call.
-                "token_usage_status": (
-                    "partial" if usage_missing and records else
-                    "unknown" if usage_missing else "reported"
-                ),
+                "token_usage_status": token_usage_status,
                 "missing_provider_target_ids": sorted(missing_target_costs),
                 "provider_exposed_target_counts": dict(exposed_target_counts),
                 "provider_observations": observation_details,
@@ -4556,7 +4567,7 @@ class CostBudgetController:
                 event["llm_missing_usage_charged"] = False
             elif usage_missing:
                 event["llm_missing_usage_charged"] = bool(unknown_cost > 0.0)
-            if usage_missing:
+            if token_usage_status != "reported":
                 event["reasoning_output_tokens_unknown"] = True
             if usage_missing and bool(event.get("llm_retry_deadline_exhausted")):
                 event["llm_usage_missing_due_to_retry_deadline"] = True

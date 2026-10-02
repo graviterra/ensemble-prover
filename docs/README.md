@@ -11,6 +11,7 @@ translate a claim, or investigate a problem before choosing a proof approach.
 | Install and launch the browser workspace | [Quick start](../README.md#quick-start) · [Interface guide](../interface/README.md) |
 | Run a Lean theorem or directory of problems | [CLI quick start](CLI_QUICKSTART.md#run-the-prover) |
 | Choose models, transports, and reasoning controls | [Providers and model roles](providers.md) |
+| Read the complete LLM prompts and find their definitions | [Prompt reference](LLM_PROMPTS.md) |
 | Understand how the prover chooses and checks work | [Proof search and mathematical research](proof-search.md) |
 | Reuse lemmas and understand application history | [Retrieval, theory, and mathematical memory](mathematical-memory.md) |
 | Monitor, stop, resume, or diagnose a run | [Operations and recovery](operations.md) |

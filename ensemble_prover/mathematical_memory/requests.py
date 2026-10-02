@@ -51,6 +51,16 @@ _TRANSITIONS = {
 }
 
 
+def _is_finite_number(value: Any) -> bool:
+    """Reject JSON integers too large for a finite floating-point allowance."""
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict) or set(payload) - _FIELDS:
         raise MemoryRequestError("invalid_request_fields")
@@ -89,7 +99,7 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
     seconds = payload.get("max_seconds", 0)
     if (
         type(seconds) not in (int, float)
-        or not math.isfinite(seconds)
+        or not _is_finite_number(seconds)
         or seconds < 0
         or seconds > 86400
     ):
@@ -182,7 +192,8 @@ class MemoryRequestStore:
                             "requests": {},
                         }
                     if (
-                        ledger.get("schema_version") != 1
+                        not isinstance(ledger, dict)
+                        or ledger.get("schema_version") != 1
                         or ledger.get("run_identity") != str(self.run_dir.absolute())
                         or not isinstance(ledger.get("requests"), dict)
                     ):
@@ -207,7 +218,7 @@ class MemoryRequestStore:
                         submitted = record.get("submitted_at")
                         if (
                             type(submitted) not in (int, float)
-                            or not math.isfinite(submitted)
+                            or not _is_finite_number(submitted)
                             or submitted < 0
                         ):
                             raise MemoryRequestError("request_store_corrupt")
@@ -226,7 +237,7 @@ class MemoryRequestStore:
                         cap = allocation.get("total_seconds")
                         if (
                             type(cap) not in (int, float)
-                            or not math.isfinite(cap)
+                            or not _is_finite_number(cap)
                             or cap <= 0
                         ):
                             raise MemoryRequestError("research_ledger_corrupt")
@@ -252,7 +263,7 @@ class MemoryRequestStore:
                             cost = reservation.get("reserved_seconds")
                             if (
                                 type(cost) not in (int, float)
-                                or not math.isfinite(cost)
+                                or not _is_finite_number(cost)
                                 or cost <= 0
                                 or cost > owner["payload"]["max_seconds"]
                             ):
@@ -261,7 +272,7 @@ class MemoryRequestStore:
                                 cost = reservation.get("actual_seconds")
                                 if (
                                     type(cost) not in (int, float)
-                                    or not math.isfinite(cost)
+                                    or not _is_finite_number(cost)
                                     or cost < 0
                                 ):
                                     raise MemoryRequestError("research_ledger_corrupt")
@@ -290,7 +301,7 @@ class MemoryRequestStore:
             if not write:
                 return mutate({"requests": {}})
             raise MemoryRequestError("request_store_unavailable")
-        except (OSError, EvidenceUnavailable, ValueError, TypeError) as exc:
+        except (OSError, EvidenceUnavailable, ValueError, TypeError, RecursionError) as exc:
             if isinstance(exc, MemoryRequestError):
                 raise
             raise MemoryRequestError("request_store_unavailable") from exc
@@ -323,6 +334,17 @@ class MemoryRequestStore:
             return record
 
         return self._transaction(insert, deadline_monotonic=deadline_monotonic)
+
+    def get(
+        self, request_id: str, *, deadline_monotonic: float | None = None
+    ) -> dict[str, Any] | None:
+        """Read a durable request independently of the recent display window."""
+
+        return self._transaction(
+            lambda ledger: ledger["requests"].get(request_id),
+            write=False,
+            deadline_monotonic=deadline_monotonic,
+        )
 
     def list(
         self, *, limit: int = 64, status: str | None = None
@@ -465,7 +487,7 @@ class MemoryRequestStore:
         for value in (total_seconds, max_seconds):
             if (
                 type(value) not in (int, float)
-                or not math.isfinite(value)
+                or not _is_finite_number(value)
                 or value <= 0
             ):
                 raise MemoryRequestError("invalid_research_budget")
@@ -534,7 +556,7 @@ class MemoryRequestStore:
         """Definitive completion can release unused time; uncertain work stays reserved."""
         if (
             type(actual_seconds) not in (int, float)
-            or not math.isfinite(actual_seconds)
+            or not _is_finite_number(actual_seconds)
             or actual_seconds < 0
         ):
             raise MemoryRequestError("invalid_actual_research_cost")

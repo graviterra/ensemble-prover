@@ -1560,7 +1560,8 @@ def _giveup_decomposition_nudge(
             "research progress, not a proof of the root."
             if allow_helper_decomposition and not at_recursion_limit
             else "Keep the selected target fixed. Test a local bridge inside its proof "
-            "with try_lean; do not request another decomposition at this layer."
+            "with try_lean when available, or submit it inside the Lean candidate "
+            "for host checking; do not request another decomposition at this layer."
         )
         return (
             "Research-search recovery: no verified resolution was produced. "
@@ -1568,7 +1569,8 @@ def _giveup_decomposition_nudge(
             "and it is not a proof of the statement or its negation. Do not fabricate "
             "a resolution. Within the remaining budget, choose one concrete local "
             "claim on a mathematical route and test an actual proof attempt with "
-            "try_lean. Use a failed check to isolate or revise that claim; a failed "
+            "try_lean when available, or submit a Lean candidate for host checking. "
+            "Use a failed check to isolate or revise the attempted proof; a failed "
             "attempt is useful diagnostic evidence, not a certified fact. A library "
             "search or finite experiment alone cannot settle the full target. "
             + artifact_instruction
@@ -1702,10 +1704,11 @@ def _giveup_decomposition_nudge(
             "Your reply treated a missing named theorem as a blocker."
             + quoted
             + " Two-step protocol:\n\n"
-            "Step 1. If the exact name has not already been checked, call "
+            "Step 1. If a search tool is available and the exact name has not "
+            "already been checked, call "
             "the Mathlib search tool once with several phrasings (look for "
             "the result type, the first argument, alternate keywords).\n"
-            "Step 2. If search returns nothing usable, do not treat that as "
+            "Step 2. If search is unavailable or returns nothing usable, do not treat that as "
             "a stopping condition. Manufacture the fact as a local theorem, "
             "lemma, definition, or proved `have`; if it is too large, split "
             "it into smaller checked targets. Do not repeat absence-of-library "
@@ -1941,8 +1944,9 @@ def _format_no_proof_extracted_feedback(
     if allow_helper_decomposition:
         return (
             "No root proof was accepted from this response. Work on one concrete "
-            "mathematical step: test it with try_lean and use the diagnostic to "
-            "repair or revise the route. You may submit complete named helper "
+            "mathematical step: test it with try_lean when available, or submit "
+            "a Lean candidate for host checking. Use the diagnostic to repair "
+            "the attempt or reconsider the route. You may submit complete named helper "
             "declarations without a root proof. Their statements and proofs must "
             "pass independent Lean checking before reuse; they are research progress, "
             "not a proof of the root. Do not submit sorry/admit stubs, assume an "

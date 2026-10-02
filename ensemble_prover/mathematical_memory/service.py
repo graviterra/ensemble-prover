@@ -861,7 +861,10 @@ class MathematicalMemoryService:
                     helper_block=origin.helper_source,
                     phase="mathematical_memory_recheck",
                     turn_index=session.iteration,
+                    # This owner funds the complete admission pipeline. Each
+                    # subsequent check borrows what remains after earlier ones.
                     timeout_s=budget.remaining_s(),
+                    timeout_is_remaining_budget=True,
                     proof_cache=None,
                     proof_state=session.proof_state,
                     target_statement=self.context()[0],
@@ -2004,14 +2007,9 @@ class MathematicalMemoryService:
             raise ValueError("generalization request is bound to another obligation")
         if self.request_store is None:
             raise ValueError("generalization requires a durable run request ledger")
-        records = self.request_store.list(limit=1024)
-        dispatch = next(
-            (
-                record
-                for record in records
-                if record["payload"]["request_id"] == request.get("request_id")
-            ),
-            None,
+        dispatch = self.request_store.get(
+            str(request.get("request_id", "")),
+            deadline_monotonic=budget.deadline_monotonic,
         )
         if dispatch is None or dispatch["status"] not in {"admitted", "running"}:
             raise ValueError("generalization has not been durably admitted")

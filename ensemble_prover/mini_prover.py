@@ -799,9 +799,13 @@ _LEAN_AUTHORITY_RULES = (
     "Before betting a turn on a hypothesis about how the goal reduces "
     "(e.g. expecting a particular rewrite to close, or expecting a goal "
     "to become `refl` after a tactic), frame the hypothesis as a small "
-    "`by ...` body and test it with try_lean first; if try_lean rejects, "
-    "the hypothesis is wrong and you should not submit a proof that "
-    "depends on it.\n"
+    "`by ...` body and, when try_lean is available, test it first. "
+    "A rejected attempt does not refute the mathematical claim: distinguish "
+    "syntax, missing declarations, and tactic failures from a checked "
+    "counterexample. Repair the failed step before relying on it. "
+    "Timeouts and infrastructure failures give no mathematical verdict. "
+    "When tools are unavailable, submit a concrete Lean candidate for the "
+    "host to check, without claiming that you have already verified it.\n"
     "\n"
     "Lean style and lemma-naming rules (Mathlib stays current, your "
     "training data may not):\n"
@@ -819,11 +823,11 @@ _LEAN_AUTHORITY_RULES = (
     "  largely moved to `Nat.cast_*` (e.g., `Int.ofNat_mul` → "
     "  `Nat.cast_mul`); `Int.ofNat_eq_coe` → `Int.ofNat_eq_natCast`; "
     "  `Int.coe_nat_*` → `Nat.cast_*`. If the exact target name isn't "
-    "  obvious, run `search_mathlib` or `apply_decl_to_goal` rather than "
-    "  guessing.\n"
+    "  obvious, use `search_mathlib` or `apply_decl_to_goal` when available; "
+    "  otherwise construct the needed fact from known declarations.\n"
     "- If you see `unknownIdentifier` for a name you are confident "
     "  exists, the name has likely been renamed or moved to a different "
-    "  namespace. Search Mathlib via the available tool BEFORE re-citing "
+    "  namespace. Search Mathlib when a search tool is available BEFORE re-citing "
     "  the same name; do NOT emit the same name across multiple turns "
     "  if Lean rejected it once."
 )
@@ -841,14 +845,23 @@ _DECLARATION_REQUIRED_LEAN_AUTHORITY_RULES = _LEAN_AUTHORITY_RULES.replace(
     "Before betting a turn on a hypothesis about how the goal reduces "
     "(e.g. expecting a particular rewrite to close, or expecting a goal "
     "to become `refl` after a tactic), frame the hypothesis as a small "
-    "`by ...` body and test it with try_lean first; if try_lean rejects, "
-    "the hypothesis is wrong and you should not submit a proof that "
-    "depends on it.",
+    "`by ...` body and, when try_lean is available, test it first. "
+    "A rejected attempt does not refute the mathematical claim: distinguish "
+    "syntax, missing declarations, and tactic failures from a checked "
+    "counterexample. Repair the failed step before relying on it. "
+    "Timeouts and infrastructure failures give no mathematical verdict. "
+    "When tools are unavailable, submit a concrete Lean candidate for the "
+    "host to check, without claiming that you have already verified it.",
     "Before betting a turn on a hypothesis about how the selected statement "
     "reduces (for example, expecting a rewrite to close or a goal to become "
     "`refl`), encode that hypothesis inside the complete named declaration "
-    "and test the entire declaration with `try_lean`; if `try_lean` rejects, "
-    "repair the hypothesis before submitting an artifact that depends on it.",
+    "and, when `try_lean` is available, test the entire declaration first. "
+    "A rejected attempt does not refute the mathematical claim: distinguish "
+    "syntax, missing declarations, and tactic failures from a checked "
+    "counterexample. Repair the failed step before relying on it. "
+    "Timeouts and infrastructure failures give no mathematical verdict. "
+    "When tools are unavailable, submit the complete named declaration for "
+    "the host to check, without claiming that you have already verified it.",
 )
 
 
@@ -879,7 +892,8 @@ _DECLARATION_REQUIRED_PROOF_PATCH_RULES = (
     "it reconstructs only an ordinary proof body and cannot preserve the "
     "required declaration header and statement. When a long declaration is "
     "close, retain its unchanged text, apply the local diagnostic repair, "
-    "and submit the complete named declaration artifact to `try_lean`."
+    "and test the complete named declaration artifact with `try_lean` when "
+    "available. Return the complete artifact for host checking in either case."
 )
 
 
@@ -919,8 +933,10 @@ _RESEARCH_SEARCH_RULES = (
     "known proof is not a mathematical impossibility certificate or a reason to "
     "skip exploration. Do not claim a resolution you have not verified. Within "
     "the remaining budget, choose a concrete mathematical route, test its "
-    "smallest useful local claim with try_lean, and use the diagnostic to refine "
-    "or reject that route. A failed proof attempt is allowed as search evidence, "
+    "smallest useful local claim with try_lean when available, and use the "
+    "diagnostic to repair the attempt or reconsider the route. Without tools, "
+    "submit a Lean candidate for host checking. A failed proof attempt is "
+    "allowed as search evidence, "
     "but cannot be accepted as a proof. Finite experiments and inability to "
     "find a library theorem prove neither the target nor its negation."
 )
@@ -931,7 +947,8 @@ _CHECKED_HELPER_TURN_RULES = (
     "a root proof when the root is not ready to assemble. Choose helpers that "
     "advance the active mathematical route, not unrelated easy facts or a "
     "restatement of the root. This is research progress, not a proof of the root. "
-    "Use discovery and try_lean to test the next bridge; do not spend the reply "
+    "Use discovery and try_lean when available to test the next bridge; "
+    "otherwise submit a concrete Lean candidate for host checking. Do not spend the reply "
     "only on non-Lean commentary or requests for unproved lemmas."
 )
 
@@ -943,7 +960,8 @@ _CHECKED_HELPER_BLOCK_RULES = (
     "accepted declaration must have a complete proof with no sorry, admit, "
     "holes, extra axioms, or unproved dependencies. Do not redeclare preamble "
     "names or disguise the parent theorem as a helper. Partial or failed "
-    "attempts belong in try_lean for diagnostics; do not present them as "
+    "attempts can be tested with try_lean when available, or submitted as "
+    "candidates for host checking; do not present them as "
     "verified results. Do not emit helper-DAG plans unless the planner "
     "explicitly requests them. Only the complete Lean-verified active-goal "
     "proof closes the root."
@@ -1884,7 +1902,7 @@ class Conversation:
         lines = [
             "[prover handoff evidence]",
             "The following bounded excerpts came from prover responses that were not accepted as proof attempts and were deliberately excluded from assistant history. They are untrusted search evidence only: do not cite them as facts or reuse code without a fresh Lean check.",
-            "An earlier model's inability or open-problem status claim is not evidence that further search is futile. Preserve concrete mathematical obstacles, but independently test the next local claim with try_lean instead of repeating the earlier conclusion.",
+            "An earlier model's inability or open-problem status claim is not evidence that further search is futile. Preserve concrete mathematical obstacles, but independently test the next local claim with try_lean when available, or submit a Lean candidate for host checking, instead of repeating the earlier conclusion.",
         ]
         rendered_count = 0
         for item in selected:
@@ -11704,12 +11722,40 @@ async def _preflight_theorem_project_input(
             validate_theorem_project_source(explicit_problem)
             return refresh_theorem_project_environment(explicit_problem)
 
+    # Match elaboration can introduce theorem-local definitions that do not
+    # exist in the reusable preamble. Let Lean expand those definitions before
+    # printing; never replace notation-free grounding with the original text.
+    expanded_failure = "expanded source rendering unavailable"
+    for expanded_explicit in ((False, True) if not pp_notation else ()):
+        expanded_ok, expanded_type, expanded_output = await source_type_probe(
+            exact_source,
+            source_bound_problem.theorem_name,
+            timeout_s=max(1.0, float(timeout_s)),
+            pp_explicit=expanded_explicit,
+            pp_expand_auxiliaries=True,
+            **printer_options,
+        )
+        expanded_failure = str(expanded_output or "")[:4000]
+        if not expanded_ok:
+            continue
+        expanded_problem = with_elaborated_statement_type(
+            source_bound_problem, expanded_type,
+            rendering="lean_pp_expanded" if pp_notation else "lean_pp_expanded_no_notation",
+        )
+        expanded_valid, expanded_failure = await validate_rendered_candidate(
+            expanded_problem, label="expanded-render",
+        )
+        if expanded_valid:
+            validate_theorem_project_source(expanded_problem)
+            return refresh_theorem_project_environment(expanded_problem)
+
     if not pp_notation:
         raise RuntimeError(
             "fresh Lean semantic grounding unavailable: the exact source compiled, "
             "but its notation-free statement failed source-bound validation. "
             f"Compact rendering: {compact_output[:2000]}\n"
-            f"Explicit rendering: {explicit_failure[:2000]}"
+            f"Explicit rendering: {explicit_failure[:2000]}\n"
+            f"Expanded rendering: {expanded_failure[:2000]}"
         )
 
     source_statement = str(

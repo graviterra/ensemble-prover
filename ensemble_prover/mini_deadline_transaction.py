@@ -45,6 +45,7 @@ class DeadlineMutationTransaction:
         self._proof_state = proof_state
         self._label = str(label or "deadline_mutation")
         self._dossier_snapshot: Optional[dict[str, Any]] = None
+        self._baseline_verified_helpers: dict[str, Any] = {}
         self._proof_state_snapshot: Optional[dict[str, Any]] = None
         self._proof_state_checkpoint_id = ""
         self._proof_state_checkpoint_snapshot: Any = None
@@ -224,6 +225,13 @@ class DeadlineMutationTransaction:
         try:
             if capture_dossier and self._dossier is not None:
                 self._dossier_snapshot = copy.deepcopy(vars(self._dossier))
+                from .proof_dossier import VerifiedHelper
+
+                self._baseline_verified_helpers = {
+                    name: helper
+                    for name, helper in getattr(self._dossier, "verified_helpers", {}).items()
+                    if isinstance(helper, VerifiedHelper)
+                }
             if capture_proof_state and self._proof_state is not None:
                 checkpoint = getattr(self._proof_state, "checkpoint", None)
                 capture = getattr(self._proof_state, "capture_checkpoint", None)
@@ -303,9 +311,30 @@ class DeadlineMutationTransaction:
         if obj is None or snapshot is None:
             return
         try:
+            memo: dict[int, Any] = {}
+            baseline_records: list[tuple[Any, Any]] = []
+            if obj is self._dossier:
+                saved_helpers = snapshot.get("verified_helpers", {})
+                for name, helper in self._baseline_verified_helpers.items():
+                    saved = saved_helpers.get(name)
+                    if type(saved) is not type(helper):
+                        continue
+                    # Only this live transaction's exact baseline records
+                    # retain their identity. Restore their mutable fields;
+                    # copied tags/bytes never issue fresh source authority.
+                    baseline_records.append((helper, saved))
+                    memo[id(saved)] = helper
+            helper_states = [
+                (helper, copy.deepcopy(vars(saved), memo))
+                for helper, saved in baseline_records
+            ]
+            restored = copy.deepcopy(snapshot, memo)
+            for helper, fields in helper_states:
+                vars(helper).clear()
+                vars(helper).update(fields)
             state = vars(obj)
             state.clear()
-            state.update(copy.deepcopy(snapshot))
+            state.update(restored)
         except Exception:
             pass
 

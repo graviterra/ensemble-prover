@@ -7946,6 +7946,7 @@ class LeanRunner:
         pp_explicit: bool = False,
         pp_universes: bool = False,
         pp_notation: bool = True,
+        pp_expand_auxiliaries: bool = False,
     ) -> tuple[bool, str, str]:
         """Compile an exact input module and return its elaborated root type.
 
@@ -7958,11 +7959,19 @@ class LeanRunner:
 
         ``pp_notation=False`` exposes resolved operators and quantifiers for
         semantic review without changing the declaration being elaborated.
+        ``pp_expand_auxiliaries`` uses Lean to inline declaration-local match
+        definitions that would be absent when replaying the displayed type.
         """
 
         sanitized, error = self._normalize_check_term_name(theorem_name)
         if error:
             return False, "", error
+        if pp_expand_auxiliaries:
+            return await self._render_source_type_without_auxiliaries(
+                source, sanitized, timeout_s=timeout_s,
+                pp_explicit=pp_explicit, pp_universes=pp_universes,
+                pp_notation=pp_notation,
+            )
         # ``#check`` is a display command, not a source serializer. Its
         # default delaborator omits dependent Pi/Exists binder types whenever
         # the surrounding expression supplies enough expected-type context
@@ -7978,7 +7987,12 @@ class LeanRunner:
         if pp_explicit:
             printer_prefix += "set_option pp.explicit true in\n"
         if not pp_notation:
-            printer_prefix += "set_option pp.notation false in\n"
+            printer_prefix += (
+                "set_option pp.notation false in\n"
+                "set_option pp.deepTerms true in\n"
+                "set_option pp.proofs true in\n"
+                "set_option pp.maxSteps 1000000 in\n"
+            )
         content = (
             str(source or "").rstrip()
             + "\n\n"
@@ -8007,6 +8021,127 @@ class LeanRunner:
         if complete_type:
             return True, complete_type, output
         return False, "", output + "\nmissing exact #check type report"
+
+    @staticmethod
+    def _source_probe_module_paths(source_path: Path) -> tuple[Path, ...]:
+        """All compiler outputs owned by a temporary source-module probe."""
+        return (source_path, *(source_path.with_suffix(suffix) for suffix in (
+            ".olean", ".ilean", ".ir", ".olean.private", ".olean.server",
+        )))
+
+    async def _render_source_type_without_auxiliaries(
+        self, source: str, theorem_name: str, *, timeout_s: float,
+        pp_explicit: bool, pp_universes: bool, pp_notation: bool,
+    ) -> tuple[bool, str, str]:
+        """Expand declaration-local match/let auxiliaries in Lean before display.
+
+        Compile the original source in its own module before importing the
+        metaprogramming API. Adding an import to the original header could
+        change its notation or instance resolution. The caller must still
+        independently elaborate this display and compare it to the source.
+        """
+        allowance = float(timeout_s)
+        if not math.isfinite(allowance) or allowance <= 0:
+            return False, "", "source type rendering allocation exhausted"
+        nonce = uuid.uuid4().hex
+        module = f"MiniSourceRender{nonce}"
+        source_path = self.temp_dir / f"{module}.lean"
+        output_path = self.temp_dir / f"{module}.olean"
+        probe_path = self.temp_dir / f"{module}Probe.lean"
+        marker = f"MINI_SOURCE_RENDER_{nonce}:"
+        witness = f"miniSourceRenderWitness_{nonce}"
+        # Export only the resolved constant's name. A public proof alias could
+        # expose a module-private match auxiliary in its type and be rejected.
+        # Name quotation resolves private targets in their original scope.
+        witnessed_source = (
+            str(source).rstrip()
+            + f"\n\npublic def _root_.{witness} : Lean.Name := ``_root_.{theorem_name}\n"
+        )
+        probe = f"""import Lean.Elab.Command
+import Lean.Meta.Tactic.Delta
+import Lean.Meta.Eval
+import {module}
+
+run_cmd Lean.Elab.Command.liftTermElabM do
+  let name ← Lean.Meta.evalExpr Lean.Name (Lean.mkConst ``Lean.Name)
+    (Lean.mkConst (Lean.Name.mkSimple "{witness}"))
+  let info ← Lean.getConstInfo name
+  let isAux := fun constant => name.isPrefixOf constant && constant != name
+  let type ← Lean.Meta.deltaExpand info.type isAux
+  if type.find? (fun expr => match expr with
+      | .const constant _ => isAux constant
+      | _ => false) |>.isSome then
+    Lean.throwError "source type contains an unexpanded declaration-local auxiliary"
+  if type.hasMVar || type.hasFVar || type.hasLooseBVars || type.hasSorry then
+    Lean.throwError "source type is not closed and sound"
+  let rendered ← Lean.withOptions (fun options => options
+      |>.setBool `pp.fullNames true
+      |>.setBool `pp.explicit {str(pp_explicit).lower()}
+      |>.setBool `pp.universes {str(pp_universes).lower()}
+      |>.setBool `pp.notation {str(pp_notation).lower()}
+      |>.setBool `pp.piBinderTypes true
+      |>.setBool `pp.funBinderTypes true
+      |>.setBool `pp.deepTerms true
+      |>.setBool `pp.proofs true
+      |>.set `pp.maxSteps (1000000 : Nat)) do
+    Lean.Meta.ppExpr type
+  Lean.logInfo ("{marker}" ++ (Lean.Json.str rendered.pretty).compress)
+"""
+        paths = (*self._source_probe_module_paths(source_path), probe_path)
+        lifecycle_task = None
+        deadline = time.monotonic() + allowance
+        try:
+            async with asyncio.timeout(allowance):
+                lifecycle_task = await self._admit_uncached_execution(asyncio.current_task())
+                for path, content in ((source_path, witnessed_source), (probe_path, probe)):
+                    error = self._write_temp_lean_file(path, content)
+                    if error is not None:
+                        return False, "", f"disk write failed: {error}"
+                    self._owned_temp_files.add(path)
+                async with self.sem:
+                    code, output = await self._run_via_lake(
+                        source_path, output_path=output_path,
+                        timeout_s=max(0.001, (deadline - time.monotonic()) * 0.65),
+                        extra_module_paths=(self.temp_dir,),
+                    )
+                    if code != 0:
+                        return False, "", output
+                    code, output = await self._run_via_lake(
+                        probe_path, timeout_s=max(0.001, deadline - time.monotonic()),
+                        extra_module_paths=(self.temp_dir,),
+                    )
+                    if code != 0:
+                        return False, "", output
+                reports = []
+                for line in str(output).split("\n"):
+                    if marker in line:
+                        try:
+                            reports.append(json.loads(line.split(marker, 1)[1]))
+                        except (ValueError, TypeError):
+                            return False, "", output + "\ninvalid source rendering report"
+                if len(reports) != 1 or not isinstance(reports[0], str) or not reports[0].strip():
+                    return False, "", output + "\nmissing exact source rendering report"
+                rendered = reports[0].strip()
+                # Pretty-printed let/match layout must start at its own column,
+                # not after the generated identity declaration's long header.
+                if "\n" in rendered:
+                    rendered = "(\n" + rendered + "\n)"
+                return True, rendered, output
+        except TimeoutError:
+            return False, "", "Lean timeout during source type rendering"
+        finally:
+            for path in paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self._owned_temp_files.discard(path)
+            if lifecycle_task is not None:
+                cancellation = await self._finish_cleanup_despite_cancellation(
+                    self._release_uncached_execution(lifecycle_task)
+                )
+                if cancellation is not None:
+                    raise cancellation
 
     async def check_source_declaration_type_equivalence(
         self,
@@ -8160,16 +8295,38 @@ class LeanRunner:
         module_name = f"MiniSourceEquiv{uuid.uuid4().hex}"
         module_path = self.temp_dir / f"{module_name}.lean"
         olean_path = self.temp_dir / f"{module_name}.olean"
-        ilean_path = self.temp_dir / f"{module_name}.ilean"
         probe_path = self.temp_dir / f"{module_name}Probe.lean"
-        module_probe = f"import Lean.Elab.Command\nimport {module_name}\n\n{probe}"
-        compile_units = [(module_path, olean_path, module_content)]
-        cleanup_paths = [module_path, olean_path, ilean_path, probe_path]
+        source_witness = f"miniSourceName_{uuid.uuid4().hex}"
+        witness_command = (
+            f"\npublic def _root_.{source_witness} : Lean.Name := ``_root_.{sanitized}\n"
+        )
+        # Resolve private/module-local source names in the original module,
+        # export the name alone, and load private definitions for comparison.
+        source_lookup = f"""  let sourceStx ←
+    match Lean.Parser.runParserCategory (← Lean.getEnv) `term {source_literal} with
+    | .ok stx => pure stx
+    | .error error => Lean.throwError error
+  let sourceTerm ← Lean.Elab.Term.withoutErrToSorry do
+    Lean.Elab.Term.elabTerm sourceStx none
+  let some sourceName := sourceTerm.getAppFn.constName?
+    | Lean.throwError "source theorem did not elaborate to a constant"
+"""
+        fallback_probe = probe.replace(source_lookup, f"""  let sourceName ←
+    Lean.Meta.evalExpr Lean.Name (Lean.mkConst ``Lean.Name)
+      (Lean.mkConst (Lean.Name.mkSimple "{source_witness}"))
+""")
+        module_probe = (
+            f"import Lean.Elab.Command\nimport Lean.Meta.Eval\n"
+            f"import {module_name}\n\n{fallback_probe}"
+        )
+        compile_units = [(module_path, olean_path,
+                          module_content if independent_expected_context
+                          else module_content + witness_command)]
+        cleanup_paths = [*self._source_probe_module_paths(module_path), probe_path]
         if independent_expected_context:
             source_module_name = f"MiniSourceOriginal{uuid.uuid4().hex}"
             source_path = self.temp_dir / f"{source_module_name}.lean"
             source_olean = self.temp_dir / f"{source_module_name}.olean"
-            source_ilean = self.temp_dir / f"{source_module_name}.ilean"
             bounded_source = clamp_lean_heartbeat_options(original_source, max_heartbeats)
             if max_heartbeats is not None:
                 from .lean_source_lexing import _scan_lean_header
@@ -8179,11 +8336,12 @@ class LeanRunner:
                     + f"\nset_option maxHeartbeats {max_heartbeats}\n"
                     + bounded_source[body_start:]
                 )
-            compile_units.append((source_path, source_olean, bounded_source))
-            cleanup_paths.extend((source_path, source_olean, source_ilean))
+            compile_units.append((source_path, source_olean, bounded_source + witness_command))
+            cleanup_paths.extend(self._source_probe_module_paths(source_path))
             module_probe = (
-                f"import Lean.Elab.Command\nimport {module_name}\n"
-                f"import {source_module_name}\n\n{probe}"
+                f"import Lean.Elab.Command\nimport Lean.Meta.Eval\n"
+                f"import {module_name}\n"
+                f"import {source_module_name}\n\n{fallback_probe}"
             )
         lifecycle_task: Optional[asyncio.Task[Any]] = None
         sem_acquired = False

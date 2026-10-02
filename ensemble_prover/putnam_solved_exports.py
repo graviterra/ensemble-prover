@@ -9,8 +9,11 @@ verification status.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import stat
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -26,11 +29,21 @@ FORBIDDEN_SOLVED_ARTIFACT_RE = re.compile(
     r"\b(?:sorry|admit|native_decide|axiom|constant|opaque|unsafe)\b"
 )
 
-def _read_text(path: Path) -> str:
+def _read_regular_bytes(path: Path) -> bytes | None:
+    """Read one regular-file snapshot without blocking on replaced FIFOs."""
+
+    def opener(selected: str, flags: int) -> int:
+        return os.open(selected, flags | getattr(os, "O_NONBLOCK", 0))
+
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except FileNotFoundError:
-        return ""
+        # The file constructor owns the descriptor even if it rejects the
+        # opened path (for example, a directory) before entering the context.
+        with open(path, "rb", opener=opener) as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                return None
+            return source.read()
+    except OSError:
+        return None
 
 
 def _problem_from_name(name: str) -> str | None:
@@ -141,16 +154,18 @@ def _artifact_declares_verified_theorem(text: str, problem: str) -> bool:
 def scan_solved_artifacts(paths: Iterable[Path]) -> set[str]:
     solved: set[str] = set()
     for root in paths:
-        if not root.exists():
-            continue
+        root = Path(root)
         manifest_path = root / "manifest.json"
-        if not manifest_path.exists():
+        manifest_bytes = _read_regular_bytes(manifest_path)
+        if manifest_bytes is None:
             continue
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            manifest = []
-        for item in list(manifest or []):
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(manifest, list):
+            continue
+        for item in manifest:
             if not isinstance(item, dict):
                 continue
             output_stem = _manifest_row_output_stem(item)
@@ -166,12 +181,21 @@ def scan_solved_artifacts(paths: Iterable[Path]) -> set[str]:
                 continue
             artifact = root / f"{output_stem}.lean"
             if (
-                not artifact.exists()
-                or artifact.suffix != ".lean"
+                artifact.suffix != ".lean"
                 or _problem_from_name(artifact.name) != problem
             ):
                 continue
-            text = _read_text(artifact)
+            artifact_bytes = _read_regular_bytes(artifact)
+            if artifact_bytes is None:
+                continue
+            # Legacy trusted receipts omit the digest (or store its old empty
+            # default). A supplied modern digest binds these exact bytes.
+            if "verified_source_digest" in item and item["verified_source_digest"] != "":
+                digest = item["verified_source_digest"]
+                if (not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None
+                        or hashlib.sha256(artifact_bytes).hexdigest() != digest):
+                    continue
+            text = artifact_bytes.decode("utf-8", errors="replace")
             if not _artifact_declares_verified_theorem(text, problem):
                 continue
             solved.add(problem)

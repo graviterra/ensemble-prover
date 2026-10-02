@@ -268,6 +268,7 @@ async def _await_serialized_lean_operation(
     operation_label: str = "proof_state_lean_operation",
     deadline_elapsed: Optional[Callable[[], bool]] = None,
     release_unrecyclable_tail: bool = False,
+    timeout_is_remaining_budget: bool = False,
 ) -> Any:
     """Strictly bound one Lean operation and retain its tail lease.
 
@@ -291,23 +292,39 @@ async def _await_serialized_lean_operation(
     )
     from .runtime_context import mark_runtime_owned_callback
 
+    if timeout_is_remaining_budget and (
+        timeout_s is None
+        or not math.isfinite(deadline_monotonic)
+        or deadline_monotonic <= 0.0
+    ):
+        raise ValueError("remaining-budget operations require a finite owner deadline")
+
+    def funded_timeout() -> float:
+        requested = float(timeout_s or 0.0)
+        if timeout_is_remaining_budget:
+            # The owner explicitly allocated one aggregate budget, rather
+            # than a fixed capability for every check. Lock waiting and prior
+            # checks spend that same allocation; they never renew it.
+            requested = min(requested, max(0.0, deadline_monotonic - time.monotonic()))
+            return _fully_funded_operation_timeout(requested)
+        return _fully_funded_operation_timeout(requested, deadline_monotonic)
+
     unbounded = timeout_s is None
     if currently_owns_lean_lock(lean):
+        if timeout_is_remaining_budget:
+            # This mode owns a whole action allocation. A nested, shorter
+            # watchdog cannot release or detach its caller's existing lease.
+            # Defer before dispatch so the owner can retry at its boundary.
+            raise _LeanAdmissionDeferred("aggregate admission requires its own Lean lease")
         if deadline_elapsed is not None and deadline_elapsed():
             raise _LeanOperationDeadline
         if not unbounded:
-            nested_timeout = _fully_funded_operation_timeout(
-                float(timeout_s or 0.0),
-                deadline_monotonic,
-            )
+            nested_timeout = funded_timeout()
             if nested_timeout <= 0.0:
                 raise _LeanOperationDeadline
         return await operation()
 
-    requested = None if unbounded else _fully_funded_operation_timeout(
-        timeout_s,
-        deadline_monotonic,
-    )
+    requested = None if unbounded else funded_timeout()
     if not unbounded and requested <= 0.0:
         raise _LeanOperationDeadline
     if unbounded:
@@ -339,10 +356,7 @@ async def _await_serialized_lean_operation(
         if deadline_elapsed is not None and deadline_elapsed():
             raise _LeanOperationDeadline
         if not unbounded:
-            admitted = _fully_funded_operation_timeout(
-                float(timeout_s or 0.0),
-                deadline_monotonic,
-            )
+            admitted = funded_timeout()
             if admitted <= 0.0:
                 raise _LeanOperationDeadline
     except BaseException:
@@ -374,6 +388,10 @@ async def _await_serialized_lean_operation(
     )
     try:
         from .lean_runner import current_lean_deadline
+        owner_deadlines = [current_lean_deadline() or 0.0]
+        if timeout_is_remaining_budget:
+            owner_deadlines.append(deadline_monotonic)
+        hard_deadline = min((value for value in owner_deadlines if value > 0.0), default=0.0)
         completed, value = await await_with_strict_deadline(
             operation_task,
             # Admission reserves the complete operation capability. Keep that
@@ -383,7 +401,7 @@ async def _await_serialized_lean_operation(
             # the child, so an equal timeout could discard a completed verdict
             # while leaving the child alive and holding the lock.
             timeout_s=outer_guard_timeout_s(admitted),
-            deadline_monotonic=current_lean_deadline() or 0.0,
+            deadline_monotonic=hard_deadline,
             operation_label=operation_label,
             operation_ownership="result_only",
         )
@@ -4503,6 +4521,7 @@ async def _accept_proof_state_helper(
     phase: str,
     turn_index: int,
     timeout_s: float,
+    timeout_is_remaining_budget: bool = False,
     proof_cache: Optional[MiniVerifiedLemmaCache] = None,
     proof_state: Optional[ProofSearchState] = None,
     status_out: Optional[Dict[str, Any]] = None,
@@ -4518,7 +4537,17 @@ async def _accept_proof_state_helper(
     defer_cache_seed_derived_refresh: bool = False,
     cache_seed_derived_refresh: Optional["_CacheSeedDerivedRefresh"] = None,
 ) -> bool:
-    """Verify and record a proof-state helper in the authoritative context."""
+    """Verify and record a proof-state helper in the authoritative context.
+
+    Fixed per-check capabilities are the default. Memory owners may instead
+    allocate one remaining budget to the complete admission pipeline, bounded
+    by an explicit absolute deadline. Every stage spends that same allocation.
+    """
+
+    if timeout_is_remaining_budget and (
+        not math.isfinite(deadline_monotonic) or deadline_monotonic <= 0.0
+    ):
+        raise ValueError("remaining-budget admission requires a finite owner deadline")
 
     observer_started = False
     observer_finished = False
@@ -4598,6 +4627,8 @@ async def _accept_proof_state_helper(
         # caller's retry frame; this only defers the next atomic operation.
         if deadline_elapsed():
             return 0.0
+        if timeout_is_remaining_budget:
+            return min(timeout, max(0.0, deadline_monotonic - time.monotonic()))
         return _fully_funded_operation_timeout(timeout, deadline_monotonic)
 
     def acceptance_error_kind(exc: BaseException) -> str:
@@ -4608,43 +4639,37 @@ async def _accept_proof_state_helper(
         return type(exc).__name__
 
     async def await_acceptance_operation(
-        awaitable: Any,
+        operation_factory: Callable[[float], Any],
         operation_timeout: float,
     ) -> Any:
-        # One serializer with formal search: acquire, full-fund recheck,
-        # then a result-only watchdog. Intra-search does not force-release a
-        # still-running adapter; a timeout detaches, marks the late tail, and
-        # keeps the lease so the next acceptance cannot overlap. The Lean
-        # call itself still owns kill/reap via ``timeout_s=operation_timeout``;
-        # the outer guard only catches an adapter that never returns.
-        started = False
-
+        # Create the checker operation after admission. Aggregate owners spend
+        # lock waiting as well as earlier checks, so adapters must receive the
+        # live remaining allowance instead of a pre-admission timeout.
         async def operation() -> Any:
-            nonlocal started, lean_attempted
+            nonlocal lean_attempted
             if deadline_elapsed():
                 raise _LeanOperationDeadline(
                     "proof-state helper acceptance deadline elapsed"
                 )
-            started = True
-            lean_attempted = True
-            return await awaitable
-
-        try:
-            return await _await_serialized_lean_operation(
-                lean,
-                operation,
-                timeout_s=operation_timeout,
-                deadline_monotonic=deadline_monotonic,
-                operation_label="proof_state_helper_acceptance",
-                deadline_elapsed=deadline_elapsed,
-                release_unrecyclable_tail=False,
+            dispatch_timeout = (
+                min(operation_timeout, remaining_timeout())
+                if timeout_is_remaining_budget else operation_timeout
             )
-        except BaseException:
-            if not started:
-                close = getattr(awaitable, "close", None)
-                if callable(close):
-                    close()
-            raise
+            if dispatch_timeout <= 0.0:
+                raise _LeanOperationDeadline("proof-state helper allocation exhausted")
+            lean_attempted = True
+            return await operation_factory(dispatch_timeout)
+
+        return await _await_serialized_lean_operation(
+            lean,
+            operation,
+            timeout_s=operation_timeout,
+            deadline_monotonic=deadline_monotonic,
+            operation_label="proof_state_helper_acceptance",
+            deadline_elapsed=deadline_elapsed,
+            release_unrecyclable_tail=False,
+            timeout_is_remaining_budget=timeout_is_remaining_budget,
+        )
 
     if deadline_elapsed():
         _status("retryable_error", error_kind="llm_turn_elapsed_budget_exhausted")
@@ -4745,16 +4770,16 @@ async def _accept_proof_state_helper(
                 )
                 return False
             context, _ = await await_acceptance_operation(
-                lean_valid_helper_context_excluding_name(
+                lambda dispatch_timeout: lean_valid_helper_context_excluding_name(
                     lean,
                     list(_proof_state_verified_helper_blocks(dossier)),
                     name,
                     preamble=_proof_state_check_preamble(conv),
-                    timeout_s=operation_timeout,
+                    timeout_s=dispatch_timeout,
                     # Cap the aggregate revalidation sweep. Nested pending-block loops can
                     # run O(N^2) sequential Lean checks, each with a full per-check timeout.
                     # An aggregate cap bounds the work without discarding a landing verdict.
-                    deadline_monotonic=time.monotonic() + float(operation_timeout),
+                    deadline_monotonic=time.monotonic() + float(dispatch_timeout),
                     true_statement="True",
                     true_proof="by\n  trivial",
                 ),
@@ -4799,12 +4824,12 @@ async def _accept_proof_state_helper(
                 return False
             try:
                 result = await await_acceptance_operation(
-                    lean.check(
+                    lambda dispatch_timeout: lean.check(
                         "True",
                         "by\n  trivial",
                         merge_context_helpers(context, [helper_block]),
                         preamble_override=_proof_state_check_preamble(conv),
-                        timeout_s=operation_timeout,
+                        timeout_s=dispatch_timeout,
                         check_kind="proof_state_helper",
                     ),
                     operation_timeout,
@@ -4812,18 +4837,18 @@ async def _accept_proof_state_helper(
             except TypeError:
                 try:
                     result = await await_acceptance_operation(
-                        lean.check(
+                        lambda dispatch_timeout: lean.check(
                             "True",
                             "by\n  trivial",
                             merge_context_helpers(context, [helper_block]),
                             preamble_override=_proof_state_check_preamble(conv),
-                            timeout_s=operation_timeout,
+                            timeout_s=dispatch_timeout,
                         ),
                         operation_timeout,
                     )
                 except TypeError:
                     result = await await_acceptance_operation(
-                        lean.check(
+                        lambda dispatch_timeout: lean.check(
                             "True",
                             "by\n  trivial",
                             merge_context_helpers(context, [helper_block]),
@@ -4862,12 +4887,12 @@ async def _accept_proof_state_helper(
             return False
         try:
             safe_result = await await_acceptance_operation(
-                lean.check(
+                lambda dispatch_timeout: lean.check(
                     "True",
                     "by\n  trivial",
                     merge_context_helpers(context, [helper_block]),
                     preamble_override=str(getattr(conv, "preamble", "") or ""),
-                    timeout_s=operation_timeout,
+                    timeout_s=dispatch_timeout,
                     check_kind="proof_state_helper_answer_safe",
                 ),
                 operation_timeout,
@@ -4875,19 +4900,19 @@ async def _accept_proof_state_helper(
         except TypeError:
             try:
                 safe_result = await await_acceptance_operation(
-                    lean.check(
+                    lambda dispatch_timeout: lean.check(
                         "True",
                         "by\n  trivial",
                         merge_context_helpers(context, [helper_block]),
                         preamble_override=str(getattr(conv, "preamble", "") or ""),
-                        timeout_s=operation_timeout,
+                        timeout_s=dispatch_timeout,
                     ),
                     operation_timeout,
                 )
             except TypeError:
                 try:
                     safe_result = await await_acceptance_operation(
-                        lean.check(
+                        lambda dispatch_timeout: lean.check(
                             "True",
                             "by\n  trivial",
                             merge_context_helpers(context, [helper_block]),
@@ -4941,14 +4966,14 @@ async def _accept_proof_state_helper(
             return False
         try:
             relevance_ok, relevance_rejection = await await_acceptance_operation(
-                _proof_state_helper_passes_relevance_gate(
+                lambda dispatch_timeout: _proof_state_helper_passes_relevance_gate(
                     lean=lean,
                     conv=conv,
                     dossier=dossier,
                     proof_state=proof_state,
                     helper_block=helper_block,
                     check_lemmas=check_lemmas,
-                    timeout_s=operation_timeout,
+                    timeout_s=dispatch_timeout,
                     target_statement=target_statement,
                 ),
                 operation_timeout,
@@ -4985,18 +5010,18 @@ async def _accept_proof_state_helper(
             return False
         try:
             stale_dependents = await await_acceptance_operation(
-                lean_invalid_helpers_after_replacement(
+                lambda dispatch_timeout: lean_invalid_helpers_after_replacement(
                     lean,
                     list(_proof_state_verified_helper_blocks(dossier)),
                     name,
                     helper_block,
                     context,
                     preamble=_proof_state_check_preamble(conv),
-                    timeout_s=operation_timeout,
+                    timeout_s=dispatch_timeout,
                     # Cap the aggregate revalidation sweep. Nested pending-block loops can
                     # run O(N^2) sequential Lean checks, each with a full per-check timeout.
                     # An aggregate cap bounds the work without discarding a landing verdict.
-                    deadline_monotonic=time.monotonic() + float(operation_timeout),
+                    deadline_monotonic=time.monotonic() + float(dispatch_timeout),
                     true_statement="True",
                     true_proof="by\n  trivial",
                 ),
@@ -5029,19 +5054,34 @@ async def _accept_proof_state_helper(
             contract_environment = str(dossier.current_lean_environment_hash or "")
             from .verified_helper_contract import analyze_verified_helper_contract
 
-            contract_fields = dict(await analyze_verified_helper_contract(
-                lean,
-                helper_statement,
-                preamble=contract_preamble,
-                context=context,
-                environment_hash=contract_environment,
-                timeout_s=operation_timeout,
-                context_is_current=lambda: (
-                    contract_preamble == _proof_state_check_preamble(conv)
-                    and contract_environment
-                    == str(dossier.current_lean_environment_hash or "")
-                ),
-            ))
+            async def analyze_contract(dispatch_timeout: float) -> Mapping[str, Any]:
+                return await analyze_verified_helper_contract(
+                    lean,
+                    helper_statement,
+                    preamble=contract_preamble,
+                    context=context,
+                    environment_hash=contract_environment,
+                    timeout_s=dispatch_timeout,
+                    context_is_current=lambda: (
+                        contract_preamble == _proof_state_check_preamble(conv)
+                        and contract_environment
+                        == str(dossier.current_lean_environment_hash or "")
+                    ),
+                )
+
+            if timeout_is_remaining_budget:
+                try:
+                    contract_fields = dict(await await_acceptance_operation(
+                        analyze_contract, operation_timeout,
+                    ))
+                except asyncio.CancelledError:
+                    _status("cancelled", error_kind="cancelled")
+                    raise
+                except _LeanOperationDeadline as exc:
+                    _status("retryable_error", error_kind=acceptance_error_kind(exc))
+                    return False
+            else:
+                contract_fields = dict(await analyze_contract(operation_timeout))
             if not contract_fields:
                 dossier.increment_tool_metric("mini_helper_contract_analysis_unavailable", 1)
     # The monotonic deadline is an admission boundary between atomic checks.

@@ -258,6 +258,7 @@ and contributors for making this benchmark available. See
 | Browser installation, controls, storage, and limitations | [Interface guide](interface/README.md) |
 | Terminal commands for proving, formalization, and research | [CLI quick start](docs/CLI_QUICKSTART.md) |
 | Providers, project setup, search, and troubleshooting | [User Guide](docs/USER_GUIDE.md) |
+| Complete LLM instructions, task templates, and source locations | [Prompt reference](docs/LLM_PROMPTS.md) |
 | Model roles, hosted APIs, subscriptions, and local inference | [Providers](docs/providers.md) |
 | Root blockers, recursive helpers, formal search, and refutation | [Proof search](docs/proof-search.md) |
 | Retrieval, reusable theory, application history, and generalization | [Mathematical memory](docs/mathematical-memory.md) |
