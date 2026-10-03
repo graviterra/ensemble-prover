@@ -14099,14 +14099,19 @@ async def _canonicalize_dependency_contract_inputs(
         )
     root_elaborated = bool(elaborated_items[0])
     root_context_error = ""
+    shared_observer_diagnostic = _contract_identity_shared_diagnostic(str(output or ""))
     if not root_elaborated:
         # A root-context failure says nothing about independently elaborated
         # claims. Keep their bound evidence, but route the pass through the
         # bounded analyzer-failure path before mathematical filtering/replanning.
-        root_diagnostic = _contract_identity_diagnostics_by_statement(
+        root_diagnostic = shared_observer_diagnostic or _contract_identity_diagnostics_by_statement(
             str(output or "")
         ).get(0, "") or _compact_lean_elaboration_diagnostics(str(output or ""))
-        root_context_error = "contract identity root context unavailable: " + (
+        root_context_error = (
+            "contract identity shared observer unavailable: "
+            if shared_observer_diagnostic
+            else "contract identity root context unavailable: "
+        ) + (
             root_diagnostic or "root statement did not elaborate"
         )
     claim_end = 1 + len(plan.claims)
@@ -14467,6 +14472,29 @@ def _compact_lean_elaboration_diagnostics(output: str, *, limit: int = 500) -> s
     return _compact_text(joined, limit)
 
 
+_CONTRACT_IDENTITY_SHARED_DIAGNOSTIC_PREFIX = "MINI_CONTRACT_SHARED_DIAGNOSTIC:"
+
+
+def _contract_identity_shared_diagnostic(output: str) -> str:
+    """Read separately attributed observer errors without claiming a bad goal."""
+    blocks: list[str] = []
+    active: list[str] | None = None
+    for line in str(output or "").splitlines():
+        if line.startswith("MINI_CONTRACT_"):
+            if active is not None:
+                blocks.append("\n".join(active))
+            active = (
+                [line[len(_CONTRACT_IDENTITY_SHARED_DIAGNOSTIC_PREFIX):]]
+                if line.startswith(_CONTRACT_IDENTITY_SHARED_DIAGNOSTIC_PREFIX)
+                else None
+            )
+        elif active is not None:
+            active.append(line)
+    if active is not None:
+        blocks.append("\n".join(active))
+    return _compact_lean_elaboration_diagnostics("\n".join(blocks), limit=320)
+
+
 def _contract_identity_diagnostics_by_statement(output: str) -> dict[int, str]:
     """Extract diagnostics keyed by the original batch index, including root."""
 
@@ -14495,6 +14523,9 @@ def _contract_identity_diagnostics_by_statement(output: str) -> dict[int, str]:
     # compatibility regex repeatedly backtracked through those marker lines
     # and added another ~20 minutes after each already-slow partial batch.
     for line in str(output or "").splitlines():
+        if line.startswith(_CONTRACT_IDENTITY_SHARED_DIAGNOSTIC_PREFIX):
+            flush()
+            continue
         attributed = _CONTRACT_IDENTITY_ATTRIBUTED_DIAGNOSTIC_RE.match(line)
         legacy = legacy_header_re.search(line[:8192])
         if attributed is not None:

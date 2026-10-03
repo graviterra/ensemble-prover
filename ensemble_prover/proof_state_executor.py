@@ -4823,6 +4823,7 @@ async def _accept_proof_state_helper(
                 )
                 return False
             try:
+                from .helper_utilization import declaration_usage_kwargs
                 result = await await_acceptance_operation(
                     lambda dispatch_timeout: lean.check(
                         "True",
@@ -4831,6 +4832,7 @@ async def _accept_proof_state_helper(
                         preamble_override=_proof_state_check_preamble(conv),
                         timeout_s=dispatch_timeout,
                         check_kind="proof_state_helper",
+                        **declaration_usage_kwargs(lean, (helper_block,)),
                     ),
                     operation_timeout,
                 )
@@ -5131,6 +5133,13 @@ async def _accept_proof_state_helper(
         if item is None:
             _status("rejected", error_kind="record_verified_helper_rejected")
             return False
+        from .helper_utilization import record_runner_declaration_utilization
+        record_runner_declaration_utilization(
+            lean, dossier, source=helper_block, statement="True", proof="by\n  trivial",
+            preamble=_proof_state_check_preamble(conv),
+            lemmas=(batch_admission.receipt.covered_contexts[-1][1]
+                    if batch_prevalidated else merge_context_helpers(context, [helper_block])),
+        )
         if existing is not None:
             refresh_revalidated_dependent_support_hashes(dossier, name)
         if proof_state is not None:
@@ -5449,9 +5458,12 @@ async def _validate_same_problem_cache_batch(
                 batch_timeout_s, deadline_monotonic,
             ) <= 0.0:
                 raise _LeanOperationDeadline("cache seed batch deadline deferred")
+            from .helper_utilization import declaration_usage_kwargs
+
             optional_kwargs: Dict[str, Any] = {
                 "timeout_s": batch_timeout_s,
                 "check_kind": check_kind,
+                **declaration_usage_kwargs(lean, helper_blocks),
             }
             for _attempt in range(3):
                 try:

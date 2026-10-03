@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import contextlib
+import copy
 import re
 import time
 import uuid
@@ -227,8 +228,57 @@ def observe_application(dossier: Any, **payload: Any) -> None:
 def observe_use(dossier: Any, payload: Mapping[str, Any]) -> None:
     session = session_for_dossier(dossier)
     service = getattr(session, "mathematical_memory", None)
-    if service is not None:
+    if service is None:
+        return
+    from ensemble_prover.mini_deadline_transaction import active_deadline_transaction
+
+    transaction = active_deadline_transaction()
+    if transaction is None:
         service.record_use(payload)
+        return
+
+    # Dossier mutations can still roll back after a provisional helper bank.
+    # Memory is append-only, so publish only after its outer owner commits.
+    # Freeze the context used to enrich imported-helper observations as well:
+    # newly retrieved declarations must not acquire spurious "unused" events.
+    frozen = copy.deepcopy(dict(payload))
+    environment = str(getattr(dossier, "current_lean_environment_hash", "") or "")
+
+    def imported_context() -> tuple[Any, Any]:
+        return (
+            tuple(sorted(
+                (name, str(getattr(profile, "declaration_id", "")))
+                for name, profile in getattr(service, "known_declarations", {}).items()
+            )),
+            dict(getattr(service, "known_candidate_ids", {})),
+        )
+
+    imported_at_check = imported_context()
+
+    def publish() -> None:
+        if (
+            session_for_dossier(dossier) is not session
+            or getattr(session, "mathematical_memory", None) is not service
+            or str(getattr(dossier, "current_lean_environment_hash", "") or "") != environment
+            or imported_context() != imported_at_check
+        ):
+            return
+        from ensemble_prover.helper_utilization import source_digest
+
+        helpers = getattr(dossier, "verified_helpers", {})
+        consumer_name = frozen.get("consumer_declaration_name")
+        consumer_hash = frozen.get("consumer_declaration_source_hash")
+        if consumer_name or consumer_hash:
+            consumer = helpers.get(consumer_name)
+            if consumer is None or source_digest(consumer.source) != consumer_hash:
+                return
+        for name, binding in frozen.get("helpers", {}).items():
+            helper = helpers.get(name)
+            if helper is None or source_digest(helper.source) != binding.get("source_hash"):
+                return
+        service.record_use(frozen)
+
+    transaction.after_commit(publish)
 
 
 class MathematicalMemoryService:

@@ -11,6 +11,7 @@ session mutations retain their zero-copy behavior.
 from __future__ import annotations
 
 import copy
+import logging
 from contextvars import ContextVar
 from typing import Any, Callable, List, Optional
 
@@ -20,6 +21,7 @@ from .tactic_attempt_telemetry import MONOTONIC_LEAN_ATTEMPT_METRICS
 _ACTIVE_DEADLINE_TRANSACTION: ContextVar[Optional["DeadlineMutationTransaction"]] = (
     ContextVar("active_mini_deadline_transaction", default=None)
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class DeadlineMutationTransaction:
@@ -50,6 +52,7 @@ class DeadlineMutationTransaction:
         self._proof_state_checkpoint_id = ""
         self._proof_state_checkpoint_snapshot: Any = None
         self._participants: List[Any] = []
+        self._after_commit_callbacks: list[Callable[[], None]] = []
         self._snapshot_failed = False
         self._rolled_back = False
         self._deadline_won = False
@@ -213,6 +216,22 @@ class DeadlineMutationTransaction:
         if self._parent is not None:
             return self._parent.has_pending_participant(predicate)
         return any(predicate(participant) for participant in self._participants)
+
+    def after_commit(self, callback: Callable[[], None]) -> bool:
+        """Defer best-effort observations until the outer scope exits committed.
+
+        Unlike reversible participants, these notifications cannot influence
+        acceptance or run during provisional nested commits. A stale task's
+        copied context must not enqueue work through a closed child scope.
+        """
+        if not self._entered or not self.can_mutate():
+            return False
+        if self._parent is not None:
+            return self._parent.after_commit(callback)
+        if not self.enabled:
+            return False
+        self._after_commit_callbacks.append(callback)
+        return True
 
     def _capture_local_state(
         self,
@@ -424,6 +443,7 @@ class DeadlineMutationTransaction:
                 self._restore_local_state(force=True)
             return
         self._rolled_back = True
+        self._after_commit_callbacks.clear()
         if self._parent is not None:
             self._restore_local_state()
             self._parent.rollback()
@@ -559,6 +579,13 @@ class DeadlineMutationTransaction:
                     _ACTIVE_DEADLINE_TRANSACTION.reset(self._context_token)
                 except Exception:
                     pass
+            callbacks, self._after_commit_callbacks = self._after_commit_callbacks, []
+            if self._parent is None and self._committed and not self._rolled_back:
+                for callback in callbacks:
+                    try:
+                        callback()
+                    except Exception:
+                        _LOGGER.debug("Post-commit observation unavailable", exc_info=True)
         return False
 
 

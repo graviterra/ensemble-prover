@@ -58,6 +58,8 @@ class HelperUsageObservation:
     complete: bool
     helper_bindings: tuple[tuple[str, str], ...] = ()
     _authority: object = field(default=None, repr=False, compare=False)
+    consumer_source: str = ""
+    consumer_name: str = ""
 
     @property
     def observed(self) -> bool:
@@ -162,3 +164,136 @@ def record_runner_helper_utilization(
         ))
     except Exception:
         return False
+
+
+def declaration_usage_kwargs(runner: Any, sources: Any) -> dict[str, Any]:
+    """Request optional telemetry only from adapters exposing this capability."""
+    import inspect
+
+    checker = getattr(runner, "check", None)
+    try:
+        parameters = inspect.signature(checker).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "helper_usage_sources" not in parameters:
+        # Capability proxies forward check through **kwargs and expose the
+        # generation-safe lookup; old adapters must keep their old API.
+        if not callable(getattr(runner, "declaration_usage_observation", None)):
+            return {}
+        if not any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
+            return {}
+    return {"helper_usage_sources": tuple(sources)}
+
+
+def parse_declaration_usage_observation(
+    output: str, *, marker_identity: str, source: str,
+    lemmas: tuple[str, ...], preamble: str,
+) -> HelperUsageObservation | None:
+    from dataclasses import replace
+    from .proof_graph import helper_decl_name, helper_decl_statement
+
+    name = helper_decl_name(source)
+    if not name or source not in lemmas:
+        return None
+    matches = re.findall(
+        r"ENSEMBLE_HELPER_USAGE:" + re.escape(marker_identity) + r":([^\r\n]+)", output
+    )
+    if len(matches) != 1:
+        return None
+    try:
+        payload = json.loads(matches[0])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("consumer") != name:
+        return None
+    observation = parse_helper_usage_observation(
+        output, marker_identity=marker_identity, statement=helper_decl_statement(source),
+        proof=source, lemmas=tuple(block for block in lemmas if block != source), preamble=preamble,
+    )
+    if (
+        observation is None
+        or dict(observation.helper_bindings).get(name) != payload.get("resolvedConsumer")
+    ):
+        return None
+    return replace(observation, consumer_source=source, consumer_name=name)
+
+
+def record_runner_declaration_utilization(
+    runner: Any, dossier: Any, *, source: str, statement: str,
+    proof: str, preamble: str, lemmas: Any,
+) -> bool:
+    """Publish observed declaration usage only after the exact helper landed."""
+    from .proof_graph import helper_decl_statement
+
+    try:
+        lookup = getattr(runner, "declaration_usage_observation", None)
+        record = getattr(dossier, "record_helper_utilization", None)
+        if not callable(lookup) or not callable(record):
+            return False
+        observation = lookup(
+            source=source, statement=statement, proof=proof, preamble=preamble, lemmas=lemmas,
+        )
+        return bool(record(
+            observation, statement=helper_decl_statement(source), proof=source,
+            consumer_kind="helper", environment_hash=str(dossier.current_lean_environment_hash or ""),
+        ))
+    except Exception:
+        return False
+
+
+def transfer_declaration_utilization(source_dossier: Any, target_dossier: Any, names: Any) -> None:
+    """Carry committed usage with exact helpers imported from a live route dossier."""
+    import copy
+    from .mini_deadline_transaction import active_deadline_transaction
+    from .proof_dossier import ProofDossier
+
+    if not isinstance(source_dossier, ProofDossier) or not isinstance(target_dossier, ProofDossier):
+        return
+    selected = frozenset(names)
+    if not selected:
+        return
+    transaction = active_deadline_transaction()
+    if transaction is not None and not transaction.can_mutate():
+        return
+    environment = str(target_dossier.current_lean_environment_hash or "")
+    if str(source_dossier.current_lean_environment_hash or "") != environment:
+        return
+
+    def eligible(payload: Mapping[str, Any]) -> bool:
+        name = payload.get("consumer_declaration_name")
+        helper = target_dossier.verified_helpers.get(name)
+        return bool(
+            name in selected and helper is not None
+            and str(target_dossier.current_lean_environment_hash or "") == environment
+            and payload.get("environment_hash") == environment
+            and payload.get("consumer_declaration_source_hash") == source_digest(helper.source)
+            and all(
+                dependency in target_dossier.verified_helpers
+                and entry.get("source_hash") == source_digest(target_dossier.verified_helpers[dependency].source)
+                for dependency, entry in payload.get("helpers", {}).items()
+            )
+        )
+
+    for key, record in list(source_dossier.helper_utilization_observations.items()):
+        payload = copy.deepcopy(record)
+        if not eligible(payload) or target_dossier.helper_utilization_observations.get(key) == payload:
+            continue
+
+        def publish(key: str = key, payload: dict[str, Any] = payload) -> None:
+            if not eligible(payload):
+                return
+            target_dossier.helper_utilization_observations[key] = payload
+            while len(target_dossier.helper_utilization_observations) > 4096:
+                target_dossier.helper_utilization_observations.pop(next(iter(target_dossier.helper_utilization_observations)))
+
+        if transaction is not None:
+            if not transaction.after_commit(publish):
+                continue
+        else:
+            publish()
+        try:
+            from .mathematical_memory.service import observe_use
+
+            observe_use(target_dossier, payload)
+        except Exception:
+            pass

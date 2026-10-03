@@ -421,6 +421,10 @@ async def verify_with_lean(
             )
         try:
             check_method = lean.check_feedback if conditional_feedback else live.check
+            if not conditional_feedback:
+                from ...helper_utilization import declaration_usage_kwargs
+
+                kwargs.update(declaration_usage_kwargs(live, helpers))
             awaitable = check_method(*args, **kwargs)
         except BaseException:
             _safe_release_lean_lock(lock)

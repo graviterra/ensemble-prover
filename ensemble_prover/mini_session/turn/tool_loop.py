@@ -6063,6 +6063,14 @@ async def _call_llm_with_tools_one_round_impl(
                                         or visibility(recorded_bridge)
                                     )
                                 )
+                                if bridge_visible:
+                                    from ...helper_utilization import record_runner_declaration_utilization
+                                    record_runner_declaration_utilization(
+                                        lean, dossier, source=bridge_source,
+                                        statement="True", proof="by\n  trivial",
+                                        preamble=conv.preamble,
+                                        lemmas=[*context_lemmas, bridge_source],
+                                    )
                                 if (
                                     bridge_was_new
                                     and bridge_visible

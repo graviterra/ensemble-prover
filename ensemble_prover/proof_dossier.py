@@ -14585,6 +14585,19 @@ class ProofDossier:
             or environment_hash != str(self.current_lean_environment_hash or "")
         ):
             return False
+        if observation.consumer_source:
+            from .mini_deadline_transaction import active_deadline_transaction
+
+            transaction = active_deadline_transaction()
+            if transaction is not None and not transaction.can_mutate():
+                return False
+            consumer = self.verified_helpers.get(observation.consumer_name)
+            if (
+                consumer_kind != "helper" or consumer is None
+                or str(consumer.source).strip() != observation.consumer_source.strip()
+                or proof != observation.consumer_source
+            ):
+                return False
         helpers = {}
         direct = set(observation.direct_constants)
         reachable = set(observation.reachable_constants)
@@ -14621,6 +14634,9 @@ class ProofDossier:
             "direct_constants": list(observation.direct_constants),
             "reachable_constants": list(observation.reachable_constants),
         }
+        if observation.consumer_source:
+            payload["consumer_declaration_name"] = observation.consumer_name
+            payload["consumer_declaration_source_hash"] = source_digest(observation.consumer_source)
         if not helpers:
             try:
                 from .mathematical_memory.service import observe_use
@@ -14633,6 +14649,20 @@ class ProofDossier:
         if self.helper_utilization_observations.get(key) == payload:
             return False
         self.helper_utilization_observations[key] = payload
+        if observation.consumer_source:
+            from .mini_deadline_transaction import active_deadline_transaction
+
+            transaction = active_deadline_transaction()
+            if transaction is not None:
+                def discard_uncommitted_consumer() -> None:
+                    final_consumer = self.verified_helpers.get(observation.consumer_name)
+                    if (
+                        final_consumer is None
+                        or source_digest(final_consumer.source) != source_digest(observation.consumer_source)
+                    ) and self.helper_utilization_observations.get(key) == payload:
+                        self.helper_utilization_observations.pop(key, None)
+
+                transaction.after_commit(discard_uncommitted_consumer)
         try:
             from .mathematical_memory.service import observe_use
             observe_use(self, payload)

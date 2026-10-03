@@ -568,14 +568,14 @@ def _check_source_boundary_file(
         helper_checks += f"""
 run_cmd do
   let input := Lean.Parser.mkInputContext {_lean_string(helper_source)} "scratch-helpers.lean"
-  let (parsedHeader, initialState, initialMessages) ← Lean.Parser.parseHeader input
+  let (parsedHeader@_, initialState@_, initialMessages@_) ← Lean.Parser.parseHeader input
   let header : Lean.Elab.HeaderSyntax := ⟨parsedHeader.raw⟩
   unless (header.imports (includeInit := false)).isEmpty do
     Lean.throwError "scratch source boundary: helper imports are not permitted"
   let mut state := initialState
   let mut messages := initialMessages
   repeat
-    let (command, nextState, nextMessages) := Lean.Parser.parseCommand input
+    let (command@_, nextState@_, nextMessages@_) := Lean.Parser.parseCommand input
       {{ env := ← Lean.getEnv, options := ← Lean.getOptions,
          currNamespace := ← Lean.getCurrNamespace, openDecls := ← Lean.getOpenDecls }} state messages
     state := nextState
@@ -594,7 +594,7 @@ run_cmd do
       let nameArg := if decl.isOfKind ``Lean.Parser.Command.openSimple then some 0
         else if decl.isOfKind ``Lean.Parser.Command.openScoped then some 1 else none
       let opens := match nameArg with
-        | some index => decl[index].getArgs.map fun name =>
+        | some index@_ => decl[index].getArgs.map fun name =>
           command.setArg 1 (decl.setArg index (Lean.mkNullNode #[name]))
         | none => #[command]
       for opened in opens do
@@ -614,10 +614,10 @@ run_cmd do
 {target_context}
 run_cmd do
   match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(statement_input)} with
-  | .error error => Lean.throwError m!"scratch source boundary: invalid target term: {{error}}"
+  | .error error@_ => Lean.throwError m!"scratch source boundary: invalid target term: {{error}}"
   | .ok _ => pure ()
   match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(proof_input)} with
-  | .error error => Lean.throwError m!"scratch source boundary: invalid proof term: {{error}}"
+  | .error error@_ => Lean.throwError m!"scratch source boundary: invalid proof term: {{error}}"
   | .ok _ => pure ()
 """
 
@@ -670,65 +670,75 @@ run_cmd do
 
 def _check_helper_usage_blocks(
     identity: str, goal_name: str, helper_names: Sequence[str],
+    declaration_consumers: Sequence[tuple[str, str]] = (),
 ) -> tuple[str, str]:
-    """Observe the checked proof value without changing proof acceptance.
-
-    Traverse only current-module constants: imported declarations cannot depend
-    on freshly supplied helpers. The cap makes incomplete observations unknown.
-    """
+    """Observe exact checked proof values; share inventory and name resolution."""
     from .nl_lean import _lean_string
 
     function = f"ensemble_helper_usage_{identity}"
     requested_names = "#[" + ", ".join(_lean_string(name) for name in helper_names) + "]"
+    consumers = "#[" + ", ".join(
+        f"({_lean_string(name)}, {_lean_string(marker)})"
+        for name, marker in declaration_consumers
+    ) + "]"
     before = f"""
 private def _root_.{function} : Lean.Elab.Command.CommandElabM Unit := do
   try
     let env ← Lean.getEnv
     let localNames := env.constants.map₂.toList.map (·.1)
     if localNames.length > 10000 then return
-    let goals := localNames.filter fun name => name.components.any (·.toString == "{goal_name}")
-    let goals := goals.filter fun name => name.getString! == "{goal_name}"
-    if goals.length != 1 then return
-    let some goal := env.checked.get.find? goals.head! | return
-    let value := match goal with
-      | .opaqueInfo v => some v.value
-      | .thmInfo v => some v.value
-      | .defnInfo v => some v.value
-      | _ => none
-    let some value := value | return
-    let direct := value.getUsedConstants
     let localSet := localNames.foldl (fun set name => set.insert name) ({{}} : Lean.NameSet)
-    let mut pending := direct.toList
-    let mut seen : Lean.NameSet := {{}}
-    let mut reached : Array Lean.Name := #[]
-    let mut fuel := 10000
-    while !pending.isEmpty && fuel > 0 do
-      fuel := fuel - 1
-      let name := pending.head!
-      pending := pending.tail!
-      unless seen.contains name do
-        seen := seen.insert name
-        reached := reached.push name
-        if localSet.contains name then
-          if let some info := env.checked.get.find? name then
-            pending := info.getUsedConstantsAsSet.toList ++ pending
     let mut bindings : Array Lean.Json := #[]
+    let mut resolvedBindings : Array (String × Lean.Name) := #[]
     for requested in ({requested_names} : Array String) do
       try
-        let .ok parsed := Lean.Parser.runParserCategory env `term requested | continue
+        let .ok parsed@_ := Lean.Parser.runParserCategory env `term requested | continue
         unless parsed.isIdent do continue
         let resolved ← Lean.resolveGlobalConstNoOverload parsed
         if localSet.contains resolved then
+          resolvedBindings := resolvedBindings.push (requested, resolved)
           bindings := bindings.push <| Lean.Json.mkObj [
             ("requested", Lean.toJson requested),
             ("resolved", Lean.toJson resolved.toString)]
       catch _ => pure ()
-    Lean.logInfo ("ENSEMBLE_HELPER_USAGE:{identity}:" ++ (Lean.Json.mkObj [
-      ("bindings", Lean.Json.arr bindings),
-      ("complete", Lean.toJson pending.isEmpty),
-      ("declarations", Lean.toJson (localNames.map Lean.Name.toString)),
-      ("direct", Lean.toJson (direct.map Lean.Name.toString)),
-      ("reachable", Lean.toJson (reached.map Lean.Name.toString))]).compress)
+    let goals := localNames.filter fun name => name.components.any (·.toString == "{goal_name}")
+    let goals := goals.filter fun name => name.getString! == "{goal_name}"
+    let mut consumers : Array (String × String × Lean.Name) := #[]
+    if goals.length == 1 then consumers := consumers.push ("", "{identity}", goals.head!)
+    for (requested@_, marker@_) in ({consumers} : Array (String × String)) do
+      for (bound@_, resolved@_) in resolvedBindings do
+        if bound == requested then consumers := consumers.push (requested, marker, resolved)
+    for (requested@_, marker@_, resolved@_) in consumers do
+      let some goal@_ := env.checked.get.find? resolved | continue
+      let value := match goal with
+        | .opaqueInfo v@_ => some v.value
+        | .thmInfo v@_ => some v.value
+        | .defnInfo v@_ => some v.value
+        | _ => none
+      let some value@_ := value | continue
+      let direct := value.getUsedConstants
+      let mut pending := direct.toList
+      let mut seen : Lean.NameSet := {{}}
+      let mut reached : Array Lean.Name := #[]
+      let mut fuel := 10000
+      while !pending.isEmpty && fuel > 0 do
+        fuel := fuel - 1
+        let name := pending.head!
+        pending := pending.tail!
+        unless seen.contains name do
+          seen := seen.insert name
+          reached := reached.push name
+          if localSet.contains name then
+            if let some info@_ := env.checked.get.find? name then
+              pending := info.getUsedConstantsAsSet.toList ++ pending
+      Lean.logInfo ("ENSEMBLE_HELPER_USAGE:" ++ marker ++ ":" ++ (Lean.Json.mkObj [
+        ("consumer", Lean.toJson requested),
+        ("resolvedConsumer", Lean.toJson resolved.toString),
+        ("bindings", Lean.Json.arr bindings),
+        ("complete", Lean.toJson pending.isEmpty),
+        ("declarations", Lean.toJson (localNames.map Lean.Name.toString)),
+        ("direct", Lean.toJson (direct.map Lean.Name.toString)),
+        ("reachable", Lean.toJson (reached.map Lean.Name.toString))]).compress)
   catch _ => pure ()
 """
     return before, f"\nrun_cmd _root_.{function}\n"
@@ -772,7 +782,7 @@ def _check_target_identity_guard_definition(witness: str) -> str:
 def _root_.{witness}_guard (goal : Lean.Name) : Lean.Elab.Command.CommandElabM Unit :=
  Lean.Elab.Command.liftTermElabM do
   let goalInfo ← Lean.getConstInfo goal
-  let .defnInfo witnessInfo ← Lean.getConstInfo (Lean.Name.mkSimple "{witness}")
+  let .defnInfo witnessInfo@_ ← Lean.getConstInfo (Lean.Name.mkSimple "{witness}")
     | Lean.throwError "scratch target type witness missing"
   let expected ← Lean.Meta.lambdaTelescope witnessInfo.value fun params body => do
     unless params.size > 0 && body == params.back! do
@@ -811,6 +821,45 @@ _SAFE_CHECK_NAME_RE = re.compile(
     rf"^{_SAFE_CHECK_COMPONENT}(?:\.{_SAFE_CHECK_COMPONENT})*$",
     flags=re.UNICODE,
 )
+
+
+def _lean_inspection_timeout_s(lean: object, requested: float | None) -> float:
+    """Use the configured finite allowance unless the caller supplies one."""
+    candidates = (requested,) if requested is not None else (
+        getattr(getattr(lean, "cfg", None), "timeout_s", None),
+        getattr(lean, "timeout_s", None),
+    )
+    for raw in candidates:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and (value > 0 or requested is not None):
+            return max(0.0, value)
+    return 10.0
+
+
+def _lean_inspection_failure_note(
+    kind: str, *, output: str = "", phase: str = "execution", missing: bool = False,
+) -> str:
+    """Expose actionable infrastructure stages without leaking raw diagnostics."""
+    lowered = output.lower()
+    stages = (
+        ("environment transition", "environment admission timed out"),
+        ("lean execution queue", "verifier queue timed out"),
+        ("shared lean execution", "shared execution wait timed out"),
+        ("disk write failed", "scratch file write failed"),
+    )
+    reason = next((label for token, label in stages if token in lowered), "")
+    if not reason:
+        timed_out = any(token in lowered for token in ("timeout", "timed out", "deadline"))
+        reason = "execution deadline exceeded" if timed_out else (
+            "execution unavailable" if missing else "verifier transport unavailable"
+        )
+    subject = "definition" if kind == "print" else "type"
+    return f"Note: {subject} information unavailable ({phase}: {reason}; no declaration verdict)."
+
+
 _OBSERVATION_COMMAND_RE = re.compile(
     r"^\s*#(eval|reduce|check)(?:\s+|$)(.*)$",
     re.DOTALL,
@@ -2807,6 +2856,7 @@ class LeanResult:
     generated_goal_start_line: int = 0
     generated_lemma_line_spans: Tuple[Tuple[int, int], ...] = ()
     helper_usage: Optional[HelperUsageObservation] = field(default=None, repr=False)
+    declaration_helper_usage: Dict[str, HelperUsageObservation] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -4087,6 +4137,8 @@ class LeanRunner:
     _generation_forwarded_methods = frozenset(
         {
             "ensure_project_imports_built",
+            "helper_usage_observation",
+            "declaration_usage_observation",
             "revalidate_theorem_project_environment",
             "ensure_support_projects_built",
             "mark_project_imports_ready",
@@ -4098,6 +4150,7 @@ class LeanRunner:
             "suggest_tactics",
             "check_term_type",
             "print_declaration",
+            "inspect_declarations",
             "check_source_declaration_type",
             "check_source_declaration_type_equivalence",
             "extract_typed_residual_batch",
@@ -4134,6 +4187,7 @@ class LeanRunner:
     def __init__(self, cfg: LeanConfig, *, oracle_max_concurrent: int = 2):
         self.cfg = cfg
         self._helper_usage_observations: dict[tuple[str, str, str, tuple[str, ...]], HelperUsageObservation] = {}
+        self._declaration_usage_observations: dict[tuple, dict[str, HelperUsageObservation]] = {}
         self._oracle_max_concurrent = max(1, int(oracle_max_concurrent or 1))
         # Kept only for compatibility with captured pre-indirection runners.
         # New rotations publish through the stable generation ref; teardown
@@ -4710,6 +4764,7 @@ class LeanRunner:
                     self._execution_environment_generation += 1
                     self._completed_exec.clear()
                     getattr(self, "_helper_usage_observations", {}).clear()
+                    getattr(self, "_declaration_usage_observations", {}).clear()
             finally:
                 async with self._environment_transition_condition:
                     self._environment_transitioning = False
@@ -5642,6 +5697,7 @@ class LeanRunner:
         max_heartbeats: Optional[int] = None,
         axiom_audit_names: Optional[Sequence[str]] = None,
         require_proposition: bool = False,
+        helper_usage_sources: Sequence[str] = (),
     ) -> "_BuiltLeanFile":
         """Assemble the Lean source for a single check.
 
@@ -5687,6 +5743,8 @@ class LeanRunner:
             usage_before, usage_after = _check_helper_usage_blocks(
                 hash_text(statement + "\0" + proof_code + "\0" + lemma_block), goal_name,
                 tuple(axiom_audit_names or ()),
+                tuple((helper_decl_name(source), hash_text(statement + "\0" + proof_code + "\0" + lemma_block) + "_decl_" + hash_text(source))
+                      for source in helper_usage_sources if helper_decl_name(source)),
             )
         goal_line = (
             # ``check`` also supports constructive/non-Prop targets, so a
@@ -6470,6 +6528,7 @@ class LeanRunner:
         check_kind: str = "full",
         warning_as_error: bool = False,
         dispatch_observer: Optional[Callable[[], None]] = None,
+        helper_usage_sources: Sequence[str] = (),
     ) -> LeanResult:
         """Check submitted proof artifacts with mandatory source admission.
 
@@ -6487,6 +6546,7 @@ class LeanRunner:
             check_kind=check_kind,
             warning_as_error=warning_as_error,
             dispatch_observer=dispatch_observer,
+            helper_usage_sources=helper_usage_sources,
         )
 
     async def check_feedback(
@@ -6534,6 +6594,7 @@ class LeanRunner:
         check_kind: str = "full",
         warning_as_error: bool = False,
         dispatch_observer: Optional[Callable[[], None]] = None,
+        helper_usage_sources: Sequence[str] = (),
     ) -> LeanResult:
         from .utils import normalize_classical_tactic_prefix
 
@@ -6563,6 +6624,11 @@ class LeanRunner:
         )
         usage_key_at_start = self._helper_usage_key(statement, requested_proof_code, preamble_override, tuple(lemmas or ()))
         self._helper_usage_observations.pop(usage_key_at_start, None)
+        self._declaration_usage_observations.pop(usage_key_at_start, None)
+        usage_sources = tuple(dict.fromkeys(
+            source for source in helper_usage_sources
+            if source in (lemmas or ()) and helper_decl_name(source)
+        ))[:32]
         goal_name = f"goal_{short_id(statement + proof_code)}"
         audited_lemmas: list[str] = []
         anonymous_audit_names: list[str] = []
@@ -6589,6 +6655,7 @@ class LeanRunner:
             warning_as_error=warning_as_error,
             max_heartbeats=max_heartbeats,
             axiom_audit_names=(*helper_audit_names, *anonymous_audit_names),
+            helper_usage_sources=usage_sources,
         )
         lemma_line_spans: Tuple[Tuple[int, int], ...] = ()
         if built.lemma_block_start_line > 0:
@@ -6692,6 +6759,10 @@ class LeanRunner:
         cleaned_output = strip_helper_usage_output(
             out, marker_identity=usage_marker_identity,
         )
+        for source in usage_sources:
+            cleaned_output = strip_helper_usage_output(
+                cleaned_output, marker_identity=usage_marker_identity + "_decl_" + hash_text(source),
+            )
         out = (
             LeanOutput(cleaned_output, runtime_status=out.runtime_status)
             if isinstance(out, LeanOutput) else cleaned_output
@@ -6812,11 +6883,31 @@ class LeanRunner:
             usage_key = self._helper_usage_key(statement, requested_proof_code, preamble_override, tuple(lemmas or ()))
             if usage_key == usage_key_at_start:
                 self._helper_usage_observations[usage_key] = observation
+            else:
+                observation = None
             while len(self._helper_usage_observations) > 128:
                 self._helper_usage_observations.pop(next(iter(self._helper_usage_observations)))
+        declaration_observations = {}
+        if ok and axiom_audit_ok is True:
+            from .helper_utilization import parse_declaration_usage_observation
+            for source in usage_sources:
+                item = parse_declaration_usage_observation(
+                    usage_output, marker_identity=usage_marker_identity + "_decl_" + hash_text(source),
+                    source=source, lemmas=tuple(lemmas or ()),
+                    preamble=self._resolve_preamble(preamble_override, proof_code=proof_code),
+                )
+                if item is not None:
+                    declaration_observations[source] = item
+            if self._helper_usage_key(statement, requested_proof_code, preamble_override, tuple(lemmas or ())) == usage_key_at_start:
+                self._declaration_usage_observations[usage_key_at_start] = declaration_observations
+            else:
+                declaration_observations = {}
+            while len(self._declaration_usage_observations) > 128:
+                self._declaration_usage_observations.pop(next(iter(self._declaration_usage_observations)))
         return LeanResult(
             ok=ok,
             helper_usage=observation,
+            declaration_helper_usage=declaration_observations,
             output=out,
             file_path=str(file_path or ""),
             returncode=int(returncode),
@@ -6849,6 +6940,14 @@ class LeanRunner:
         return self._helper_usage_observations.get(
             self._helper_usage_key(statement, proof, preamble, lemmas)
         )
+
+    def declaration_usage_observation(
+        self, *, source: str, statement: str, proof: str, preamble: str, lemmas: Sequence[str],
+    ) -> Optional[HelperUsageObservation]:
+        """Return only a declaration observed in this exact checked context."""
+        return self._declaration_usage_observations.get(
+            self._helper_usage_key(statement, proof, preamble, lemmas), {}
+        ).get(source)
 
     async def run_observation_commands(
         self,
@@ -7811,7 +7910,7 @@ class LeanRunner:
         *,
         preamble_override: str | None = None,
         lemmas: Optional[List[str]] = None,
-        timeout_s: float = 10.0,
+        timeout_s: float | None = None,
     ) -> str:
         """Run ``#check <term>`` and return the type string.
 
@@ -7820,6 +7919,10 @@ class LeanRunner:
         ``"Real.sqrt_pos : 0 < √x ↔ 0 < x"`` on success, or an error
         description on failure.
         """
+        timeout_s = _lean_inspection_timeout_s(self, timeout_s)
+        deadline = self._execution_deadline(timeout_s)
+        if timeout_s <= 0:
+            return _lean_inspection_failure_note("check", output="deadline", phase="admission")
         preamble = self._resolve_preamble(preamble_override)
         sanitized, error = self._normalize_check_term_name(term)
         if error:
@@ -7854,7 +7957,7 @@ class LeanRunner:
                 "  match Lean.Parser.runParserCategory (← getEnv) `term "
                 f"{parse_literal} with\n"
                 "  | .ok _ => pure ()\n"
-                "  | .error e => throwError e\n"
+                '  | .error e@_ => throwError m!"inspection term parse rejected: {e}"\n'
             )
             (
                 _parse_file_path,
@@ -7866,14 +7969,35 @@ class LeanRunner:
                 timeout_s=timeout_s,
                 fast_fail_timeout_s=timeout_s,
                 semaphore=self.suggest_sem,
+                operation_deadline=deadline,
             )
             if parse_execution is None:
-                return "Note: type information unavailable (verifier busy)"
-            if int(parse_execution.returncode or 0) != 0:
+                return _lean_inspection_failure_note(
+                    "check", output=str(_parse_write_error or ""), phase="term parsing", missing=True,
+                )
+            parsed_probe = parse_lean_output(parse_execution.output, parse_execution.returncode)
+            if parsed_probe.infra_failure or int(parse_execution.returncode or 0) == 124:
+                return _lean_inspection_failure_note(
+                    "check", output=parse_execution.output, phase="term parsing",
+                )
+            if int(parse_execution.returncode or 0) != 0 or any(
+                item.severity == "error" for item in parsed_probe.diagnostics
+            ):
+                parser_start = parse_content[:parse_content.rfind("\nrun_cmd\n") + 1].count("\n") + 1
+                errors = [item for item in parsed_probe.diagnostics if item.severity == "error"]
+                if not errors or any(
+                    _parse_file_path is None or item.file != str(_parse_file_path)
+                    or item.line < parser_start
+                    or "inspection term parse rejected:" not in item.message
+                    for item in errors
+                ):
+                    return "Note: type information unavailable (shared Lean context or parser setup failed; no term verdict)."
                 return (
                     "Error: unsupported check_type term: expression must be "
                     "exactly one complete Lean term"
                 )
+        if self._execution_time_remaining(deadline) <= 0:
+            return _lean_inspection_failure_note("check", output="deadline", phase="term parsing")
         content = (
             f"{preamble}\n\n"
             f"{head_universe_decl}"
@@ -7887,9 +8011,10 @@ class LeanRunner:
             timeout_s=timeout_s,
             fast_fail_timeout_s=timeout_s,
             semaphore=self.suggest_sem,
+            operation_deadline=deadline,
         )
         if execution is None:
-            return "Note: type information unavailable (verifier busy)"
+            return _lean_inspection_failure_note("check", output=str(write_error or ""), missing=True)
 
         returncode, out = execution.returncode, execution.output
         # #check output appears as an info diagnostic: "<file>:N:M: info: <name> : <type>"
@@ -7900,13 +8025,13 @@ class LeanRunner:
         # model to try to "fix" a phantom Lean error, wasting budget.
         # Return a distinct sentinel the tool-loop handler can treat as
         # "skip, infra problem" rather than "fix this Lean error".
-        if bool(getattr(parsed, "infra_failure", False)):
+        if bool(getattr(parsed, "infra_failure", False)) or int(returncode or 0) == 124:
             # Don't surface the raw infra error to the tool-loop LLM —
             # it would treat "persistent verifier timed out" as a Lean
             # error and attempt to fix it. Return a neutral sentinel so
             # the LLM moves on (the declaration was not verified, but
             # that is not a signal to the LLM's proof search).
-            return "Note: type information unavailable (verifier busy)"
+            return _lean_inspection_failure_note("check", output=out)
         signature_candidates: List[str] = []
         for diag in getattr(parsed, "diagnostics", []):
             if getattr(diag, "severity", "") == "info":
@@ -7916,9 +8041,10 @@ class LeanRunner:
         raw_signature = self._complete_check_signature_from_output(out)
         if raw_signature:
             signature_candidates.append(raw_signature)
-        if returncode == 0 and signature_candidates:
+        has_errors = any(item.severity == "error" for item in parsed.diagnostics)
+        if returncode == 0 and not has_errors and signature_candidates:
             return max(signature_candidates, key=len)
-        if returncode != 0:
+        if returncode != 0 or has_errors:
             error_type = canonical_error_type(parsed) or "lean_error"
             parts = [f"Error: #check failed ({error_type}) for `{sanitized}`."]
             if error_type == "unknown_identifier":
@@ -7964,7 +8090,7 @@ class LeanRunner:
         *,
         preamble_override: str | None = None,
         lemmas: Optional[List[str]] = None,
-        timeout_s: float = 10.0,
+        timeout_s: float | None = None,
         allow_solution_refs: bool = False,
     ) -> str:
         """Inspect one declaration body in the model's read-only environment.
@@ -7974,6 +8100,10 @@ class LeanRunner:
         across both plain subprocess and structured diagnostic transports.
         This operation produces no proof receipt or proof-state mutation.
         """
+        timeout_s = _lean_inspection_timeout_s(self, timeout_s)
+        deadline = self._execution_deadline(timeout_s)
+        if timeout_s <= 0:
+            return _lean_inspection_failure_note("print", output="deadline", phase="admission")
         sanitized, error = self._normalize_print_declaration_name(
             name, allow_solution_refs=allow_solution_refs,
         )
@@ -8006,12 +8136,13 @@ class LeanRunner:
             timeout_s=timeout_s,
             fast_fail_timeout_s=timeout_s,
             semaphore=self.suggest_sem,
+            operation_deadline=deadline,
         )
         if execution is None:
-            return "Note: definition information unavailable (verifier busy)"
+            return _lean_inspection_failure_note("print", output=str(_write_error or ""), missing=True)
         parsed = parse_lean_output(execution.output, execution.returncode)
-        if bool(getattr(parsed, "infra_failure", False)):
-            return "Note: definition information unavailable (verifier busy)"
+        if bool(getattr(parsed, "infra_failure", False)) or int(execution.returncode or 0) == 124:
+            return _lean_inspection_failure_note("print", output=execution.output)
         if int(execution.returncode or 0) != 0 or any(
             str(getattr(diagnostic, "severity", "")).lower() == "error"
             for diagnostic in parsed.diagnostics
@@ -8036,6 +8167,142 @@ class LeanRunner:
         if not allow_solution_refs and _contains_solution_ref_for_prompt(result):
             return "Error: that declaration is not available for inspection"
         return result[:2000]
+
+    async def inspect_declarations(
+        self,
+        queries: Sequence[tuple[str, str]],
+        *,
+        preamble_override: str | None = None,
+        lemmas: Sequence[str] = (),
+        timeout_s: float | None = None,
+        allow_solution_refs: bool = False,
+    ) -> list[str]:
+        """Inspect identifier queries in one compilation of the exact context.
+
+        Query errors are isolated by generated source location. Errors in the
+        shared context invalidate every result. This produces no proof receipt.
+        Expressions use ``check_term_type`` and its separate term-parser gate.
+        """
+        queries = tuple(queries)
+        if not queries:
+            return []
+        if len(queries) > 8:
+            return ["Error: at most eight declaration inspections are supported"] * len(queries)
+        timeout_s = _lean_inspection_timeout_s(self, timeout_s)
+        deadline = self._execution_deadline(timeout_s)
+        preamble = self._resolve_preamble(preamble_override)
+        lemma_block = "\n".join(tuple(lemmas))
+        context = f"{preamble}\n{lemma_block}"
+        aliases = _observation_preamble_solution_ref_aliases(context) if not allow_solution_refs else set()
+        materialized = not allow_solution_refs and _observation_preamble_materializes_solution_ref(context)
+        universe_decl = _free_universe_decl(lemma_block, declared_in=preamble)
+        content = f"{preamble}\n\n{universe_decl}\n\n{lemma_block}\n\n"
+        results = [""] * len(queries)
+        # index, begin marker, end marker, first line, query line, last line
+        spans: list[tuple[int, str, str, int, int, int]] = []
+        nonce = uuid.uuid4().hex
+        for index, (kind, query) in enumerate(queries):
+            if kind == "print":
+                name, error = self._normalize_print_declaration_name(query, allow_solution_refs=allow_solution_refs)
+                if not error and materialized:
+                    error = "Error: definition inspection unavailable in this answer-restricted context"
+                if not error and not allow_solution_refs and _observation_expression_references_proof_alias(name, aliases):
+                    error = "Error: that declaration is not available for inspection"
+            elif kind == "check":
+                name, error = self._normalize_check_term_name(query)
+            else:
+                name, error = "", "Error: unsupported declaration inspection"
+            if not error and not _SAFE_CHECK_NAME_RE.fullmatch(name):
+                error = "Error: declaration batch requires a single identifier"
+            if error:
+                results[index] = error
+                continue
+            begin = f"ensemble_inspect_begin_{nonce}_{index}"
+            end = f"ensemble_inspect_end_{nonce}_{index}"
+            first_line = content.count("\n") + 1
+            rendered = f"@{name}" if kind == "check" else name
+            content += (
+                f'#print "{begin}"\n'
+                "set_option maxHeartbeats 200000 in\n"
+                f"#{kind} {rendered}\n"
+                f'#print "{end}"\n'
+            )
+            spans.append((index, begin, end, first_line, first_line + 2, first_line + 3))
+        if not spans:
+            return results
+        if timeout_s <= 0 or self._execution_time_remaining(deadline) <= 0:
+            return [value or _lean_inspection_failure_note(kind, output="deadline", phase="admission")
+                    for value, (kind, _) in zip(results, queries)]
+        file_path, execution, write_error = await self._execute_generated_file(
+            mode="declaration_inspection", goal_name=f"inspect_{nonce}", content=content,
+            timeout_s=timeout_s, fast_fail_timeout_s=None, semaphore=self.suggest_sem,
+            operation_deadline=deadline, warning_as_error=False,
+        )
+        if execution is None:
+            return [value or _lean_inspection_failure_note(kind, output=str(write_error or ""), missing=True)
+                    for value, (kind, _) in zip(results, queries)]
+        parsed = parse_lean_output(execution.output, execution.returncode)
+        if parsed.infra_failure or int(execution.returncode or 0) == 124:
+            return [value or _lean_inspection_failure_note(kind, output=execution.output)
+                    for value, (kind, _) in zip(results, queries)]
+        errors: dict[int, list[LeanDiagnostic]] = {}
+        for diagnostic in parsed.diagnostics:
+            if diagnostic.severity != "error":
+                continue
+            owner = next((index for index, _, _, _, line, _ in spans
+                          if file_path is not None and diagnostic.file == str(file_path)
+                          and diagnostic.line == line), None)
+            if owner is None:
+                return [value or "Note: inspection unavailable (shared Lean context failed to compile; no declaration verdict)."
+                        for value in results]
+            errors.setdefault(owner, []).append(diagnostic)
+        if int(execution.returncode or 0) != 0 and not errors:
+            return [value or "Note: inspection unavailable (incomplete execution; no declaration verdict)."
+                    for value in results]
+        header = re.compile(r"^(.+?):(\d+):\d+:\s*(info|warning|error)(?:\([^)]+\))?:\s*(.*)$")
+        raw_lines = execution.output.split("\n")
+        headers = [header.match(line) for line in raw_lines]
+        payloads = [match.group(4) if match else line for match, line in zip(headers, raw_lines)]
+        expected_markers = [marker for _, begin, end, _, _, _ in spans for marker in (begin, end)]
+        marker_set = set(expected_markers)
+        observed_markers = [line.strip() for line in payloads if line.strip() in marker_set]
+        if observed_markers != expected_markers:
+            return [value or "Note: inspection unavailable (incomplete or overlapping query frames; no declaration verdict)."
+                    for value in results]
+        for index, begin, end, first_line, query_line, last_line in spans:
+            kind, _ = queries[index]
+            if index in errors:
+                detail = " ".join(diagnostic_preview(item.message)[:240] for item in errors[index][:2])
+                results[index] = f"Error: #{kind} failed. {detail}"
+                continue
+            starts = [i for i, line in enumerate(payloads) if line.strip() == begin]
+            ends = [i for i, line in enumerate(payloads) if line.strip() == end]
+            if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+                results[index] = "Note: inspection unavailable (incomplete query output; no declaration verdict)."
+                continue
+            start, finish = starts[0], ends[0]
+            invalid_owner = any(
+                match is not None and (
+                    int(match.group(2)) != source_line
+                    or (file_path is not None and match.group(1) != str(file_path))
+                    or match.group(3) != "info"
+                )
+                for match, source_line in ((headers[start], first_line), (headers[finish], last_line))
+            )
+            invalid_owner = invalid_owner or any(
+                match is not None and (
+                    int(match.group(2)) != query_line
+                    or (file_path is not None and match.group(1) != str(file_path))
+                ) for match in headers[start + 1:finish]
+            )
+            body = "\n".join(payloads[start + 1:finish]).strip()
+            if invalid_owner or not body:
+                results[index] = "Note: inspection unavailable (unattributed query output; no declaration verdict)."
+            elif kind == "print" and not allow_solution_refs and _contains_solution_ref_for_prompt(body):
+                results[index] = "Error: that declaration is not available for inspection"
+            else:
+                results[index] = body[:2000] if kind == "print" else body
+        return results
 
     async def check_source_declaration_type(
         self,
@@ -8169,7 +8436,7 @@ run_cmd Lean.Elab.Command.liftTermElabM do
   let isAux := fun constant => name.isPrefixOf constant && constant != name
   let type ← Lean.Meta.deltaExpand info.type isAux
   if type.find? (fun expr => match expr with
-      | .const constant _ => isAux constant
+      | .const constant@_ _ => isAux constant
       | _ => false) |>.isSome then
     Lean.throwError "source type contains an unexpanded declaration-local auxiliary"
   if type.hasMVar || type.hasFVar || type.hasLooseBVars || type.hasSorry then
@@ -8343,17 +8610,17 @@ run_cmd Lean.Elab.Command.liftTermElabM do
         probe = f"""run_cmd Lean.Elab.Command.liftTermElabM do
   let sourceStx ←
     match Lean.Parser.runParserCategory (← Lean.getEnv) `term {source_literal} with
-    | .ok stx => pure stx
-    | .error error => Lean.throwError error
+    | .ok stx@_ => pure stx
+    | .error error@_ => Lean.throwError error
   let sourceTerm ← Lean.Elab.Term.withoutErrToSorry do
     Lean.Elab.Term.elabTerm sourceStx none
-  let some sourceName := sourceTerm.getAppFn.constName?
+  let some sourceName@_ := sourceTerm.getAppFn.constName?
     | Lean.throwError "source theorem did not elaborate to a constant"
   let sourceInfo ← Lean.getConstInfo sourceName
   if {str(require_proposition).lower()} then
     unless ← Lean.Meta.isProp sourceInfo.type do
       Lean.throwError "source declaration is not proposition-valued"
-  let .defnInfo candidateDef ← Lean.getConstInfo (Lean.Name.mkSimple "{candidate_name}")
+  let .defnInfo candidateDef@_ ← Lean.getConstInfo (Lean.Name.mkSimple "{candidate_name}")
     | Lean.throwError "candidate type witness is not a definition"
   let candidateType ← Lean.Meta.lambdaTelescope candidateDef.value fun params body => do
     unless params.size > 0 && body == params.back! do
@@ -8404,11 +8671,11 @@ run_cmd Lean.Elab.Command.liftTermElabM do
         # export the name alone, and load private definitions for comparison.
         source_lookup = f"""  let sourceStx ←
     match Lean.Parser.runParserCategory (← Lean.getEnv) `term {source_literal} with
-    | .ok stx => pure stx
-    | .error error => Lean.throwError error
+    | .ok stx@_ => pure stx
+    | .error error@_ => Lean.throwError error
   let sourceTerm ← Lean.Elab.Term.withoutErrToSorry do
     Lean.Elab.Term.elabTerm sourceStx none
-  let some sourceName := sourceTerm.getAppFn.constName?
+  let some sourceName@_ := sourceTerm.getAppFn.constName?
     | Lean.throwError "source theorem did not elaborate to a constant"
 """
         fallback_probe = probe.replace(source_lookup, f"""  let sourceName ←
@@ -8852,6 +9119,8 @@ private def {inventory_function} (name : Lean.Name) : Lean.Elab.Command.CommandE
         proof_header = f"opaque goal_{short_id(raw_statement + raw_proof)} : {raw_statement} := "
         proof_column = len(proof_header.rsplit("\n", 1)[-1])
         proof_literal = json.dumps(" " * proof_column + raw_proof, ensure_ascii=False)
+        # Explicit variable patterns remain binders even when caller namespaces
+        # expose constants with the same names (for example RingHom.id).
         serializer = f"""
 private def {serializer_prefix}_binderInfo :
     Lean.BinderInfo → Lean.Json
@@ -8863,63 +9132,63 @@ private def {serializer_prefix}_binderInfo :
 private partial def {serializer_prefix}_level :
     Lean.Level → Lean.Json
   | .zero => Lean.Json.arr #[Lean.Json.str "zero"]
-  | .succ level =>
+  | .succ level@_ =>
       Lean.Json.arr #[Lean.Json.str "succ", {serializer_prefix}_level level]
-  | .max left right =>
+  | .max left@_ right@_ =>
       Lean.Json.arr #[Lean.Json.str "max", {serializer_prefix}_level left,
         {serializer_prefix}_level right]
-  | .imax left right =>
+  | .imax left@_ right@_ =>
       Lean.Json.arr #[Lean.Json.str "imax", {serializer_prefix}_level left,
         {serializer_prefix}_level right]
-  | .param name =>
+  | .param name@_ =>
       Lean.Json.arr #[Lean.Json.str "param", Lean.Json.str name.toString]
-  | .mvar id =>
+  | .mvar id@_ =>
       Lean.Json.arr #[Lean.Json.str "mvar", Lean.Json.str id.name.toString]
 
 private def {serializer_prefix}_literal : Lean.Literal → Lean.Json
-  | .natVal value =>
+  | .natVal value@_ =>
       Lean.Json.arr #[Lean.Json.str "nat", Lean.ToJson.toJson value]
-  | .strVal value =>
+  | .strVal value@_ =>
       Lean.Json.arr #[Lean.Json.str "str", Lean.Json.str value]
 
 private partial def {serializer_prefix}_expr :
     Lean.Expr → Lean.Json
-  | .bvar index =>
+  | .bvar index@_ =>
       Lean.Json.arr #[Lean.Json.str "bvar", Lean.ToJson.toJson index]
-  | .fvar id =>
+  | .fvar id@_ =>
       Lean.Json.arr #[Lean.Json.str "fvar", Lean.Json.str id.name.toString]
-  | .mvar id =>
+  | .mvar id@_ =>
       Lean.Json.arr #[Lean.Json.str "mvar", Lean.Json.str id.name.toString]
-  | .sort level =>
+  | .sort level@_ =>
       Lean.Json.arr #[Lean.Json.str "sort", {serializer_prefix}_level level]
-  | .const name levels =>
+  | .const name@_ levels@_ =>
       Lean.Json.arr #[Lean.Json.str "const", Lean.Json.str name.toString,
         Lean.Json.arr (levels.toArray.map {serializer_prefix}_level)]
-  | .app fn arg =>
+  | .app fn@_ arg@_ =>
       Lean.Json.arr #[Lean.Json.str "app", {serializer_prefix}_expr fn,
         {serializer_prefix}_expr arg]
-  | .lam _ domain body info =>
+  | .lam _ domain@_ body@_ info@_ =>
       Lean.Json.arr #[Lean.Json.str "lam", {serializer_prefix}_binderInfo info,
         {serializer_prefix}_expr domain, {serializer_prefix}_expr body]
-  | .forallE _ domain body info =>
+  | .forallE _ domain@_ body@_ info@_ =>
       Lean.Json.arr #[Lean.Json.str "forall", {serializer_prefix}_binderInfo info,
         {serializer_prefix}_expr domain, {serializer_prefix}_expr body]
-  | .letE _ type value body nonDependent =>
+  | .letE _ type@_ value@_ body@_ nonDependent@_ =>
       Lean.Json.arr #[Lean.Json.str "let", Lean.ToJson.toJson nonDependent,
         {serializer_prefix}_expr type, {serializer_prefix}_expr value,
         {serializer_prefix}_expr body]
-  | .lit literal =>
+  | .lit literal@_ =>
       Lean.Json.arr #[Lean.Json.str "lit", {serializer_prefix}_literal literal]
-  | .mdata _ body => {serializer_prefix}_expr body
-  | .proj typeName index projected =>
+  | .mdata _ body@_ => {serializer_prefix}_expr body
+  | .proj typeName@_ index@_ projected@_ =>
       Lean.Json.arr #[Lean.Json.str "proj", Lean.Json.str typeName.toString,
         Lean.ToJson.toJson index, {serializer_prefix}_expr projected]
 
 private def {serializer_prefix}_parse
     (category : Lean.Name) (source : String) : Lean.CoreM Lean.Syntax := do
   match Lean.Parser.runParserCategory (← Lean.getEnv) category source with
-  | .ok stx => pure stx
-  | .error error => Lean.throwError error
+  | .ok stx@_ => pure stx
+  | .error error@_ => Lean.throwError error
 
 private def {serializer_prefix}_prepare : Lean.Elab.Command.CommandElabM Unit := do
   let source := {statement_literal}
@@ -8933,13 +9202,13 @@ private def {serializer_prefix}_prepare : Lean.Elab.Command.CommandElabM Unit :=
   let before ← Lean.getEnv
   Lean.Elab.Command.elabCommand (← `(command|
     noncomputable def $ident:ident (_miniStatement : $stx) := @_miniStatement))
-  for (introduced, _) in (← Lean.getEnv).constants.map₂.toList do
+  for (introduced@_, _) in (← Lean.getEnv).constants.map₂.toList do
     if name.isPrefixOf introduced && before.contains introduced then
       Lean.throwError "residual witness name collides with an existing declaration"
 
 private def {serializer_prefix}_parentType : Lean.Elab.Term.TermElabM Lean.Expr := do
   let name := `{witness_name}
-  let .defnInfo witness ← Lean.getConstInfo name
+  let .defnInfo witness@_ ← Lean.getConstInfo name
     | Lean.throwError "residual parent witness is not a definition"
   let type ← Lean.Meta.lambdaTelescope witness.value fun params body => do
     if params.isEmpty || body != params.back! then
@@ -8947,10 +9216,12 @@ private def {serializer_prefix}_parentType : Lean.Elab.Term.TermElabM Lean.Expr 
     Lean.Meta.mkForallFVars params.pop (← Lean.Meta.inferType body)
   -- Fresh recursive auxiliaries cannot appear in a durable receipt or in its
   -- standalone goal sources. Preserve all trusted context declarations.
-  let isAux := fun constant => name.isPrefixOf constant && constant != name
+  let imported := (← Lean.getEnv).constants.map₁
+  let isAux := fun constant =>
+    !imported.contains constant && name.isPrefixOf constant && constant != name
   let type ← Lean.Meta.deltaExpand type isAux
   if type.find? (fun expr => match expr with
-      | .const constant _ => isAux constant
+      | .const constant@_ _ => isAux constant
       | _ => false) |>.isSome then
     Lean.throwError "residual parent auxiliary could not be serialized"
   if type.hasMVar || type.hasFVar || type.hasLooseBVars || type.hasSorry then
@@ -8977,10 +9248,10 @@ private def {serializer_prefix}_elabType
                 "  let proofStx ← try",
                 f"    {serializer_prefix}_parse `term {proof_literal}",
                 "  catch",
-                "  | .error ref message =>",
+                "  | .error ref@_ message@_ =>",
                 "      Lean.logErrorAt ref message",
                 f'      Lean.throwError "{proof_rejection_marker}"',
-                "  | exception => throw exception",
+                "  | exception@_ => throw exception",
                 "  let tacticStx ← try",
                 "    match proofStx with",
                 "    | `(term| by $tactics:tacticSeq) => pure tactics.raw",
@@ -8988,19 +9259,19 @@ private def {serializer_prefix}_elabType
                 "      let term : Lean.TSyntax `term := ⟨proofStx⟩",
                 "      pure (← `(tactic| refine $term)).raw",
                 "  catch",
-                "  | .error ref message =>",
+                "  | .error ref@_ message@_ =>",
                 "      Lean.logErrorAt ref message",
                 f'      Lean.throwError "{proof_rejection_marker}"',
-                "  | exception => throw exception",
+                "  | exception@_ => throw exception",
                 "  let rootGoal ← Lean.Meta.mkFreshExprSyntheticOpaqueMVar statementType",
                 "  let tacticResult ← try",
                 "    Lean.Elab.runTactic rootGoal.mvarId! tacticStx (← read) (← get)",
                 "  catch",
-                "  | .error ref message =>",
+                "  | .error ref@_ message@_ =>",
                 "      Lean.logErrorAt ref message",
                 f'      Lean.throwError "{proof_rejection_marker}"',
-                "  | exception => throw exception",
-                "  let (goals, tacticState) := tacticResult",
+                "  | exception@_ => throw exception",
+                "  let (goals@_, tacticState@_) := tacticResult",
                 "  set tacticState",
                 "  let proofMessages :=",
                 "    (\u2190 Lean.Core.getMessageLog).reportedPlusUnreported.toArray",
@@ -9055,10 +9326,10 @@ private def {serializer_prefix}_elabType
                 "        if closed.hasSorry then",
                 '          Lean.throwError "residual proof goal contains sorry"',
                 "  catch",
-                "  | .error ref message =>",
+                "  | .error ref@_ message@_ =>",
                 "      Lean.logErrorAt ref message",
                 f'      Lean.throwError "{proof_rejection_marker}"',
-                "  | exception => throw exception",
+                "  | exception@_ => throw exception",
                 "  let closedGoals ← goals.mapM fun goalId => goalId.withContext do",
                 "    let target ← Lean.instantiateMVars (← goalId.getType)",
                 "    let lctx ← Lean.getLCtx",
@@ -9073,7 +9344,7 @@ private def {serializer_prefix}_elabType
                 "    let instances ← Lean.Meta.getLocalInstances",
                 "    let mut residualLCtx := lctx",
                 "    for decl in lctx do",
-                "      if let .ldecl index id name type _ _ kind := decl then",
+                "      if let .ldecl index@_ id@_ name@_ type@_ _ _ kind@_ := decl then",
                 "        if ← Lean.Meta.isProp type then",
                 "          let bi := if instances.any (fun inst => inst.fvar.fvarId! == id)",
                 "            then Lean.BinderInfo.instImplicit else Lean.BinderInfo.default",
@@ -9097,7 +9368,7 @@ private def {serializer_prefix}_elabType
                 "    | [] =>",
                 "      let proof ← Lean.instantiateMVars rootGoal",
                 "      Lean.Meta.mkAppM ``PProd.mk #[proof, Lean.mkNatLit goals.length]",
-                "    | goalId :: rest =>",
+                "    | goalId@_ :: rest@_ =>",
                 "      Lean.Meta.withLocalDeclD `residualProof (← goalId.getType) fun parameter => do",
                 # Delayed assignments created by local recursion must know the
                 # parameter's scope before lambda abstraction can traverse them.
@@ -9123,8 +9394,8 @@ private def {serializer_prefix}_elabType
     Lean.Elab.Command.elabCommand (← `(command|
       noncomputable def $ident:ident := {capture_syntax}))
   catch
-  | .error ref message => Lean.logErrorAt ref message
-  | exception => throw exception
+  | .error ref@_ message@_ => Lean.logErrorAt ref message
+  | exception@_ => throw exception
   let messages := (← get).messages.reportedPlusUnreported.toArray
   let fresh := messages.extract before messages.size
   let mut marked := false
@@ -9138,16 +9409,16 @@ private def {serializer_prefix}_elabType
             (
                 "run_cmd Lean.Elab.Command.liftTermElabM do",
                 f"  let statementType ← {serializer_prefix}_parentType",
-                f"  let .defnInfo conditional ← Lean.getConstInfo `{proof_witness}",
+                f"  let .defnInfo conditional@_ ← Lean.getConstInfo `{proof_witness}",
                 '    | Lean.throwError "residual conditional proof is not a definition"',
                 "  if conditional.value.hasSorry || conditional.type.hasSorry then",
                 '    Lean.throwError "residual conditional proof contains sorry"',
-                "  let (closedGoals, rootProofType) ←",
+                "  let (closedGoals@_, rootProofType@_) ←",
                 "    Lean.Meta.lambdaTelescope conditional.value fun parameters packet => do",
                 "      let args := packet.getAppArgs",
                 "      unless packet.getAppFn.constName? == some ``PProd.mk && args.size == 4 do",
                 '        Lean.throwError "residual conditional proof packet is malformed"',
-                "      let some count ← Lean.Meta.getNatValue? args[3]!",
+                "      let some count@_ ← Lean.Meta.getNatValue? args[3]!",
                 '        | Lean.throwError "residual conditional proof count is malformed"',
                 "      unless count == parameters.size do",
                 '        Lean.throwError "residual conditional proof parameter count changed"',
@@ -9155,9 +9426,10 @@ private def {serializer_prefix}_elabType
                 "      pure (closedGoals, ← Lean.Meta.inferType args[2]!)",
                 "  unless ← Lean.Meta.isDefEq rootProofType statementType do",
                 '    Lean.throwError "residual conditional proof changed the parent type"',
-                "  let isAux := fun constant =>",
+                "  let imported := (← Lean.getEnv).constants.map₁",
+                "  let isAux := fun constant => !imported.contains constant && (",
                 f"    (`{proof_witness}).isPrefixOf constant && constant != `{proof_witness} ||",
-                f"    (`{witness_name}).isPrefixOf constant && constant != `{witness_name}",
+                f"    (`{witness_name}).isPrefixOf constant && constant != `{witness_name})",
                 helper_expansion.rstrip(),
                 # Standalone target witnesses run before candidate helpers.
                 # Inline helper-defined data without changing its value; never
@@ -9183,8 +9455,8 @@ private def {serializer_prefix}_elabType
                 # normal target checker cannot elaborate. Required theory
                 # declarations belong in the trusted preamble; this failure
                 # leaves the parent proof available for continued search.
-                "        if let some dependent := closed.find? (fun expr => match expr with",
-                "            | .const name _ | .proj name _ _ => expandTarget name",
+                "        if let some dependent@_ := closed.find? (fun expr => match expr with",
+                "            | .const name@_ _ | .proj name@_ _ _ => expandTarget name",
                 "            | _ => false) then",
                 '          Lean.throwError m!"residual target requires helper-local declaration {dependent}; place required theory declarations in the trusted preamble or continue the parent proof"',
                 "        if closed.hasMVar || closed.hasFVar || closed.hasLooseBVars then",
@@ -9223,10 +9495,10 @@ private def {serializer_prefix}_elabType
                 "      goalPayloads := goalPayloads.push goalPayload",
                 "    pure goalPayloads",
                 "  catch",
-                "  | .error ref message =>",
+                "  | .error ref@_ message@_ =>",
                 "      Lean.logErrorAt ref message",
                 f'      Lean.throwError "{postprocess_marker}"',
-                "  | exception => throw exception",
+                "  | exception@_ => throw exception",
                 "  let payload := Lean.Json.mkObj [",
                 f'    ("version", Lean.ToJson.toJson {_LEAN_RESIDUAL_BATCH_FORMAT_VERSION}),',
                 f'    ("parentExpr", {serializer_prefix}_expr statementType),',
@@ -9512,6 +9784,8 @@ private def {serializer_prefix}_elabType
             f"  | {json.dumps(statement, ensure_ascii=False)} => `{name}"
             for statement, name in witness_names.items()
         )
+        # Explicit variable patterns remain binders even when caller namespaces
+        # expose constants with the same names (for example RingHom.id).
         serializer = f"""
 private def {serializer_prefix}_binderInfo :
     Lean.BinderInfo → Lean.Json
@@ -9523,23 +9797,23 @@ private def {serializer_prefix}_binderInfo :
 private partial def {serializer_prefix}_level :
     Lean.Level → Lean.Json
   | .zero => Lean.Json.arr #[Lean.Json.str "zero"]
-  | .succ level =>
+  | .succ level@_ =>
       Lean.Json.arr #[Lean.Json.str "succ", {serializer_prefix}_level level]
-  | .max left right =>
+  | .max left@_ right@_ =>
       Lean.Json.arr #[Lean.Json.str "max", {serializer_prefix}_level left,
         {serializer_prefix}_level right]
-  | .imax left right =>
+  | .imax left@_ right@_ =>
       Lean.Json.arr #[Lean.Json.str "imax", {serializer_prefix}_level left,
         {serializer_prefix}_level right]
-  | .param name =>
+  | .param name@_ =>
       Lean.Json.arr #[Lean.Json.str "param", Lean.Json.str name.toString]
-  | .mvar id =>
+  | .mvar id@_ =>
       Lean.Json.arr #[Lean.Json.str "mvar", Lean.Json.str id.name.toString]
 
 private def {serializer_prefix}_literal : Lean.Literal → Lean.Json
-  | .natVal value =>
+  | .natVal value@_ =>
       Lean.Json.arr #[Lean.Json.str "nat", Lean.ToJson.toJson value]
-  | .strVal value =>
+  | .strVal value@_ =>
       Lean.Json.arr #[Lean.Json.str "str", Lean.Json.str value]
 
 private def {serializer_prefix}_printerOptions
@@ -9552,39 +9826,39 @@ private def {serializer_prefix}_printerOptions
 
 private partial def {serializer_prefix}_expr :
     Lean.Expr → Lean.Json
-  | .bvar index =>
+  | .bvar index@_ =>
       Lean.Json.arr #[Lean.Json.str "bvar", Lean.ToJson.toJson index]
-  | .fvar id =>
+  | .fvar id@_ =>
       Lean.Json.arr #[Lean.Json.str "fvar", Lean.Json.str id.name.toString]
-  | .mvar id =>
+  | .mvar id@_ =>
       Lean.Json.arr #[Lean.Json.str "mvar", Lean.Json.str id.name.toString]
-  | .sort level =>
+  | .sort level@_ =>
       Lean.Json.arr #[Lean.Json.str "sort",
         {serializer_prefix}_level level]
-  | .const name levels =>
+  | .const name@_ levels@_ =>
       Lean.Json.arr #[Lean.Json.str "const", Lean.Json.str name.toString,
         Lean.Json.arr (levels.toArray.map {serializer_prefix}_level)]
-  | .app fn arg =>
+  | .app fn@_ arg@_ =>
       Lean.Json.arr #[Lean.Json.str "app", {serializer_prefix}_expr fn,
         {serializer_prefix}_expr arg]
-  | .lam _ domain body info =>
+  | .lam _ domain@_ body@_ info@_ =>
       Lean.Json.arr #[Lean.Json.str "lam",
         {serializer_prefix}_binderInfo info,
         {serializer_prefix}_expr domain, {serializer_prefix}_expr body]
-  | .forallE _ domain body info =>
+  | .forallE _ domain@_ body@_ info@_ =>
       Lean.Json.arr #[Lean.Json.str "forall",
         {serializer_prefix}_binderInfo info,
         {serializer_prefix}_expr domain, {serializer_prefix}_expr body]
-  | .letE _ type value body nonDependent =>
+  | .letE _ type@_ value@_ body@_ nonDependent@_ =>
       Lean.Json.arr #[Lean.Json.str "let",
         Lean.ToJson.toJson nonDependent,
         {serializer_prefix}_expr type, {serializer_prefix}_expr value,
         {serializer_prefix}_expr body]
-  | .lit literal =>
+  | .lit literal@_ =>
       Lean.Json.arr #[Lean.Json.str "lit",
         {serializer_prefix}_literal literal]
-  | .mdata _ body => {serializer_prefix}_expr body
-  | .proj typeName index projected =>
+  | .mdata _ body@_ => {serializer_prefix}_expr body
+  | .proj typeName@_ index@_ projected@_ =>
       Lean.Json.arr #[Lean.Json.str "proj",
         Lean.Json.str typeName.toString, Lean.ToJson.toJson index,
         {serializer_prefix}_expr projected]
@@ -9634,15 +9908,15 @@ private def {serializer_prefix}_prepare (source : String) (name : Lean.Name) :
   let stx ←
     match Lean.Parser.runParserCategory (← Lean.getEnv) `term
         ({serializer_prefix}_parserSource source name) with
-    | .ok stx => pure stx
-    | .error error => Lean.throwError error
+    | .ok stx@_ => pure stx
+    | .error error@_ => Lean.throwError error
   let stx : Lean.TSyntax `term := ⟨stx⟩
   let ident := Lean.mkIdent (`_root_ ++ name)
   let before ← Lean.getEnv
   Lean.Elab.Command.elabCommand (← `(command|
     noncomputable def $ident:ident (_miniStatement : $stx) := @_miniStatement))
   -- Never unfold a trusted declaration whose name happens to share a prefix.
-  for (introduced, _) in (← Lean.getEnv).constants.map₂.toList do
+  for (introduced@_, _) in (← Lean.getEnv).constants.map₂.toList do
     if name.isPrefixOf introduced && before.contains introduced then
       Lean.throwError "contract witness name collides with an existing declaration"
 
@@ -9651,28 +9925,22 @@ private def {serializer_prefix}_witnessName (source : String) : Lean.Name :=
 {witness_lookup}
   | _ => .anonymous
 
-private def {serializer_prefix}_isRecursiveAux (constant : Lean.Name) : Bool :=
-  ([{witness_prefixes}] : List Lean.Name).any fun name =>
-    name.isPrefixOf constant && constant != name
+private def {serializer_prefix}_isRecursiveAux
+    (env : Lean.Environment) (constant : Lean.Name) : Bool :=
+  !env.constants.map₁.contains constant &&
+    ([{witness_prefixes}] : List Lean.Name).any fun name =>
+      name.isPrefixOf constant && constant != name
 
 private def {serializer_prefix}_recursiveType (source : String) :
     Lean.Elab.Term.TermElabM Lean.Expr := do
   let name := {serializer_prefix}_witnessName source
   if name.isAnonymous then Lean.throwError "missing recursive contract witness"
-  let .defnInfo witness ← Lean.getConstInfo name
+  let .defnInfo witness@_ ← Lean.getConstInfo name
     | Lean.throwError "recursive contract witness is not a definition"
   let type ← Lean.Meta.lambdaTelescope witness.value fun params body => do
     if params.isEmpty || body != params.back! then
       Lean.throwError "recursive contract witness is not an identity"
     Lean.Meta.mkForallFVars params.pop (← Lean.Meta.inferType body)
-  -- Remove only fresh auxiliary constants. Their nonce names must never enter
-  -- persisted identities; trusted library constants retain existing semantics.
-  -- Lean may share a compiled matcher across witnesses in this batch.
-  let type ← Lean.Meta.deltaExpand type {serializer_prefix}_isRecursiveAux
-  if type.find? (fun expr => match expr with
-      | .const constant _ => {serializer_prefix}_isRecursiveAux constant
-      | _ => false) |>.isSome then
-    Lean.throwError "recursive contract auxiliary could not be serialized"
   pure type
 
 private def {serializer_prefix}_elabType (source : String) :
@@ -9681,8 +9949,8 @@ private def {serializer_prefix}_elabType (source : String) :
   let stx ←
     match Lean.Parser.runParserCategory (← Lean.getEnv) `term
         ({serializer_prefix}_parserSource source ({serializer_prefix}_witnessName source)) with
-    | .ok stx => pure stx
-    | .error error => Lean.throwError error
+    | .ok stx@_ => pure stx
+    | .error error@_ => Lean.throwError error
   let type ← Lean.Elab.Term.withoutErrToSorry do
     Lean.Elab.Term.elabType stx
   Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing
@@ -9690,6 +9958,17 @@ private def {serializer_prefix}_elabType (source : String) :
   let type ← if (← Lean.Elab.Term.getLetRecsToLift).isEmpty then
       pure type
     else {serializer_prefix}_recursiveType source
+  -- Ordinary match expressions also reuse compiled witness auxiliaries even
+  -- when no local recursive declarations remain to lift.
+  -- Remove only fresh auxiliary constants. Their nonce names must never enter
+  -- persisted identities; trusted library constants retain existing semantics.
+  -- Lean may share a compiled matcher across witnesses in this batch.
+  let isAux := {serializer_prefix}_isRecursiveAux (← Lean.getEnv)
+  let type ← Lean.Meta.deltaExpand type isAux
+  if type.find? (fun expr => match expr with
+      | .const constant@_ _ => isAux constant
+      | _ => false) |>.isSome then
+    Lean.throwError "recursive contract auxiliary could not be serialized"
   let type ← Lean.Elab.Term.levelMVarToParam type
   if type.hasMVar then
     Lean.throwError "statement type contains unresolved metavariables"
@@ -9702,10 +9981,10 @@ private def {serializer_prefix}_elabType (source : String) :
 private partial def {serializer_prefix}_contractTypeCore (type : Lean.Expr) :
     Lean.MetaM (Option Lean.Expr) := do
   match type with
-  | .forallE name domain body info =>
+  | .forallE name@_ domain@_ body@_ info@_ =>
       let proof ← Lean.Meta.isProp domain
       Lean.Meta.withLocalDecl name info domain fun localExpr => do
-        let some rest ←
+        let some rest@_ ←
           {serializer_prefix}_contractTypeCore (body.instantiate1 localExpr)
           | pure none
         if proof then
@@ -9747,8 +10026,8 @@ private def {serializer_prefix}_contractDefeq
     Lean.Elab.Term.TermElabM (Option Bool) := do
   try
     let other ← {serializer_prefix}_elabType source
-    let some left ← {serializer_prefix}_contractType type | pure none
-    let some right ← {serializer_prefix}_contractType other | pure none
+    let some left@_ ← {serializer_prefix}_contractType type | pure none
+    let some right@_ ← {serializer_prefix}_contractType other | pure none
     let left ← {serializer_prefix}_alphaType left
     let right ← {serializer_prefix}_alphaType right
     pure (some (← Lean.Meta.withNewMCtxDepth <| Lean.Meta.isDefEq left right))
@@ -9773,7 +10052,7 @@ private def {serializer_prefix}_contractDefeq
                             (
                                 f"    match ← {serializer_prefix}_defeq type "
                                 f"{json.dumps(other, ensure_ascii=False)} with",
-                                "    | some equal =>",
+                                "    | some equal@_ =>",
                                 "      defeqChecked := defeqChecked.push "
                                 f"(Lean.ToJson.toJson {other_index})",
                                 "      if equal then defeq := defeq.push "
@@ -9781,7 +10060,7 @@ private def {serializer_prefix}_contractDefeq
                                 "    | none => pure ()",
                                 f"    match ← {serializer_prefix}_contractDefeq type "
                                 f"{json.dumps(other, ensure_ascii=False)} with",
-                                "    | some equal =>",
+                                "    | some equal@_ =>",
                                 "      contractDefeqChecked := "
                                 "contractDefeqChecked.push "
                                 f"(Lean.ToJson.toJson {other_index})",
@@ -9799,14 +10078,14 @@ private def {serializer_prefix}_contractDefeq
                         for other in (raw_statements[other_index],)
                     ),
                     "    let normalizedType ← Lean.Meta.whnf type",
-                    f"    let (binders, conclusionDependencies) ← {serializer_prefix}_binders normalizedType",
+                    f"    let (binders@_, conclusionDependencies@_) ← {serializer_prefix}_binders normalizedType",
                     f"    let contractType ← {serializer_prefix}_contractType type",
                     "    let contractExpr := match contractType with",
-                    f"      | some value => {serializer_prefix}_expr value",
+                    f"      | some value@_ => {serializer_prefix}_expr value",
                     "      | none => Lean.Json.null",
                     "    let contractConclusionExpr ←",
                     "      match contractType with",
-                    "      | some contractType =>",
+                    "      | some contractType@_ =>",
                     "        pure <| "
                     f"{serializer_prefix}_expr (← Lean.Meta.whnf contractType)",
                     "      | none => pure Lean.Json.null",
@@ -9872,6 +10151,7 @@ private def {serializer_prefix}_contractDefeq
         # explicitly probe-prefixed above, but parser/runtime diagnostics that
         # bypass that catch may still be attributable from their source line.
         probe_line_ranges: list[tuple[int, int, int]] = []
+        shared_observer_range: tuple[int, int] | None = None
         next_line = 1
         probe_index_by_text = {
             probe: probe_statement_indices[index]
@@ -9879,6 +10159,8 @@ private def {serializer_prefix}_contractDefeq
         }
         for part in content_parts:
             line_count = max(1, part.count("\n") + 1)
+            if part == serializer:
+                shared_observer_range = (next_line, next_line + line_count - 1)
             probe_index = probe_index_by_text.get(part)
             if probe_index is not None:
                 probe_line_ranges.append(
@@ -9892,6 +10174,10 @@ private def {serializer_prefix}_contractDefeq
             content = content[:body_start] + f"\nset_option maxHeartbeats {max_heartbeats}\n" + content[body_start:]
             probe_line_ranges = [(start + 2, end + 2, index)
                                  for start, end, index in probe_line_ranges]
+            if shared_observer_range is not None:
+                shared_observer_range = tuple(
+                    line + 2 for line in shared_observer_range
+                )
         content_built_at = time.monotonic()
         execution_started = content_built_at
         remaining_operation_s = operation_deadline - time.monotonic()
@@ -10240,8 +10526,8 @@ private def {serializer_prefix}_contractDefeq
         # Large structural-contract JSON markers contain many colons and must
         # not participate in diagnostic regex backtracking.
         diagnostic_header_re = re.compile(
-            r"^.{0,4096}?:(?P<line>\d+):\d+:\s+"
-            r"(?:error|warning)(?:\([^\r\n)]*\))?:"
+            r"^(?P<file>.{0,4096}?):(?P<line>\d+):\d+:\s+"
+            r"(?P<severity>error|warning)(?:\([^\r\n)]*\))?:"
         )
         attributed: list[str] = []
         output_lines = output.splitlines()
@@ -10274,6 +10560,23 @@ private def {serializer_prefix}_contractDefeq
                 block_lines.append(continuation)
                 continuation_index += 1
             block = "\n".join(block_lines).strip()
+            owned_file = _path is not None and match.group("file") == str(_path)
+            if match.group("severity") != "error" or (
+                _path is not None and not owned_file
+            ):
+                line_index = continuation_index
+                continue
+            # Only an error in this generated observer is shared. Preamble,
+            # imported-file and statement preparation failures have different
+            # owners; a secondary per-probe sorry error must not hide this cause.
+            if (
+                owned_file
+                and shared_observer_range is not None
+                and shared_observer_range[0] <= source_line <= shared_observer_range[1]
+            ):
+                attributed.append(f"MINI_CONTRACT_SHARED_DIAGNOSTIC: {block}")
+                line_index = continuation_index
+                continue
             named_probe = re.search(
                 r"mini_contract_identity_[0-9a-f]+_(\d+):",
                 block,
@@ -10285,7 +10588,7 @@ private def {serializer_prefix}_contractDefeq
                     (
                         index
                         for start, end, index in probe_line_ranges
-                        if start <= source_line <= end
+                        if owned_file and start <= source_line <= end
                     ),
                     None,
                 )

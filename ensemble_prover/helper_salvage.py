@@ -1872,9 +1872,11 @@ class HelperSalvager:
         check_lemmas: Sequence[str],
         preamble: str,
     ) -> Any:
+        from .helper_utilization import declaration_usage_kwargs
         kwargs = {
             "preamble_override": preamble,
             "check_kind": "full",
+            **declaration_usage_kwargs(self.lean, tuple(check_lemmas[-1:])),
         }
         if self.timeout_s is not None:
             kwargs["timeout_s"] = self.timeout_s
@@ -2274,6 +2276,13 @@ class HelperSalvager:
                 if recorded is None:
                     result.rejected.append(f"{name}:record_rejected")
                     continue
+                from .helper_utilization import record_runner_declaration_utilization
+                record_runner_declaration_utilization(
+                    self.lean, dossier, source=src, statement=self.true_statement,
+                    proof=self.true_proof,
+                    preamble=self.answer_safe_preamble if self._answer_safe_preamble_differs() else self.preamble,
+                    lemmas=check_lemmas,
+                )
                 if callable(self.verified_helper_accept_callback):
                     try:
                         self.verified_helper_accept_callback(recorded, dossier)

@@ -5374,7 +5374,7 @@ async def _run_check_lean_tool(
     context_lemmas: Sequence[str] = (),
     args: Dict[str, Any],
     redact_solution_refs: bool = True,
-    timeout_s: float = 10.0,
+    timeout_s: float | None = None,
 ) -> str:
     """Run answer-safe #check/#print queries without proof-state effects."""
     from .deadline_guard import await_with_strict_deadline
@@ -5388,82 +5388,81 @@ async def _run_check_lean_tool(
             "not supported by this tool."
         )
 
-    try:
-        adapter_timeout_s = max(0.05, float(timeout_s or 10.0))
-    except (TypeError, ValueError):
-        adapter_timeout_s = 10.0
-    configured_timeout_s = None
-    for raw in (
-        getattr(getattr(lean, "cfg", None), "timeout_s", None),
-        getattr(lean, "timeout_s", None),
-    ):
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if value > 0.0:
-            configured_timeout_s = value
+    from .lean_runner import _SAFE_CHECK_NAME_RE, _lean_inspection_timeout_s
+
+    budget_s = _lean_inspection_timeout_s(lean, timeout_s)
+    deadline = time.monotonic() + budget_s
+    frozen_lemmas = tuple(context_lemmas or ())
+    results: list[str] = []
+    cursor = 0
+    while cursor < len(queries):
+        kind, query = queries[cursor]
+        end = cursor + 1
+        batch = getattr(lean, "inspect_declarations", None)
+        use_batch = callable(batch) and bool(_SAFE_CHECK_NAME_RE.fullmatch(query))
+        if use_batch:
+            while end < len(queries) and _SAFE_CHECK_NAME_RE.fullmatch(queries[end][1]):
+                end += 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            results.extend([
+                "Note: inspection unavailable (shared tool deadline exhausted; no declaration verdict)."
+            ] * (len(queries) - cursor))
             break
-    # Keep the advertised adapter budget. The controller may wait as long as
-    # the Lean runner's configured check so a late successful #check is not
-    # discarded when the adapter swallows cancellation. This does not take
-    # the proof-state Lean lock: #check is oracle work and must not defer a
-    # later try_lean or reject just because a cancelled tail still holds it.
-    controller_timeout_s = adapter_timeout_s
-    if configured_timeout_s is not None:
-        controller_timeout_s = max(adapter_timeout_s, configured_timeout_s)
+        try:
+            if use_batch:
+                values = await await_with_strict_deadline(
+                    batch(
+                        queries[cursor:end], preamble_override=preamble,
+                        lemmas=frozen_lemmas, timeout_s=remaining,
+                        allow_solution_refs=not redact_solution_refs,
+                    ),
+                    timeout_s=remaining, operation_label="mini_tool_check_lean",
+                    operation_ownership="result_only",
+                )
+                if not isinstance(values, (list, tuple)) or len(values) != end - cursor:
+                    values = ["Note: inspection unavailable (invalid batch response; no declaration verdict)."] * (end - cursor)
+                results.extend(str(value) for value in values)
+            else:
+                error = ""
+                inspector = getattr(lean, "print_declaration", None) if kind == "print" else lean.check_term_type
+                if kind == "print":
+                    _name, error = LeanRunner._normalize_print_declaration_name(
+                        query, allow_solution_refs=not redact_solution_refs,
+                    )
+                    if not error and not callable(inspector):
+                        error = "Note: definition inspection unavailable (adapter does not support #print)"
+                if error:
+                    results.append(error)
+                else:
+                    kwargs: Dict[str, Any] = {
+                        "preamble_override": preamble,
+                        "lemmas": list(frozen_lemmas), "timeout_s": remaining,
+                    }
+                    if kind == "print":
+                        kwargs["allow_solution_refs"] = not redact_solution_refs
+                    result = await await_with_strict_deadline(
+                        inspector(query, **kwargs), timeout_s=remaining,
+                        operation_label="mini_tool_check_lean", operation_ownership="result_only",
+                    )
+                    results.append(str(result or ""))
+        except asyncio.TimeoutError:
+            results.extend([
+                "Note: inspection unavailable (shared tool deadline exceeded; no declaration verdict)."
+            ] * (end - cursor))
+        except Exception as exc:
+            safe_exc_type = _prompt_safe_inline_text(
+                type(exc).__name__, limit=120, redact_solution_refs=redact_solution_refs,
+            )
+            safe_exc = _prompt_safe_inline_text(
+                exc, limit=500, redact_solution_refs=redact_solution_refs,
+            )
+            results.extend([f"Error: {safe_exc_type}: {safe_exc}"] * (end - cursor))
+        cursor = end
 
     label = "inspection(s)" if any(kind == "print" for kind, _ in queries) else "check(s)"
     lines: List[str] = [f"{len(queries)} {label}:"]
-    for i, (kind, query) in enumerate(queries, 1):
-        try:
-            error = ""
-            inspector = (
-                getattr(lean, "print_declaration", None)
-                if kind == "print" else lean.check_term_type
-            )
-            if kind == "print":
-                _name, error = LeanRunner._normalize_print_declaration_name(
-                    query, allow_solution_refs=not redact_solution_refs,
-                )
-                if not error and not callable(inspector):
-                    error = "Note: definition inspection unavailable (adapter does not support #print)"
-            if error:
-                result = error
-            else:
-                kwargs: Dict[str, Any] = {
-                    "preamble_override": preamble,
-                    "lemmas": list(context_lemmas or []),
-                    "timeout_s": adapter_timeout_s,
-                }
-                if kind == "print":
-                    kwargs["allow_solution_refs"] = not redact_solution_refs
-                result = await await_with_strict_deadline(
-                    inspector(
-                        query,
-                        **kwargs,
-                    ),
-                    timeout_s=controller_timeout_s,
-                    operation_label="mini_tool_check_lean",
-                    operation_ownership="result_only",
-                )
-        except asyncio.TimeoutError:
-            result = f"Note: {'definition' if kind == 'print' else 'type'} information unavailable (verifier busy)"
-        except Exception as exc:
-            safe_exc_type = _prompt_safe_inline_text(
-                type(exc).__name__,
-                limit=120,
-                redact_solution_refs=redact_solution_refs,
-            )
-            safe_exc = _prompt_safe_inline_text(
-                exc,
-                limit=500,
-                redact_solution_refs=redact_solution_refs,
-            )
-            result = (
-                f"Error: {safe_exc_type}: "
-                f"{safe_exc}"
-            )
+    for i, ((kind, query), result) in enumerate(zip(queries, results), 1):
         result = str(result or "").strip() or "Error: no output"
         result = _prompt_safe_lean_diagnostic_text(
             result,
@@ -10069,6 +10068,13 @@ async def run_conversation(
                     )
                     if helper_record is None:
                         continue
+                    from .helper_utilization import record_runner_declaration_utilization
+
+                    record_runner_declaration_utilization(
+                        lean, dossier, source=helper, statement=conv.goal_statement,
+                        proof=proof, preamble=str(getattr(conv, "lean_preamble", "") or ""),
+                        lemmas=check_lemmas,
+                    )
                     if (
                         prior_helper is not None
                         and verified_helper_semantic_statement_changed(

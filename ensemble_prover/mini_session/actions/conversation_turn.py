@@ -1065,6 +1065,9 @@ def _propagate_route_scoped_tool_helpers(
                         pass
                 continue
             added.append(recorded_name)
+    from ...helper_utilization import transfer_declaration_utilization
+
+    transfer_declaration_utilization(source_dossier, target_dossier, added)
     return added
 
 
@@ -4642,7 +4645,10 @@ async def _check_graph_native_formalization_replay(
     lean: Any,
     conv: Any,
     replay_helpers: Sequence[str],
+    usage_sources: Sequence[str] = (),
 ) -> Any:
+    from ...helper_utilization import declaration_usage_kwargs
+
     try:
         return await lean.check(
             "True",
@@ -4650,6 +4656,7 @@ async def _check_graph_native_formalization_replay(
             list(replay_helpers),
             preamble_override=str(getattr(conv, "preamble", "") or ""),
             check_kind="graph_native_formalization_helper",
+            **declaration_usage_kwargs(lean, usage_sources),
         )
     except TypeError:
         return await lean.check(
@@ -6800,6 +6807,7 @@ async def _run_graph_native_formalization_helper_contract(
             lean=lean,
             conv=conv,
             replay_helpers=candidate_replay_helpers,
+            usage_sources=[*pre_replay_dependency_blocks, candidate],
         )
         if not bool(getattr(result, "ok", False)):
             replay_only_prefix_names = _replay_only_prefix_names(
@@ -7161,6 +7169,7 @@ async def _run_graph_native_formalization_helper_contract(
                     lean=lean,
                     conv=conv,
                     replay_helpers=dependency_replay_helpers,
+                    usage_sources=[dependency_block],
                 )
                 if not bool(getattr(dependency_replay, "ok", False)):
                     dependency_banking_failed = True
@@ -7187,6 +7196,13 @@ async def _run_graph_native_formalization_helper_contract(
                 dependency_banking_failed = True
                 last_failure = "same-turn helper dependency policy rejected"
                 break
+            from ...helper_utilization import record_runner_declaration_utilization
+
+            record_runner_declaration_utilization(
+                lean, dossier, source=dependency_block, statement="True",
+                proof="by\n  trivial", preamble=str(getattr(conv, "preamble", "") or ""),
+                lemmas=dependency_replay_helpers if replay_only_failure_names else candidate_replay_helpers,
+            )
             _stage_verified_helper_receipt(session, dependency_record, dossier)
             if dependency_record.name not in candidate_support_names:
                 candidate_support_names.append(dependency_record.name)
@@ -7219,6 +7235,7 @@ async def _run_graph_native_formalization_helper_contract(
                 lean=lean,
                 conv=conv,
                 replay_helpers=candidate_standalone_replay_helpers,
+                usage_sources=[candidate],
             )
             if not bool(getattr(candidate_standalone, "ok", False)):
                 last_failure = (
@@ -7269,6 +7286,13 @@ async def _run_graph_native_formalization_helper_contract(
         if helper_record is None:
             last_failure = "verified helper policy rejected the declaration"
             continue
+        from ...helper_utilization import record_runner_declaration_utilization
+
+        record_runner_declaration_utilization(
+            lean, dossier, source=candidate, statement="True", proof="by\n  trivial",
+            preamble=str(getattr(conv, "preamble", "") or ""),
+            lemmas=candidate_standalone_replay_helpers if replay_only_failure_names else candidate_replay_helpers,
+        )
         _stage_verified_helper_receipt(session, helper_record, dossier)
         helper_name = helper_record.name
         helper_is_negative_evidence = (
@@ -20002,6 +20026,14 @@ class ConversationTurnAction:
                     )
                     if helper_record is None:
                         continue
+                    from ...helper_utilization import record_runner_declaration_utilization
+
+                    record_runner_declaration_utilization(
+                        session.lean, dossier, source=helper,
+                        statement=selected_goal_statement_override or conv.goal_statement,
+                        proof=proof, preamble=str(getattr(conv, "lean_preamble", "") or ""),
+                        lemmas=check_lemmas,
+                    )
                     _stage_verified_helper_receipt(session, helper_record, dossier)
                     if (
                         prior_helper is not None

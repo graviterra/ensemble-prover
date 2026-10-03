@@ -858,6 +858,7 @@ async def _run_try_lean_tool_impl(
                 live = None
             if live is not None:
                 checker = live
+        from .helper_utilization import declaration_usage_kwargs
         try:
             return await checker.check(
                 check_goal_statement,
@@ -867,6 +868,7 @@ async def _run_try_lean_tool_impl(
                 timeout_s=timeout_s,
                 max_heartbeats=max_heartbeats,
                 check_kind="full",
+                **declaration_usage_kwargs(checker, (code,) if declaration_mode else ()),
             )
         except TypeError:
             pass
