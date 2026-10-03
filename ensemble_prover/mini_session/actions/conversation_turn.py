@@ -8862,6 +8862,7 @@ class ConversationTurnAction:
         formalization_llm_request_timeout_s: float = 0.0,
         formalization_llm_turn_elapsed_s: float = 0.0,
         provider_dispatch_limit: int = 0,
+        speculative_followthrough_only: bool = False,
     ) -> None:
         self.role = str(role or "prove")
         self.id = f"conversation_turn_{self.role}"
@@ -8891,6 +8892,7 @@ class ConversationTurnAction:
             formalization_llm_turn_elapsed_s or 0.0
         )
         self.provider_dispatch_limit = max(0, int(provider_dispatch_limit or 0))
+        self.speculative_followthrough_only = bool(speculative_followthrough_only)
         self._answer_safe_recheck_pending: Dict[str, Any] = {}
         self._answer_safe_recheck_parked: Dict[str, Dict[str, Any]] = {}
         self._answer_safe_recheck_held_terminal_provider_failure: Dict[
@@ -11789,6 +11791,42 @@ class ConversationTurnAction:
                     portfolio["native_research_advice"] = identity
         return portfolio
 
+    def _speculative_followthrough_ready(self, session: Any) -> bool:
+        """Allow the reserved response only for checked feedback or tool results."""
+
+        metadata = dict(getattr(session, "last_action_outcome_metadata", {}) or {})
+        target = str(getattr(getattr(session, "conv", None), "goal_statement", "") or "").strip()
+        ticket = getattr(session, "pending_repair_ticket", None)
+        if (
+            metadata.get("local_repair_target")
+            and metadata.get("lean_verdict") == "lean_rejected"
+            and ticket is not None
+            and not bool(getattr(ticket, "exhausted", True))
+            and str(getattr(ticket, "source_action_id", "") or "") == self.id
+            and str(getattr(ticket, "target_statement", "") or "").strip() == target
+            and bool(metadata.get("repair_ticket_id"))
+            and metadata["repair_ticket_id"] == str(getattr(ticket, "ticket_id", "") or "")
+            and bool(metadata.get("lean_failure_signature"))
+            and metadata["lean_failure_signature"] == str(getattr(ticket, "failure_signature", "") or "")
+        ):
+            return True
+        if not metadata.get("speculative_closure_inspection_completed"):
+            return False
+        try:
+            checkpoint = self._validated_provider_quantum_checkpoint(
+                self._provider_quantum_checkpoint,
+                conv=session.conv,
+                expected_target=target,
+            )
+            if not checkpoint:
+                return False
+            record = self._rehydrate_provider_quantum_selected_work_record(
+                checkpoint["binding"].get("selected_work_record"), target=target,
+            )
+            return checkpoint["binding"]["repair_cycle"] == _provider_repair_cycle_identity(session, record)
+        except StateSnapshotCompatibilityError:
+            return False
+
     def is_applicable(self, session: Any) -> bool:
         if session.conv is None or session.lean is None:
             return False
@@ -11828,6 +11866,11 @@ class ConversationTurnAction:
             )
             >= self.provider_dispatch_limit
         ):
+            return False
+        if self.speculative_followthrough_only and max(
+            int(getattr(session, "provider_dispatches_started_total", 0) or 0),
+            int(getattr(session, "provider_calls_completed_total", 0) or 0),
+        ) >= 1 and not self._speculative_followthrough_ready(session):
             return False
         if (
             self.has_answer_safe_terminal_provider_failure()
@@ -16172,6 +16215,21 @@ class ConversationTurnAction:
                     "llm_failure_reason": structured_failure_reason_text,
                     "provider_yield_reason": provider_yield_reason,
                     "llm_retryable": llm_retryable,
+                    "speculative_closure_inspection_completed": bool(
+                        self.speculative_followthrough_only
+                        and cooperative_provider_yield
+                        and any(
+                            isinstance(entry, Mapping)
+                            and entry.get("name") in {
+                                "check_lean", "search_mathlib", "try_lean",
+                                "apply_decl_to_goal", "compute_examples",
+                            }
+                            and entry.get("execution_disposition") == "completed_semantic"
+                            and entry.get("protocol_attempted") is not False
+                            and entry.get("json_parsed") is not False
+                            for entry in loop_tool_call_log
+                        )
+                    ),
                     "terminal_failure": bool(terminal_failure),
                     "terminal_failure_reason": terminal_failure_reason,
                     "scoped_failure_reason": scoped_failure_reason,

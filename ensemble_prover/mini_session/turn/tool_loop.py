@@ -3759,13 +3759,10 @@ async def _call_llm_with_tools_one_round_impl(
             _validate_selected_proof_idea_dispatch_context(rendered, dossier)
         return rendered
 
-    # The first snapshot is observability initialization. The request-path
-    # invocation inside the outer exception boundary below performs the
-    # authoritative immediately-before-dispatch validation.
-    sent_messages = _messages_with_current_context(
-        conv.messages_for_llm(),
-        validate_selected_context=False,
-    )
+    # Keep a transcript for failures before dispatch without rebuilding the
+    # full mathematical context twice. The request path below renders and
+    # validates the current context immediately before each provider call.
+    sent_messages = list(conv.messages_for_llm())
 
     def _set_repair_self_check_gap(*, budget_exhausted: bool = False) -> str:
         nonlocal repair_self_check_budget_exhausted, repair_self_check_status

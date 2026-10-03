@@ -2710,6 +2710,27 @@ def _dossier_statements_root_adjacent(
     *,
     conclusion_bound_names: Sequence[str] = (),
 ) -> bool:
+    from .proof_graph import _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS, _large_lexical_result
+
+    names = tuple(conclusion_bound_names)
+    if max(len(conclusion), len(root_statement)) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+        return _large_lexical_result(
+            ("dossier_root_adjacency", conclusion, root_statement, names),
+            lambda: _uncached_dossier_statements_root_adjacent(
+                conclusion, root_statement, conclusion_bound_names=names,
+            ),
+        )
+    return _uncached_dossier_statements_root_adjacent(
+        conclusion, root_statement, conclusion_bound_names=names,
+    )
+
+
+def _uncached_dossier_statements_root_adjacent(
+    conclusion: str,
+    root_statement: str,
+    *,
+    conclusion_bound_names: Sequence[str] = (),
+) -> bool:
     from .mini_falsification.generators import _right_pi_term_mentions_dependency
 
     # Unused outer binders must not shift the indices assigned to inner

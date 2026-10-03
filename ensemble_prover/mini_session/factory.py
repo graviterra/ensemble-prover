@@ -7139,6 +7139,11 @@ async def _mini_session_run_conversation_callback(
     speculative_operational_probe = bool(
         kwargs.get("speculative_root_close_operational_probe", False)
     )
+    if speculative_operational_probe:
+        # Two responses share the same enclosing wall deadline. The second
+        # requires useful tool results or a concrete Lean rejection.
+        max_turns = 2
+        conv.turn_budget = max_turns
     raw_child_tool_cap = max(
         0,
         int(kwargs.get("recursive_conversation_max_tool_calls", 10) or 0),
@@ -7875,7 +7880,8 @@ async def _mini_session_run_conversation_callback(
             max_turns_for_budget=max_turns,
             llm_turn_elapsed_s=_client_llm_turn_elapsed_budget_s(client),
             formalization_llm_turn_elapsed_s=_client_llm_turn_elapsed_budget_s(client),
-            provider_dispatch_limit=(1 if speculative_operational_probe else 0),
+            provider_dispatch_limit=(2 if speculative_operational_probe else 0),
+            speculative_followthrough_only=speculative_operational_probe,
         )
     )
     session.set_budget(

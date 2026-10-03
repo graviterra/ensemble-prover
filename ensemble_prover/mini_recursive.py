@@ -14637,6 +14637,8 @@ async def _repair_contract_identity_statements(
     operation_timeout_s: float,
     max_repairs: int = 4,
     max_empty_retries: int = 2,
+    replay_only: bool = False,
+    answer_safe_preamble: str = "",
     suppress_solution_placeholders: Optional[bool] = None,
     opaque_mode: bool = True,
     allow_official_answer_visibility: bool = False,
@@ -14651,8 +14653,14 @@ async def _repair_contract_identity_statements(
         ]
     ] = None,
 ) -> MiniSubgoalPlan:
-    """Make bounded, cost-metered statement repairs for failed claims."""
+    """Make bounded repairs; durable reservations prevent paid replay on resume.
 
+    Completed indices include dispatched calls whose outcome is unavailable.
+    Only an explicitly funded empty-response retry reopens an obligation.
+    """
+
+    if replay_only:
+        return plan
     repaired_claims = list(plan.claims)
     attempts = max(
         len(completed_repair_indices),
@@ -14769,6 +14777,24 @@ async def _repair_contract_identity_statements(
         )
         attempts += 1
         stats.contract_identity_statement_repairs_attempted += 1
+        # Reserve before dispatch: cancellation or a crash after provider billing
+        # must not make the same obligation silently eligible on restoration.
+        completed_indices.add(index)
+        _record(record_event, {
+            "phase": "mini_recursive_plan_dependency_contract_identity",
+            "pass_index": pass_index,
+            "claim_name": claim.name,
+            "claim_index": index,
+            "attempts_used": attempts,
+            "verdict": "contract_identity_statement_repair_dispatch_reserved",
+        })
+        if progress_callback is not None:
+            await progress_callback(
+                dataclass_replace(plan, claims=tuple(repaired_claims)),
+                tuple(sorted(completed_indices)),
+                attempts,
+                dict(retry_counts),
+            )
         prompt_safe_diagnostic = _prompt_safe_lean_diagnostic_text(
             diagnostic,
             limit=1800,
@@ -14783,12 +14809,22 @@ async def _repair_contract_identity_statements(
                     "corrected bare proposition: no declaration, proof, markdown, "
                     "or explanation. Preserve its mathematical meaning and binders. "
                     "Never add assumptions. Never pass implicit/instance arguments "
-                    "explicitly; for example use Function.Injective f."
+                    "explicitly; for example use Function.Injective f. "
+                    "Use only notation enabled by the supplied context; when a "
+                    "scope is unavailable, use the fully qualified type or term."
                 ),
             },
             {
                 "role": "user",
                 "content": (
+                    "Available answer-safe Lean context:\n"
+                    + (_prompt_safe_lean_diagnostic_text(
+                        answer_safe_preamble,
+                        limit=12000,
+                        redact_solution_refs=redact_solution_refs,
+                        preserve_line_breaks=True,
+                    ) or "(not supplied)")
+                    + "\n\n"
                     f"Original proposition:\n{analyzed_statement}\n\n"
                     f"Lean diagnostic:\n{prompt_safe_diagnostic}\n\n"
                     "Return the minimally corrected Lean proposition."
@@ -14858,6 +14894,7 @@ async def _repair_contract_identity_statements(
             )
         if not candidate:
             if not call_completed:
+                retry_counts.pop(repair_key_by_index[index], None)
                 if progress_callback is not None:
                     await progress_callback(
                         dataclass_replace(plan, claims=tuple(repaired_claims)),
@@ -14877,6 +14914,7 @@ async def _repair_contract_identity_statements(
                 and attempts < aggregate_repair_budget
             )
             if retry_available:
+                completed_indices.discard(index)
                 pending_indices.append((index, True))
                 retry_counts[repair_key] = retry_counts.get(repair_key, 0) + 1
             _record(
@@ -16383,10 +16421,11 @@ def _filter_plan_declared_sanity_contract(
         withhold = bool(
             withhold_missing_required_checks
             and require_complete
-            # A missing required receipt is observable protocol incompleteness.
-            # Interpreting an existing check through English/numeric regexes
-            # is not: outside-premise examples, contradiction arguments and
-            # alternate assignment notation must still reach formal checks.
+            # Source spelling is only guidance: nested type annotations,
+            # library names and definitional aliases defeat lexical numeric
+            # classification. Only an explicitly declared counting contract
+            # can impose a missing-receipt protocol requirement.
+            and "explicit_counting_classification" in requirement.triggers
             and reason == "sanity_check_required"
             and int(getattr(claim, "sanity_contract_version", 0) or 0) >= 1
         )
@@ -18406,6 +18445,12 @@ async def run_mini_recursive_attempt(
 
     def record_event(record: dict[str, Any]) -> Any:
         record.setdefault(
+            "session_scope",
+            "subgoal" if suppress_root_solved or recursion_depth > 0 else "problem",
+        )
+        record.setdefault("target_theorem_name", theorem_name)
+        record.setdefault("recursion_depth", recursion_depth)
+        record.setdefault(
             "recursive_attempt_activation_id",
             recursive_attempt_activation_id,
         )
@@ -20238,16 +20283,18 @@ async def run_mini_recursive_attempt(
         )
         if speculative_operational_probe:
             root_close_request += (
-                " This probe has one model response. Submit the complete root "
-                "proof in that response"
+                " Prefer submitting the complete root "
+                "proof in your first response"
                 + (
                     ", either in a Lean code block or in a try_lean call "
                     "containing the full proof"
                     if try_lean_tool_enabled
                     else " in a Lean code block"
                 )
-                + ". Tool results are checked, but there is no later model "
-                "response to read lookup results or repair a rejected proof."
+                + ". One bounded follow-up response may consume completed "
+                "inspection results or repair a concrete Lean rejection. Both "
+                "responses share the original time limit; no further "
+                "continuation is available."
             )
         close_conv.append_user(root_close_request)
         if helper_context_blocks:
@@ -21289,6 +21336,7 @@ async def run_mini_recursive_attempt(
             ),
             cost_controller=cost_controller,
             enforce_root_finalization_contract=not suppress_root_solved,
+            recursion_depth=recursion_depth,
             progress_callback=progress_callback,
             helper_accept_yield_enabled=helper_accept_yield_enabled,
             continuation_state=continuation_state,
@@ -21912,6 +21960,7 @@ async def run_mini_recursive_driver(
     record_invalidated_statement: Optional[Callable[[str, str], None]] = None,
     cost_controller: Any = None,
     enforce_root_finalization_contract: bool = True,
+    recursion_depth: int = 0,
     prove_root_close: Optional[ProveRootCloseFn] = None,
     progress_callback: Optional[ProgressCallback] = None,
     helper_accept_yield_enabled: bool = False,
@@ -21948,6 +21997,13 @@ async def run_mini_recursive_driver(
             # Child campaigns retain their own identity when callbacks nest.
             return campaign_record_event({
                 "recursive_campaign_id": stats.campaign_id,
+                "session_scope": (
+                    "subgoal"
+                    if recursion_depth > 0 or not enforce_root_finalization_contract
+                    else "problem"
+                ),
+                "target_theorem_name": theorem_name,
+                "recursion_depth": recursion_depth,
                 **event,
             })
 
@@ -24741,7 +24797,7 @@ async def run_mini_recursive_driver(
                     else 0.0
                 ),
                 "speculative_provider_dispatch_limit": (
-                    1 if speculative_assembly else 0
+                    2 if speculative_assembly else 0
                 ),
                 "verdict": "llm_root_close_started",
             },
@@ -24781,7 +24837,8 @@ async def run_mini_recursive_driver(
                 "after_helper": after_helper,
             }
             if speculative_assembly:
-                # The speculative post-helper synthesis probe gets one turn.
+                # A bounded follow-up may consume inspection or concrete Lean
+                # repair feedback within the same absolute deadline.
                 # Route-ready/certificate closes retain their configured multi-turn
                 # budget. Pass the optional governor only to callbacks that declare it,
                 # preserving compatibility with the five-keyword callback contract.
@@ -24789,7 +24846,7 @@ async def run_mini_recursive_driver(
                     prove_root_close,
                     "max_conversation_turns",
                 ):
-                    root_close_kwargs["max_conversation_turns"] = 1
+                    root_close_kwargs["max_conversation_turns"] = 2
                 if _callable_accepts_keyword(
                     prove_root_close,
                     "speculative_operational_probe",
@@ -27472,6 +27529,11 @@ async def run_mini_recursive_driver(
                     opaque_mode=opaque_mode,
                     allow_official_answer_visibility=(allow_official_answer_visibility),
                     official_answer_payload_present=(official_answer_payload_present),
+                    # Reconstructing a pending/adopted replan is pure replay.
+                    # Older checkpoints may lack terminal failure indices; they
+                    # still must not dispatch provider calls behind a muted sink.
+                    replay_only=replaying_contract_replan_filters,
+                    answer_safe_preamble=current_answer_safe_preamble(),
                     completed_repair_indices=frozenset(
                         contract_repair_progress_indices
                     ),

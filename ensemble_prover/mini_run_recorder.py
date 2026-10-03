@@ -3220,6 +3220,12 @@ class RunRecorder:
         elapsed = record.get("elapsed_s")
         elapsed_part = f" t={elapsed}s" if elapsed is not None else ""
 
+        if phase == "worker_startup":
+            stage = " ".join(str(record.get("stage") or "unknown").split())[:100]
+            duration = record.get("stage_elapsed_s")
+            duration_part = f" duration={duration}s" if duration is not None else ""
+            return [f"[worker_startup]{elapsed_part} stage={stage}{duration_part} verdict={verdict}"]
+
         if phase == "session_iteration":
             return [
                 "[session]"
@@ -3319,9 +3325,19 @@ class RunRecorder:
             phase_label = phase or "record"
             if scope and scope != "problem":
                 phase_label = f"{scope} {phase_label}"
+            root_scope_part = ""
+            if phase.startswith("mini_recursive_") and (
+                "root" in phase or phase == "mini_recursive_complete"
+            ):
+                target_name = " ".join(str(record.get("target_theorem_name") or "").split())
+                if target_name:
+                    root_scope_part += " target=" + json.dumps(target_name[:160], ensure_ascii=False)
+                depth = record.get("recursion_depth")
+                if isinstance(depth, int) and not isinstance(depth, bool) and depth >= 0:
+                    root_scope_part += f" depth={depth}"
             lines.append(
                 f"[{phase_label}]{elapsed_part}{turn_part}"
-                f" verdict={verdict}{error}{reason_part}{helper_part}{tools_part}{lean_part}"
+                f" verdict={verdict}{root_scope_part}{error}{reason_part}{helper_part}{tools_part}{lean_part}"
             )
 
         # MiniSession conversation turns do not otherwise print assistant

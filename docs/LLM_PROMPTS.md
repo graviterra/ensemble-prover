@@ -1,6 +1,6 @@
 # LLM prompt reference
 
-Last updated: 2026-10-02.
+Last updated: 2026-10-03.
 
 This document shows Ensemble Prover’s built-in LLM prompts and where they are
 defined. The system messages below are reproduced in full, including expanded
@@ -1132,7 +1132,7 @@ a mathematical certificate of natural-language equivalence.
 Source: [ensemble_prover/mini_recursive.py](../ensemble_prover/mini_recursive.py#L14634) — `_repair_contract_identity_statements`.
 
 ```text
-Repair one Lean proposition's type syntax. Return ONLY the corrected bare proposition: no declaration, proof, markdown, or explanation. Preserve its mathematical meaning and binders. Never add assumptions. Never pass implicit/instance arguments explicitly; for example use Function.Injective f.
+Repair one Lean proposition's type syntax. Return ONLY the corrected bare proposition: no declaration, proof, markdown, or explanation. Preserve its mathematical meaning and binders. Never add assumptions. Never pass implicit/instance arguments explicitly; for example use Function.Injective f. Use only notation enabled by the supplied context; when a scope is unavailable, use the fully qualified type or term.
 ```
 
 <a id="prompt-23"></a>
@@ -2493,6 +2493,9 @@ Source: [ensemble_prover/mini_recursive.py](../ensemble_prover/mini_recursive.py
 Complete inline message template. Braces containing Python expressions identify runtime substitutions.
 
 ```text
+Available answer-safe Lean context:
+{sanitized answer_safe_preamble, or '(not supplied)'}
+
 Original proposition:
 {analyzed_statement}
 
@@ -4049,6 +4052,18 @@ Complete instruction fragment from this conditional builder. The source determin
 
 ```text
 Close the root theorem `{theorem_name}` stated above. {certificate_note} Submit exactly one Lean proof body.
+```
+
+Speculative closure appends the following instruction when `try_lean` is enabled:
+
+```text
+ Prefer submitting the complete root proof in your first response, either in a Lean code block or in a try_lean call containing the full proof. One bounded follow-up response may consume completed inspection results or repair a concrete Lean rejection. Both responses share the original time limit; no further continuation is available.
+```
+
+When `try_lean` is disabled, the appended instruction is:
+
+```text
+ Prefer submitting the complete root proof in your first response in a Lean code block. One bounded follow-up response may consume completed inspection results or repair a concrete Lean rejection. Both responses share the original time limit; no further continuation is available.
 ```
 
 <a id="prompt-183"></a>

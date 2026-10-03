@@ -8989,8 +8989,8 @@ run_cmd Lean.Elab.Command.liftTermElabM do
         """Run a partial proof and return an atomic typed residual receipt.
 
         The residual goals come directly from ``Lean.Elab.runTactic``. Each
-        goal is closed over the tactic-created local context, fully explicitly
-        delaborated, reparsed as a standalone type in this same Lean command,
+        goal is closed over the tactic-created local context, compactly
+        delaborated with an explicit fallback, reparsed as a standalone type,
         and required to be definitionally equal to the original closed
         ``Expr`` before the nonce-bound batch marker is emitted.
 
@@ -9470,30 +9470,45 @@ private def {serializer_prefix}_elabType
                 '          Lean.throwError "residual goal did not close"',
                 "        if closed.hasSorry then",
                 '          Lean.throwError "residual goal contains sorry"',
-                "        let rendered ← Lean.withOptions (fun options =>",
-                "          options",
-                "            |>.setBool `pp.fullNames true",
-                "            |>.setBool `pp.explicit true",
-                "            |>.setBool `pp.universes true",
-                "            |>.setBool `pp.piBinderTypes true",
-                "            |>.setBool `pp.funBinderTypes true",
-                "            |>.setBool `pp.deepTerms true",
-                "            |>.setBool `pp.proofs true",
-                "            |>.set `pp.maxSteps (1000000 : Nat)) do",
-                "          Lean.Meta.ppExpr closed",
-                f"        if rendered.pretty.length > {_LEAN_RESIDUAL_SOURCE_MAX_CHARS} then",
-                '          Lean.throwError "residual source exceeded size limit"',
+                "        let renderSource (explicit : Bool) : Lean.Elab.Term.TermElabM String := do",
+                "          let messageCount := (← Lean.Core.getMessageLog).reportedPlusUnreported.size",
+                "          let rendered ← Lean.withOptions (fun options =>",
+                "            options",
+                "              |>.setBool `pp.fullNames true",
+                "              |>.setBool `pp.explicit explicit",
+                "              |>.setBool `pp.universes explicit",
+                "              |>.setBool `pp.piBinderTypes true",
+                "              |>.setBool `pp.funBinderTypes true",
+                "              |>.setBool `pp.deepTerms true",
+                "              |>.setBool `pp.proofs true",
+                "              |>.set `pp.maxSteps (1000000 : Nat)) do",
+                "            Lean.Meta.ppExpr closed",
+                f"          if rendered.pretty.length > {_LEAN_RESIDUAL_SOURCE_MAX_CHARS} then",
+                '            Lean.throwError "residual source exceeded size limit"',
                 # Delaborated lets can span several lines. Give the term its
                 # own layout boundary so its meaning does not depend on the
                 # length of a later example/theorem declaration header.
-                '        let source := if (rendered.pretty.splitOn "\\n").length > 1',
-                '          then "(\\n" ++ rendered.pretty ++ "\\n)" else rendered.pretty',
-                f"        let replayed ← {serializer_prefix}_elabType source",
-                "        if replayed.hasSorry then",
-                '          Lean.throwError "replayed residual contains sorry"',
-                "        unless ← Lean.Meta.withNewMCtxDepth <|",
-                "            Lean.Meta.isDefEq closed replayed do",
-                '          Lean.throwError "residual source round-trip changed its type"',
+                '          let source := if (rendered.pretty.splitOn "\\n").length > 1',
+                '            then "(\\n" ++ rendered.pretty ++ "\\n)" else rendered.pretty',
+                f"          let replayed ← {serializer_prefix}_elabType source",
+                "          if replayed.hasSorry then",
+                '            Lean.throwError "replayed residual contains sorry"',
+                "          unless ← Lean.Meta.withNewMCtxDepth <|",
+                "              Lean.Meta.isDefEq closed replayed do",
+                '            Lean.throwError "residual source round-trip changed its type"',
+                "          let messages := (← Lean.Core.getMessageLog).reportedPlusUnreported.toArray",
+                "          if (messages.extract messageCount messages.size).any (fun m => m.severity matches .error) then",
+                '            Lean.throwError "residual source round-trip logged errors"',
+                "          pure source",
+                # A compact presentation is usable only after the identical
+                # closed Expr round-trips in the actual elaboration context.
+                # Failed delaboration attempts must not leak errors or state.
+                "        let saved ← Lean.Elab.Term.saveState",
+                "        let source ← try renderSource false catch",
+                "          | .error _ _ =>",
+                "            saved.restore",
+                "            renderSource true",
+                "          | exception@_ => throw exception",
                 "        pure <| Lean.Json.mkObj [",
                 '          ("slot", Lean.ToJson.toJson slot),',
                 '          ("source", Lean.Json.str source),',

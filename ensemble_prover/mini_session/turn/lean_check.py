@@ -23,6 +23,7 @@ from ...deadline_guard import (
 from ...runtime_context import mark_runtime_owned_callback
 from ...proof_dossier import active_root_target_statement
 from ...mini_lean_repairs import (
+    repair_ground_numeric_gcongr,
     rejection_supports_single_line_layout_repair,
     repair_single_line_by_tactic_block,
 )
@@ -524,15 +525,23 @@ async def verify_with_lean(
                 )
             raise
 
+    numeric_repair_attempted = False
+
     async def checked_with_layout_repair(
         statement: str,
         candidate: str,
         **kwargs: Any,
     ) -> tuple[Any, str]:
+        nonlocal numeric_repair_attempted
         result = await checked(statement, candidate, **kwargs)
         repaired = repair_single_line_by_tactic_block(candidate)
         if not repaired or not rejection_supports_single_line_layout_repair(result):
-            return result, candidate
+            if numeric_repair_attempted or kwargs.get("_conditional_feedback"):
+                return result, candidate
+            repaired = repair_ground_numeric_gcongr(candidate, result)
+            if not repaired:
+                return result, candidate
+            numeric_repair_attempted = True
         repaired_result = await checked(statement, repaired, **kwargs)
         if bool(getattr(repaired_result, "ok", False)):
             return repaired_result, repaired

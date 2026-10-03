@@ -122,3 +122,45 @@ def rejection_supports_single_line_layout_repair(result: Any) -> bool:
             for item in list(getattr(parsed, "diagnostics", ()) or ())
         )
     return _REPAIRABLE_REJECTION_RE.search("\n".join(text_parts)) is not None
+
+
+def repair_ground_numeric_gcongr(proof: str, result: Any) -> Optional[str]:
+    """Propose one numeric side-condition repair, subject to full Lean replay.
+
+    Congruence can leave a closed numeric monotonicity premise. Only a single
+    structured, small arithmetic goal qualifies; prose diagnostics and source
+    text never establish that the repaired theorem is valid.
+    """
+
+    parsed = getattr(result, "parsed", None)
+    goals = list(getattr(parsed, "remaining_goals", ()) or ())
+    if (bool(getattr(result, "ok", False))
+            or bool(getattr(parsed, "infra_failure", False)) or len(goals) != 1):
+        return None
+    target = str(getattr(goals[0], "target", "") or "").strip()
+    if (len(target) > 80 or len(re.sub(r"\D", "", target)) > 20
+            or not re.fullmatch(r"[0-9\s()+*/%<>=≤≥≠-]+", target)
+            or not re.search(r"[<>=≤≥≠]", target)):
+        return None
+    source = str(proof or "")
+    # Syntax quotations may contain tactic text without executing that tactic.
+    if "`" in source:
+        return None
+    candidates = {
+        match.start("tactic"): match
+        for match in re.finditer(r"(?m)^[ \t]+(?P<tactic>gcongr)[ \t]*$", source)
+    }
+    visible = []
+    index = 0
+    while index < len(source):
+        skip = _lean_lexical_skip_end(source, index)
+        if skip is not None and skip > index:
+            index = skip
+            continue
+        if index in candidates:
+            visible.append(candidates[index])
+        index += 1
+    if len(visible) != 1:
+        return None
+    end = visible[0].end("tactic")
+    return source[:end] + " <;> norm_num" + source[end:]

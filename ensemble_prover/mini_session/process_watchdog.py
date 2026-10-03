@@ -861,7 +861,10 @@ def _consume_messages(
 
 def _violation_failure_class(violation: str) -> Tuple[str, bool]:
     detail = str(violation or "watchdog_failure")
-    if detail == f"watchdog_supervisor_signal:{int(signal.SIGINT)}":
+    if detail in {
+        f"watchdog_supervisor_signal:{int(signal.SIGINT)}",
+        f"watchdog_cooperative_stop_timeout:{int(signal.SIGINT)}",
+    }:
         # SIGINT is the operator/user cancellation convention. If the worker
         # cannot publish its own terminal summary before the supervisor sweep,
         # the fallback must preserve that semantic classification.
@@ -1805,9 +1808,11 @@ def _write_failure_summary(
         )
         if (
             failure_reason == "user_interrupted"
-            and str(violation or "") == "watchdog_supervisor_signal:2"
             and existing_failure_detail == str(violation or "")
-            and existing_failure_reason == "mini_session_worker_process_failure"
+            and existing_failure_reason in {
+                "mini_session_worker_process_failure",
+                "mini_session_worker_hard_timeout",
+            }
         ):
             existing_failure_reason = failure_reason
         payload = {
@@ -1830,7 +1835,9 @@ def _write_failure_summary(
             ),
             "worker_failure_reason": failure_reason,
             "worker_failure_detail": str(violation or "watchdog_failure"),
-            "worker_shutdown_timeout": bool(shutdown_timeout and timed_out),
+            # Shutdown escalation is independent of the primary stop cause:
+            # an operator interruption can still require forced cleanup.
+            "worker_shutdown_timeout": bool(shutdown_timeout),
             "mini_session_process_isolated": True,
             "mini_session_worker_timeout": timed_out,
             "root_proof_certificate": None,

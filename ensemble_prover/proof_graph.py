@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import re
+import sys
 import unicodedata
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
@@ -60,6 +61,55 @@ from .utils import (
 
 _GRAPH_LEXICAL_CACHE_MAX_ENTRIES = 128
 _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS = 16384
+_GRAPH_LARGE_LEXICAL_CACHE_MAX_BYTES = 16 * 1024 * 1024
+_GRAPH_LARGE_LEXICAL_CACHE: OrderedDict[Tuple[Any, ...], Tuple[Any, int]] = OrderedDict()
+_GRAPH_LARGE_LEXICAL_CACHE_BYTES = 0
+_GRAPH_LARGE_LEXICAL_CACHE_LOCK = Lock()
+
+
+def _lexical_retained_bytes(value: Any) -> int:
+    """Conservatively count immutable lexical values, including Unicode storage."""
+
+    size = sys.getsizeof(value)
+    if isinstance(value, (tuple, frozenset)):
+        size += sum(_lexical_retained_bytes(item) for item in value)
+    return size
+
+
+def _large_lexical_result(key: Tuple[Any, ...], compute: Callable[[], Any]) -> Any:
+    """Reuse exact-source parsing with a shared byte and entry bound.
+
+    Large elaborated terms must not make every read rescan their entire source.
+    This cache contains immutable syntax projections and pure source-derived
+    quality classifications. It never stores Lean proof/admission receipts,
+    mutable helper status, or environment-dependent validity.
+    """
+
+    global _GRAPH_LARGE_LEXICAL_CACHE_BYTES
+    with _GRAPH_LARGE_LEXICAL_CACHE_LOCK:
+        entry = _GRAPH_LARGE_LEXICAL_CACHE.get(key)
+        if entry is not None:
+            _GRAPH_LARGE_LEXICAL_CACHE.move_to_end(key)
+            return entry[0]
+    result = compute()
+    # Count keys, values, the entry tuple, and conservative mapping overhead.
+    weight = _lexical_retained_bytes(key) + _lexical_retained_bytes(result) + 256
+    if weight > _GRAPH_LARGE_LEXICAL_CACHE_MAX_BYTES:
+        return result
+    with _GRAPH_LARGE_LEXICAL_CACHE_LOCK:
+        previous = _GRAPH_LARGE_LEXICAL_CACHE.pop(key, None)
+        if previous is not None:
+            _GRAPH_LARGE_LEXICAL_CACHE_BYTES -= previous[1]
+        while _GRAPH_LARGE_LEXICAL_CACHE and (
+            _GRAPH_LARGE_LEXICAL_CACHE_BYTES + weight > _GRAPH_LARGE_LEXICAL_CACHE_MAX_BYTES
+            or len(_GRAPH_LARGE_LEXICAL_CACHE) >= _GRAPH_LEXICAL_CACHE_MAX_ENTRIES
+        ):
+            _, (_, evicted_weight) = _GRAPH_LARGE_LEXICAL_CACHE.popitem(last=False)
+            _GRAPH_LARGE_LEXICAL_CACHE_BYTES -= evicted_weight
+        if _GRAPH_LEXICAL_CACHE_MAX_ENTRIES > 0:
+            _GRAPH_LARGE_LEXICAL_CACHE[key] = (result, weight)
+            _GRAPH_LARGE_LEXICAL_CACHE_BYTES += weight
+    return result
 
 
 def graph_text_hash(text: str) -> str:
@@ -949,7 +999,10 @@ _GRAPH_NAMESPACED_SOLUTION_MARKER_RE = re.compile(r"putnam_[^\s]*\.\s*solution")
 def _helper_source_solution_references(src: str) -> Set[str]:
     source = str(src or "")
     if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
-        return _uncached_helper_source_solution_references(source)
+        return set(_large_lexical_result(
+            ("source_solution_references", source),
+            lambda: frozenset(_uncached_helper_source_solution_references(source)),
+        ))
     return set(_cached_helper_source_solution_references(source))
 
 
@@ -1132,7 +1185,10 @@ def _helper_free_solution_references(code: str) -> Set[str]:
 def _helper_decl_statement_solution_references(src: str) -> Set[str]:
     source = str(src or "")
     if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
-        return _uncached_helper_decl_statement_solution_references(source)
+        return set(_large_lexical_result(
+            ("statement_solution_references", source),
+            lambda: frozenset(_uncached_helper_decl_statement_solution_references(source)),
+        ))
     return set(_cached_helper_decl_statement_solution_references(source))
 
 
@@ -9769,11 +9825,14 @@ def _graph_support_candidates(
 ) -> List[Tuple[str, Tuple[str, ...]]]:
     source = str(statement or "")
     if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
-        return _uncached_graph_support_candidates(
-            source,
-            include_implication_premises=include_implication_premises,
-            premises_are_assumptions=premises_are_assumptions,
-        )
+        return list(_large_lexical_result(
+            ("support_candidates", source, include_implication_premises, premises_are_assumptions),
+            lambda: tuple(_uncached_graph_support_candidates(
+                source,
+                include_implication_premises=include_implication_premises,
+                premises_are_assumptions=premises_are_assumptions,
+            )),
+        ))
     # Only immutable lexical results are shared; callers own their result list.
     return list(_cached_graph_support_candidates(
         source, include_implication_premises, premises_are_assumptions,
@@ -10246,7 +10305,9 @@ def helper_decl_statement(src: str) -> str:
 
     source = str(src or "")
     if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
-        return _uncached_helper_decl_statement(source)
+        return _large_lexical_result(
+            ("helper_statement", source), lambda: _uncached_helper_decl_statement(source),
+        )
     return _cached_helper_decl_statement(source)
 
 
@@ -10308,7 +10369,9 @@ def helper_decl_body(src: str) -> str:
 
     source = str(src or "")
     if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
-        return _uncached_helper_decl_body(source)
+        return _large_lexical_result(
+            ("helper_body", source), lambda: _uncached_helper_decl_body(source),
+        )
     return _cached_helper_decl_body(source)
 
 

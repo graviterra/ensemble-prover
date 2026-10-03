@@ -652,6 +652,35 @@ def classify_auxiliary_statement_quality(
     *,
     proof_binder_types: tuple[str, ...] = (),
 ) -> HelperAdmissionQuality:
+    from .proof_graph import _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS, _large_lexical_result
+
+    binder_types = tuple(proof_binder_types)
+    if len(statement) + sum(map(len, binder_types)) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+        def compute() -> tuple:
+            quality = _uncached_auxiliary_statement_quality(
+                statement, proof_binder_types=binder_types,
+            )
+            # Store immutable primitives so the byte bound includes all strings
+            # retained by the result, not merely the dataclass shell.
+            return (
+                quality.schema_version, quality.classification,
+                quality.generic_novelty, quality.cache_publishable,
+                quality.auxiliary_target_admissible, quality.conclusion,
+                quality.premise_keys,
+            )
+
+        return HelperAdmissionQuality(*_large_lexical_result(
+            ("auxiliary_quality", HELPER_ADMISSION_QUALITY_SCHEMA_VERSION, statement, binder_types),
+            compute,
+        ))
+    return _uncached_auxiliary_statement_quality(statement, proof_binder_types=binder_types)
+
+
+def _uncached_auxiliary_statement_quality(
+    statement: str,
+    *,
+    proof_binder_types: tuple[str, ...] = (),
+) -> HelperAdmissionQuality:
     from .finite_claim_check import _unwrap_transparent_parens
 
     conclusion, surface_premises = _right_spine_conclusion_and_premises(statement)

@@ -15629,6 +15629,26 @@ async def _main_async(args: argparse.Namespace) -> int:
             refiner_reasoning_effort=refiner_reasoning_effort,
         )
         recorder.record_turn(run_config_record)
+        startup_stage_name = ""
+        startup_stage_started = time.monotonic()
+
+        def advance_startup_stage(name: str) -> None:
+            nonlocal startup_stage_name, startup_stage_started
+            now = time.monotonic()
+            if startup_stage_name:
+                recorder.record_turn({
+                    "phase": "worker_startup", "stage": startup_stage_name,
+                    "stage_elapsed_s": round(now - startup_stage_started, 6),
+                    "verdict": "startup_stage_completed",
+                })
+            startup_stage_name, startup_stage_started = name, now
+            if name:
+                recorder.record_turn({
+                    "phase": "worker_startup", "stage": name,
+                    "verdict": "startup_stage_started",
+                })
+
+        advance_startup_stage("lean_and_theory_initialization")
         print(
             "Reasoning controls: "
             f"prover={prover_reasoning_mode}"
@@ -15814,6 +15834,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 f"promotion_inbox={promotion_status}"
             )
 
+        advance_startup_stage("source_preflight")
         prepared_problem = await _preflight_theorem_project_input(
             lean,
             problem,
@@ -15836,7 +15857,9 @@ async def _main_async(args: argparse.Namespace) -> int:
                     "self-contained)\n"
                 )
 
+        advance_startup_stage("mathlib_api_index")
         api_searcher = _init_api_searcher(lean_cfg) if args.api_search else None
+        advance_startup_stage("mathematical_retrieval")
         searcher = _init_mathematical_retrieval_service(
             lean_cfg=lean_cfg,
             args=args,
@@ -15848,6 +15871,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             ),
         )
 
+        advance_startup_stage("proof_session_initialization")
         try:
             proof_dossier = ProofDossier(
                 theorem_name=problem.theorem_name,
@@ -15862,6 +15886,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             def signal_proof_worker_ready() -> None:
                 from .sweep_control import signal_sweep_worker_ready
 
+                advance_startup_stage("")
                 signal_sweep_worker_ready()
                 signal_worker_ready()
 
