@@ -13594,6 +13594,9 @@ class ConversationTurnAction:
                 0,
                 self.provider_dispatch_limit - provider_dispatches_used - reserved_dispatches,
             )
+            # Unlike retry-policy zero (unlimited), this is a finite allowance
+            # for the entire invocation, including finalizers and repairs.
+            temperature_metadata["provider_dispatches_remaining"] = remaining_provider_dispatches
             configured_dispatches = max(
                 0,
                 int(

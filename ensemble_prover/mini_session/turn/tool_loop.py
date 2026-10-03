@@ -2737,6 +2737,30 @@ async def _call_llm_with_tools_one_round_impl(
     in_turn_tool_history_compacted_chars = 0
     provider_calls_completed = 0
     provider_dispatches_started = 0
+    provider_dispatch_allowance = (temperature_metadata or {}).get(
+        "provider_dispatches_remaining"
+    )
+    if provider_dispatch_allowance is not None and (
+        type(provider_dispatch_allowance) is not int or provider_dispatch_allowance < 0
+    ):
+        raise ValueError("provider dispatch allowance must be a nonnegative integer")
+
+    def remaining_provider_dispatches() -> Optional[int]:
+        if provider_dispatch_allowance is None:
+            return None
+        return max(
+            0,
+            provider_dispatch_allowance - max(provider_dispatches_started, provider_calls_completed),
+        )
+
+    def require_provider_dispatch_allowance() -> None:
+        if remaining_provider_dispatches() == 0:
+            raise ProviderDispatchAttemptLimitExceeded(
+                "conversation provider dispatch allowance exhausted",
+                provider_dispatches_started=max(provider_dispatches_started, provider_calls_completed),
+                dispatch_attempt_limit=provider_dispatch_allowance,
+            )
+
     provider_call_quantum_exhausted = False
     provider_finalizer_continuation_exhausted = False
     provider_dispatch_quantum_yield_metric_pending = False
@@ -4001,6 +4025,7 @@ async def _call_llm_with_tools_one_round_impl(
             f"Mini provider dispatch ({call_kind})"
         )
         provider_call_metadata = dict(temperature_metadata or {})
+        require_provider_dispatch_allowance()
         provider_quantum_cap_active = False
         provider_finalizer_continuation_active = False
         provider_quantum_authenticated_dispatches_started = 0
@@ -4074,6 +4099,13 @@ async def _call_llm_with_tools_one_round_impl(
                 or 0
             ),
         )
+        remaining_dispatches = remaining_provider_dispatches()
+        if remaining_dispatches is not None:
+            dispatch_attempt_limit = (
+                min(dispatch_attempt_limit, remaining_dispatches)
+                if dispatch_attempt_limit > 0 else remaining_dispatches
+            )
+            provider_call_metadata["provider_dispatch_max_attempts"] = dispatch_attempt_limit
         provider_dispatch_lease = (
             ProviderDispatchAttemptLease(dispatch_attempt_limit)
             if dispatch_attempt_limit > 0
@@ -4138,10 +4170,24 @@ async def _call_llm_with_tools_one_round_impl(
             require_hard_timeout_capability_active(
                 f"Mini metered provider transport ({call_kind})"
             )
+            require_provider_dispatch_allowance()
             _validate_selected_proof_idea_dispatch_context(
                 request_messages,
                 dossier,
             )
+
+            async def invoke_with_allowance(usage_callback):
+                nonlocal provider_dispatches_started
+                require_provider_dispatch_allowance()
+                if provider_dispatch_allowance is not None and not bool(
+                    getattr(client, "supports_transport_dispatch_authorization", False)
+                ):
+                    # Charge opaque clients only after metering admission,
+                    # immediately before calling them (including retries).
+                    provider_dispatches_started += 1
+                return await invoke(
+                    list(request_messages or ()), usage_callback, request_max_tokens_override,
+                )
 
             def _retryable_exception_will_be_retried(exc: BaseException) -> bool:
                 if _is_invalid_prompt_error(exc):
@@ -4195,11 +4241,7 @@ async def _call_llm_with_tools_one_round_impl(
                             _retryable_exception_will_be_retried
                         ),
                         provider_dispatch_lease=provider_dispatch_lease,
-                        invoke=lambda usage_callback: invoke(
-                            list(request_messages or ()),
-                            usage_callback,
-                            request_max_tokens_override,
-                        ),
+                        invoke=invoke_with_allowance,
                     ),
                 )
 
@@ -4906,6 +4948,7 @@ async def _call_llm_with_tools_one_round_impl(
                         not repair_self_check_attempted
                         and not repair_self_check_reminder_sent
                         and can_call_tools
+                        and remaining_provider_dispatches() != 0
                     ):
                         conv.ensure_bootstrap()
                         message_fn = primitives.get(

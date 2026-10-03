@@ -13,11 +13,13 @@ import re
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from .lean_names import LEAN_NAME_COMPONENT_PATTERN
 from .proof_state import (
     _find_top_level_operator,
     _leading_identity_let_body,
     _strip_balanced_outer_parens,
-    lean_statement_conclusion,
+    lean_statement_bound_names,
+    lean_statement_forall_body,
 )
 
 
@@ -55,6 +57,7 @@ class FinsetReindexingProfile:
     has_image_or_map: bool = False
     has_sigma: bool = False
     has_infinite_sum: bool = False
+    has_numeric_equality_side: bool = False
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -72,6 +75,7 @@ class FinsetReindexingProfile:
             "finset_reindexing_has_image_or_map": self.has_image_or_map,
             "finset_reindexing_has_sigma": self.has_sigma,
             "finset_reindexing_has_infinite_sum": self.has_infinite_sum,
+            "finset_reindexing_has_numeric_equality_side": self.has_numeric_equality_side,
         }
 
 
@@ -291,6 +295,16 @@ def _blank_shadowed_infinite_bigop_names(text: str) -> str:
     return "".join(output)
 
 
+def _is_numeric_side(expression: str, literal_names: set[str]) -> bool:
+    """Recognize a numeral or a known local alias without unfolding unknown names."""
+
+    operand = _strip_balanced_outer_parens(expression)
+    annotation = _find_top_level_operator(operand, ":")
+    if annotation >= 0:
+        operand = _strip_balanced_outer_parens(operand[:annotation])
+    return operand in literal_names or bool(re.fullmatch(r"[+-]?\s*[0-9]+", operand))
+
+
 def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
     """Return the finite-sum/product reindexing profile for a Lean statement."""
 
@@ -302,17 +316,48 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
         "∀ᵐ", "Filter.Eventually"
     )
     conclusion = analysis_text
+    literal_names: set[str] = set()
     while True:
-        conclusion = _strip_balanced_outer_parens(
-            lean_statement_conclusion(conclusion)
-        )
+        # A later binder can shadow a numeric answer alias. Clearing all
+        # syntactically bound names is conservative even for nested scopes.
+        if literal_names:
+            literal_names.difference_update(lean_statement_bound_names(conclusion))
+        conclusion = _strip_balanced_outer_parens(conclusion)
         binding_surface = (
             "let" + conclusion[4:]
             if re.match(r"^have\s", conclusion) else conclusion
         )
-        _head, _value, body = _leading_identity_let_body(binding_surface)
+        head, value, body = _leading_identity_let_body(binding_surface)
         if not body:
+            next_conclusion = _strip_balanced_outer_parens(
+                lean_statement_forall_body(conclusion)
+            )
+            if next_conclusion != conclusion:
+                conclusion = next_conclusion
+                continue
+            if re.match(r"^(?:∃|@?(?:Exists\b|Filter\.Eventually\b))", conclusion):
+                break
+            # Iff binds more loosely than implication. Its right-hand arrow
+            # is not a hypothesis telescope for the complete target.
+            if any(_find_top_level_operator(conclusion, token) >= 0
+                   for token in ("↔", "<->")):
+                break
+            arrows = [
+                (index, len(token)) for token in ("→", "->")
+                if (index := _find_top_level_operator(conclusion, token)) >= 0
+            ]
+            if arrows:
+                index, length = min(arrows)
+                conclusion = conclusion[index + length:].strip()
+                continue
             break
+        annotation = _find_top_level_operator(head, ":")
+        name = (head[:annotation] if annotation >= 0 else head).strip()
+        if re.fullmatch(LEAN_NAME_COMPONENT_PATTERN, name):
+            if _is_numeric_side(value, literal_names):
+                literal_names.add(name)
+            else:
+                literal_names.discard(name)
         conclusion = body
     compact = " ".join(conclusion.split())
     needs_witness = bool(re.match(r"^(?:∃|@?(?:Exists\b|Filter\.Eventually\b))", compact))
@@ -335,6 +380,9 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
     equality_sides = (
         (compact[:equality_index], compact[equality_index + 1 :])
         if has_equality else ()
+    )
+    has_numeric_equality_side = any(
+        _is_numeric_side(side, literal_names) for side in equality_sides
     )
     has_bigop_side = False
     for side in equality_sides:
@@ -395,6 +443,11 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
         and not needs_witness
         and not has_infinite_sum
         and (finite_sum_count > 0 or finite_product_count > 0)
+        and (
+            not has_numeric_equality_side
+            or any((has_filter, has_nested_sum, has_nested_product, has_antidiagonal,
+                    has_range, has_interval, has_attach, has_image_or_map, has_sigma))
+        )
     )
     return FinsetReindexingProfile(
         should_attempt=should_attempt,
@@ -411,6 +464,7 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
         has_image_or_map=has_image_or_map,
         has_sigma=has_sigma,
         has_infinite_sum=has_infinite_sum,
+        has_numeric_equality_side=has_numeric_equality_side,
     )
 
 
@@ -515,7 +569,7 @@ def reindexing_materializable_goals(attempts: Sequence[Any]) -> tuple[dict[str, 
     return tuple(out)
 
 
-def _add_sum_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
+def _add_sum_congruence_scripts(add: Any) -> None:
     add(
         ("classical", "refine Finset.sum_congr rfl ?_", "intro x hx", "ring_nf"),
         tactic="classical refine Finset.sum_congr rfl ?_; intro x hx; ring_nf",
@@ -562,6 +616,11 @@ def _add_sum_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
         ),
         source="finset_reindexing_sum_ext_simp",
     )
+
+
+def _add_sum_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
+    if not profile.has_numeric_equality_side:
+        _add_sum_congruence_scripts(add)
     if profile.has_nested_sum:
         add(
             ("classical", "rw [Finset.sum_comm]"),
@@ -637,7 +696,7 @@ def _add_sum_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
         )
 
 
-def _add_product_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
+def _add_product_congruence_scripts(add: Any) -> None:
     add(
         ("classical", "refine Finset.prod_congr rfl ?_", "intro x hx", "ring_nf"),
         tactic="classical refine Finset.prod_congr rfl ?_; intro x hx; ring_nf",
@@ -653,6 +712,11 @@ def _add_product_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
         tactic="apply Finset.prod_congr",
         source="finset_reindexing_prod_congr_residual",
     )
+
+
+def _add_product_scripts(add: Any, profile: FinsetReindexingProfile) -> None:
+    if not profile.has_numeric_equality_side:
+        _add_product_congruence_scripts(add)
     if profile.has_nested_product:
         add(
             ("classical", "rw [Finset.prod_comm]"),
