@@ -265,7 +265,13 @@ class Campaign:
         ) != 1 or not self.store.get_metadata("initialized"):
             self.store.close()
             raise ValueError("unsupported or incomplete campaign initialization")
-        self.sources = SourceLibrary(self.directory / "sources")
+        try:
+            self.sources = SourceLibrary(self.directory / "sources")
+        except BaseException:
+            # The store is already open. Release it on source-library failure
+            # rather than leaving the connection for garbage collection.
+            self.store.close()
+            raise
         try:
             self.environment = EnvironmentSnapshot.from_dict(
                 self.store.get_metadata("environment")

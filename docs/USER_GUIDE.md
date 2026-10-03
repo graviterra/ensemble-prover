@@ -652,9 +652,12 @@ generation to cross phase and retry deadlines while retaining the configured
 HTTP-attempt watchdog. `hard` rejects a late model/tool-loop operation, but it
 does not replace `--mini-worker-timeout-s` as an overall run cap.
 
-Claude Code and Codex subscriptions default to a 300-second inactivity watchdog
-under soft policy. Advancing generation renews it. Explicit role/request timeouts
-remain absolute, including time spent thinking. `--require-output-token-limit`
+Claude Code subscriptions default to a 300-second inactivity watchdog under soft
+policy. Advancing generation renews it. Codex instead relies on its native
+network-stream watchdog: its CLI JSONL output omits in-flight reasoning updates,
+so Mini does not treat silent stdout as stalled generation. An explicit timeout
+can bound a wedged CLI process. Explicit role/request timeouts remain absolute,
+including time spent thinking. `--require-output-token-limit`
 requires a total output-token cap per invocation and rejects subscription CLI
 transports that cannot provide it.
 

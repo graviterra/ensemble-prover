@@ -9,7 +9,7 @@ from typing import Iterable, Optional
 
 _RAW_STRING_START_RE = re.compile(r'r(?P<hashes>#+)?"')
 _LETTER_LIKE = (
-    r"\u03b1-\u03ba\u03bc-\u03c9\u0391-\u039f\u03a1\u03a4-\u03a9"
+    r"\u03b1-\u03ba\u03bc-\u03c9\u0391-\u039f\u03a1-\u03a2\u03a4-\u03a9"
     r"\u03ca-\u03fb\u1f00-\u1ffe\u2100-\u214f\U0001d49c-\U0001d59f"
     r"\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff\u0100-\u017f"
 )
@@ -69,7 +69,7 @@ def _mask_noncode(
             i = end
             continue
         raw_match = _RAW_STRING_START_RE.match(src, i) if src[i] == "r" else None
-        if raw_match is not None and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] in "_")):
+        if raw_match is not None and (i == 0 or _IDENT_REST_RE.fullmatch(src[i - 1]) is None):
             hashes = raw_match.group("hashes") or ""
             raw_delimiter = '"' + hashes
             body_start = raw_match.end()
@@ -112,7 +112,7 @@ def _mask_noncode(
                 raw_match = _RAW_STRING_START_RE.match(src, end) if src[end] == "r" else None
                 if raw_match is not None and (
                     end == 0
-                    or not (src[end - 1].isalnum() or src[end - 1] == "_")
+                    or _IDENT_REST_RE.fullmatch(src[end - 1]) is None
                 ):
                     hashes = raw_match.group("hashes") or ""
                     raw_delimiter = '"' + hashes
@@ -122,7 +122,7 @@ def _mask_noncode(
                     continue
                 if src[end] == "'" and (
                     end == 0
-                    or not (src[end - 1].isalnum() or src[end - 1] in "_'")
+                    or _IDENT_REST_RE.fullmatch(src[end - 1]) is None
                 ):
                     char_end = end + 1
                     char_end += 2 if char_end < n and src[char_end] == "\\" else 1
@@ -163,7 +163,7 @@ def _mask_noncode(
             i = end
             continue
         if src[i] == "'" and (
-            i == 0 or not (src[i - 1].isalnum() or src[i - 1] in "_'")
+            i == 0 or _IDENT_REST_RE.fullmatch(src[i - 1]) is None
         ):
             end = i + 1
             if end < n and src[end] == "\\":

@@ -2708,7 +2708,7 @@ Source: [ensemble_prover/mini_prover.py](../ensemble_prover/mini_prover.py#L8762
 Complete inline message template. Braces containing Python expressions identify runtime substitutions.
 
 ```text
-Your Lean block contains a top-level command ({forbidden_command}). The proof block may contain helper declarations and the main proof only; do not use `#eval`, `#check`, `#print`, `import`, or `axiom` commands in proof submissions.
+Your Lean block contains a top-level command ({forbidden_command!r}). The proof block may contain helper declarations and the main proof only; do not use `#eval`, `#check`, `#print`, `import`, or `axiom` commands in proof submissions.
 ```
 
 <a id="prompt-76"></a>
@@ -2768,7 +2768,7 @@ Source: [ensemble_prover/mini_prover.py](../ensemble_prover/mini_prover.py#L9696
 Complete inline message template. Braces containing Python expressions identify runtime substitutions.
 
 ```text
-Your Lean block contains a top-level command ({forbidden_command}). The proof block may contain helper declarations and the main proof only; do not use `#eval`, `#check`, `#print`, `import`, or `axiom` commands in proof submissions. {check_hint}
+Your Lean block contains a top-level command ({forbidden_command!r}). The proof block may contain helper declarations and the main proof only; do not use `#eval`, `#check`, `#print`, `import`, or `axiom` commands in proof submissions. {check_hint}
 ```
 
 <a id="prompt-81"></a>

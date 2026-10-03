@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -38,6 +39,10 @@ class TheoryNeedRecord:
     active_attempt_started_ts: float = 0.0
     active_attempt_bundle_id: str = ""
     active_attempt_scope_id: str = ""
+    # Need-relative verification authority for the active attempt.  Written
+    # only after independent verification accepts the candidate for this exact
+    # need/root; recovery requires it before granting `context_available`.
+    active_attempt_need_authority: str = ""
     updated_ts: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -61,6 +66,7 @@ class TheoryNeedRecord:
             "active_attempt_started_ts": self.active_attempt_started_ts,
             "active_attempt_bundle_id": self.active_attempt_bundle_id,
             "active_attempt_scope_id": self.active_attempt_scope_id,
+            "active_attempt_need_authority": self.active_attempt_need_authority,
             "updated_ts": self.updated_ts,
         }
 
@@ -124,6 +130,9 @@ class TheoryNeedRecord:
             ),
             active_attempt_scope_id=str(
                 payload.get("active_attempt_scope_id") or ""
+            ),
+            active_attempt_need_authority=str(
+                payload.get("active_attempt_need_authority") or ""
             ),
             updated_ts=float(payload.get("updated_ts") or 0.0),
         )
@@ -291,6 +300,7 @@ class TheoryNeedStore:
                     active_attempt_started_ts=time.time(),
                     active_attempt_bundle_id="",
                     active_attempt_scope_id=self.attempt_scope_id,
+                    active_attempt_need_authority="",
                     updated_ts=time.time(),
                 )
                 self._write(claimed)
@@ -340,6 +350,7 @@ class TheoryNeedStore:
                     active_attempt_started_ts=0.0,
                     active_attempt_bundle_id="",
                     active_attempt_scope_id="",
+                    active_attempt_need_authority="",
                     updated_ts=time.time(),
                 )
             self._write(restored)
@@ -350,12 +361,24 @@ class TheoryNeedStore:
         attempt_id: str,
         *,
         bundle_id: str,
+        need_authority: str = "",
     ) -> tuple[TheoryNeedRecord, bool]:
-        """CAS-bind the content identity needed for crash recovery."""
+        """CAS-bind the content identity needed for crash recovery.
+
+        ``bundle_id`` must be a real content-addressed Mini theory bundle id;
+        malformed ids are rejected at this writer so they can never reach (and
+        crash) the startup recovery path.  ``need_authority`` records the exact
+        need-relative verification authority once independent verification has
+        accepted the candidate; recovery refuses to grant ``context_available``
+        without a matching authority.
+        """
 
         clean_bundle_id = str(bundle_id or "").strip()
-        if not clean_bundle_id:
-            raise ValueError("theory build candidate bundle id is required")
+        if re.fullmatch(r"[0-9a-f]{16}", clean_bundle_id) is None:
+            raise ValueError(
+                f"invalid theory build candidate bundle id: {bundle_id!r}"
+            )
+        clean_authority = str(need_authority or "").strip()
         with self._lock():
             existing = self._get_unlocked(need_id)
             if existing is None:
@@ -365,6 +388,7 @@ class TheoryNeedStore:
             marked = replace(
                 existing,
                 active_attempt_bundle_id=clean_bundle_id,
+                active_attempt_need_authority=clean_authority,
                 updated_ts=time.time(),
             )
             self._write(marked)
@@ -437,6 +461,7 @@ class TheoryNeedStore:
                 active_attempt_started_ts=0.0,
                 active_attempt_bundle_id="",
                 active_attempt_scope_id="",
+                active_attempt_need_authority="",
                 updated_ts=time.time(),
             )
             self._write(settled)
@@ -564,6 +589,7 @@ class TheoryNeedStore:
                 active_attempt_started_ts=0.0,
                 active_attempt_bundle_id="",
                 active_attempt_scope_id="",
+                active_attempt_need_authority="",
                 updated_ts=time.time(),
             )
             self._write(released)
@@ -634,6 +660,7 @@ class TheoryNeedStore:
                     active_attempt_started_ts=0.0,
                     active_attempt_bundle_id="",
                     active_attempt_scope_id="",
+                    active_attempt_need_authority="",
                     updated_ts=time.time(),
                 )
                 affected.append(old_id)
@@ -678,6 +705,7 @@ class TheoryNeedStore:
                         active_attempt_started_ts=0.0,
                         active_attempt_bundle_id="",
                         active_attempt_scope_id="",
+                        active_attempt_need_authority="",
                         updated_ts=time.time(),
                     )
                     existing_revised = records.get(revised_need.need_id)
@@ -705,6 +733,7 @@ class TheoryNeedStore:
                         active_attempt_started_ts=0.0,
                         active_attempt_bundle_id="",
                         active_attempt_scope_id="",
+                        active_attempt_need_authority="",
                         updated_ts=time.time(),
                     )
                     if record.need.need_id not in affected:
@@ -747,6 +776,7 @@ class TheoryNeedStore:
             active_attempt_started_ts=0.0,
             active_attempt_bundle_id="",
             active_attempt_scope_id="",
+            active_attempt_need_authority="",
             updated_ts=time.time(),
         )
 
@@ -822,6 +852,11 @@ class TheoryNeedStore:
                     if str(status or "pending") in {"resolved", "superseded"}
                     else existing.active_attempt_scope_id
                 ),
+                active_attempt_need_authority=(
+                    ""
+                    if str(status or "pending") in {"resolved", "superseded"}
+                    else existing.active_attempt_need_authority
+                ),
                 updated_ts=time.time(),
             )
             self._write(record)
@@ -857,6 +892,7 @@ class TheoryNeedStore:
                 active_attempt_started_ts=0.0,
                 active_attempt_bundle_id="",
                 active_attempt_scope_id="",
+                active_attempt_need_authority="",
                 updated_ts=time.time(),
             )
             self._write(reopened)

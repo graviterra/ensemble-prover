@@ -21,6 +21,7 @@ from .model import (
     TheoryBundleCandidate,
     TheoryVerificationReceipt,
     content_hash,
+    theory_need_authority,
 )
 from .need_store import TheoryNeedStore
 from .retrieval import MiniTheoryRetriever, TheorySearchHit
@@ -194,9 +195,19 @@ class MiniTheoryLibrary:
                         record.active_attempt_bundle_id,
                         domain=record.need.domain,
                     )
-                except TheoryStoreError:
+                except (TheoryStoreError, ValueError):
+                    # A malformed historical id must settle safely, never abort
+                    # the library constructor and never grant context.
                     bundle = None
-            if bundle is not None:
+            # Mere publication for this content is not need-relative authority:
+            # the same content may have been published for a different need, or
+            # journaled before forbidden-target verification completed.  Only
+            # an authority digest bound to this exact need/root/candidate and
+            # to the durable verification provenance may grant context.
+            if bundle is not None and self._recovery_authority_matches(
+                record,
+                bundle,
+            ):
                 _, applied = self.needs.settle_build_attempt(
                     record.need.need_id,
                     record.active_attempt_id,
@@ -212,6 +223,45 @@ class MiniTheoryLibrary:
                 )
             recovered += int(applied)
         return recovered
+
+    @staticmethod
+    def _recovery_authority_matches(record: object, bundle: object) -> bool:
+        """Confirm durable need-relative verification authority for a bundle.
+
+        Authority is reconstructed from the durable need alone.  A build that
+        verified an explicit current-session root absent from the frozen need
+        evidence cannot reproduce its digest here, so a root that drifted after
+        the need was frozen fails closed and the attempt is released for a
+        funded retry -- it is never silently accepted as a stale contract.
+        """
+
+        expected = str(
+            getattr(record, "active_attempt_need_authority", "") or ""
+        ).strip()
+        if not expected:
+            return False
+        source_hash = str(getattr(bundle, "source_hash", "") or "")
+        verification_output_hash = str(
+            getattr(bundle, "verification_output_hash", "") or ""
+        )
+        if not source_hash or not verification_output_hash:
+            # Without durable verification provenance the bundle cannot carry
+            # need-relative authority; fail closed rather than mint acceptance
+            # from a stored/advisory bundle record.
+            return False
+        try:
+            actual = theory_need_authority(
+                need=record.need,
+                bundle_id=getattr(bundle, "bundle_id", ""),
+                source_hash=source_hash,
+                verification_output_hash=verification_output_hash,
+                compiled_artifact_hash=str(
+                    getattr(bundle, "compiled_artifact_hash", "") or ""
+                ),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return bool(actual) and actual == expected
 
     @_serialized_library_operation
     def search(self, query_text: str, **kwargs: object) -> list[TheorySearchHit]:

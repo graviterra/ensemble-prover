@@ -8,7 +8,9 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
+import tempfile
 import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
@@ -149,10 +151,31 @@ def _tokenize(text: str) -> List[str]:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
+    """Publish text atomically via a unique temporary file in the same directory.
+
+    A fixed ``<name>.tmp`` sibling made concurrent saves of the same index race:
+    both writers opened the same path and the first replace removed it under the
+    second, which then raised ``FileNotFoundError`` mid-publication.  A unique
+    per-call temporary name keeps readers on the previous complete file until
+    ``os.replace`` swaps in the new one, and ties cleanup to this call.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    tmp_path.replace(path)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _extract_symbols(text: str) -> List[str]:

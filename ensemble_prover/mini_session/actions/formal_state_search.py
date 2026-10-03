@@ -14,6 +14,7 @@ from ensemble_prover.mini_formal_state_search import (
     FormalStateSearchCheckpoint,
     FormalStateSearchConfig,
     _formal_policy_identity,
+    _formal_policy_request_key,
     run_goal_conditioned_formal_search,
 )
 from ensemble_prover.proof_dossier import (
@@ -846,6 +847,7 @@ class FormalStateSearchAction:
         *,
         now: float | None = None,
         policy_identity: str = "",
+        proof_idea_context_digest: str = "",
         beam_width: int = 1,
     ) -> float:
         if continuation is None:
@@ -864,19 +866,19 @@ class FormalStateSearchAction:
                 node = tree.nodes.get(str(node_id or ""))
                 if node is None or node.status != TacticNodeStatus.OPEN:
                     continue
-                payload = {
-                    "state": tree.goal_state_key(node.goals),
-                    "prefix": [str(item or "") for item in node.tactics_from_root],
-                    "policy_identity": str(policy_identity),
-                }
+                # The engine records the durable retry ledger under this exact
+                # key, including the actual proof-idea context digest.  Hash
+                # the same shared payload or the scheduler cannot see the
+                # engine's backoff and re-dispatches during it.
                 owner_keys.append(
-                    hashlib.sha256(
-                        json.dumps(
-                            payload,
-                            sort_keys=True,
-                            ensure_ascii=False,
-                        ).encode("utf-8")
-                    ).hexdigest()
+                    _formal_policy_request_key(
+                        goal_state_key=tree.goal_state_key(node.goals),
+                        tactics_from_root=node.tactics_from_root,
+                        policy_identity=str(policy_identity),
+                        proof_idea_context_digest=str(
+                            proof_idea_context_digest or ""
+                        ),
+                    )
                 )
             # Any scheduled owner without a backoff record is executable now.
             if not owner_keys or any(key not in retry_records for key in owner_keys):
@@ -1184,6 +1186,10 @@ class FormalStateSearchAction:
                 )
             pending_root_context = ""
         eligible: list[Tuple[str, str, Any, bool, Tuple[str, ...]]] = []
+        # Resolve the scheduler's proof-idea digest lazily: it must match the
+        # engine's retry-ledger owner key, but most probes never inspect a
+        # live checkpoint and should not pay for cognition resolution.
+        selected_context_digest: Optional[str] = None
         # A pending accepted root is stronger than ordinary frontier routing.
         # A Lean-solved root must preempt a selected child expansion;
         # otherwise retryable child work can starve root finalization forever.
@@ -1236,12 +1242,23 @@ class FormalStateSearchAction:
                             beam_width=self.config.beam_width,
                         )
                     )
+                    if selected_context_digest is None:
+                        try:
+                            _, selected_context_digest = (
+                                self._formal_policy_cognition_context(
+                                    session,
+                                    project=False,
+                                )
+                            )
+                        except Exception:
+                            selected_context_digest = ""
                     retry_delay = self._provider_retry_delay(
                         context_continuation,
                         policy_identity=_formal_policy_identity(
                             getattr(session, "prover_client", None),
                             self.config,
                         ),
+                        proof_idea_context_digest=selected_context_digest,
                         beam_width=self.config.beam_width,
                     )
                 except (TypeError, ValueError):

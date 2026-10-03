@@ -37,7 +37,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -169,6 +169,66 @@ def _write_solved_manifest(manifest_path: Path, records: List[Dict[str, Any]]) -
         handle.write("\n")
         temp_name = handle.name
     os.replace(temp_name, manifest_path)
+
+
+def _export_provenance_hashes(
+    *,
+    proof: str,
+    export_verified: bool,
+    verified_source_digests: Sequence[str],
+) -> Tuple[str, str]:
+    """Bind a verified receipt to its exact bytes and accepted root proof.
+
+    Both the live and batch publication paths must mint identical provenance:
+    the digest of the published Lean bytes recorded by ``_install_exported_lean``
+    plus the hash of the accepted root proof. Unverified installs leave both
+    empty so consumers can never mistake them for byte- or proof-bound receipts.
+    """
+
+    if not export_verified:
+        return "", ""
+    digest = str(verified_source_digests[-1]) if verified_source_digests else ""
+    return digest, hashlib.sha256(proof.strip().encode("utf-8")).hexdigest()
+
+
+def _manifest_run_key(item: Mapping[str, Any]) -> Tuple[str, str, str]:
+    """Identity used to retire a receipt when its recorded run is republished."""
+
+    return (
+        str(item.get("run_dir") or ""),
+        str(item.get("theorem_name") or ""),
+        _normalize_answer_visibility(str(item.get("answer_visibility") or "opaque")),
+    )
+
+
+def _merge_solved_manifest(
+    prior_manifest: Sequence[Mapping[str, Any]],
+    *,
+    replaced_run_keys: Iterable[Tuple[str, str, str]],
+    retired_stems: Iterable[str],
+    records: Sequence[SolvedRecord],
+) -> List[Dict[str, Any]]:
+    """Preserve unrelated receipts while replacing this publication's rows.
+
+    The manifest is shared by both answer-visibility pools and by live/batch
+    exporters holding the same directory lock. A publication may only drop rows
+    it is rewriting (same output stem), rows for runs it handled (same
+    run/theorem/visibility), and rows whose artifacts it retired. Every other
+    receipt, including the other visibility pool, must survive.
+    """
+
+    run_keys = set(replaced_run_keys)
+    stems = {str(stem) for stem in retired_stems if str(stem)}
+    stems.update(str(record.output_stem) for record in records)
+    merged: List[Dict[str, Any]] = []
+    for item in prior_manifest:
+        row = dict(item)
+        stem = str(row.get("output_stem") or "").strip()
+        if not stem or stem in stems or _manifest_run_key(row) in run_keys:
+            continue
+        merged.append(row)
+    merged.extend(asdict(record) for record in records)
+    return merged
 
 
 class SolvedExportVerificationError(RuntimeError):
@@ -2217,8 +2277,18 @@ def _export_solved_files_locked(
 
     manifest: List[SolvedRecord] = []
     skipped: List[Tuple[str, str]] = []
+    # Receipts this batch rewrites or retires. Anything else in the shared
+    # manifest (notably the other answer-visibility pool) must be preserved.
+    replaced_run_keys: Set[Tuple[str, str, str]] = set()
+    retired_stems: Set[str] = set()
+    for run_name in sorted(runs_by_name):
+        for run_dir in runs_by_name[run_name]:
+            replaced_run_keys.add(
+                (_display_path(run_dir), run_name, visibility)
+            )
 
     def remove_stale_output(stem: str) -> None:
+        retired_stems.add(str(stem))
         stale_out = solved_dir / f"{stem}.lean"
         try:
             stale_out.unlink()
@@ -2277,6 +2347,7 @@ def _export_solved_files_locked(
                 continue
             if solve_count > 1 and int(match.group(1)) <= solve_count:
                 continue
+            retired_stems.add(str(stem))
             path = solved_dir / f"{stem}.lean"
             try:
                 path.unlink()
@@ -2327,6 +2398,7 @@ def _export_solved_files_locked(
         )
         if solve_count > 1:
             stale_single = solved_dir / f"{single_stem}.lean"
+            retired_stems.add(str(single_stem))
             if stale_single.exists():
                 stale_single.unlink()
             _remove_export_presentation_report(solved_dir, single_stem)
@@ -2400,6 +2472,7 @@ def _export_solved_files_locked(
                 for path in list(source_record.get("compiled_module_roots") or ())
                 if str(path or "").strip()
             )
+            verified_source_digests: List[str] = []
             export_verified, verification_status, verification_output, export_axioms = (
                 _install_exported_lean(
                     out_path,
@@ -2413,6 +2486,7 @@ def _export_solved_files_locked(
                     support_project_builds=dict(
                         project_record.get("support_project_builds") or {}
                     ),
+                    verified_source_digests=verified_source_digests,
                 )
             )
             if verify_lean and not export_verified:
@@ -2436,6 +2510,11 @@ def _export_solved_files_locked(
             )
 
             ts = run_dir.stat().st_mtime
+            provenance_digest, accepted_root_hash = _export_provenance_hashes(
+                proof=proof,
+                export_verified=export_verified,
+                verified_source_digests=verified_source_digests,
+            )
             record = SolvedRecord(
                 theorem_name=name,
                 output_stem=output_stem,
@@ -2465,6 +2544,8 @@ def _export_solved_files_locked(
                 proof_chars=len(proof),
                 answer_visibility=_summary_answer_visibility(s),
                 **_summary_visibility_flags(s),
+                verified_source_digest=provenance_digest,
+                accepted_root_proof_hash=accepted_root_hash,
                 export_verified=export_verified,
                 export_verification_status=verification_status,
                 export_verification_output=verification_output[:4000],
@@ -2492,7 +2573,24 @@ def _export_solved_files_locked(
 
     if write_manifest:
         manifest_path = solved_dir / "manifest.json"
-        _write_solved_manifest(manifest_path, [asdict(record) for record in manifest])
+        try:
+            raw_prior_manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            raw_prior_manifest = []
+        prior_manifest = [
+            dict(item)
+            for item in list(raw_prior_manifest or [])
+            if isinstance(item, dict)
+        ]
+        merged_manifest = _merge_solved_manifest(
+            prior_manifest,
+            replaced_run_keys=sorted(replaced_run_keys),
+            retired_stems=sorted(retired_stems),
+            records=manifest,
+        )
+        _write_solved_manifest(manifest_path, merged_manifest)
     return ExportResult(records=manifest, skipped=skipped)
 
 
@@ -2833,6 +2931,11 @@ def _export_solved_run_locked(
         else {}
     )
     ts = run_dir.stat().st_mtime
+    provenance_digest, accepted_root_hash = _export_provenance_hashes(
+        proof=proof,
+        export_verified=export_verified,
+        verified_source_digests=verified_source_digests,
+    )
     record = SolvedRecord(
         theorem_name=problem_name,
         output_stem=out_path.stem,
@@ -2853,13 +2956,8 @@ def _export_solved_run_locked(
         proof_chars=len(proof),
         answer_visibility=visibility,
         **visibility_flags,
-        verified_source_digest=(
-            verified_source_digests[-1] if export_verified and verified_source_digests else ""
-        ),
-        accepted_root_proof_hash=(
-            hashlib.sha256(proof.strip().encode("utf-8")).hexdigest()
-            if export_verified else ""
-        ),
+        verified_source_digest=provenance_digest,
+        accepted_root_proof_hash=accepted_root_hash,
         export_verified=export_verified,
         export_verification_status=verification_status,
         export_verification_output=verification_output[:4000],
@@ -2884,24 +2982,12 @@ def _export_solved_run_locked(
             ).items()
         },
     )
-    manifest: List[Dict[str, Any]] = []
-    for item in prior_manifest:
-        if not str(item.get("output_stem") or "").strip():
-            continue
-        same_run = (
-            str(item.get("run_dir") or "") == run_key
-            and str(item.get("theorem_name") or "") == problem_name
-            and _normalize_answer_visibility(
-                str(item.get("answer_visibility") or "opaque")
-            )
-            == visibility
-        )
-        if same_run:
-            continue
-        if str(item.get("output_stem") or "") == record.output_stem:
-            continue
-        manifest.append(item)
-    manifest.append(asdict(record))
+    manifest = _merge_solved_manifest(
+        prior_manifest,
+        replaced_run_keys=[(run_key, problem_name, visibility)],
+        retired_stems=(),
+        records=[record],
+    )
     _write_solved_manifest(manifest_path, manifest)
     return record
 

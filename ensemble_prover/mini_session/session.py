@@ -10731,6 +10731,7 @@ class MiniSession:
     # work must not steal the one continuation that prevented quiescence.
     pending_fallback_action_id: str = ""
     final_proof: Optional[str] = None
+    _root_environment_invalidated: bool = field(default=False, repr=False)
     # When the selector reaches "no applicable action" while proof work is
     # still unresolved, the session can grant a bounded continuation budget
     # instead of treating scheduler exhaustion as mathematical exhaustion.
@@ -25002,7 +25003,10 @@ class MiniSession:
                 # iteration counter and stagnation are top-level concerns.
                 if action_id in self.budgets:
                     if not bool((outcome.metadata or {}).get("preserve_action_budget")):
-                        self.budgets[action_id].consume(outcome.cost_seconds)
+                        self.budgets[action_id].consume(
+                            outcome.cost_seconds,
+                            productive=outcome.elapsed_is_productive(),
+                        )
                         if outcome.exception is not None:
                             self.budgets[action_id].mark_exhausted(
                                 f"raised:{type(outcome.exception).__name__}"
@@ -25523,12 +25527,91 @@ class MiniSession:
             and candidate_verification != dict(verification or {})
         )
 
+    def _stored_root_environment_matches_runtime(self) -> bool:
+        """Require stored root authority to describe the current checker context."""
+
+        dossier = self.dossier
+        if dossier is None or not str(getattr(dossier, "final_proof", "") or "").strip():
+            return True
+        certificate = dict(getattr(dossier, "root_proof_certificate", {}) or {})
+        accepted_environment = str(certificate.get("target_environment_hash") or "")
+        current_environment = str(
+            getattr(dossier, "current_lean_environment_hash", "") or ""
+        )
+        conv = self.conv
+        if conv is not None and (
+            hasattr(conv, "lean_preamble") or hasattr(conv, "preamble")
+        ):
+            actual_environment = text_hash(str(
+                getattr(conv, "lean_preamble", "")
+                or getattr(conv, "preamble", "")
+                or ""
+            ))
+            return bool(
+                accepted_environment == current_environment == actual_environment
+            )
+        if not accepted_environment and not current_environment:
+            # Older in-process embeddings may have no explicit checker context.
+            # Missing stamps are never proof authority on their own.
+            return has_live_root_proof_finalization_receipt(dossier)
+        return bool(accepted_environment and accepted_environment == current_environment)
+
+    def _root_candidate_reuses_invalidated_environment(
+        self, candidate: RootFinalizationCandidate, *, already_applied: bool = False,
+    ) -> bool:
+        metadata = dict(candidate.metadata or {})
+        reuses_stored_authority = bool(
+            already_applied
+            or metadata.get("root_finalization_already_applied")
+            or metadata.get("hydrated_from_existing_root_finalization")
+        )
+        return bool(
+            self._root_environment_invalidated
+            and reuses_stored_authority
+            and not (
+                has_live_root_proof_finalization_receipt(self.dossier)
+                and self._stored_root_environment_matches_runtime()
+                and sanitize_lean_artifact_text(candidate.proof)
+                == getattr(self.dossier, "final_proof", None)
+            )
+        )
+
+    def _withdraw_stale_root_environment(self) -> bool:
+        """Revoke solved state whose accepted environment is no longer selected."""
+
+        if self._stored_root_environment_matches_runtime():
+            return False
+        certificate = dict(getattr(self.dossier, "root_proof_certificate", {}) or {})
+        if not certificate.get("target_environment_hash"):
+            # Unknown legacy provenance cannot authorize hydration, but it is
+            # not evidence of an environment change. Keep untrusted artifacts
+            # available as replay inputs and retain the gate's precise veto.
+            return False
+        self._root_environment_invalidated = True
+        self.dossier.clear_solved()
+        self.final_proof = None
+        self.root_finalized = False
+        reconciler = getattr(self.proof_state, "reconcile_with_dossier", None)
+        if callable(reconciler):
+            reconciler(self.dossier)
+        self._record_event({
+            "phase": "session_root_finalization",
+            "iteration": self.iteration,
+            "accepted": False,
+            "verdict": "root_finalization_environment_mismatch",
+        })
+        return True
+
     def _hydrate_root_candidate_from_existing_finalization(
         self,
         candidate: RootFinalizationCandidate,
     ) -> RootFinalizationCandidate:
         dossier = self.dossier
-        if dossier is None:
+        if (
+            dossier is None
+            or not self._stored_root_environment_matches_runtime()
+            or self._root_candidate_reuses_invalidated_environment(candidate)
+        ):
             return candidate
         proof_text = str(candidate.proof or "").strip()
         artifact_proof_text = sanitize_lean_artifact_text(candidate.proof)
@@ -25605,6 +25688,18 @@ class MiniSession:
         )
         if not replay_helpers and stored_replay_helpers:
             replay_helpers = stored_replay_helpers
+        live_stored_context = has_live_root_proof_finalization_receipt(dossier)
+        if live_stored_context:
+            # The live receipt binds the stored closure. An already-applied
+            # candidate supplies identity, not replacement helper sources.
+            replay_helpers = stored_replay_helpers
+            helper_names = tuple(
+                root_proof_certificate.get("candidate_helper_names") or ()
+            )
+            verification_certificate = dict(persisted_verification_certificate or {})
+            dependency_helper_names = tuple(
+                root_proof_certificate.get("dependency_helper_names", ())
+            )
         raw_replay_helpers = replay_helpers
         try:
             from ensemble_prover.proof_dossier import helper_decl_name
@@ -25618,7 +25713,7 @@ class MiniSession:
                     for name in [helper_decl_name(block)]
                     if name
                 )
-            if helper_names:
+            if helper_names and not live_stored_context:
                 helper_name_set = set(helper_names)
                 sources = list(replay_helpers) + list(stored_replay_helpers)
                 verified_getter = getattr(dossier, "verified_helper_blocks", None)
@@ -25769,7 +25864,9 @@ class MiniSession:
             route_id=route_id,
             dependency_node_ids=dependency_node_ids,
             replay_helpers=replay_helpers,
-            helper_names=helper_names or candidate.helper_names,
+            helper_names=(
+                helper_names if live_stored_context else helper_names or candidate.helper_names
+            ),
             dependency_helper_names=dependency_helper_names,
             require_route_contract=bool(route_id)
             or bool(candidate.require_route_contract),
@@ -25798,7 +25895,11 @@ class MiniSession:
         is present and no route/helper state is being reconstructed.
         """
 
-        if not self._root_candidate_target_matches_dossier(candidate):
+        if (
+            not self._root_candidate_target_matches_dossier(candidate)
+            or not self._stored_root_environment_matches_runtime()
+            or self._root_candidate_reuses_invalidated_environment(candidate)
+        ):
             return False
         artifact_hash = str(hydrated_proof_hash or "").strip()
         if not artifact_hash:
@@ -26167,23 +26268,44 @@ class MiniSession:
     ) -> bool:
         """Rewrite legacy already-applied root artifacts without new attempts."""
 
+        if (
+            self._withdraw_stale_root_environment()
+            or not self._stored_root_environment_matches_runtime()
+            or self._root_candidate_reuses_invalidated_environment(candidate, already_applied=True)
+            or not str(getattr(self.dossier, "final_proof", "") or "").strip()
+        ):
+            return False
         dossier = self.dossier
         refresher = getattr(dossier, "rewrite_solved_artifact", None)
         if not callable(refresher) or not getattr(result, "accepted", False):
             return False
+        live_stored_context = has_live_root_proof_finalization_receipt(dossier)
+        if live_stored_context:
+            candidate = self._hydrate_root_candidate_from_existing_finalization(
+                candidate
+            )
         verification_certificate = copy.deepcopy(
             candidate.verification_certificate or {}
         )
         expected_proof = sanitize_lean_artifact_text(candidate.proof)
+        if live_stored_context and (
+            expected_proof != dossier.final_proof
+            or tuple(sanitize_lean_artifact_texts(candidate.replay_helpers))
+            != tuple(dossier.final_replay_helpers)
+        ):
+            return False
         if result.proof != expected_proof:
             return False
         root_identity = (dossier.theorem_name, dossier.root_statement)
         dependency_helper_names = tuple(
             str(name or "").strip()
             for name in list(
-                getattr(result, "helper_names", ())
-                or candidate.dependency_helper_names
-                or ()
+                candidate.dependency_helper_names
+                if live_stored_context else (
+                    getattr(result, "helper_names", ())
+                    or candidate.dependency_helper_names
+                    or ()
+                )
             )
             if str(name or "").strip()
         )
@@ -26207,6 +26329,8 @@ class MiniSession:
                         )
                     )
                 )
+                if live_stored_context and expected_helpers != tuple(dossier.final_replay_helpers):
+                    return False
                 refresher(
                     candidate.proof,
                     replay_helpers=candidate.replay_helpers,
@@ -26284,6 +26408,26 @@ class MiniSession:
 
     def _apply_root_finalization(self, outcome: MiniOutcome) -> Dict[str, Any]:
         candidate = self._root_candidate_from_outcome(outcome)
+        withdrew_stale_root = self._withdraw_stale_root_environment()
+        reused_invalidated_proof = bool(
+            candidate is not None
+            and self._root_candidate_reuses_invalidated_environment(
+                candidate,
+                already_applied=bool((outcome.metadata or {}).get("root_finalization_already_applied")),
+            )
+        )
+        stale_already_applied = bool(
+            withdrew_stale_root and (
+                candidate is None
+                or (outcome.metadata or {}).get("root_finalization_already_applied")
+                or dict(candidate.metadata or {}).get("root_finalization_already_applied")
+            )
+        )
+        if reused_invalidated_proof or stale_already_applied:
+            return {
+                "root_finalization_accepted": False,
+                "root_finalization_verdict": "root_finalization_environment_mismatch",
+            }
         if candidate is None:
             if outcome.solved:
                 has_proof = bool(str(outcome.proof or "").strip())
@@ -26556,6 +26700,31 @@ class MiniSession:
                     route_contract_status.get("verdict") or ""
                 ),
             }
+        conv = self.conv
+        if (
+            not already_finalized
+            and conv is not None
+            and (hasattr(conv, "lean_preamble") or hasattr(conv, "preamble"))
+            and _verification_certificate_status(
+                certificate=candidate.verification_certificate,
+                proof=candidate.proof,
+                target_statement=candidate.target_statement,
+                replay_helpers=tuple(candidate.replay_helpers),
+                helper_names=tuple(candidate.helper_names),
+                require_certificate=True,
+            ).get("ready") is True
+        ):
+            # Fresh native candidates carry the checker result rather than a
+            # stored-root reuse request. Select their current checker context
+            # before the canonical finalizer binds and publishes the receipt.
+            preamble = str(
+                getattr(conv, "lean_preamble", "")
+                or getattr(conv, "preamble", "")
+                or ""
+            )
+            self.dossier.record_lean_environment(
+                text_hash(preamble), environment_source_text=preamble,
+            )
         result = finalize_root_solution(
             dossier=self.dossier,
             proof_state=self.proof_state,
@@ -28451,7 +28620,13 @@ class MiniSession:
                 }
             )
         else:
-            budget.consume(outcome.cost_seconds)
+            # The action-reported receipt decides spin accounting, exactly as
+            # the nested subaction dispatch does. The effective-solved gate
+            # governs mathematical state, not whether provider time paid off.
+            budget.consume(
+                outcome.cost_seconds,
+                productive=action_reported_outcome.elapsed_is_productive(),
+            )
         cleanup_continuation_identity = str(
             metadata.get("recursive_helper_cleanup_continuation_identity") or ""
         ).strip()
@@ -30535,6 +30710,11 @@ class MiniSession:
         are gone, so a retracted root can no longer look preserved.
         """
 
+        if (
+            self._withdraw_stale_root_environment()
+            or not self._stored_root_environment_matches_runtime()
+        ):
+            return False
         dossier = self.dossier
         # ``clear_solved`` nulls the dossier's proof, so its presence alone is
         # enough to tell "prior success still stands" from "just retracted".
@@ -30958,6 +31138,13 @@ class MiniSession:
         return False
 
     def _durable_final_proof(self) -> Optional[str]:
+        if (
+            self._withdraw_stale_root_environment()
+            or not self._stored_root_environment_matches_runtime()
+        ):
+            self.root_finalized = False
+            self.final_proof = None
+            return None
         proof = str(self.final_proof or "").strip()
         if proof:
             return self.final_proof

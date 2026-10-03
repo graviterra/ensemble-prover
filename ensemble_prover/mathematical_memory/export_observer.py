@@ -8,11 +8,15 @@ one.
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -71,11 +75,128 @@ def read_regular_file(path: Path, limit: int, deadline: float) -> bytes:
         os.close(fd)
 
 
+BINDING_NAME = "mathematical_memory_binding.json"
+
+
 def persist_export_binding(run_dir: Path, catalog: MemoryCatalog) -> bool:
+    """Pin this run to the first valid admitted catalog binding.
+
+    Publication stages the complete bytes in a private temporary file and moves
+    it onto the canonical name with a single atomic
+    ``renameat2(RENAME_NOREPLACE)``. The move never replaces an existing
+    destination and never creates a second link to the canonical inode, so an
+    interrupted or concurrent publisher can neither truncate nor replace a
+    binding that already exists, and no ambiguous two-name state needs to be
+    reclaimed. When no-replace rename is unavailable the call fails closed
+    rather than fall back to an overwriting ``os.replace``. A real crash can
+    leave an orphaned unique staging file; it is deliberately never reclaimed
+    by name or inode because no surviving process can prove ownership of it.
+    """
     try:
         return _persist_export_binding(run_dir, catalog)
     except (OSError, ValueError, RuntimeError):
         return False
+
+
+def _read_binding(directory: int, deadline: float) -> Any | None:
+    """Return the parsed canonical binding, or None when the file is absent.
+
+    Decoding errors surface instead of being repaired: a malformed canonical
+    file cannot prove which catalog it belonged to, and replacing it would
+    risk discarding a valid competing pin.
+    """
+    try:
+        raw = read_contained(directory, BINDING_NAME, 65536, deadline)
+    except FileNotFoundError:
+        return None
+    return json.loads(raw)
+
+
+_RENAME_NOREPLACE = 1
+
+
+def _rename_noreplace(src_fd: int, src: str, dst_fd: int, dst: str) -> bool:
+    """Atomically rename ``src`` over ``dst`` only when ``dst`` does not exist.
+
+    Returns True when the rename installed ``src`` as ``dst`` and False when
+    ``dst`` already exists. Raises RuntimeError when the running kernel or libc
+    cannot provide no-replace semantics: there is no portable rename that is
+    both atomic and non-replacing, and falling back to ``os.replace`` could
+    silently overwrite a competing pin.
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError("renameat2 unavailable") from exc
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        src_fd, os.fsencode(src), dst_fd, os.fsencode(dst), _RENAME_NOREPLACE
+    )
+    if result == 0:
+        return True
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        return False
+    if error_number in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+        raise RuntimeError("renameat2 no-replace unsupported")
+    raise OSError(error_number, os.strerror(error_number))
+
+
+def _publish_binding(
+    directory: int, raw: bytes, binding: Mapping[str, Any], deadline: float
+) -> bool:
+    """Install complete bytes atomically without clobbering a winning binding."""
+    temporary = f"tmp-{uuid.uuid4().hex}"
+    created = False
+    try:
+        handle = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory,
+        )
+        created = True
+        try:
+            remaining = memoryview(raw)
+            while remaining:
+                if time.monotonic() >= deadline:
+                    raise EvidenceUnavailable("deadline_exhausted")
+                count = os.write(handle, remaining)
+                if count <= 0:
+                    raise EvidenceUnavailable("write_failed")
+                remaining = remaining[count:]
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+        if not _rename_noreplace(directory, temporary, directory, BINDING_NAME):
+            # A competing writer won the race. Its binding is authoritative and
+            # is only read back for identity comparison, never rewritten. The
+            # reader stays strict: a destination with extra links or a symlink
+            # is rejected rather than repaired.
+            return _read_binding(directory, deadline) == binding
+        # The staged bytes were fsynced before the move, so the canonical name
+        # now refers to a complete file. Syncing the directory makes the
+        # rename durable; a crash before this cannot leave a partial file.
+        os.fsync(directory)
+        return True
+    finally:
+        # Remove only this call's own uniquely named staging file. A failed
+        # exclusive open never created it, so a name collision or permission
+        # error must not delete a pre-existing file that belongs to someone
+        # else. A real crash can orphan this name, and it is deliberately never
+        # reclaimed by name or inode because no surviving process can prove
+        # ownership of it.
+        if created:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=directory)
 
 
 def _persist_export_binding(run_dir: Path, catalog: MemoryCatalog) -> bool:
@@ -97,39 +218,10 @@ def _persist_export_binding(run_dir: Path, catalog: MemoryCatalog) -> bool:
     }
     raw = canonical_json(binding).encode()
     with contained_directory(Path(run_dir)) as directory:
-        try:
-            existing = json.loads(
-                read_contained(
-                    directory, "mathematical_memory_binding.json", 65536, deadline
-                )
-            )
-        except FileNotFoundError:
-            try:
-                fd = os.open(
-                    "mathematical_memory_binding.json",
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=directory,
-                )
-            except FileExistsError:
-                existing = json.loads(
-                    read_contained(
-                        directory, "mathematical_memory_binding.json", 65536, deadline
-                    )
-                )
-            else:
-                try:
-                    written = 0
-                    while written < len(raw):
-                        if time.monotonic() >= deadline:
-                            raise EvidenceUnavailable("deadline_exhausted")
-                        written += os.write(fd, raw[written:])
-                    os.fsync(fd)
-                    os.fsync(directory)
-                finally:
-                    os.close(fd)
-                return True
-        return existing == binding
+        existing = _read_binding(directory, deadline)
+        if existing is not None:
+            return existing == binding
+        return _publish_binding(directory, raw, binding, deadline)
 
 
 def _binding_matches(
@@ -339,5 +431,21 @@ def observe_verified_export(run_dir: Path, fresh_result: Mapping[str, Any]) -> i
             event, deadline_monotonic=deadline, queue_on_failure=False
         )
         if result.status in {"stored", "duplicate"}:
+            # Storing the session-local event is not by itself authority. The
+            # owning live service must admit this exact id and payload digest,
+            # and only when the referenced prior use was already admitted by a
+            # live process for this catalog root. Restored or disk-only records
+            # never populate that in-process admission map.
+            try:
+                from .service import admit_live_export_credit
+
+                admit_live_export_credit(
+                    catalog.root,
+                    event,
+                    prior_event_id=prior.event_id,
+                    prior_payload_digest=prior.payload_digest,
+                )
+            except Exception:
+                pass
             observed += 1
     return observed

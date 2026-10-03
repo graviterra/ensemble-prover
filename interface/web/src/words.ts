@@ -317,6 +317,20 @@ export function spendLines(costFields: Record<string, unknown>): string[] {
   return unique.slice(0, 8).map((line) => (/^\$\s*0+(?:\.0+)?$/.test(line) ? "unpriced" : line));
 }
 
+const SERVICE_MESSAGES: Record<string, string> = {
+  not_found: "That attempt is not in the library.",
+  not_owned: "That attempt is not owned by this service, so it cannot be changed here.",
+  not_owned_or_control_disabled: "This service is not allowing that for this attempt.",
+  launch_failed: "That attempt could not be started. Its storage and execution are uncertain.",
+  registry_state_unavailable: "Saved launch state cannot be read or updated safely.",
+  memory_unavailable: "Mathematical memory is unavailable for this attempt right now.",
+  memory_request_unavailable_or_conflicting: "That memory request could not be recorded; it may conflict with an earlier request.",
+  evidence_unavailable: "That evidence copy is unavailable right now.",
+  invalid_evidence_reference: "That evidence reference was not valid.",
+  host_rejected: "The request was not accepted from this address.",
+  origin_rejected: "The request was not accepted from this page.",
+};
+
 export function publicMessage(status: number, code: string, raw: string, action: "start" | "stop" | "read"): string {
   if (code === "csrf_rejected") return "The local session changed. Try again.";
   if (code === "confirmation_rejected") {
@@ -328,6 +342,9 @@ export function publicMessage(status: number, code: string, raw: string, action:
     return "This service is not allowing that.";
   }
   const trimmed = raw.trim();
+  const token = normalize(code);
+  const known = SERVICE_MESSAGES[token];
+  if (typeof known === "string" && (!trimmed || normalize(trimmed) === token)) return known;
   if (!trimmed || trimmed.length > 240 || /traceback|python\s+-m|\bargv\b|stack trace|\bcommand\b|\bshell\b/i.test(trimmed)) {
     if (status === 404 && action === "read") return "That attempt is not in the library.";
     return "The service could not complete that.";

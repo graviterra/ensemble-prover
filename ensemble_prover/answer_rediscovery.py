@@ -343,7 +343,9 @@ def rediscovery_arguments(prior: RefutedAnswer, argv: Sequence[str]) -> list[str
         question.extend(("--import", value))
     for value in prior.request.source_dirs:
         question.extend(("--source-dir", str(value)))
-    if prior.request.description:
+    # An explicitly empty description is a distinct, normalized request value
+    # ("" vs None) and must survive the round trip to the rediscovery worker.
+    if prior.request.description is not None:
         question.extend(("--description", prior.request.description))
     return [*base, *overrides, *question, *replacements,
             "--answer-refutation-from", str(prior.run_dir)]

@@ -42,6 +42,10 @@ from .contract_identity import (
     LEAN_CONTRACT_IDENTITY_VERSION,
     make_lean_contract_identity,
 )
+from .deadline_guard import (
+    await_with_strict_deadline,
+    create_result_only_deadline_task,
+)
 from .domain import (
     build_problem_profile,
     enabled_opt_in_tactics_from_config,
@@ -198,6 +202,11 @@ def current_lean_heartbeat_limit() -> int | None:
 def _effective_heartbeat_limit(
     value: int | None, inherited_limit: int | None = None
 ) -> int | None:
+    # Semantic probes replay the same helper declarations as proof checks.
+    # Honor the run's default before applying any stricter operation allowance;
+    # otherwise those probes silently fall back to Lean's 200k default.
+    if value is None and type(inherited_limit) is int and inherited_limit > 0:
+        value = inherited_limit
     outer = _OPERATION_HEARTBEATS.get()
     if (
         _OPERATION_MEMORY_MB.get() is not None
@@ -5409,8 +5418,15 @@ class LeanRunner:
                     "Lean execution queue",
                     file_path=file_path,
                 )
+                # Publish an interruption receipt instead of this leader's
+                # queue-timeout payload.  A coalesced follower whose own
+                # original deadline is still funded re-elects and waits for
+                # the permit again; only the leader that actually expired
+                # returns its own queue timeout below.  Publishing the timeout
+                # as the shared result would terminate every follower at once,
+                # even ones with budget left to reach the backend.
                 if not future.done():
-                    future.set_result(payload)
+                    future.set_exception(_SharedExecutionInterrupted())
                 return payload
             if self._closed or self._quiesced:
                 raise RuntimeError(
@@ -5853,6 +5869,37 @@ class LeanRunner:
             return None
         return (int(response.returncode), output)
 
+    async def _await_repl_resource(
+        self,
+        awaitable: Awaitable[Optional[LeanREPL]],
+        *,
+        deadline_monotonic: float,
+        operation_label: str,
+    ) -> Optional[LeanREPL]:
+        """Bound REPL adapter acquisition/restart by the operation deadline.
+
+        Acquiring a cold backend and restarting a failed one are resource
+        leases that belong to the adapter, not the caller's proof transaction.
+        Awaiting them through the result-only strict-deadline helper keeps the
+        complete operation inside its budget: on expiry the underlying task is
+        cancelled and tracked rather than orphaned, and a late completion
+        cannot publish a backend for this call.  The task is constructed with
+        the result-only owner so the reader/reap descendants ``LeanREPL`` may
+        spawn are authenticated as adapter leases too.  ``None`` is the same
+        fallback signal the unguarded resource helpers already use.
+        """
+
+        task = create_result_only_deadline_task(awaitable)
+        try:
+            return await await_with_strict_deadline(
+                task,
+                deadline_monotonic=deadline_monotonic,
+                operation_label=operation_label,
+                operation_ownership="result_only",
+            )
+        except asyncio.TimeoutError:
+            return None
+
     async def _run_via_repl(
         self,
         file_path: Path,
@@ -5862,7 +5909,39 @@ class LeanRunner:
         retry_termination: bool = True,
         dispatch_observer: Optional[Callable[[], None]] = None,
     ) -> Optional[tuple[int, str]]:
-        """Try the env-cached backend, restart once on failure, then fall back."""
+        """Try the env-cached backend, restart once on failure, then fall back.
+
+        The first attempt, the restart, and the post-restart retry draw from a
+        single absolute deadline derived from ``timeout_s``.  Each attempt's
+        allowance is recomputed from that deadline, so a retry cannot grant
+        itself a fresh full timeout and outlive the caller's complete-operation
+        budget after acquisition or a restart.
+
+        Acquisition (a cold ``repl.start()``) and the restart are adapter
+        resource work, not proof-transaction state.  Both are awaited through
+        the result-only strict-deadline helper so a slow start or restart
+        cannot extend the operation past its deadline; the helper cancels and
+        tracks the abandoned task instead of orphaning it, and any late
+        completion stays unobservable to this call.
+        """
+
+        configured_timeout_s = (
+            float(timeout_s) if timeout_s is not None else float(self.cfg.timeout_s)
+        )
+        if configured_timeout_s <= 0.0:
+            configured_timeout_s = 1.0
+        deadline_monotonic = time.monotonic() + configured_timeout_s
+
+        def next_attempt_allowance() -> Optional[tuple[float, Optional[float]]]:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            fast_fail = (
+                min(float(fast_fail_timeout_s), remaining)
+                if fast_fail_timeout_s is not None
+                else None
+            )
+            return remaining, fast_fail
 
         def require_live_result(result: tuple[int, str]) -> tuple[int, str]:
             returncode = int(result[0])
@@ -5870,18 +5949,28 @@ class LeanRunner:
                 raise RuntimeError(f"REPL terminated by signal {-returncode}")
             return result
 
-        repl = await self._get_repl()
+        repl = await self._await_repl_resource(
+            self._get_repl(),
+            deadline_monotonic=deadline_monotonic,
+            operation_label="repl acquisition",
+        )
         if repl is None:
             if self._configured_use_repl():
                 self._repl_fallback_count += 1
             return None
         repl_generation = int(self._repl_generation)
+        first_attempt = next_attempt_allowance()
+        if first_attempt is None:
+            # Acquiring the REPL consumed the complete-operation budget.
+            self._repl_fallback_count += 1
+            return None
+        first_timeout_s, first_fast_fail_s = first_attempt
         try:
             return require_live_result(
                 await repl.check(
                     file_path,
-                    timeout_s=timeout_s,
-                    fast_fail_timeout_s=fast_fail_timeout_s,
+                    timeout_s=first_timeout_s,
+                    fast_fail_timeout_s=first_fast_fail_s,
                     **(
                         {"dispatch_observer": dispatch_observer}
                         if dispatch_observer is not None
@@ -5899,17 +5988,28 @@ class LeanRunner:
                 "environment refresh" if stale_environment else "restart",
                 exc,
             )
-            restarted = await self._restart_repl_backend(
-                expected_generation=repl_generation,
-                invalidate_environment=not stale_environment,
+            restarted = await self._await_repl_resource(
+                self._restart_repl_backend(
+                    expected_generation=repl_generation,
+                    invalidate_environment=not stale_environment,
+                ),
+                deadline_monotonic=deadline_monotonic,
+                operation_label="repl restart",
             )
             if restarted is not None:
+                retry_attempt = next_attempt_allowance()
+                if retry_attempt is None:
+                    # The restart consumed the remaining operation budget;
+                    # do not grant the retry a fresh allowance.
+                    self._repl_fallback_count += 1
+                    return None
+                retry_timeout_s, retry_fast_fail_s = retry_attempt
                 try:
                     return require_live_result(
                         await restarted.check(
                             file_path,
-                            timeout_s=timeout_s,
-                            fast_fail_timeout_s=fast_fail_timeout_s,
+                            timeout_s=retry_timeout_s,
+                            fast_fail_timeout_s=retry_fast_fail_s,
                             **(
                                 {"dispatch_observer": dispatch_observer}
                                 if dispatch_observer is not None

@@ -12734,16 +12734,20 @@ def _make_role_cfg(
                 f"{role_name} request timeout must be a finite number > 0, "
                 f"got {request_timeout_f}"
             )
-    subscription_inactivity_timeout_s = (
-        timeout_f
-        if provider in {"codex", "claude-code", "cursor"}
+    default_subscription_soft_policy = (
+        provider in {"codex", "claude-code", "cursor"}
         and clean_deadline_policy == "soft"
         and not role_timeout_explicit
         and request_timeout_s is None
         and request_timeout_disabled is None
-        else 0.0
     )
-    if subscription_inactivity_timeout_s:
+    # Codex exec JSONL emits completed reasoning/answer items, not in-flight
+    # generation deltas. Silence here cannot distinguish thinking from a stall;
+    # the CLI owns the native network-stream inactivity watchdog instead.
+    subscription_inactivity_timeout_s = (
+        timeout_f if default_subscription_soft_policy and provider != "codex" else 0.0
+    )
+    if default_subscription_soft_policy:
         request_timeout_disabled = True
     if request_timeout_disabled is None:
         # Search lifetime and one provider operation are different budgets.
@@ -12773,6 +12777,7 @@ def _make_role_cfg(
     setattr(cfg, "request_timeout_s", request_timeout_f)
     setattr(cfg, "request_timeout_disabled", bool(request_timeout_disabled))
     setattr(cfg, "subscription_inactivity_timeout_s", subscription_inactivity_timeout_s)
+    setattr(cfg, "subscription_native_inactivity_watchdog", provider == "codex")
     return cfg
 
 
@@ -12987,6 +12992,9 @@ def _llm_deadline_cli_summary(cfg: Optional[RoleConfig]) -> Optional[Dict[str, A
         "subscription_inactivity_timeout_s": float(
             getattr(cfg, "subscription_inactivity_timeout_s", 0.0) or 0.0
         ),
+        "subscription_native_inactivity_watchdog": bool(
+            getattr(cfg, "subscription_native_inactivity_watchdog", False)
+        ),
         "operation_timeout_s": (
             float(getattr(cfg, "operation_timeout_s"))
             if getattr(cfg, "operation_timeout_s", None) is not None
@@ -13106,11 +13114,15 @@ def _build_argparser() -> argparse.ArgumentParser:
             "kill switch. Each HTTP request retains the finite role/model "
             "watchdog unless --llm-request-timeout-s off (or a role-scoped "
             "equivalent) explicitly disables it.\n"
-            "  Claude Code and Codex subscriptions default to a 300s inactivity "
+            "  Claude Code subscriptions default to a 300s inactivity "
             "watchdog in soft mode. Genuine generation progress renews it; "
             "status and retry messages do not. Explicit role/request timeouts "
             "and hard mode use absolute deadlines, including thinking. "
             "A killed CLI generation cannot resume.\n"
+            "  Codex soft mode relies on the CLI's native stream inactivity "
+            "watchdog: exec JSONL omits in-flight reasoning updates, so stdout "
+            "silence does not arm an implicit host deadline. Explicit role/request "
+            "timeouts and hard mode still impose absolute host deadlines.\n"
             "  Cursor selection uses the same 300s soft-mode inactivity "
             "watchdog. The installed Cursor CLI is unqualified: startup hooks "
             "outside CURSOR_CONFIG_DIR and undetected context compaction refuse "
@@ -13340,7 +13352,8 @@ def _build_argparser() -> argparse.ArgumentParser:
             "for both roles when explicitly supplied. "
             "Defaults are model/provider-specific (OpenRouter or Qwen: "
             "1200s; DeepSeek-V4: 600s; others: 300s). Default soft-policy "
-            "subscription requests use a 300s inactivity watchdog."
+            "Claude Code requests use a 300s inactivity watchdog; Codex uses "
+            "its native stream watchdog without a host stdout-silence deadline."
         ),
     )
     p.add_argument(
@@ -13364,7 +13377,8 @@ def _build_argparser() -> argparse.ArgumentParser:
             "subscription providers, for both roles. Use a finite number of "
             "seconds, or 'none'/'off'/'unbounded' to disable this clock. "
             "Default: the role/model watchdog for HTTP; a progress-renewed "
-            "300s inactivity watchdog for soft-policy subscriptions."
+            "300s inactivity watchdog for soft-policy Claude Code; the native "
+            "stream watchdog for soft-policy Codex."
         ),
     )
     p.add_argument(
@@ -15627,6 +15641,8 @@ async def _main_async(args: argparse.Namespace) -> int:
                 return f"{inactivity_s:g}s inactivity"
             configured = getattr(role_cfg, "request_timeout_s", None)
             if configured is None:
+                if getattr(role_cfg, "subscription_native_inactivity_watchdog", False):
+                    return "native Codex stream watchdog; no host wall limit"
                 return "unbounded"
             return f"{float(configured):g}s absolute"
 

@@ -741,6 +741,80 @@ async def _run_try_lean_tool_impl(
             "monotonicity instead."
         )
 
+    # Try plausible complete target proofs before publishing scratch acceptance.
+    # A later optional replay would spend a second deadline after a helper had
+    # already succeeded, risking loss of that paid progress at the cutpoint.
+    # Here a successful conversion is itself the first authoritative check;
+    # rejection falls through to the ordinary helper check below.
+    if (declaration_mode or example_mode) and not require_declaration and not feedback_context:
+        from .checked_target import (
+            _accepted_scratch_target_candidate, statement_may_close_target,
+        )
+        from .mini_recursive import _iter_checked_lean_target_headers
+        from .proof_dossier import canonical_dossier_statement_key
+
+        header_source = re.sub(
+            r"^(\s*(?:noncomputable\s+)?)example\b",
+            r"\1lemma mini_scratch_evidence", code,
+        )
+        bound_statement = helper_decl_statement(header_source)
+        headers = (bound_statement,) if bound_statement else _iter_checked_lean_target_headers(code)
+        target_key = canonical_dossier_statement_key(goal_statement)
+        # The tool-loop's textual fast path recognizes only unparameterized
+        # headers. Bound declarations still need conversion even when their
+        # reconstructed universal statement has identical surface text.
+        exact_header = any(
+            canonical_dossier_statement_key(header) == target_key
+            for header in _iter_checked_lean_target_headers(code)
+        )
+        named_target = bool(
+            decl_name and decl_name == str(getattr(dossier, "theorem_name", "") or "")
+        )
+        candidate = (
+            _accepted_scratch_target_candidate(code)
+            if not exact_header and (
+                named_target or any(statement_may_close_target(header, goal_statement) for header in headers)
+            ) else ""
+        )
+        if candidate:
+            target_receipt: Dict[str, str] = {}
+            target_context = tuple(context_lemmas or ())
+            environment = str(getattr(dossier, "current_lean_environment_hash", "") or "")
+            target_result = await _run_try_lean_tool_impl(
+                lean, goal_statement=goal_statement, preamble=preamble,
+                args={"code": candidate, "purpose": purpose},
+                context_lemmas=list(target_context), dossier=None,
+                timeout_s=timeout_s, max_heartbeats=max_heartbeats,
+                redact_solution_refs=redact_solution_refs,
+                deadline_exhausted=deadline_exhausted, accepted_code_out=target_receipt,
+            )
+            if deadline_elapsed():
+                return "try_lean cancelled: llm_turn_elapsed_budget_exhausted before target conversion could be recorded."
+            if (
+                environment != str(getattr(dossier, "current_lean_environment_hash", "") or "")
+                or target_context != tuple(context_lemmas or ())
+            ):
+                return "try_lean cancelled: Lean environment changed during target conversion."
+            if target_result.startswith("try_lean accepted.") and target_receipt.get("code") == candidate:
+                from .runtime_context import require_hard_timeout_capability_active
+
+                require_hard_timeout_capability_active("Mini checked target promotion")
+                if dossier is not None:
+                    dossier.record_scratch(
+                        turn_index=turn_index, tool_call_index=tool_call_index, ok=True,
+                        summary=target_result, code=candidate, goal_statement=goal_statement,
+                    )
+                    if hasattr(dossier, "record_accepted_proof_stub"):
+                        dossier.record_accepted_proof_stub(
+                            turn_index=turn_index, tool_call_index=tool_call_index,
+                            goal_statement=goal_statement, preamble=preamble,
+                            context_lemmas=list(target_context), code=candidate,
+                        )
+                if isinstance(accepted_code_out, dict):
+                    accepted_code_out["code"] = candidate
+                    accepted_code_out["target_conversion"] = "checked"
+                return target_result
+
     lemmas = list(context_lemmas or [])
     check_goal_statement = goal_statement
     check_code = code
@@ -1034,4 +1108,6 @@ async def run_try_lean_tool(*args: Any, **kwargs: Any) -> str:
         and str(accepted_code_receipt.get("code") or "").strip()
     ):
         caller_accepted_code_out["code"] = accepted_code_receipt["code"]
+        if accepted_code_receipt.get("target_conversion") == "checked":
+            caller_accepted_code_out["target_conversion"] = "checked"
     return result

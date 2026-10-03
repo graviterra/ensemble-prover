@@ -732,6 +732,77 @@ def _chat_tool_to_responses_tool(tool: Any) -> Dict[str, Any]:
     return flattened
 
 
+def _chat_content_to_responses_parts(content: Any) -> List[Dict[str, Any]]:
+    """Translate a chat-completions content field into Responses content parts.
+
+    Plain strings become ``input_text``. Structured ``text``/``image_url``
+    parts are translated to ``input_text``/``input_image`` with the image URL
+    and ``detail`` preserved, so callers that attach source images keep the
+    bytes instead of shipping their Python ``repr``. Unsupported part shapes
+    raise: caller content must never be silently replaced or dropped.
+    """
+
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}]
+    if not isinstance(content, (list, tuple)):
+        raise ValueError(
+            "Unsupported chat message content type: "
+            f"{type(content).__name__}"
+        )
+    parts: List[Dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append({"type": "input_text", "text": part})
+            continue
+        if not isinstance(part, Mapping):
+            raise ValueError(f"Unsupported chat message content part: {part!r}")
+        kind = str(part.get("type") or "")
+        if kind in {"text", "input_text", "output_text"}:
+            parts.append(
+                {"type": "input_text", "text": str(part.get("text") or "")}
+            )
+        elif kind in {"image_url", "input_image"}:
+            image = part.get("image_url")
+            if isinstance(image, Mapping):
+                url = str(image.get("url") or "")
+                detail = image.get("detail")
+            else:
+                url = str(image or part.get("url") or "")
+                detail = part.get("detail")
+            translated: Dict[str, Any] = {
+                "type": "input_image",
+                "image_url": url,
+            }
+            if detail:
+                translated["detail"] = str(detail)
+            parts.append(translated)
+        else:
+            raise ValueError(
+                "Unsupported chat message content part type: "
+                f"{kind or repr(part)}"
+            )
+    return parts
+
+
+def _responses_content_text(parts: List[Dict[str, Any]]) -> str:
+    """Flatten translated Responses text parts back to visible text."""
+
+    return "\n".join(
+        str(part.get("text") or "")
+        for part in parts
+        if part.get("type") == "input_text" and str(part.get("text") or "")
+    )
+
+
+def _require_text_only_parts(
+    parts: List[Dict[str, Any]], *, context: str
+) -> None:
+    if any(part.get("type") != "input_text" for part in parts):
+        raise ValueError(f"{context} cannot carry non-text Responses content")
+
+
 def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -739,7 +810,8 @@ def _chat_messages_to_responses_input(
 
     Assistant tool calls become ``function_call`` items and tool-role results
     become ``function_call_output`` items so multi-turn tool loops replay
-    faithfully.
+    faithfully. Structured user content (source images) is translated part by
+    part rather than flattened.
     """
 
     items: List[Dict[str, Any]] = []
@@ -748,13 +820,14 @@ def _chat_messages_to_responses_input(
             continue
         role = str(message.get("role") or "").strip() or "user"
         content = message.get("content")
-        text = content if isinstance(content, str) else str(content or "")
         if role == "tool":
+            parts = _chat_content_to_responses_parts(content)
+            _require_text_only_parts(parts, context="Tool messages")
             items.append(
                 {
                     "type": "function_call_output",
                     "call_id": str(message.get("tool_call_id") or ""),
-                    "output": text,
+                    "output": _responses_content_text(parts),
                 }
             )
             continue
@@ -775,6 +848,10 @@ def _chat_messages_to_responses_input(
                 # echoed as an input item.
                 items.extend(replay_items)
                 continue
+            parts = _chat_content_to_responses_parts(content)
+            _require_text_only_parts(
+                parts, context="Assistant input messages"
+            )
             for reasoning_item in message.get("_responses_reasoning_items") or ():
                 if isinstance(reasoning_item, dict):
                     items.append(
@@ -784,6 +861,7 @@ def _chat_messages_to_responses_input(
                             if key != "status"
                         }
                     )
+            text = _responses_content_text(parts)
             if text.strip():
                 items.append(
                     {
@@ -808,10 +886,11 @@ def _chat_messages_to_responses_input(
                     }
                 )
             continue
+        parts = _chat_content_to_responses_parts(content)
         items.append(
             {
                 "role": role,
-                "content": [{"type": "input_text", "text": text}],
+                "content": parts or [{"type": "input_text", "text": ""}],
             }
         )
     return items
@@ -876,6 +955,7 @@ def _responses_payload_to_chat_completion(data: Any) -> Dict[str, Any]:
         else {}
     )
     status = str(body.get("status") or "")
+    normalized_status = status.strip().lower()
     incomplete_reason = ""
     if isinstance(body.get("incomplete_details"), dict):
         incomplete_reason = str(
@@ -883,12 +963,20 @@ def _responses_payload_to_chat_completion(data: Any) -> Dict[str, Any]:
         )
     if tool_calls:
         finish_reason = "tool_calls"
-    elif status == "incomplete" and incomplete_reason == "max_output_tokens":
+    elif normalized_status == "incomplete" and incomplete_reason == "max_output_tokens":
         finish_reason = "length"
-    elif status == "incomplete" and incomplete_reason == "content_filter":
+    elif normalized_status == "incomplete" and incomplete_reason == "content_filter":
         finish_reason = "content_filter"
-    else:
+    elif normalized_status in {"", "completed"}:
         finish_reason = "stop"
+    elif normalized_status == "incomplete":
+        # Unknown incomplete reason: keep the reason (or a generic marker) so
+        # consumers that only inspect finish_reason cannot read it as success.
+        finish_reason = incomplete_reason or "incomplete"
+    else:
+        # Any other provider noncompletion (``failed``, ``cancelled``, ...)
+        # must not be reported as the synthetic success reason.
+        finish_reason = status or "incomplete"
     message: Dict[str, Any] = {
         "role": "assistant",
         "content": "\n".join(part for part in text_parts if part),
@@ -913,8 +1001,9 @@ def _responses_payload_to_chat_completion(data: Any) -> Dict[str, Any]:
         "model": str(body.get("model") or ""),
         **({"service_tier": body["service_tier"]} if "service_tier" in body else {}),
         **({"created": body["created_at"]} if "created_at" in body else {}),
-        # Consumers of a completed artifact must not mistake an unknown
-        # incomplete/failed Responses status for the synthetic `stop` below.
+        # Preserve the provider status verbatim so consumers can distinguish a
+        # genuine completion from a failed/unknown-incomplete turn even when
+        # the synthesized finish reason is not itself conclusive.
         "_responses_status": status,
         "choices": [
             {

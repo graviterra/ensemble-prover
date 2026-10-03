@@ -56,6 +56,10 @@ _TRUSTED_RUNTIME_CALLBACKS = {
     ("ensemble_prover.models", "_consume_task_exception"): "none",
     ("ensemble_prover.persistent_verifier", "_consume_task_exception"): "none",
     (
+        "ensemble_prover.persistent_verifier",
+        "_lane_release_callback.<locals>.release_lane_slot",
+    ): "lane_release",
+    (
         "ensemble_prover.mini_session.factory",
         "_consume_sample_task_exception",
     ): "none",
@@ -383,6 +387,26 @@ def _runtime_callback_has_internal_provenance(callback: Callable[..., Any]) -> b
             len(captured) == 2
             and any(isinstance(value, asyncio.Lock) for value in captured)
             and any(isinstance(value, dict) for value in captured)
+        )
+    if policy == "lane_release":
+        # Exactly the pool's lane-in-flight dict, one lane name, and the lane
+        # queue's change event. Nothing else may be captured, so the callback
+        # can only adjust one counter in a dict the pool already owns and wake
+        # its waiters -- it cannot reach pool or MiniSession state.
+        lane_inflight = [
+            value
+            for value in captured
+            if isinstance(value, dict)
+            and all(
+                isinstance(key, str) and isinstance(count, int)
+                for key, count in value.items()
+            )
+        ]
+        return (
+            len(captured) == 3
+            and len(lane_inflight) == 1
+            and any(isinstance(value, str) for value in captured)
+            and any(isinstance(value, asyncio.Event) for value in captured)
         )
     return False
 

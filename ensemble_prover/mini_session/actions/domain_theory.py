@@ -18,6 +18,10 @@ from ensemble_prover.mini_theory import (
     TheoryStoreError,
     TheoryStorePublicationCommitted,
 )
+from ensemble_prover.mini_theory.model import (
+    theory_need_authority,
+    theory_need_forbidden_target_statements,
+)
 from ensemble_prover.mini_theory.worker import run_cancellable_worker
 from ensemble_prover.proof_dossier import (
     StaleProofIdeaContextProjectionError,
@@ -170,24 +174,9 @@ def _candidate_need_forbidden_targets(
     *,
     root_statement: str = "",
 ) -> tuple[str, ...]:
-    evidence = dict(need.evidence_payload or {})
-    return tuple(
-        dict.fromkeys(
-            text
-            for text in (
-                str(need.consumer_statement or "").strip(),
-                str(need.target_statement or "").strip(),
-                str(root_statement or "").strip(),
-                _first_text(
-                    evidence,
-                    "formalization_bridge_parent_statement",
-                    "parent_repair_target_statement",
-                    "materialization_parent_statement",
-                    "root_contract_statement",
-                ),
-            )
-            if text
-        )
+    return theory_need_forbidden_target_statements(
+        need,
+        root_statement=root_statement,
     )
 
 
@@ -1197,13 +1186,13 @@ class DomainTheoryAction:
                 preserve_frontier_work=False,
                 semantic_budget_step_consumed=True,
             )
+        current_root_statement = str(
+            getattr(getattr(session, "dossier", None), "root_statement", "") or ""
+        )
         contract_rejection = _candidate_need_contract_rejection(
             candidate,
             need,
-            root_statement=str(
-                getattr(getattr(session, "dossier", None), "root_statement", "")
-                or ""
-            ),
+            root_statement=current_root_statement,
         )
         if bool(contract_rejection.get("rejected")):
             diagnostic = str(
@@ -1292,29 +1281,69 @@ class DomainTheoryAction:
             verify_parameters = inspect.signature(
                 library.verify_candidate
             ).parameters.values()
+            # The durable need may carry a frozen older root contract: upsert
+            # preserves the first observational evidence for a stable need
+            # identity, so the need's evidence payload is not automatically the
+            # root in force now.  The current session root is therefore added
+            # explicitly here -- the semantic Lean audit must independently
+            # check the root actually in force, never merely the conveniently
+            # persisted one, and a textual precheck cannot substitute for it
+            # when a transparent alias hides the equivalence.  Recovery
+            # reconstructs only the durable set, so a root that drifted since
+            # the need was frozen fails closed instead of borrowing authority
+            # for a stale contract.
+            forbidden_targets = _candidate_need_forbidden_targets(
+                need,
+                root_statement=current_root_statement,
+            )
             if any(
                 parameter.name == "forbidden_target_statements"
                 or parameter.kind is inspect.Parameter.VAR_KEYWORD
                 for parameter in verify_parameters
             ):
-                verify_kwargs["forbidden_target_statements"] = (
-                    _candidate_need_forbidden_targets(
-                        need,
-                        root_statement=str(
-                            getattr(
-                                getattr(session, "dossier", None),
-                                "root_statement",
-                                "",
-                            )
-                            or ""
-                        ),
-                    )
-                )
+                verify_kwargs["forbidden_target_statements"] = forbidden_targets
             verification = await run_cancellable_worker(
                 library.verify_candidate,
                 candidate,
                 **verify_kwargs,
             )
+            if (
+                leased_claim
+                and bool(getattr(verification, "accepted", False))
+                and callable(
+                    getattr(
+                        library.needs,
+                        "mark_build_attempt_candidate",
+                        None,
+                    )
+                )
+            ):
+                receipt = getattr(verification, "receipt", None)
+                # Bind recovery authority to this exact need/forbidden-target
+                # set/candidate and to the independent verification provenance.
+                # The exact set checked above is hashed into the authority, so
+                # recovery cannot narrow it back to the frozen durable root and
+                # silently accept a stale contract.  Publication alone must
+                # never mint acceptance on the recovery path.
+                library.needs.mark_build_attempt_candidate(
+                    need.need_id,
+                    attempt_id,
+                    bundle_id=candidate.bundle_id,
+                    need_authority=theory_need_authority(
+                        need=need,
+                        bundle_id=candidate.bundle_id,
+                        source_hash=candidate.source_hash,
+                        verification_output_hash=str(
+                            getattr(receipt, "verification_output_hash", "")
+                            or ""
+                        ),
+                        compiled_artifact_hash=str(
+                            getattr(receipt, "compiled_artifact_hash", "")
+                            or ""
+                        ),
+                        forbidden_target_statements=forbidden_targets,
+                    ),
+                )
             publication = library.publish_verified(
                 candidate,
                 verification,

@@ -22,6 +22,7 @@ from .pricing import (
     ensure_openrouter_reasoning_capabilities_async,
     lookup_openrouter_reasoning_capabilities,
 )
+from .math_utils import _raw_string_end
 from .utils import extract_code_fences, parse_tool_arguments, strip_lean_comments
 
 
@@ -2049,7 +2050,24 @@ def _simple_xml_tool_arguments(name: str, body: str) -> Optional[Dict[str, Any]]
 
 
 def _mask_nonprotocol_regions(content: str) -> str:
-    """Mask fenced and Lean-comment/string regions while preserving offsets."""
+    """Mask fenced and Lean-comment/string regions while preserving offsets.
+
+    Visible prose can carry quote punctuation that is not a Lean string
+    delimiter, most visibly inch notation such as ``a 6" ruler``.  A ``"`` is
+    therefore only a Lean string opener when it is not glued to a preceding
+    identifier character and an unescaped closing quote follows it somewhere
+    in the message.  Strings may span lines, so a matched string is masked
+    through its closing quote; an unmatched or identifier-glued quote stays
+    visible rather than swallowing the rest of the message.
+
+    Raw Lean strings (``r"..."``, ``r#"..."#``, ...) are recognized first via
+    the shared Lean lexical helper, because their ``r`` prefix would otherwise
+    make the opening quote look like glued prose punctuation.  A raw literal
+    is masked through its matching ``"`` and hash run, but only when that
+    terminator is present: an unterminated raw opener is deliberately left
+    visible, exactly like an unmatched prose quote, so ambiguous punctuation
+    cannot hide a real request that follows it.
+    """
 
     text = str(content or "")
     masked = list(text)
@@ -2084,6 +2102,34 @@ def _mask_nonprotocol_regions(content: str) -> str:
         _blank(offset, len(text))
 
     scan = "".join(masked)
+
+    # Record whether an unescaped quote exists to the right of each position.
+    # This keeps string detection linear even for quote-heavy proof text
+    # instead of rescanning from every quote.
+    unescaped_quote = [False] * len(scan)
+    cursor = 0
+    while cursor < len(scan):
+        if scan[cursor] == "\\":
+            cursor += 2
+            continue
+        if scan[cursor] == '"':
+            unescaped_quote[cursor] = True
+        cursor += 1
+    quote_follows = [False] * (len(scan) + 1)
+    for cursor in range(len(scan) - 1, -1, -1):
+        quote_follows[cursor] = quote_follows[cursor + 1] or unescaped_quote[cursor]
+
+    def _glued_to_identifier(position: int) -> bool:
+        # Lean never puts a string literal directly after an identifier
+        # character, but prose does (``6"``, ``foo"``).
+        if position <= 0:
+            return False
+        previous = scan[position - 1]
+        return previous.isalnum() or previous in {"_", "'"}
+
+    def _has_closing_quote(position: int) -> bool:
+        return quote_follows[position + 1]
+
     index = 0
     block_depth = 0
     in_string = False
@@ -2125,9 +2171,23 @@ def _mask_nonprotocol_regions(content: str) -> str:
             _blank(index, index + 2)
             index += 2
             continue
+        if scan[index] == "r":
+            raw_string = _raw_string_end(scan, index)
+            if raw_string is not None:
+                raw_end, raw_closed = raw_string
+                if raw_closed:
+                    # A raw literal is one Lean string even across lines, so
+                    # mask the ``r``, its hash/quote opener and the matching
+                    # terminator together.  Backslashes never escape inside
+                    # a raw string, so no escape handling applies here.
+                    _blank(index, raw_end)
+                    index = raw_end
+                    continue
+                # Unterminated raw opener: fall through and leave it visible.
         if scan[index] == '"':
-            in_string = True
-            _blank(index, index + 1)
+            if not _glued_to_identifier(index) and _has_closing_quote(index):
+                in_string = True
+                _blank(index, index + 1)
         index += 1
     return "".join(masked)
 
@@ -2140,7 +2200,10 @@ def extract_simple_xml_tool_calls(
     """Normalize DeepSeek's short XML tool form into ordinary tool calls.
 
     Only line-anchored, balanced tags for Mini's known tools are accepted.
-    Fenced code is excluded so a Lean string or comment cannot become a call.
+    Fenced code, Lean comments, and matched Lean string literals (including
+    raw ``r"..."``/``r#"..."#`` forms) are excluded so a quoted snippet
+    containing tag-like text cannot become a call.  Quote punctuation in
+    visible prose, including inch notation, is not a Lean string delimiter.
     Callers may further restrict names to the schemas enabled for that turn.
     """
 

@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from .lean_decl_parser import find_decl_header_end
+from .lean_source_lexing import _command_matches, _identifier_token_end, _mask_noncode
 from .theorem_project import (
     PUTNAMBENCH_ADAPTER_ID,
     PutnamProblem,
     TheoremProjectRequest,
+    _DOTTED_IDENT,
+    _active_command_scopes,
+    _component_identity,
+    _name_final_component,
+    _qualified_name,
+    _raw_name_components,
     _resolve_theorem_project,
     active_include_variables,
     decode_theorem_target_context,
@@ -37,18 +44,19 @@ def problem_docstring_text(
     return text or fallback
 
 
-_THEOREM_RE = re.compile(r"(?m)^\s*theorem\s+([A-Za-z0-9_']+)\b")
 _DECL_RE = re.compile(
-    r"(?m)^\s*(?:noncomputable\s+)?(theorem|lemma|def|abbrev)\s+([A-Za-z0-9_']+)\b"
+    rf"(?m)^\s*(?:noncomputable\s+)?(theorem|lemma|def|abbrev)\s+({_DOTTED_IDENT})"
 )
 _SORRY_DEF_RE = re.compile(
-    r"(?m)^\s*(?:noncomputable\s+)?(abbrev|def)\s+([A-Za-z0-9_']+)\s*:\s*(.*?)\s*:=\s*sorry\s*$"
+    rf"(?m)^\s*(?:noncomputable\s+)?(abbrev|def)\s+({_DOTTED_IDENT})\s*:\s*(.*?)\s*"
+    r"(?P<assignment>:=)\s*(?P<placeholder>sorry)\s*$"
 )
 # Two-line pattern: sorry def followed by a solution-value comment (PutnamBench convention).
 _SORRY_VALUE_RE = re.compile(
-    r"(?m)^(\s*(?:noncomputable\s+)?)(abbrev|def)\s+([A-Za-z0-9_']+)\s*:\s*(.*?)\s*:=\s*sorry[^\S\n]*\n[^\S\n]*--[^\S\n]*(.+?)[^\S\n]*$"
+    rf"(?m)^(\s*(?:noncomputable\s+)?)(abbrev|def)\s+({_DOTTED_IDENT})\s*:\s*(.*?)\s*"
+    r"(?P<assignment>:=)\s*(?P<placeholder>sorry)[^\S\n]*\n[^\S\n]*--[^\S\n]*"
+    r"(?P<solution_value>.+?)[^\S\n]*$"
 )
-_SORRY_TOKEN_RE = re.compile(r"\bsorry\b")
 
 
 def _strip_comments_and_strings_for_sorry_scan(text: str) -> str:
@@ -60,95 +68,138 @@ def _strip_comments_and_strings_for_sorry_scan(text: str) -> str:
     corrupt namespace/section balance.
     """
 
-    src = str(text or "")
-    out: list[str] = []
-    i = 0
-    n = len(src)
-    while i < n:
-        if src.startswith("--", i):
-            j = src.find("\n", i + 2)
-            if j == -1:
-                break
-            out.append("\n")
-            i = j + 1
-            continue
-        if src.startswith("/-", i):
-            depth = 1
-            j = i + 2
-            while j < n and depth > 0:
-                if src.startswith("/-", j):
-                    depth += 1
-                    j += 2
-                    continue
-                if src.startswith("-/", j):
-                    depth -= 1
-                    j += 2
-                    continue
-                if src[j] == "\n":
-                    out.append("\n")
-                j += 1
-            i = j
-            continue
-        if src[i] == '"':
-            out.append('"')
-            i += 1
-            while i < n:
-                if src[i] == "\\":
-                    i += 2
-                    continue
-                if src[i] == '"':
-                    out.append('"')
-                    i += 1
-                    break
-                if src[i] == "\n":
-                    out.append("\n")
-                i += 1
-            continue
-        out.append(src[i])
-        i += 1
-    return "".join(out)
+    # Keep escaped names so a qualified token such as ``Foo.«x».sorry``
+    # remains one identifier rather than exposing its final component.
+    return _mask_noncode(text)
 
 
 def _contains_code_sorry(text: str) -> bool:
-    return bool(_SORRY_TOKEN_RE.search(_strip_comments_and_strings_for_sorry_scan(text)))
+    masked = _strip_comments_and_strings_for_sorry_scan(text)
+    index = 0
+    while index < len(masked):
+        end = _identifier_token_end(masked, start=index)
+        if end > index:
+            if masked[index:end] == "sorry":
+                return True
+            index = end
+        else:
+            index += 1
+    return False
+
+
+def _code_declaration_matches(
+    pattern: re.Pattern[str], text: str, *, kind_group: int = 1,
+) -> Iterable[re.Match[str]]:
+    """Keep original captures only when declaration syntax is code."""
+
+    masked = _mask_noncode(text, mask_quoted_identifiers=True)
+    for match in pattern.finditer(text):
+        start, end = match.span(kind_group)
+        if masked[start:end] != match.group(kind_group):
+            continue
+        # A regex prefix is not a declaration name. Check the shared lexical
+        # token as well, preserving apostrophes, qualified and escaped names.
+        name_start, name_end = match.span(kind_group + 1)
+        if _identifier_token_end(text, start=name_start) != name_end:
+            continue
+        # A real declaration keyword can precede a multiline escaped type
+        # containing the text ``:= sorry``. The placeholder pattern must also
+        # point at executable assignment/body tokens, not that type's text.
+        syntax_groups = (name for name in ("assignment", "placeholder") if name in pattern.groupindex)
+        if any(masked[match.start(name):match.end(name)] != match.group(name)
+               for name in syntax_groups):
+            continue
+        yield match
+
+
+def _replace_code_declarations(
+    pattern: re.Pattern[str], replacement: Callable[[re.Match[str]], str],
+    text: str, *, kind_group: int = 1,
+) -> str:
+    parts: list[str] = []
+    cursor = 0
+    for match in _code_declaration_matches(pattern, text, kind_group=kind_group):
+        parts.extend((text[cursor:match.start()], replacement(match)))
+        cursor = match.end()
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+# Lean commands that may only start a new top-level declaration or scope.  A
+# preamble declaration body ends right before one of these so sanitization
+# cannot swallow a following scope closer or prerequisite declaration.
+_PREAMBLE_BOUNDARY_COMMANDS = frozenset(
+    {
+        "namespace",
+        "section",
+        "end",
+        "open",
+        "variable",
+        "include",
+        "omit",
+        "set_option",
+        "attribute",
+        "local",
+        "theorem",
+        "lemma",
+        "def",
+        "abbrev",
+        "noncomputable",
+        "private",
+        "protected",
+        "instance",
+        "example",
+        "class",
+        "structure",
+        "inductive",
+        "axiom",
+        "constant",
+        "opaque",
+        "mutual",
+    }
+)
+_COMMAND_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
+
+
+def _lean_identifier_continues(text: str, index: int) -> bool:
+    """Return whether the Lean identifier token at *text* continues at *index*.
+
+    The shared lexer follows Lean's ``isIdRest`` and qualified-name rules,
+    including letter-like symbols such as ``℘`` that Python's Unicode
+    alphanumeric predicate excludes. A keyword prefix of ``end℘`` or
+    ``end.foo`` must not cut a declaration body in half.
+    """
+
+    return _identifier_token_end(text) > index
 
 
 def _is_top_level_preamble_boundary(line: str) -> bool:
-    stripped = str(line or "").strip()
-    if not stripped:
+    """Return whether an unindented line starts a new top-level command.
+
+    Only a line whose first token is a Lean command keyword bounds a
+    declaration body.  Multiline Lean bodies routinely continue with
+    unindented non-command lines (``by``, ``trivial``, a bare application);
+    treating every column-zero line as a boundary would truncate them, and
+    matching literal prefixes would miss a bare ``end`` or an ``axiom``.  The
+    keyword must also be followed by an identifier boundary so the valid
+    identifiers ``end!`` and ``end₁`` are not read as the ``end`` command.
+    """
+
+    if not line:
         return False
     if line[:1] in {" ", "\t"}:
         return False
-    prefixes = (
-        "namespace ",
-        "section ",
-        "end ",
-        "open ",
-        "variable ",
-        "include ",
-        "omit ",
-        "set_option ",
-        "attribute ",
-        "local ",
-        "theorem ",
-        "lemma ",
-        "def ",
-        "abbrev ",
-        "noncomputable def ",
-        "noncomputable abbrev ",
-        "noncomputable theorem ",
-        "noncomputable lemma ",
-        "private ",
-        "protected ",
-        "instance ",
-        "example ",
-        "class ",
-        "structure ",
-        "inductive ",
-        "/--",
-        "/-!",
-    )
-    return any(stripped.startswith(prefix) for prefix in prefixes)
+    stripped = str(line).strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("/--", "/-!")):
+        return True
+    match = _COMMAND_WORD_RE.match(stripped)
+    if match is None:
+        return False
+    if _lean_identifier_continues(stripped, match.end()):
+        return False
+    return match.group(0) in _PREAMBLE_BOUNDARY_COMMANDS
 
 
 def _find_decl_body_end(text: str, header_end: int) -> int:
@@ -167,16 +218,17 @@ def _find_decl_body_end(text: str, header_end: int) -> int:
     first_newline = src.find("\n", header_end)
     if first_newline == -1:
         return len(src)
-    pos = first_newline + 1
-    while pos < len(src):
-        next_newline = src.find("\n", pos)
-        line_end = len(src) if next_newline == -1 else next_newline
-        line = src[pos:line_end]
-        if _is_top_level_preamble_boundary(line):
-            return pos
-        if next_newline == -1:
-            return len(src)
-        pos = next_newline + 1
+    # Scan the complete source so a literal/comment opened on an earlier line
+    # cannot turn its contents into a command. Preserve documentation openers:
+    # they belong to the following declaration and must survive replacement.
+    masked = _mask_noncode(src, preserve_doc_comments=True)
+    # Keep escaped names intact for token boundaries (``end.«name»`` is a
+    # reference), while excluding lines inside a multiline escaped name.
+    for line in _command_matches(re.compile(r"(?m)^[^\n]*"), masked):
+        if line.start() <= first_newline:
+            continue
+        if _is_top_level_preamble_boundary(line.group()):
+            return line.start()
     return len(src)
 
 
@@ -185,10 +237,12 @@ def _axiomatize_concrete_solution_decls(preamble: str) -> str:
 
     text = str(preamble or "")
     replacements: list[tuple[int, int, str]] = []
-    for match in _DECL_RE.finditer(text):
+    for match in _code_declaration_matches(_DECL_RE, text):
         kind = match.group(1)
         name = match.group(2)
-        if kind not in {"def", "abbrev"} or not name.endswith("_solution"):
+        if kind not in {"def", "abbrev"} or not _component_identity(
+            _name_final_component(name)
+        ).endswith("_solution"):
             continue
         header_end = find_decl_header_end(text, match.end())
         if header_end is None:
@@ -257,11 +311,13 @@ def _header_to_type(header: str) -> tuple[str, str]:
     # Remove trailing ':=' so we don't accidentally select that ':' as the type separator.
     if ":=" in header:
         header = header.rsplit(":=", 1)[0]
-    m = re.search(r"\b(theorem|lemma|def|abbrev)\s+([A-Za-z0-9_']+)\b", header)
+    m = re.search(r"\b(theorem|lemma|def|abbrev)\s+", header)
     if not m:
         raise ValueError("Header missing declaration name")
-    name = m.group(2)
-    name_end = m.end()
+    name_end = _identifier_token_end(header, start=m.end())
+    name = header[m.end():name_end]
+    if not name:
+        raise ValueError("Header missing declaration name")
     colon_pos = _first_top_level_colon_after(header, name_end)
     if colon_pos == -1:
         raise ValueError(f"Header for {name} missing top-level ':'")
@@ -292,7 +348,7 @@ def _sanitize_preamble(preamble: str, *, fill_values: bool = False) -> str:
         kind = match.group(2)  # "abbrev" or "def"
         name = match.group(3)
         typ = match.group(4).strip()
-        value = match.group(5).strip()
+        value = match.group("solution_value").strip()
         # A ``sorry`` placeholder elaborates regardless of whether its eventual
         # body is executable.  The answer supplied by PutnamBench may not be:
         # for example ``Real.exp 1`` has no compiler implementation.  Always
@@ -316,14 +372,18 @@ def _sanitize_preamble(preamble: str, *, fill_values: bool = False) -> str:
 
     if fill_values:
         # Pass 0: sorry defs with a next-line solution comment → fill in value.
-        sanitized = _SORRY_VALUE_RE.sub(_repl_value, preamble)
+        sanitized = _replace_code_declarations(
+            _SORRY_VALUE_RE, _repl_value, preamble, kind_group=2,
+        )
     else:
         # Pass 0: sorry defs with a next-line solution comment → axiom
         # (strips both the sorry line AND the solution comment line).
-        sanitized = _SORRY_VALUE_RE.sub(_repl_axiom_with_comment, preamble)
+        sanitized = _replace_code_declarations(
+            _SORRY_VALUE_RE, _repl_axiom_with_comment, preamble, kind_group=2,
+        )
 
     # Pass 1: remaining sorry defs (no solution comment) → opaque axiom.
-    sanitized = _SORRY_DEF_RE.sub(_repl_axiom, sanitized)
+    sanitized = _replace_code_declarations(_SORRY_DEF_RE, _repl_axiom, sanitized)
 
     if not fill_values:
         # Some local or generated Putnam files already contain concrete answer
@@ -333,7 +393,7 @@ def _sanitize_preamble(preamble: str, *, fill_values: bool = False) -> str:
         sanitized = _axiomatize_concrete_solution_decls(sanitized)
 
     # Then, replace any declaration block containing `sorry` with an axiom.
-    matches = list(_DECL_RE.finditer(sanitized))
+    matches = list(_code_declaration_matches(_DECL_RE, sanitized))
     if not matches:
         return sanitized
 
@@ -370,16 +430,33 @@ def _extract_solution_comment(
     *,
     theorem_name: str,
 ) -> str:
-    preferred_name = f"{str(theorem_name or '').strip()}_solution"
+    # The suffix belongs inside the final decoded component, including when
+    # the theorem is escaped. Canonical names already resolve `_root_` and
+    # enclosing namespaces; do not reinterpret them as source references.
+    target_components = tuple(map(_component_identity, _raw_name_components(theorem_name)))
+    preferred_components = (
+        (*target_components[:-1], target_components[-1] + "_solution")
+        if target_components else ()
+    )
     fallback = ""
-    for match in _SORRY_VALUE_RE.finditer(str(preamble or "")):
+    for match in _code_declaration_matches(
+        _SORRY_VALUE_RE, str(preamble or ""), kind_group=2,
+    ):
         name = str(match.group(3) or "").strip()
-        comment = str(match.group(5) or "").strip()
+        comment = str(match.group("solution_value") or "").strip()
         if not comment:
             continue
-        if name == preferred_name:
+        namespace = tuple(
+            scope_name
+            for kind, scope_name, _start, _end in _active_command_scopes(preamble, match.start(3))
+            if kind == "namespace"
+        )
+        components = tuple(map(
+            _component_identity, _raw_name_components(_qualified_name(namespace, name)),
+        ))
+        if preferred_components and components == preferred_components:
             return comment
-        if not fallback and name.endswith("_solution"):
+        if not fallback and _component_identity(_name_final_component(name)).endswith("_solution"):
             fallback = comment
     return fallback
 

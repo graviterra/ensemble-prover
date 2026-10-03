@@ -251,6 +251,116 @@ class TheoryNeed:
         return cls(**data)
 
 
+def _exact_target_statement(value: Any) -> str:
+    """Return the exact Lean source of a forbidden target, outer-stripped only.
+
+    These strings are interpolated verbatim into the verifier's generated audit
+    as ``Prop`` definitions, so internal whitespace, line/block comments, and
+    quoted or string literals are meaning-bearing source and must be preserved
+    byte-for-byte.  Collapsing whitespace (for example joining lines) turns a
+    ``--`` line comment into a comment consuming the rest of the statement, and
+    rewrites the contents of string literals; either silently changes the
+    proposition.  Distinct exact spellings must also stay distinct so their
+    authority hashes cannot be equated.  Only surrounding whitespace is
+    removed.
+    """
+
+    return str(value or "").strip()
+
+
+def theory_need_forbidden_target_statements(
+    need: "TheoryNeed",
+    *,
+    root_statement: str = "",
+) -> tuple[str, ...]:
+    """Return the exact need/root targets a candidate must not assume.
+
+    This is the single source of truth for the forbidden-target set used both
+    when independently verifying a candidate and when reconstructing recovery
+    authority from durable state.  It intentionally derives the root from the
+    need's own evidence payload so a crashed process can reproduce the same set
+    without the original session.  Statements are preserved as exact Lean
+    source (outer whitespace stripped only) because they are handed to the
+    verifier; no text normalization may pretend two spellings are the same
+    mathematical identity.
+    """
+
+    evidence = dict(need.evidence_payload or {})
+    return tuple(
+        dict.fromkeys(
+            text
+            for text in (
+                _exact_target_statement(need.consumer_statement),
+                _exact_target_statement(need.target_statement),
+                _exact_target_statement(root_statement),
+                *(
+                    _exact_target_statement(evidence.get(key))
+                    for key in (
+                        "formalization_bridge_parent_statement",
+                        "parent_repair_target_statement",
+                        "materialization_parent_statement",
+                        "root_contract_statement",
+                    )
+                ),
+            )
+            if text
+        )
+    )
+
+
+def theory_need_authority(
+    *,
+    need: "TheoryNeed",
+    bundle_id: str,
+    source_hash: str,
+    verification_output_hash: str,
+    compiled_artifact_hash: str,
+    forbidden_target_statements: Sequence[str] | None = None,
+) -> str:
+    """Bind independent verification authority to an exact need/candidate/root.
+
+    The digest incorporates the need identity, the exact forbidden-target set
+    that was independently checked, the content-addressed candidate identity,
+    and the durable proof that independent verification actually ran (the
+    verification output and compiled artifact hashes the verifier issued for
+    this run).  A recycled bundle published for a different need, or one
+    journaled before need-relative verification completed, cannot reproduce
+    this digest.
+
+    ``forbidden_target_statements`` lets a caller bind the exact set handed to
+    the semantic verifier.  Build callers must pass the set that includes the
+    current session root: the durable need may have frozen an older root
+    contract at ``upsert`` time, so deriving the set from durable state alone
+    would bind authority to a narrower contract than was actually checked.
+    Recovery recomputes only the durable set, so a root that drifted fails
+    closed instead of borrowing authority for a stale contract.
+    """
+
+    if forbidden_target_statements is None:
+        target_statements = theory_need_forbidden_target_statements(need)
+    else:
+        target_statements = tuple(
+            dict.fromkeys(
+                text
+                for statement in forbidden_target_statements
+                if (text := _exact_target_statement(statement))
+            )
+        )
+    payload = {
+        "schema_version": 1,
+        "need_id": _clean_text(need.need_id),
+        "forbidden_target_hashes": sorted(
+            content_hash(statement, length=64)
+            for statement in target_statements
+        ),
+        "bundle_id": _clean_text(bundle_id),
+        "source_hash": _clean_text(source_hash),
+        "verification_output_hash": _clean_text(verification_output_hash),
+        "compiled_artifact_hash": _clean_text(compiled_artifact_hash),
+    }
+    return content_hash(_canonical_json(payload), length=64)
+
+
 @dataclass(frozen=True)
 class TheoryDeclaration:
     fq_name: str

@@ -7032,7 +7032,11 @@ def _inherit_child_memory_source_obligations(session: Any, *, parent: Any = None
         parent = getattr(session, "parent", None)
     if parent is None:
         return
-    from ..mathematical_memory.service import snapshot_memory_source_obligations
+    from ..mathematical_memory.service import (
+        _merge_retired_support_identities,
+        _retired_support_unknown_names,
+        snapshot_memory_source_obligations,
+    )
 
     memory = getattr(parent, "mathematical_memory", None)
     try:
@@ -7049,6 +7053,17 @@ def _inherit_child_memory_source_obligations(session: Any, *, parent: Any = None
         state["retired_support_incomplete"] = True
         return
     if inherited.get("retired_support_incomplete") is True:
+        state["retired_support_incomplete"] = True
+    try:
+        unknown = _retired_support_unknown_names(state) | _retired_support_unknown_names(inherited)
+        if len(unknown) > 4096:
+            raise ValueError("retired support name limit exceeded")
+        state["retired_support_unknown_names"] = sorted(unknown)
+        state["retired_support_identities"] = _merge_retired_support_identities(
+            state.get("retired_support_identities", {}),
+            inherited.get("retired_support_identities", {}),
+        )
+    except ValueError:
         state["retired_support_incomplete"] = True
     for key in (
         "retired_support_names", "retired_bundle_obligations", "retired_import_owners"

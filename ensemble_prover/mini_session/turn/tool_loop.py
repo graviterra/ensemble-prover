@@ -5945,6 +5945,8 @@ async def _call_llm_with_tools_one_round_impl(
                                     # If classification is unavailable, leave
                                     # the ordinary transcript path in control.
                                     accepted_target_negation = bool(bridge_source)
+                            if accepted_code_out.get("target_conversion") == "checked":
+                                accepted_exact_target = True
                             if accepted_exact_target:
                                 accepted_exact_target_code = (
                                     accepted_try_lean_code
@@ -6412,7 +6414,11 @@ async def _call_llm_with_tools_one_round_impl(
                             "content": result_text,
                         }
                     )
-                    tool_calls_used += 1
+                    if not replaying_paid_tool_retry:
+                        # The paid replay spends its entitlement on this
+                        # launched-but-timed-out attempt; charging again would
+                        # exceed max_tool_calls_per_turn in the checkpoint.
+                        tool_calls_used += 1
                     if replaying_durable_progress_tool:
                         # A timed closer is not semantically disproved. Rotate
                         # it behind untouched calls when the configured replay
@@ -6761,7 +6767,13 @@ async def _call_llm_with_tools_one_round_impl(
                     not args_parse_error
                     and consumes_tool_budget
                 )
-                if consumes_tool_budget:
+                # A persisted paid replay re-runs the exact call whose slot was
+                # charged before its after-launch failure. This dispatch spends
+                # that entitlement; it does not charge the paid budget, or the
+                # matching repair phase counter, a second time. Re-charging
+                # would persist tool_calls_used beyond max_tool_calls_per_turn
+                # and leave the continuation checkpoint unrepresentable.
+                if consumes_tool_budget and not replaying_paid_tool_retry:
                     tool_calls_used += 1
                     if repair_self_check_required:
                         if name in {"try_lean", "certify_counterexample"}:

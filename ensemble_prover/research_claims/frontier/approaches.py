@@ -81,41 +81,69 @@ def _join_service_tail(state: dict[str, Any], approach_id: str) -> None:
     queue.append(approach_id)
 
 
+def _mark_held(state: dict[str, Any], approach_id: str) -> None:
+    """Record an effective hold so release and eligibility agree on the state."""
+    approach = _approach(state, approach_id)
+    if approach["status"] == "held":
+        return
+    approach["status"] = "held"
+    approach["status_revision"] += 1
+    approach["resume_condition"] = "appeal_or_route_revision"
+    mark_permits_stale(state, approach_id)
+
+
+def _leave_service(state: dict[str, Any], approach_id: str) -> None:
+    """Withdraw held work from residency and service without losing its ticket.
+
+    The admission ticket stays in the queue so releasing the hold resumes the
+    work through the normal admission path in its original order. A held route
+    cannot occupy a residency slot or displace viable queued work meanwhile.
+    """
+    for queue in ("resident", "service_queue"):
+        while approach_id in state[queue]:
+            state[queue].remove(approach_id)
+
+
 def _admit_from_queue(state: dict[str, Any], *, now: float) -> dict[str, Any] | None:
     if len(state["resident"]) >= state["policy"]["max_resident_approaches"]:
         return None
-    if not state["admission_queue"]:
-        return None
-    approach_id = state["admission_queue"].pop(0)
-    approach = _approach(state, approach_id)
-    approach["outstanding_admission_sequence"] = None
-    approach["status"] = "waiting" if approach.pop("readmit_waiting", False) else "runnable"
-    approach["blocked_reason"] = None
-    if approach_id not in state["resident"]:
-        state["resident"].append(approach_id)
-    _join_service_tail(state, approach_id)
-    approach["protect_until_served"] = True
-    if not any(
-        item["approach_id"] == approach_id and item["kind"] == "initial_exploration"
-        for item in state["permits"].values()
-    ):
-        question = state["questions"][approach["question_id"]]
-        try:
-            issue_permit(
-                state,
-                kind="initial_exploration",
-                approach_id=approach_id,
-                question_id=question["question_id"],
-                question_revision=question["revision"],
-                route_revision=state["routes"][approach["route_id"]]["revision"],
-                operation=question["uncertainty"],
-                expires_at=now + state["policy"]["permit_lease_seconds"],
-                lineage_id=approach["lineage_id"],
-            )
-        except FrontierRefusal as exc:
-            if exc.reason != "initial_permit_already_issued":
-                raise
-    return approach
+    for index, approach_id in enumerate(state["admission_queue"]):
+        approach = _approach(state, approach_id)
+        if approach_is_held(state, approach_id):
+            # Held work keeps its place but never consumes a residency slot or
+            # displaces a viable queued approach.
+            _mark_held(state, approach_id)
+            continue
+        del state["admission_queue"][index]
+        approach["outstanding_admission_sequence"] = None
+        approach["status"] = "waiting" if approach.pop("readmit_waiting", False) else "runnable"
+        approach["blocked_reason"] = None
+        if approach_id not in state["resident"]:
+            state["resident"].append(approach_id)
+        _join_service_tail(state, approach_id)
+        approach["protect_until_served"] = True
+        if not any(
+            item["approach_id"] == approach_id and item["kind"] == "initial_exploration"
+            for item in state["permits"].values()
+        ):
+            question = state["questions"][approach["question_id"]]
+            try:
+                issue_permit(
+                    state,
+                    kind="initial_exploration",
+                    approach_id=approach_id,
+                    question_id=question["question_id"],
+                    question_revision=question["revision"],
+                    route_revision=state["routes"][approach["route_id"]]["revision"],
+                    operation=question["uncertainty"],
+                    expires_at=now + state["policy"]["permit_lease_seconds"],
+                    lineage_id=approach["lineage_id"],
+                )
+            except FrontierRefusal as exc:
+                if exc.reason != "initial_permit_already_issued":
+                    raise
+        return approach
+    return None
 
 
 def fill_resident_slots(state: dict[str, Any], *, now: float) -> None:
@@ -235,7 +263,10 @@ def propose_approach(
     state["admission_queue"].append(approach_id)
     fill_resident_slots(state, now=now)
     if approach_id not in state["resident"]:
-        approach["status"] = "dormant"
+        if approach_is_held(state, approach_id):
+            _mark_held(state, approach_id)
+        else:
+            approach["status"] = "dormant"
     return approach
 
 
@@ -534,7 +565,7 @@ def hold_obligation(state: dict[str, Any], obligation_id: str, *, method: str = 
     })
     held: list[str] = []
     for approach in state["approaches"].values():
-        if approach["status"] in {"superseded", "completed", "dormant"}:
+        if approach["status"] in {"superseded", "completed"}:
             continue
         if method and approach.get("method") != method:
             continue
@@ -544,8 +575,10 @@ def hold_obligation(state: dict[str, Any], obligation_id: str, *, method: str = 
         approach["status_revision"] += 1
         approach["resume_condition"] = "appeal_or_route_revision"
         mark_permits_stale(state, approach["approach_id"])
-        if approach["approach_id"] in state["resident"]:
-            state["resident"].remove(approach["approach_id"])
+        # Dormant queued work is held too. It must leave service so it cannot
+        # fill a residency slot while the obligation is held, but its queued
+        # admission ticket stays so release readmits it normally.
+        _leave_service(state, approach["approach_id"])
         held.append(approach["approach_id"])
     fill_resident_slots(state, now=now)
     return held
@@ -592,6 +625,11 @@ def expire_waiting(state: dict[str, Any], now: float) -> list[str]:
 
 def request_readmission(state: dict[str, Any], approach_id: str, *, now: float) -> None:
     approach = _approach(state, approach_id)
+    if approach_is_held(state, approach_id):
+        # Held work stays queued and out of service until its hold is released.
+        _mark_held(state, approach_id)
+        _leave_service(state, approach_id)
+        return
     if approach.get("outstanding_admission_sequence") is None:
         state["admission_sequence"] += 1
         approach["outstanding_admission_sequence"] = state["admission_sequence"]
@@ -602,7 +640,7 @@ def request_readmission(state: dict[str, Any], approach_id: str, *, now: float) 
     if approach_id in state["resident"]:
         state["resident"].remove(approach_id)
     fill_resident_slots(state, now=now)
-    if approach_id not in state["resident"]:
+    if approach_id not in state["resident"] and not approach_is_held(state, approach_id):
         approach["status"] = "paused"
         approach["blocked_reason"] = "awaiting_admission"
 

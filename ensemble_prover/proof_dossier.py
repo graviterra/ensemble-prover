@@ -4038,17 +4038,29 @@ def _recipe_repair_cursor_matches_finding(
     expected_outcome = (
         "refuted" if status == "exhausted" else "transient_failure"
     )
-    return bool(
+    if not (
         str(finding.get("engine") or "") == "function"
         and str(finding.get("outcome") or "") == expected_outcome
         and str(candidate.get("candidate_hash") or "")
         == str(disposition.get("candidate_hash") or "")
-        and candidate == dict(disposition.get("candidate") or {})
         and metadata.get("right_pi_replay") is True
         and metadata.get("right_pi_plan_hash") == disposition.get("plan_hash")
         and metadata.get("right_pi_candidate_index")
         == disposition.get("candidate_index")
-    )
+    ):
+        return False
+    if (
+        status == "pending"
+        and disposition.get("candidate") is None
+        and disposition.get("candidate_oversized") is True
+    ):
+        # A legitimately oversized disposition deliberately omits the candidate
+        # body and binds through its content hash plus the typed right-Pi plan
+        # and index metadata checked above.  The body cannot be compared
+        # because the generator never persisted it; the hash still pins the
+        # recorded report to the parked candidate.
+        return True
+    return candidate == dict(disposition.get("candidate") or {})
 
 
 def _merge_falsification_cursor(

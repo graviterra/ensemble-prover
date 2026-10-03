@@ -1288,7 +1288,14 @@ class TheoryBundleVerifier:
             type_text = ""
             type_match = next((
                 match for match in re.finditer(
-                    rf"(?ms)^(?P<name>{_DOTTED_IDENT})(?P<type>.*?)(?=^'[^\r\n]+'\s+(?:depends|does)\b)",
+                    # With `pp.universes true`, Lean prints a polymorphic
+                    # constant's name together with its universe parameters
+                    # (`N.foo.{u}`).  That suffix belongs to the printed
+                    # declaration name, not to the type: consume it here so the
+                    # captured type keeps only the universes that are genuinely
+                    # part of the declaration (e.g. `Eq.{u + 1}`).
+                    rf"(?ms)^(?P<name>{_DOTTED_IDENT})(?:\.\{{[^{{}}]*\}})?"
+                    rf"(?P<type>.*?)(?=^'[^\r\n]+'\s+(?:depends|does)\b)",
                     str(output or ""),
                 ) if lean_name_components(match.group("name")) == lean_name_components(fq_name)
             ), None)

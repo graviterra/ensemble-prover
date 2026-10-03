@@ -40,7 +40,7 @@ _COMMAND_PREFIX = (
 )
 _FORBIDDEN_COMMAND_WORDS = (
     r"axiom|run_cmd|initialize|builtin_initialize|"
-    r"elab|elab_rules|macro|syntax|declare_syntax_cat|register_option|"
+    r"elab|elab_rules|macro_rules|macro|syntax|declare_syntax_cat|register_option|"
     r"register_simp_attr|opaque"
 )
 _FORBIDDEN_COMMAND_RE = re.compile(

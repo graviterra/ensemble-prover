@@ -228,6 +228,26 @@ class MiniOutcome:
     repair_ticket: Optional[RepairTicket] = None
     root_candidate: Optional[RootFinalizationCandidate] = None
 
+    def elapsed_is_productive(self) -> bool:
+        """Whether this dispatch's wall time paid off for spin accounting.
+
+        ``ActionBudget``'s aggregate seconds ceiling exists to bound spin:
+        time spent on dispatches that produced no progress.  Actions report
+        that through ``solved``/``progress``.  ``FormalStateSearchAction``
+        deliberately reports ``progress=False`` for a bounded exploration
+        quantum while its outcome metadata records whether the quantum reset
+        its per-context no-improvement window in ``formal_rank_improved``;
+        that action-emitted receipt is the narrow formal-search productivity
+        signal.  Provider prose, replayed free text, and exception receipts
+        never qualify.
+        """
+
+        if self.exception is not None:
+            return False
+        if self.solved or self.progress:
+            return True
+        return (self.metadata or {}).get("formal_rank_improved") is True
+
     @classmethod
     def from_exception(
         cls,

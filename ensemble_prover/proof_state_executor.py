@@ -9183,6 +9183,14 @@ async def _try_proof_state_root_tactic_assembly(
             record["root_tactic_context_preserved"] = True
             record["root_tactic_finalization_pending"] = True
             return False, None, [], [record]
+        # A Lean-accepted close with no helper dependencies is a standalone root
+        # proof even when helper assembly was available: it is not routed
+        # through any helper, so it must not be forced through the helper route
+        # contract at finalization.
+        root_assembly_uses_helpers = (
+            str(contract_status.get("verdict") or "")
+            != "root_tactic_no_helper_dependencies"
+        )
         route_helper_names = [
             str(name or "").strip()
             for name in list(contract_status.get("helper_names") or [])
@@ -9232,7 +9240,7 @@ async def _try_proof_state_root_tactic_assembly(
                 or getattr(conv, "goal_statement", "")
                 or ""
             ),
-            require_route_contract=True,
+            require_route_contract=root_assembly_uses_helpers,
             verification_certificate=root_verification_certificate(
                 accepted=True,
                 proof=root_tactic.proof,

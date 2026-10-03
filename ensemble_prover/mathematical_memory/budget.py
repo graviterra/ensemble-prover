@@ -221,20 +221,29 @@ class MemoryAllocation:
                         return 0.0
                     token = MemoryReservation(amount)
                     token.identity = uuid.uuid4().hex
-                    self._spent += amount
+                    # Stage the debit for durable publication without touching
+                    # live state; a dispatch that is never accepted must not
+                    # leave a charge behind.
+                    staged_spent = self._spent + amount
                     if ledger is not None:
                         ledger.update(
                             total=self.seconds,
-                            spent=self._spent,
+                            spent=staged_spent,
                             active=token.identity,
                             active_reserved_s=amount,
                         )
                 # Publish live dispatch only after reservation fsync succeeds.
+                self._spent = staged_spent
                 self._active = True
                 self._reservation = token
                 self._synchronize()
                 return token
             except (OSError, ValueError, RuntimeError):
+                # Publication may have failed before or after the durable
+                # record landed. The live debit stays unpublished either way:
+                # a missing record leaves the slot available, while a landed
+                # record makes every later read fail closed on its active
+                # token until a live controller receipt reconciles it.
                 return 0.0
 
     def finish(self, reserved: float, elapsed: float) -> None:

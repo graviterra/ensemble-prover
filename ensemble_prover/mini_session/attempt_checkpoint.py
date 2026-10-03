@@ -13,6 +13,7 @@ import json
 import math
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, cast
 
@@ -163,6 +164,42 @@ def worker_elapsed_for_resume(record: dict[str, Any]) -> float:
     return float(elapsed)
 
 
+class _LiveLaneOwner:
+    """One lane's process-local owner, tracked without extending its lifetime.
+
+    A completed child can remain reachable by its caller after its receipt is
+    committed. If the registry held the only strong reference, every finished
+    child would be retained for the whole attempt and every later commit would
+    audit all of them. A weak reference keeps the lane guard, commit ownership
+    and late metric sweep for as long as the session is genuinely live, then
+    lets a dead lane be pruned. Only a double that cannot be weak-referenced
+    falls back to a strong reference, and that fallback is released when the
+    lane settles.
+    """
+
+    __slots__ = ("_ref", "_strong")
+
+    def __init__(self, session: Any) -> None:
+        self._strong = None
+        try:
+            self._ref = weakref.ref(session)
+        except TypeError:
+            self._ref = None
+            self._strong = session
+
+    def session(self) -> Any:
+        if self._strong is not None:
+            return self._strong
+        ref = self._ref
+        return ref() if ref is not None else None
+
+    def owns(self, session: Any) -> bool:
+        return self.session() is session
+
+    def strong_only(self) -> bool:
+        return self._ref is None
+
+
 class AttemptCheckpointRegistry:
     """One locked writer and a map of the latest committed session records."""
 
@@ -204,7 +241,10 @@ class AttemptCheckpointRegistry:
         self._outer_state: dict[str, Any] = {}
         self._planner_receipts: dict[str, dict[str, Any]] = {}
         self._durable_child_archives: set[str] = set()
-        self._bound_sessions: dict[str, Any] = {}
+        # One process-local owner per lane, held weakly so a finished child
+        # that no longer has an external owner does not keep a live capability
+        # or stay in every later commit audit for the rest of the attempt.
+        self._bound_sessions: dict[str, _LiveLaneOwner] = {}
         self._audit_ready_lanes: set[str] = set()
         self._execution_audit: dict[str, dict[str, int]] = {}
         self._sequence = 0
@@ -548,13 +588,24 @@ class AttemptCheckpointRegistry:
         )
         if type(lane_key) is not str or not lane_key:
             raise ValueError("Checkpoint lane identity is required")
-        if lane_key in self._bound_sessions:
-            if self._bound_sessions[lane_key] is session:
+        owner = self._bound_sessions.get(lane_key)
+        if owner is not None:
+            if owner.owns(session):
                 return
-            raise ValueError("Checkpoint lane already has a live session owner")
+            if owner.session() is not None:
+                raise ValueError("Checkpoint lane already has a live session owner")
+            # The former owner was finalized without leaving a live session;
+            # its lane is free again. Drop the dead lane's reporting readiness
+            # with it so a not-yet-restored replacement cannot donate its own
+            # placeholder metrics to a concurrent snapshot.
+            self._bound_sessions.pop(lane_key, None)
+            self._audit_ready_lanes.discard(lane_key)
         # Reserve this process-local lane before any fresh Lean check awaits.
-        # Parallel restores of distinct lanes remain independent.
-        self._bound_sessions[lane_key] = session
+        # Parallel restores of distinct lanes remain independent. Readiness is
+        # granted only after a successful restore below, so a snapshot that
+        # interleaves with the restore cannot sample this placeholder.
+        self._audit_ready_lanes.discard(lane_key)
+        self._bound_sessions[lane_key] = _LiveLaneOwner(session)
         previous_registry = getattr(session, "checkpoint_registry", None)
         previous_lane = getattr(session, "checkpoint_lane_key", "")
         try:
@@ -605,16 +656,28 @@ class AttemptCheckpointRegistry:
             if record is None:
                 await self.commit_session(lane_key, session)
             self._audit_ready_lanes.add(lane_key)
+            settled_owner = self._bound_sessions.get(lane_key)
+            if (settled_owner is not None and settled_owner.strong_only()
+                    and lane_key in self._sessions
+                    and self._children.get(lane_key, {}).get("result") is not None):
+                # A completed child lane replayed from its committed receipt is
+                # finished work. The weak owner would release itself once the
+                # caller drops the restored session; a strong fallback must be
+                # released here after its final capture.
+                await self._commit_update(settle_lanes={lane_key})
         except BaseException:
-            if self._bound_sessions.get(lane_key) is session:
+            owner = self._bound_sessions.get(lane_key)
+            if owner is not None and owner.owns(session):
                 self._bound_sessions.pop(lane_key)
+                self._audit_ready_lanes.discard(lane_key)
             session.checkpoint_registry = previous_registry
             session.checkpoint_lane_key = previous_lane
             raise
 
     async def commit_session(self, lane_key: str, session: Any) -> None:
         from .durable_checkpoint import capture_session_record
-        if self._bound_sessions.get(lane_key) is not session:
+        binding = self._bound_sessions.get(lane_key)
+        if binding is None or not binding.owns(session):
             raise ValueError("Checkpoint session does not own its lane")
         record = capture_session_record(session)
         broker = session.planner_job_broker(create=False)
@@ -642,6 +705,7 @@ class AttemptCheckpointRegistry:
                 raise RuntimeError("Planner publication ownership was revoked")
             planner_updates = updates.pop("planner_receipt_updates", {})
             planner_removals = updates.pop("planner_receipt_removals", {})
+            settle_lanes = set(updates.pop("settle_lanes", ()))
             planner_receipts = _json(self._planner_receipts)
             for lane, keys in planner_removals.items():
                 for key in keys:
@@ -690,7 +754,15 @@ class AttemptCheckpointRegistry:
             session_updates = updates.pop("session_updates", {})
             snapshot["sessions"] = {**self._sessions, **session_updates}
             execution_audit = _json(self._execution_audit)
-            for lane, session in self._bound_sessions.items():
+            for lane, binding in list(self._bound_sessions.items()):
+                session = binding.session()
+                if session is None:
+                    # A finalized session no longer guards or reports on its
+                    # lane, so drop the dead owner as we sweep.
+                    if self._bound_sessions.get(lane) is binding:
+                        self._bound_sessions.pop(lane, None)
+                        self._audit_ready_lanes.discard(lane)
+                    continue
                 # bind_session reserves ownership before asynchronous restore;
                 # a pending/failed new bind is not a committed reporting lane.
                 if (lane not in snapshot["sessions"]
@@ -721,6 +793,16 @@ class AttemptCheckpointRegistry:
             self._restored_cost_record = cost_record
             self._restored_recorder_record = recorder_record
             self._restored_journal_watermark = watermark
+            # A weak owner releases itself once its session is finalized, so
+            # only a strong fallback is dropped here, after both the final
+            # metric capture above and the durable publication succeeded. The
+            # serialized session and child records stay in
+            # self._sessions/self._children (and in the archives) for replay.
+            for lane in settle_lanes:
+                binding = self._bound_sessions.get(lane)
+                if binding is not None and binding.strong_only():
+                    self._bound_sessions.pop(lane, None)
+                    self._audit_ready_lanes.discard(lane)
 
     async def prepare_child(
         self, parent_lane: str, descriptor: dict[str, Any],
@@ -756,8 +838,13 @@ class AttemptCheckpointRegistry:
         result = _json(result_record)
         if type(result) is not dict:
             raise ValueError("Completed child receipt must be an object")
+        # Commit the receipt and the child's final metrics together. A weak
+        # lane owner then releases itself as soon as the caller drops the
+        # finished session; the durable session/child records and the archive
+        # the head references stay untouched.
         await self._commit_update(completed_child_updates={child_lane: result},
-                                  publication_guard=publication_guard)
+                                  publication_guard=publication_guard,
+                                  settle_lanes={child_lane})
 
     async def update_outer_state(self, record: dict[str, Any]) -> None:
         await self._commit_update(outer_state=_json(record))

@@ -1358,7 +1358,30 @@ class LemmaRetriever:
 
             # Guard: refuse to overwrite a non-empty index with an empty build.
             # This prevents cwd-resolution bugs from destroying a valid index.
-            existing_count = meta.get("lemma_count", 0) if meta else 0
+            # Metadata is not authoritative for the pre-existing count: missing,
+            # corrupt, or partial metadata previously reported 0 and let an
+            # empty rebuild replace a loaded non-empty index. Fall back to the
+            # already loaded index (loading it once when needed) so an
+            # unreadable count can never authorize that overwrite.
+            existing_count = 0
+            if meta:
+                try:
+                    existing_count = int(meta.get("lemma_count", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    # JSON allows a nonfinite literal such as ``1e999``, which
+                    # json.loads maps to float('inf'); int(inf) raises
+                    # OverflowError (and int(nan) raises ValueError). A
+                    # nonfinite or otherwise unconvertible count is not usable
+                    # evidence that the index is non-empty, so treat the field
+                    # as unavailable and fall through to the loaded index below
+                    # instead of crashing the retriever.
+                    existing_count = 0
+            if len(idx.entries) == 0 and existing_count <= 0:
+                if existing_index is None and index_path.exists():
+                    existing_index = LemmaIndex.load(index_path)
+                if existing_index is not None:
+                    existing_count = len(existing_index.entries)
+
             if len(idx.entries) == 0 and existing_count > 0:
                 logger.error(
                     "Lemma index rebuild produced 0 entries but existing index has %d. "
@@ -1368,7 +1391,11 @@ class LemmaRetriever:
                     self.lean_cfg.project_dir,
                     roots,
                 )
-                self.index = LemmaIndex.load(index_path)
+                self.index = (
+                    existing_index
+                    if existing_index is not None
+                    else LemmaIndex.load(index_path)
+                )
                 self._ready = self.index is not None
             else:
                 meta_obj = LemmaIndexMeta(

@@ -174,6 +174,27 @@ class SatSmtEngine:
                 return replace(finding, candidates=(candidate,), cursor={})
             if finding.outcome is FalsificationOutcome.TRANSIENT_FAILURE:
                 return finding
+            if (
+                finding.outcome is FalsificationOutcome.INCONCLUSIVE
+                and finding.error_kind
+            ):
+                # A reduced or expired probe deadline cut the Lean replay
+                # short, so this SAT model has not been tested with its full
+                # budget.  Publish an index-only retry cursor rather than the
+                # plan-bearing exhaustion cursor below: a plan-bound cursor
+                # both satisfies this engine's durable-skip check and closes
+                # the native SMT lane in lane planning, which would turn a
+                # transient budget cutoff into a permanently skipped query.
+                # The deterministic query is cheap to repeat, and its model
+                # may still be Lean-checked under a fresh allowance.
+                return replace(
+                    finding,
+                    reason=(
+                        f"{finding.reason}; SMT model replay was cut short by a "
+                        "deadline and remains eligible for a funded retry"
+                    )[:1000],
+                    cursor={"next_index": 0},
+                )
 
         if not results or any(item.get("status") == "error" for item in results):
             return FalsificationFinding(

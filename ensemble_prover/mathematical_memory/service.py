@@ -32,6 +32,181 @@ _LOCAL_EVENTS: dict[str, OrderedDict[str, str]] = {}
 _LOCAL_EVENTS_LOCK = RLock()
 
 
+def _live_event_key(root: Any) -> str:
+    return str(Path(root).absolute())
+
+
+def _merge_retired_support_identities(*records: Any) -> dict[str, list[str]]:
+    """Copy a bounded union of source obligations; these are never admission."""
+    combined: dict[str, set[str]] = {}
+    count = 0
+    for record in records:
+        if not isinstance(record, dict) or len(record) > 4096:
+            raise ValueError("invalid retired support identities")
+        for name, identities in record.items():
+            if (
+                not isinstance(name, str) or not name
+                or not isinstance(identities, (list, tuple))
+                or not identities or len(identities) > 4096
+                or any(not isinstance(identity, str) or not identity for identity in identities)
+            ):
+                raise ValueError("invalid retired support identity")
+            owners = combined.setdefault(name, set())
+            before = len(owners)
+            owners.update(identities)
+            count += len(owners) - before
+            if count > 4096:
+                raise ValueError("retired support identity limit exceeded")
+    return {name: sorted(owners) for name, owners in combined.items()}
+
+
+def _retired_support_unknown_names(state: Mapping[str, Any]) -> set[str]:
+    """Keep legacy obligations unresolved even after a same-name replacement."""
+    identities = _merge_retired_support_identities(state.get("retired_support_identities", {}))
+    retired = state.get("retired_support_names", ())
+    unknown = state.get("retired_support_unknown_names", ())
+    for values in (retired, unknown):
+        if (
+            not isinstance(values, (list, tuple)) or len(values) > 4096
+            or any(not isinstance(name, str) or not name for name in values)
+        ):
+            raise ValueError("invalid retired support names")
+    result = set(unknown) | (set(retired) - set(identities))
+    if len(result) > 4096:
+        raise ValueError("retired support name limit exceeded")
+    return result
+
+
+def admit_live_export_credit(
+    root: Any,
+    event: MemoryEvent,
+    *,
+    prior_event_id: str,
+    prior_payload_digest: str,
+) -> bool:
+    """Admit a freshly observed export credit from an already live prior use.
+
+    The export observer issues this narrow call only after it stored the new
+    event. Admission requires the referenced prior use to have been recorded by
+    a live service in this process under the same catalog root. Disk or restored
+    records never populate that in-process map, so they cannot self-authorize.
+    Complete portable events carry their own controller authority and are not
+    admitted through this session-local map.
+    """
+    if (
+        not isinstance(event, MemoryEvent)
+        or event.provenance.complete
+        or not prior_event_id
+        or not prior_payload_digest
+    ):
+        return False
+    key = _live_event_key(root)
+    with _LOCAL_EVENTS_LOCK:
+        issued = _LOCAL_EVENTS.get(key)
+        if issued is None or issued.get(prior_event_id) != prior_payload_digest:
+            return False
+        existing = issued.get(event.event_id)
+        if existing is not None and existing != event.payload_digest:
+            return False
+        issued[event.event_id] = event.payload_digest
+        while len(issued) > 4096:
+            issued.popitem(last=False)
+    return True
+
+
+def _trusted_helper_resolution(
+    usage: Any,
+) -> dict[str, tuple[str, frozenset[str]]]:
+    """Resolve requested helper names through exact observed Lean bindings.
+
+    Only a present, observed and complete usage receipt contributes. Each
+    binding records the canonical constant the checker reported for a printed
+    helper name together with every source hash the observation requested under
+    that name. A
+    missing binding is never inferred from a printed short name or a shared
+    suffix, and a binding speaks only for an obligation whose own source hash
+    matches an observed one exactly: a same-name declaration from a different
+    source must not discharge a genuinely reachable obligation.
+    """
+    from ensemble_prover.helper_utilization import HelperUsageObservation, source_digest
+    from ensemble_prover.proof_dossier import (
+        canonical_lean_identifier,
+        helper_decl_name,
+    )
+
+    bindings: dict[str, tuple[str, frozenset[str]]] = {}
+    if not (
+        isinstance(usage, HelperUsageObservation)
+        and usage.observed
+        and usage.complete
+    ):
+        return bindings
+    observed_sources: dict[str, set[str]] = {}
+    for block in getattr(usage, "lemma_sources", ()) or ():
+        if isinstance(block, str):
+            name = helper_decl_name(block)
+            if name:
+                canonical = canonical_lean_identifier(name)
+                observed_sources.setdefault(canonical, set()).add(
+                    source_digest(block)
+                )
+    resolved: dict[str, str] = {}
+    for entry in getattr(usage, "helper_bindings", ()) or ():
+        if (
+            not isinstance(entry, (tuple, list))
+            or len(entry) != 2
+            or not isinstance(entry[0], str)
+            or not isinstance(entry[1], str)
+            or not entry[0]
+            or not entry[1]
+        ):
+            continue
+        canonical_requested = canonical_lean_identifier(entry[0])
+        resolved.setdefault(
+            canonical_requested, canonical_lean_identifier(entry[1])
+        )
+    for name, canonical_resolved in resolved.items():
+        bindings[name] = (
+            canonical_resolved,
+            frozenset(observed_sources.get(name, ())),
+        )
+    return bindings
+
+
+def _observation_proves_unused(
+    raw_name: str,
+    reachable: set[str] | None,
+    bindings: Mapping[str, tuple[str, frozenset[str]]],
+    *,
+    source_hash: str | None = None,
+) -> bool:
+    """Return True only when a trusted complete observation proves non-use.
+
+    A binding resolves a printed name to the constant the checker reported, but
+    it speaks only for the exact source hash the observation requested under
+    that name. A missing, mismatched or ambiguous observed source retains the
+    source obligation rather than discharging it by a shared printed name. A
+    missing or unresolved binding for a requested helper is likewise not
+    evidence of absence. Printed names, including qualified ones, do not prove
+    a resolved constant identity. An authentic empty inventory proves that no
+    declaration was used, even when an old obligation has lost its binding.
+    """
+    from ensemble_prover.proof_dossier import canonical_lean_identifier
+
+    if reachable is None:
+        return False
+    if not reachable:
+        return True
+    canonical_name = canonical_lean_identifier(raw_name)
+    entry = bindings.get(canonical_name)
+    if entry is not None:
+        resolved, observed_sources = entry
+        if source_hash is None or observed_sources != frozenset((source_hash,)):
+            return False
+        return resolved not in reachable
+    return False
+
+
 def default_memory_root() -> Path:
     return Path.home() / ".local" / "share" / "ensemble-prover" / "mathematical-memory"
 
@@ -1436,16 +1611,39 @@ class MathematicalMemoryService:
                 if callable(usage_getter)
                 else None
             )
+            from ensemble_prover.helper_utilization import HelperUsageObservation, source_digest
             from ensemble_prover.proof_dossier import canonical_lean_identifier
 
+            bindings = _trusted_helper_resolution(usage)
             reachable = (
                 {canonical_lean_identifier(name) for name in usage.reachable_constants}
-                if usage is not None and usage.observed and usage.complete
+                if isinstance(usage, HelperUsageObservation) and usage.observed and usage.complete
                 else None
             )
+            # An unused exemption is only sound for the exact source the
+            # observation requested under that printed name. Every obligation
+            # keeps its own identity: a helper is matched against its own
+            # source, and a profiled memory declaration against its own
+            # declaration source. A printed-name collision never lets one
+            # obligation borrow a same-named replacement helper's source.
+            declaration_sources = {
+                canonical_lean_identifier(declared_name): source_digest(
+                    getattr(profile, "source", "")
+                )
+                for declared_name, profile in self.known_declarations.items()
+            }
+            candidate_sources = {
+                identity: declaration_sources[canonical_lean_identifier(name)]
+                for name, identity in self.known_candidate_ids.items()
+                if canonical_lean_identifier(name) in declaration_sources
+            }
             support = {**self.known_candidate_ids, **self._memory_support_names}
             state = session.mathematical_memory_state
             retired = state.get("retired_support_names", ())
+            retired_identities = _merge_retired_support_identities(
+                state.get("retired_support_identities", {})
+            )
+            retired_unknown = _retired_support_unknown_names(state)
             retired_bundles = state.get("retired_bundle_obligations", ())
             retired_imports = state.get("retired_import_owners", ())
             if state.get("retired_support_incomplete") is True or any(
@@ -1455,6 +1653,7 @@ class MathematicalMemoryService:
                 for items in (retired, retired_bundles, retired_imports)
             ):
                 return False
+            retired = tuple(dict.fromkeys((*retired, *retired_identities, *retired_unknown)))
             # A theorem's name does not identify its defining module or all
             # imports that exposed it. Complete proof-use inventories therefore
             # cannot discharge these whole-environment source obligations.
@@ -1464,10 +1663,14 @@ class MathematicalMemoryService:
                 for identity in self._memory_import_owners
             ):
                 return False
-            live_names = {canonical_lean_identifier(name) for name in support}
             for helper in session.dossier.verified_helpers.values():
                 name = canonical_lean_identifier(helper.name)
-                if reachable is not None and name not in reachable:
+                if _observation_proves_unused(
+                    helper.name,
+                    reachable,
+                    bindings,
+                    source_hash=source_digest(helper.source),
+                ):
                     continue
                 local_owner = self._local_context_source_id(helper)
                 registry = self.provenance_registry
@@ -1488,11 +1691,12 @@ class MathematicalMemoryService:
                 if owner:
                     if not self.application_eligible(owner):
                         return False
-                    live_names.add(name)
             for name, identity in support.items():
-                if (
-                    reachable is not None
-                    and canonical_lean_identifier(name) not in reachable
+                if _observation_proves_unused(
+                    name,
+                    reachable,
+                    bindings,
+                    source_hash=candidate_sources.get(identity),
                 ):
                     continue
                 if not self.application_eligible(identity):
@@ -1522,10 +1726,27 @@ class MathematicalMemoryService:
                 if not self._sources_admitted((identity,)):
                     return False
             for raw_name in retired:
-                name = canonical_lean_identifier(raw_name)
-                if reachable is not None and name not in reachable:
+                if _observation_proves_unused(
+                    raw_name,
+                    reachable,
+                    bindings,
+                    # A snapshot retains candidate IDs, not the exact source
+                    # binding needed to establish an unused exemption.
+                    source_hash=None,
+                ):
                     continue
-                if name not in live_names:
+                # Persisted identities retain every original obligation. Each
+                # one needs fresh live admission; a replacement with the same
+                # printed name cannot authorize a different original owner.
+                identities = retired_identities.get(raw_name, ())
+                live_identities = (
+                    set(self.known_candidate_ids.values())
+                    | set(self._memory_support_names.values())
+                    | self._memory_import_owners
+                )
+                if raw_name in retired_unknown or not identities or not set(identities).issubset(live_identities):
+                    return False
+                if any(not self.application_eligible(identity) for identity in identities):
                     return False
             for node in getattr(
                 getattr(session, "proof_state", None), "nodes", {}
@@ -1540,12 +1761,23 @@ class MathematicalMemoryService:
                     operation, declaration = str(group.source)[len(prefix) :].split(
                         ":", 1
                     )
+                    binding = self._reduction_bindings.get(operation)
+                    source_hash = None
                     if (
-                        reachable is not None
-                        and canonical_lean_identifier(declaration) not in reachable
+                        binding is not None
+                        and binding[0] is session.proof_state
+                        and binding[2] == self.policy_id
+                    ):
+                        # The live reduction binding is itself the trusted
+                        # source anchor for this obligation.
+                        source_hash = candidate_sources.get(binding[1])
+                    if _observation_proves_unused(
+                        declaration,
+                        reachable,
+                        bindings,
+                        source_hash=source_hash,
                     ):
                         continue
-                    binding = self._reduction_bindings.get(operation)
                     if (
                         binding is None
                         or binding[0] is not session.proof_state
@@ -2569,14 +2801,27 @@ def finalization_without_memory_eligible(session: Any, candidate: Any) -> bool:
     """Retain dependency obligations when current memory authority is absent."""
     if candidate.source_action_id == "mathematical_memory":
         return False
+    from ensemble_prover.helper_utilization import HelperUsageObservation, source_digest
     from ensemble_prover.proof_dossier import canonical_lean_identifier
 
-    names = {
+    # Only an exemption backed by the exact observed source may discharge an
+    # obligation; a same-name shadow from another source must retain it.
+    verified_helpers = tuple(
+        getattr(session.dossier, "verified_helpers", {}).values()
+    )
+    known_sources = {
+        canonical_lean_identifier(helper.name): source_digest(helper.source)
+        for helper in verified_helpers
+    }
+    memory_owned_names = {
         canonical_lean_identifier(helper.name)
-        for helper in getattr(session.dossier, "verified_helpers", {}).values()
+        for helper in verified_helpers
         if helper.phase.startswith("mathematical_memory")
         or "mathematical_memory_owned_context" in helper.provenance_tags
     }
+    # Retired and reduction names have no live admission here. Only an
+    # authentic complete empty inventory can discharge these unknown sources.
+    retired_names: set[str] = set()
     state = getattr(session, "mathematical_memory_state", {})
     if state.get("retired_support_incomplete") is True:
         return False
@@ -2584,13 +2829,22 @@ def finalization_without_memory_eligible(session: Any, candidate: Any) -> bool:
     if not isinstance(retired_imports, (list, tuple)) or retired_imports:
         return False
     retired = state.get("retired_support_names", ())
+    try:
+        retired_identities = _merge_retired_support_identities(
+            state.get("retired_support_identities", {})
+        )
+        retired_unknown = _retired_support_unknown_names(state)
+    except ValueError:
+        return False
     if (
         not isinstance(retired, (list, tuple))
         or len(retired) > 4096
         or any(not isinstance(name, str) for name in retired)
     ):
         return False
-    names.update(canonical_lean_identifier(name) for name in retired)
+    retired_names.update(canonical_lean_identifier(name) for name in retired)
+    retired_names.update(canonical_lean_identifier(name) for name in retired_identities)
+    retired_names.update(canonical_lean_identifier(name) for name in retired_unknown)
     bundles = state.get("retired_bundle_obligations", ())
     if (
         not isinstance(bundles, (list, tuple))
@@ -2605,7 +2859,8 @@ def finalization_without_memory_eligible(session: Any, candidate: Any) -> bool:
                 parts = str(group.source)[len(prefix) :].split(":", 1)
                 if len(parts) != 2:
                     return False
-                names.add(canonical_lean_identifier(parts[1]))
+                retired_names.add(canonical_lean_identifier(parts[1]))
+    names = memory_owned_names | retired_names
     if not names and not bundles:
         return True
     getter = getattr(session.lean, "helper_usage_observation", None)
@@ -2620,12 +2875,29 @@ def finalization_without_memory_eligible(session: Any, candidate: Any) -> bool:
             if callable(getter)
             else None
         )
-        if usage is None or not usage.observed or not usage.complete:
+        if not isinstance(usage, HelperUsageObservation) or not usage.observed or not usage.complete:
             return False
+        bindings = _trusted_helper_resolution(usage)
         reachable = {
             canonical_lean_identifier(name) for name in usage.reachable_constants
         }
-        return names.isdisjoint(reachable) and not any(
+        return all(
+            _observation_proves_unused(
+                name,
+                reachable,
+                bindings,
+                source_hash=known_sources.get(name),
+            )
+            for name in memory_owned_names
+        ) and all(
+            _observation_proves_unused(
+                name,
+                reachable,
+                bindings,
+                source_hash=None,
+            )
+            for name in retired_names
+        ) and not any(
             "B_" + identity in constant.split(".")
             for identity in bundles
             for constant in reachable
@@ -2642,6 +2914,19 @@ def snapshot_memory_source_obligations(
     if session is None:
         return {}
     state = dict(session.mathematical_memory_state)
+    try:
+        unknown = _retired_support_unknown_names(state)
+        identities = _merge_retired_support_identities(
+            state.get("retired_support_identities", {}),
+            {name: [identity] for name, identity in service.known_candidate_ids.items()},
+            {name: [identity] for name, identity in service._memory_support_names.items()},
+        )
+    except ValueError:
+        state["retired_support_incomplete"] = True
+        identities = {}
+        unknown = set()
+    state["retired_support_identities"] = identities
+    state["retired_support_unknown_names"] = sorted(unknown)
     retired = state.get("retired_support_names", ())
     if (
         not isinstance(retired, (list, tuple))
@@ -2654,6 +2939,8 @@ def snapshot_memory_source_obligations(
         dict.fromkeys(
             (
                 *retired,
+                *unknown,
+                *identities,
                 *service.known_candidate_ids,
                 *service._memory_support_names,
             )

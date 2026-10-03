@@ -927,6 +927,16 @@ def console_log_path(output_dir: Path) -> Path:
     return directory.with_name(directory.name + ".sweep_console.log")
 
 
+def control_journal_path(output_dir: Path) -> Path:
+    """The attempt's authority journal is a sibling of its output directory.
+
+    ``SweepControl.create`` writes it before the child is spawned, so its
+    presence is durable evidence that ``run_attempt`` began launching.
+    """
+    directory = Path(output_dir).resolve()
+    return directory.with_name(directory.name + ".sweep_control.jsonl")
+
+
 def run_attempt(
     command: Sequence[str],
     output_dir: Path,
@@ -1139,7 +1149,19 @@ def run_attempt(
                 monitor_error = monitor_error or f"could not record result: {exc}"
         relay.copy_available(final=True)
         monitor_error = monitor_error or relay.error
-        if monitor_error and status not in {"cleanup_unconfirmed", "solved", "interrupted", "monitor_error"}:
+        if monitor_error and status not in {
+            "cleanup_unconfirmed",
+            "solved",
+            "interrupted",
+            "monitor_error",
+            # A cosmetic relay/console failure must not erase an outcome this
+            # attempt already classified. ``infrastructure_blocked`` in
+            # particular promises "resume to retry the blocked problem"; an
+            # ``answer_preparation_failed`` row is terminal. Either would
+            # otherwise become an un-resumable ``monitor_error`` and void it.
+            "infrastructure_blocked",
+            "answer_preparation_failed",
+        }:
             status = "monitor_error"
             # The result notice itself can discover a broken output pipe.
             # Keep the durable final result aligned with the manifest even
@@ -1288,41 +1310,132 @@ def _attempt_dir_in_use(output_dir: Any) -> bool:
     return False
 
 
-def _reconcile_dead_running_attempts(manifest: dict[str, Any]) -> bool:
-    """Mark ``running`` rows whose owner provably died as ``interrupted``.
+def _attempt_never_launched(output_dir: Any) -> bool:
+    """True only when durable evidence proves no child was ever started.
 
-    A host crash or SIGKILL of the driver leaves ``running`` behind. Cleanup
-    is provable when the host rebooted since the attempt started (every
-    process died), or when the CLI's process group, which it leads via
-    ``start_new_session``, has no members left. Anything else stays
-    unconfirmed so the caller keeps refusing new work.
+    A crash between saving a ``running`` row and ``on_started`` leaves no
+    ``cli_pid``. A missing pid is not cleanup by itself: the CLI may have
+    spawned before its pid could be persisted. Cleanup is provable only when
+    the attempt directory is still empty, none of the sweep-owned launch
+    artifacts exist, and no live process owns or references the directory.
+    The control journal and console log are created before the child is
+    spawned, so any populated directory, sidecar, or live owner stays
+    unconfirmed rather than being adopted.
+    """
+    if not isinstance(output_dir, str) or not output_dir:
+        return False
+    directory = Path(output_dir)
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    try:
+        if any(directory.iterdir()):
+            return False
+    except OSError:
+        return False
+    if console_log_path(directory).exists():
+        return False
+    if control_journal_path(directory).exists():
+        return False
+    if answer_preparation_dir(directory).exists():
+        return False
+    if _attempt_dir_in_use(output_dir):
+        return False
+    return True
+
+
+def _reconcile_dead_running_attempts(manifest: dict[str, Any]) -> bool:
+    """Mark dead ``running``/``monitor_error`` rows as ``interrupted``.
+
+    A host crash or SIGKILL of the driver leaves ``running`` behind; a monitor
+    failure whose cleanup was confirmed is equally settled but was previously
+    parked at ``monitor_error`` forever, blocking ``--resume``. Cleanup is
+    provable when the host rebooted since the attempt started (every process
+    died), when the CLI's process group, which it leads via
+    ``start_new_session``, has no members left, or when a crash before the
+    child pid was persisted left an empty, artifact-free attempt directory that
+    no live process references. Anything else stays unconfirmed so the caller
+    keeps refusing new work. A ``monitor_error`` row is only cleared when its
+    recorded cleanup is explicitly confirmed.
     """
     boot_id = _current_boot_id()
     changed = False
     for row in manifest["queue"]:
-        if row["status"] != "running" or not row["attempts"]:
+        status = row["status"]
+        if status not in {"running", "monitor_error"} or not row["attempts"]:
             continue
         attempt = row["attempts"][-1]
-        if attempt.get("status") != "running":
+        attempt_status = attempt.get("status")
+        if status == "running":
+            if attempt_status != "running":
+                continue
+        elif (
+            attempt_status != "monitor_error"
+            or attempt.get("cleanup_confirmed") is not True
+        ):
+            # Without a recorded cleanup confirmation this attempt may still
+            # own live work; keep refusing rather than adopt it.
             continue
         started_boot = attempt.get("boot_id")
         if boot_id and started_boot and started_boot != boot_id:
             reason = "host_restarted"
         elif not started_boot or started_boot == boot_id:
-            if not _process_group_gone(attempt.get("cli_pid")):
+            cli_pid = attempt.get("cli_pid")
+            if cli_pid is None:
+                # The running row is durable but ``on_started`` never recorded
+                # a pid. Never treat the missing pid as cleanup; only reconcile
+                # when the directory proves no child ever launched.
+                if not _attempt_never_launched(attempt.get("output_dir")):
+                    continue
+                reason = "prelaunch_no_child"
+            elif not _process_group_gone(cli_pid):
                 continue
-            if _attempt_dir_in_use(attempt.get("output_dir")):
+            elif _attempt_dir_in_use(attempt.get("output_dir")):
                 continue
-            reason = "cli_process_group_gone"
+            else:
+                reason = "cli_process_group_gone"
         else:
             continue
         attempt["status"] = "interrupted"
         attempt["cleanup_confirmed"] = True
         attempt["reconciled_reason"] = reason
         attempt["reconciled_at"] = datetime.now(timezone.utc).isoformat()
+        attempt["reconciled_from_status"] = status
         row["status"] = "interrupted"
         changed = True
     return changed
+
+
+def _claim_attempt_dir(output_dir: Path) -> None:
+    """Create the next attempt directory, reusing an empty crash orphan.
+
+    A driver killed between ``mkdir`` and the manifest save leaves an empty
+    directory at the deterministic next index; nothing ever recorded it, and
+    ``FileExistsError`` on the next resume wedged the sweep permanently. Reuse
+    such a directory only when it holds no entry, its console sidecar and
+    answer-preparation sibling are absent, and no live process references it.
+    Any populated or active directory still fails closed.
+    """
+    try:
+        output_dir.mkdir(parents=True, exist_ok=False)
+        return
+    except FileExistsError:
+        pass
+    if output_dir.is_symlink() or not output_dir.is_dir() or any(output_dir.iterdir()):
+        raise FileExistsError(
+            f"attempt output directory already contains run artifacts: {output_dir}"
+        )
+    if (
+        console_log_path(output_dir).exists()
+        or control_journal_path(output_dir).exists()
+        or answer_preparation_dir(output_dir).exists()
+    ):
+        raise FileExistsError(
+            f"attempt output directory already has sweep-owned artifacts: {output_dir}"
+        )
+    if _attempt_dir_in_use(output_dir):
+        raise FileExistsError(
+            f"attempt output directory is in use by a live process: {output_dir}"
+        )
 
 
 def run_sweep(
@@ -1352,7 +1465,8 @@ def run_sweep(
             for row in manifest["queue"]
         ):
             raise ValueError(
-                "previous attempt cleanup is unconfirmed; refusing to start new work"
+                "previous attempt is still active or its cleanup is unconfirmed; "
+                "refusing to start new work"
             )
         if manifest.get("prewarm_shared_mathlib"):
             try:
@@ -1405,7 +1519,7 @@ def run_sweep(
                 / f"attempt_{len(row['attempts']) + 1:03d}"
             )
             resume_dir = _resumable_checkpoint_dir(row, manifest["mini_args"])
-            output_dir.mkdir(parents=True, exist_ok=False)
+            _claim_attempt_dir(output_dir)
             command = (
                 build_resume_command(resume_dir, output_dir, manifest["mini_args"])
                 if resume_dir is not None
@@ -1418,6 +1532,9 @@ def run_sweep(
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "boot_id": _current_boot_id(),
                 "status": "running",
+                # Durable prelaunch state: the row survives a crash before the
+                # child exists. ``on_started`` advances it once a pid is known.
+                "launch_state": "prelaunch",
             }
             if resume_dir is not None:
                 attempt["resumed_from"] = str(resume_dir)
@@ -1427,6 +1544,7 @@ def run_sweep(
 
             def started(pid: int) -> None:
                 attempt["cli_pid"] = pid
+                attempt["launch_state"] = "launched"
                 save_manifest(manifest_path, manifest)
 
             print(

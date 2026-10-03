@@ -287,7 +287,81 @@ class RootCloseOperationalFailure:
     kind: str = ""
 
 
+class _RootCloseProof(str):
+    """Proof text carrying the exact context of its accepted root check."""
+
+    replay_helpers: tuple[str, ...]
+
+    def __new__(cls, proof: str, replay_helpers: Sequence[str]) -> "_RootCloseProof":
+        result = super().__new__(cls, proof)
+        result.replay_helpers = tuple(replay_helpers)
+        return result
+
+
 ProveRootCloseFn = Callable[..., Awaitable[Optional[str] | RootCloseOperationalFailure]]
+
+
+def _accepted_child_replay_helpers(dossier: Any, proof: str) -> tuple[str, ...]:
+    """Use the accepted artifact closure, including declarations hidden from prompts."""
+    from .root_finalization import has_live_root_proof_finalization_receipt
+    from .lean_artifact_sanitize import sanitize_lean_artifact_text
+
+    if (
+        str(getattr(dossier, "final_proof", "") or "").strip()
+        == sanitize_lean_artifact_text(proof)
+        and has_live_root_proof_finalization_receipt(dossier)
+    ):
+        return tuple(dossier.final_replay_helpers)
+    return tuple(dossier.execution_helper_blocks())
+
+
+async def _replay_root_finalization_context(
+    *, lean: Any, statement: str, proof: str, helpers: Sequence[str],
+    preamble: str, timeout_s: float, record_event: RecordEvent,
+) -> bool:
+    """Check the selected root context before granting finalization authority.
+
+    Persisted replay bytes identify checker inputs, never a successful check.
+    The same gate covers current callbacks and restored result schemas.
+    """
+    from .mini_formal_state_search import _run_serialized_lean_operation
+
+    current_lean = _live_lean_capability_for_new_work(lean)
+    allowance = _recursive_lean_operation_timeout_s(current_lean, timeout_s)
+
+    async def replay() -> Any:
+        kwargs: dict[str, Any] = {
+            "preamble_override": preamble, "timeout_s": allowance,
+        }
+        if _callable_accepts_keyword(current_lean.check, "check_kind"):
+            kwargs["check_kind"] = "mini_recursive_root_finalization_replay"
+        return await current_lean.check(statement, proof, list(helpers), **kwargs)
+
+    try:
+        checked = await _run_serialized_lean_operation(
+            current_lean, replay, operation_timeout_s=float(allowance or 0.0),
+        )
+    except Exception as exc:
+        record_event({
+            "phase": "mini_recursive_root_finalization_replay",
+            "verdict": "root_finalization_replay_inconclusive",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+        return False
+    output = str(getattr(checked, "output", "") or "")
+    parsed = getattr(checked, "parsed", None)
+    accepted = bool(
+        getattr(checked, "ok", False)
+        and not getattr(parsed, "timeout", False)
+        and not getattr(parsed, "infra_failure", False)
+        and not has_timeout(output)
+        and not has_infra_failure(output)
+    )
+    record_event({
+        "phase": "mini_recursive_root_finalization_replay",
+        "verdict": "root_finalization_replay_accepted" if accepted else "root_finalization_replay_unverified",
+    })
+    return accepted
 
 
 def _falsification_event_verdict(
@@ -995,6 +1069,12 @@ class MiniRecursiveResult:
     # speculative pass reservation made solely to publish the already-paid
     # outcome after process restart.
     resumed_from_terminal_receipt: bool = False
+    root_replay_helpers: Optional[tuple[str, ...]] = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.proof, _RootCloseProof):
+            object.__setattr__(self, "root_replay_helpers", self.proof.replay_helpers)
+            object.__setattr__(self, "proof", str(self.proof))
 
 
 def _mini_recursive_result_state_record(
@@ -1010,6 +1090,10 @@ def _mini_recursive_result_state_record(
             copy.deepcopy(item) for item in result.root_tactic_attempts
         ],
         "root_close_source": str(result.root_close_source or ""),
+        "root_replay_helpers": (
+            list(result.root_replay_helpers)
+            if result.root_replay_helpers is not None else None
+        ),
         "disproved": bool(result.disproved),
         "disproof_certificate": copy.deepcopy(result.disproof_certificate),
     }
@@ -1049,6 +1133,10 @@ def _mini_recursive_result_from_terminal_state_record(
         disproved=bool(data.get("disproved")),
         disproof_certificate=copy.deepcopy(data.get("disproof_certificate")),
         resumed_from_terminal_receipt=True,
+        root_replay_helpers=(
+            tuple(str(block) for block in data["root_replay_helpers"])
+            if isinstance(data.get("root_replay_helpers"), list) else None
+        ),
     )
 
 
@@ -1067,6 +1155,7 @@ class ClaimProofResult:
     theory_snapshot: Any = None
     theory_context_hash: str = ""
     child_verified_helper_blocks: tuple[str, ...] = ()
+    child_replay_helpers: Optional[tuple[str, ...]] = None
     theory_promotion_commit: Any = None
     child_helper_merge_commit: Any = None
     required_child_helper_hashes: tuple[tuple[str, str], ...] = ()
@@ -1620,6 +1709,10 @@ def _claim_proof_result_state_record(result: ClaimProofResult) -> dict[str, Any]
         "theory_snapshot": copy.deepcopy(result.theory_snapshot),
         "theory_context_hash": result.theory_context_hash,
         "child_verified_helper_blocks": list(result.child_verified_helper_blocks),
+        "child_replay_helpers": (
+            list(result.child_replay_helpers)
+            if result.child_replay_helpers is not None else None
+        ),
         "required_child_helper_hashes": [
             list(item) for item in result.required_child_helper_hashes
         ],
@@ -1660,6 +1753,10 @@ def _claim_proof_result_from_state_record(
             str(item or "")
             for item in list(data.get("child_verified_helper_blocks") or [])
             if str(item or "").strip()
+        ),
+        child_replay_helpers=(
+            tuple(str(block) for block in data["child_replay_helpers"])
+            if isinstance(data.get("child_replay_helpers"), list) else None
         ),
         required_child_helper_hashes=tuple(
             (str(item[0]), str(item[1]))
@@ -13793,7 +13890,7 @@ async def _canonicalize_dependency_contract_inputs(
         infrastructure_error = (
             f"contract identity verifier terminated by signal {termination_signal}"
             if termination_signal
-            else _compact_text(str(output or ""), 360)
+            else _compact_contract_identity_failure(str(output or ""))
             or (
                 "contract identity verifier failed with returncode "
                 f"{normalized_returncode}"
@@ -14296,6 +14393,23 @@ _LEAN_DIAGNOSTIC_NOISE_RE = re.compile(
     r"Some diagnostics)",
     re.IGNORECASE,
 )
+
+
+def _compact_contract_identity_failure(output: str) -> str:
+    """Report verifier errors without sanitizing structural payloads as prose."""
+
+    diagnostic = _compact_lean_elaboration_diagnostics(output, limit=360)
+    if diagnostic:
+        return diagnostic
+    # A host timeout can follow megabytes of partial structural markers without
+    # any Lean diagnostic header. Keep its runtime status, not the marker data.
+    for raw in reversed(str(output or "").splitlines()):
+        line = raw.strip()
+        if len(line) > 4096 or line.startswith("MINI_CONTRACT_ANALYSIS_"):
+            continue
+        if has_timeout(line) or has_infra_failure(line):
+            return _compact_text(line, 360)
+    return ""
 
 
 def _compact_lean_elaboration_diagnostics(output: str, *, limit: int = 500) -> str:
@@ -18766,9 +18880,14 @@ async def run_mini_recursive_attempt(
                         classifier(quality_probe)
                     except Exception:
                         pass
+                # Required dependencies have just replayed in the complete
+                # child context. Retain them with their existing visibility;
+                # heuristic usefulness does not decide proof dependencies.
                 if not _recursive_helper_item_passes_quality_gate(
                     quality_probe,
                     variant.statement,
+                ) and not (
+                    required_names_only is not None and name in required_names_only
                 ):
                     record_event(
                         {
@@ -19056,9 +19175,12 @@ async def run_mini_recursive_attempt(
                 )
                 if helper_decl_name(block)
             }
+            accepted_replay_helpers = _accepted_child_replay_helpers(
+                subgoal_dossier, proof,
+            )
             child_delta_blocks = tuple(
                 str(block or "").strip()
-                for block in subgoal_dossier.execution_helper_blocks()
+                for block in accepted_replay_helpers
                 if str(block or "").strip()
                 and parent_helper_sources.get(helper_decl_name(block))
                 != str(block or "").strip()
@@ -19096,11 +19218,32 @@ async def run_mini_recursive_attempt(
                     ).strip()
                 }
             )
-            required_child_blocks = tuple(
-                block
-                for block in child_delta_blocks
-                if helper_decl_name(block) in required_child_helper_hashes
-            )
+            required_child_blocks = child_delta_blocks
+
+            def merge_required_child_replay_helpers() -> Any:
+                if not merge_subgoal_verified_helpers(
+                    frozenset(required_child_helper_hashes)
+                ):
+                    return False
+                for block in child_delta_blocks:
+                    name = helper_decl_name(block)
+                    if not name or name in subgoal_dossier.verified_helpers:
+                        continue
+                    current = attempt_dossier.verified_helpers.get(name)
+                    if current is not None and str(current.source).strip() != block:
+                        return False
+                    if current is None:
+                        current = attempt_dossier.record_verified_helper(
+                            block, phase="mini_recursive_child_replay", turn_index=0,
+                        )
+                        if current is None:
+                            return False
+                return {
+                    "ok": True,
+                    "proof": proof,
+                    "environment_changed": bool(child_delta_blocks),
+                    "replay_helpers": accepted_replay_helpers,
+                }
 
             return ClaimProofResult(
                 proof=proof,
@@ -19129,16 +19272,13 @@ async def run_mini_recursive_attempt(
                     getattr(subgoal_conv, "mini_theory_context_hash", "") or ""
                 ).strip(),
                 child_verified_helper_blocks=required_child_blocks,
+                child_replay_helpers=accepted_replay_helpers,
                 theory_promotion_commit=getattr(
                     subgoal_conv,
                     "mini_theory_commit_promotion",
                     None,
                 ),
-                child_helper_merge_commit=(
-                    lambda: merge_subgoal_verified_helpers(
-                        frozenset(required_child_helper_hashes)
-                    )
-                ),
+                child_helper_merge_commit=merge_required_child_replay_helpers,
                 required_child_helper_hashes=tuple(
                     sorted(required_child_helper_hashes.items())
                 ),
@@ -19931,6 +20071,7 @@ async def run_mini_recursive_attempt(
             or successful_result.child_lean_preamble != lean_check_preamble
             or successful_result.theory_imported_bundle_ids
             or callable(successful_result.theory_promotion_commit)
+            or successful_result.child_verified_helper_blocks
         )
         if not child_environment_changed:
             if not merge_subgoal_verified_helpers():
@@ -20202,9 +20343,10 @@ async def run_mini_recursive_attempt(
                 )
                 if helper_decl_name(block)
             }
+            accepted_replay_helpers = _accepted_child_replay_helpers(close_dossier, proof)
             child_delta_blocks = tuple(
                 str(block or "").strip()
-                for block in close_dossier.execution_helper_blocks()
+                for block in accepted_replay_helpers
                 if str(block or "").strip()
                 and parent_helper_sources.get(helper_decl_name(block))
                 != str(block or "").strip()
@@ -20239,7 +20381,7 @@ async def run_mini_recursive_attempt(
             }
 
             def merge_required_root_close_helpers() -> Any:
-                nonlocal proof
+                nonlocal proof, accepted_replay_helpers
                 collision_names: dict[str, str] = {}
                 _merge_new_verified_helpers(
                     attempt_dossier,
@@ -20255,12 +20397,21 @@ async def run_mini_recursive_attempt(
                         old_name,
                         new_name,
                     )
-                for original_name in required_names:
+                    accepted_replay_helpers = tuple(
+                        _rename_helper_identifier(block, old_name, new_name)
+                        for block in accepted_replay_helpers
+                    )
+                for original_name in required_hashes:
                     mapped_name = collision_names.get(original_name, original_name)
                     current = attempt_dossier.verified_helpers.get(mapped_name)
                     child = close_dossier.verified_helpers.get(original_name)
-                    if current is None or child is None:
+                    if child is None:
                         return False
+                    if current is None:
+                        # A root-local declaration need not qualify for the
+                        # reusable helper registry. It remains in the exact
+                        # standalone context checked below.
+                        continue
                     expected_source = str(getattr(child, "source", "") or "")
                     for old_name, new_name in sorted(
                         collision_names.items(),
@@ -20284,10 +20435,16 @@ async def run_mini_recursive_attempt(
                         helper_decl_statement(expected_source)
                     ):
                         return False
+                    accepted_replay_helpers = tuple(
+                        str(current.source).strip()
+                        if helper_decl_name(block) == mapped_name else block
+                        for block in accepted_replay_helpers
+                    )
                 return {
                     "ok": True,
                     "proof": proof,
                     "environment_changed": bool(child_delta_blocks),
+                    "replay_helpers": accepted_replay_helpers,
                 }
 
             root_close_result = ClaimProofResult(
@@ -20314,11 +20471,8 @@ async def run_mini_recursive_attempt(
                 theory_context_hash=str(
                     getattr(close_conv, "mini_theory_context_hash", "") or ""
                 ).strip(),
-                child_verified_helper_blocks=tuple(
-                    block
-                    for block in child_delta_blocks
-                    if helper_decl_name(block) in required_hashes
-                ),
+                child_verified_helper_blocks=child_delta_blocks,
+                child_replay_helpers=accepted_replay_helpers,
                 theory_promotion_commit=getattr(
                     close_conv,
                     "mini_theory_commit_promotion",
@@ -20336,7 +20490,7 @@ async def run_mini_recursive_attempt(
             if not promoted:
                 return None
             pending_root_close_promotion = (root_statement, proof)
-            return proof
+            return _RootCloseProof(proof, accepted_replay_helpers)
         if getattr(close_conv, "_mini_recursive_child_elapsed_budget_exhausted", False):
             return RootCloseOperationalFailure("recursive_claim_elapsed_budget_exhausted")
         failure_reason = str(
@@ -20512,6 +20666,8 @@ async def run_mini_recursive_attempt(
             and helper_decl_name(helper) not in child_helper_names
         ]
         replay_helpers.extend(child_helper_blocks)
+        if claim_proof_result.child_replay_helpers is not None:
+            replay_helpers = list(claim_proof_result.child_replay_helpers)
         replay_kwargs: dict[str, Any] = {
             "preamble_override": candidate_lean_preamble,
             "timeout_s": _recursive_lean_operation_timeout_s(
@@ -20748,7 +20904,10 @@ async def run_mini_recursive_attempt(
                 and merge_result.get("environment_changed")
             )
             if merged_proof and (merged_proof != proof or merged_environment_changed):
-                merged_replay_helpers = attempt_dossier.verified_helper_blocks()
+                merged_replay_helpers = list(
+                    merge_result.get("replay_helpers", replay_helpers)
+                    if isinstance(merge_result, Mapping) else replay_helpers
+                )
                 try:
                     merged_replay = await lean.check(
                         statement,
@@ -21142,6 +21301,29 @@ async def run_mini_recursive_attempt(
             raise driver_error from rollback_failures[0]
         raise
     final_result = result
+    checked_environment_hash = text_hash(lean_check_preamble)
+    stored_replay_helpers = tuple(attempt_dossier.final_replay_helpers)
+    already_durable_proof = _durable_root_solution_for_statement(
+        attempt_dossier, root_statement,
+    )
+    certified_environment_hash = str(
+        (attempt_dossier.root_proof_certificate or {}).get("target_environment_hash") or ""
+    ).strip()
+    stored_environment_matches = bool(
+        certified_environment_hash == checked_environment_hash
+        and str(attempt_dossier.current_lean_environment_hash or "").strip()
+        == checked_environment_hash
+    )
+    if (
+        not suppress_root_solved
+        and already_durable_proof
+        and str(attempt_dossier.root_statement).strip() == str(root_statement).strip()
+        and not stored_environment_matches
+    ):
+        # An unrelated environment invalidates the prior solved artifact even
+        # when a resumed result selects a different candidate or reports failure.
+        # Retain its bytes only as local inputs for a possible fresh replay.
+        attempt_dossier.clear_solved()
     if final_result.ok and final_result.proof:
         success_attempt = next(
             (
@@ -21168,20 +21350,26 @@ async def run_mini_recursive_attempt(
         # root theorem. Writing it back would corrupt the shared
         # parent dossier's final_proof_hash + proof_graph.root_proof.
         if not suppress_root_solved:
-            already_durable_proof = _durable_root_solution_for_statement(
-                attempt_dossier,
-                root_statement,
-            )
+            from .root_finalization import has_live_root_proof_finalization_receipt
+
             final_proof_text = str(final_result.proof or "").strip()
-            if (
+            matching_stored_proof = bool(
                 already_durable_proof
                 and str(already_durable_proof).strip() == final_proof_text
+            )
+            if (
+                matching_stored_proof
+                and str(attempt_dossier.root_statement).strip() == str(root_statement).strip()
+                and stored_environment_matches
+                and has_live_root_proof_finalization_receipt(attempt_dossier)
             ):
-                # The dossier already carries a durable same-statement proof.
-                # Avoid re-running root finalization and duplicating route
-                # metrics on an already-closed target.
-                pass
-            elif str(getattr(final_result, "root_close_source", "") or "") in {
+                # Only a live receipt can avoid repeating the root check.
+                # Restored artifact bytes and schema fields are checker inputs.
+                usage_root_replay_helpers = list(attempt_dossier.final_replay_helpers)
+                final_result = dataclass_replace(
+                    final_result, root_replay_helpers=tuple(usage_root_replay_helpers),
+                )
+            elif matching_stored_proof or str(getattr(final_result, "root_close_source", "") or "") in {
                 "llm_root_close",
                 "accepted_exact_root",
             }:
@@ -21189,8 +21377,8 @@ async def run_mini_recursive_attempt(
                 # against the canonical root, either in the dedicated root
                 # conversation or as an exact recursive claim. Its provenance
                 # is that Lean check, NOT a tactic graft, so the tactic route
-                # contract does not apply. Finalize with the full visible
-                # helper set rather than narrowing to a synthesized route.
+                # contract does not apply. Preserve the complete accepted
+                # replay context, including route-local declarations.
                 from ensemble_prover.root_finalization import (
                     finalize_root_solution,
                     root_verification_certificate,
@@ -21226,7 +21414,19 @@ async def run_mini_recursive_attempt(
                     allow_official_answer_visibility=allow_official_answer_visibility,
                     official_answer_payload_present=official_answer_payload_present,
                 )
+                if final_result.root_replay_helpers is not None:
+                    llm_replay_helpers = list(final_result.root_replay_helpers)
+                elif matching_stored_proof:
+                    llm_replay_helpers = list(stored_replay_helpers)
                 usage_root_replay_helpers = list(llm_replay_helpers)
+                if (
+                    matching_stored_proof
+                    and str(attempt_dossier.root_statement).strip() == str(root_statement).strip()
+                ):
+                    # The prior artifact is only a replay candidate here. Do
+                    # not leave stale solved authority available to other
+                    # consumers if checking fails or is cancelled.
+                    attempt_dossier.clear_solved()
                 llm_helper_names = [
                     name
                     for block in llm_replay_helpers
@@ -21234,28 +21434,52 @@ async def run_mini_recursive_attempt(
                     if name
                 ]
                 try:
-                    finalization = finalize_root_solution(
-                        dossier=attempt_dossier,
-                        proof=result.proof,
-                        replay_helpers=llm_replay_helpers,
-                        helper_names=llm_helper_names,
-                        phase=direct_root_phase,
-                        turn_index=0,
-                        target_statement=root_statement,
-                        require_route_contract=False,
-                        verification_certificate=root_verification_certificate(
-                            accepted=True,
+                    context_verified = await _replay_root_finalization_context(
+                        lean=lean, statement=root_statement, proof=str(result.proof),
+                        helpers=llm_replay_helpers, preamble=lean_check_preamble,
+                        # Rechecking an accepted proof uses the verifier's
+                        # operation allowance, not the tactic search budget.
+                        timeout_s=0.0,
+                        record_event=record_event,
+                    )
+                    if context_verified:
+                        final_result = dataclass_replace(
+                            final_result, root_replay_helpers=tuple(llm_replay_helpers),
+                        )
+                    if not context_verified:
+                        from .root_finalization import RootFinalizationResult
+
+                        finalization = RootFinalizationResult(
+                            accepted=False, proof=str(result.proof),
+                            verdict="root_finalization_replay_unverified",
+                        )
+                    else:
+                        attempt_dossier.record_lean_environment(
+                            checked_environment_hash,
+                            environment_source_text=lean_check_preamble,
+                        )
+                        finalization = finalize_root_solution(
+                            dossier=attempt_dossier,
                             proof=result.proof,
+                            replay_helpers=llm_replay_helpers,
+                            helper_names=llm_helper_names,
                             phase=direct_root_phase,
                             turn_index=0,
                             target_statement=root_statement,
-                            replay_helpers=llm_replay_helpers,
-                            helper_names=llm_helper_names,
-                            source=direct_root_phase,
-                        ),
-                        require_verification_certificate=True,
-                        metadata={direct_root_source: True},
-                    )
+                            require_route_contract=False,
+                            verification_certificate=root_verification_certificate(
+                                accepted=True,
+                                proof=result.proof,
+                                phase=direct_root_phase,
+                                turn_index=0,
+                                target_statement=root_statement,
+                                replay_helpers=llm_replay_helpers,
+                                helper_names=llm_helper_names,
+                                source=direct_root_phase,
+                            ),
+                            require_verification_certificate=True,
+                            metadata={direct_root_source: True},
+                        )
                 except BaseException as finalization_error:
                     if pending_root_close_promotion is not None:
                         pending_statement, pending_proof = pending_root_close_promotion
@@ -21320,52 +21544,72 @@ async def run_mini_recursive_attempt(
                 else:
                     replay_helpers = []
                     helper_names = []
-                finalization = finalize_root_solution(
-                    dossier=attempt_dossier,
-                    proof=result.proof,
-                    replay_helpers=replay_helpers,
-                    helper_names=helper_names,
-                    phase="mini_recursive_root_tactic",
-                    turn_index=0,
-                    route_id=str(
-                        contract_status.get("route_id")
-                        or contract_status.get("created_route_id")
-                        or ""
-                    ),
-                    dependency_node_ids=tuple(
-                        str(node_id or "").strip()
-                        for node_id in list(
-                            contract_status.get("dependency_node_ids")
-                            or contract_status.get("required_node_ids")
-                            or []
-                        )
-                        if str(node_id or "").strip()
-                    ),
-                    dependency_helper_names=route_helper_names or helper_names,
-                    target_statement=root_statement,
-                    require_route_contract=bool(
-                        contract_status.get("route_id")
-                        or contract_status.get("created_route_id")
-                        or helper_names
-                    ),
-                    verification_certificate=root_verification_certificate(
-                        accepted=True,
+                context_verified = await _replay_root_finalization_context(
+                    lean=lean, statement=root_statement, proof=str(result.proof),
+                    helpers=replay_helpers, preamble=lean_check_preamble,
+                    timeout_s=0.0, record_event=record_event,
+                )
+                if context_verified:
+                    final_result = dataclass_replace(
+                        final_result, root_replay_helpers=tuple(replay_helpers),
+                    )
+                    attempt_dossier.record_lean_environment(
+                        checked_environment_hash,
+                        environment_source_text=lean_check_preamble,
+                    )
+                    finalization = finalize_root_solution(
+                        dossier=attempt_dossier,
                         proof=result.proof,
-                        phase="mini_recursive_root_tactic",
-                        turn_index=0,
-                        target_statement=root_statement,
                         replay_helpers=replay_helpers,
                         helper_names=helper_names,
-                        output=str(
-                            success_attempt.get("output")
-                            or success_attempt.get("output_preview")
+                        phase="mini_recursive_root_tactic",
+                        turn_index=0,
+                        route_id=str(
+                            contract_status.get("route_id")
+                            or contract_status.get("created_route_id")
                             or ""
                         ),
-                        source="mini_recursive_root_tactic",
-                    ),
-                    require_verification_certificate=True,
-                    metadata={"route_assembly_contract_status": dict(contract_status)},
-                )
+                        dependency_node_ids=tuple(
+                            str(node_id or "").strip()
+                            for node_id in list(
+                                contract_status.get("dependency_node_ids")
+                                or contract_status.get("required_node_ids")
+                                or []
+                            )
+                            if str(node_id or "").strip()
+                        ),
+                        dependency_helper_names=route_helper_names or helper_names,
+                        target_statement=root_statement,
+                        require_route_contract=bool(
+                            contract_status.get("route_id")
+                            or contract_status.get("created_route_id")
+                            or helper_names
+                        ),
+                        verification_certificate=root_verification_certificate(
+                            accepted=True,
+                            proof=result.proof,
+                            phase="mini_recursive_root_tactic",
+                            turn_index=0,
+                            target_statement=root_statement,
+                            replay_helpers=replay_helpers,
+                            helper_names=helper_names,
+                            output=str(
+                                success_attempt.get("output")
+                                or success_attempt.get("output_preview")
+                                or ""
+                            ),
+                            source="mini_recursive_root_tactic",
+                        ),
+                        require_verification_certificate=True,
+                        metadata={"route_assembly_contract_status": dict(contract_status)},
+                    )
+                else:
+                    from .root_finalization import RootFinalizationResult
+
+                    finalization = RootFinalizationResult(
+                        accepted=False, proof=str(result.proof),
+                        verdict="root_finalization_replay_unverified",
+                    )
                 if not finalization.accepted:
                     final_result = dataclass_replace(
                         final_result,
@@ -22762,6 +23006,7 @@ async def run_mini_recursive_driver(
         accepted_helper_name: str = "",
         accepted_helper_statement: str = "",
         accepted_helper_proof: str = "",
+        accepted_helper_replay_helpers: Optional[Sequence[str]] = None,
         active_variant_statement: str = "",
         active_variant_mode: str = "",
         selected_variant_key: str = "",
@@ -22912,6 +23157,10 @@ async def run_mini_recursive_driver(
             "accepted_helper_name": str(accepted_helper_name or ""),
             "accepted_helper_statement": str(accepted_helper_statement or ""),
             "accepted_helper_proof": str(accepted_helper_proof or ""),
+            "accepted_helper_replay_helpers": (
+                list(accepted_helper_replay_helpers)
+                if accepted_helper_replay_helpers is not None else None
+            ),
             "reused_route_local_sources": dict(reused_route_local_sources),
             "helper_continuation_sources": (
                 _recursive_helper_continuation_sources(dossier)
@@ -24593,6 +24842,10 @@ async def run_mini_recursive_driver(
                 },
             )
             return None
+        accepted_context = (
+            proof_text.replay_helpers
+            if isinstance(proof_text, _RootCloseProof) else tuple(helper_blocks)
+        )
         proof_text = str(proof_text or "").strip()
         if proof_text:
             stats.llm_root_close_solved += 1
@@ -24611,7 +24864,7 @@ async def run_mini_recursive_driver(
                     "verdict": "llm_root_close_solved",
                 },
             )
-            return proof_text
+            return _RootCloseProof(proof_text, accepted_context)
         _record(
             record_event,
             {
@@ -30611,6 +30864,7 @@ async def run_mini_recursive_driver(
             next_claim_index: int,
             publish_acceptance: bool,
             accepted_proof: str = "",
+            accepted_replay_helpers: Optional[Sequence[str]] = None,
             root_tactic_already_completed: bool = False,
             promoted_proof: str = "",
         ) -> Optional[MiniRecursiveResult]:
@@ -30628,6 +30882,7 @@ async def run_mini_recursive_driver(
                         accepted_helper_name=accepted,
                         accepted_helper_statement=statement,
                         accepted_helper_proof=accepted_proof,
+                        accepted_helper_replay_helpers=accepted_replay_helpers,
                         pass_helper_fingerprints_before=(
                             verified_helper_fingerprints_before
                         ),
@@ -30703,6 +30958,10 @@ async def run_mini_recursive_driver(
                     stats=stats,
                     plan_summaries=tuple(summaries),
                     root_close_source="accepted_exact_root",
+                    root_replay_helpers=(
+                        tuple(accepted_replay_helpers)
+                        if accepted_replay_helpers is not None else None
+                    ),
                 )
             if verified_helper_is_premise_projection(
                 accepted_item or {"statement": statement}
@@ -30840,6 +31099,7 @@ async def run_mini_recursive_driver(
                     accepted_helper_name=accepted,
                     accepted_helper_statement=statement,
                     accepted_helper_proof=accepted_proof,
+                    accepted_helper_replay_helpers=accepted_replay_helpers,
                     pass_helper_fingerprints_before=(
                         verified_helper_fingerprints_before
                     ),
@@ -30888,6 +31148,7 @@ async def run_mini_recursive_driver(
                     accepted_helper_name=accepted,
                     accepted_helper_statement=statement,
                     accepted_helper_proof=accepted_proof,
+                    accepted_helper_replay_helpers=accepted_replay_helpers,
                     pass_helper_fingerprints_before=(
                         verified_helper_fingerprints_before
                     ),
@@ -30904,6 +31165,7 @@ async def run_mini_recursive_driver(
                     accepted_helper_name=accepted,
                     accepted_helper_statement=statement,
                     accepted_helper_proof=accepted_proof,
+                    accepted_helper_replay_helpers=accepted_replay_helpers,
                     pass_helper_fingerprints_before=(
                         verified_helper_fingerprints_before
                     ),
@@ -31048,6 +31310,9 @@ async def run_mini_recursive_driver(
                 next_claim_index=claim_cursor,
                 publish_acceptance=False,
                 accepted_proof=pending_accepted_proof,
+                accepted_replay_helpers=resume_frame.get(
+                    "accepted_helper_replay_helpers"
+                ),
                 root_tactic_already_completed=(
                     str(resume_frame.get("phase") or "")
                     in {"helper_root_tactic_completed", "helper_root_close_intent"}
@@ -32121,6 +32386,7 @@ async def run_mini_recursive_driver(
                             next_claim_index=claim_cursor,
                             publish_acceptance=True,
                             accepted_proof=tactic_result.proof,
+                            accepted_replay_helpers=claim_replay_helpers,
                         )
                         if accepted_result is not None:
                             pass_finished = True
@@ -32562,7 +32828,11 @@ async def run_mini_recursive_driver(
                         route_environment_hash = route_hash_for_lifecycle(
                             route_identity_lifecycle_context
                         )
-                        claim_replay_helpers = list(get_helpers())
+                        claim_replay_helpers = list(
+                            claim_proof_result.child_replay_helpers
+                            if claim_proof_result.child_replay_helpers is not None
+                            else get_helpers()
+                        )
                     support_names = _support_names_for_proof(
                         claim_replay_helpers, proof
                     )
@@ -32636,6 +32906,7 @@ async def run_mini_recursive_driver(
                             next_claim_index=claim_cursor,
                             publish_acceptance=True,
                             accepted_proof=proof,
+                            accepted_replay_helpers=claim_replay_helpers,
                             promoted_proof=(
                                 proof if claim_environment_promoted else ""
                             ),
@@ -33291,6 +33562,7 @@ class _PlannerRawResponse:
     reasoning_content: str = ""
     finish_reason: str = ""
     raw_data: Mapping[str, Any] | None = None
+    provider_status: str = ""
 
     def parse_candidates(self) -> tuple[tuple[str, str], ...]:
         candidates: list[tuple[str, str]] = []
@@ -33335,7 +33607,17 @@ def _planner_raw_response(raw: Any) -> _PlannerRawResponse:
         getattr(raw, "reasoning_content", "") or getattr(raw, "reasoning", "") or ""
     )
     finish_reason = str(getattr(raw, "finish_reason", "") or "")
+    provider_status = ""
     if raw_data is not None:
+        # Responses transports preserve the provider status either verbatim
+        # (``status``) or via the adapter (``_responses_status``). Read it
+        # independently of finish_reason so a synthesized success reason can
+        # never hide a failed/unknown-incomplete turn.
+        provider_status = str(
+            raw_data.get("_responses_status")
+            or raw_data.get("status")
+            or ""
+        ).strip().lower()
         choices = raw_data.get("choices")
         if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
             first = choices[0]
@@ -33368,6 +33650,7 @@ def _planner_raw_response(raw: Any) -> _PlannerRawResponse:
         reasoning_content=reasoning_content,
         finish_reason=finish_reason,
         raw_data=raw_data,
+        provider_status=provider_status,
     )
 
 
@@ -33383,6 +33666,19 @@ def _planner_response_is_incomplete(
         return True, "truncated_transport"
     if reasoning_only:
         return True, "reasoning_only_transport"
+    # A provider that reported failed/incomplete must never be admitted as a
+    # complete plan, even when it carried parseable JSON. Detect this from
+    # either a distinct non-completion finish reason or the preserved provider
+    # status, so a synthesized success reason cannot hide the failure.
+    noncompletion_finish = (
+        str(response.finish_reason or "").strip().lower().replace("-", "_")
+    )
+    if (
+        noncompletion_finish
+        in {"failed", "failure", "error", "cancelled", "canceled", "content_filter"}
+        or response.provider_status not in {"", "completed"}
+    ):
+        return True, "provider_incomplete_transport"
     return False, ""
 
 
@@ -37386,7 +37682,11 @@ async def _request_plan(
                     "verdict": (
                         "plan_truncated_transport_rejected"
                         if planner_transport_truncated
-                        else "plan_reasoning_only_transport_rejected"
+                        else (
+                            "plan_provider_incomplete_transport_rejected"
+                            if recovery_trigger == "provider_incomplete_transport"
+                            else "plan_reasoning_only_transport_rejected"
+                        )
                     ),
                 },
             )
@@ -38327,6 +38627,7 @@ def _root_equivalent_helper_blocks(
     *,
     root_statement: str,
     active_target_statements: Sequence[str] = (),
+    candidate_helper_name: str = "",
     preamble: str = "",
     helpers: Sequence[Any],
     dossier: Any = None,
@@ -38335,6 +38636,8 @@ def _root_equivalent_helper_blocks(
     allow_official_answer_visibility: bool = False,
     official_answer_payload_present: Optional[bool] = None,
 ) -> list[tuple[str, str]]:
+    from .checked_target import statement_may_close_target
+
     effective_active_targets = list(active_target_statements or ())
     if (
         dossier is not None
@@ -38426,7 +38729,17 @@ def _root_equivalent_helper_blocks(
         if name in seen:
             continue
         statement_key = canonical_dossier_statement_key(statement)
-        if not statement_root_equivalent(statement) and statement_key not in root_keys:
+        # A just-accepted helper may be definitionally the root despite a
+        # different surface header. Candidate inclusion grants no authority:
+        # the promotion lane must independently check `exact` at the root.
+        if (
+            not (
+                name == str(candidate_helper_name or "").strip()
+                and statement_may_close_target(statement, root_statement)
+            )
+            and not statement_root_equivalent(statement)
+            and statement_key not in root_keys
+        ):
             continue
         seen.add(name)
         candidates.append((name, block))
@@ -38869,6 +39182,7 @@ async def _try_root_equivalent_helper_promotion(
     dossier: Any,
     root_statement: str,
     active_target_statements: Sequence[str] = (),
+    candidate_helper_name: str = "",
     preamble: str,
     helpers: Sequence[Any],
     config: MiniRecursiveConfig,
@@ -38886,6 +39200,7 @@ async def _try_root_equivalent_helper_promotion(
     candidates = _root_equivalent_helper_blocks(
         root_statement=root_statement,
         active_target_statements=active_target_statements,
+        candidate_helper_name=candidate_helper_name,
         preamble=preamble,
         helpers=helpers,
         dossier=dossier,
@@ -38919,7 +39234,7 @@ async def _try_root_equivalent_helper_promotion(
         {"candidate_count": len(candidates), "source": "root_equivalent_helper_exact"},
     )
     for index, (helper_name, helper_block) in enumerate(candidates):
-        proof = f"by\n  exact {helper_name}"
+        proof = f"by\n  exact @{helper_name}"
         helper_blocks = _root_equivalent_helper_replay_context(
             dossier=dossier,
             helper_name=helper_name,
@@ -38959,7 +39274,7 @@ async def _try_root_equivalent_helper_promotion(
                 "index": index,
                 "ok": ok,
                 "proof": proof,
-                "tactic": f"exact {helper_name}",
+                "tactic": f"exact @{helper_name}",
                 "source": "root_equivalent_helper_exact",
                 "helper": helper_name,
                 "elapsed_s": round(time.monotonic() - attempt_started, 3),
@@ -39294,6 +39609,7 @@ async def _try_root_close(
         dossier=dossier,
         root_statement=root_statement,
         active_target_statements=active_root_target_statements,
+        candidate_helper_name=after_helper,
         preamble=preamble,
         helpers=helpers,
         config=config,

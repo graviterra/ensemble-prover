@@ -869,8 +869,10 @@ async def _run_serialized_provider_operation(
             ) from exc
 
     release_owned_lock = _once_only_lock_release(lock)
+    provider_task_started: list[bool] = []
 
     async def run_with_owned_lock() -> Any:
+        provider_task_started.append(True)
         try:
             with formal_provider_exclusive_scope():
                 return await operation()
@@ -886,19 +888,27 @@ async def _run_serialized_provider_operation(
     if timeout <= 0.0:
         release_owned_lock()
         raise _ProviderAdmissionDeferred("formal provider deadline elapsed")
-    operation_task = asyncio.create_task(run_with_owned_lock())
-    # A task cancelled before its coroutine body gets a first timeslice does
-    # not execute ``finally``.  The callback is therefore the authoritative
-    # once-only release path for that edge case; for a cancellation-resistant
-    # provider tail it fires only after the tail really ends.
-    operation_task.add_done_callback(
-        mark_runtime_owned_callback(release_owned_lock)
-    )
-    return await _await_with_hard_timeout(
-        operation_task,
-        timeout=timeout,
-        cancel_grace=0.0,
-    )
+    # Pass a coroutine, not a pre-created task: ``_await_with_hard_timeout``
+    # installs the phase's HardTimeoutLease before it creates the task, so the
+    # provider body inherits the exact lease the watchdog abandons.  A task
+    # created here would capture its own context first, and timeouts would then
+    # mark a lease the provider never received -- letting a cancellation-
+    # resistant tail pass lease-gated mutation and dispatch checks.
+    try:
+        return await _await_with_hard_timeout(
+            run_with_owned_lock(),
+            timeout=timeout,
+            cancel_grace=0.0,
+        )
+    except BaseException:
+        # A task cancelled before its coroutine body gets a first timeslice
+        # never executes ``finally``, and the lease watchdog cannot observe
+        # that either.  Release the serialization lease here only for that
+        # pre-start edge; a started cancellation-resistant tail owns the
+        # release until it actually ends.
+        if not provider_task_started:
+            release_owned_lock()
+        raise
 
 
 @dataclass(frozen=True)
@@ -1360,6 +1370,33 @@ def _formal_policy_identity(client: Any, cfg: FormalStateSearchConfig) -> str:
     ).hexdigest()
 
 
+def _formal_policy_request_key(
+    *,
+    goal_state_key: str,
+    tactics_from_root: Sequence[str],
+    policy_identity: str,
+    proof_idea_context_digest: str,
+) -> str:
+    """Stable request identity shared by the engine and the scheduler.
+
+    The engine's durable retry ledger and the scheduler's retry-delay
+    selection must hash exactly the same fields -- including the actual
+    proof-idea context digest -- or the scheduler cannot see the engine's
+    backoff and keeps dispatching empty quanta while the provider is not yet
+    eligible.
+    """
+
+    payload = {
+        "state": str(goal_state_key),
+        "prefix": [str(item or "") for item in tactics_from_root],
+        "policy_identity": str(policy_identity),
+        "proof_idea_context_digest": str(proof_idea_context_digest or ""),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
 def _merge_candidates(
     deterministic: Sequence[Tuple[str, float]],
     learned: Sequence[Tuple[str, float]],
@@ -1529,15 +1566,12 @@ async def run_goal_conditioned_formal_search(
         current_goals: Sequence[LeanGoalState],
         tactics_so_far: Sequence[str],
     ) -> str:
-        payload = {
-            "state": tree.goal_state_key(current_goals),
-            "prefix": [str(item or "") for item in tactics_so_far],
-            "policy_identity": policy_identity,
-            "proof_idea_context_digest": str(proof_idea_context_digest or ""),
-        }
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
+        return _formal_policy_request_key(
+            goal_state_key=tree.goal_state_key(current_goals),
+            tactics_from_root=tactics_so_far,
+            policy_identity=policy_identity,
+            proof_idea_context_digest=proof_idea_context_digest,
+        )
 
     async def durable_progress(
         event: str,

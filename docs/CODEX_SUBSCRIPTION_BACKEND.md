@@ -183,10 +183,13 @@ and the CLI's sandbox context markers.
   allowances cannot be valued or enforced using API per-token prices.
 - One dispatch means one `codex exec` invocation. Codex may reconnect internally;
   its underlying HTTP requests are not individually observable by Mini.
-- With the default soft policy, requests have a 300-second inactivity watchdog.
-  Advancing reasoning or assistant output renews it; repeated events and retry
-  notices do not. Explicit role/request timeouts and hard-policy deadlines remain
-  absolute. `chat_n` shares any configured operation deadline across samples.
+- With the default soft policy, Codex's native network-stream watchdog detects
+  inactivity. Mini does not infer a stall from silent CLI stdout: exec JSONL
+  reports completed reasoning and answer items, and can omit reasoning summaries
+  entirely. A healthy generation can therefore be quiet for several minutes.
+  A wedged CLI process is not bounded by a default host wall deadline; use an
+  explicit role/request timeout when that bound is required. These timeouts and
+  hard-policy deadlines remain absolute. `chat_n` shares any configured operation deadline across samples.
   Cancellation and shutdown kill and reap local process groups. Terminating a
   local process does not guarantee an already submitted remote generation stopped
   immediately.

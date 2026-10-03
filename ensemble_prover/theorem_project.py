@@ -159,6 +159,75 @@ def _name_final_component(name: str) -> str:
     return clean[last_dot + 1 :]
 
 
+def _raw_name_components(name: str) -> tuple[str, ...]:
+    """Split a dotted Lean name at dots outside escaped ``«...»`` components.
+
+    The original spelling of each component is retained so an ``end`` closer
+    can reproduce an escaped component such as ``«B.C»`` verbatim; a dot
+    inside quotes is part of one component, not a scope separator.
+    """
+
+    # Scope commands treat `_root_` as an ordinary namespace component;
+    # only declaration/reference names use it as absolute qualification.
+    value = str(name or "").strip()
+    if not value or re.fullmatch(_DOTTED_IDENT, value, flags=re.UNICODE) is None:
+        return ()
+    return tuple(re.findall(_IDENT_COMPONENT, value, flags=re.UNICODE))
+
+
+def _component_identity(component: str) -> str:
+    """Compare escaped and unescaped spellings of one name component."""
+
+    text = str(component or "")
+    if len(text) >= 2 and text.startswith("«") and text.endswith("»"):
+        return text[1:-1]
+    return text
+
+
+def _scope_closed_by_end(
+    scopes: Sequence[tuple[Any, ...]],
+    requested: str,
+) -> Optional[int]:
+    """Index of the innermost command scope an ``end`` command closes.
+
+    ``scopes`` is ordered outermost first with one frame per namespace
+    component, so ``namespace A.B`` followed by ``end B`` closes only ``B``.
+    A named ``end`` may name the trailing run of open namespace components or
+    the innermost section. ``None`` means the command names no open scope, and
+    the caller must leave the stack unchanged rather than guess.
+    """
+
+    if not scopes:
+        return None
+    name = str(requested or "").strip()
+    if not name:
+        return len(scopes) - 1
+    components = _raw_name_components(name)
+    if not components:
+        return None
+    top_kind, top_name = scopes[-1][0], scopes[-1][1]
+    if top_kind == "section" and top_name:
+        if tuple(map(_component_identity, _raw_name_components(top_name))) == tuple(
+            map(_component_identity, components)
+        ):
+            return len(scopes) - 1
+    trailing: list[int] = []
+    index = len(scopes) - 1
+    while index >= 0 and scopes[index][0] == "namespace":
+        trailing.append(index)
+        index -= 1
+    trailing.reverse()
+    if len(components) > len(trailing):
+        return None
+    matched = trailing[-len(components) :]
+    if all(
+        _component_identity(scopes[frame][1]) == _component_identity(component)
+        for frame, component in zip(matched, components)
+    ):
+        return matched[0]
+    return None
+
+
 def _qualified_name(namespace: Sequence[str], source_name: str) -> str:
     source = str(source_name or "").strip()
     if source.startswith("_root_."):
@@ -255,7 +324,11 @@ def _active_command_scopes(
     events.sort(key=lambda item: item[0])
     scopes: list[tuple[str, str, int, int]] = []
     for _offset, kind, match in events:
-        if kind in {"namespace", "section"}:
+        if kind == "namespace":
+            name = str(match.group("name") or "").strip()
+            for component in _raw_name_components(name) or (name,):
+                scopes.append((kind, component, match.start(), match.end()))
+        elif kind == "section":
             scopes.append(
                 (
                     kind,
@@ -266,15 +339,11 @@ def _active_command_scopes(
             )
         elif kind == "mutual":
             scopes.append((kind, "", match.start(), match.end()))
-        elif scopes:
+        else:
             requested = str(match.group("name") or "").strip()
-            if not requested:
-                scopes.pop()
-            else:
-                for index in range(len(scopes) - 1, -1, -1):
-                    if scopes[index][1] == requested:
-                        del scopes[index:]
-                        break
+            index = _scope_closed_by_end(scopes, requested)
+            if index is not None:
+                del scopes[index:]
     return tuple(scopes)
 
 
@@ -587,7 +656,9 @@ def scan_lean_declarations(text: str) -> tuple[LeanTheoremDeclaration, ...]:
     declarations: list[LeanTheoremDeclaration] = []
     for _, event_kind, match in events:
         if event_kind == "namespace":
-            scopes.append(("namespace", str(match.group("name") or "").strip()))
+            name = str(match.group("name") or "").strip()
+            for component in _raw_name_components(name) or (name,):
+                scopes.append(("namespace", component))
             continue
         if event_kind == "section":
             scopes.append(("section", str(match.group("name") or "").strip()))
@@ -596,19 +667,10 @@ def scan_lean_declarations(text: str) -> tuple[LeanTheoremDeclaration, ...]:
             scopes.append(("mutual", ""))
             continue
         if event_kind == "end":
-            if not scopes:
-                continue
             requested = str(match.group("name") or "").strip()
-            if not requested:
-                scopes.pop()
-                continue
-            for index in range(len(scopes) - 1, -1, -1):
-                frame_name = scopes[index][1]
-                if frame_name and (
-                    frame_name == requested or frame_name.endswith("." + requested)
-                ):
-                    del scopes[index:]
-                    break
+            index = _scope_closed_by_end(scopes, requested)
+            if index is not None:
+                del scopes[index:]
             continue
 
         kind = str(match.group("kind") or "")
@@ -753,13 +815,22 @@ def normalize_imports(imports: Iterable[str]) -> tuple[str, ...]:
 
 
 def scan_lean_imports(text: str) -> tuple[str, ...]:
+    """Return the module names of the file's leading Lean import commands.
+
+    Lean accepts ``public``/``meta`` modifiers, an ``all`` qualifier, and a
+    leading ``module``/``prelude`` command, none of which a line-oriented
+    regex handles. Missing those commands drops real dependencies from the
+    environment closure (a changed dependency then hashes identically), so use
+    the shared token-level header scanner, which already preserves quoted
+    module names, comments, and the stop-before-module-code boundary.
+    """
     source = str(text or "")
+    commands, _ = _scan_lean_header(source, header_only=True)
     imports: list[str] = []
-    import_re = re.compile(
-        r"(?m)^[^\S\r\n]*(?:public[^\S\r\n]+)?import[^\S\r\n]+([^\r\n]+?)[^\S\n]*$"
-    )
-    for match in _command_matches(import_re, _mask_noncode(source)):
-        module = match.group(1).strip()
+    for command in commands:
+        if command.kind != "import" or command.module_start is None:
+            continue
+        module = source[command.module_start : command.end].strip()
         if is_valid_lean_qualified_name(module) and module not in imports:
             imports.append(module)
     return tuple(imports)
@@ -936,7 +1007,12 @@ def active_include_variables(text: str, end: int) -> tuple[str, ...]:
     included: list[str] = []
     scopes: list[tuple[str, str, tuple[str, ...]]] = []
     for _offset, kind, match in events:
-        if kind in {"namespace", "section", "mutual"}:
+        if kind == "namespace":
+            name = str(match.groupdict().get("name") or "").strip()
+            for component in _raw_name_components(name) or (name,):
+                scopes.append((kind, component, tuple(included)))
+            continue
+        if kind in {"section", "mutual"}:
             name = (
                 str(match.groupdict().get("name") or "").strip()
                 if kind != "mutual"
@@ -945,20 +1021,10 @@ def active_include_variables(text: str, end: int) -> tuple[str, ...]:
             scopes.append((kind, name, tuple(included)))
             continue
         if kind == "end":
-            if not scopes:
-                continue
             requested = str(match.group("name") or "").strip()
-            remove_at = len(scopes) - 1
-            if requested:
-                matches = [
-                    index
-                    for index, (_scope_kind, name, _snapshot) in enumerate(scopes)
-                    if name
-                    and (name == requested or name.endswith("." + requested))
-                ]
-                if not matches:
-                    continue
-                remove_at = matches[-1]
+            remove_at = _scope_closed_by_end(scopes, requested)
+            if remove_at is None:
+                continue
             included = list(scopes[remove_at][2])
             del scopes[remove_at:]
             continue

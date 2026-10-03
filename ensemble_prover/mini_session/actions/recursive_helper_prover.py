@@ -31,6 +31,24 @@ from ..recursive_helper_prover import (
 RECURSIVE_HELPER_PARENT_RECHECK_TIMEOUT_S = 300.0
 RECURSIVE_HELPER_TARGET_TYPECHECK_TIMEOUT_FLOOR_S = 300.0
 CHILD_EXECUTION_SCHEMA_VERSION = 1
+# Durable checkpoints written before the provider-free parent-recheck receipt
+# was folded into the canonical execution-frame schema recorded that exact
+# frame as version 2.  Restore still reads it, but only for a structurally
+# valid pending parent recheck and only by rewriting it to the canonical
+# version; arbitrary future versions remain unreadable.
+LEGACY_PARENT_RECHECK_SCHEMA_VERSION = 2
+PARENT_RECHECK_PENDING_STATUS = "parent_recheck_pending"
+# Provider-free execution statuses this action may persist and resume.
+DURABLE_CHILD_EXECUTION_STATUSES = frozenset(
+    {
+        "child_prepared",
+        "child_live",
+        "child_complete",
+        "scheduler_backoff",
+        "parent_recheck_pending",
+        "retryable_error",
+    }
+)
 
 
 def _nonnegative_counter(value: Any) -> int:
@@ -645,6 +663,96 @@ class RecursiveHelperProverAction:
             raise ValueError("Cannot checkpoint a live recursive child capability")
         return clone_json_value({"nested_execution_frame": frame})
 
+    @staticmethod
+    def _validated_child_descriptor(descriptor: Any) -> Optional[dict[str, Any]]:
+        """Return a structurally valid child descriptor, else ``None``.
+
+        These are exactly the identity fields a resumed parent recheck needs to
+        address the same reserved child attempt.  A descriptor that omits or
+        mistypes any of them is not resumable and must not be trusted.
+        """
+
+        if type(descriptor) is not dict:
+            return None
+        node_id = descriptor.get("node_id")
+        attempt_number = descriptor.get("attempt_number")
+        helper_name = descriptor.get("helper_name")
+        target_statement = descriptor.get("target_statement")
+        if (
+            type(node_id) is not str
+            or not node_id.strip()
+            or type(attempt_number) is not int
+            or attempt_number <= 0
+            or type(helper_name) is not str
+            or not helper_name.strip()
+            or type(target_statement) is not str
+            or not target_statement.strip()
+        ):
+            return None
+        return descriptor
+
+    @staticmethod
+    def _validated_parent_recheck_result(value: Any) -> Optional[list[Any]]:
+        """Return the canonical parent-recheck receipt, else ``None``.
+
+        The receipt only schedules a later recheck of the saved child proof in
+        the parent environment; it carries no acceptance authority, so it is
+        validated structurally and never published as a proof at restore time.
+        """
+
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            return None
+        ok, proof_text, telemetry = value
+        if (
+            type(ok) is not bool
+            or not ok
+            or not isinstance(proof_text, str)
+            or not proof_text.strip()
+            or type(telemetry) is not dict
+        ):
+            return None
+        return [ok, proof_text, dict(telemetry)]
+
+    def _validate_durable_child_frame(self, frame: dict[str, Any]) -> None:
+        """Validate one provider-free child frame, canonicalizing its version.
+
+        Rejects wrong owners/kinds, malformed descriptors, unknown future
+        schema versions, and malformed or authority-bearing payloads.  A
+        recognized legacy parent-recheck version is rewritten in place to the
+        canonical version; no proof authority is granted here.
+        """
+
+        if (
+            frame.get("owner_action_id") != self.id
+            or frame.get("child_kind") != "recursive_helper_subsession"
+            or self._validated_child_descriptor(frame.get("descriptor")) is None
+        ):
+            raise ValueError("Recursive child runtime identity mismatch")
+        status = str(frame.get("status") or "")
+        if status not in DURABLE_CHILD_EXECUTION_STATUSES:
+            raise ValueError("Recursive child runtime status mismatch")
+        version = frame.get("schema_version")
+        if status == PARENT_RECHECK_PENDING_STATUS:
+            result = self._validated_parent_recheck_result(
+                frame.get("completed_result")
+            )
+            if result is None:
+                raise ValueError(
+                    "Invalid pending recursive-helper parent recheck checkpoint"
+                )
+            if version not in (
+                CHILD_EXECUTION_SCHEMA_VERSION,
+                LEGACY_PARENT_RECHECK_SCHEMA_VERSION,
+            ):
+                raise ValueError("Recursive child runtime identity mismatch")
+            frame["schema_version"] = CHILD_EXECUTION_SCHEMA_VERSION
+            frame["completed_result"] = result
+            return
+        if version != CHILD_EXECUTION_SCHEMA_VERSION or (
+            frame.get("completed_result") is not None
+        ):
+            raise ValueError("Recursive child runtime identity mismatch")
+
     def apply_scheduler_runtime_state(self, state: Any) -> None:
         clean = clone_json_value(state)
         if type(clean) is not dict or set(clean) != {"nested_execution_frame"}:
@@ -652,13 +760,8 @@ class RecursiveHelperProverAction:
         frame = clean["nested_execution_frame"]
         if type(frame) is not dict or frame.get("child_session") is not None:
             raise ValueError("Invalid recursive child runtime frame")
-        if frame and (
-            frame.get("schema_version") != CHILD_EXECUTION_SCHEMA_VERSION
-            or frame.get("owner_action_id") != self.id
-            or frame.get("child_kind") != "recursive_helper_subsession"
-            or type(frame.get("descriptor")) is not dict
-        ):
-            raise ValueError("Recursive child runtime identity mismatch")
+        if frame:
+            self._validate_durable_child_frame(frame)
         self._nested_execution_frame = frame
 
     def restore_checkpoint_children(self, session: Any, frames: dict[str, Any]) -> None:
@@ -2609,20 +2712,21 @@ class RecursiveHelperProverAction:
             # ``prove_helper_in_subsession`` has already finalized its child
             # frame.  Replace the bulky child snapshot with the minimum
             # proof-bearing continuation state.  This mutation is published by
-            # ordinary parent outcome application.
+            # ordinary parent outcome application under the canonical,
+            # restartable execution-frame schema.
             descriptor = dict(
                 self._nested_execution_frame.get("descriptor") or {}
             )
             descriptor["action_deadline_epoch_s"] = 0.0
             self._nested_execution_frame = {
-                "schema_version": 2,
+                "schema_version": CHILD_EXECUTION_SCHEMA_VERSION,
                 "owner_action_id": self.id,
                 "child_kind": "recursive_helper_subsession",
                 "descriptor": descriptor,
-                "status": "parent_recheck_pending",
+                "status": PARENT_RECHECK_PENDING_STATUS,
                 "child_session": None,
                 "completed_result": [True, proof_text, dict(telemetry)],
-                "child_reason": "parent_recheck_pending",
+                "child_reason": PARENT_RECHECK_PENDING_STATUS,
             }
 
         _emit_telemetry({

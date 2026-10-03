@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 PERSISTENT_VERIFIER_PROTOCOL = "persistent_verifier_transport"
 PERSISTENT_VERIFIER_VERSION = "1.0"
 
+# Upper bound on how long a caller parked on an empty lane may sleep before
+# re-checking availability. Lane changes normally wake it immediately via the
+# queue's change event; this periodic backstop covers a terminal transition
+# that updated worker/lane state without routing through that signal, so the
+# caller still falls back promptly instead of at the lane timeout.
+_LANE_CHANGE_POLL_S = 0.05
+
 
 def _protocol_major(version: str) -> str:
     text = str(version or "").strip()
@@ -50,6 +57,34 @@ def _consume_task_exception(task: "asyncio.Future[Any]") -> None:
         task.exception()
     except BaseException:
         pass
+
+
+def _lane_release_callback(
+    lane_inflight: Dict[str, int],
+    lane: str,
+    changed: asyncio.Event,
+) -> Callable[..., None]:
+    """Once-only lane-slot release, usable as a task done-callback.
+
+    Must be a named module-level factory, not an inline lambda: only callables
+    on ``runtime_context._TRUSTED_RUNTIME_CALLBACKS`` authenticate. An
+    unauthenticated ``mark_runtime_owned_callback`` is a silent no-op, so
+    MiniSession rewrites the callback to a no-op once the action boundary
+    closes; the lane slot is then never released and every later request
+    routed to that lane sees a phantom in-flight worker that can never arrive.
+
+    Captures exactly the pool's lane-in-flight dict, one lane name, and the
+    lane queue's change event -- which is what the ``lane_release`` policy
+    admits -- so it can only adjust one counter it already owns and wake the
+    queue's parked waiters.
+    """
+
+    def release_lane_slot(_finished: Any = None) -> None:
+        remaining = int(lane_inflight.get(lane, 0)) - 1
+        lane_inflight[lane] = remaining if remaining > 0 else 0
+        changed.set()
+
+    return release_lane_slot
 
 
 @dataclass
@@ -256,7 +291,12 @@ class PersistentVerifierWorker:
         async with self._lock:
             policy_id = current_network_policy().policy_id
             if (self._proc is not None and self.state in {"idle", "busy"}
+                    and getattr(self._proc, "returncode", None) is None
                     and getattr(self, "_network_policy_id", None) == policy_id):
+                # Only a subprocess that is still running counts as healthy.
+                # A worker whose child exited (returncode set) falls through
+                # and is rebuilt, because the next write would otherwise fail
+                # with a broken-pipe transport error.
                 return True
             await self._kill_process()
             self.generation += 1
@@ -396,6 +436,34 @@ class PersistentVerifierWorker:
         self._worker_cancellations = 0
         self._requests_served = 0
 
+    def _transport_failure_response(
+        self,
+        request: VerifierRequest,
+        output: str,
+        *,
+        partial_output: str,
+        queue_wait_s: float,
+    ) -> VerifierResponse:
+        """Build the bounded fatal response for a dead or unwritable worker.
+
+        Transport failures are reported to the pool as a fatal response so the
+        pool-owned restart path rebuilds the worker (or the caller falls back)
+        instead of an opaque exception escaping and leaving the worker stuck
+        in ``busy``.
+        """
+
+        return VerifierResponse(
+            request_id=str(request.request_id),
+            ok=False,
+            returncode=1,
+            output=_status_with_output(output, partial_output),
+            backend_kind="persistent_process",
+            worker_id=self.worker_id,
+            worker_generation=int(self.generation),
+            service_time_s=0.0,
+            queue_wait_s=float(queue_wait_s),
+        )
+
     async def execute(
         self,
         request: VerifierRequest,
@@ -404,10 +472,27 @@ class PersistentVerifierWorker:
         dispatch_observer: Optional[Callable[[], None]] = None,
     ) -> VerifierResponse:
         async with self._lock:
-            if self._proc is None or self.state not in {"idle", "busy"}:
-                ok = await self.start()
-                if not ok:
-                    raise PersistentVerifierError("persistent verifier worker unavailable")
+            if (
+                self._proc is None
+                or self.state not in {"idle", "busy"}
+                or getattr(self._proc, "returncode", None) is not None
+            ):
+                # The worker's subprocess is missing or already dead, so it
+                # cannot serve this request. Do NOT call self.start() here:
+                # self._lock is held and start() re-acquires it, which would
+                # deadlock. Instead surface a bounded fatal so the pool-owned
+                # restart path rebuilds this worker and the caller falls back.
+                response = self._transport_failure_response(
+                    request,
+                    "persistent verifier worker is not running",
+                    partial_output="",
+                    queue_wait_s=queue_wait_s,
+                )
+                self.state = "poisoned"
+                if self._proc is not None:
+                    self._worker_crashes += 1
+                await self._kill_process()
+                raise PersistentVerifierFatalError(response, "lean_backend_crash")
             self.state = "busy"
             try:
                 return await self._execute_locked(
@@ -459,22 +544,39 @@ class PersistentVerifierWorker:
         )
         if total_timeout_s <= 0.0:
             total_timeout_s = 1.0
-        await self._send_message(
-            {
-                **self._message_envelope("check"),
-                "session_id": self.session_id,
-                "request_id": str(request.request_id),
-                "mode": str(request.mode),
-                "goal_name": str(request.goal_name),
-                "document_uri": str(request.document_uri),
-                "content": str(request.content),
-                "warning_as_error": bool(request.warning_as_error),
-                "max_heartbeats": request.max_heartbeats,
-                "timeout_s": float(request.timeout_s),
-                "queue_class": str(request.queue_class),
-                "metadata": dict(request.metadata or {}),
-            }
-        )
+        try:
+            await self._send_message(
+                {
+                    **self._message_envelope("check"),
+                    "session_id": self.session_id,
+                    "request_id": str(request.request_id),
+                    "mode": str(request.mode),
+                    "goal_name": str(request.goal_name),
+                    "document_uri": str(request.document_uri),
+                    "content": str(request.content),
+                    "warning_as_error": bool(request.warning_as_error),
+                    "max_heartbeats": request.max_heartbeats,
+                    "timeout_s": float(request.timeout_s),
+                    "queue_class": str(request.queue_class),
+                    "metadata": dict(request.metadata or {}),
+                }
+            )
+        except Exception:
+            # The subprocess can die between the liveness check and this write
+            # (or its stdin pipe can already be broken). Convert that transport
+            # failure into the same bounded fatal used for a mid-request crash
+            # so the pool restarts the worker rather than leaving it busy with
+            # a stale request queued behind it.
+            self._worker_crashes += 1
+            self.state = "poisoned"
+            response = self._transport_failure_response(
+                request,
+                "persistent verifier worker transport failed before dispatch",
+                partial_output=partial_output,
+                queue_wait_s=queue_wait_s,
+            )
+            await self._kill_process()
+            raise PersistentVerifierFatalError(response, "lean_backend_crash")
         if dispatch_observer is not None:
             try:
                 dispatch_observer()
@@ -741,6 +843,25 @@ class PersistentVerifierWorker:
         }
 
 
+class _LaneWorkerQueue(asyncio.Queue[PersistentVerifierWorker]):
+    """Worker queue that signals lane-state changes to queued callers.
+
+    ``put_nowait`` is the single funnel for every requeue (``put`` delegates
+    to it), so setting ``changed`` here wakes parked callers whenever a worker
+    becomes available, regardless of whether the pool or a test put it there.
+    Terminal lane transitions set the same event directly so a caller waiting
+    out a recovery that then failed can re-check and fall back promptly.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.changed: asyncio.Event = asyncio.Event()
+
+    def put_nowait(self, item: PersistentVerifierWorker) -> None:
+        super().put_nowait(item)
+        self.changed.set()
+
+
 class PersistentVerifierPool:
     def __init__(self, cfg: LeanConfig):
         self.cfg = cfg
@@ -771,9 +892,9 @@ class PersistentVerifierPool:
         # Main queue. Kept as `_available` (not `_available_main`) so
         # existing callers and tests that touch pool._available
         # directly continue to work.
-        self._available: asyncio.Queue[PersistentVerifierWorker] = asyncio.Queue()
+        self._available: asyncio.Queue[PersistentVerifierWorker] = _LaneWorkerQueue()
         self._available_oracle: Optional[asyncio.Queue[PersistentVerifierWorker]] = (
-            asyncio.Queue() if self.oracle_worker_count > 0 else None
+            _LaneWorkerQueue() if self.oracle_worker_count > 0 else None
         )
         self._started = False
         self._closing = False
@@ -787,6 +908,14 @@ class PersistentVerifierPool:
         self._queue_wait_max_s: float = 0.0
         self._service_time_total_s: float = 0.0
         self._service_time_max_s: float = 0.0
+        # Per-lane count of workers currently checked out of a sub-pool
+        # queue (busy serving a request or being restarted). A lane with
+        # a non-zero count can still put a worker back on its queue; a
+        # lane at zero whose queue is empty cannot, so a request for it
+        # must fail through the unavailable/fallback path instead of
+        # waiting out the queue timeout. Keyed by lane name ("main" or
+        # "oracle") so both sub-pools are tracked independently.
+        self._lane_inflight: Dict[str, int] = {"main": 0, "oracle": 0}
         # Per-class request counters for telemetry — surface through
         # pool.stats() so operators can verify separation in prod.
         self._request_count_main: int = 0
@@ -814,6 +943,97 @@ class PersistentVerifierPool:
             return self._available_oracle
         return self._available
 
+    def _lane_name_for_queue(
+        self, queue: "asyncio.Queue[PersistentVerifierWorker]"
+    ) -> str:
+        """Map a sub-pool queue to its lane name.
+
+        Routing, worker re-queue, and in-flight accounting all have to
+        agree on a single label per sub-pool, so the label is derived
+        from queue identity rather than from a caller-supplied string.
+        """
+        if self._available_oracle is not None and queue is self._available_oracle:
+            return "oracle"
+        return "main"
+
+    def _workers_in_lane(
+        self, queue: "asyncio.Queue[PersistentVerifierWorker]"
+    ) -> list[PersistentVerifierWorker]:
+        if self._available_oracle is not None and queue is self._available_oracle:
+            return self._workers_oracle
+        return self._workers_main
+
+    def _reserve_lane_slot(
+        self, queue: "asyncio.Queue[PersistentVerifierWorker]"
+    ) -> str:
+        """Record that a worker was checked out of *queue*'s lane.
+
+        The slot is held until that worker is back on a queue (or has
+        been closed), which lets :meth:`_lane_may_supply_worker` tell a
+        lane with work in flight apart from a lane that has genuinely
+        run dry.
+        """
+        lane = self._lane_name_for_queue(queue)
+        self._lane_inflight[lane] = int(self._lane_inflight.get(lane, 0)) + 1
+        return lane
+
+    def _queue_for_lane(
+        self, lane: str
+    ) -> "asyncio.Queue[PersistentVerifierWorker]":
+        """Return the sub-pool queue that serves *lane*.
+
+        Inverse of :meth:`_lane_name_for_queue`, so lane accounting can reach
+        the queue whose parked callers must re-check availability.
+        """
+        if lane == "oracle" and self._available_oracle is not None:
+            return self._available_oracle
+        return self._available
+
+    def _notify_lane_changed(self, lane: str) -> None:
+        """Wake callers parked on *lane*'s queue to re-check availability."""
+        changed = getattr(self._queue_for_lane(lane), "changed", None)
+        if changed is not None:
+            changed.set()
+
+    def _release_lane_slot(self, lane: str) -> None:
+        remaining = int(self._lane_inflight.get(lane, 0)) - 1
+        self._lane_inflight[lane] = remaining if remaining > 0 else 0
+        # Wake any caller parked on this lane: the release either requeued the
+        # worker first (the queue's own put already signalled) or the lane is
+        # now terminal, and a waiting caller must re-check rather than sleep
+        # until the lane timeout.
+        self._notify_lane_changed(lane)
+
+    def _lane_may_supply_worker(
+        self, queue: "asyncio.Queue[PersistentVerifierWorker]"
+    ) -> bool:
+        """Return True when a worker could still arrive on *queue*.
+
+        A lane can still deliver a worker while one of its workers is
+        checked out: a busy worker is re-queued on completion and a
+        restarted worker is re-queued once recovery settles. A lane
+        whose workers are idle-but-unqueued, dead, poisoned, or cold has
+        no pending recovery, so waiting on its empty queue only burns
+        the caller's deadline. A closing pool never re-queues.
+        """
+        if self._closing:
+            return False
+        lane = self._lane_name_for_queue(queue)
+        if int(self._lane_inflight.get(lane, 0)) > 0:
+            return True
+        # Also honor workers explicitly marked busy or mid-recovery even
+        # if their checkout was not tracked here (for example a caller
+        # that sets state directly); each of these can plausibly put a
+        # worker back on this lane.
+        for worker in self._workers_in_lane(queue):
+            if str(getattr(worker, "state", "") or "") in {
+                "busy",
+                "restarting",
+                "starting",
+            }:
+                return True
+        return False
+
     async def _restart_and_requeue_worker(
         self,
         worker: PersistentVerifierWorker,
@@ -827,6 +1047,19 @@ class PersistentVerifierPool:
             await target_queue.put(worker)
         elif restarted:
             await self._close_worker_best_effort(worker)
+        elif not self._closing:
+            # Recovery failed: the worker cannot serve this lane unless a
+            # later start() rebuilds it, so it must not keep the lane looking
+            # recoverable. A worker left in a "starting"/"restarting" state
+            # would hold queued callers until the lane timeout; mark it
+            # terminal so the done callback below, which releases the lane
+            # slot and wakes those callers, lets them fall back promptly. A
+            # closing pool has already retired the worker, so leave its
+            # terminal state alone.
+            try:
+                worker.state = "poisoned"
+            except Exception:
+                pass
 
     async def _close_worker_best_effort(
         self, worker: PersistentVerifierWorker
@@ -856,8 +1089,76 @@ class PersistentVerifierPool:
         task = asyncio.create_task(
             self._restart_and_requeue_worker(worker, target_queue)
         )
+        # The worker already holds a lane slot from checkout. Release it
+        # only once the restart settles: on success the worker is back on
+        # the queue before this callback runs, so a concurrent request
+        # for the lane either finds the worker or keeps waiting rather
+        # than failing while recovery is still in flight.
+        lane = self._lane_name_for_queue(target_queue)
+        changed = getattr(target_queue, "changed", None)
+        if changed is None:
+            changed = asyncio.Event()
+        task.add_done_callback(
+            mark_runtime_owned_callback(
+                _lane_release_callback(self._lane_inflight, lane, changed)
+            )
+        )
         self._track_background_task(task)
         return task
+
+    async def _acquire_worker(
+        self,
+        source_queue: "asyncio.Queue[PersistentVerifierWorker]",
+        request_queue_class: str,
+    ) -> PersistentVerifierWorker:
+        """Wait for a worker without stranding a caller on a dead lane.
+
+        The queue is polled with ``get_nowait`` rather than awaited directly:
+        the successful dequeue and the caller's lane-slot reservation then
+        happen in the same scheduling step (see ``execute``), so a competing
+        request cannot observe an empty queue with no slot held. Between polls
+        the caller parks on the lane queue's change event, set whenever a
+        worker is queued or a lane slot is released. Re-checking availability
+        after every wake lets a terminal transition -- a recovery that failed
+        and left the lane with no worker and nothing in flight -- fail the
+        caller promptly so its own fallback can run, instead of holding it
+        until the lane timeout.
+        """
+
+        changed = getattr(source_queue, "changed", None)
+        while True:
+            try:
+                return source_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            if not self._lane_may_supply_worker(source_queue):
+                raise PersistentVerifierUnavailableError(
+                    "no persistent verifier workers available for the "
+                    f"{request_queue_class} lane"
+                )
+            if changed is None:
+                # Plain-queue fallback (no change signal available): keep the
+                # pre-existing single await, still bounded by the caller.
+                return await source_queue.get()
+            # Clear before re-checking so a signal raised between the poll
+            # above and the wait below is never lost.
+            changed.clear()
+            try:
+                return source_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            if not self._lane_may_supply_worker(source_queue):
+                raise PersistentVerifierUnavailableError(
+                    "no persistent verifier workers available for the "
+                    f"{request_queue_class} lane"
+                )
+            try:
+                async with asyncio.timeout(_LANE_CHANGE_POLL_S):
+                    await changed.wait()
+            except asyncio.TimeoutError:
+                # Backstop for a terminal transition applied directly to lane
+                # state rather than through the queue's change event.
+                continue
 
     async def start(self) -> bool:
         self._closing = False
@@ -899,11 +1200,12 @@ class PersistentVerifierPool:
             getattr(request, "queue_class", "main") or "main"
         )
         source_queue = self._pick_request_queue(request_queue_class)
+        lane_wait_s = max(1.0, float(self.cfg.persistent_worker_start_timeout_s))
         try:
-            worker = await asyncio.wait_for(
-                source_queue.get(),
-                timeout=max(1.0, float(self.cfg.persistent_worker_start_timeout_s)),
-            )
+            async with asyncio.timeout(lane_wait_s):
+                worker = await self._acquire_worker(
+                    source_queue, request_queue_class
+                )
         except asyncio.TimeoutError as exc:
             raise PersistentVerifierUnavailableError(
                 "no persistent verifier workers became available"
@@ -923,6 +1225,11 @@ class PersistentVerifierPool:
         # mode) goes back to main, and an oracle worker always goes
         # back to oracle.
         target_queue = self._target_queue_for(worker)
+        # Hold a slot on the lane this worker came from until it is back
+        # on a queue or closed. While the slot is held, a concurrent
+        # request routed to the same lane treats the lane as still able
+        # to supply a worker.
+        lane = self._reserve_lane_slot(target_queue)
         # Track pool ownership separately from worker state. Cancellation or
         # restart can leave a worker poisoned or starting; either state still
         # requires explicit cleanup and eventual requeue/replacement. Otherwise
@@ -996,9 +1303,15 @@ class PersistentVerifierPool:
                         await target_queue.put(worker)
                     else:
                         await self._close_worker_best_effort(worker)
+                    # Released only after the worker is back on its queue
+                    # (or closed) so no request can observe the lane as
+                    # empty while this worker is still in transition.
+                    self._release_lane_slot(lane)
 
     async def close(self) -> None:
         self._closing = True
+        self._notify_lane_changed("main")
+        self._notify_lane_changed("oracle")
         pending_tasks = [task for task in self._background_tasks if not task.done()]
         for task in pending_tasks:
             task.cancel()
@@ -1019,6 +1332,8 @@ class PersistentVerifierPool:
 
     def close_nowait(self) -> None:
         self._closing = True
+        self._notify_lane_changed("main")
+        self._notify_lane_changed("oracle")
         for task in list(self._background_tasks):
             task.cancel()
         self._background_tasks.clear()

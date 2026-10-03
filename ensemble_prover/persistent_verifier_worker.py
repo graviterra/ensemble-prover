@@ -131,10 +131,16 @@ class LeanLspSession:
         self._stderr_task = None
         if proc is None:
             return
+        # The Lean server deliberately shares this worker's process group (see
+        # start()), so proc.pid is not a process-group id here. Killing that
+        # group with killpg(proc.pid) would be unsafe: it could address an
+        # unrelated group that happens to reuse the id. Kill only the server
+        # process and disconnect its pipes; the group sweep performed when the
+        # worker itself is torn down reaps any remaining descendants.
         await terminate_and_reap_process(
             proc,
             auxiliary_tasks=(stderr_task,) if stderr_task is not None else (),
-            kill_process_group=True,
+            kill_process_group=False,
             log=logger,
         )
 
@@ -210,6 +216,13 @@ class LeanLspSession:
     async def start(self) -> None:
         if self._proc is not None:
             return
+        # The Lean server intentionally inherits this worker's session and
+        # process group (no start_new_session). The worker is itself a session
+        # leader created by the host with start_new_session=True, so a host
+        # forced kill of the worker's group sweeps the server too — the server
+        # cannot outlive a SIGKILLed worker that is unable to run cleanup.
+        # Giving the server its own session here would strand it as an orphan
+        # in a group the host never signals.
         proc = await asyncio.create_subprocess_exec(
             "lake",
             "env",
@@ -220,7 +233,6 @@ class LeanLspSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
         )
         self._proc = proc
         self._stderr_task = asyncio.create_task(self._drain_stderr())
