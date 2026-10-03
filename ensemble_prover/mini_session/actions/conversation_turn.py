@@ -978,6 +978,7 @@ def _propagate_route_scoped_tool_helpers(
     if not callable(importer):
         return []
     added: List[str] = []
+    usage_consumers: List[str] = []
     for name, helper in list(source_helpers.items()):
         helper_name = str(name or "").strip()
         if not helper_name:
@@ -997,6 +998,7 @@ def _propagate_route_scoped_tool_helpers(
                 str(getattr(existing, "source_hash", "") or "").strip()
                 == str(getattr(helper, "source_hash", "") or "").strip()
             ):
+                usage_consumers.append(helper_name)
                 continue
             increment = getattr(target_dossier, "increment_tool_metric", None)
             if callable(increment):
@@ -1065,9 +1067,10 @@ def _propagate_route_scoped_tool_helpers(
                         pass
                 continue
             added.append(recorded_name)
+            usage_consumers.append(recorded_name)
     from ...helper_utilization import transfer_declaration_utilization
 
-    transfer_declaration_utilization(source_dossier, target_dossier, added)
+    transfer_declaration_utilization(source_dossier, target_dossier, usage_consumers)
     return added
 
 
@@ -13022,6 +13025,11 @@ class ConversationTurnAction:
             # promoting route-local helpers into global proof context.
             llm_dossier = copy.copy(dossier)
             setattr(llm_dossier, "_mini_skip_proof_state_reconcile", True)
+            # Usage belongs to the exact route consumer until helper
+            # propagation accepts that source in the live dossier.
+            llm_dossier.helper_utilization_observations = copy.deepcopy(
+                dossier.helper_utilization_observations
+            )
             verified_helpers = getattr(dossier, "verified_helpers", {}) or {}
             closure_names = {
                 helper_decl_name(block) for block in assemble_route_helper_blocks

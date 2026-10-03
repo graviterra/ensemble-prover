@@ -14636,8 +14636,9 @@ class ProofDossier:
         }
         if observation.consumer_source:
             payload["consumer_declaration_name"] = observation.consumer_name
+            payload["consumer_declaration_resolved_name"] = bindings[observation.consumer_name]
             payload["consumer_declaration_source_hash"] = source_digest(observation.consumer_source)
-        if not helpers:
+        if not helpers and not observation.consumer_source:
             try:
                 from .mathematical_memory.service import observe_use
                 observe_use(self, payload)

@@ -614,8 +614,14 @@ class MathematicalMemoryService:
             canonical_lean_identifier(str(name))
             for name in payload.get("reachable_constants", ())
         }
+        consumer = canonical_lean_identifier(
+            str(payload.get("consumer_declaration_resolved_name")
+                or payload.get("consumer_declaration_name") or "")
+        ).removeprefix("_root_.")
         for name, profile in self.known_declarations.items():
             canonical = canonical_lean_identifier(name)
+            if consumer and canonical.removeprefix("_root_.") == consumer:
+                continue
             helpers.setdefault(
                 name,
                 {

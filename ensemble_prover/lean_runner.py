@@ -706,6 +706,13 @@ private def _root_.{function} : Lean.Elab.Command.CommandElabM Unit := do
     let mut consumers : Array (String × String × Lean.Name) := #[]
     if goals.length == 1 then consumers := consumers.push ("", "{identity}", goals.head!)
     for (requested@_, marker@_) in ({consumers} : Array (String × String)) do
+      let .ok parsed@_ := Lean.Parser.runParserCategory env `term requested | continue
+      unless parsed.isIdent do continue
+      let requestedName := parsed.getId.replacePrefix `_root_ Lean.Name.anonymous
+      -- Source blocks may change namespace scope. A final surface-name
+      -- resolution cannot identify the source when multiple declarations
+      -- have that relative name; leave its proof usage unknown.
+      if (localNames.filter fun name => requestedName.isSuffixOf name).length != 1 then continue
       for (bound@_, resolved@_) in resolvedBindings do
         if bound == requested then consumers := consumers.push (requested, marker, resolved)
     for (requested@_, marker@_, resolved@_) in consumers do
