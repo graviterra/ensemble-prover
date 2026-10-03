@@ -44,6 +44,7 @@ from .proof_graph import (
     graph_node_frontier_quarantined,
     graph_root_equivalent_suppression_decision,
     graph_statement_is_executable,
+    graph_statement_local_name_kind,
     helper_decl_statement,
 )
 from .utils import (
@@ -15766,10 +15767,11 @@ class ProofSearchState:
         details = dict(analysis.get("details") or {})
         goals = list(analysis.get("remaining_goals") or [])
         if family == "unknown_identifier":
-            return (
-                "manufacture_or_retrieve_missing_identifier",
-                str(details.get("unknown_identifier") or "unknown declaration"),
-            )
+            unknown = str(details.get("unknown_identifier") or "unknown declaration")
+            root = self.nodes.get(self.root_node_id)
+            if graph_statement_local_name_kind(str(getattr(root, "target", "") or ""), unknown):
+                return ("repair_syntax_or_binders", unknown)
+            return ("manufacture_or_retrieve_missing_identifier", unknown)
         if family == "known_answer_no_construction_collapse":
             return ("force_graph_decomposition", "no durable construction emitted")
         if family == "sorry_used":

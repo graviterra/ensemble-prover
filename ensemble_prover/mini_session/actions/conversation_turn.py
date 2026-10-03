@@ -94,7 +94,7 @@ from ensemble_prover.proof_graph import (
     graph_statement_has_circular_premise,
     graph_statement_is_executable,
     graph_statement_key,
-    graph_statement_leading_contract,
+    graph_statement_local_name_kind,
     graph_statement_leading_telescope_is_universal,
     graph_statement_parent_existential_payload_premise,
     graph_statement_root_equivalent,
@@ -808,34 +808,16 @@ def _unknown_identifier_is_target_binder(
     *,
     target_statement: str,
 ) -> bool:
-    """Whether Lean's unknown name belongs to the target's binder telescope.
+    """Whether a missing name is local to the selected target's type.
 
-    A missing ``intro`` makes target-bound variables look like unknown global
-    declarations to Lean.  Such failures are local proof-shape errors; forcing
-    Mathlib/API lookup for the binder manufactures an impossible repair target.
-    The shared proof-graph parser is the authority for the selected target's
-    leading telescope, and parser uncertainty remains fail-closed (grounding
-    is still required).
+    This is repair guidance only. Value bindings and introduction parameters
+    both avoid impossible API lookup, but require different proof-shape advice.
     """
 
-    name = str(unknown_identifier or "").strip()
-    statement = str(target_statement or "").strip()
-    if not name or not statement:
-        return False
     try:
-        _body, bound_names, _premises = graph_statement_leading_contract(statement)
+        return bool(graph_statement_local_name_kind(target_statement, unknown_identifier))
     except Exception:
         return False
-    def identifier_surface(identifier: str) -> str:
-        clean = str(identifier or "").strip()
-        if clean.startswith("«") and clean.endswith("»"):
-            return clean[1:-1]
-        return clean
-
-    target_name = identifier_surface(name)
-    return bool(target_name) and target_name in {
-        identifier_surface(bound_name) for bound_name in bound_names
-    }
 
 
 _PROOF_LOCAL_BINDER_RE = re.compile(
@@ -1486,6 +1468,10 @@ def _repair_ticket_from_lean_rejection(
             "unknown_identifier_is_target_binder": bool(
                 unknown_identifier_is_target_binder
             ),
+            "unknown_identifier_target_binding_kind": (
+                graph_statement_local_name_kind(target_statement, unknown_name)
+                if unknown_identifier_is_target_binder else ""
+            ),
             "unknown_identifier_is_proof_local_binder": bool(
                 unknown_identifier_is_proof_local_binder
             ),
@@ -1730,6 +1716,20 @@ def _format_repair_ticket_prompt(ticket: RepairTicket) -> str:
                 "another repair, call `search_mathlib`, `check_lean`, or "
                 "`apply_decl_to_goal` to ground the declaration name. A blind "
                 "retry against the same unknown identifier is a policy failure."
+            ),
+        ])
+    elif metadata.get("unknown_identifier_target_binding_kind") == "value" and unknown_identifier:
+        parts.extend([
+            "",
+            "Local target-value binding repair required:",
+            (
+                f"{_inline_ticket_code(unknown_identifier)} is a local value binding "
+                "inside the active target's type, not a global declaration. "
+                "Do not search the API for it or assume that its label is already "
+                "in the proof context. Inspect the exact target and reduce its "
+                "leading have/let binding (for example with plain `dsimp`), or "
+                "use a definitionally equivalent `change`; then introduce the "
+                "remaining parameters. Lean must verify the unchanged target."
             ),
         ])
     elif (
@@ -20490,6 +20490,14 @@ class ConversationTurnAction:
         # Record the rejected attempt before the cascade so failure
         # accounting matches legacy semantics.
         if dossier is not None:
+            from ...closure_feedback import capture_checked_failure
+
+            capture_checked_failure(
+                dossier=dossier, conv=conv, lean=session.lean, proof=proof,
+                helpers=check_lemmas, verdict=lean_verdict,
+                checked_target=str(graph_native_goal_statement or assemble_route_goal_statement
+                                   or conv.goal_statement or ""),
+            )
             failure_helper_names = [
                 helper_decl_name(b) or "" for b in check_lemmas if helper_decl_name(b)
             ]

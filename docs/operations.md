@@ -37,6 +37,25 @@ and [discovery budgets](USER_GUIDE.md#research-budgets-and-recovery).
 An output-token reservation used for cost accounting does not change the model's
 output allowance. Missing usage remains unknown rather than becoming free work.
 
+Model calls that repair ill-typed planner statements use the configured provider
+deadline policy. The Lean tactic timeout bounds the subsequent formal check,
+not model generation. Aggregate repair-call limits and enclosing run cancellation
+still apply, including when the provider deadline policy is soft.
+
+Fresh root-assembly conversations can receive the prover's earlier rejected
+proof and Lean diagnostics when the target, environment, answer policy and
+existing helper sources still match. This feedback describes failed code, not
+a false mathematical claim. It also flags research advice that repeats the
+rejected steps as needing correction or another check.
+
+An unknown name bound by a leading `have` or `let` inside the target is routed
+to local proof-shape repair. Such a label may disappear when Lean reduces the
+target; it is not necessarily a library declaration available to API search.
+
+Startup events include a `verified_helper_cache` stage with wall time and process
+CPU time. This stage is nested within proof-session initialization; do not add
+its duration to that containing stage when calculating total startup time.
+
 ## Read the mathematical and operational status together
 
 In the browser, inspect **Mathematical focus**, **Runtime evidence**, and

@@ -3650,10 +3650,28 @@ async def prove_problem_via_session(
         else MiniVerifiedLemmaCache.default_path()
     )
     proof_cache_run_id = f"{problem.theorem_name}.{uuid.uuid4().hex}"
+    if recorder is not None and hasattr(recorder, "record_turn"):
+        recorder.record_turn({
+            "phase": "worker_startup", "stage": "verified_helper_cache",
+            "parent_stage": "proof_session_initialization",
+            "enabled": proof_cache_enabled, "verdict": "startup_stage_started",
+        })
+    cache_started = time.monotonic()
+    cache_cpu_started = time.process_time()
     shared_proof_cache = _make_proof_state_cache(
         enabled=proof_cache_enabled,
         base_path=proof_cache_base_path,
     )
+    cache_elapsed = time.monotonic() - cache_started
+    cache_cpu_elapsed = time.process_time() - cache_cpu_started
+    if recorder is not None and hasattr(recorder, "record_turn"):
+        recorder.record_turn({
+            "phase": "worker_startup", "stage": "verified_helper_cache",
+            "parent_stage": "proof_session_initialization",
+            "enabled": proof_cache_enabled, "verdict": "startup_stage_completed",
+            "stage_elapsed_s": round(cache_elapsed, 6),
+            "stage_process_cpu_s": round(cache_cpu_elapsed, 6),
+        })
     recursive_pass_budget_remaining = (
         max(
             0,

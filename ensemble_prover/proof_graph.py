@@ -8745,6 +8745,74 @@ def graph_statement_leading_contract(
     return body, bound_names, binder_premises
 
 
+def graph_statement_local_name_kind(statement: str, name: str) -> str:
+    """Classify a leading local name for repair advice, never proof authority.
+
+    Value bindings inside a target type need reduction or a matching local
+    proof shape; they are not global API declarations. Walk only the target's
+    leading telescope and value-binding bodies, never initializer expressions,
+    premise interiors or existential witnesses. The innermost name wins.
+    """
+
+    def surface(value: str) -> str:
+        text = str(value or "").strip()
+        return text[1:-1] if text.startswith("«") and text.endswith("»") else text
+
+    sought = surface(name)
+    if not sought:
+        return ""
+    body = _graph_strip_balanced_outer_parens(
+        _graph_blank_lexical_comments(str(statement or "")).strip()
+    )
+    found = ""
+    for _ in range(256):
+        if not body:
+            break
+        if re.match(r"^(?:have|let)\b", body):
+            binding_source = "let" + body[4:] if body.startswith("have") else body
+            # The conservative legacy let parser accepts ASCII or escaped
+            # heads. Quote a Unicode head only in this advisory parser input;
+            # never rewrite the checked statement or its identity.
+            unicode_head = re.match(
+                rf"^let\s+(?:rec\s+)?([{_GRAPH_LEAN_ID_FIRST_CHARS}]"
+                rf"[{_GRAPH_LEAN_ID_REST_CHARS}]*)(?=\s|:|$)",
+                binding_source,
+            )
+            if unicode_head and not re.fullmatch(
+                _GRAPH_LEAN_IDENTIFIER_PATTERN, unicode_head.group(1)
+            ):
+                start, end = unicode_head.span(1)
+                binding_source = (
+                    binding_source[:start] + "«" + unicode_head.group(1) + "»"
+                    + binding_source[end:]
+                )
+            binding, remaining = _graph_top_level_let_parts(binding_source)
+            if not binding or not remaining:
+                break
+            head = re.match(
+                rf"^let\s+(?:rec\s+)?({_GRAPH_LEAN_IDENTIFIER_PATTERN})(?=\s|:|$)",
+                binding,
+            )
+            if head and surface(head.group(1)) == sought:
+                found = "value"
+            body = _graph_strip_balanced_outer_parens(remaining.strip())
+            continue
+        remaining, records = _graph_leading_binder_analysis(body)
+        if records:
+            if any(surface(bound) == sought for _raw, names, *_ in records for bound in names):
+                found = "parameter"
+            body = _graph_strip_balanced_outer_parens(remaining.strip())
+            continue
+        # Anonymous premises do not bind names. Only their consequent can
+        # introduce a later parameter or value binding belonging to this goal.
+        implications = _graph_split_top_level_implications(body)
+        if len(implications) > 1:
+            body = _graph_strip_balanced_outer_parens(implications[-1].strip())
+            continue
+        break
+    return found
+
+
 @lru_cache(maxsize=512)
 def graph_statement_keyed_contract(statement: str) -> Tuple[str, Tuple[str, ...]]:
     """Contract text that keeps hypothesis binders, in telescope order.

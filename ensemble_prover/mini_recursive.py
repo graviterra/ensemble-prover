@@ -14634,7 +14634,7 @@ async def _repair_contract_identity_statements(
     pass_index: int,
     stats: MiniRecursiveStats,
     record_event: Optional[RecordEvent],
-    operation_timeout_s: float,
+    operation_timeout_s: Optional[float] = None,
     max_repairs: int = 4,
     max_empty_retries: int = 2,
     replay_only: bool = False,
@@ -14657,6 +14657,8 @@ async def _repair_contract_identity_statements(
 
     Completed indices include dispatched calls whose outcome is unavailable.
     Only an explicitly funded empty-response retry reopens an obligation.
+    Without an explicit operation bound, the provider's configured LLM deadline
+    policy applies; a Lean tactic timeout is not a model generation deadline.
     """
 
     if replay_only:
@@ -14680,7 +14682,7 @@ async def _repair_contract_identity_statements(
     # returning no visible proposition. Keep those claims in a FIFO retry lane
     # behind all as-yet-unattempted failed claims. The aggregate cap remains
     # authoritative: large bad plans must not turn contract repair into 20
-    # sequential minute-long calls.
+    # sequential provider calls.
     root_route_names = set(
         _root_route_dependency_names(
             plan.claims,
@@ -14839,42 +14841,46 @@ async def _repair_contract_identity_statements(
             reasoning_effort="none" if empty_retry else "low",
         )
         try:
-            repair_timeout_s = max(1.0, float(operation_timeout_s or 1.0))
-            raw = await _await_with_hard_timeout(
-                metered_or_plain_call(
-                    cost_controller=cost_controller,
-                    client=client,
-                    messages=messages,
-                    role="planner",
-                    scope="mini_recursive",
-                    action_id=(f"mini_contract_identity_repair_{pass_index}_{index}"),
-                    call_kind="chat_contract_identity_statement_repair",
-                    max_tokens_override=repair_envelope,
-                    metadata={
-                        "temperature": mini_automatic_temperature_override(client, 0.0),
-                        "phase": "contract_identity_statement_repair",
-                        "claim_index": index,
-                    },
-                    invoke=lambda usage_callback, repair_messages=messages: (
-                        call_with_optional_usage_callback(
-                            client.chat_raw,
-                            repair_messages,
-                            required_keywords=(
-                                "max_tokens_override",
-                                "reasoning_effort_override",
-                                "operation_timeout_override_s",
-                            ),
-                            temperature_override=mini_automatic_temperature_override(client, 0.0),
-                            max_tokens_override=repair_envelope,
-                            reasoning_effort_override=mini_bounded_visible_output_reasoning_effort(
-                                client, effort=repair_envelope.reasoning_effort,
-                            ),
-                            operation_timeout_override_s=repair_timeout_s,
-                            usage_callback=usage_callback,
-                        )
-                    ),
+            repair_timeout_s = (
+                max(1.0, float(operation_timeout_s))
+                if operation_timeout_s is not None else None
+            )
+            repair_call = metered_or_plain_call(
+                cost_controller=cost_controller,
+                client=client,
+                messages=messages,
+                role="planner",
+                scope="mini_recursive",
+                action_id=(f"mini_contract_identity_repair_{pass_index}_{index}"),
+                call_kind="chat_contract_identity_statement_repair",
+                max_tokens_override=repair_envelope,
+                metadata={
+                    "temperature": mini_automatic_temperature_override(client, 0.0),
+                    "phase": "contract_identity_statement_repair",
+                    "claim_index": index,
+                },
+                invoke=lambda usage_callback, repair_messages=messages: (
+                    call_with_optional_usage_callback(
+                        client.chat_raw,
+                        repair_messages,
+                        required_keywords=(
+                            "max_tokens_override",
+                            "reasoning_effort_override",
+                            "operation_timeout_override_s",
+                        ),
+                        temperature_override=mini_automatic_temperature_override(client, 0.0),
+                        max_tokens_override=repair_envelope,
+                        reasoning_effort_override=mini_bounded_visible_output_reasoning_effort(
+                            client, effort=repair_envelope.reasoning_effort,
+                        ),
+                        operation_timeout_override_s=repair_timeout_s,
+                        usage_callback=usage_callback,
+                    )
                 ),
-                timeout=repair_timeout_s,
+            )
+            raw = (
+                await _await_with_hard_timeout(repair_call, timeout=repair_timeout_s)
+                if repair_timeout_s is not None else await repair_call
             )
             call_completed = True
             repair_response = _planner_raw_response(raw)
@@ -20304,6 +20310,14 @@ async def run_mini_recursive_attempt(
                 + "\n\n".join(helper_context_blocks)
                 + "\n```"
             )
+        from .closure_feedback import merge_feedback, render_closure_feedback
+
+        prior_closure_feedback = render_closure_feedback(
+            dossier=attempt_dossier, conv=close_conv, lean=lean,
+            helpers=helper_context_blocks,
+        )
+        if prior_closure_feedback:
+            close_conv.append_user(prior_closure_feedback)
         close_proof_state = ProofSearchState(
             theorem_name=theorem_name,
             root_statement=root_statement,
@@ -20569,6 +20583,9 @@ async def run_mini_recursive_attempt(
                 return None
             pending_root_close_promotion = (root_statement, proof)
             return _RootCloseProof(proof, accepted_replay_helpers)
+        merge_feedback(
+            attempt_dossier, getattr(close_dossier, "checked_failure_feedback", []),
+        )
         if getattr(close_conv, "_mini_recursive_child_elapsed_budget_exhausted", False):
             return RootCloseOperationalFailure("recursive_claim_elapsed_budget_exhausted")
         failure_reason = str(
@@ -27521,10 +27538,6 @@ async def run_mini_recursive_driver(
                     pass_index=pass_index,
                     stats=original_filter_stats,
                     record_event=record_dependency_contract_event,
-                    operation_timeout_s=max(
-                        10.0,
-                        min(float(config.tactic_timeout_s or 20.0), 60.0),
-                    ),
                     suppress_solution_placeholders=(suppress_solution_placeholders),
                     opaque_mode=opaque_mode,
                     allow_official_answer_visibility=(allow_official_answer_visibility),
@@ -28731,13 +28744,7 @@ async def run_mini_recursive_driver(
                             pass_index=pass_index,
                             stats=stats,
                             record_event=record_dependency_contract_event,
-                            operation_timeout_s=max(
-                                10.0,
-                                min(
-                                    float(config.tactic_timeout_s or 20.0),
-                                    60.0,
-                                ),
-                            ),
+                            answer_safe_preamble=current_answer_safe_preamble(),
                             suppress_solution_placeholders=(
                                 suppress_solution_placeholders
                             ),

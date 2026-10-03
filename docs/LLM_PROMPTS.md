@@ -41,6 +41,7 @@ is mathematical task context, not a replacement for the role or transport prompt
 | Recursive plan task | [ensemble_prover/mini_subgoal_planner.py](../ensemble_prover/mini_subgoal_planner.py#L1031) — `render_mini_subgoal_planner_prompt` | Root obligations, decisive bridge and JSON contract |
 | Planner execution and inline repair/deliberation prompts | [ensemble_prover/mini_recursive.py](../ensemble_prover/mini_recursive.py) | Planner, child claims, root assembly, syntax repair and continuations |
 | Selected graph work and repair tickets | [ensemble_prover/mini_session/actions/conversation_turn.py](../ensemble_prover/mini_session/actions/conversation_turn.py) | Exact selected obligation, proof-idea context and Lean repair target |
+| Historical root-assembly rejection feedback | [ensemble_prover/closure_feedback.py](../ensemble_prover/closure_feedback.py) — `render_closure_feedback` | A previous checked candidate and diagnostics in a compatible target and environment |
 | Nested helper task construction | [ensemble_prover/mini_session/recursive_helper_prover.py](../ensemble_prover/mini_session/recursive_helper_prover.py) | Scoped child statement and inherited checked context |
 | Proof dossier context | [ensemble_prover/proof_dossier.py](../ensemble_prover/proof_dossier.py#L20630) — `render_context` | Checked helpers, failed routes and current proof-search evidence |
 | Root-target and strategy context | [ensemble_prover/proof_dossier.py](../ensemble_prover/proof_dossier.py#L13506) — `render_active_root_target_context` | Active root target and route-specific context |
@@ -4950,4 +4951,23 @@ Complete tool description and parameter schema. The runtime advertises only tool
     }
   }
 }
+```
+
+## Historical closure feedback and local value-binding repair
+
+Source: [ensemble_prover/closure_feedback.py](../ensemble_prover/closure_feedback.py) — `render_closure_feedback`. The message is appended only when retained failure feedback matches the current target, preambles, environment, answer policy and prior helper sources. Proof and diagnostic substitutions are sanitized JSON strings; the diagnostic label includes ` (truncated)` when applicable.
+
+```text
+Previous root-assembly candidate rejected by Lean in this target and environment. Additional verified helpers may now be available. This is historical code feedback, not a refutation of the mathematical claim. Research advice remains unverified: if its code repeats the identifiers or steps rejected below, correct or recheck that code; do not treat claims that it is kernel-ready as verification.
+Rejected proof (JSON string):
+{sanitized rejected proof encoded as a JSON string}
+Lean diagnostic{optional truncation label} (JSON string):
+{sanitized Lean diagnostic encoded as a JSON string}
+```
+
+Source: [ensemble_prover/mini_session/actions/conversation_turn.py](../ensemble_prover/mini_session/actions/conversation_turn.py) — `_format_repair_ticket_prompt`. When an unknown identifier is a leading target-value binding, the repair ticket includes this complete conditional fragment:
+
+```text
+Local target-value binding repair required:
+{unknown identifier formatted as inline code} is a local value binding inside the active target's type, not a global declaration. Do not search the API for it or assume that its label is already in the proof context. Inspect the exact target and reduce its leading have/let binding (for example with plain `dsimp`), or use a definitionally equivalent `change`; then introduce the remaining parameters. Lean must verify the unchanged target.
 ```

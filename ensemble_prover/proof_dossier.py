@@ -8161,6 +8161,7 @@ class ProofDossier:
         default_factory=set
     )
     mini_recursive_exhausted_claim_keys: Set[str] = field(default_factory=set)
+    checked_failure_feedback: List[Dict[str, Any]] = field(default_factory=list)
     opaque_mode: bool = True
     allow_official_answer_visibility: bool = False
     official_answer_payload_present: Optional[bool] = None
@@ -21417,6 +21418,9 @@ class ProofDossier:
             "mini_falsification_trust_boundary_conflict_certificate_hashes": sorted(
                 self.mini_falsification_trust_boundary_conflict_certificate_hashes
             ),
+            "checked_failure_feedback": clone_json_value(
+                self.checked_failure_feedback, label="checked failure feedback",
+            ),
             "mini_recursive_exhausted_claim_keys": sorted(
                 self.mini_recursive_exhausted_claim_keys
             ),
@@ -22166,6 +22170,8 @@ class ProofDossier:
                 if str(item)
             },
         )
+        from .closure_feedback import bounded_receipts
+        dossier.checked_failure_feedback = bounded_receipts(data.get("checked_failure_feedback"))
         # A fact ID is shared by equivalent helper aliases, so retaining a
         # whole persisted receipt merely because one alias survived source
         # verification launders the removed alias's names, hashes, resolved
