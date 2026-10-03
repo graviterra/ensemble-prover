@@ -58,6 +58,7 @@ class FinsetReindexingProfile:
     has_sigma: bool = False
     has_infinite_sum: bool = False
     has_numeric_equality_side: bool = False
+    requires_intro: bool = False
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -76,6 +77,7 @@ class FinsetReindexingProfile:
             "finset_reindexing_has_sigma": self.has_sigma,
             "finset_reindexing_has_infinite_sum": self.has_infinite_sum,
             "finset_reindexing_has_numeric_equality_side": self.has_numeric_equality_side,
+            "finset_reindexing_requires_intro": self.requires_intro,
         }
 
 
@@ -316,6 +318,7 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
         "∀ᵐ", "Filter.Eventually"
     )
     conclusion = analysis_text
+    requires_intro = False
     literal_names: set[str] = set()
     while True:
         # A later binder can shadow a numeric answer alias. Clearing all
@@ -333,6 +336,7 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
                 lean_statement_forall_body(conclusion)
             )
             if next_conclusion != conclusion:
+                requires_intro = True
                 conclusion = next_conclusion
                 continue
             if re.match(r"^(?:∃|@?(?:Exists\b|Filter\.Eventually\b))", conclusion):
@@ -347,6 +351,7 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
                 if (index := _find_top_level_operator(conclusion, token)) >= 0
             ]
             if arrows:
+                requires_intro = True
                 index, length = min(arrows)
                 conclusion = conclusion[index + length:].strip()
                 continue
@@ -465,6 +470,7 @@ def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
         has_sigma=has_sigma,
         has_infinite_sum=has_infinite_sum,
         has_numeric_equality_side=has_numeric_equality_side,
+        requires_intro=requires_intro,
     )
 
 
@@ -478,7 +484,9 @@ def finset_reindexing_scripts(
 
     if not profile.should_attempt:
         return ()
-    prefix = ("intros",) if needs_intro else ()
+    # The conclusion may sit under local definitions or parentheses, where
+    # a caller inspecting only the leading token cannot see its binders.
+    prefix = ("intros",) if needs_intro or profile.requires_intro else ()
     scripts: list[FinsetReindexingScript] = []
 
     def add(lines: Sequence[str], *, tactic: str, source: str) -> None:
