@@ -2718,7 +2718,18 @@ def _decl_matches_main_target(
     expected_statement = _normalize_statement_for_contract(goal_statement)
     decl_statement = _normalize_statement_for_contract(helper_decl_statement(decl))
     if expected_statement and decl_statement:
-        return decl_statement == expected_statement
+        if decl_statement == expected_statement:
+            return True
+        # Local opens belong to declaration identity, but this function only
+        # selects a candidate body for replay against the actual current goal.
+        # A redundant leading open must not turn a same-statement submission
+        # into helper-only output. Keep the open on the extracted proof; Lean
+        # must still reject any name/notation shadowing that changes its type.
+        unscoped_decl, open_commands = _partition_scoped_open_prefix(decl)
+        return bool(open_commands) and (
+            _normalize_statement_for_contract(helper_decl_statement(unscoped_decl))
+            == expected_statement
+        )
     name = helper_decl_name(decl) or ""
     expected_name = str(theorem_name or "").strip()
     if expected_name and name == expected_name:

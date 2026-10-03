@@ -31,6 +31,13 @@ statement; it must then prove that statement. A generated answer is not assumed
 equal to a hidden benchmark answer. See
 [answer discovery and certified rediscovery](USER_GUIDE.md#questions-with-an-unknown-answer).
 
+Answer review receives a Lean-elaborated statement whose meaning is checked
+against the original source. Generated internal proof terms can be reconstructed
+into a compact rendering only if independent Lean replay and source equivalence
+both succeed. If the validated rendering still exceeds 64,000 characters, answer
+preparation stops and saves the full rendering in its artifacts. It does not
+truncate the statement or classify the proposed answer as mathematically wrong.
+
 ## The search lanes
 
 | Lane | Purpose | How to control it |

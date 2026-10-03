@@ -11,7 +11,9 @@ import math
 import re
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+from threading import Lock
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .state_data import clone_json_value
@@ -4142,6 +4144,13 @@ def _canonicalize_identity_expr(
     return _replace_local_names_tokenwise_text(expr, replacements), next_index
 
 
+_CANONICAL_STATEMENT_CACHE_MAX_BYTES = 4 * 1024 * 1024
+_CANONICAL_STATEMENT_CACHE_MAX_ENTRIES = 128
+_CANONICAL_STATEMENT_CACHE: OrderedDict[Tuple[Any, ...], Tuple[str, int]] = OrderedDict()
+_CANONICAL_STATEMENT_CACHE_BYTES = 0
+_CANONICAL_STATEMENT_CACHE_LOCK = Lock()
+
+
 def canonicalize_lean_statement_for_identity(
     statement: str,
     *,
@@ -4149,6 +4158,47 @@ def canonicalize_lean_statement_for_identity(
 ) -> str:
     """Syntactically alpha-normalize a Lean proposition for graph/cache identity."""
 
+    from .proof_graph import _lexical_retained_bytes
+
+    # Short-lived identity keys must not evict expensive helper source parsing.
+    # This separate bounded store retains only exact-input immutable syntax;
+    # Lean validity and environment-dependent evidence are checked separately.
+    global _CANONICAL_STATEMENT_CACHE_BYTES
+    source = str(statement or "")
+    names = tuple(str(name or "").strip() for name in extra_bound_names)
+    key = (source, names)
+    with _CANONICAL_STATEMENT_CACHE_LOCK:
+        entry = _CANONICAL_STATEMENT_CACHE.get(key)
+        if entry is not None:
+            _CANONICAL_STATEMENT_CACHE.move_to_end(key)
+            return entry[0]
+    result = _canonicalize_lean_statement_for_identity_uncached(
+        source, extra_bound_names=names,
+    )
+    weight = _lexical_retained_bytes(key) + _lexical_retained_bytes(result) + 256
+    if weight > _CANONICAL_STATEMENT_CACHE_MAX_BYTES:
+        return result
+    with _CANONICAL_STATEMENT_CACHE_LOCK:
+        previous = _CANONICAL_STATEMENT_CACHE.pop(key, None)
+        if previous is not None:
+            _CANONICAL_STATEMENT_CACHE_BYTES -= previous[1]
+        while _CANONICAL_STATEMENT_CACHE and (
+            _CANONICAL_STATEMENT_CACHE_BYTES + weight > _CANONICAL_STATEMENT_CACHE_MAX_BYTES
+            or len(_CANONICAL_STATEMENT_CACHE) >= _CANONICAL_STATEMENT_CACHE_MAX_ENTRIES
+        ):
+            _, (_, evicted_weight) = _CANONICAL_STATEMENT_CACHE.popitem(last=False)
+            _CANONICAL_STATEMENT_CACHE_BYTES -= evicted_weight
+        if _CANONICAL_STATEMENT_CACHE_MAX_ENTRIES > 0:
+            _CANONICAL_STATEMENT_CACHE[key] = (result, weight)
+            _CANONICAL_STATEMENT_CACHE_BYTES += weight
+    return result
+
+
+def _canonicalize_lean_statement_for_identity_uncached(
+    statement: str,
+    *,
+    extra_bound_names: Sequence[str] = (),
+) -> str:
     text = _identity_source_text(statement)
     text = _replace_type_symbols_capture_safe(text)
     text = _normalize_colon_spacing_outside_lean_quotes(text)

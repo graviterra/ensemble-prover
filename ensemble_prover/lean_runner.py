@@ -8413,6 +8413,12 @@ class LeanRunner:
         metaprogramming API. Adding an import to the original header could
         change its notation or instance resolution. The caller must still
         independently elaborate this display and compare it to the source.
+        The explicit fallback also disables structure and field display sugar:
+        expanded index-bound proofs otherwise lose the expected types needed
+        to elaborate anonymous structure values in nested proof arguments.
+        Compact display reconstructs only proof-valued omissions. The caller's
+        independent elaboration and source-equivalence checks must succeed
+        before this display is used.
         """
         allowance = float(timeout_s)
         if not math.isfinite(allowance) or allowance <= 0:
@@ -8431,6 +8437,28 @@ class LeanRunner:
             str(source).rstrip()
             + f"\n\npublic def _root_.{witness} : Lean.Name := ``_root_.{theorem_name}\n"
         )
+        render_expression = "Lean.Meta.ppExpr type"
+        if not pp_explicit:
+            render_expression = """let (term, infos) ← Lean.PrettyPrinter.delabCore type {}
+      Lean.PrettyPrinter.Delaborator.delab
+    let omitted ← `(⋯)
+    let replacement ← `(by first | assumption | rfl | decide | omega)
+    let mut proofPositions : Std.HashSet Nat := {}
+    for (position, item) in infos.toArray do
+      if let .ofDelabTermInfo detail@_ := item then
+        if detail.stx.isOfKind omitted.raw.getKind then
+          unless ← Lean.Meta.withLCtx detail.lctx {} <| Lean.Meta.isProof detail.expr do
+            Lean.throwError "source rendering omitted a non-proof expression"
+          proofPositions := proofPositions.insert position
+    let rebuilt ← term.raw.replaceM fun stx => do
+      if stx.isOfKind omitted.raw.getKind then
+        let some position := stx.getPos?
+          | Lean.throwError "source rendering omission lacks an expression position"
+        unless proofPositions.contains position.byteIdx do
+          Lean.throwError "source rendering omission lacks proof provenance"
+        return some replacement.raw
+      return none
+    Lean.PrettyPrinter.ppTerm ⟨rebuilt⟩"""
         probe = f"""import Lean.Elab.Command
 import Lean.Meta.Tactic.Delta
 import Lean.Meta.Eval
@@ -8449,6 +8477,7 @@ run_cmd Lean.Elab.Command.liftTermElabM do
   if type.hasMVar || type.hasFVar || type.hasLooseBVars || type.hasSorry then
     Lean.throwError "source type is not closed and sound"
   let rendered ← Lean.withOptions (fun options => options
+      |>.setBool `pp.all {str(pp_explicit).lower()}
       |>.setBool `pp.fullNames true
       |>.setBool `pp.explicit {str(pp_explicit).lower()}
       |>.setBool `pp.universes {str(pp_universes).lower()}
@@ -8456,9 +8485,10 @@ run_cmd Lean.Elab.Command.liftTermElabM do
       |>.setBool `pp.piBinderTypes true
       |>.setBool `pp.funBinderTypes true
       |>.setBool `pp.deepTerms true
-      |>.setBool `pp.proofs true
+      |>.setBool `pp.proofs {str(pp_explicit).lower()}
+      |>.set `pp.proofs.threshold (0 : Nat)
       |>.set `pp.maxSteps (1000000 : Nat)) do
-    Lean.Meta.ppExpr type
+    {render_expression}
   Lean.logInfo ("{marker}" ++ (Lean.Json.str rendered.pretty).compress)
 """
         paths = (*self._source_probe_module_paths(source_path), probe_path)
@@ -9479,6 +9509,9 @@ private def {serializer_prefix}_elabType
                 "              |>.setBool `pp.universes explicit",
                 "              |>.setBool `pp.piBinderTypes true",
                 "              |>.setBool `pp.funBinderTypes true",
+                # A let initializer can use overloaded notation whose expected
+                # type is essential (for example a Finset set-builder).
+                "              |>.setBool `pp.letVarTypes true",
                 "              |>.setBool `pp.deepTerms true",
                 "              |>.setBool `pp.proofs true",
                 "              |>.set `pp.maxSteps (1000000 : Nat)) do",
@@ -9490,7 +9523,10 @@ private def {serializer_prefix}_elabType
                 # length of a later example/theorem declaration header.
                 '          let source := if (rendered.pretty.splitOn "\\n").length > 1',
                 '            then "(\\n" ++ rendered.pretty ++ "\\n)" else rendered.pretty',
-                f"          let replayed ← {serializer_prefix}_elabType source",
+                # The checked definition generalized Type* and other universe
+                # parameters. Replay in that same declared level context.
+                "          let replayed ← Lean.Elab.Term.withLevelNames conditional.levelParams <|",
+                f"            {serializer_prefix}_elabType source",
                 "          if replayed.hasSorry then",
                 '            Lean.throwError "replayed residual contains sorry"',
                 "          unless ← Lean.Meta.withNewMCtxDepth <|",

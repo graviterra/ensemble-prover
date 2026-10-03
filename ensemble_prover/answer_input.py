@@ -28,6 +28,7 @@ from .utils import has_sorry_or_admit
 
 _HOLE = re.compile(r"(?<![\w.'«»])answer\s*\(\s*(?P<hole>sorry)\s*\)")
 ANSWER_CONTEXT_MARKER = "-- ensemble-answer-input: preserve-context"
+MAX_SEMANTIC_GROUNDING_CHARS = 64_000
 
 
 class AnswerValidationError(ValueError):
@@ -238,6 +239,8 @@ def _require_accepted_review(text: str) -> None:
 
 
 def _grounding_message(grounding: dict[str, str]) -> str:
+    if len(grounding["elaborated_statement_type"]) > MAX_SEMANTIC_GROUNDING_CHARS:
+        raise RuntimeError("Lean semantic grounding exceeds the answer-review context allowance")
     return (
         "Fresh Lean elaboration of this exact candidate. This is authoritative "
         "for the meaning of its statement, not proof of its truth. Use these "
@@ -334,6 +337,22 @@ async def discover_answer(
                 if require_semantic_grounding and not (elaborated or "").strip():
                     raise RuntimeError("answer review requires fresh nonempty Lean elaboration")
                 if (elaborated or "").strip():
+                    if len(elaborated) > MAX_SEMANTIC_GROUNDING_CHARS:
+                        grounding_path = directory / f"grounding_{index:04d}.txt"
+                        grounding_path.write_text(elaborated, encoding="utf-8")
+                        entry["semantic_grounding_error"] = {
+                            "reason": "rendering_exceeds_review_context",
+                            "characters": len(elaborated),
+                            "limit": MAX_SEMANTIC_GROUNDING_CHARS,
+                            "rendering_file": grounding_path.name,
+                            "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                        }
+                        raise RuntimeError(
+                            "Lean semantic grounding exceeds the answer-review context "
+                            f"allowance ({len(elaborated)} > {MAX_SEMANTIC_GROUNDING_CHARS} "
+                            f"characters); full validated rendering saved to {grounding_path}. "
+                            "The proposed answer has not been mathematically rejected."
+                        )
                     entry["semantic_grounding"] = {
                         "evidence": "fresh_lean_elaboration",
                         "theorem_name": template.declaration.canonical_name,
@@ -474,6 +493,7 @@ def load_candidate(
         or grounding.get("source_sha256") != digest
         or not isinstance(grounding.get("elaborated_statement_type"), str)
         or not grounding["elaborated_statement_type"].strip()
+        or len(grounding["elaborated_statement_type"]) > MAX_SEMANTIC_GROUNDING_CHARS
     ):
         raise ValueError("answer semantic grounding differs from its candidate")
     path, description = directory / name, directory / "proof_plan.txt"
