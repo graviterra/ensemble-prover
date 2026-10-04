@@ -1,6 +1,6 @@
 # LLM prompt reference
 
-Last updated: 2026-10-03.
+Last updated: 2026-10-04.
 
 This document shows Ensemble Prover’s built-in LLM prompts and where they are
 defined. The system messages below are reproduced in full, including expanded
@@ -2563,9 +2563,9 @@ Source: [ensemble_prover/mini_recursive.py](../ensemble_prover/mini_recursive.py
 Complete inline message template. Braces containing Python expressions identify runtime substitutions.
 
 ````text
-The following verified helper declarations are available in the Lean replay context for this root-close turn:
+The following verified helper signatures are available as named facts. Their full proofs are supplied to Lean; apply these facts rather than reconstructing their proofs:
 ```lean
-{'\n\n'.join(helper_context_blocks)}
+{'\n\n'.join(helper_prompt_signature(block, redact_solution_refs=False) for block in helper_context_blocks)}
 ```
 ````
 
@@ -4970,4 +4970,12 @@ Source: [ensemble_prover/mini_session/actions/conversation_turn.py](../ensemble_
 ```text
 Local target-value binding repair required:
 {unknown identifier formatted as inline code} is a local value binding inside the active target's type, not a global declaration. Do not search the API for it or assume that its label is already in the proof context. Inspect the exact target and reduce its leading have/let binding (for example with plain `dsimp`), or use a definitionally equivalent `change`; then introduce the remaining parameters. Lean must verify the unchanged target.
+```
+
+## Final response in bounded speculative closure
+
+Source: [ensemble_prover/mini_session/actions/conversation_turn.py](../ensemble_prover/mini_session/actions/conversation_turn.py) — `ConversationTurnAction._run_impl`. After the first provider request in a speculative closure session, the follow-up includes this complete message and disables new tool calls. Any submitted proof still requires Lean verification.
+
+```text
+This is the final response for this bounded root closure. Use the completed inspection results or Lean feedback to submit one complete Lean proof body. Further tool calls are unavailable in this response.
 ```

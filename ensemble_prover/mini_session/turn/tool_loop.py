@@ -2288,6 +2288,7 @@ async def _call_llm_with_tools_one_round_impl(
     try_skeleton_tool_enabled: bool = False,
     apply_decl_to_goal_tool_enabled: bool = False,
     max_tool_calls_per_turn: int = 10,
+    force_proof_submission: bool = False,
     max_no_formal_progress_tool_calls: int = 6,
     max_consecutive_search_tool_calls: int = 6,
     proof_state_child_goal_limit: int = 4,
@@ -4433,6 +4434,7 @@ async def _call_llm_with_tools_one_round_impl(
                     use_tools
                     and tool_calls_used < max_tool_calls_per_turn
                     and not force_finalize_without_tools
+                    and not force_proof_submission
                 )
             )
             response_data: Any = None
@@ -4586,14 +4588,16 @@ async def _call_llm_with_tools_one_round_impl(
                             len(ignored_tool_calls),
                         )
                     if ignored_tool_calls and (
-                        tool_calls_used >= max_tool_calls_per_turn
+                        force_proof_submission
+                        or tool_calls_used >= max_tool_calls_per_turn
                     ) and _bankable_final_proof_content(content):
                         # No executable slot remains, but the visible content
                         # may still be a valid proof. Preserve it for the
                         # ordinary downstream Lean gate and terminate normally.
                         tool_calls = []
                     elif ignored_tool_calls and (
-                        tool_calls_used >= max_tool_calls_per_turn
+                        force_proof_submission
+                        or tool_calls_used >= max_tool_calls_per_turn
                     ):
                         # There is no executable slot left. Reissuing the same
                         # forced finalizer lets a provider that ignores

@@ -13493,6 +13493,21 @@ class ConversationTurnAction:
         ):
             tools_list.append(APPLY_DECL_TO_GOAL_TOOL)
 
+        speculative_submission_only = bool(
+            self.speculative_followthrough_only
+            and max(
+                int(getattr(session, "provider_dispatches_started_total", 0) or 0),
+                int(getattr(session, "provider_calls_completed_total", 0) or 0),
+            ) >= 1
+        )
+        if speculative_submission_only:
+            conv.append_user(
+                "This is the final response for this bounded root closure. "
+                "Use the completed inspection results or Lean feedback to "
+                "submit one complete Lean proof body. Further tool calls "
+                "are unavailable in this response."
+            )
+
         # ---- Step 1: LLM tool-use loop -------------------------------
         selected_record_for_temperature = (
             getattr(session, "selected_work_item_record", {}) or {}
@@ -14064,6 +14079,7 @@ class ConversationTurnAction:
                                 max_tool_calls_per_turn=(
                                     self.max_tool_calls_per_turn
                                 ),
+                                force_proof_submission=speculative_submission_only,
                                 proof_state_child_goal_limit=(
                                     self.proof_state_child_goal_limit
                                 ),

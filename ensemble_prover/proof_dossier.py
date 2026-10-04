@@ -10550,6 +10550,15 @@ class ProofDossier:
             add(f"idea_strategy:{idea_key}", idea.strategy)
             add(f"idea_notes:{idea_key}", "\n".join(idea.notes))
             add(
+                f"idea_current_status:{idea_key}",
+                json.dumps(
+                    idea.current_status_transition.to_record(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+            )
+            add(
                 f"idea_status_history:{idea_key}",
                 json.dumps(
                     [item.to_record() for item in idea.status_history],
@@ -10568,6 +10577,17 @@ class ProofDossier:
                 ),
             )
             for intent in idea.claim_intents:
+                current_resolution = idea.current_claim_resolution(intent.claim_id)
+                if current_resolution is not None:
+                    add(
+                        f"idea_current_claim_resolution:{idea_key}:{intent.claim_id}",
+                        json.dumps(
+                            current_resolution.to_record(),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ),
+                    )
                 add(
                     f"idea_claim_intent:{idea_key}:{intent.claim_id}",
                     json.dumps(
@@ -12047,7 +12067,10 @@ class ProofDossier:
             current_status = idea.current_status_transition
             if (
                 current_status.authority == "accepted_fact"
-                and current_status.evidence_id not in active_fact_ids
+                and (
+                    not all_closed
+                    or current_status.evidence_id not in active_fact_ids
+                )
             ):
                 active_evidence = sorted(
                     {
@@ -12077,7 +12100,7 @@ class ProofDossier:
                         else "accepted-fact retirement was retracted"
                     ),
                     turn_index=max(turn_index, current_status.turn_index + 1),
-                    evidence_id="|".join(active_evidence),
+                    evidence_id=active_evidence[0] if active_evidence else "",
                 )
                 self.upsert_proof_idea(
                     replace(
@@ -12133,12 +12156,31 @@ class ProofDossier:
             additions: List[ProofIdeaClaimResolution] = []
             for claim_id, claim_node_ids in sorted(claims.items()):
                 current = idea.current_claim_resolution(claim_id)
+                # Different formal occurrences can attest the same conserved
+                # claim. Preserve each fact's latest attestation rather than
+                # taking turns replacing the current claim resolution forever.
+                # A compensation for this fact must still allow re-attestation
+                # if the fact subsequently becomes available again.
+                previous_attestation = max(
+                    (
+                        resolution
+                        for resolution in idea.claim_resolutions
+                        if resolution.claim_id == claim_id
+                        and resolution.authority == "accepted_fact"
+                        and resolution.evidence_id == fact_id
+                    ),
+                    key=lambda resolution: (
+                        resolution.turn_index,
+                        resolution.status == "retracted",
+                        resolution.status == "solved",
+                        resolution.resolution_id,
+                    ),
+                    default=None,
+                )
                 if (
-                    current is not None
-                    and current.authority == "accepted_fact"
-                    and current.status in {"retired", "solved"}
-                    and current.evidence_id == fact_id
-                    and set(claim_node_ids).issubset(current.node_ids)
+                    previous_attestation is not None
+                    and previous_attestation.status in {"retired", "solved"}
+                    and set(claim_node_ids).issubset(previous_attestation.node_ids)
                 ):
                     continue
                 next_turn = max(
@@ -12175,11 +12217,18 @@ class ProofDossier:
                 and resolution.status in {"retired", "solved"}
                 for intent in idea.claim_intents
             ):
+                # Whole-idea retirement represents all closed claims, rather
+                # than whichever fact happens to be visited last. Alternating
+                # sibling facts must not append another retirement each pass.
+                retirement_evidence_id = min(
+                    idea.current_claim_resolution(intent.claim_id).evidence_id
+                    for intent in idea.claim_intents
+                )
                 current_status = idea.current_status_transition
                 if not (
                     current_status.authority == "accepted_fact"
                     and current_status.status == "retired"
-                    and current_status.evidence_id == fact_id
+                    and current_status.evidence_id == retirement_evidence_id
                 ):
                     self.upsert_proof_idea(
                         replace(
@@ -12189,7 +12238,7 @@ class ProofDossier:
                                 ProofIdeaStatusTransition.create(
                                     proof_idea_id=idea_id,
                                     occurrence_key=(
-                                        fact_id
+                                        retirement_evidence_id
                                         + ":converge:"
                                         + str(
                                             self.verified_helper_eviction_generation
@@ -12207,7 +12256,7 @@ class ProofDossier:
                                         current_status.turn_index + 1,
                                     ),
                                     branch_id="",
-                                    evidence_id=fact_id,
+                                    evidence_id=retirement_evidence_id,
                                 ),
                             ),
                         )
@@ -12337,6 +12386,14 @@ class ProofDossier:
             if ready_before is not None
             else self._ready_route_ids()
         )
+        # Readiness checks inspect entire route contracts. Carry a local
+        # snapshot through this reconciliation and refresh after graph work;
+        # unchanged helpers do not require another complete route scan.
+        ready_current = (
+            self._ready_route_ids()
+            if ready_before is not None
+            else set(ready_before_all)
+        )
         projected_fact_ids_by_node: Dict[str, str] = {}
         projected_fact_order_by_node: Dict[str, int] = {}
         for helper_order, helper in enumerate(self.verified_helpers.values()):
@@ -12356,7 +12413,7 @@ class ProofDossier:
                 )
             ):
                 continue
-            helper_ready_before = self._ready_route_ids()
+            helper_ready_before = ready_current
             helper_node_id = str(
                 graph.helper_name_to_node_id.get(helper.name) or ""
             ).strip()
@@ -12529,9 +12586,9 @@ class ProofDossier:
             receipt["reconciliation_count"] = int(
                 receipt.get("reconciliation_count", 0) or 0
             ) + 1
-            fact_triggered_routes = set(
-                self._ready_route_ids() - helper_ready_before
-            )
+            if newly_resolved:
+                ready_current = self._ready_route_ids()
+            fact_triggered_routes = ready_current - helper_ready_before
             fact_triggered_routes = sorted(fact_triggered_routes)
             receipt_routes = receipt.setdefault("newly_ready_route_ids", [])
             for route_id in fact_triggered_routes:
@@ -12618,43 +12675,6 @@ class ProofDossier:
                             claim_resolutions=idea.claim_resolutions + resolutions,
                         )
                     )
-                    idea = self.proof_ideas[idea_id]
-                    if idea.claim_intents and all(
-                        (
-                            resolution := idea.current_claim_resolution(
-                                intent.claim_id
-                            )
-                        )
-                        is not None
-                        and resolution.status in {"retired", "solved"}
-                        for intent in idea.claim_intents
-                    ):
-                        self.upsert_proof_idea(
-                            replace(
-                                idea,
-                                status_history=idea.status_history
-                                + (
-                                    ProofIdeaStatusTransition.create(
-                                        proof_idea_id=idea_id,
-                                        occurrence_key=fact_id,
-                                        status="retired",
-                                        authority="accepted_fact",
-                                        reason=(
-                                            "all claim intents were fulfilled by "
-                                            "accepted facts"
-                                        ),
-                                        turn_index=max(
-                                            0, int(helper.turn_index or 0)
-                                        ),
-                                        # Whole-idea retirement may aggregate
-                                        # several branch consumers; blank is
-                                        # the explicit global scope.
-                                        branch_id="",
-                                        evidence_id=fact_id,
-                                    ),
-                                ),
-                            )
-                        )
         # Consumer topology may grow after a node was first retired (for
         # example, a later route reuses shared graph work). Re-project every
         # live receipt idempotently so those consumers receive lifecycle state
@@ -12687,7 +12707,11 @@ class ProofDossier:
                     node_ids=certified_node_ids,
                 )
         fulfilled_partial_route_ids = self._archive_fulfilled_partial_routes()
-        ready_after_all = self._ready_route_ids()
+        ready_after_all = (
+            self._ready_route_ids()
+            if fulfilled_partial_route_ids
+            else ready_current
+        )
         externally_triggered_routes = sorted(
             ready_after_all - ready_before_all
         )

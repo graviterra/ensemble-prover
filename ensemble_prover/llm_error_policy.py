@@ -208,6 +208,9 @@ _SCOPED_CONTROLLER_FAILURE_REASONS = {
     # A child proof's wall-clock lease includes local Lean and bookkeeping;
     # exhaustion is scoped to that attempt, not a provider/network failure.
     "recursive_claim_elapsed_budget_exhausted",
+    # Reaching the child depth limit is a scheduling restriction, not a
+    # failed mathematical proof or a transient provider fault.
+    "recursive_child_depth_exhausted",
     # An unchanged obligation with sustained helper-only work remains open;
     # its local search intervention is not a mathematical rejection.
     "sustained_helper_progress_stalled",

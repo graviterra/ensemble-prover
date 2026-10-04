@@ -2916,6 +2916,44 @@ def _refresh_verified_helper_contract_evidence_from_support_analysis(
     return refreshed
 
 
+def _speculative_blocker_identity(
+    node: Any, *, include_contract_identity: bool = True,
+) -> str:
+    """Freeze the obligation that a later speculative retry must discharge."""
+
+    if node is None:
+        return ""
+    metadata = dict(getattr(node, "metadata", {}) or {})
+    return hashlib.sha256(json.dumps(
+        {
+            "kind": str(getattr(node, "kind", "") or ""),
+            "statement": str(getattr(node, "statement", "") or ""),
+            "environment_hash": str(metadata.get("statement_environment_hash") or ""),
+            "contract_identity": (
+                ProofDossier._graph_node_contract_identity(node)
+                if include_contract_identity else ""
+            ),
+        },
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _speculative_blocker_matches(
+    node: Any, identity_hash: str, identity_state: str,
+) -> bool:
+    if _speculative_blocker_identity(node) == identity_hash:
+        return True
+    # Admission can add a Lean identity after the planner created the node.
+    # Preserve the frozen kind, source and environment while allowing that
+    # one-way enrichment. Previously bound (and legacy) receipts stay exact.
+    return bool(
+        identity_state == "unbound"
+        and node is not None
+        and parse_lean_contract_identity(ProofDossier._graph_node_contract_identity(node))
+        and _speculative_blocker_identity(node, include_contract_identity=False) == identity_hash
+    )
+
+
 def _ready_root_route_status(
     dossier: ProofDossier,
     root_statement: str,
@@ -7489,7 +7527,34 @@ def _bounded_planner_proof_idea_projection(
     """
 
     limit = max(0, int(max_chars or 0))
-    if limit <= 0 or len(projection.render()) <= limit:
+    def rendered_evidence_chars(item: ProofIdeaContextEvidence) -> int:
+        header = (
+            f"[{item.kind}; completeness={item.completeness}; "
+            f"sha256={item.sha256}; chars={item.char_length}]"
+        )
+        body = (
+            f"(withheld: {item.omitted_reason})"
+            if item.completeness == "withheld"
+            else item.content
+        )
+        return len(header) + len(body) + 2
+
+    history_budget = limit // 5
+    claim_budget = limit // 3
+    historical_prefixes = ("idea_status_history:", "idea_claim_resolution:")
+    history_chars = sum(
+        rendered_evidence_chars(item) for item in projection.evidence
+        if item.kind.startswith(historical_prefixes)
+    )
+    claim_chars = sum(
+        rendered_evidence_chars(item) for item in projection.evidence
+        if item.kind.startswith(("idea_claim_intent:", "idea_current_claim_resolution:"))
+    )
+    if limit <= 0 or (
+        len(projection.render()) <= limit
+        and history_chars <= history_budget
+        and claim_chars <= claim_budget
+    ):
         return projection
 
     evidence = tuple(projection.evidence)
@@ -7512,18 +7577,6 @@ def _bounded_planner_proof_idea_projection(
             "planner lifecycle context limit is smaller than its required header"
         )
     selected_chars = empty_chars
-
-    def rendered_evidence_chars(item: ProofIdeaContextEvidence) -> int:
-        header = (
-            f"[{item.kind}; completeness={item.completeness}; "
-            f"sha256={item.sha256}; chars={item.char_length}]"
-        )
-        body = (
-            f"(withheld: {item.omitted_reason})"
-            if item.completeness == "withheld"
-            else item.content
-        )
-        return len(header) + len(body) + 2
 
     observation_prefixes = (
         "idea_observation_coordinates:",
@@ -7584,9 +7637,9 @@ def _bounded_planner_proof_idea_projection(
         kinds = tuple(evidence[index].kind for index in indices)
         if group_key.startswith("idea_core:"):
             priority = 500
-        elif any(kind.startswith("idea_status_history:") for kind in kinds):
+        elif any(kind.startswith("idea_current_status:") for kind in kinds):
             priority = 450
-        elif any(kind.startswith("idea_claim_resolution:") for kind in kinds):
+        elif any(kind.startswith("idea_current_claim_resolution:") for kind in kinds):
             priority = 425
         elif any(kind.startswith("idea_claim_intent:") for kind in kinds):
             priority = 400
@@ -7596,6 +7649,10 @@ def _bounded_planner_proof_idea_projection(
             priority = 300
         elif any(kind.startswith("idea_branch_provenance:") for kind in kinds):
             priority = 200
+        elif any(kind.startswith("idea_status_history:") for kind in kinds):
+            priority = 175
+        elif any(kind.startswith("idea_claim_resolution:") for kind in kinds):
+            priority = 150
         else:
             priority = 100
         source_pass, turn_index = observation_newness(indices)
@@ -7608,13 +7665,31 @@ def _bounded_planner_proof_idea_projection(
         reverse=True,
     )
     selected_groups: list[tuple[str, tuple[int, ...]]] = []
+    selected_history_chars = 0
+    selected_claim_chars = 0
     for group_key, raw_indices in ranked_groups:
         indices = tuple(raw_indices)
         group_chars = sum(rendered_evidence_chars(evidence[index]) for index in indices)
+        is_history = any(
+            evidence[index].kind.startswith(historical_prefixes)
+            for index in indices
+        )
+        is_claim = any(
+            evidence[index].kind.startswith(("idea_claim_intent:", "idea_current_claim_resolution:"))
+            for index in indices
+        )
+        if is_history and selected_history_chars + group_chars > history_budget:
+            continue
+        if is_claim and selected_claim_chars + group_chars > claim_budget:
+            continue
         if selected_chars + group_chars <= limit:
             for index in indices:
                 selected[index] = evidence[index]
             selected_chars += group_chars
+            if is_history:
+                selected_history_chars += group_chars
+            if is_claim:
+                selected_claim_chars += group_chars
             selected_groups.append((group_key, indices))
             continue
         if not group_key.startswith("idea_core:"):
@@ -18667,6 +18742,21 @@ async def run_mini_recursive_attempt(
         planner_handoff: Optional[Mapping[str, Any]] = None,
     ) -> ClaimProofResult:
         nonlocal lean
+        child_recursion_depth = max(0, int(recursion_depth or 0)) + 1
+        depth_limit = max(0, int(recursive_helper_max_depth or 0))
+        if depth_limit > 0 and child_recursion_depth > depth_limit:
+            record_event({
+                "phase": "mini_recursive_child_depth",
+                "helper_name": helper_name,
+                "recursion_depth": max(0, int(recursion_depth or 0)),
+                "child_recursion_depth": child_recursion_depth,
+                "max_recursion_depth": depth_limit,
+                "verdict": "recursive_child_depth_exhausted",
+            })
+            return ClaimProofResult(
+                terminal_failure_reason="recursive_child_depth_exhausted",
+                terminal_failure_kind="recursive_child_depth_exhausted",
+            )
         lean = _live_lean_capability_for_new_work(lean)
         child_invocation_key = (pass_index, claim_index, variant_index)
         child_invocation_generation = int(
@@ -19640,7 +19730,7 @@ async def run_mini_recursive_attempt(
             recursive_helper_turns=recursive_helper_turns,
             recursive_helper_refine=recursive_helper_refine,
             recursive_helper_budget=recursive_helper_budget,
-            recursion_depth=recursion_depth,
+            recursion_depth=child_recursion_depth,
             cost_controller=cost_controller,
             strict_progress_accounting=strict_progress_accounting,
             soft_progress_streak_cap=soft_progress_streak_cap,
@@ -19817,7 +19907,7 @@ async def run_mini_recursive_attempt(
                 recursive_helper_turns=recursive_helper_turns,
                 recursive_helper_refine=recursive_helper_refine,
                 recursive_helper_budget=recursive_helper_budget,
-                recursion_depth=recursion_depth,
+                recursion_depth=child_recursion_depth,
                 cost_controller=cost_controller,
                 strict_progress_accounting=strict_progress_accounting,
                 soft_progress_streak_cap=soft_progress_streak_cap,
@@ -19990,7 +20080,7 @@ async def run_mini_recursive_attempt(
                 recursive_helper_turns=recursive_helper_turns,
                 recursive_helper_refine=recursive_helper_refine,
                 recursive_helper_budget=recursive_helper_budget,
-                recursion_depth=recursion_depth,
+                recursion_depth=child_recursion_depth,
                 cost_controller=cost_controller,
                 strict_progress_accounting=strict_progress_accounting,
                 soft_progress_streak_cap=soft_progress_streak_cap,
@@ -20198,6 +20288,10 @@ async def run_mini_recursive_attempt(
         certificate or assembling membership/minimality helpers); Lean verifies
         it. The harness supplies no closing tactic and no answer."""
         nonlocal pending_root_close_promotion
+        close_deadline_epoch_s = (
+            time.time() + max(0.0, float(max_elapsed_s or 0.0))
+            if max_elapsed_s else 0.0
+        )
         named_certificates = [
             f"`{name}`"
             for name in certificate_names
@@ -20305,9 +20399,13 @@ async def run_mini_recursive_attempt(
         close_conv.append_user(root_close_request)
         if helper_context_blocks:
             close_conv.append_user(
-                "The following verified helper declarations are available in "
-                "the Lean replay context for this root-close turn:\n```lean\n"
-                + "\n\n".join(helper_context_blocks)
+                "The following verified helper signatures are available as "
+                "named facts. Their full proofs are supplied to Lean; apply "
+                "these facts rather than reconstructing their proofs:\n```lean\n"
+                + "\n\n".join(
+                    helper_prompt_signature(block, redact_solution_refs=False)
+                    for block in helper_context_blocks
+                )
                 + "\n```"
             )
         from .closure_feedback import merge_feedback, render_closure_feedback
@@ -20328,6 +20426,10 @@ async def run_mini_recursive_attempt(
         )
         label = f"[mini-recursive p{pass_index} root-close after {after_helper}]"
         root_close_governor_kwargs: dict[str, Any] = {}
+        if close_deadline_epoch_s > 0.0 and _callable_accepts_keyword(
+            run_conversation_fn, "action_deadline_epoch_s",
+        ):
+            root_close_governor_kwargs["action_deadline_epoch_s"] = close_deadline_epoch_s
         if _callable_accepts_keyword(
             run_conversation_fn,
             "recursive_conversation_max_elapsed_s",
@@ -20580,6 +20682,7 @@ async def run_mini_recursive_attempt(
                 helpers=attempt_dossier.verified_helper_blocks(),
             )
             if not promoted:
+                _merge_new_verified_helpers(attempt_dossier, close_dossier)
                 return None
             pending_root_close_promotion = (root_statement, proof)
             return _RootCloseProof(proof, accepted_replay_helpers)
@@ -20588,6 +20691,11 @@ async def run_mini_recursive_attempt(
         )
         if getattr(close_conv, "_mini_recursive_child_elapsed_budget_exhausted", False):
             return RootCloseOperationalFailure("recursive_claim_elapsed_budget_exhausted")
+        # A failed root proof still owns independently verified helper work.
+        # Import through the same provenance/environment gates as other child
+        # results. Timed-out children may remain detached, so only settled
+        # returns can transfer their helper inventory.
+        _merge_new_verified_helpers(attempt_dossier, close_dossier)
         failure_reason = str(
             getattr(close_conv, "_last_llm_failure_reason", "")
             or getattr(close_dossier, "session_failure_reason", "")
@@ -24745,6 +24853,92 @@ async def run_mini_recursive_driver(
         if not certificate_names and not assembly_helper_names:
             _record_llm_root_close_skip("no_certificate_names")
             return None
+        speculative_blockers: tuple[dict[str, str], ...] = ()
+        if speculative_assembly:
+            graph = getattr(dossier, "proof_graph", None)
+            # One early synthesis probe remains available. Later probes need
+            # at least one previously recorded obligation to gain a durable
+            # certificate. Other obligations can belong to alternative routes;
+            # requiring all of them would suppress useful partial progress.
+            # A new helper or bookkeeping event alone is insufficient.
+            previous_probes: list[tuple[int, tuple[tuple[str, str, str], ...]]] = []
+            for key in llm_root_close_attempted_keys:
+                generations = [
+                    part.removeprefix("speculative_generation:")
+                    for part in key if part.startswith("speculative_generation:")
+                ]
+                blockers = [
+                    part.removeprefix("speculative_blockers:")
+                    for part in key if part.startswith("speculative_blockers:")
+                ]
+                if len(generations) != 1 or len(blockers) != 1:
+                    continue
+                try:
+                    generation = int(generations[0])
+                    blocker_records = json.loads(blockers[0])
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    generation >= 0 and isinstance(blocker_records, list)
+                    and all(
+                        isinstance(item, dict)
+                        and set(item) in (
+                            {"node_id", "identity_hash"},
+                            {"node_id", "identity_hash", "identity_state"},
+                        )
+                        and item.get("identity_state", "bound") in ("bound", "unbound")
+                        and isinstance(item["node_id"], str) and item["node_id"]
+                        and isinstance(item["identity_hash"], str)
+                        and re.fullmatch(r"[0-9a-f]{64}", item["identity_hash"])
+                        for item in blocker_records
+                    )
+                ):
+                    previous_probes.append((generation, tuple(
+                        (item["node_id"], item["identity_hash"], item.get("identity_state", "bound"))
+                        for item in blocker_records
+                    )))
+            if int(stats.llm_root_speculative_assembly_attempts or 0) > 0:
+                expected_generation = int(stats.llm_root_speculative_assembly_attempts) - 1
+                latest_generation = max((generation for generation, _ in previous_probes), default=-1)
+                latest_probes = [
+                    blockers for generation, blockers in previous_probes
+                    if generation == expected_generation
+                ]
+                # A damaged latest receipt must not fall back to an older
+                # probe and spend that probe's already consumed progress again.
+                previous_blockers = (
+                    latest_probes[0]
+                    if latest_generation == expected_generation and len(latest_probes) == 1
+                    else ()
+                )
+                if not (
+                    graph is not None and previous_blockers
+                    and any(
+                        _speculative_blocker_matches(graph.nodes.get(node_id), identity_hash, identity_state)
+                        and graph._proved_node_has_durable_certificate(graph.nodes.get(node_id))
+                        for node_id, identity_hash, identity_state in previous_blockers
+                    )
+                ):
+                    _record_llm_root_close_skip("speculative_root_blockers_unresolved")
+                    return None
+            if graph is not None:
+                speculative_blockers = tuple(
+                    {
+                        "node_id": node.node_id,
+                        "identity_hash": _speculative_blocker_identity(node),
+                        "identity_state": (
+                            "bound" if ProofDossier._graph_node_contract_identity(node) else "unbound"
+                        ),
+                    }
+                    for node in sorted(graph.nodes.values(), key=lambda item: item.node_id)
+                    if node.kind in {
+                        "proposed_claim", "formal_variant", "missing_obligation",
+                        "proof_state_child_goal",
+                    }
+                    and node.status in {"open", "blocked"}
+                    and not graph.is_superseded_tombstone(node)
+                    and not graph._proved_node_has_durable_certificate(node)
+                )
         attempt_names = certificate_names or assembly_helper_names
         helper_blocks = _llm_root_close_replay_context(
             dossier=dossier,
@@ -24776,6 +24970,12 @@ async def run_mini_recursive_driver(
                 f"mode:{root_close_mode}",
                 f"helper_context:{helper_context_key}",
                 *attempt_names,
+                *(
+                    (
+                        f"speculative_generation:{int(stats.llm_root_speculative_assembly_attempts or 0)}",
+                        "speculative_blockers:" + json.dumps(speculative_blockers, sort_keys=True),
+                    ) if speculative_assembly else ()
+                ),
                 *(
                     ("authority:ready_root_assembly_contract",)
                     if assembly_reason == "ready_root_assembly_contract"
@@ -32649,6 +32849,10 @@ async def run_mini_recursive_driver(
                         claim_proof_result.terminal_failure_reason
                         == "recursive_claim_elapsed_budget_exhausted"
                     )
+                    child_depth_exhausted = (
+                        claim_proof_result.terminal_failure_reason
+                        == "recursive_child_depth_exhausted"
+                    )
                     child_failure_scope = llm_failure_scope(
                         claim_proof_result.terminal_failure_reason
                     )
@@ -32682,7 +32886,9 @@ async def run_mini_recursive_driver(
                         {
                             "phase": (
                                 "mini_recursive_claim_deadline"
-                                if child_budget_expired else "mini_recursive_claim_llm"
+                                if child_budget_expired else
+                                "mini_recursive_claim_depth"
+                                if child_depth_exhausted else "mini_recursive_claim_llm"
                             ),
                             "pass_index": pass_index,
                             "claim_index": claim_index,
@@ -32712,6 +32918,8 @@ async def run_mini_recursive_driver(
                             "verdict": (
                                 "claim_elapsed_budget_exhausted"
                                 if child_budget_expired else
+                                "claim_recursion_depth_exhausted"
+                                if child_depth_exhausted else
                                 "claim_llm_scoped_failure"
                                 if child_failure_scope == "scoped"
                                 else "claim_llm_terminal_failure"
@@ -32722,11 +32930,15 @@ async def run_mini_recursive_driver(
                     if child_failure_scope == "scoped":
                         last_failure_reason = (
                             "claim_elapsed_budget_exhausted"
-                            if child_budget_expired else "claim_llm_scoped_failure"
+                            if child_budget_expired else
+                            "claim_recursion_depth_exhausted"
+                            if child_depth_exhausted else "claim_llm_scoped_failure"
                         )
                         failure_description = (
                             "exhausted its elapsed-time allowance"
-                            if child_budget_expired else "hit a scoped LLM failure"
+                            if child_budget_expired else
+                            "reached its child recursion depth limit"
+                            if child_depth_exhausted else "hit a scoped LLM failure"
                         )
                         _add_planner_feedback(
                             planner_feedback,

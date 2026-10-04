@@ -56,18 +56,24 @@ def _local_inputs(project: Path, imports: list[str], sources: dict[str, str]) ->
 def material_environment_hash(lean: Any, project: Path, config: dict[str, Any], preamble: str) -> str:
     """Coalesce cold captures only for the exact live verifier capability."""
     key, _ = _environment_key(lean, project, config, preamble)
+    from .session import _dispatch_capability_identity
+
+    # Recursive leases wrap the same verifier in non-weak-referenceable views.
+    # Cache by its owning generation after reading through the live lease, so
+    # a revoked view still fails before it can reuse any cached identity.
+    owner = _dispatch_capability_identity(lean)
     try:
-        completed = _CACHE.get(lean, {}).get(key)
+        completed = _CACHE.get(owner, {}).get(key)
     except TypeError:
         completed = None
     if completed is not None:
         return completed
     with _CAPTURE_LOCKS_GUARD:
         try:
-            lock = _CAPTURE_LOCKS.get(lean)
+            lock = _CAPTURE_LOCKS.get(owner)
             if lock is None:
                 lock = threading.Lock()
-                _CAPTURE_LOCKS[lean] = lock
+                _CAPTURE_LOCKS[owner] = lock
         except TypeError:
             # Non-weak-referenceable adapters retain the uncached behavior.
             lock = threading.Lock()
@@ -89,8 +95,11 @@ def _environment_key(lean: Any, project: Path, config: dict[str, Any], preamble:
 def _material_environment_hash(lean: Any, project: Path, config: dict[str, Any], preamble: str) -> str:
     """Recheck the cache under ownership; fresh runners recapture disk inputs."""
     key, imports = _environment_key(lean, project, config, preamble)
+    from .session import _dispatch_capability_identity
+
+    owner = _dispatch_capability_identity(lean)
     try:
-        cached = _CACHE.get(lean, {})
+        cached = _CACHE.get(owner, {})
     except TypeError:
         cached = {}
     if key in cached:
@@ -112,7 +121,7 @@ def _material_environment_hash(lean: Any, project: Path, config: dict[str, Any],
         material = _local_inputs(project, imports, config["project_import_sources"])
     digest = _digest(material)
     try:
-        _CACHE.setdefault(lean, {})[key] = digest
+        _CACHE.setdefault(owner, {})[key] = digest
     except TypeError:
         pass
     return digest

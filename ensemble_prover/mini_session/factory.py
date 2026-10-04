@@ -7124,6 +7124,7 @@ async def _mini_session_run_conversation_callback(
 ) -> Tuple[bool, Optional[str]]:
     """Run a mini-recursive child conversation through MiniSession actions."""
 
+    callback_started_epoch_s = time.time()
     conv = kwargs.get("conv")
     client = kwargs.get("client") or kwargs.get("prover_client")
     lean = kwargs.get("lean")
@@ -7920,8 +7921,13 @@ async def _mini_session_run_conversation_callback(
         0.0,
         float(kwargs.get("action_deadline_epoch_s", 0.0) or 0.0),
     )
-    if deadline_epoch_s <= 0.0 and recursive_max_elapsed_s > 0.0:
-        deadline_epoch_s = time.time() + recursive_max_elapsed_s
+    if recursive_max_elapsed_s > 0.0:
+        # Setup and checkpoint identity capture consume this same allowance.
+        local_deadline_epoch_s = callback_started_epoch_s + recursive_max_elapsed_s
+        deadline_epoch_s = (
+            min(deadline_epoch_s, local_deadline_epoch_s)
+            if deadline_epoch_s > 0.0 else local_deadline_epoch_s
+        )
     if theory_parent_session is not None:
         try:
             parent_recursive_deadline_epoch_s = float(
