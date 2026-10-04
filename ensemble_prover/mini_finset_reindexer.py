@@ -10,7 +10,10 @@ infinite ``tsum`` goals.
 from __future__ import annotations
 
 import re
+import sys
+from collections import OrderedDict
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Sequence
 
 from .lean_names import LEAN_NAME_COMPONENT_PATTERN
@@ -307,7 +310,61 @@ def _is_numeric_side(expression: str, literal_names: set[str]) -> bool:
     return operand in literal_names or bool(re.fullmatch(r"[+-]?\s*[0-9]+", operand))
 
 
+_FINSET_PROFILE_CACHE_MAX_BYTES = 4 * 1024 * 1024
+_FINSET_PROFILE_CACHE_MAX_ENTRIES = 128
+_FINSET_PROFILE_CACHE: OrderedDict[str, tuple[tuple[Any, ...], int]] = OrderedDict()
+_FINSET_PROFILE_CACHE_BYTES = 0
+_FINSET_PROFILE_CACHE_LOCK = Lock()
+
+
 def detect_finset_reindexing_profile(text: str) -> FinsetReindexingProfile:
+    """Reuse the immutable syntactic profile for the exact Lean source.
+
+    Retention is bounded by bytes and entries so long elaborated goals can be
+    reused without growing memory across a long search. Oversized statements
+    still receive complete analysis; only their retention is skipped.
+    """
+
+    global _FINSET_PROFILE_CACHE_BYTES
+    source = str(text or "")
+    with _FINSET_PROFILE_CACHE_LOCK:
+        entry = _FINSET_PROFILE_CACHE.get(source)
+        if entry is not None:
+            _FINSET_PROFILE_CACHE.move_to_end(source)
+            return FinsetReindexingProfile(*entry[0])
+
+    # Parse outside the lock: unrelated statements must not wait for a large
+    # goal's analysis. Concurrent misses may compute the same immutable value.
+    result = _detect_finset_reindexing_profile_uncached(source)
+    # Frozen dataclasses still expose a writable field dictionary. Retain only
+    # immutable field values so callers never receive the cached instance.
+    values = tuple(vars(result).values())
+    # Include Unicode storage, retained field tuples and mapping overhead.
+    weight = (
+        sys.getsizeof(source)
+        + sys.getsizeof(values)
+        + sum(sys.getsizeof(value) for value in values)
+        + 256
+    )
+    if weight > _FINSET_PROFILE_CACHE_MAX_BYTES:
+        return result
+    with _FINSET_PROFILE_CACHE_LOCK:
+        previous = _FINSET_PROFILE_CACHE.pop(source, None)
+        if previous is not None:
+            _FINSET_PROFILE_CACHE_BYTES -= previous[1]
+        while _FINSET_PROFILE_CACHE and (
+            _FINSET_PROFILE_CACHE_BYTES + weight > _FINSET_PROFILE_CACHE_MAX_BYTES
+            or len(_FINSET_PROFILE_CACHE) >= _FINSET_PROFILE_CACHE_MAX_ENTRIES
+        ):
+            _, (_, evicted_weight) = _FINSET_PROFILE_CACHE.popitem(last=False)
+            _FINSET_PROFILE_CACHE_BYTES -= evicted_weight
+        if _FINSET_PROFILE_CACHE_MAX_ENTRIES > 0:
+            _FINSET_PROFILE_CACHE[source] = (values, weight)
+            _FINSET_PROFILE_CACHE_BYTES += weight
+    return result
+
+
+def _detect_finset_reindexing_profile_uncached(text: str) -> FinsetReindexingProfile:
     """Return the finite-sum/product reindexing profile for a Lean statement."""
 
     raw = _blank_lean_comments_and_strings(str(text or ""))

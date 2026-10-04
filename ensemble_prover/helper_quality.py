@@ -9,7 +9,9 @@ statement is structurally capable of adding mathematical information.
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Mapping, Tuple
 
 from .contract_identity import has_lean_contract_identity
@@ -45,6 +47,15 @@ class HelperAdmissionQuality:
             "tautological_connective",
             "neutral_identity",
         }
+
+
+_HELPER_QUALITY_CACHE_MAX_BYTES = 4 * 1024 * 1024
+_HELPER_QUALITY_CACHE_MAX_ENTRIES = 128
+_HELPER_QUALITY_CACHE: OrderedDict[
+    tuple[int, str, tuple[str, ...]], tuple[tuple[Any, ...], int]
+] = OrderedDict()
+_HELPER_QUALITY_CACHE_BYTES = 0
+_HELPER_QUALITY_CACHE_LOCK = Lock()
 
 
 def _right_spine_conclusion_and_premises(
@@ -652,8 +663,13 @@ def classify_auxiliary_statement_quality(
     *,
     proof_binder_types: tuple[str, ...] = (),
 ) -> HelperAdmissionQuality:
-    from .proof_graph import _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS, _large_lexical_result
+    from .proof_graph import (
+        _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS,
+        _large_lexical_result,
+        _lexical_retained_bytes,
+    )
 
+    global _HELPER_QUALITY_CACHE_BYTES
     binder_types = tuple(proof_binder_types)
     if len(statement) + sum(map(len, binder_types)) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
         def compute() -> tuple:
@@ -673,7 +689,42 @@ def classify_auxiliary_statement_quality(
             ("auxiliary_quality", HELPER_ADMISSION_QUALITY_SCHEMA_VERSION, statement, binder_types),
             compute,
         ))
-    return _uncached_auxiliary_statement_quality(statement, proof_binder_types=binder_types)
+
+    # Repeated small-helper reads must not evict expensive large-source
+    # projections from the shared lexical store. Retain only immutable
+    # classification for exact source, ordered binder evidence, and policy.
+    key = (HELPER_ADMISSION_QUALITY_SCHEMA_VERSION, statement, binder_types)
+    with _HELPER_QUALITY_CACHE_LOCK:
+        entry = _HELPER_QUALITY_CACHE.get(key)
+        if entry is not None:
+            _HELPER_QUALITY_CACHE.move_to_end(key)
+            return HelperAdmissionQuality(*entry[0])
+    result = _uncached_auxiliary_statement_quality(statement, proof_binder_types=binder_types)
+    # A frozen dataclass's field dictionary is still writable. Retain its
+    # immutable values and return a fresh instance on every cache hit.
+    values = tuple(vars(result).values())
+    # Include retained strings/tuples, Unicode storage and entry overhead.
+    weight = (
+        _lexical_retained_bytes(key)
+        + _lexical_retained_bytes(values)
+        + 256
+    )
+    if weight > _HELPER_QUALITY_CACHE_MAX_BYTES:
+        return result
+    with _HELPER_QUALITY_CACHE_LOCK:
+        previous = _HELPER_QUALITY_CACHE.pop(key, None)
+        if previous is not None:
+            _HELPER_QUALITY_CACHE_BYTES -= previous[1]
+        while _HELPER_QUALITY_CACHE and (
+            _HELPER_QUALITY_CACHE_BYTES + weight > _HELPER_QUALITY_CACHE_MAX_BYTES
+            or len(_HELPER_QUALITY_CACHE) >= _HELPER_QUALITY_CACHE_MAX_ENTRIES
+        ):
+            _, (_, evicted_weight) = _HELPER_QUALITY_CACHE.popitem(last=False)
+            _HELPER_QUALITY_CACHE_BYTES -= evicted_weight
+        if _HELPER_QUALITY_CACHE_MAX_ENTRIES > 0:
+            _HELPER_QUALITY_CACHE[key] = (values, weight)
+            _HELPER_QUALITY_CACHE_BYTES += weight
+    return result
 
 
 def _uncached_auxiliary_statement_quality(

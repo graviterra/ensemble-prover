@@ -1461,6 +1461,29 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
         raise ValueError("native research is not active")
     if name == "read_native_research_artifact":
         object_fields(payload, {"artifact_id", "offset", "length", "path"}, set(), name)
+        offset = payload.get("offset", 0)
+        length = payload.get("length", 6000)
+        invalid_fields = []
+        if type(offset) is not int or offset < 0:
+            invalid_fields.append("offset")
+        if type(length) is not int or not 1 <= length <= 12000:
+            invalid_fields.append("length")
+        if invalid_fields:
+            return {
+                "status": "invalid_arguments",
+                "kernel_verified": False,
+                "execution_disposition": "completed_semantic",
+                "invalid_fields": invalid_fields,
+                "constraints": {
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    "length": {"type": "integer", "minimum": 1, "maximum": 12000, "default": 6000},
+                },
+                "instruction": (
+                    "Retry with an integer offset >= 0 and an integer length from 1 to 12000 "
+                    "characters (default 6000). To read the complete selected text, follow "
+                    "each page's next_offset until it is null."
+                ),
+            }
         if "artifact_id" not in payload:
             guidance = owner._guidance_for(conv)
             if owner.store is None or guidance is None:
@@ -1520,6 +1543,6 @@ NATIVE_TOOLS = [
      "description": "Request independent investigation of an unsupported ancestor or stalled method; never refutes or stops the run.",
      "parameters": {"type": "object", "properties": {"statement": {"type": "string"}, "reason": {"type": "string"}, "evidence_artifact_ids": {"type": "array", "items": {"type": "string"}}}, "required": ["statement", "reason"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "read_native_research_artifact",
-     "description": "Read exact pages of archived research arguments or sources. Omit artifact_id for the complete current advice envelope, including argument and handoff links. If advice is not yet available for the active target and context, returns not_available_yet; reading does not start research.",
-     "parameters": {"type": "object", "properties": {"artifact_id": {"type": "string"}, "offset": {"type": "integer"}, "length": {"type": "integer"}, "path": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}}, "required": [], "additionalProperties": False}}},
+     "description": "Read exact pages of archived research arguments or sources. Offset is a nonnegative integer character index (default 0); length is an integer from 1 to 12000 characters (default 6000). Follow next_offset until null to read the complete selected text. Omit artifact_id for the complete current advice envelope, including argument and handoff links. If advice is not yet available for the active target and context, returns not_available_yet; reading does not start research.",
+     "parameters": {"type": "object", "properties": {"artifact_id": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "length": {"type": "integer", "minimum": 1, "maximum": 12000, "default": 6000}, "path": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}}, "required": [], "additionalProperties": False}}},
 ]
