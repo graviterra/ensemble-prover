@@ -8364,6 +8364,10 @@ class LeanRunner:
             printer_prefix += "set_option pp.explicit true in\n"
         if not pp_notation:
             printer_prefix += (
+                # Source display preferences must not force the compact
+                # semantic-review pass to expand every implicit instance.
+                "set_option pp.all false in\n"
+                f"set_option pp.explicit {str(bool(pp_explicit)).lower()} in\n"
                 "set_option pp.notation false in\n"
                 "set_option pp.numericTypes true in\n"
                 "set_option pp.deepTerms true in\n"
