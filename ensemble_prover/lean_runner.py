@@ -8333,6 +8333,8 @@ class LeanRunner:
 
         ``pp_notation=False`` exposes resolved operators and quantifiers for
         semantic review without changing the declaration being elaborated.
+        Numeric type annotations preserve overloaded arithmetic when operator
+        notation no longer supplies the expected type for its arguments.
         ``pp_expand_auxiliaries`` uses Lean to inline declaration-local match
         definitions that would be absent when replaying the displayed type.
         """
@@ -8363,6 +8365,7 @@ class LeanRunner:
         if not pp_notation:
             printer_prefix += (
                 "set_option pp.notation false in\n"
+                "set_option pp.numericTypes true in\n"
                 "set_option pp.deepTerms true in\n"
                 "set_option pp.proofs true in\n"
                 "set_option pp.maxSteps 1000000 in\n"
@@ -8482,6 +8485,7 @@ run_cmd Lean.Elab.Command.liftTermElabM do
       |>.setBool `pp.explicit {str(pp_explicit).lower()}
       |>.setBool `pp.universes {str(pp_universes).lower()}
       |>.setBool `pp.notation {str(pp_notation).lower()}
+      |>.setBool `pp.numericTypes {str(not pp_notation).lower()}
       |>.setBool `pp.piBinderTypes true
       |>.setBool `pp.funBinderTypes true
       |>.setBool `pp.deepTerms true
