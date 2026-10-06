@@ -1611,7 +1611,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--resume", type=Path, help="Resume a sweep directory or manifest.json"
     )
     parser.add_argument("--putnam-dir", type=Path)
-    parser.add_argument("--solved-dir", type=Path, action="append")
+    parser.add_argument(
+        "--solved-dir", type=Path, action="append",
+        help="Override the solved-export directory (default: runs/mini_prover/solved); repeat for multiple directories",
+    )
     parser.add_argument(
         "--solved-policy", choices=("exported", "verified"),
         help="Skip existing exported filenames (default), or only verified manifest entries",
@@ -1711,7 +1714,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     source_dir=args.putnam_dir
                     or ROOT / "external/PutnamBench/lean4/src",
                     solved_dirs=args.solved_dir
-                    or [ROOT / "runs/mini_prover/solved", ROOT / "runs/solved"],
+                    or [ROOT / "runs/mini_prover/solved"],
                     seed=args.seed if args.seed is not None else secrets.randbits(64),
                     mini_args=mini_args,
                     solved_policy=args.solved_policy or "exported",

@@ -17,7 +17,7 @@ creating the sweep. The release does not include the benchmark or Lean project.
 This attempts every currently unsolved PutnamBench problem once, in random order.
 Previously failed attempts remain eligible unless an export now exists.
 By default, the sweep excludes problems with an existing Putnam `.lean` export
-in `runs/mini_prover/solved` or `runs/solved`, and checks again before each launch.
+in `runs/mini_prover/solved`, and checks again before each launch.
 It counts each problem once across visible-answer and versioned filenames.
 This is a scheduling choice: legacy exports and exports flagged by the axiom
 audit are skipped too, and their verification/audit status remains unchanged.
@@ -26,7 +26,7 @@ verified-manifest filter instead. That filter only recognizes matching verified
 manifest entries, so exports missing from the current manifest remain eligible.
 The queue size depends on your local corpus and solved exports.
 Add `--solved-dir /path/to/solved` to scan another export directory.
-Explicit `--solved-dir` options replace the default directories, so repeat the
+Explicit `--solved-dir` options replace the default directory, so repeat the
 option for every directory you want checked.
 
 Problems run sequentially. `--parallel-samples 2` runs two samples within each

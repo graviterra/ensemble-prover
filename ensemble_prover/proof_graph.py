@@ -1418,6 +1418,20 @@ def graph_formal_statement_text(
     )
 
 
+def graph_exact_statement_text(text: str) -> str:
+    """Compare Lean surfaces without rewriting literals or layout.
+
+    Single-line token spacing can be compacted outside lexical atoms. Retain
+    multiline source verbatim because indentation and comment boundaries can
+    affect parsing. This projection grants no elaborated type equivalence.
+    """
+
+    source = str(text or "").strip()
+    if "\n" in source or "\r" in source:
+        return source
+    return _graph_compact_lean_whitespace(source)
+
+
 def _graph_compact_lean_whitespace(
     text: str,
     *,
@@ -1426,6 +1440,31 @@ def _graph_compact_lean_whitespace(
 ) -> str:
     """Compact code whitespace while retaining the exact contents of literals."""
 
+    source = str(text or "")
+    if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+        return _large_lexical_result(
+            ("compact_whitespace", source, preserve_layout, canonicalize_guarded_iff),
+            lambda: _uncached_graph_compact_lean_whitespace(
+                source, preserve_layout, canonicalize_guarded_iff,
+            ),
+        )
+    return _cached_graph_compact_lean_whitespace(
+        source, preserve_layout, canonicalize_guarded_iff,
+    )
+
+
+@lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
+def _cached_graph_compact_lean_whitespace(
+    text: str, preserve_layout: bool, canonicalize_guarded_iff: Optional[bool],
+) -> str:
+    return _uncached_graph_compact_lean_whitespace(
+        text, preserve_layout, canonicalize_guarded_iff,
+    )
+
+
+def _uncached_graph_compact_lean_whitespace(
+    text: str, preserve_layout: bool, canonicalize_guarded_iff: Optional[bool],
+) -> str:
     normalized = str(text or "")
     # Formatting inside lexical islands is part of the Lean proposition.
     # Select an absent prefix in one source scan, even for adversarial names.
@@ -9191,6 +9230,21 @@ def graph_statement_has_circular_premise(statement: str) -> bool:
     alpha-renaming so nested quantified targets cannot evade the guard.
     """
 
+    source = str(statement or "")
+    if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+        return _large_lexical_result(
+            ("circular_premise", source),
+            lambda: _uncached_graph_statement_has_circular_premise(source),
+        )
+    return _cached_graph_statement_has_circular_premise(source)
+
+
+@lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
+def _cached_graph_statement_has_circular_premise(statement: str) -> bool:
+    return _uncached_graph_statement_has_circular_premise(statement)
+
+
+def _uncached_graph_statement_has_circular_premise(statement: str) -> bool:
     formal_statement = graph_formal_statement_text(statement)
     def closed_telescope_key(closed_statement: str) -> str:
         body, records = _graph_leading_binder_analysis(closed_statement)
@@ -10314,6 +10368,20 @@ _SCOPED_OPEN_DECL_PREFIX_RE = re.compile(
 
 
 def _helper_decl_header(src: str) -> Optional[Tuple[str, str, str]]:
+    source = str(src or "")
+    if len(source) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+        return _large_lexical_result(
+            ("helper_header", source), lambda: _uncached_helper_decl_header(source),
+        )
+    return _cached_helper_decl_header(source)
+
+
+@lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
+def _cached_helper_decl_header(src: str) -> Optional[Tuple[str, str, str]]:
+    return _uncached_helper_decl_header(src)
+
+
+def _uncached_helper_decl_header(src: str) -> Optional[Tuple[str, str, str]]:
     text = str(src or "").strip()
     if not text:
         return None
@@ -10775,7 +10843,7 @@ class ProofGraph:
             or self.active_root_target_contract_identities
         )
         self.active_root_target_statements = [
-            " ".join(str(item or "").split()).strip()
+            graph_exact_statement_text(str(item or ""))
             for item in list(self.active_root_target_statements or [])
             if str(item or "").strip()
         ]
@@ -10936,7 +11004,7 @@ class ProofGraph:
         seen: Set[str] = set()
         cleaned: List[str] = []
         for item in list(targets or ()):
-            text = " ".join(str(item or "").split()).strip()
+            text = graph_exact_statement_text(str(item or ""))
             if not text or text in seen:
                 continue
             seen.add(text)
@@ -22245,6 +22313,13 @@ class ProofGraph:
         self._compact_attempt_history()
         return attempt
 
+    @staticmethod
+    def _is_operational_attempt_failure(verdict: str, error_type: str) -> bool:
+        """A missing execution result cannot reject a mathematical target."""
+        return str(verdict or "").lower() in {"lean_infra_error", "llm_call_failed"} or str(
+            error_type or ""
+        ).lower() in {"timeout", "infra_failure", "exception", "cancelled", "forced_termination"}
+
     def _update_status_from_verdict(
         self,
         node_id: str,
@@ -22347,6 +22422,13 @@ class ProofGraph:
                 )
         elif node.kind == "root":
             node.status = "open"
+        elif v in rejected_verdicts and self._is_operational_attempt_failure(v, error_type):
+            # Preserve earlier checked rejection/acceptance as well as open
+            # work. The attempt remains recorded, but carries no new verdict
+            # about the target's mathematical validity.
+            node.metadata["last_operational_attempt_verdict"] = v
+            node.metadata["last_operational_attempt_error_type"] = str(error_type or "")
+            return
         elif (
             node.kind == "missing_obligation"
             and v in rejected_verdicts

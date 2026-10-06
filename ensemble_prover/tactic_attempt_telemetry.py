@@ -35,6 +35,21 @@ _INFRASTRUCTURE_ERROR_TYPES = {
     "spawn_error",
     "transport_error",
 }
+_COMPLETED_LEAN_ERROR_TYPES = {
+    "forbidden_axioms",
+    "unknown_universe",
+    "termination_failed",
+    "parse_error",
+    "unknown_identifier",
+    "missing_instance",
+    "proposition_falsified",
+    "type_mismatch",
+    "unification_failed",
+    "binder_arity_mismatch",
+    "simp_no_progress",
+    "tactic_failed",
+    "unsolved_goals",
+}
 
 
 TACTIC_PHASE_LANES: Dict[str, str] = {
@@ -110,7 +125,15 @@ def _attempt_kind(attempt: Mapping[str, Any]) -> str:
     diagnostic = _text(attempt.get("diagnostic"))
     exception = _text(attempt.get("exception"))
     exit_reason = _text(attempt.get("exit_reason"))
-    combined = " ".join((error_type, diagnostic, exception, exit_reason))
+    # A structured completed Lean error outranks words in its diagnostic:
+    # `timeout` and `TimeoutError` are also legal Lean identifiers. Explicit
+    # exception/exit metadata remains independent operational evidence.
+    combined = " ".join((
+        error_type,
+        "" if error_type in _COMPLETED_LEAN_ERROR_TYPES else diagnostic,
+        exception,
+        exit_reason,
+    ))
     if (
         error_type in _CANCELLATION_ERROR_TYPES
         or bool(attempt.get("cancelled"))

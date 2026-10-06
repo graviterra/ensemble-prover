@@ -393,7 +393,29 @@ def lean_relation_binder_equivalent(left: str, right: str) -> bool:
     right_lhs, right_op, right_rhs = right_parts
 
     def compact(value: str) -> str:
-        return re.sub(r"\s+", "", str(value or ""))
+        raw = str(value or "").strip()
+        if "\n" in raw or "\r" in raw:
+            return raw
+        parts: list[str] = []
+        index = 0
+        while index < len(raw):
+            end = _lean_surface_lexical_skip_end(raw, index)
+            if end is not None:
+                parts.append(raw[index:end])
+                index = end
+                continue
+            if raw[index].isspace():
+                end = index + 1
+                while end < len(raw) and raw[end].isspace():
+                    end += 1
+                # Keep token boundaries: f 'a' differs from f'a', and removing
+                # spacing can even turn separate operators into a comment.
+                parts.append(" ")
+                index = end
+                continue
+            parts.append(raw[index])
+            index += 1
+        return "".join(parts)
 
     return bool(
         left_op == right_op

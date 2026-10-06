@@ -13,13 +13,16 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
+import time
 import tomllib
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from ..mini_theory.environment import dependency_environment_fingerprint
 from ..subprocess_environment import sanitized_subprocess_environment
@@ -53,6 +56,31 @@ _RUNTIME_SELECTORS = (
     "LEAN_SRC_PATH",
 )
 
+# Optional caller-owned cancellation for background identity capture. Ordinary
+# campaign/checkpoint capture has no callback and retains its existing policy.
+_CAPTURE_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(
+    "environment_capture_check", default=None,
+)
+
+
+def _check_capture() -> None:
+    check = _CAPTURE_CHECK.get()
+    if check is not None:
+        check()
+
+
+def _read_capture_bytes(path: Path) -> bytes:
+    if _CAPTURE_CHECK.get() is None:
+        return path.read_bytes()
+    chunks = []
+    with path.open("rb") as handle:
+        while True:
+            _check_capture()
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+
 
 def _encoded(value: Any) -> bytes:
     return json.dumps(
@@ -69,16 +97,34 @@ def _inside(path: Path, root: Path) -> bool:
 
 
 def _file(path: Path, scope: str, *, data: bytes | None = None) -> dict[str, Any]:
+    _check_capture()
     resolved = path.resolve()
     digest = None
     if path.exists():
         if not path.is_file():
             raise ValueError(f"environment input is not a file: {path}")
         if data is not None:
-            digest = hashlib.sha256(data).hexdigest()
+            if _CAPTURE_CHECK.get() is None:
+                digest = hashlib.sha256(data).hexdigest()
+            else:
+                hasher = hashlib.sha256()
+                for offset in range(0, len(data), 1024 * 1024):
+                    _check_capture()
+                    hasher.update(memoryview(data)[offset:offset + 1024 * 1024])
+                digest = hasher.hexdigest()
         else:
             with path.open("rb") as handle:
-                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                if _CAPTURE_CHECK.get() is None:
+                    digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                else:
+                    hasher = hashlib.sha256()
+                    while True:
+                        _check_capture()
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+                    digest = hasher.hexdigest()
     elif path.is_symlink():
         raise ValueError(f"environment input is a broken symlink: {path}")
     return {
@@ -126,6 +172,7 @@ def _compiled_tree_identity(
         raise ValueError(f"compiled build directory is not a directory: {root}")
     walk = os.walk(root, onerror=fail, followlinks=True) if root.exists() else ()
     for raw, directories, files in walk:
+        _check_capture()
         directory = Path(raw)
         resolved = directory.resolve()
         if not resolved.is_relative_to(resolved_origin) or resolved in seen:
@@ -137,6 +184,7 @@ def _compiled_tree_identity(
             if str((directory / name).relative_to(root)) not in excluded
         )
         for name in sorted(files):
+            _check_capture()
             if str((directory / name).relative_to(root)) in excluded:
                 continue
             if not name.endswith((*_COMPILED_SUFFIXES, ".so")):
@@ -177,6 +225,8 @@ def _compiled_tree_identity(
 
 
 def _git(root: Path, *args: str) -> bytes:
+    if _CAPTURE_CHECK.get() is not None:
+        return _capture_git(root, *args)
     try:
         command = subprocess.run(
             ["git", "-C", str(root), *args],
@@ -188,6 +238,39 @@ def _git(root: Path, *args: str) -> bytes:
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError(f"cannot identify resolved git dependency: {root}") from exc
     return command.stdout
+
+
+def _capture_git(root: Path, *args: str) -> bytes:
+    """Own optional background metadata work until cancellation has reaped it."""
+    _check_capture()
+    try:
+        process = subprocess.Popen(
+            ["git", "-C", str(root), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=sanitized_subprocess_environment(), start_new_session=True,
+        )
+        deadline = time.monotonic() + 60.0
+        try:
+            while True:
+                _check_capture()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("environment Git capture deadline exhausted")
+                try:
+                    output, _ = process.communicate(timeout=0.02)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            _check_capture()
+            if process.returncode != 0:
+                raise ValueError(f"cannot identify resolved git dependency: {root}")
+            return output
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=1.0)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"cannot identify resolved git dependency: {root}") from exc
 
 
 def _runtime_selection(project: Path) -> dict[str, Any]:
@@ -553,7 +636,7 @@ class _SnapshotBuilder:
         manifest: dict[str, Any] = {}
         for name in _CONFIG_FILES:
             path = root / name
-            data = path.read_bytes() if path.is_file() else None
+            data = _read_capture_bytes(path) if path.is_file() else None
             self._record(path, scope, data=data)
             if name == "lake-manifest.json" and data is not None:
                 parsed = json.loads(data)
@@ -583,6 +666,7 @@ class _SnapshotBuilder:
         if not isinstance(packages_dir, str):
             raise ValueError("invalid Lake packagesDir")
         for package in manifest.get("packages", []):
+            _check_capture()
             if not isinstance(package, dict) or not isinstance(
                 package.get("name"), str
             ):
@@ -716,6 +800,7 @@ class _SnapshotBuilder:
         )
 
     def _module(self, module: str) -> tuple[bytes, str]:
+        _check_capture()
         components = _lean_name_components(module)
         if not components:
             raise ValueError("invalid imported module")
@@ -734,7 +819,7 @@ class _SnapshotBuilder:
         if len(unique) != 1:
             raise ValueError(f"unresolved or ambiguous trusted module: {module}")
         source, root, scope, compiled_roots = next(iter(unique.values()))
-        data = source.read_bytes()
+        data = _read_capture_bytes(source)
         self._record(source, scope, data=data)
         compiled = [
             directory / relative
@@ -751,6 +836,7 @@ class _SnapshotBuilder:
         return data, scope
 
     def collect(self, imports: tuple[str, ...]) -> None:
+        _check_capture()
         manifest = self._configuration(self.project, "project")
         self._mutable_build(
             self.project / manifest.get("lakeDir", ".lake") / "build/lib",

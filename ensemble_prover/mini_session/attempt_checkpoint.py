@@ -674,7 +674,7 @@ class AttemptCheckpointRegistry:
             session.checkpoint_lane_key = previous_lane
             raise
 
-    async def commit_session(self, lane_key: str, session: Any) -> None:
+    async def commit_session(self, lane_key: str, session: Any, *, publication_guard: Any = None) -> None:
         from .durable_checkpoint import capture_session_record
         binding = self._bound_sessions.get(lane_key)
         if binding is None or not binding.owns(session):
@@ -690,7 +690,8 @@ class AttemptCheckpointRegistry:
         removals = {broker_lane: [_digest([item.job_id, item.request_fingerprint])
                                  for item in acknowledged]} if acknowledged else {}
         await self._commit_update(session_updates={lane_key: _json(record)},
-                                  planner_receipt_removals=removals)
+                                  planner_receipt_removals=removals,
+                                  publication_guard=publication_guard)
         if acknowledged:
             broker.confirm_receipts_committed(acknowledged)
 

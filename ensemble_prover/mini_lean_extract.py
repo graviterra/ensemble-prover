@@ -1965,12 +1965,13 @@ def _split_lean_qualified_name(name: str) -> List[str]:
 
 
 def _normalized_decl_text_for_redeclaration_comparison(text: str) -> str:
-    """Collapse cosmetic spelling so a faithful restatement compares equal."""
+    """Ignore comments and safe spacing, retaining Lean's extensible tokens."""
 
-    stripped = _strip_lean_comments(str(text or ""))
-    return " ".join(
-        stripped.replace("=>", "↦").replace("->", "→").split()
-    )
+    from .proof_graph import graph_exact_statement_text
+
+    # Even standalone ASCII/Unicode arrows can denote different custom
+    # operators. Source equality cannot substitute for elaborated identity.
+    return graph_exact_statement_text(_strip_lean_comments(str(text or "")))
 
 
 def _top_level_declaration_registry_with_opens(
@@ -2693,7 +2694,9 @@ def _extract_single_decl_body(chunk: str) -> Optional[str]:
 
 
 def _normalize_statement_for_contract(text: object) -> str:
-    compact = " ".join(str(text or "").split())
+    from .proof_graph import graph_exact_statement_text
+
+    compact = graph_exact_statement_text(str(text or ""))
     if not compact:
         return ""
     try:
@@ -3036,7 +3039,9 @@ def _helper_statement_root_equivalent(
             == canonicalize_lean_statement_for_identity(goal_statement)
         )
     except Exception:
-        return " ".join(statement.split()) == " ".join(str(goal_statement).split())
+        from .proof_graph import graph_exact_statement_text
+
+        return graph_exact_statement_text(statement) == graph_exact_statement_text(goal_statement)
 
 
 def _root_equivalent_helper_names_from_blocks(

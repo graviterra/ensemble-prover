@@ -41,6 +41,7 @@ from .proof_dossier import (
     text_hash,
 )
 from .provider_tool_protocol import _checked_code_body
+from .proof_graph import _SCOPED_OPEN_NAME_RE, graph_exact_statement_text
 from .utils import extract_code_fences, parse_tool_arguments
 
 
@@ -3147,6 +3148,45 @@ def _format_repackaged_goal_target_feedback(
     return "\n".join(lines)
 
 
+_SIMPLE_REPAIR_PROOF_RE = re.compile(
+    rf"by(?:[ \t]+|\n[ \t]+)(?P<exact>exact[ \t]+)?(?P<name>{_SCOPED_OPEN_NAME_RE})"
+)
+_NUMERIC_REPAIR_CAST_RE = re.compile(
+    r"\([ \t]*(?P<value>-?[0-9]+)[ \t]*:[ \t]*"
+    r"(?P<type>[^\W\d][\w'.]*)[ \t]*\)"
+)
+
+
+def _repair_source_cosmetic_key(text: str) -> str:
+    """Allow simple proof formatting without changing literals or block layout."""
+
+    from .proof_graph import _graph_lexical_island_end
+
+    # A single reference/tactic has no nested layout to disambiguate. More
+    # complex proof bodies retain their exact relative line indentation.
+    body = helper_decl_body(text) or text
+    simple = _SIMPLE_REPAIR_PROOF_RE.fullmatch(body)
+    if simple is not None:
+        prefix = text[:-len(body)].rstrip()
+        canonical = "by " + ("exact " if simple.group("exact") else "") + simple.group("name")
+        return (prefix + " " + canonical).strip()
+
+    # Numeric type ascriptions have fixed delimiters. Ignore only horizontal
+    # spacing there, without joining arbitrary operators or identifier tokens.
+    parts: List[str] = []
+    start = index = 0
+    while index < len(text):
+        end = _graph_lexical_island_end(text, index)
+        if end is None:
+            index += 1
+            continue
+        parts.append(_NUMERIC_REPAIR_CAST_RE.sub(r"(\g<value> : \g<type>)", text[start:index]))
+        parts.append(text[index:end])
+        start = index = end
+    parts.append(_NUMERIC_REPAIR_CAST_RE.sub(r"(\g<value> : \g<type>)", text[start:]))
+    return "".join(parts)
+
+
 def _normalized_repair_code(
     value: Any,
     *,
@@ -3169,10 +3209,7 @@ def _normalized_repair_code(
                     text = decl_body
     except Exception:
         pass
-    compact = " ".join(text.split())
-    compact = re.sub(r"\s*(:=|=>|←|↦)\s*", r"\1", compact)
-    compact = re.sub(r"\s*([()\[\]{},:;])\s*", r"\1", compact)
-    return compact
+    return _repair_source_cosmetic_key(graph_exact_statement_text(text))
 
 
 def _repair_self_check_matches_submission(
@@ -3217,7 +3254,10 @@ def _repair_self_check_matches_submission(
                 continue
             if item_context_hash != expected_context_hash:
                 continue
-            registry_codes.append(str(item.get("normalized_code") or ""))
+            if item.get("normalization_schema") == "lean_exact_surface_v1":
+                registry_codes.append(str(item.get("normalized_code") or ""))
+            elif item.get("code_hash") == text_hash(str(submitted or "")):
+                registry_codes.append(str(submitted or ""))
         else:
             item_goal_hash = str(getattr(item, "goal_hash", "") or "")
             item_preamble_hash = str(getattr(item, "preamble_hash", "") or "")
@@ -3236,7 +3276,10 @@ def _repair_self_check_matches_submission(
                 continue
             if item_context_hash != expected_context_hash:
                 continue
-            registry_codes.append(str(getattr(item, "normalized_code", "") or ""))
+            if getattr(item, "normalization_schema", "") == "lean_exact_surface_v1":
+                registry_codes.append(str(getattr(item, "normalized_code", "") or ""))
+            elif getattr(item, "code_hash", "") == text_hash(str(submitted or "")):
+                registry_codes.append(str(submitted or ""))
     for code in [*list(checked_codes or ()), *registry_codes]:
         checked_norm = _normalized_checked_repair_code(
             code,
@@ -3417,11 +3460,68 @@ def _repair_checked_code_covers_submission(
     shorter = min(len(checked_norm), len(submitted_norm))
     if shorter < 16:
         return False
-    if (
-        _repair_checked_code_is_local_fragment(checked_norm)
-        and checked_norm in submitted_norm
-    ):
-        return True
+    if _repair_checked_code_is_local_fragment(checked_norm):
+        from .proof_graph import _graph_lexical_island_end
+
+        def lexical_spans(source: str) -> List[Tuple[int, int]]:
+            spans: List[Tuple[int, int]] = []
+            index = 0
+            while index < len(source):
+                end = _graph_lexical_island_end(source, index)
+                if end is not None:
+                    spans.append((index, end))
+                    index = end
+                else:
+                    index += 1
+            return spans
+
+        submitted_spans = lexical_spans(submitted_norm)
+
+        def complete_fragment(start: int, end: int) -> bool:
+            line_start = submitted_norm.rfind("\n", 0, start) + 1
+            leading = submitted_norm[line_start:start]
+            if leading.strip():
+                return False
+            tail = submitted_norm[end:]
+            remaining = tail.lstrip(" \t")
+            if not remaining:
+                return True
+            if not remaining.startswith("\n"):
+                return False
+            # A following, more-indented line may continue the assignment or
+            # the checked inner proof, so it is not a completed local block.
+            for line in remaining.splitlines()[1:]:
+                if line.strip():
+                    indentation = line[:len(line) - len(line.lstrip(" \t"))]
+                    return len(indentation.expandtabs(8)) <= len(leading.expandtabs(8))
+            return True
+
+        for match in re.finditer(re.escape(checked_norm), submitted_norm):
+            if "\n" in checked_norm and match.start() != (
+                submitted_norm.rfind("\n", 0, match.start()) + 1
+            ):
+                continue
+            if (
+                complete_fragment(match.start(), match.end())
+                and not any(start <= match.start() < end for start, end in submitted_spans)
+            ):
+                return True
+        # Embedding a checked local block under `by` adds one consistent
+        # indentation prefix. Preserve all relative indentation; never shift
+        # a multiline literal, whose embedded whitespace is a value.
+        if any("\n" in checked_norm[start:end] for start, end in lexical_spans(checked_norm)):
+            return False
+        first_line = checked_norm.splitlines()[0]
+        for match in re.finditer(r"(?m)^([ \t]*)" + re.escape(first_line) + r"(?=\n|$)", submitted_norm):
+            if any(start <= match.start() < end for start, end in submitted_spans):
+                continue
+            prefix = match.group(1)
+            shifted = prefix + checked_norm.replace("\n", "\n" + prefix)
+            if (
+                submitted_norm.startswith(shifted, match.start())
+                and complete_fragment(match.start() + len(prefix), match.start() + len(shifted))
+            ):
+                return True
     return False
 
 
@@ -3435,9 +3535,19 @@ def _repair_norm_has_executable_tail(
     submitted = str(submitted_norm or "").strip()
     if not checked or not submitted or checked == submitted:
         return False
-    if not submitted.startswith(checked):
-        return False
-    tail = submitted[len(checked):]
+    if submitted.startswith(checked):
+        tail = submitted[len(checked):]
+    else:
+        checked_simple = _SIMPLE_REPAIR_PROOF_RE.fullmatch(checked)
+        submitted_simple = _SIMPLE_REPAIR_PROOF_RE.match(submitted)
+        if checked_simple is None or submitted_simple is None:
+            return False
+        if (
+            bool(checked_simple.group("exact")) != bool(submitted_simple.group("exact"))
+            or checked_simple.group("name") != submitted_simple.group("name")
+        ):
+            return False
+        tail = submitted[submitted_simple.end():]
     if not tail:
         return False
     next_char = tail[:1]

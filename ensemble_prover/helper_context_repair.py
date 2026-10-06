@@ -94,8 +94,11 @@ async def repair_verified_helper_context(
     # Use original declaration names and exact sources, with support closures.
     # A textual scan only proposes a context; Lean decides whether it suffices.
     attempted = 0
+    visible = {
+        helper_decl_name(block)
+        for block in dossier.verified_helper_blocks(refresh_quality=False)
+    }
     for name in list(dossier.verified_helpers):
-        visible = {helper_decl_name(block) for block in dossier.verified_helper_blocks(refresh_quality=False)}
         helper = dossier.verified_helpers[name]
         if (
             name in visible
@@ -133,6 +136,12 @@ async def repair_verified_helper_context(
             check_kind="helper_context_repair",
         )
         publish_guard(expected_key)
+        # Scope validation may reconcile quality even when Lean rejects this
+        # repair. Subsequent helpers must observe that refreshed visibility.
+        visible = {
+            helper_decl_name(block)
+            for block in dossier.verified_helper_blocks(refresh_quality=False)
+        }
         if not result.ok or getattr(result, "axiom_audit_ok", None) is not True:
             retryable = retryable or retryable_check(result)
             continue
@@ -157,6 +166,10 @@ async def repair_verified_helper_context(
             verdict="helper_context_repaired", metadata=receipt,
         )
         repaired.append(name)
+        visible = {
+            helper_decl_name(block)
+            for block in dossier.verified_helper_blocks(refresh_quality=False)
+        }
 
     if repaired:
         dossier._refresh_verified_helper_quality()

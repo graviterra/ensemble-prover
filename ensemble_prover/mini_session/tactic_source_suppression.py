@@ -7,24 +7,18 @@ from typing import Any, Mapping, Sequence
 from ensemble_prover.mini_finset_reindexer import finset_reindexing_context_key
 from ensemble_prover.mini_tactic_closer import TacticPatternCache
 from ensemble_prover.proof_dossier import helper_decl_name, text_hash
+from ensemble_prover.proof_graph import graph_exact_statement_text
 
 
 SESSION_TACTIC_SOURCE_SUPPRESSION_ATTR = "_tactic_close_source_suppression_records"
 
 
 def helper_fingerprints(helper_blocks: Sequence[str]) -> tuple[str, ...]:
-    """Return stable helper fingerprints for tactic-source context keys."""
+    """Preserve every exact block in elaboration order, including commands."""
 
-    block_by_name = {
-        name: str(block or "")
-        for block in list(helper_blocks or ())
-        for name in [helper_decl_name(str(block or ""))]
-        if name
-    }
     return tuple(
-        f"{name}:{text_hash(block_by_name.get(name, ''))}"
-        for name in sorted(block_by_name)
-        if str(name or "").strip()
+        f"{helper_decl_name(str(block or ''))}:{text_hash(str(block or ''))}"
+        for block in (helper_blocks or ())
     )
 
 
@@ -36,13 +30,9 @@ def tactic_source_context_key(
 ) -> str:
     """Build the context key used to decide whether a source was exhausted."""
 
-    prefix = str(source_prefix or "").strip()
-    goal = " ".join(str(goal_statement or "").split())
+    goal = graph_exact_statement_text(goal_statement)
     fingerprints = helper_fingerprints(tuple(str(item or "") for item in helper_blocks))
-    if prefix == "finset_reindexing":
-        return finset_reindexing_context_key(goal, fingerprints)
-    helpers = ",".join(fingerprints)
-    return f"{goal}|helpers={helpers}"
+    return finset_reindexing_context_key(goal, fingerprints)
 
 
 def tactic_source_suppression_records(session: Any) -> tuple[dict[str, Any], ...]:
@@ -192,7 +182,7 @@ def mark_tactic_source_prefix_exhausted(
     record = {
         "source_prefix": prefix,
         "context_key": context_key,
-        "goal_hash": text_hash(" ".join(str(goal_statement or "").split())),
+        "goal_hash": text_hash(graph_exact_statement_text(goal_statement)),
         "helper_fingerprints": list(fingerprints),
         "reason": str(reason or "exhausted").strip(),
     }

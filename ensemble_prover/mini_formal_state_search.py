@@ -121,6 +121,8 @@ _LEAN_LATE_TAILS: "weakref.WeakKeyDictionary[asyncio.Lock, Dict[str, Any]]" = (
 )
 _LEAN_LATE_TAIL_QUARANTINE_GRACE_S = 300.0
 _LEAN_LOCK_ADMISSION_TIMEOUT_S = 1.0
+_LEAN_TAIL_CALLBACK_GRACE_S = 0.05
+_LEAN_TAIL_CALLBACK_GRACE_TURNS = 8
 _OWNED_LEAN_LOCK: ContextVar[Optional[asyncio.Lock]] = ContextVar(
     "ensemble_prover_owned_lean_lock",
     default=None,
@@ -671,6 +673,8 @@ async def acquire_prepared_lean_lock(
 
     started = time.monotonic()
     poll = max(0.01, float(poll_s or 0.1))
+    absolute_deadline = float(deadline_monotonic or 0.0)
+    last_graced_tail = None
     steal_unrecyclable_tail = bool(
         release_unrecyclable_tail
         and admission_timeout_s is None
@@ -678,9 +682,13 @@ async def acquire_prepared_lean_lock(
     )
 
     def admission_remaining() -> Optional[float]:
-        if admission_timeout_s is None:
-            return None
-        return max(0.0, float(admission_timeout_s) - (time.monotonic() - started))
+        now = time.monotonic()
+        limits = []
+        if admission_timeout_s is not None:
+            limits.append(float(admission_timeout_s) - (now - started))
+        if absolute_deadline > 0.0:
+            limits.append(absolute_deadline - now)
+        return max(0.0, min(limits)) if limits else None
 
     def timed_out() -> bool:
         if deadline_elapsed is not None and deadline_elapsed():
@@ -688,13 +696,37 @@ async def acquire_prepared_lean_lock(
         remaining = admission_remaining()
         return remaining is not None and remaining <= 0.0
 
+    async def prepare_for_new_check() -> bool:
+        nonlocal last_graced_tail
+        live = _live_lean_generation(lean)
+        lock = _lean_lock(live)
+        state = _LEAN_LATE_TAILS.get(lock)
+        if state is not None and state is not last_graced_tail:
+            last_graced_tail = state
+            task = state.get("task")
+            if task is not None and not task.done() and not _lean_has_live_sibling_lease(live):
+                # Exit delivery may require several queued callback hops after
+                # synchronous preparation. Yield without cancelling or joining
+                # the old owner, and never renew this window for the same tail.
+                grace_deadline = time.monotonic() + _LEAN_TAIL_CALLBACK_GRACE_S
+                for _ in range(_LEAN_TAIL_CALLBACK_GRACE_TURNS):
+                    if timed_out():
+                        raise asyncio.TimeoutError("lean lock admission deferred")
+                    if task.done() or _LEAN_LATE_TAILS.get(lock) is not state:
+                        break
+                    await asyncio.sleep(0)
+                    if time.monotonic() >= grace_deadline:
+                        break
+        if timed_out():
+            raise asyncio.TimeoutError("lean lock admission deferred")
+        return _prepare_lean_lock_for_new_check(
+            lean, release_unrecyclable_tail=steal_unrecyclable_tail,
+        )
+
     while True:
         if timed_out():
             raise asyncio.TimeoutError("lean lock admission deferred")
-        _prepare_lean_lock_for_new_check(
-            lean,
-            release_unrecyclable_tail=steal_unrecyclable_tail,
-        )
+        await prepare_for_new_check()
         live = _live_lean_generation(lean)
         lock = _lean_lock(live)
         acquire_task = asyncio.create_task(lock.acquire())
@@ -710,10 +742,7 @@ async def acquire_prepared_lean_lock(
                     timeout=wait_s,
                 )
                 if acquire_task not in done:
-                    prepared = _prepare_lean_lock_for_new_check(
-                        lean,
-                        release_unrecyclable_tail=steal_unrecyclable_tail,
-                    )
+                    prepared = await prepare_for_new_check()
                     generation_moved = (
                         _lean_lock(_live_lean_generation(lean)) is not lock
                     )

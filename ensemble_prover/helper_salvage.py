@@ -24,7 +24,7 @@ from .proof_dossier import (
 )
 from .contract_identity import parse_lean_contract_identity
 from .lean_names import lean_name_key
-from .proof_graph import helper_decl_statement
+from .proof_graph import graph_exact_statement_text, helper_decl_statement
 from .proof_state import lean_referenced_helper_names
 from .proof_state_cache import (
     _proof_state_helper_policy_rejection,
@@ -98,7 +98,7 @@ def _helper_statement_signature(block: str) -> str:
     are NOT silently dropped during merge.
     """
 
-    return " ".join(str(helper_decl_statement(block) or "").split())
+    return graph_exact_statement_text(helper_decl_statement(block))
 
 
 def helper_statement_changed(previous_source: str, replacement_source: str) -> bool:

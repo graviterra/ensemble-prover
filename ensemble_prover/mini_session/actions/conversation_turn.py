@@ -86,6 +86,7 @@ from ensemble_prover.provider_tool_protocol import (
     mini_request_envelope_policy,
 )
 from ensemble_prover.proof_graph import (
+    graph_exact_statement_text,
     graph_negated_statement_key,
     graph_node_frontier_quarantined,
     graph_statement_closed_premises,
@@ -5312,7 +5313,7 @@ def _top_level_symbol_parts(text: str, symbol: str) -> List[str]:
 
 
 def _strip_leading_forall_body(text: str) -> str:
-    current = _strip_balanced_outer_parens(" ".join(str(text or "").split()))
+    current = _strip_balanced_outer_parens(graph_exact_statement_text(text))
     while current.startswith("∀") or current.startswith("forall "):
         depth = 0
         comma_index = -1
@@ -5891,7 +5892,7 @@ def _formalization_bridge_status(
     the intended formalization of the selected graph node.
     """
 
-    statement = " ".join(str(formal_statement or "").split()).strip()
+    statement = graph_exact_statement_text(formal_statement)
     if graph_statement_has_circular_premise(statement):
         premise_keys, conclusion_key = graph_statement_contract_profile(statement)
         return {
@@ -6091,7 +6092,7 @@ def _formalization_bridge_status(
         if rejection is not None:
             return rejection
     if target_executable:
-        if " ".join(target_statement.split()).strip() == statement:
+        if graph_exact_statement_text(target_statement) == statement:
             return {
                 "accepted": True,
                 "reason": "exact_executable_target",
@@ -19643,23 +19644,51 @@ class ConversationTurnAction:
             common_payload.get("recovered_finalizer_failure_kind") or ""
         ).strip()
 
+        # Retain the complete returned source, including new helper declarations,
+        # against the context that survives a cancelled action's rollback. An
+        # accepted scratch candidate keeps its first verifier deadline and input.
+        final_verifier_candidate = copy.deepcopy(
+            getattr(loop_result, "unverified_candidate", {}) or {}
+        )
+        candidate_sink = getattr(conv, "_unverified_candidate_cancellation_sink", None)
+
         async def call_current_verifier(
             *,
             timeout_s: float,
             deadline: float,
         ) -> Any:
-            return await verify_with_lean(
-                conv=conv,
-                lean=session.lean,
-                proof=proof,
-                helpers=lean_verification_helpers,
-                context_helpers=context_helpers,
-                check_lemmas=check_lemmas,
-                goal_statement_override=selected_goal_statement_override,
-                active_root_targets=active_root_targets,
-                deadline_monotonic=deadline,
-                verifier_timeout_override_s=timeout_s,
-            )
+            nonlocal final_verifier_candidate
+            if callable(candidate_sink) and not final_verifier_candidate:
+                from ..unverified_candidate import capture_candidate
+
+                original_helpers = getattr(loop_result, "candidate_helper_context", None)
+                original_helpers = list(context_helpers if original_helpers is None else original_helpers)
+                added_context = [block for block in context_helpers if block not in original_helpers]
+                source = "\n\n".join([
+                    *(f"```lean\n{block}\n```" for block in added_context), content,
+                ])
+                final_verifier_candidate = capture_candidate(
+                    conv=conv, target=extraction_goal_statement, helpers=original_helpers,
+                    args={"code": source}, lean=session.lean, replay_mode="final_response",
+                )
+            try:
+                return await verify_with_lean(
+                    conv=conv,
+                    lean=session.lean,
+                    proof=proof,
+                    helpers=lean_verification_helpers,
+                    context_helpers=context_helpers,
+                    check_lemmas=check_lemmas,
+                    goal_statement_override=selected_goal_statement_override,
+                    active_root_targets=active_root_targets,
+                    deadline_monotonic=deadline,
+                    verifier_timeout_override_s=timeout_s,
+                )
+            except asyncio.CancelledError as cancellation:
+                if final_verifier_candidate and callable(candidate_sink):
+                    candidate_sink(final_verifier_candidate)
+                    cancellation.mini_unverified_root_candidate = final_verifier_candidate
+                raise
 
         def publish_current_verifier_pending(
             *,

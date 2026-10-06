@@ -273,8 +273,8 @@ FinalizeClaimEnvironmentFn = Callable[..., Any]
 # Honest conversational root-close short-circuit. Invoked when a verified
 # root-equivalent certificate exists, or when a newly accepted route-local
 # helper (for example exact negative evidence) may make the verified helper set
-# sufficient for the canonical root. The callback runs ONE conversational
-# root-close turn: the model supplies the bridging proof and Lean verifies it --
+# sufficient for the canonical root. The callback runs a conversational
+# root-close attempt: the model supplies the bridging proof and Lean verifies it --
 # the harness never injects a closing tactic. Called with
 # keyword args (root_statement, certificate_names, helper_blocks, pass_index,
 # after_helper) and returns the verified root proof text, None on rejection,
@@ -285,6 +285,7 @@ class RootCloseOperationalFailure:
 
     reason: str
     kind: str = ""
+    expired_before_provider_dispatch: bool = False
 
 
 class _RootCloseProof(str):
@@ -702,7 +703,7 @@ class MiniRecursiveConfig:
     llm_root_close_max_attempts: int = 2
     # Route-incomplete post-helper root synthesis is a probe, not a nested
     # proof campaign. The production callback combines this strict total wall
-    # with a one-provider-dispatch lane.
+    # with a two-response lane for inspection or concrete Lean repair.
     llm_root_speculative_max_elapsed_s: float = 180.0
     falsification_enabled: bool = True
     falsification_max_checks: int = 32
@@ -19091,15 +19092,8 @@ async def run_mini_recursive_attempt(
                     copied = clone_verified_helper(helper)
                     copied.support_names = support_names
                     attempt_dossier.verified_helpers[name] = copied
-            # when the merge
-            # repopulates verified_helpers, also lock the alias map to
-            # the subgoal's authoritative direction (filtered to
-            # surviving names). The merge is incremental — unlike
-            # seed_verified_helpers it preserves attempt_dossier's
-            # pre-existing helpers — so OVERLAY rather than replace.
-            # The overlay still won't invert direction because the
-            # subgoal's alias map is the canonical record built by
-            # record_verified_helper on the subgoal side.
+            # Preserve surviving source aliases, then normalize the combined
+            # map: independent dossiers may choose opposite representatives.
             if hasattr(
                 attempt_dossier, "verified_helper_statement_aliases"
             ) and hasattr(subgoal_dossier, "verified_helper_statement_aliases"):
@@ -19115,6 +19109,9 @@ async def run_mini_recursive_attempt(
                         attempt_dossier.verified_helper_statement_aliases[req] = (
                             canonical
                         )
+                refresh_aliases = getattr(attempt_dossier, "_refresh_verified_helper_statement_aliases", None)
+                if callable(refresh_aliases):
+                    refresh_aliases()
             if getattr(attempt_dossier, "proof_graph", None) is not None:
                 verified_names = set(
                     getattr(attempt_dossier, "verified_helpers", {}) or {}
@@ -20281,6 +20278,7 @@ async def run_mini_recursive_attempt(
         max_conversation_turns: Optional[int] = None,
         speculative_operational_probe: bool = False,
         max_elapsed_s: Optional[float] = None,
+        setup_retry_generation: int = 0,
     ) -> Optional[str] | RootCloseOperationalFailure:
         """Honest root close: run a conversational proof attempt against the
         canonical root with a route-local verified helper context. The model
@@ -20288,6 +20286,8 @@ async def run_mini_recursive_attempt(
         certificate or assembling membership/minimality helpers); Lean verifies
         it. The harness supplies no closing tactic and no answer."""
         nonlocal pending_root_close_promotion
+        if type(setup_retry_generation) is not int or setup_retry_generation not in (0, 1):
+            raise ValueError("Invalid root-close setup retry generation")
         close_deadline_epoch_s = (
             time.time() + max(0.0, float(max_elapsed_s or 0.0))
             if max_elapsed_s else 0.0
@@ -20525,6 +20525,10 @@ async def run_mini_recursive_attempt(
                         separators=(",", ":"),
                     )
                 )
+                + (
+                    f":setup-retry:{setup_retry_generation}"
+                    if setup_retry_generation else ""
+                )
             ),
             session_scope="problem",
         )
@@ -20690,7 +20694,16 @@ async def run_mini_recursive_attempt(
             attempt_dossier, getattr(close_dossier, "checked_failure_feedback", []),
         )
         if getattr(close_conv, "_mini_recursive_child_elapsed_budget_exhausted", False):
-            return RootCloseOperationalFailure("recursive_claim_elapsed_budget_exhausted")
+            return RootCloseOperationalFailure(
+                "recursive_claim_elapsed_budget_exhausted",
+                expired_before_provider_dispatch=(
+                    getattr(
+                        close_conv,
+                        "_mini_recursive_elapsed_budget_expired_before_provider_dispatch",
+                        False,
+                    ) is True
+                ),
+            )
         # A failed root proof still owns independently verified helper work.
         # Import through the same provenance/environment gates as other child
         # results. Timed-out children may remain detached, so only settled
@@ -22699,6 +22712,19 @@ async def run_mini_recursive_driver(
         for item in list(resume_frame.get("llm_root_close_pending_keys") or [])
         if isinstance(item, (list, tuple, set, frozenset))
     }
+    # Setup that expires without provider exposure is not a mathematical
+    # attempt. Keep its bounded retry separate from speculative progress
+    # receipts, so it cannot consume a later checked route's allowance.
+    llm_root_close_setup_retry_keys: set[frozenset[str]] = {
+        frozenset(str(part or "") for part in item if str(part or ""))
+        for item in list(resume_frame.get("llm_root_close_setup_retry_keys") or [])
+        if isinstance(item, (list, tuple, set, frozenset))
+    }
+    llm_root_close_setup_exhausted_keys: set[frozenset[str]] = {
+        frozenset(str(part or "") for part in item if str(part or ""))
+        for item in list(resume_frame.get("llm_root_close_setup_exhausted_keys") or [])
+        if isinstance(item, (list, tuple, set, frozenset))
+    }
     # Root tactic receipts have their own exact execution identities. They can
     # survive a planner-lane handoff even when that lane's full continuation
     # frame is inadmissible; no planner or pass state crosses this boundary.
@@ -23443,6 +23469,20 @@ async def run_mini_recursive_driver(
                 sorted(item)
                 for item in sorted(
                     llm_root_close_pending_keys,
+                    key=lambda value: tuple(sorted(value)),
+                )
+            ],
+            "llm_root_close_setup_retry_keys": [
+                sorted(item)
+                for item in sorted(
+                    llm_root_close_setup_retry_keys,
+                    key=lambda value: tuple(sorted(value)),
+                )
+            ],
+            "llm_root_close_setup_exhausted_keys": [
+                sorted(item)
+                for item in sorted(
+                    llm_root_close_setup_exhausted_keys,
                     key=lambda value: tuple(sorted(value)),
                 )
             ],
@@ -24986,6 +25026,10 @@ async def run_mini_recursive_driver(
         if attempt_key in llm_root_close_attempted_keys:
             _record_llm_root_close_skip("root_close_context_already_attempted")
             return None
+        if attempt_key in llm_root_close_setup_exhausted_keys:
+            _record_llm_root_close_skip("root_close_setup_retry_exhausted")
+            return None
+        setup_retry_generation = int(attempt_key in llm_root_close_setup_retry_keys)
         llm_root_close_pending_keys.add(attempt_key)
         _record(
             record_event,
@@ -25016,6 +25060,7 @@ async def run_mini_recursive_driver(
                 "speculative_provider_dispatch_limit": (
                     2 if speculative_assembly else 0
                 ),
+                "setup_retry_generation": setup_retry_generation,
                 "verdict": "llm_root_close_started",
             },
         )
@@ -25053,6 +25098,10 @@ async def run_mini_recursive_driver(
                 "pass_index": pass_index,
                 "after_helper": after_helper,
             }
+            if setup_retry_generation and _callable_accepts_keyword(
+                prove_root_close, "setup_retry_generation",
+            ):
+                root_close_kwargs["setup_retry_generation"] = setup_retry_generation
             if speculative_assembly:
                 # A bounded follow-up may consume inspection or concrete Lean
                 # repair feedback within the same absolute deadline.
@@ -25127,6 +25176,67 @@ async def run_mini_recursive_driver(
                     "error_type": type(exc).__name__,
                 },
             )
+            return None
+        if (
+            isinstance(proof_text, RootCloseOperationalFailure)
+            and proof_text.expired_before_provider_dispatch is True
+        ):
+            stats.llm_root_close_attempts = max(0, stats.llm_root_close_attempts - 1)
+            if root_close_mode == "helper_set_assembly":
+                stats.llm_root_assembly_attempts = max(
+                    0, stats.llm_root_assembly_attempts - 1,
+                )
+            if speculative_assembly:
+                stats.llm_root_speculative_assembly_attempts = max(
+                    0, stats.llm_root_speculative_assembly_attempts - 1,
+                )
+            retry_allowed = bool(
+                not setup_retry_generation
+                and _callable_accepts_keyword(prove_root_close, "setup_retry_generation")
+            )
+            exhausted = getattr(cost_controller, "exhausted", None)
+            if retry_allowed and callable(exhausted):
+                try:
+                    retry_allowed = not bool(exhausted())
+                except Exception:
+                    retry_allowed = False
+            _record(
+                record_event,
+                {
+                    "phase": "mini_recursive_llm_root_close",
+                    "pass_index": pass_index,
+                    "after_helper": after_helper,
+                    "root_close_mode": root_close_mode,
+                    "assembly_reason": assembly_reason,
+                    "setup_retry_generation": setup_retry_generation,
+                    "failure_reason": proof_text.reason,
+                    "verdict": (
+                        "root_close_setup_zero_work_retry_granted"
+                        if retry_allowed else "root_close_setup_retry_exhausted"
+                    ),
+                },
+            )
+            if retry_allowed:
+                llm_root_close_setup_retry_keys.add(attempt_key)
+                # The recursive call publishes the updated intent before
+                # dispatch. Its fresh identity can replace only the local
+                # lease; the factory still clamps it to every ancestor.
+                return await _maybe_llm_root_close(
+                    after_helper, candidate_statement, candidate_helper_name,
+                    publish_attempt_intent,
+                )
+            llm_root_close_pending_keys.discard(attempt_key)
+            llm_root_close_setup_exhausted_keys.add(attempt_key)
+            if publish_attempt_intent is not None:
+                await publish_attempt_intent()
+            else:
+                await publish_driver_state(
+                    "recursive_llm_root_close_setup_exhausted",
+                    phase="root_close_intent",
+                    pass_index=pass_index,
+                    pass_helper_fingerprints_before=verified_helper_fingerprints_before,
+                    pass_helpers_accepted_before=pass_helpers_before,
+                )
             return None
         llm_root_close_pending_keys.discard(attempt_key)
         llm_root_close_attempted_keys.add(attempt_key)
@@ -40214,8 +40324,20 @@ def _record_tactic_event(
     **extra: Any,
 ) -> None:
     verdict_override = str(extra.pop("verdict_override", "") or "").strip()
+    verdict = verdict_override or ("tactic_solved" if result.ok else "tactic_rejected")
     success_attempt = next(
         (attempt for attempt in result.attempts if attempt.get("ok")), None
+    )
+    # The preview is diagnostic only. A later candidate can fail operationally,
+    # or finish retrying an earlier candidate, beyond its truncation boundary.
+    failure_error_type = (
+        ProofDossier._mini_recursive_failure_error_type({
+            "phase": phase,
+            "verdict": verdict,
+            "tactic_exit_reason": result.exit_reason,
+            "tactic_attempts": result.attempts,
+        })
+        if not result.ok else ""
     )
     _record(
         record_event,
@@ -40225,14 +40347,14 @@ def _record_tactic_event(
             "tactic_candidate_count": result.candidate_count,
             **tactic_attempt_telemetry_fields(result.attempts),
             "tactic_attempts": result.attempts[:10],
+            "tactic_failure_error_type": failure_error_type,
             "tactic_success_attempt": success_attempt,
             "tactic_success_index": (
                 success_attempt.get("index") if success_attempt else None
             ),
             "tactic_elapsed_s": result.elapsed_s,
             "tactic_exit_reason": result.exit_reason,
-            "verdict": verdict_override
-            or ("tactic_solved" if result.ok else "tactic_rejected"),
+            "verdict": verdict,
         },
     )
 

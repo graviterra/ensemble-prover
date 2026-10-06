@@ -9,7 +9,9 @@ import threading
 from typing import Any
 from weakref import WeakKeyDictionary
 
-from ensemble_prover.formalization.environment import _SnapshotBuilder, _imports, _module_file
+from ensemble_prover.formalization.environment import (
+    _SnapshotBuilder, _imports, _module_file, _CAPTURE_CHECK, _check_capture, _file, _read_capture_bytes,
+)
 from ensemble_prover.theorem_project import _lean_name_components
 
 _CACHE: WeakKeyDictionary[Any, dict[str, str]] = WeakKeyDictionary()
@@ -32,6 +34,7 @@ def _local_inputs(project: Path, imports: list[str], sources: dict[str, str]) ->
     seen: set[str] = set()
     result: dict[str, str] = {}
     while pending:
+        _check_capture()
         module = pending.pop()
         if module in seen:
             continue
@@ -46,10 +49,10 @@ def _local_inputs(project: Path, imports: list[str], sources: dict[str, str]) ->
         for path in (source, _module_file(project / ".lake/build/lib/lean", relative, ".olean"),
                      _module_file(project / ".lake/build/lib", relative, ".olean")):
             result[str(path.resolve())] = (
-                hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "missing"
+                _file(path, "project")["sha256"] if path.is_file() else "missing"
             )
         if source.is_file():
-            pending.extend(_imports(source.read_text()))
+            pending.extend(_imports(_read_capture_bytes(source).decode()))
     return result
 
 
@@ -77,8 +80,16 @@ def material_environment_hash(lean: Any, project: Path, config: dict[str, Any], 
         except TypeError:
             # Non-weak-referenceable adapters retain the uncached behavior.
             lock = threading.Lock()
-    with lock:
+    if _CAPTURE_CHECK.get() is None:
+        with lock:
+            return _material_environment_hash(lean, project, config, preamble)
+    while not lock.acquire(timeout=0.01):
+        _check_capture()
+    try:
+        _check_capture()
         return _material_environment_hash(lean, project, config, preamble)
+    finally:
+        lock.release()
 
 
 def _environment_key(lean: Any, project: Path, config: dict[str, Any], preamble: str) -> tuple[str, list[str]]:
@@ -120,6 +131,7 @@ def _material_environment_hash(lean: Any, project: Path, config: dict[str, Any],
     else:
         material = _local_inputs(project, imports, config["project_import_sources"])
     digest = _digest(material)
+    _check_capture()
     try:
         _CACHE.setdefault(owner, {})[key] = digest
     except TypeError:

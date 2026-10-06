@@ -298,6 +298,7 @@ class PreparedControllerChild:
     lane: str
     dispatch_id: str
     record: dict[str, Any]
+    restored_from_checkpoint: bool = False
 
     def publication_allowed(self) -> bool:
         require_current_action_dispatch(self.parent, self.dispatch_id)
@@ -320,6 +321,16 @@ class PreparedControllerChild:
 
     async def complete(self, *, ok: bool, proof: str | None, timed_out: bool) -> None:
         if self.record.get("result") is None:
+            if timed_out and not getattr(
+                getattr(self.child, "_mini_recursive_hard_timeout_lease", None), "abandoned", False,
+            ):
+                # Cancellation has settled; retain operational input and
+                # zero-work evidence from the rolled-back child, never a
+                # cancellation-resistant workspace or a late proof value.
+                self.publication_allowed()
+                await self.registry.commit_session(
+                    self.lane, self.child, publication_guard=self.publication_allowed,
+                )
             await self.registry.complete_child(
                 self.lane, {"ok": ok, "proof": proof, "timed_out": timed_out},
                 publication_guard=self.publication_allowed,
@@ -355,6 +366,7 @@ async def prepare_controller_child(
     }
     lane = f"{parent_lane}/controller:{_digest(descriptor)}"
     existing = registry.child_record(lane)
+    restored_from_checkpoint = existing is not None
     if existing is None:
         frames = registry.child_records_for_parent(parent_lane)
         ordinal = 1 + max((int(item["descriptor"].get("preparation_ordinal", 0))
@@ -393,4 +405,7 @@ async def prepare_controller_child(
     # restore so an older, longer child lease cannot overwrite today's tighter
     # parent/allocation deadline. A restored shorter deadline still wins.
     admitted_limits.intersect_restored(child, parent)
-    return PreparedControllerChild(registry, parent, child, lane, dispatch_id, existing)
+    return PreparedControllerChild(
+        registry, parent, child, lane, dispatch_id, existing,
+        restored_from_checkpoint=restored_from_checkpoint,
+    )

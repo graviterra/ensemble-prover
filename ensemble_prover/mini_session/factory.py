@@ -17,6 +17,7 @@ import time
 import uuid
 import weakref
 from dataclasses import asdict, is_dataclass, replace
+from contextlib import contextmanager
 from functools import partial, update_wrapper
 from pathlib import Path
 from types import SimpleNamespace
@@ -7119,6 +7120,28 @@ def _install_child_mathematical_memory(session: Any, config: Any, allocation: An
                            policy=policy, provenance_registry=registry)
 
 
+@contextmanager
+def _child_theory_promotion_registration(session: Any, parent: Any):
+    """Keep helper publication ownership scoped to preparation and execution."""
+    if not _session_theory_promotion_enabled(session):
+        yield False
+        return
+    from ..proof_state_executor import (
+        register_verified_helper_accept_session,
+        unregister_verified_helper_accept_session,
+    )
+
+    session.theory_verified_helper_accept_callback = partial(_stage_session_verified_helper, session)
+    session.theory_verified_helper_reconcile_callback = partial(_stage_all_session_verified_helpers, session)
+    try:
+        register_verified_helper_accept_session(session.dossier, session)
+        yield True
+    finally:
+        unregister_verified_helper_accept_session(session.dossier)
+        if parent is not None and session.dossier is parent.dossier:
+            register_verified_helper_accept_session(parent.dossier, parent)
+
+
 async def _mini_session_run_conversation_callback(
     **kwargs: Any,
 ) -> Tuple[bool, Optional[str]]:
@@ -7158,11 +7181,15 @@ async def _mini_session_run_conversation_callback(
     speculative_operational_probe = bool(
         kwargs.get("speculative_root_close_operational_probe", False)
     )
+    candidate_replay = kwargs.get("_unverified_root_candidate_replay")
     if speculative_operational_probe:
         # Two responses share the same enclosing wall deadline. The second
         # requires useful tool results or a concrete Lean rejection.
         max_turns = 2
         conv.turn_budget = max_turns
+    if candidate_replay is not None:
+        max_turns = 1
+        conv.turn_budget = 1
     raw_child_tool_cap = max(
         0,
         int(kwargs.get("recursive_conversation_max_tool_calls", 10) or 0),
@@ -7345,6 +7372,10 @@ async def _mini_session_run_conversation_callback(
         session._static_action_receipt_authority = recursive_lane_owner
         session._recursive_lane_authority = recursive_lane_owner
     lane_ledger = _recursive_conversation_lane_ledger(recursive_lane_owner)
+    if candidate_replay is not None:
+        # This child has no provider entitlement. The original paid request
+        # remains charged to its own lane.
+        lane_ledger = None
     lane_token = ""
     lane_allowance = 0
     lane_key = ""
@@ -7691,102 +7722,66 @@ async def _mini_session_run_conversation_callback(
             False,
         )
     )
-    child_promotion_registered = False
-    if _session_theory_promotion_enabled(session):
-        # A recursive child is its own authoritative workspace. Stage from
-        # that dossier immediately so a hard process loss cannot strand an
-        # accepted helper until the outer workspace happens to merge it.
-        session.theory_verified_helper_accept_callback = partial(
-            _stage_session_verified_helper,
-            session,
-        )
-        from ..proof_state_executor import register_verified_helper_accept_session
-
-        register_verified_helper_accept_session(session.dossier, session)
-        session.theory_verified_helper_reconcile_callback = partial(
-            _stage_all_session_verified_helpers,
-            session,
-        )
-        _initialize_promotion_helper_baseline(
-            session,
-            durable_parent_fingerprints=dict(
-                getattr(
-                    theory_parent_session,
-                    "_theory_promotion_helper_fingerprints",
-                    {},
-                )
-                or {}
-            ),
-        )
-        # Retry any inherited helper whose parent receipt was not durably
-        # attested, while coalescing helpers the parent already persisted.
-        _stage_all_session_verified_helpers(session, force=True)
-        child_promotion_registered = True
-    session.max_stagnation = max(3, max_turns + 2)
-    # Parent prove sessions get this from the LLM turn budget. Nested
-    # claim sessions defaulted to max_no_applicable_recoveries=0, so
-    # generation_rotation_ready followed by a single empty select killed
-    # the only prove lane.
-    session.configure_no_applicable_recovery(max_turns)
-
-    if not speculative_operational_probe and session.theory_library is not None:
-        session.register(DomainTheoryAction(stage="retrieve", id="domain_theory"))
-        session.set_budget(
-            "domain_theory",
-            ActionBudget(max_invocations=2, max_total_seconds=0.0),
-        )
-        if getattr(session.theory_library, "mode", "off") == "build":
-            session.register(
-                DomainTheoryAction(
-                    candidate_builder=session.theory_candidate_builder,
-                    stage="build",
-                    id="domain_theory_build",
-                )
+    with _child_theory_promotion_registration(session, theory_parent_session) as child_promotion_registered:
+        if _session_theory_promotion_enabled(session):
+            # A recursive child is its own authoritative workspace. Stage from
+            # that dossier immediately so a hard process loss cannot strand an
+            # accepted helper until the outer workspace happens to merge it.
+            _initialize_promotion_helper_baseline(
+                session,
+                durable_parent_fingerprints=dict(
+                    getattr(
+                        theory_parent_session,
+                        "_theory_promotion_helper_fingerprints",
+                        {},
+                    )
+                    or {}
+                ),
             )
-            # See parent-session note above: theory_need scope ignores a session
-            # time cap; per-build caps + the per-need guard bound theory builds.
+            # Retry any inherited helper whose parent receipt was not durably
+            # attested, while coalescing helpers the parent already persisted.
+            _stage_all_session_verified_helpers(session, force=True)
+        session.max_stagnation = max(3, max_turns + 2)
+        # Parent prove sessions get this from the LLM turn budget. Nested
+        # claim sessions defaulted to max_no_applicable_recoveries=0, so
+        # generation_rotation_ready followed by a single empty select killed
+        # the only prove lane.
+        session.configure_no_applicable_recovery(max_turns)
+
+        if not speculative_operational_probe and session.theory_library is not None:
+            session.register(DomainTheoryAction(stage="retrieve", id="domain_theory"))
             session.set_budget(
-                "domain_theory_build",
-                ActionBudget(max_invocations=4, max_total_seconds=0.0),
+                "domain_theory",
+                ActionBudget(max_invocations=2, max_total_seconds=0.0),
             )
+            if getattr(session.theory_library, "mode", "off") == "build":
+                session.register(
+                    DomainTheoryAction(
+                        candidate_builder=session.theory_candidate_builder,
+                        stage="build",
+                        id="domain_theory_build",
+                    )
+                )
+                # See parent-session note above: theory_need scope ignores a session
+                # time cap; per-build caps + the per-need guard bound theory builds.
+                session.set_budget(
+                    "domain_theory_build",
+                    ActionBudget(max_invocations=4, max_total_seconds=0.0),
+                )
 
-    child_tactics_enabled = bool(kwargs.get("proof_state_child_tactics_enabled", False))
-    if not speculative_operational_probe and child_tactics_enabled:
-        _register_child_session_tactic_actions(
-            session,
-            max_turns=max_turns,
-            kwargs=dict(kwargs),
-        )
-    elif not speculative_operational_probe and session.proof_state is not None:
-        max_nodes = max(1, int(kwargs.get("proof_state_child_goal_limit", 3) or 0))
-        session.register(
-            GraphRouteAssemblyAction(
-                max_routes=max_nodes,
-                root_tactic_timeout_s=float(
-                    kwargs.get(
-                        "root_tactic_timeout_s",
-                        kwargs.get(
-                            "proof_state_child_tactic_timeout_s",
-                            DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-                        ),
-                    )
-                    or 0.0
-                ),
-                root_tactic_max_candidates=int(
-                    kwargs.get(
-                        "root_tactic_max_candidates",
-                        kwargs.get("proof_state_child_tactic_max_candidates", 32),
-                    )
-                    or 0
-                ),
+        child_tactics_enabled = bool(kwargs.get("proof_state_child_tactics_enabled", False))
+        if not speculative_operational_probe and child_tactics_enabled:
+            _register_child_session_tactic_actions(
+                session,
+                max_turns=max_turns,
+                kwargs=dict(kwargs),
             )
-        )
-        session.set_budget(
-            "graph_route_assembly",
-            ActionBudget(
-                max_invocations=max(1, max_turns),
-                max_total_seconds=_route_assembly_budget_seconds(
-                    timeout_s=float(
+        elif not speculative_operational_probe and session.proof_state is not None:
+            max_nodes = max(1, int(kwargs.get("proof_state_child_goal_limit", 3) or 0))
+            session.register(
+                GraphRouteAssemblyAction(
+                    max_routes=max_nodes,
+                    root_tactic_timeout_s=float(
                         kwargs.get(
                             "root_tactic_timeout_s",
                             kwargs.get(
@@ -7796,309 +7791,374 @@ async def _mini_session_run_conversation_callback(
                         )
                         or 0.0
                     ),
+                    root_tactic_max_candidates=int(
+                        kwargs.get(
+                            "root_tactic_max_candidates",
+                            kwargs.get("proof_state_child_tactic_max_candidates", 32),
+                        )
+                        or 0
+                    ),
+                )
+            )
+            session.set_budget(
+                "graph_route_assembly",
+                ActionBudget(
                     max_invocations=max(1, max_turns),
+                    max_total_seconds=_route_assembly_budget_seconds(
+                        timeout_s=float(
+                            kwargs.get(
+                                "root_tactic_timeout_s",
+                                kwargs.get(
+                                    "proof_state_child_tactic_timeout_s",
+                                    DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
+                                ),
+                            )
+                            or 0.0
+                        ),
+                        max_invocations=max(1, max_turns),
+                    ),
                 ),
-            ),
-        )
-        session.register(GraphNativeShortcutAction())
-        session.set_budget(
-            "graph_native_shortcut",
-            ActionBudget(
-                max_invocations=max(1, max_turns * 2),
-                max_total_seconds=30.0,
-            ),
-        )
-
-    if not speculative_operational_probe:
-        _register_child_graph_recursive_decompose_action(
-            session,
-            max_turns=max_turns,
-            kwargs=dict(kwargs),
-            max_recursion_depth=max_recursion_depth,
-        )
-
-    recursive_helper_enabled = bool(
-        kwargs.get("recursive_helper_prover_enabled", False)
-    )
-    recursive_helper_depth_allowed = bool(
-        max_recursion_depth <= 0
-        or int(session.recursion_depth or 0) < max_recursion_depth
-    )
-    if (
-        not speculative_operational_probe
-        and recursive_helper_enabled
-        and child_tactics_enabled
-        and session.proof_state is not None
-        and recursive_helper_depth_allowed
-    ):
-        raw_helper_budget = int(kwargs.get("recursive_helper_budget", 0) or 0)
-        helper_budget = raw_helper_budget if raw_helper_budget > 0 else max_turns
-        session.register(
-            RecursiveHelperProverAction(
-                max_attempts_per_node=int(
-                    kwargs.get("recursive_helper_max_attempts_per_node", 2)
-                    if kwargs.get("recursive_helper_max_attempts_per_node", 2)
-                    is not None
-                    else 2
+            )
+            session.register(GraphNativeShortcutAction())
+            session.set_budget(
+                "graph_native_shortcut",
+                ActionBudget(
+                    max_invocations=max(1, max_turns * 2),
+                    max_total_seconds=30.0,
                 ),
-                helper_turns=int(
-                    kwargs.get("recursive_helper_turns", max_turns) or max_turns
-                ),
-                refine_enabled=bool(kwargs.get("recursive_helper_refine", False)),
-                max_elapsed_s=PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S,
             )
-        )
-        session.set_budget(
-            "recursive_helper_prover",
-            ActionBudget(
-                max_invocations=max(1, int(helper_budget or 1)),
-                max_total_seconds=0.0,
-            ),
-        )
 
-    session.register(
-        ConversationTurnAction(
-            role=role,
-            client=client,
-            sample_temperature=kwargs.get("temperature_override"),
-            mini_phase_temperatures=kwargs.get("mini_phase_temperatures"),
-            # Keep tool/retrieval dispatch on the same isolated child view as
-            # MiniSession.searcher.  Reusing the raw parent kwarg here would
-            # bypass the fork whenever ConversationTurnAction runs.
-            searcher_override=child_searcher,
-            lean_check_tool_enabled=bool(kwargs.get("lean_check_tool_enabled", True)),
-            try_lean_tool_enabled=bool(kwargs.get("try_lean_tool_enabled", True)),
-            compute_examples_tool_enabled=_kwargs_compute_examples_tool_enabled(kwargs),
-            apply_decl_to_goal_tool_enabled=bool(
-                kwargs.get("apply_decl_to_goal_tool_enabled", True)
-            ),
-            max_tool_calls_per_turn=child_tool_calls_per_turn,
-            raw_feedback=bool(kwargs.get("raw_feedback", False)),
-            repair_retrieval_enabled=bool(kwargs.get("repair_retrieval_enabled", True)),
-            repair_retrieval_top_k=int(kwargs.get("repair_retrieval_top_k", 6) or 0),
-            proof_state_child_tactics_enabled=child_tactics_enabled,
-            proof_state_child_tactic_timeout_s=float(
-                kwargs.get(
-                    "proof_state_child_tactic_timeout_s",
-                    DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-                )
-                or 0.0
-            ),
-            proof_state_child_tactic_max_candidates=int(
-                kwargs.get("proof_state_child_tactic_max_candidates", 32) or 0
-            ),
-            proof_state_child_goal_limit=int(
-                kwargs.get("proof_state_child_goal_limit", 3) or 0
-            ),
-            proof_state_decl_application_limit=int(
-                kwargs.get("proof_state_decl_application_limit", 6) or 0
-            ),
-            proof_state_batch_parallelism=int(
-                kwargs.get("proof_state_batch_parallelism", 1) or 1
-            ),
-            max_turns_for_budget=max_turns,
-            llm_turn_elapsed_s=_client_llm_turn_elapsed_budget_s(client),
-            formalization_llm_turn_elapsed_s=_client_llm_turn_elapsed_budget_s(client),
-            provider_dispatch_limit=(2 if speculative_operational_probe else 0),
-            speculative_followthrough_only=speculative_operational_probe,
-        )
-    )
-    session.set_budget(
-        f"conversation_turn_{role}",
-        ActionBudget(max_invocations=max_turns, max_total_seconds=0.0),
-    )
-    parent_memory = getattr(theory_parent_session, "mathematical_memory", None)
-    if parent_memory is not None:
-        _install_child_mathematical_memory(session, parent_memory.config, parent_memory.allocation,
-                                          parent_memory.policy, parent_memory.provenance_registry,
-                                          parent=theory_parent_session)
-    else:
-        _install_child_mathematical_memory(session, kwargs.get("mathematical_memory_config"),
-            kwargs.get("mathematical_memory_allocation"), kwargs.get("mathematical_memory_policy"),
-            kwargs.get("mathematical_memory_provenance_registry"), parent=theory_parent_session)
-    session.expand_max_iterations_to_action_budgets(headroom=4)
-    deadline_epoch_s = max(
-        0.0,
-        float(kwargs.get("action_deadline_epoch_s", 0.0) or 0.0),
-    )
-    if recursive_max_elapsed_s > 0.0:
-        # Setup and checkpoint identity capture consume this same allowance.
-        local_deadline_epoch_s = callback_started_epoch_s + recursive_max_elapsed_s
-        deadline_epoch_s = (
-            min(deadline_epoch_s, local_deadline_epoch_s)
-            if deadline_epoch_s > 0.0 else local_deadline_epoch_s
-        )
-    if theory_parent_session is not None:
-        try:
-            parent_recursive_deadline_epoch_s = float(
-                getattr(
-                    theory_parent_session,
-                    "recursive_elapsed_deadline_epoch_s",
-                    0.0,
-                )
-                or 0.0
-            )
-        except (TypeError, ValueError):
-            parent_recursive_deadline_epoch_s = 0.0
-        if parent_recursive_deadline_epoch_s > 0.0:
-            # The ancestor's durable elapsed authority cannot be reset by a
-            # fresh local child allowance or a replayed nested descriptor.
-            deadline_epoch_s = (
-                parent_recursive_deadline_epoch_s
-                if deadline_epoch_s <= 0.0
-                else min(deadline_epoch_s, parent_recursive_deadline_epoch_s)
-            )
-    # RecursiveHelperProverAction selected inside this nested conversation
-    # inherits the enclosing deadline rather than resetting its allowance.
-    session.recursive_elapsed_deadline_epoch_s = deadline_epoch_s
-    checkpoint_child = None
-    if checkpoint_child_enabled:
-        from .durable_recursive_child import prepare_controller_child
-
-        checkpoint_child = await prepare_controller_child(
-            parent=theory_parent_session, child=session, action=checkpoint_parent_action,
-            nested_invocation_id=str(kwargs.get("nested_invocation_id") or ""),
-            max_turns=max_turns, deadline_epoch_s=deadline_epoch_s,
-            graph_subpass_context=kwargs.get("checkpoint_graph_subpass_context"),
-        )
-        deadline_epoch_s = session.recursive_elapsed_deadline_epoch_s
-    if isinstance(inherited_escalation_state, dict):
-        merge_planner_escalation_failure_state(inherited_escalation_state, session.planner_escalation_failure_state)
-        session.planner_escalation_failure_state = inherited_escalation_state
-    checkpoint_result = checkpoint_child.replay_result() if checkpoint_child is not None else None
-    if lane_ledger is not None:
-        reservation = lane_ledger.try_reserve(
-            lane_key,
-            limit=(1 if speculative_operational_probe else 3),
-        )
-        if reservation is None and checkpoint_result is None:
-            if child_promotion_registered:
-                from ..proof_state_executor import (
-                    register_verified_helper_accept_session,
-                    unregister_verified_helper_accept_session,
-                )
-
-                unregister_verified_helper_accept_session(session.dossier)
-                if (
-                    theory_parent_session is not None
-                    and session.dossier is theory_parent_session.dossier
-                ):
-                    register_verified_helper_accept_session(
-                        theory_parent_session.dossier,
-                        theory_parent_session,
-                    )
-            return _record_lane_exhausted()
-        if reservation is not None:
-            lane_token, lane_allowance = reservation
-            session.max_model_call_deferred_frontier_retries = max(
-                0,
-                lane_allowance - 1,
-            )
-            session.max_model_call_deferred_static_retries = max(
-                0,
-                lane_allowance - 1,
-            )
-    completed_normally = False
-    child_run_settled = False
-    timed_out = False
-    reporting_parent_dossier = kwargs.get("reporting_parent_dossier")
-    if reporting_parent_dossier is None:
-        reporting_parent_dossier = getattr(theory_parent_session, "dossier", None)
-    if (
-        reporting_parent_dossier is not None
-        and reporting_parent_dossier is not session.dossier
-        and not callable(getattr(session.dossier, "_monotonic_tool_metric_sink", None))
-    ):
-        # Mirror new execution-audit events while the child is running, including
-        # late cancellation callbacks. Restored/cloned totals are already history;
-        # this runtime-only sink forwards no historical counts or proof authority.
-        _install_parallel_monotonic_metric_sink(
-            session.dossier, reporting_parent_dossier,
-        )
-    reporting_baseline = {
-        key: int(getattr(session.dossier, "tool_metrics", {}).get(key, 0) or 0)
-        for key in _RECURSIVE_CHILD_REPORTING_METRICS
-    }
-    try:
-        from .recursive_helper_prover import _run_child_with_elapsed_budget
-
-        if checkpoint_result is not None:
-            ok, proof, timed_out = checkpoint_result
-        else:
-            ok, proof, timed_out = await _run_child_with_elapsed_budget(
+        if not speculative_operational_probe:
+            _register_child_graph_recursive_decompose_action(
                 session,
-                max_elapsed_s=recursive_max_elapsed_s,
-                deadline_epoch_s=deadline_epoch_s,
+                max_turns=max_turns,
+                kwargs=dict(kwargs),
+                max_recursion_depth=max_recursion_depth,
             )
-        child_run_settled = True
-        result = (ok, proof)
-        if timed_out:
-            setattr(conv, "_mini_recursive_child_elapsed_budget_exhausted", True)
-            increment_metric = getattr(dossier, "increment_tool_metric", None)
-            if callable(increment_metric):
-                increment_metric("mini_recursive_child_elapsed_budget_exhausted", 1)
-            recorder = kwargs.get("recorder")
-            record_turn = getattr(recorder, "record_turn", None)
-            if callable(record_turn):
-                record_turn(
-                    {
-                        "phase": "mini_recursive_child_conversation",
-                        "role": role,
-                        "theorem_name": theorem_name,
-                        "max_elapsed_s": recursive_max_elapsed_s,
-                        "action_deadline_epoch_s": deadline_epoch_s,
-                        "verdict": "recursive_claim_elapsed_budget_exhausted",
-                    }
+
+        recursive_helper_enabled = bool(
+            kwargs.get("recursive_helper_prover_enabled", False)
+        )
+        recursive_helper_depth_allowed = bool(
+            max_recursion_depth <= 0
+            or int(session.recursion_depth or 0) < max_recursion_depth
+        )
+        if (
+            not speculative_operational_probe
+            and recursive_helper_enabled
+            and child_tactics_enabled
+            and session.proof_state is not None
+            and recursive_helper_depth_allowed
+        ):
+            raw_helper_budget = int(kwargs.get("recursive_helper_budget", 0) or 0)
+            helper_budget = raw_helper_budget if raw_helper_budget > 0 else max_turns
+            session.register(
+                RecursiveHelperProverAction(
+                    max_attempts_per_node=int(
+                        kwargs.get("recursive_helper_max_attempts_per_node", 2)
+                        if kwargs.get("recursive_helper_max_attempts_per_node", 2)
+                        is not None
+                        else 2
+                    ),
+                    helper_turns=int(
+                        kwargs.get("recursive_helper_turns", max_turns) or max_turns
+                    ),
+                    refine_enabled=bool(kwargs.get("recursive_helper_refine", False)),
+                    max_elapsed_s=PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S,
                 )
-        completed_normally = True
-    finally:
+            )
+            session.set_budget(
+                "recursive_helper_prover",
+                ActionBudget(
+                    max_invocations=max(1, int(helper_budget or 1)),
+                    max_total_seconds=0.0,
+                ),
+            )
+
+        session.register(
+            ConversationTurnAction(
+                role=role,
+                client=client,
+                sample_temperature=kwargs.get("temperature_override"),
+                mini_phase_temperatures=kwargs.get("mini_phase_temperatures"),
+                # Keep tool/retrieval dispatch on the same isolated child view as
+                # MiniSession.searcher.  Reusing the raw parent kwarg here would
+                # bypass the fork whenever ConversationTurnAction runs.
+                searcher_override=child_searcher,
+                lean_check_tool_enabled=bool(kwargs.get("lean_check_tool_enabled", True)),
+                try_lean_tool_enabled=bool(kwargs.get("try_lean_tool_enabled", True)),
+                compute_examples_tool_enabled=_kwargs_compute_examples_tool_enabled(kwargs),
+                apply_decl_to_goal_tool_enabled=bool(
+                    kwargs.get("apply_decl_to_goal_tool_enabled", True)
+                ),
+                max_tool_calls_per_turn=child_tool_calls_per_turn,
+                raw_feedback=bool(kwargs.get("raw_feedback", False)),
+                repair_retrieval_enabled=bool(kwargs.get("repair_retrieval_enabled", True)),
+                repair_retrieval_top_k=int(kwargs.get("repair_retrieval_top_k", 6) or 0),
+                proof_state_child_tactics_enabled=child_tactics_enabled,
+                proof_state_child_tactic_timeout_s=float(
+                    kwargs.get(
+                        "proof_state_child_tactic_timeout_s",
+                        DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
+                    )
+                    or 0.0
+                ),
+                proof_state_child_tactic_max_candidates=int(
+                    kwargs.get("proof_state_child_tactic_max_candidates", 32) or 0
+                ),
+                proof_state_child_goal_limit=int(
+                    kwargs.get("proof_state_child_goal_limit", 3) or 0
+                ),
+                proof_state_decl_application_limit=int(
+                    kwargs.get("proof_state_decl_application_limit", 6) or 0
+                ),
+                proof_state_batch_parallelism=int(
+                    kwargs.get("proof_state_batch_parallelism", 1) or 1
+                ),
+                max_turns_for_budget=max_turns,
+                llm_turn_elapsed_s=_client_llm_turn_elapsed_budget_s(client),
+                formalization_llm_turn_elapsed_s=_client_llm_turn_elapsed_budget_s(client),
+                provider_dispatch_limit=(2 if speculative_operational_probe else 0),
+                speculative_followthrough_only=(speculative_operational_probe and candidate_replay is None),
+            )
+        )
+        session.set_budget(
+            f"conversation_turn_{role}",
+            ActionBudget(max_invocations=max_turns, max_total_seconds=0.0),
+        )
+        parent_memory = getattr(theory_parent_session, "mathematical_memory", None)
+        if parent_memory is not None:
+            _install_child_mathematical_memory(session, parent_memory.config, parent_memory.allocation,
+                                              parent_memory.policy, parent_memory.provenance_registry,
+                                              parent=theory_parent_session)
+        else:
+            _install_child_mathematical_memory(session, kwargs.get("mathematical_memory_config"),
+                kwargs.get("mathematical_memory_allocation"), kwargs.get("mathematical_memory_policy"),
+                kwargs.get("mathematical_memory_provenance_registry"), parent=theory_parent_session)
+        session.expand_max_iterations_to_action_budgets(headroom=4)
+        deadline_epoch_s = max(
+            0.0,
+            float(kwargs.get("action_deadline_epoch_s", 0.0) or 0.0),
+        )
+        if recursive_max_elapsed_s > 0.0:
+            # Setup and checkpoint identity capture consume this same allowance.
+            local_deadline_epoch_s = callback_started_epoch_s + recursive_max_elapsed_s
+            deadline_epoch_s = (
+                min(deadline_epoch_s, local_deadline_epoch_s)
+                if deadline_epoch_s > 0.0 else local_deadline_epoch_s
+            )
+        if theory_parent_session is not None:
+            try:
+                parent_recursive_deadline_epoch_s = float(
+                    getattr(
+                        theory_parent_session,
+                        "recursive_elapsed_deadline_epoch_s",
+                        0.0,
+                    )
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                parent_recursive_deadline_epoch_s = 0.0
+            if parent_recursive_deadline_epoch_s > 0.0:
+                # The ancestor's durable elapsed authority cannot be reset by a
+                # fresh local child allowance or a replayed nested descriptor.
+                deadline_epoch_s = (
+                    parent_recursive_deadline_epoch_s
+                    if deadline_epoch_s <= 0.0
+                    else min(deadline_epoch_s, parent_recursive_deadline_epoch_s)
+                )
+        # RecursiveHelperProverAction selected inside this nested conversation
+        # inherits the enclosing deadline rather than resetting its allowance.
+        session.recursive_elapsed_deadline_epoch_s = deadline_epoch_s
+        conv._mini_recursive_provider_exposure_observed = True
+        if candidate_replay is not None:
+            from .unverified_candidate import replay_state, validate_candidate_async
+
+            if not speculative_operational_probe or not await validate_candidate_async(
+                candidate_replay, session, deadline_epoch_s=deadline_epoch_s,
+            ):
+                return False, None
+            replay_deadline = _candidate_replay_deadline(candidate=candidate_replay, parent=theory_parent_session)
+            deadline_epoch_s = min(deadline_epoch_s, replay_deadline) if deadline_epoch_s > 0 else replay_deadline
+            session.recursive_elapsed_deadline_epoch_s = deadline_epoch_s
+            conv._unverified_root_candidate_replay = copy.deepcopy(candidate_replay)
+            conv._provider_call_quantum_state = replay_state(candidate_replay, conv)
+        checkpoint_child = None
+        if checkpoint_child_enabled:
+            from .durable_recursive_child import prepare_controller_child
+
+            checkpoint_child = await prepare_controller_child(
+                parent=theory_parent_session, child=session, action=checkpoint_parent_action,
+                nested_invocation_id=str(kwargs.get("nested_invocation_id") or ""),
+                max_turns=max_turns, deadline_epoch_s=deadline_epoch_s,
+                graph_subpass_context=kwargs.get("checkpoint_graph_subpass_context"),
+            )
+            deadline_epoch_s = session.recursive_elapsed_deadline_epoch_s
+        if isinstance(inherited_escalation_state, dict):
+            merge_planner_escalation_failure_state(inherited_escalation_state, session.planner_escalation_failure_state)
+            session.planner_escalation_failure_state = inherited_escalation_state
+        checkpoint_result = checkpoint_child.replay_result() if checkpoint_child is not None else None
+        session._retain_cancelled_root_candidate = speculative_operational_probe and candidate_replay is None
+        if lane_ledger is not None:
+            reservation = lane_ledger.try_reserve(
+                lane_key,
+                limit=(1 if speculative_operational_probe else 3),
+            )
+            if reservation is None and checkpoint_result is None:
+                return _record_lane_exhausted()
+            if reservation is not None:
+                lane_token, lane_allowance = reservation
+                session.max_model_call_deferred_frontier_retries = max(
+                    0,
+                    lane_allowance - 1,
+                )
+                session.max_model_call_deferred_static_retries = max(
+                    0,
+                    lane_allowance - 1,
+                )
+        completed_normally = False
+        child_run_settled = False
+        timed_out = False
+        reporting_parent_dossier = kwargs.get("reporting_parent_dossier")
+        if reporting_parent_dossier is None:
+            reporting_parent_dossier = getattr(theory_parent_session, "dossier", None)
         if (
             reporting_parent_dossier is not None
             and reporting_parent_dossier is not session.dossier
+            and not callable(getattr(session.dossier, "_monotonic_tool_metric_sink", None))
         ):
-            # Prove/refine callbacks reuse a dossier, and a restored child can
-            # already contain earlier totals. Forward only work since entry.
-            child_metrics = getattr(session.dossier, "tool_metrics", {}) or {}
-            reporting_delta = {
-                key: max(0, int(child_metrics.get(key, 0) or 0) - before)
-                for key, before in reporting_baseline.items()
-            }
-            _merge_dossier_tool_metrics(
-                reporting_parent_dossier,
-                SimpleNamespace(tool_metrics=reporting_delta),
+            # Mirror new execution-audit events while the child is running, including
+            # late cancellation callbacks. Restored/cloned totals are already history;
+            # this runtime-only sink forwards no historical counts or proof authority.
+            _install_parallel_monotonic_metric_sink(
+                session.dossier, reporting_parent_dossier,
             )
-        if lane_ledger is not None and lane_token:
-            try:
-                charged_attempts = _recursive_conversation_lane_paid_failure_count(
-                    session,
-                    include_unapplied_exposure=(timed_out or not child_run_settled),
-                )
-            except Exception:
-                charged_attempts = 0
-            lane_ledger.settle(
-                lane_token,
-                charge_count=charged_attempts,
-            )
-        if child_promotion_registered:
-            try:
-                _stage_all_session_verified_helpers(session, force=True)
-            except Exception:
-                pass
-            from ..proof_state_executor import (
-                register_verified_helper_accept_session,
-                unregister_verified_helper_accept_session,
-            )
+        reporting_baseline = {
+            key: int(getattr(session.dossier, "tool_metrics", {}).get(key, 0) or 0)
+            for key in _RECURSIVE_CHILD_REPORTING_METRICS
+        }
+        try:
+            from .recursive_helper_prover import _run_child_with_elapsed_budget
 
-            unregister_verified_helper_accept_session(session.dossier)
-            if (
-                theory_parent_session is not None
-                and session.dossier is theory_parent_session.dossier
+            if checkpoint_result is not None:
+                ok, proof, timed_out = checkpoint_result
+            elif (
+                candidate_replay is None and speculative_operational_probe
+                and getattr(session.conv, "_unverified_root_candidate", None)
             ):
-                register_verified_helper_accept_session(
-                    theory_parent_session.dossier,
-                    theory_parent_session,
+                # A process may have stopped after cancellation input was saved
+                # but before its result receipt. Verify that input first; never
+                # repeat synthesis merely because the child was incomplete.
+                from .unverified_candidate import validate_candidate_async
+
+                retained = session.conv._unverified_root_candidate
+                if await validate_candidate_async(retained, session, deadline_epoch_s=float(
+                    getattr(theory_parent_session, "recursive_elapsed_deadline_epoch_s", 0.0) or 0.0,
+                )) and (
+                    checkpoint_child is not None
+                    or getattr(session.conv, "_unverified_candidate_replay_attempted", "") != retained["digest"]
+                ):
+                    ok, proof, timed_out = False, None, True
+                else:
+                    ok, proof, timed_out = await _run_child_with_elapsed_budget(
+                        session, max_elapsed_s=recursive_max_elapsed_s,
+                        deadline_epoch_s=deadline_epoch_s,
+                    )
+            else:
+                ok, proof, timed_out = await _run_child_with_elapsed_budget(
+                    session,
+                    max_elapsed_s=recursive_max_elapsed_s,
+                    deadline_epoch_s=deadline_epoch_s,
                 )
-        _snapshot_session_state_for_caller(session)
+            child_run_settled = True
+            result = (ok, proof)
+            if timed_out:
+                from .recursive_helper_prover import _child_provider_exposure
+
+                conv._mini_recursive_elapsed_budget_expired_before_provider_dispatch = bool(
+                    getattr(session.conv, "_mini_recursive_provider_exposure_observed", False)
+                    and not (checkpoint_child is not None and checkpoint_child.restored_from_checkpoint)
+                    and not any(_child_provider_exposure(session, include_inflight=True))
+                    and not getattr(session.conv, "_unverified_root_candidate", None)
+                    and not session.root_finalized
+                    and not getattr(
+                        getattr(session, "_mini_recursive_hard_timeout_lease", None), "abandoned", False,
+                    )
+                    and checkpoint_result is None
+                ) if checkpoint_result is None else bool(getattr(
+                    session.conv, "_mini_recursive_elapsed_budget_expired_before_provider_dispatch", False,
+                ))
+                setattr(conv, "_mini_recursive_child_elapsed_budget_exhausted", True)
+                increment_metric = getattr(dossier, "increment_tool_metric", None)
+                if callable(increment_metric):
+                    increment_metric("mini_recursive_child_elapsed_budget_exhausted", 1)
+                recorder = kwargs.get("recorder")
+                record_turn = getattr(recorder, "record_turn", None)
+                if callable(record_turn):
+                    record_turn(
+                        {
+                            "phase": "mini_recursive_child_conversation",
+                            "role": role,
+                            "theorem_name": theorem_name,
+                            "max_elapsed_s": recursive_max_elapsed_s,
+                            "action_deadline_epoch_s": deadline_epoch_s,
+                            "verdict": "recursive_claim_elapsed_budget_exhausted",
+                        }
+                    )
+            completed_normally = True
+        finally:
+            if (
+                reporting_parent_dossier is not None
+                and reporting_parent_dossier is not session.dossier
+            ):
+                # Prove/refine callbacks reuse a dossier, and a restored child can
+                # already contain earlier totals. Forward only work since entry.
+                child_metrics = getattr(session.dossier, "tool_metrics", {}) or {}
+                reporting_delta = {
+                    key: max(0, int(child_metrics.get(key, 0) or 0) - before)
+                    for key, before in reporting_baseline.items()
+                }
+                _merge_dossier_tool_metrics(
+                    reporting_parent_dossier,
+                    SimpleNamespace(tool_metrics=reporting_delta),
+                )
+            if lane_ledger is not None and lane_token:
+                try:
+                    charged_attempts = _recursive_conversation_lane_paid_failure_count(
+                        session,
+                        include_unapplied_exposure=(timed_out or not child_run_settled),
+                    )
+                except Exception:
+                    charged_attempts = 0
+                lane_ledger.settle(
+                    lane_token,
+                    charge_count=charged_attempts,
+                )
+            if child_promotion_registered:
+                try:
+                    _stage_all_session_verified_helpers(session, force=True)
+                except Exception:
+                    pass
+            _snapshot_session_state_for_caller(session)
+            if (
+                not completed_normally and checkpoint_child is not None
+                and getattr(session.conv, "_unverified_root_candidate", None)
+                and not getattr(
+                    getattr(session, "_mini_recursive_hard_timeout_lease", None), "abandoned", False,
+                )
+            ):
+                # Preserve settled unverified input on external cancellation too.
+                # Keep the child incomplete and retain the original ancestor and
+                # verifier deadlines. Revoked ownership cannot publish this data.
+                try:
+                    await checkpoint_child.registry.commit_session(
+                        checkpoint_child.lane, session,
+                        publication_guard=checkpoint_child.publication_allowed,
+                    )
+                except Exception:
+                    # Preserve the original cancellation/failure when its owner
+                    # has already revoked this checkpoint publication.
+                    pass
     durable_role_counts = getattr(
         session,
         "_conversation_role_turn_counts",
@@ -8187,7 +8247,81 @@ async def _mini_session_run_conversation_callback(
             pass
     if checkpoint_child is not None:
         await checkpoint_child.complete(ok=ok, proof=proof, timed_out=timed_out)
+    if timed_out and candidate_replay is None and speculative_operational_probe:
+        from .unverified_candidate import validate_candidate_async
+
+        candidate = getattr(session.conv, "_unverified_root_candidate", None)
+        candidate_deadline = candidate.get("verification_deadline_epoch_s") if type(candidate) is dict else None
+        if (type(candidate_deadline) in {int, float} and math.isfinite(candidate_deadline)
+                and _candidate_replay_deadline(candidate=candidate, parent=theory_parent_session) <= time.time()):
+            record_turn = getattr(kwargs.get("recorder"), "record_turn", None)
+            if callable(record_turn):
+                record_turn({
+                    "phase": "mini_recursive_candidate_verification",
+                    "verdict": "unverified_candidate_verification_deadline_exhausted",
+                    "candidate_digest": str(candidate.get("digest", "")),
+                    "theorem_name": theorem_name, "remaining_s": 0.0,
+                })
+            return result
+        if candidate and await validate_candidate_async(candidate, session, deadline_epoch_s=float(
+            getattr(theory_parent_session, "recursive_elapsed_deadline_epoch_s", 0.0) or 0.0,
+        )):
+            if checkpoint_child is None and getattr(
+                session.conv, "_unverified_candidate_replay_attempted", "",
+            ) == candidate["digest"]:
+                return result
+            deadline = _candidate_replay_deadline(candidate=candidate, parent=theory_parent_session)
+            def record_candidate_replay(verdict: str, **details: Any) -> None:
+                record_turn = getattr(kwargs.get("recorder"), "record_turn", None)
+                if callable(record_turn):
+                    record_turn({
+                        "phase": "mini_recursive_candidate_verification",
+                        "verdict": verdict,
+                        "candidate_digest": candidate["digest"],
+                        "theorem_name": theorem_name,
+                        "remaining_s": max(0.0, deadline - time.time()),
+                        **details,
+                    })
+
+            if deadline > time.time():
+                if checkpoint_child is None:
+                    session.conv._unverified_candidate_replay_attempted = candidate["digest"]
+                replay_kwargs = dict(kwargs)
+                replay_kwargs.update(
+                    conv=session.conv, dossier=session.dossier,
+                    _unverified_root_candidate_replay=candidate,
+                    max_turns=1, recursive_conversation_max_elapsed_s=0.0,
+                    action_deadline_epoch_s=deadline,
+                    nested_invocation_id=str(kwargs.get("nested_invocation_id") or "")
+                    + ":candidate:" + candidate["digest"],
+                )
+                paid_turns_used = getattr(conv, "_last_run_turns_used", 0)
+                previous_quantum = copy.deepcopy(getattr(conv, "_provider_call_quantum_state", None))
+                record_candidate_replay("unverified_candidate_verification_started")
+                try:
+                    recovered = await _mini_session_run_conversation_callback(**replay_kwargs)
+                    record_candidate_replay("unverified_candidate_verification_finished", accepted=bool(recovered[0]))
+                finally:
+                    # Rechecking retained input consumes no synthesis turn.
+                    conv._last_run_turns_used = paid_turns_used
+                    conv.__dict__.pop("_unverified_root_candidate_replay", None)
+                    if previous_quantum is None:
+                        conv.__dict__.pop("_provider_call_quantum_state", None)
+                    else:
+                        conv._provider_call_quantum_state = previous_quantum
+                if recovered[0]:
+                    conv._mini_recursive_child_elapsed_budget_exhausted = False
+                    return recovered
+            else:
+                record_candidate_replay("unverified_candidate_verification_deadline_exhausted")
     return result
+
+
+def _candidate_replay_deadline(*, candidate: Mapping[str, Any], parent: Any) -> float:
+    """Reuse the allowance started at the first verifier dispatch, without renewal."""
+    deadline = float(candidate["verification_deadline_epoch_s"])
+    ancestor = float(getattr(parent, "recursive_elapsed_deadline_epoch_s", 0.0) or 0.0)
+    return min(deadline, ancestor) if ancestor > 0.0 else deadline
 
 
 def _bind_theory_parent_callback(session: MiniSession, **inherited_kwargs: Any):

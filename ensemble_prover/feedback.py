@@ -239,7 +239,7 @@ def helper_inventory_hint_for_unknown_identifier(
     # Prefer the deduplicated LLM-facing view; fall back for dossiers
     # that do not expose it (e.g., a SimpleNamespace stub).
     blocks_getter = getattr(
-        dossier, "verified_helper_blocks_unique_by_statement", None
+        dossier, "verified_helper_blocks_unique_by_fact", None
     ) or getattr(dossier, "verified_helper_blocks", None)
     if blocks_getter is None:
         return None

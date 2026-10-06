@@ -457,6 +457,10 @@ async def _run_child_with_elapsed_budget(
             )
         return False, None, True
 
+    child_conv = getattr(child_session, "conv", None)
+    if child_conv is not None:
+        child_conv._mini_recursive_elapsed_budget_expired_before_run = False
+
     cleanup_allowance_s = max(
         0.001,
         float(
@@ -485,7 +489,64 @@ async def _run_child_with_elapsed_budget(
     _install_recursive_helper_capability_fence(child_session, mutation_lease)
     child_context.run(_CURRENT_HARD_TIMEOUT_LEASE.set, mutation_lease)
     setattr(child_session, "_mini_recursive_hard_timeout_lease", mutation_lease)
-    task = child_context.run(asyncio.create_task, child_session.run())
+    cancelled_candidate: dict[str, Any] = {}
+    retain_candidate = child_conv is not None and getattr(child_session, "_retain_cancelled_root_candidate", False)
+    identity_task = None
+
+    def start_child_task(awaitable: Any) -> asyncio.Task:
+        try:
+            return child_context.run(asyncio.create_task, awaitable)
+        except BaseException:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            raise
+
+    if retain_candidate:
+        from .unverified_candidate import candidate_project_hash
+
+        # Optional identity capture overlaps productive work. A cold Mathlib
+        # closure must neither block the loop nor consume all setup headroom.
+        identity_task = start_child_task(candidate_project_hash(
+            child_session, deadline_epoch_s=(durable_deadline or time.time() + 300.0),
+        ))
+
+    def finish_identity() -> str:
+        if identity_task is None:
+            return ""
+        if not identity_task.done():
+            identity_task.cancel()
+            identity_task.add_done_callback(
+                lambda finished: finished.exception() if not finished.cancelled() else None,
+            )
+            return ""
+        try:
+            return identity_task.result()
+        except (asyncio.CancelledError, Exception):
+            return ""
+
+    def retain_cancelled_input(record: dict) -> None:
+        if not mutation_lease.abandoned:
+            cancelled_candidate.clear()
+            cancelled_candidate.update(copy.deepcopy(record))
+
+    if retain_candidate:
+        child_conv._unverified_candidate_cancellation_sink = retain_cancelled_input
+    if durable_deadline > 0.0:
+        remaining_s = max(0.0, durable_deadline - time.time())
+        if remaining_s <= 0.0:
+            if child_conv is not None:
+                child_conv.__dict__.pop("_unverified_candidate_cancellation_sink", None)
+                child_conv._mini_recursive_elapsed_budget_expired_before_run = True
+            child_session._mini_recursive_elapsed_budget_expired_before_run = True
+            finish_identity()
+            return False, None, True
+    try:
+        task = start_child_task(child_session.run())
+    except BaseException:
+        finish_identity()
+        if child_conv is not None:
+            child_conv.__dict__.pop("_unverified_candidate_cancellation_sink", None)
+        raise
 
     async def drain_cancelled_child(
         *,
@@ -500,7 +561,9 @@ async def _run_child_with_elapsed_budget(
 
         caller_cancellation = initial_cancellation
         cleanup_deadline = time.monotonic() + cleanup_allowance_s
-        while not task.done():
+        while not task.done() or (
+            cancelled_candidate and identity_task is not None and not identity_task.done()
+        ):
             cleanup_remaining_s = cleanup_deadline - time.monotonic()
             if cleanup_remaining_s <= 0.0:
                 break
@@ -508,12 +571,16 @@ async def _run_child_with_elapsed_budget(
                 # ``asyncio.wait`` deliberately avoids forwarding later
                 # caller cancellations into a child already performing its
                 # owned provider settlement.
-                await asyncio.wait({task}, timeout=cleanup_remaining_s)
+                pending = {task} if not task.done() else {identity_task}
+                await asyncio.wait(pending, timeout=cleanup_remaining_s)
             except asyncio.CancelledError as cancellation:
                 caller_cancellation = caller_cancellation or cancellation
                 continue
 
         cleanup_timed_out = not task.done()
+        project_hash = finish_identity()
+        if child_conv is not None:
+            child_conv.__dict__.pop("_unverified_candidate_cancellation_sink", None)
         if cleanup_timed_out:
             # Revoke all child-held shared capabilities first. The same lease
             # lives in the child's copied Context and in every facade already
@@ -544,6 +611,18 @@ async def _run_child_with_elapsed_budget(
         try:
             task.result()
         except asyncio.CancelledError as child_cancellation:
+            candidate = cancelled_candidate or getattr(child_cancellation, "mini_unverified_root_candidate", None)
+            if candidate:
+                # The action transaction has now rolled back. Retain input
+                # data only; a detached tail never reaches this boundary.
+                from .unverified_candidate import bind_candidate
+
+                try:
+                    bound = bind_candidate(candidate, project_hash=project_hash)
+                except Exception:
+                    bound = {}
+                if bound:
+                    child_session.conv._unverified_root_candidate = bound
             if bool(
                 getattr(
                     child_cancellation,
@@ -582,6 +661,9 @@ async def _run_child_with_elapsed_budget(
             )
         raise caller_cancellation
     if task in done:
+        finish_identity()
+        if child_conv is not None:
+            child_conv.__dict__.pop("_unverified_candidate_cancellation_sink", None)
         ok, proof = task.result()
         return bool(ok), proof, False
 

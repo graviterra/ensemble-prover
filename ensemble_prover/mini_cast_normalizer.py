@@ -10,8 +10,11 @@ tactic closers.
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass
 from typing import Any, Sequence
+
+from .proof_graph import graph_exact_statement_text
 
 
 _SCALAR_CAST_SYMBOL_MARKERS = (
@@ -434,9 +437,9 @@ def cast_normalization_scripts(
 def cast_normalization_context_key(text: str, helper_names: Sequence[str] = ()) -> str:
     """Build a stable exact-context key for one cast-normalization pass."""
 
-    compact_goal = " ".join(str(text or "").split())
-    helpers = ",".join(sorted(str(name or "").strip() for name in helper_names if str(name or "").strip()))
-    return f"{compact_goal}|helpers={helpers}"
+    goal = graph_exact_statement_text(text)
+    helpers = [str(name or "") for name in helper_names]
+    return "lean_surface_v3:" + json.dumps([goal, helpers], ensure_ascii=False)
 
 
 def cast_side_condition_goal_count(attempts: Sequence[Any]) -> int:

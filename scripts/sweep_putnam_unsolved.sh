@@ -2,8 +2,9 @@
 # Usage: scripts/sweep_putnam_unsolved.sh [sweep options] -- [MiniProver options]
 # Resume with --resume SWEEP_DIR; saved provider arguments and deadlines apply.
 # Uses sweep acceptance deadlines; single-run unattended limits are not added.
-# Skips all existing exported problems by default; --solved-policy verified opts in
-# to the manifest-based filter. Selection does not change proof audit status.
+# Skips existing exports in runs/mini_prover/solved by default.
+# --solved-policy verified opts in to the manifest-based filter.
+# Selection does not change proof audit status.
 set -euo pipefail
 sweep_repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$sweep_repo_root"

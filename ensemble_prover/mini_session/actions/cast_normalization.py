@@ -34,6 +34,7 @@ from ensemble_prover.tactic_attempt_telemetry import (
 )
 
 from ..action import MiniOutcome
+from ..tactic_source_suppression import helper_fingerprints
 
 
 class CastNormalizationAction:
@@ -520,20 +521,9 @@ class CastNormalizationAction:
         helper_names: tuple[str, ...] | None = None,
         helper_blocks: tuple[str, ...] | None = None,
     ) -> str:
+        del helper_names
         blocks = helper_blocks if helper_blocks is not None else self._helper_blocks(session)
-        names = helper_names if helper_names is not None else self._helper_names(blocks)
-        block_by_name = {
-            name: block
-            for block in blocks
-            for name in [helper_decl_name(block)]
-            if name
-        }
-        helper_fingerprints = tuple(
-            f"{name}:{text_hash(block_by_name.get(name, ''))}"
-            for name in names
-            if str(name or "").strip()
-        )
-        base_key = cast_normalization_context_key(goal, helper_fingerprints)
+        base_key = cast_normalization_context_key(goal, helper_fingerprints(blocks))
         generation_identity = getattr(
             session,
             "lean_capability_generation_identity",

@@ -68,8 +68,9 @@ from .proof_graph import (
     graph_statement_is_executable,
     graph_statement_key,
     graph_statement_leading_contract,
+    graph_exact_statement_text,
     helper_decl_body,
-    helper_decl_kind,
+    helper_decl_kind as helper_decl_kind,
     helper_decl_name as graph_helper_decl_name,
     helper_decl_statement,
 )
@@ -1550,7 +1551,9 @@ def _prompt_safe_code_snippet(
         return []
     if len(safe) > limit:
         safe = safe[: max(0, limit - 3)].rstrip() + "..."
-    lines = [" ".join(line.rstrip().split()) for line in safe.splitlines()]
+    # Leading indentation determines the scope of nested Lean proof blocks.
+    # Keep it when presenting accepted source for subsequent proof repair.
+    lines = [line.rstrip() for line in safe.splitlines()]
     return [line for line in lines if line][:10]
 
 
@@ -1869,6 +1872,8 @@ def _active_root_statement_from_hypotheses(
     target: str,
     hypotheses: Sequence[str],
 ) -> str:
+    from .utils import _first_top_level_assign, _first_top_level_colon
+
     body = str(target or "").strip()
     pending_binders: List[str] = []
 
@@ -1883,13 +1888,13 @@ def _active_root_statement_from_hypotheses(
         text = str(hyp or "").strip()
         if not text:
             continue
-        if ":=" in text:
+        if _first_top_level_assign(text) >= 0:
             flush_binders()
             let_text = text.rstrip(";")
             prefix = let_text if let_text.startswith("let ") else f"let {let_text}"
             body = f"{prefix}; {body}"
             continue
-        if ":" not in text or "\n" in text or "⊢" in text:
+        if _first_top_level_colon(text) < 0:
             continue
         pending_binders.append(f"({text})")
     flush_binders()
@@ -1939,13 +1944,13 @@ def active_root_target_statement(
         return ""
     rendered: List[str] = []
     for item in targets[:1 if require_single else len(targets)]:
-        target = " ".join(
-            str(item.get("working_target") or item.get("target") or "").split()
-        ).strip()
+        target = graph_exact_statement_text(
+            str(item.get("working_target") or item.get("target") or "")
+        )
         if not target:
             continue
         hypotheses = [
-            " ".join(str(hyp or "").split()).strip()
+            graph_exact_statement_text(str(hyp or ""))
             for hyp in list(item.get("hypotheses") or ())
             if str(hyp or "").strip()
         ]
@@ -1953,12 +1958,9 @@ def active_root_target_statement(
             return ""
         if include_hypotheses and hypotheses:
             rendered.append(
-                " ".join(
-                    _active_root_statement_from_hypotheses(
-                        target,
-                        hypotheses,
-                    ).split()
-                ).strip()
+                graph_exact_statement_text(
+                    _active_root_statement_from_hypotheses(target, hypotheses)
+                )
             )
         else:
             rendered.append(target)
@@ -2713,15 +2715,27 @@ def _dossier_statements_root_adjacent(
     from .proof_graph import _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS, _large_lexical_result
 
     names = tuple(conclusion_bound_names)
-    if max(len(conclusion), len(root_statement)) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
+    if max(
+        len(conclusion), len(root_statement),
+        sum(len(name) + 1 for name in names),
+    ) > _GRAPH_LEXICAL_CACHE_MAX_INPUT_CHARS:
         return _large_lexical_result(
             ("dossier_root_adjacency", conclusion, root_statement, names),
             lambda: _uncached_dossier_statements_root_adjacent(
                 conclusion, root_statement, conclusion_bound_names=names,
             ),
         )
+    return _cached_dossier_statements_root_adjacent(conclusion, root_statement, names)
+
+
+@lru_cache(maxsize=128)
+def _cached_dossier_statements_root_adjacent(
+    conclusion: str,
+    root_statement: str,
+    conclusion_bound_names: Tuple[str, ...],
+) -> bool:
     return _uncached_dossier_statements_root_adjacent(
-        conclusion, root_statement, conclusion_bound_names=names,
+        conclusion, root_statement, conclusion_bound_names=conclusion_bound_names,
     )
 
 
@@ -3726,15 +3740,12 @@ def _dossier_support_contains(
 
 
 def normalize_scratch_code_for_registry(code: str) -> str:
-    """Compact scratch proof code for durable accepted-check matching."""
+    """Retain complete literal- and layout-sensitive accepted proof code."""
 
     text = str(code or "").strip()
     text = re.sub(r"^```(?:lean)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
-    text = " ".join(text.split())
-    text = re.sub(r"\s*(:=|=>|←|↦)\s*", r"\1", text)
-    text = re.sub(r"\s*([()\[\]{},:;])\s*", r"\1", text)
-    return text[:4000]
+    return graph_exact_statement_text(text)
 
 
 def clone_verified_helper(item: "VerifiedHelper") -> "VerifiedHelper":
@@ -7685,17 +7696,11 @@ def verified_helper_has_typed_binder_evidence(helper: Any) -> bool:
 def verified_helper_surface_statement_changed(existing: Any, incoming: Any) -> bool:
     """Return whether two helper declarations have different propositions."""
 
-    existing_statement = " ".join(
-        str(
-            helper_decl_statement(str(getattr(existing, "source", "") or ""))
-            or ""
-        ).split()
+    existing_statement = graph_exact_statement_text(
+        helper_decl_statement(str(getattr(existing, "source", "") or ""))
     )
-    incoming_statement = " ".join(
-        str(
-            helper_decl_statement(str(getattr(incoming, "source", "") or ""))
-            or ""
-        ).split()
+    incoming_statement = graph_exact_statement_text(
+        helper_decl_statement(str(getattr(incoming, "source", "") or ""))
     )
     if existing_statement and incoming_statement:
         return existing_statement != incoming_statement
@@ -8011,6 +8016,7 @@ class AcceptedProofStub:
     context_hash: str
     code_hash: str
     normalized_code: str
+    normalization_schema: str = ""
 
 
 @dataclass
@@ -11637,6 +11643,28 @@ class ProofDossier:
         )
 
     @staticmethod
+    def _verified_helper_replay_scope_key(helper: VerifiedHelper) -> str:
+        """Bind source-only comparisons to the ordered elaboration context."""
+        return json.dumps(
+            [
+                list(helper.replay_context_names or []),
+                sorted(dict(helper.replay_context_source_hashes or {}).items()),
+            ],
+            separators=(",", ":"),
+        )
+
+    def _verified_helper_inventory_identity(self, helper: VerifiedHelper) -> str:
+        fact_id = self._verified_fact_identity(helper)
+        if verified_helper_bound_contract_identity(helper):
+            return fact_id
+        # Notation and instances in replay context can change the meaning of
+        # identical source. Only bound Lean evidence permits cross-scope dedup.
+        return stable_identity(
+            "helper-inventory-scope", fact_id,
+            self._verified_helper_replay_scope_key(helper),
+        )
+
+    @staticmethod
     def _verified_fact_attestation(helper: VerifiedHelper) -> Dict[str, Any]:
         """Capture proof-specific evidence without changing fact identity."""
 
@@ -13354,14 +13382,19 @@ class ProofDossier:
     ) -> None:
         live_helpers = dict(getattr(self, "verified_helpers", {}) or {})
         valid_aliases: Dict[str, str] = {}
-        canonical_by_fact_key: Dict[Tuple[str, str, str], str] = {}
 
-        def helper_fact_key(name: str) -> Tuple[str, str, str]:
+        def helper_fact_key(name: str) -> Tuple[str, str, str, str, str]:
             helper = live_helpers.get(name)
             if helper is None or not self._verified_helper_context_visible(helper):
-                return ("", "", "")
+                return ("", "", "", "", "")
             statement_key = canonical_dossier_statement_key(
                 helper_decl_statement(helper.source)
+            )
+            # Identical notation can elaborate differently. Bound expression
+            # evidence must agree before a citation can use another helper;
+            # an unattested surface also cannot stand in for an attested fact.
+            identity = parse_lean_contract_identity(
+                verified_helper_bound_contract_identity(helper)
             )
             # Include unresolved support names with a stable missing sentinel so
             # two same-statement helpers that depend on different absent
@@ -13391,32 +13424,36 @@ class ProofDossier:
             )
             return (
                 statement_key,
+                identity[0] if identity is not None else "",
                 str(helper.verification_environment_hash or "").strip(),
                 dependency_hashes,
+                self._verified_helper_replay_scope_key(helper),
             )
 
+        helpers_by_fact: Dict[Tuple[str, str, str, str, str], List[str]] = {}
+        keys_by_name = {name: helper_fact_key(name) for name in live_helpers}
+        for name, key in keys_by_name.items():
+            if key[0]:
+                helpers_by_fact.setdefault(key, []).append(name)
+        previous_aliases: Dict[str, str] = {}
         for raw_req, raw_canonical in list(
             (getattr(self, "verified_helper_statement_aliases", {}) or {}).items()
         ):
             req = str(raw_req or "").strip()
             canonical = str(raw_canonical or "").strip()
-            if not req or not canonical or req not in live_helpers or canonical not in live_helpers:
-                continue
-            req_key = helper_fact_key(req)
-            canonical_key = helper_fact_key(canonical)
-            if req_key[0] and req_key == canonical_key:
-                valid_aliases[req] = canonical
-                canonical_by_fact_key.setdefault(req_key, canonical)
-
-        for name, helper in live_helpers.items():
-            if name in valid_aliases or not self._verified_helper_context_visible(helper):
-                continue
-            fact_key = helper_fact_key(name)
-            if not fact_key[0]:
-                continue
-            canonical = canonical_by_fact_key.setdefault(fact_key, name)
-            if canonical != name:
-                valid_aliases[name] = canonical
+            req_key = keys_by_name.get(req)
+            if req != canonical and req_key and req_key[0] and req_key == keys_by_name.get(canonical):
+                previous_aliases[req] = canonical
+        # Incremental imports may combine valid maps with opposite directions.
+        # Preserve an existing non-aliased root when possible; flatten chains
+        # and break cycles so each fact always has one usable representative.
+        old_targets = set(previous_aliases.values())
+        for names in helpers_by_fact.values():
+            canonical = next(
+                (name for name in names if name in old_targets and name not in previous_aliases),
+                names[0],
+            )
+            valid_aliases.update({name: canonical for name in names if name != canonical})
 
         newly_recorded = [
             name
@@ -13433,7 +13470,8 @@ class ProofDossier:
 
     def _refresh_verified_helper_progress_alias_fields(self) -> None:
         # Citation aliases retain proof-support compatibility. Mathematical
-        # novelty instead uses the existing semantic fact registry's identity.
+        # novelty uses bound fact identity, with conservative legacy accounting.
+        # Unknown equality across replay scopes does not earn repeat novelty.
         first_by_fact: Dict[str, str] = {}
         for helper in self.verified_helpers.values():
             if _verified_helper_counts_for_theory_progress(self, helper):
@@ -13464,15 +13502,13 @@ class ProofDossier:
         for item in list(targets or ()):
             if not isinstance(item, dict):
                 continue
-            raw_target = " ".join(str(item.get("target") or "").split()).strip()
-            working_target = " ".join(
-                str(item.get("working_target") or "").split()
-            ).strip()
+            raw_target = graph_exact_statement_text(str(item.get("target") or ""))
+            working_target = graph_exact_statement_text(str(item.get("working_target") or ""))
             target = working_target or raw_target
             if not target:
                 continue
             hypotheses = [
-                " ".join(str(hyp or "").split()).strip()
+                graph_exact_statement_text(str(hyp or ""))
                 for hyp in list(item.get("hypotheses") or ())
                 if str(hyp or "").strip()
             ]
@@ -13491,7 +13527,11 @@ class ProofDossier:
                 "helper_context_hash",
                 "official_answer_visible",
             ):
-                value = " ".join(str(item.get(key) or "").split()).strip()
+                value = (
+                    graph_exact_statement_text(str(item.get(key) or ""))
+                    if key == "kernel_target"
+                    else " ".join(str(item.get(key) or "").split()).strip()
+                )
                 if value:
                     record[key] = value
             closed_targets = active_root_equivalence_statements([record])
@@ -13922,20 +13962,11 @@ class ProofDossier:
                 ordered.extend(item for _name, item in next_pending)
                 break
             pending = next_pending
-        # Variant-collapse: proved variants of the SAME statement accumulate as
-        # separate helpers (observed: 40 helpers / 9 distinct statements, one
-        # lemma proved 14x across passes). Every one is re-elaborated in full on
-        # every Lean scratch/verify check. Emit the second+ occurrence of an
-        # EXACT (whitespace-normalized) folded statement as a trivial alias
-        # `theorem DUP : STMT := CANONICAL` instead of its full proof: this keeps
-        # every name in scope (citation-safe) but collapses the redundant proof
-        # work. Gated on exact-statement equality (guarantees the alias
-        # typechecks — same type, canonical already proves it) and processed in
-        # the topologically-ordered list so a canonical is always emitted before
-        # its aliases. Universe-polymorphic headers are left untouched (the name
-        # cannot be reconstructed without the `.{u}` params).
+        # Preserve every checked declaration exactly. Lean proof elaborators can
+        # add declarations, attributes and syntax even for identifier-shaped
+        # bodies. Equal statement text cannot authorize replacing that source
+        # with an alias; later helpers may depend on its elaboration effects.
         result: List[str] = []
-        canonical_name_by_statement: Dict[str, str] = {}
         for item in ordered:
             source = str(item.source or "")
             if is_answer_unsafe_helper_source(source, **answer_safety_kwargs):
@@ -13945,33 +13976,6 @@ class ProofDossier:
                 continue
             if not self._verified_helper_context_visible(item):
                 continue
-            name = helper_decl_name(source)
-            statement_norm = " ".join(str(statement or "").split())
-            header = source.split(":=", 1)[0]
-            # Only collapse SUBSTANTIVE duplicate statements: trivial/generic
-            # props (`True`, `False`, tiny equalities) are cheap to re-elaborate
-            # and are shared incidentally by role-distinct placeholder helpers, so
-            # aliasing them yields no compute benefit and would conflate them.
-            # 16 matches the dependency-contract "too short to be meaningful"
-            # threshold. Universe-polymorphic headers are skipped (the name
-            # cannot be reconstructed without `.{u}`). ONLY theorem/lemma
-            # participate: helper_decl_statement folds external binders into a
-            # leading ∀ only for theorem/lemma; for def/abbrev/instance it drops
-            # the binders, so aliasing them as `theorem DUP : <bare type> :=
-            # CANONICAL` would be ill-typed (free variables / a function value).
-            can_alias = (
-                bool(name)
-                and len(statement_norm) >= 16
-                and ".{" not in header
-                and helper_decl_kind(source) in {"theorem", "lemma"}
-            )
-            if can_alias and statement_norm in canonical_name_by_statement:
-                canonical = canonical_name_by_statement[statement_norm]
-                if canonical and canonical != name:
-                    result.append(f"theorem {name} : {statement} := {canonical}")
-                    continue
-            if can_alias:
-                canonical_name_by_statement.setdefault(statement_norm, name)
             result.append(source)
         return result
 
@@ -13983,9 +13987,9 @@ class ProofDossier:
     def verified_helper_blocks_unique_by_statement(self) -> List[str]:
         """LLM-prompt-safe dedup view of verified_helper_blocks.
 
-        two helpers with the same canonical statement key
-        are mathematically interchangeable for *citation* purposes, but the
-        underlying ``verified_helper_blocks()`` cannot drop either — it feeds
+        Helpers with matching source and compatible proposition evidence share
+        one inventory entry. The underlying ``verified_helper_blocks()`` keeps
+        every declaration because it feeds
         Lean replay contexts and the ``_support_names_for_proof`` parser,
         which would lose the support edge if a referenced declaration were
         absent from the rendered preamble.
@@ -13999,16 +14003,21 @@ class ProofDossier:
         Prevents a pathology where five identical lemmas were rendered into
         every LLM prompt.
         """
-        emitted_statement_keys: Set[str] = set()
+        emitted_statement_keys: Set[Tuple[str, str]] = set()
         result: List[str] = []
         for block in self.verified_helper_blocks():
             stmt_key = canonical_dossier_statement_key(
                 helper_decl_statement(block)
             )
-            if stmt_key and stmt_key in emitted_statement_keys:
+            helper = self.verified_helpers.get(helper_decl_name(block))
+            fact_key = (
+                stmt_key,
+                self._verified_helper_inventory_identity(helper) if helper is not None else "",
+            )
+            if stmt_key and fact_key in emitted_statement_keys:
                 continue
             if stmt_key:
-                emitted_statement_keys.add(stmt_key)
+                emitted_statement_keys.add(fact_key)
             result.append(block)
         return result
 
@@ -14027,7 +14036,7 @@ class ProofDossier:
         for block in self.verified_helper_blocks():
             helper = self.verified_helpers.get(helper_decl_name(block))
             fact_id = (
-                self._verified_fact_identity(helper)
+                self._verified_helper_inventory_identity(helper)
                 if helper is not None
                 else structural_statement_identity(
                     helper_decl_statement(block),
@@ -17677,7 +17686,7 @@ class ProofDossier:
                 summary=" ".join(str(summary or "").split())[:500],
                 code_hash=text_hash(code),
                 normalized_code=(
-                    normalize_scratch_code_for_registry(code) if ok else ""
+                    normalize_scratch_code_for_registry(code)[:4000] if ok else ""
                 ),
                 goal_hash=text_hash(
                     str(goal_statement or "").strip() or self.root_statement
@@ -17732,12 +17741,14 @@ class ProofDossier:
             context_hash=text_hash(context_text),
             code_hash=text_hash(code),
             normalized_code=normalized,
+            normalization_schema="lean_exact_surface_v1",
         )
         key = (
             record.goal_hash,
             record.preamble_hash,
             record.context_hash,
             record.normalized_code,
+            record.normalization_schema,
         )
         for existing in self.accepted_proof_stubs:
             existing_key = (
@@ -17745,6 +17756,7 @@ class ProofDossier:
                 existing.preamble_hash,
                 existing.context_hash,
                 existing.normalized_code,
+                existing.normalization_schema,
             )
             if existing_key == key:
                 return
@@ -18281,9 +18293,8 @@ class ProofDossier:
             success = record.get("tactic_success_attempt") or {}
             proof = str(success.get("proof", "") or "")
             error_type = ""
-            attempts = list(record.get("tactic_attempts", []) or [])
-            if attempts and isinstance(attempts[0], dict):
-                error_type = str(attempts[0].get("error_type", "") or "")
+            if phase == "mini_recursive_claim_tactic" and verdict != "tactic_solved":
+                error_type = self._mini_recursive_failure_error_type(record)
             if phase == "mini_recursive_claim_typecheck":
                 error_type = "type_rejected" if verdict == "variant_type_rejected" else ""
             elif phase == "mini_recursive_claim_sample":
@@ -18344,10 +18355,10 @@ class ProofDossier:
             effective_verdict = verdict
             if verdict == "tactic_solved" and not proof:
                 effective_verdict = "tactic_rejected"
-            error_type = ""
-            attempts = list(record.get("tactic_attempts", []) or [])
-            if attempts and isinstance(attempts[0], dict):
-                error_type = str(attempts[0].get("error_type", "") or "")
+            error_type = (
+                self._mini_recursive_failure_error_type(record)
+                if effective_verdict != "tactic_solved" else ""
+            )
             after_helper = str(record.get("after_helper", "") or "")
             helper_names = [after_helper] if after_helper and after_helper != "pre_plan" else []
             self.proof_graph.record_attempt(
@@ -20563,10 +20574,74 @@ class ProofDossier:
         }:
             return "previous_child_invalidation"
         attempts = list(record.get("tactic_attempts") or [])
-        if attempts and isinstance(attempts[0], dict):
-            error_type = str(attempts[0].get("error_type", "") or "").strip()
-            if error_type:
-                return error_type
+        if verdict == "tactic_rejected":
+            exit_reason = str(record.get("tactic_exit_reason") or "").strip().lower()
+            if exit_reason in {"timeout", "cancelled", "forced_termination"}:
+                return exit_reason
+            aggregate_error = record.get("tactic_failure_error_type")
+            if isinstance(aggregate_error, str) and aggregate_error.strip():
+                return aggregate_error.strip()
+            from .tactic_attempt_telemetry import tactic_attempt_telemetry_fields
+
+            operational_counts = (
+                ("tactic_cancelled_count", "cancelled"),
+                ("tactic_forced_termination_count", "forced_termination"),
+                ("tactic_timeout_count", "timeout"),
+                ("tactic_infrastructure_failure_count", "infra_failure"),
+            )
+            preview_counts = tactic_attempt_telemetry_fields(attempts)
+            declared_count = record.get("tactic_attempt_count")
+            complete_preview = bool(
+                type(declared_count) is int
+                and declared_count == preview_counts["tactic_attempt_count"]
+                and not record.get("tactic_attempts_truncated")
+                and not record.get("tactic_attempt_preview_truncated")
+            )
+            # Historical events may have full counters but only a short
+            # preview. Hidden operational attempts cannot become completed
+            # mathematical rejections merely because they were truncated.
+            for count_key, error_type in operational_counts:
+                try:
+                    full_count = int(record.get(count_key, 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not complete_preview and full_count > preview_counts[count_key]:
+                    return error_type
+            # A backend retry can settle an earlier infrastructure failure for
+            # the same candidate. Indices can be reused by stitched portfolios;
+            # a different proof/source cannot settle an earlier candidate.
+            latest: Dict[Tuple[str, int, str, str], Dict[str, Any]] = {}
+            for position, attempt in enumerate(attempts):
+                if not isinstance(attempt, dict):
+                    continue
+                index = attempt.get("index")
+                key = (
+                    (
+                        "candidate", index,
+                        str(attempt.get("proof") or ""),
+                        str(attempt.get("source") or ""),
+                    )
+                    if type(index) is int and index >= 0
+                    else ("position", position, "", "")
+                )
+                # Retried candidates retain the chronology of their final
+                # diagnostic, not the position of their first insertion.
+                latest.pop(key, None)
+                latest[key] = attempt
+            for attempt in latest.values():
+                error_type = str(attempt.get("error_type") or "").strip()
+                if ProofGraph._is_operational_attempt_failure(verdict, error_type):
+                    return error_type
+                attempt_counts = tactic_attempt_telemetry_fields((attempt,))
+                for count_key, canonical_error in operational_counts:
+                    if attempt_counts[count_key]:
+                        return canonical_error
+            attempts = list(latest.values())
+        for attempt in reversed(attempts):
+            if isinstance(attempt, dict):
+                error_type = str(attempt.get("error_type", "") or "").strip()
+                if error_type:
+                    return error_type
         return verdict or phase
 
     @classmethod
@@ -20579,6 +20654,12 @@ class ProofDossier:
         if verdict == "tactic_solved":
             return ""
         if verdict == "claim_llm_solved":
+            return ""
+        if verdict == "tactic_rejected" and ProofGraph._is_operational_attempt_failure(
+            verdict, cls._mini_recursive_failure_error_type(record),
+        ):
+            # No completed Lean result exists to justify reformalizing this
+            # claim or generating a mathematical repair obligation.
             return ""
         if verdict == "variant_skipped_context_free_raw":
             return "formal variant was skipped because it lost required context"
@@ -21155,6 +21236,11 @@ class ProofDossier:
                     continue
                 code = str(getattr(stub, "normalized_code", "") or "").strip()
                 if not code:
+                    continue
+                if (
+                    getattr(stub, "normalization_schema", "") != "lean_exact_surface_v1"
+                    and text_hash(code) != stub.code_hash
+                ):
                     continue
                 if redact_solution_refs and _contains_solution_ref_for_prompt(code):
                     skipped_answer_unsafe_stubs += 1
@@ -22286,8 +22372,9 @@ class ProofDossier:
                 context_hash=str(raw.get("context_hash") or ""),
                 code_hash=str(raw.get("code_hash") or ""),
                 normalized_code=str(raw.get("normalized_code") or ""),
+                normalization_schema=str(raw.get("normalization_schema") or ""),
             )
-            for raw in list(proof_stub_records or [])
+            for raw in list(proof_stub_records or [])[-16:]
             if isinstance(raw, dict)
         ]
         dossier.tool_metrics = {

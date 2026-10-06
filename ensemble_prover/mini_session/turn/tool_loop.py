@@ -798,6 +798,8 @@ class ToolLoopResult:
 
     content: str = ""
     helper_context: Optional[tuple[str, ...]] = None
+    candidate_helper_context: Optional[tuple[str, ...]] = None
+    unverified_candidate: dict = field(default_factory=dict)
     tool_calls_used: int = 0
     tool_call_log: List[dict] = field(default_factory=list)
     llm_error: Optional[str] = None
@@ -2854,6 +2856,29 @@ async def _call_llm_with_tools_one_round_impl(
         migrate_legacy_repair_v1=repair_self_check_required,
         max_tool_calls_per_turn=max_tool_calls_per_turn,
     )
+    verifier_only_candidate = getattr(conv, "_unverified_root_candidate_replay", None)
+    if verifier_only_candidate is not None:
+        from types import SimpleNamespace
+        from ..unverified_candidate import validate_candidate_async
+
+        if not await validate_candidate_async(verifier_only_candidate, SimpleNamespace(
+            conv=conv, dossier=dossier, lean=lean, actions=[],
+        )) or not quantum_state.get("pending_tool_replay"):
+            raise ValueError("Unverified candidate replay lost its exact context")
+        if verifier_only_candidate["replay_mode"] == "final_response":
+            # Returned source goes through the ordinary extraction and final
+            # kernel/axiom checks. No tool or provider call precedes them.
+            return ToolLoopResult(
+                content=verifier_only_candidate["args"]["code"],
+                helper_context=tuple(verifier_only_candidate["helpers"]),
+                candidate_helper_context=tuple(verifier_only_candidate["helpers"]),
+                unverified_candidate=copy.deepcopy(verifier_only_candidate),
+            )
+    candidate_helper_context = (
+        tuple(tool_helper_blocks())
+        if callable(getattr(conv, "_unverified_candidate_cancellation_sink", None)) else None
+    )
+    accepted_candidate_inputs: dict[str, dict] = {}
     resumed_provider_continuation = bool(quantum_state)
     if not resumed_provider_continuation:
         # Budgets/governors below start afresh only without a live validated
@@ -4018,6 +4043,8 @@ async def _call_llm_with_tools_one_round_impl(
         nonlocal provider_dispatches_started
         nonlocal provider_quantum_authenticated_dispatches_started
         nonlocal provider_dispatch_quantum_spent
+        if verifier_only_candidate is not None:
+            raise RuntimeError("Unverified candidate continuation cannot dispatch a provider")
         # A recursive helper may outlive its finite cancellation settlement
         # allowance.  Its copied Context retains the same mutable timeout
         # lease, so revocation here closes even raw-client dispatch paths that
@@ -4420,6 +4447,8 @@ async def _call_llm_with_tools_one_round_impl(
             current_messages = _messages_with_current_context(conv.messages_for_llm())
             sent_messages = list(current_messages or [])
             replaying_persisted_tool = bool(pending_tool_replay)
+            if verifier_only_candidate is not None and not replaying_persisted_tool:
+                break
             replaying_paid_tool_retry = bool(
                 replaying_persisted_tool
                 and pending_tool_replay_is_paid_retry
@@ -5570,6 +5599,7 @@ async def _call_llm_with_tools_one_round_impl(
                 runner_deferred_before_launch = False
                 search_cadence_skipped = False
                 accepted_try_lean_code = ""
+                unverified_candidate = {}
 
                 async def invoke_formal_runner(
                     runner: Callable[..., Any], *runner_args: Any, **runner_kwargs: Any
@@ -5853,6 +5883,17 @@ async def _call_llm_with_tools_one_round_impl(
                         )
                     elif name == "try_lean" and try_lean_tool_enabled:
                         authoritative_tool_lemmas = tool_helper_blocks() if dossier is not None else []
+                        from ..unverified_candidate import capture_candidate
+
+                        if callable(getattr(conv, "_unverified_candidate_cancellation_sink", None)):
+                            unverified_candidate = capture_candidate(
+                                conv=conv, target=tool_goal_statement, lean=lean,
+                                helpers=list(authoritative_tool_lemmas), args=args,
+                            )
+                            if verifier_only_candidate is not None:
+                                unverified_candidate["verification_deadline_epoch_s"] = (
+                                    verifier_only_candidate["verification_deadline_epoch_s"]
+                                )
                         context_lemmas = (
                             primitives["feedback_lemmas"](
                                 authoritative_tool_lemmas,
@@ -5894,6 +5935,10 @@ async def _call_llm_with_tools_one_round_impl(
                                 or args.get("code", "")
                                 or ""
                             )
+                            if unverified_candidate:
+                                accepted_candidate_inputs[_accepted_lean_artifact_content(
+                                    accepted_try_lean_code
+                                )] = copy.deepcopy(unverified_candidate)
                             helper_registry = getattr(
                                 dossier,
                                 "verified_helpers",
@@ -6608,6 +6653,11 @@ async def _call_llm_with_tools_one_round_impl(
                         tool_call_log.append(remaining_record)
                     raise
                 except asyncio.CancelledError as cancellation:
+                    if unverified_candidate:
+                        cancellation.mini_unverified_root_candidate = unverified_candidate
+                        sink = getattr(conv, "_unverified_candidate_cancellation_sink", None)
+                        if callable(sink):
+                            sink(unverified_candidate)
                     result_text = (
                         f"{safe_log_name} cancelled: tool runner cancelled before "
                         "this advertised tool call completed."
@@ -7482,6 +7532,16 @@ async def _call_llm_with_tools_one_round_impl(
                 content = ""
                 break
 
+            if verifier_only_candidate is not None:
+                # One retained input owns one verifier batch. A rejection or
+                # infrastructure failure never authorizes fresh synthesis.
+                # Bare tactic blocks have no target header for the shortcut
+                # classifier above. Submit the checked scratch text to the
+                # normal independent target/axiom finalization path.
+                if accepted_try_lean_code:
+                    content = _accepted_lean_artifact_content(accepted_try_lean_code)
+                break
+
             if (
                 durable_tool_retry_banked
                 and not accepted_try_lean_receipts
@@ -8276,6 +8336,8 @@ async def _call_llm_with_tools_one_round_impl(
     return ToolLoopResult(
         content=content,
         helper_context=tuple(tool_helper_blocks()),
+        candidate_helper_context=candidate_helper_context,
+        unverified_candidate=accepted_candidate_inputs.get(content, {}),
         tool_calls_used=tool_calls_used,
         tool_call_log=tool_call_log,
         llm_error=llm_error,

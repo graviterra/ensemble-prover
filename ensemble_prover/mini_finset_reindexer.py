@@ -10,6 +10,7 @@ infinite ``tsum`` goals.
 from __future__ import annotations
 
 import re
+import json
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from threading import Lock
 from typing import Any, Sequence
 
 from .lean_names import LEAN_NAME_COMPONENT_PATTERN
+from .proof_graph import graph_exact_statement_text
 from .proof_state import (
     _find_top_level_operator,
     _leading_identity_let_body,
@@ -587,9 +589,9 @@ def finset_reindexing_scripts(
 def finset_reindexing_context_key(text: str, helper_names: Sequence[str] = ()) -> str:
     """Build a stable exact-context key for one finite reindexing pass."""
 
-    compact_goal = " ".join(str(text or "").split())
-    helpers = ",".join(sorted(str(name or "").strip() for name in helper_names if str(name or "").strip()))
-    return f"{compact_goal}|helpers={helpers}"
+    goal = graph_exact_statement_text(text)
+    helpers = [str(name or "") for name in helper_names]
+    return "lean_surface_v3:" + json.dumps([goal, helpers], ensure_ascii=False)
 
 
 def reindexing_materializable_goals(attempts: Sequence[Any]) -> tuple[dict[str, Any], ...]:

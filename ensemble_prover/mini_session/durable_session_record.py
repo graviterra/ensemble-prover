@@ -58,7 +58,9 @@ _RUNTIME_FIELDS = frozenset({
 # The recursive prove/refine handoff reuses its conversation, including this
 # parent-bound commit/rollback handle. Only the accompanying theory provenance
 # belongs on disk; the factory recreates the handle when a child returns/replays.
-_CONVERSATION_RUNTIME_FIELDS = frozenset({"mini_theory_commit_promotion"})
+_CONVERSATION_RUNTIME_FIELDS = frozenset({
+    "mini_theory_commit_promotion", "_unverified_candidate_cancellation_sink",
+})
 _IDENTITY_CONV_FIELDS = (
     "goal_statement", "lean_signature", "preamble", "lean_preamble", "opaque_mode",
     "allow_official_answer_visibility", "official_answer_payload_present",
