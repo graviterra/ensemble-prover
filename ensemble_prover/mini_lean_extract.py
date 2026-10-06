@@ -2694,7 +2694,7 @@ def _extract_single_decl_body(chunk: str) -> Optional[str]:
 
 
 def _normalize_statement_for_contract(text: object) -> str:
-    from .proof_graph import graph_exact_statement_text
+    from .proof_graph import graph_exact_statement_text, _graph_compact_lean_whitespace
 
     compact = graph_exact_statement_text(str(text or ""))
     if not compact:
@@ -2704,9 +2704,13 @@ def _normalize_statement_for_contract(text: object) -> str:
             canonicalize_lean_statement_for_identity,
         )
 
-        return canonicalize_lean_statement_for_identity(compact)
+        compact = canonicalize_lean_statement_for_identity(compact)
     except Exception:
-        return compact
+        return _graph_compact_lean_whitespace(compact)
+    # This key only selects a proof body for replay against the actual goal.
+    # Lexical whitespace differences must not discard a candidate; Lean still
+    # checks its original scoped body, without granting contract equivalence.
+    return _graph_compact_lean_whitespace(compact)
 
 
 def _decl_matches_main_target(

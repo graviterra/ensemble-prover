@@ -42,6 +42,13 @@ deadline policy. The Lean tactic timeout bounds the subsequent formal check,
 not model generation. Aggregate repair-call limits and enclosing run cancellation
 still apply, including when the provider deadline policy is soft.
 
+Recursive contract analysis also elaborates the helper declarations needed by
+the proposed obligations. It uses the configured recursive Lean allowance;
+when that allowance is disabled, it uses the verifier's configured timeout.
+Runners without a finite configured allowance use a 60-second fallback.
+Enclosing action and run deadlines still apply. A timeout leaves the contract
+unknown and does not establish that the mathematical statement is false.
+
 Fresh root-assembly conversations can receive the prover's earlier rejected
 proof and Lean diagnostics when the target, environment, answer policy and
 existing helper sources still match. This feedback describes failed code, not

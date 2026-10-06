@@ -6161,6 +6161,31 @@ def _recursive_lean_operation_timeout_s(
     return configured if configured > 0.0 else None
 
 
+def _recursive_contract_operation_timeout_s(
+    lean: Any,
+    requested_timeout_s: float,
+) -> float:
+    """Fund contract elaboration using a finite configured Lean allowance.
+
+    Contract checks replay verified declarations as well as the new types.
+    A short tactic cap can therefore prevent an otherwise funded reduction
+    from ever reaching proof search. Keep the enclosing action deadline in
+    force and retain a finite fallback for runners without configuration.
+    """
+
+    for value in (
+        requested_timeout_s,
+        getattr(getattr(lean, "cfg", None), "timeout_s", None),
+    ):
+        try:
+            allowance = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(allowance) and allowance > 0.0:
+            return allowance
+    return 60.0
+
+
 def _live_lean_capability_for_new_work(lean: Any) -> Any:
     """Retarget captured Lean handles onto the published generation.
 
@@ -23926,10 +23951,7 @@ async def run_mini_recursive_driver(
                     )
                     if part
                 ),
-                timeout_s=max(
-                    10.0,
-                    min(float(config.tactic_timeout_s or 20.0), 60.0),
-                ),
+                timeout_s=_recursive_contract_operation_timeout_s(lean, config.tactic_timeout_s),
             )
         except Exception:
             return {}
@@ -25345,10 +25367,7 @@ async def run_mini_recursive_driver(
             plan=original_probe_plan,
             support_statements=original_support_statements,
             preamble=current_lean_check_preamble(),
-            timeout_s=max(
-                10.0,
-                min(float(config.tactic_timeout_s or 20.0), 60.0),
-            ),
+            timeout_s=_recursive_contract_operation_timeout_s(lean, config.tactic_timeout_s),
             pass_index=pass_index,
             record_event=record_event,
             environment_hash=current_contract_evidence_environment_hash(),
@@ -27512,10 +27531,7 @@ async def run_mini_recursive_driver(
                 support_statements=original_support_statements,
                 analysis_statements=plan_active_target_statements,
                 preamble=current_lean_check_preamble(),
-                timeout_s=max(
-                    10.0,
-                    min(float(config.tactic_timeout_s or 20.0), 60.0),
-                ),
+                timeout_s=_recursive_contract_operation_timeout_s(lean, config.tactic_timeout_s),
                 pass_index=pass_index,
                 record_event=record_dependency_contract_event,
                 environment_hash=current_contract_evidence_environment_hash(),
@@ -27895,10 +27911,7 @@ async def run_mini_recursive_driver(
                         support_statements=original_support_statements,
                         analysis_statements=plan_active_target_statements,
                         preamble=current_lean_check_preamble(),
-                        timeout_s=max(
-                            10.0,
-                            min(float(config.tactic_timeout_s or 20.0), 60.0),
-                        ),
+                        timeout_s=_recursive_contract_operation_timeout_s(lean, config.tactic_timeout_s),
                         pass_index=pass_index,
                         record_event=record_dependency_contract_event,
                         environment_hash=current_contract_evidence_environment_hash(),
@@ -28120,10 +28133,7 @@ async def run_mini_recursive_driver(
                     support_statements=original_support_statements,
                     analysis_statements=plan_active_target_statements,
                     preamble=current_lean_check_preamble(),
-                    timeout_s=max(
-                        10.0,
-                        min(float(config.tactic_timeout_s or 20.0), 60.0),
-                    ),
+                    timeout_s=_recursive_contract_operation_timeout_s(lean, config.tactic_timeout_s),
                     pass_index=pass_index,
                     record_event=record_dependency_contract_event,
                     environment_hash=current_contract_evidence_environment_hash(),
@@ -29015,10 +29025,7 @@ async def run_mini_recursive_driver(
                         support_statements=original_support_statements,
                         analysis_statements=plan_active_target_statements,
                         preamble=current_lean_check_preamble(),
-                        timeout_s=max(
-                            10.0,
-                            min(float(config.tactic_timeout_s or 20.0), 60.0),
-                        ),
+                        timeout_s=_recursive_contract_operation_timeout_s(lean, config.tactic_timeout_s),
                         pass_index=pass_index,
                         record_event=record_dependency_contract_event,
                         environment_hash=current_contract_evidence_environment_hash(),
@@ -29083,13 +29090,7 @@ async def run_mini_recursive_driver(
                                 support_statements=original_support_statements,
                                 analysis_statements=(plan_active_target_statements),
                                 preamble=current_lean_check_preamble(),
-                                timeout_s=max(
-                                    10.0,
-                                    min(
-                                        float(config.tactic_timeout_s or 20.0),
-                                        60.0,
-                                    ),
-                                ),
+                                timeout_s=_recursive_contract_operation_timeout_s(lean, config.tactic_timeout_s),
                                 pass_index=pass_index,
                                 record_event=record_dependency_contract_event,
                                 environment_hash=current_contract_evidence_environment_hash(),
@@ -29227,13 +29228,7 @@ async def run_mini_recursive_driver(
                             support_statements=original_support_statements,
                             analysis_statements=plan_active_target_statements,
                             preamble=current_lean_check_preamble(),
-                            timeout_s=max(
-                                10.0,
-                                min(
-                                    float(config.tactic_timeout_s or 20.0),
-                                    60.0,
-                                ),
-                            ),
+                            timeout_s=_recursive_contract_operation_timeout_s(lean, config.tactic_timeout_s),
                             pass_index=pass_index,
                             record_event=record_dependency_contract_event,
                             environment_hash=current_contract_evidence_environment_hash(),

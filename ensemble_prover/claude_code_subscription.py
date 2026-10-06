@@ -338,7 +338,10 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     "Claude Code executable not found; install it or set --claude-code-bin.",
                     kind="compatibility",
                 )
-            self._binary = str(Path(binary).absolute())
+            # CLI upgrades can retarget the launcher symlink during a run.
+            # Keep subsequent calls on the executable whose capabilities and
+            # version this client actually checked.
+            self._binary = str(Path(binary).resolve())
             with tempfile.TemporaryDirectory(
                 prefix="ensemble-claude-code-check-"
             ) as cwd:

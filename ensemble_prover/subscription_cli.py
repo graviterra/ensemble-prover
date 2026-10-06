@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import errno
 import functools
 import hashlib
 import json
@@ -392,16 +393,29 @@ class SubscriptionCLIClient:
             min(startup_limits) if startup_limits else None,
             f"{self.backend_name} request deadline expired during process startup",
         ):
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=cwd,
-                env=self._process_environment(),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=(os.name == "posix"),
-                limit=_MAX_STREAM_BYTES,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=cwd,
+                    env=self._process_environment(),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=(os.name == "posix"),
+                    limit=_MAX_STREAM_BYTES,
+                )
+            except OSError as exc:
+                if exc.errno not in {errno.ENOENT, errno.ENOTDIR, errno.ENOEXEC, errno.EACCES}:
+                    raise
+                # A checked launcher can disappear during a CLI upgrade.
+                # Fail as infrastructure before generation, without silently
+                # dispatching through an unchecked replacement executable.
+                raise self.backend_error(
+                    f"{self.backend_name} CLI could not start "
+                    f"(errno={errno.errorcode[exc.errno]}). Check its executable, "
+                    "interpreter, permissions and working directory, then start a new run.",
+                    kind="compatibility",
+                ) from None
         self._starting_processes.discard(asyncio.current_task())
         self._processes.add(proc)
         tasks: list[asyncio.Task[Any]] = []

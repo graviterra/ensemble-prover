@@ -10464,24 +10464,54 @@ def _uncached_helper_decl_statement(src: str) -> str:
     if marker is None:
         return ""
     marker_index, _marker_len = marker
-    statement = graph_formal_statement_text(
-        _strip_lean_decl_comments_preserving_strings(tail[colon + 1 : marker_index]),
-        canonicalize_guarded_iff=False,
+    # This is a declaration type, not a model-authored subgoal with possible
+    # prose attached. Prose trimming can erase valid conjuncts referring to
+    # the declaration's parameters, especially after a local let binding.
+    source = str(src or "").strip()
+    tail_offset = len(source) - len(tail)
+    statement_source = _strip_lean_decl_comments_preserving_strings(
+        tail[colon + 1 : marker_index], preserve_positions=True,
     )
+    statement = statement_source.strip()
+    if "\n" in statement:
+        # Parentheses protect the original first-line indentation from callers
+        # that strip surrounding whitespace. Local lets without semicolons
+        # depend on that column as well as the columns of subsequent lines.
+        type_offset = tail_offset + colon + 1
+        type_column = type_offset - source.rfind("\n", 0, type_offset) - 1
+        positioned = " " * type_column + statement_source
+        positioned = re.sub(r"^(?:[ \t]*\r?\n)+", "", positioned)
+        statement = "(\n" + positioned.rstrip() + "\n)"
     binders = _strip_declaration_binder_defaults(
-        _strip_lean_decl_comments_preserving_strings(tail[:colon])
+        _strip_lean_decl_comments_preserving_strings(
+            tail[:colon], preserve_positions=True,
+        )
     )
-    if kind in {"theorem", "lemma"} and binders:
-        statement = f"∀ {binders}, {statement}"
+    if kind in {"theorem", "lemma"} and binders.strip():
+        # Keep a multiline term off the binder line: moving its first token
+        # to the right can change Lean's layout parsing of local definitions.
+        separator = "\n" if "\n" in statement else " "
+        if "\n" in binders.strip():
+            binder_column = tail_offset - source.rfind("\n", 0, tail_offset) - 1
+            statement = f"∀\n{' ' * binder_column}{binders.rstrip()},{separator}{statement}"
+        else:
+            binders = _graph_compact_lean_whitespace(binders)
+            statement = f"∀ {binders},{separator}{statement}"
     # A command-local open scopes binder types and the conclusion together.
     # Replaying just the unqualified surface type in the ambient preamble can
     # resolve it to a different proposition and corrupt contract/cache keys.
-    source = str(src or "").strip()
+    scoped_source = _strip_lean_decl_comments_preserving_strings(
+        source, preserve_positions=True,
+    )
     scope_end = 0
-    while scoped_open := _SCOPED_OPEN_DECL_PREFIX_RE.match(source[scope_end:]):
+    while scoped_open := _SCOPED_OPEN_DECL_PREFIX_RE.match(scoped_source[scope_end:]):
         scope_end += scoped_open.end()
     if scope_end:
-        return f"{source[:scope_end].strip()} {statement}"
+        # Use the masked prefix so a trailing line comment cannot absorb the
+        # reconstructed type when its terminating newline is stripped.
+        scope_prefix = scoped_source[:scope_end].strip()
+        separator = "\n" if "\n" in statement else " "
+        return f"{scope_prefix}{separator}{statement}"
     return statement
 
 
@@ -10660,6 +10690,7 @@ def _strip_declaration_binder_defaults(text: str) -> str:
     """Remove Lean declaration default values from binder groups for identity."""
 
     source = str(text or "")
+    preserve_layout = "\n" in source.strip()
     out: List[str] = []
     index = 0
     while index < len(source):
@@ -10674,9 +10705,15 @@ def _strip_declaration_binder_defaults(text: str) -> str:
             out.append(source[index:])
             break
         inner = source[index + 1 : end]
-        out.append(ch + _strip_default_assignments_in_binder(inner) + close)
+        stripped = _strip_default_assignments_in_binder(inner)
+        # Erasing defaults must not move later multiline binder types left.
+        padding = (
+            "".join(char if char in "\r\n" else " " for char in inner[len(stripped):])
+            if preserve_layout else ""
+        )
+        out.append(ch + stripped + padding + close)
         index = end + 1
-    return _graph_compact_lean_whitespace("".join(out))
+    return "".join(out)
 
 
 def _strip_default_assignments_in_binder(inner: str) -> str:
