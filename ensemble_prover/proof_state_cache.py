@@ -767,9 +767,9 @@ class MiniVerifiedLemmaCache:
         self.refresh_read_paths()
         targets: List[Dict[str, Any]] = []
         normalized_statements = {
-            _normalize_cache_statement(str(statement or ""))
+            normalized
             for statement in statements
-            if _normalize_cache_statement(str(statement or ""))
+            if (normalized := _normalize_cache_statement(str(statement or "")))
         }
         for statement in sorted(normalized_statements):
             canonical_key = self._canonical_key(statement)
@@ -1740,6 +1740,36 @@ class MiniVerifiedLemmaCache:
             copied["_lookup_tier"] = "same_theorem"
             out.append(copied)
         return out
+
+    def exact_record_for_theorem(
+        self, theorem_name: str, source: str, *, preamble: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Recover an existing candidate's provenance without a popularity cap.
+
+        Older pending-helper checkpoints retained the exact body but omitted
+        its cache replay receipts. A fresh reader may recover those receipts
+        from the same owner/body; it must never infer an empty dependency set
+        merely because an ordinary capped lookup no longer serves that body.
+        The returned row remains a candidate requiring current verification.
+        """
+        if self._cache_is_disabled():
+            return None
+        self.refresh_read_paths()
+        exact_source = str(source or "").strip()
+        owner_records = self._by_theorem_name.get(str(theorem_name or "").strip(), ())
+        if not any(str(row.get("source") or "").strip() == exact_source for row in owner_records):
+            return None
+        # Use the ordinary closure builder: stored support receipts and
+        # source-inferred dependencies are as binding as explicit replay names.
+        # The owner bucket bounds the query, without dropping an older exact
+        # body merely because newer unrelated facts fill the default cap.
+        return next((
+            record
+            for record in self.records_for_theorem(
+                theorem_name, max_records=max(1, len(owner_records)), preamble=preamble,
+            )
+            if str(record.get("source") or "").strip() == exact_source
+        ), None)
 
     def retrieval_records(self, *, max_records: int = 50_000) -> List[Dict[str, Any]]:
         """Return unique verified bodies for semantic discovery.
@@ -2924,7 +2954,11 @@ def _proof_state_helper_policy_rejection(
     statement = helper_decl_statement(source)
     if not statement:
         return "missing_helper_statement"
-    if expected_statement:
+    if expected_statement and statement != expected_statement:
+        # Exact text already establishes equality. Ingestion passes the
+        # statement extracted from this same source; avoid re-running both
+        # identity pipelines for that common case. Different spellings still
+        # receive the complete capture-safe normalization and comparison.
         left = _normalize_cache_statement(statement)
         right = _normalize_cache_statement(expected_statement)
         if left != right:

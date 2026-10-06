@@ -92,18 +92,48 @@ class AcceptanceGate:
     second_accepted_by_s: float = DEFAULT_SECOND_ACCEPTED_BY_S
     accepted: dict[str, float] = field(default_factory=dict)
     earliest_acceptance_monotonic: float | None = None
+    preparation_started_monotonic: float | None = None
+    preparation_finished_monotonic: float | None = None
+    preparation_budget_s: float = 0.0
     _accepted_monotonic: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     _constructor_accepted: dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.first_accepted_by_s = _acceptance_seconds(self.first_accepted_by_s)
         self.second_accepted_by_s = _acceptance_seconds(self.second_accepted_by_s)
+        self.preparation_budget_s = _acceptance_seconds(self.preparation_budget_s)
         if (self.first_accepted_by_s and self.second_accepted_by_s
                 and self.second_accepted_by_s < self.first_accepted_by_s):
             raise ValueError("second acceptance deadline must not precede the first")
         # Constructor values retain their elapsed-time contract. Converting
         # them to absolute timestamps could round a late value onto a deadline.
         self._constructor_accepted = dict(self.accepted)
+
+    def preparation_credit(self, *, now: float) -> float:
+        started = self.preparation_started_monotonic
+        if started is None:
+            return 0.0
+        finished = self.preparation_finished_monotonic
+        return min(
+            self.preparation_budget_s,
+            max(0.0, min(now, finished if finished is not None else now) - started),
+        )
+
+    def _deadline(self, duration: float, *, now: float) -> float:
+        deadline = self.start_monotonic + duration
+        # A late preparation event cannot revive an already expired window,
+        # even when the monitor has not polled yet.
+        if (self.preparation_started_monotonic is not None
+                and self.preparation_started_monotonic < deadline):
+            deadline += self.preparation_credit(now=now)
+        return deadline
+
+    def synchronize_authority(self, transaction: Any) -> None:
+        if transaction.ready_at is not None:
+            self.start_monotonic = transaction.ready_at
+        self.preparation_started_monotonic = transaction.preparation_started_at
+        self.preparation_finished_monotonic = transaction.preparation_finished_at
+        self.preparation_budget_s = transaction.preparation_budget_s
 
     def observe(self, record: Mapping[str, Any], *, now: float) -> bool:
         """Consume only committed proof receipts belonging to this attempt."""
@@ -137,7 +167,8 @@ class AcceptanceGate:
         )
         self.accepted[identity] = min(
             self._constructor_accepted.get(identity, math.inf),
-            max(0.0, self._accepted_monotonic[identity] - self.start_monotonic),
+            max(0.0, self._accepted_monotonic[identity] - self.start_monotonic
+                - self.preparation_credit(now=self._accepted_monotonic[identity])),
         )
         return previous is None
 
@@ -151,8 +182,8 @@ class AcceptanceGate:
                 for identity in self.accepted
             )
 
-        first_deadline = self.start_monotonic + self.first_accepted_by_s
-        second_deadline = self.start_monotonic + self.second_accepted_by_s
+        first_deadline = self._deadline(self.first_accepted_by_s, now=now)
+        second_deadline = self._deadline(self.second_accepted_by_s, now=now)
         if self.first_accepted_by_s and now >= first_deadline and not accepted_by(
             self.first_accepted_by_s, first_deadline
         ):
@@ -249,8 +280,8 @@ def prewarm_shared_mathlib_runtime(
 ) -> dict[str, Any]:
     """Import Mathlib once so attempt processes do not pay a cold lake start.
 
-    Problem-specific ``proof_state_cache_seed`` still runs after attempt launch
-    under the startup bound. Missing lake/project is a skip,
+    Initial problem-specific ``proof_state_cache_seed`` receives its own bounded
+    preparation credit after attempt launch. Missing lake/project is a skip,
     not a sweep failure.
     """
     project = Path(project_dir or default_lean_project_dir()).expanduser()
@@ -968,7 +999,7 @@ def run_attempt(
     start = time.monotonic()
     gate = AcceptanceGate(start, first_accepted_by_s, second_accepted_by_s)
     gate.earliest_acceptance_monotonic = start
-    control = SweepControl.create(output_dir)
+    control = SweepControl.create(output_dir, preparation_budget_s=startup_timeout_s)
     ready_at: float | None = None
     tail = AcceptanceEventTail(output_dir / "turns.jsonl")
     startup = AttemptStartupLiveness(output_dir, start=start, timeout_s=startup_liveness_s)
@@ -1008,8 +1039,7 @@ def run_attempt(
                         authority_busy_since = None
                         now = time.monotonic()
                         ready_at = transaction.ready_at
-                        if ready_at is not None:
-                            gate.start_monotonic = ready_at
+                        gate.synchronize_authority(transaction)
                         for record in transaction.accepted_records():
                             gate.observe(record, now=now)
                         if transaction.pending:
@@ -1086,8 +1116,7 @@ def run_attempt(
                 tail.read()
                 with control.locked() as transaction:
                     ready_at = transaction.ready_at
-                    if ready_at is not None:
-                        gate.start_monotonic = ready_at
+                    gate.synchronize_authority(transaction)
                     for record in transaction.accepted_records():
                         gate.observe(record, now=time.monotonic())
                     if transaction.pending:
@@ -1183,6 +1212,7 @@ def run_attempt(
         "cleanup_confirmed": cleaned,
         "wall_s": time.monotonic() - start,
         "proof_ready_elapsed_s": ready_at - start if ready_at is not None else None,
+        "initial_preparation_credit_s": gate.preparation_credit(now=time.monotonic()),
         "monitor_error": monitor_error,
     }
 
@@ -1624,7 +1654,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--first-accepted-by-s",
         type=float,
         help=(
-            "First acceptance deadline from proof worker readiness "
+            "First acceptance deadline from proof worker readiness, excluding bounded initial helper import "
             f"(default: {DEFAULT_FIRST_ACCEPTED_BY_S:g}; 0 disables)"
         ),
     )
@@ -1632,7 +1662,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--second-accepted-by-s",
         type=float,
         help=(
-            "Second acceptance deadline from proof worker readiness "
+            "Second acceptance deadline from proof worker readiness, excluding bounded initial helper import "
             f"(default: {DEFAULT_SECOND_ACCEPTED_BY_S:g}; 0 disables)"
         ),
     )
@@ -1648,7 +1678,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--startup-timeout-s", type=float,
-        help=f"Absolute preparation/runtime startup cap (default: {DEFAULT_STARTUP_TIMEOUT_S:g}s; must be positive)",
+        help=(f"Absolute preparation/runtime startup cap and initial helper-import credit "
+              f"(default: {DEFAULT_STARTUP_TIMEOUT_S:g}s; must be positive)"),
     )
     parser.add_argument(
         "--no-prewarm",

@@ -15878,9 +15878,9 @@ async def _main_async(args: argparse.Namespace) -> int:
                 root_statement=problem.statement_type,
                 problem_text=problem_docstring_text(problem),
             )
-            # READY means the worker can begin proof search, not merely that
-            # Python reached ``main``. MiniSession fires the callback only
-            # after premise retrieval and session construction.
+            # The process can now perform proof work, including the factory's
+            # startup fast lane. MiniSession reports initial helper restoration
+            # separately so it cannot consume the whole sweep proof window.
             from .mini_session.process_watchdog import signal_worker_ready
 
             def signal_proof_worker_ready() -> None:

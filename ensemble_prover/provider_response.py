@@ -9,6 +9,53 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping
 
 
+_MAX_REJECTED_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+@dataclass
+class RejectedProviderResponseReceipt:
+    """Untrusted completed content for its caller's format-validation loop."""
+
+    content: str | None = field(default=None, repr=False)
+    error: BaseException | None = field(default=None, repr=False)
+    diagnostic: dict[str, Any] = field(default_factory=dict)
+    _active: bool = field(default=True, repr=False)
+
+
+_REJECTED_RESPONSE_CAPTURE: ContextVar[RejectedProviderResponseReceipt | None] = ContextVar(
+    "rejected_provider_response_capture", default=None,
+)
+
+
+def publish_rejected_provider_response(
+    error: BaseException, content: str, diagnostic: Mapping[str, Any],
+) -> None:
+    """Retain complete invalid content privately, without publishing an answer.
+
+    The bound matches subscription stream storage. Oversized content is omitted
+    as a whole; a clipped mathematical response cannot authorize correction.
+    """
+    receipt = _REJECTED_RESPONSE_CAPTURE.get()
+    if receipt is None or not receipt._active:
+        return
+    retained = len(content.encode("utf-8", errors="surrogatepass")) <= _MAX_REJECTED_RESPONSE_BYTES
+    receipt.content = content if retained else None
+    receipt.error = error
+    receipt.diagnostic = {**dict(diagnostic), "content_retained": retained}
+
+
+@contextmanager
+def capture_rejected_provider_response() -> Iterator[RejectedProviderResponseReceipt]:
+    """Capture one call's rejection, excluding shared state and late results."""
+    receipt = RejectedProviderResponseReceipt()
+    token = _REJECTED_RESPONSE_CAPTURE.set(receipt)
+    try:
+        yield receipt
+    finally:
+        receipt._active = False
+        _REJECTED_RESPONSE_CAPTURE.reset(token)
+
+
 @dataclass
 class ProviderResponseReceipt:
     """One call's detached response; deliberately separate from logged metadata."""

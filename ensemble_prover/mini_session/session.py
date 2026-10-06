@@ -23798,6 +23798,12 @@ class MiniSession:
         except asyncio.TimeoutError:
             self._run_governor_exhausted()
             return False, None
+        if self._owns_sweep_initial_preparation():
+            from ..sweep_control import finish_initial_sweep_preparation
+
+            # The earliest root sample ready to search ends the shared import
+            # interval. Later samples and nested sessions cannot pause search.
+            finish_initial_sweep_preparation()
         if self._dispatch_worker_poisoned:
             self._request_dispatch_generation_recycle(
                 self._dispatch_worker_poison_reason or "legacy_dispatch_worker_poisoned"
@@ -24669,6 +24675,14 @@ class MiniSession:
                 "action_ids": sorted(released), "kernel_verified": False,
             })
 
+    def _owns_sweep_initial_preparation(self) -> bool:
+        """Only independent top-level problem samples share the import credit."""
+        return (
+            self.scope in {"problem", "sample"}
+            and self.parent is None
+            and self.recursion_depth == 0
+        )
+
     async def _seed_same_problem_verified_helpers(self) -> None:
         """Import prior same-problem verified helpers before scheduling."""
 
@@ -24701,6 +24715,15 @@ class MiniSession:
             seed_deadline = (
                 time.monotonic() + remaining if remaining is not None else 0.0
             )
+            if self._owns_sweep_initial_preparation():
+                from ..sweep_control import begin_initial_sweep_preparation
+
+                preparation_deadline = begin_initial_sweep_preparation()
+                if preparation_deadline > 0.0:
+                    seed_deadline = (
+                        min(seed_deadline, preparation_deadline)
+                        if seed_deadline > 0.0 else preparation_deadline
+                    )
             summary = await seed_verified_helpers_from_same_problem_cache(
                 lean=self.lean,
                 conv=self.conv,

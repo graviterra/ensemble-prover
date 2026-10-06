@@ -2990,7 +2990,9 @@ def _strip_balanced_outer_parens(text: str) -> str:
 def _find_top_level_operator(text: str, operator: str) -> int:
     expr = str(text or "")
     op = str(operator or "")
-    if not expr or not op:
+    # Absence is independent of lexical scope. Only possible matches need
+    # the full scan through nested terms, literals, and comments.
+    if not expr or not op or op not in expr:
         return -1
     depth = 0
     index = 0
@@ -4098,10 +4100,11 @@ def _split_top_level_operator_sequence(
     text: str,
     operators: Sequence[str],
 ) -> Optional[Tuple[List[str], List[str]]]:
-    expr = _strip_balanced_outer_parens(str(text or "").strip())
+    expr = str(text or "").strip()
     ops = sorted([op for op in operators if op], key=len, reverse=True)
-    if not expr or not ops:
+    if not expr or not ops or not any(op in expr for op in ops):
         return None
+    expr = _strip_balanced_outer_parens(expr)
     depth = 0
     parts: List[str] = []
     found_ops: List[str] = []

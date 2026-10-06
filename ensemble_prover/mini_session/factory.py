@@ -3819,6 +3819,11 @@ async def prove_problem_via_session(
             }
         )
     visible_answer_root_receipt: Dict[str, Any] = {}
+    if official_answer_visible:
+        from ..sweep_control import finish_initial_sweep_preparation
+
+        _signal_worker_ready_once()
+        finish_initial_sweep_preparation(only_if_started=True)
     await _record_visible_answer_active_root_targets(
         dossier=dossier,
         lean=lean,
@@ -3950,6 +3955,11 @@ async def prove_problem_via_session(
             > 0
         ):
             return False, None
+        from ..sweep_control import finish_initial_sweep_preparation
+
+        # Recycling may have interrupted initial helper import. A fresh
+        # deterministic proof attempt must consume search time immediately.
+        finish_initial_sweep_preparation(only_if_started=True)
         dossier.increment_tool_metric(
             "mini_startup_root_fast_lane_attempts",
             1,
@@ -4057,9 +4067,9 @@ async def prove_problem_via_session(
             )
         return False, None
 
-    # READY is a process-startup handshake, so publish it before any proof
-    # search (including the startup fast lane). Durable
-    # restore/merge work below has its own supervisor-enforced operation lease.
+    # READY is a process-startup handshake, so publish it before proof search
+    # (including the startup fast lane). Initial helper import has a separate,
+    # bounded sweep credit; genuine proof work always consumes the proof window.
     _signal_worker_ready_once()
     if _saved_outer_phase("startup_root_fast_lane_exhausted") is True:
         ok, proof = False, None
@@ -4583,6 +4593,9 @@ async def prove_problem_via_session(
                     **conv_kwargs,
                 )
 
+            from ..sweep_control import finish_initial_sweep_preparation
+
+            finish_initial_sweep_preparation(only_if_started=True)
             recursive_result = await run_mini_recursive_attempt(
                 theorem_name=problem.theorem_name,
                 root_statement=problem.statement_type,
@@ -4770,6 +4783,9 @@ async def prove_problem_via_session(
             phase_key = "root_tactic_prepass_exhausted:" + text_hash(prepass_preamble)
             if _saved_outer_phase(phase_key) is True:
                 return False, None
+            from ..sweep_control import finish_initial_sweep_preparation
+
+            finish_initial_sweep_preparation(only_if_started=True)
             result = await _try_root_tactic_close(
                 phase="root_tactic_prepass",
                 theorem_name=problem.theorem_name,
@@ -5014,6 +5030,12 @@ async def prove_problem_via_session(
         async def _run_post_fanin_recursive_session() -> Tuple[bool, Optional[str]]:
             nonlocal recursive_pass_budget_remaining
             nonlocal adaptive_recursive_pass_budget_remaining
+            from ..sweep_control import finish_initial_sweep_preparation
+
+            # Every root sample has settled. If its startup governor stopped
+            # helper restoration, the shared import interval may still be open.
+            # The subsequent recursive lane must consume ordinary proof time.
+            finish_initial_sweep_preparation(only_if_started=True)
             container = _build_post_fanin_recursive_session()
             if checkpoint_registry is not None:
                 await checkpoint_registry.bind_session("parallel_fanin_recursive", container)

@@ -52,9 +52,11 @@ settings. Use `./scripts/sweep_putnam_unsolved.sh --help` for sweep controls and
 
 ## Acceptance deadlines
 
-Each problem's acceptance clock starts when the proof worker is ready:
+Each problem's acceptance clock starts when the proof worker is ready. It counts
+proof work, including deterministic startup tactics, and excludes one bounded
+initial helper-import interval:
 
-| Time from proof worker readiness | Requirement to continue |
+| Accounted time from proof worker readiness | Requirement to continue |
 | --- | --- |
 | 1,200 seconds | At least one distinct, newly accepted proof |
 | 1,800 seconds | At least two distinct, newly accepted proofs |
@@ -67,10 +69,21 @@ problem finishes normally.
 
 Preparation and startup have a separate absolute cap of 1,200 seconds, set with
 `--startup-timeout-s`. Startup liveness checks still detect silent workers.
-Worker recycling does not restart the acceptance clock. A proof accepted during
-startup counts toward the milestones.
+After readiness, the first import of cached helpers receives a separate
+preparation allowance of the same configured duration. This allowance preserves
+time for new proof search while cached proofs are checked and restored. It ends
+as soon as any root sample is ready to search; other samples and recursive
+children cannot reopen it. Work beyond the allowance consumes the ordinary proof
+window. Deferred cache candidates retain their pending verification work.
 
-These are **absolute deadlines**, not rolling inactivity timers. For example,
+Worker recycling restarts neither the acceptance clock nor the import allowance.
+An interrupted import cannot exempt a new deterministic startup proof attempt.
+A proof accepted during startup counts toward the milestones. An import that
+begins after a missed acceptance deadline cannot revive that window. Older
+attempt authority journals without preparation metadata retain their original
+acceptance timing.
+
+These are **fixed milestones on the accounted clock**, not rolling inactivity timers. For example,
 a first acceptance at 1,190 seconds leaves until 1,800 seconds for the second.
 After two timely acceptances, these gates impose no further cutoff; MiniProver's
 normal budgets still apply and may end an attempt earlier.

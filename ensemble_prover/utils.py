@@ -4496,6 +4496,8 @@ def fresh_lean_alternative_identifier(
 
 def _first_top_level_assign(s: str) -> int:
     """Return index of the first top-level ':=', or -1."""
+    if ":=" not in s:
+        return -1
     depth = 0
     i = 0
     while i < len(s) - 1:
@@ -4555,6 +4557,8 @@ def _strip_trailing_declaration_proof_assign(s: str) -> str:
 
 def _first_top_level_semicolon(s: str) -> int:
     """Return index of the first top-level ';', or -1."""
+    if ";" not in s:
+        return -1
     depth = 0
     i = 0
     while i < len(s):
@@ -4576,7 +4580,7 @@ def _first_top_level_semicolon(s: str) -> int:
 def _first_top_level_keyword(s: str, keyword: str) -> int:
     """Return the first top-level keyword token index, or -1."""
     token = str(keyword or "").strip()
-    if not token:
+    if not token or token not in s:
         return -1
     depth = 0
     idx = 0

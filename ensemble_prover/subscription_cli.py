@@ -564,6 +564,42 @@ class SubscriptionCLIClient:
         )
 
     @classmethod
+    def _validate_json_response_content(cls, content: str) -> None:
+        """Keep rejected JSON available to the owning caller, never as an answer."""
+        from .llm_usage import publish_provider_request_metadata
+        from .provider_response import publish_rejected_provider_response
+
+        diagnostic: dict[str, Any] = {}
+        try:
+            parsed = json.loads(content, parse_constant=_reject_json_constant)
+        except (ValueError, RecursionError) as exc:
+            stage = "json_content"
+            diagnostic["json_error"] = "invalid JSON"
+            if isinstance(exc, json.JSONDecodeError):
+                if exc.msg in _SAFE_ARGUMENT_JSON_ERRORS or exc.msg == "Extra data":
+                    diagnostic["json_error"] = exc.msg
+                diagnostic.update(offset=exc.pos, line=exc.lineno, column=exc.colno)
+            elif isinstance(exc, RecursionError):
+                diagnostic["json_error"] = "JSON nesting limit exceeded"
+            elif str(exc) in _SAFE_NON_JSON_CONSTANTS:
+                diagnostic["json_error"] = str(exc)
+        else:
+            if isinstance(parsed, dict):
+                return
+            stage = "json_content_object"
+            diagnostic["parsed_kind"] = _PARSED_ARGUMENT_KINDS[type(parsed)]
+        diagnostic.update(
+            validation_stage=stage,
+            content_chars=len(content),
+            content_sha256=hashlib.sha256(content.encode("utf-8", errors="surrogatepass")).hexdigest(),
+        )
+        error = cls._response_validation_error(stage)
+        error.response_json_diagnostic = dict(diagnostic)
+        publish_rejected_provider_response(error, content, diagnostic)
+        publish_provider_request_metadata({"provider_response_validation": diagnostic})
+        raise error from None
+
+    @classmethod
     def _decode_answer(
         cls, answer: str, allowed: list[str], required: bool
     ) -> tuple[str, list[dict[str, Any]]]:

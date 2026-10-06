@@ -50,7 +50,11 @@ class SweepControl:
         self.identity = hashlib.sha256(token.encode()).hexdigest()
 
     @classmethod
-    def create(cls, output_dir: Path) -> SweepControl:
+    def create(cls, output_dir: Path, *, preparation_budget_s: float = 0.0) -> SweepControl:
+        if (isinstance(preparation_budget_s, bool)
+                or not isinstance(preparation_budget_s, (int, float))
+                or not math.isfinite(preparation_budget_s) or preparation_budget_s < 0):
+            raise ValueError("invalid sweep preparation budget")
         control = cls(output_dir.with_name(output_dir.name + ".sweep_control.jsonl"), secrets.token_hex(32))
         fd = os.open(control.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -58,6 +62,7 @@ class SweepControl:
                 "control_identity": control.identity,
                 "boot_id": _boot_id(),
                 "started_monotonic_s": time.monotonic(),
+                "preparation_budget_s": preparation_budget_s,
             }, allow_nan=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -110,7 +115,10 @@ class SweepControl:
                 if header.get("boot_id") != _boot_id():
                     raise ValueError("sweep authority belongs to another boot")
                 started = _timestamp(header.get("started_monotonic_s"), earliest=0.0, now=time.monotonic())
-                transaction = ControlTransaction(handle, records[1:], started=started, identity=self.identity)
+                transaction = ControlTransaction(
+                    handle, records[1:], started=started, identity=self.identity,
+                    preparation_budget_s=header.get("preparation_budget_s", 0.0),
+                )
                 if incomplete:
                     # A torn final append never carried durable authority.
                     # Keep its preceding intent so the proof outbox can retry.
@@ -127,28 +135,50 @@ class SweepControl:
 class ControlTransaction:
     """Journal operations valid only while the owning control lock is held."""
 
-    def __init__(self, handle: TextIO, records: list[dict[str, Any]], *, started: float, identity: str) -> None:
+    def __init__(self, handle: TextIO, records: list[dict[str, Any]], *, started: float,
+                 identity: str, preparation_budget_s: float = 0.0) -> None:
         self.handle = handle
         self.records = records
         self.started = started
         self.identity = identity
+        if (isinstance(preparation_budget_s, bool)
+                or not isinstance(preparation_budget_s, (int, float))
+                or not math.isfinite(preparation_budget_s) or preparation_budget_s < 0):
+            raise ValueError("invalid sweep preparation budget")
+        self.preparation_budget_s = float(preparation_budget_s)
         self._validate(records)
 
     def _validate(self, records: list[dict[str, Any]]) -> None:
         begun: set[str] = set()
         completed: set[str] = set()
-        ready = cutoff = False
+        ready = cutoff = preparation_started = preparation_finished = False
+        ready_at = preparation_at = self.started
         now = time.monotonic()
         for record in records:
             event = record.get("event")
             if not isinstance(event, str):
                 raise ValueError("invalid sweep authority event")
+            if event in {"initial_seed_begin", "initial_seed_end"}:
+                stamp = _timestamp(record.get("monotonic_s"), earliest=ready_at, now=now)
+                if not ready or cutoff or preparation_finished:
+                    raise ValueError("invalid sweep preparation ordering")
+                if event == "initial_seed_begin":
+                    if preparation_started or not self.preparation_budget_s:
+                        raise ValueError("invalid sweep preparation start")
+                    preparation_started = True
+                    preparation_at = stamp
+                else:
+                    if stamp < preparation_at:
+                        raise ValueError("invalid sweep preparation completion")
+                    preparation_finished = True
+                continue
             if event in {"ready", "cutoff"}:
                 _timestamp(record.get("monotonic_s"), earliest=self.started, now=now)
                 if event == "ready":
                     if ready or cutoff:
                         raise ValueError("invalid sweep readiness ordering")
                     ready = True
+                    ready_at = float(record["monotonic_s"])
                 else:
                     if (cutoff or begun - completed
                             or not isinstance(record.get("reason"), str)
@@ -203,6 +233,16 @@ class ControlTransaction:
         return next((float(item["monotonic_s"]) for item in self.records if item.get("event") == "ready"), None)
 
     @property
+    def preparation_started_at(self) -> float | None:
+        return next((float(item["monotonic_s"]) for item in self.records
+                     if item.get("event") == "initial_seed_begin"), None)
+
+    @property
+    def preparation_finished_at(self) -> float | None:
+        return next((float(item["monotonic_s"]) for item in self.records
+                     if item.get("event") == "initial_seed_end"), None)
+
+    @property
     def pending(self) -> set[str]:
         started = {item["transaction"] for item in self.records if item.get("event") == "commit_begin"}
         finished = {item["transaction"] for item in self.records if item.get("event") == "commit_complete"}
@@ -225,6 +265,44 @@ def signal_sweep_worker_ready() -> None:
             transaction.append({"event": "ready", "monotonic_s": time.monotonic()})
 
 
+def begin_initial_sweep_preparation() -> float:
+    """Admit one bounded initial helper import, shared by all root samples.
+
+    Return its absolute admission deadline, or zero when there is no available
+    preparation phase. Recycling and later samples cannot replenish the credit.
+    """
+    control = SweepControl.from_environment()
+    if control is None:
+        return 0.0
+    with control.locked() as transaction:
+        if transaction.cutoff:
+            raise SweepCutoffCommitted(transaction.cutoff)
+        if (transaction.ready_at is None or transaction.preparation_finished_at is not None
+                or not transaction.preparation_budget_s):
+            return 0.0
+        if transaction.preparation_started_at is None:
+            transaction.append({"event": "initial_seed_begin", "monotonic_s": time.monotonic()})
+        return float(transaction.preparation_started_at) + transaction.preparation_budget_s
+
+
+def finish_initial_sweep_preparation(*, only_if_started: bool = False) -> None:
+    """The first searching root closes preparation for every parallel sample.
+
+    Fast-lane work uses ``only_if_started`` to close an interrupted import on
+    recycling without preventing the first import after a fresh fast lane.
+    """
+    control = SweepControl.from_environment()
+    if control is None:
+        return
+    with control.locked() as transaction:
+        if transaction.cutoff:
+            raise SweepCutoffCommitted(transaction.cutoff)
+        if (transaction.ready_at is None or transaction.preparation_finished_at is not None
+                or (only_if_started and transaction.preparation_started_at is None)):
+            return
+        transaction.append({"event": "initial_seed_end", "monotonic_s": time.monotonic()})
+
+
 @contextmanager
 def acceptance_commit_transaction(records: list[dict[str, Any]]) -> Iterator[ControlTransaction | None]:
     """Persist an intent before success, then complete it with actual receipts."""
@@ -235,6 +313,9 @@ def acceptance_commit_transaction(records: list[dict[str, Any]]) -> Iterator[Con
     with control.locked() as transaction:
         if transaction.cutoff:
             raise SweepCutoffCommitted(transaction.cutoff)
+        if (transaction.preparation_started_at is not None
+                and transaction.preparation_finished_at is None):
+            transaction.append({"event": "initial_seed_end", "monotonic_s": time.monotonic()})
         transaction_id = secrets.token_hex(16)
         transaction.append({"event": "commit_begin", "transaction": transaction_id})
         for record in records:

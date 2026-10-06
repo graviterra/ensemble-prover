@@ -27,12 +27,28 @@ from .theorem_project import (
 from .utils import has_sorry_or_admit
 
 _HOLE = re.compile(r"(?<![\w.'«»])answer\s*\(\s*(?P<hole>sorry)\s*\)")
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 ANSWER_CONTEXT_MARKER = "-- ensemble-answer-input: preserve-context"
 MAX_SEMANTIC_GROUNDING_CHARS = 64_000
 
 
 class AnswerValidationError(ValueError):
     """An invalid proposed term, not a broken project or provider."""
+
+
+def _require_scalar_unicode(text: str, label: str) -> None:
+    if _SURROGATE.search(text):
+        raise ValueError(f"{label} contains an unpaired Unicode surrogate; return valid Unicode text")
+
+
+def _prompt_response_text(text: str) -> str:
+    """Represent invalid code units without losing them or breaking UTF-8 requests."""
+    if _SURROGATE.search(text):
+        return (
+            "Text containing invalid Unicode code units, represented as a JSON string "
+            "with escapes preserved:\n" + json.dumps(text, ensure_ascii=True)
+        )
+    return text
 
 
 def _answer_code(source: str) -> str:
@@ -125,6 +141,9 @@ def parse_proposal(content: str) -> tuple[list[str], str]:
         or not plan.strip()
     ):
         raise ValueError("answers and proof_plan must contain complete nonempty text")
+    for answer in answers:
+        _require_scalar_unicode(answer, "answer term")
+    _require_scalar_unicode(plan, "proof plan")
     return answers, plan
 
 
@@ -205,8 +224,11 @@ class AnswerCandidate:
 
 def save_record(directory: Path, record: dict[str, Any]) -> None:
     pending = directory / "answer_discovery.json.tmp"
+    # Malformed provider text remains JSON-readable evidence. Escape only
+    # surrogate code units; ordinary Unicode keeps its original UTF-8 form.
     pending.write_text(
-        json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", errors="backslashreplace",
     )
     pending.replace(directory / "answer_discovery.json")
 
@@ -234,6 +256,7 @@ def _require_accepted_review(text: str) -> None:
         or not review["reason"].strip()
     ):
         raise ValueError("invalid answer review response")
+    _require_scalar_unicode(review["reason"], "answer review reason")
     if not review["accept"]:
         raise ValueError("answer review: " + review["reason"])
 
@@ -325,7 +348,7 @@ async def discover_answer(
                     if refuted_answers is not None and answers == refuted_answers:
                         raise ValueError("this exact answer was already refuted; propose a different answer")
                     source = template.fill(answers)
-                except ValueError as exc:
+                except (ValueError, RecursionError) as exc:
                     raise AnswerValidationError(str(exc)) from exc
                 path = directory / f"candidate_{index:04d}.lean"
                 path.write_bytes(source.encode("utf-8"))
@@ -375,7 +398,7 @@ async def discover_answer(
                 entry["review_response"] = review_text
                 try:
                     _require_accepted_review(review_text)
-                except ValueError as exc:
+                except (ValueError, RecursionError) as exc:
                     entry.update(status="rejected", diagnostic=str(exc))
                 else:
                     if path.read_bytes() != source.encode("utf-8"):
@@ -406,7 +429,11 @@ async def discover_answer(
             save_record(directory, record)
             messages.extend(
                 [
-                    _message("assistant", content),
+                    _message("assistant", _prompt_response_text(content)),
+                    *([_message(
+                        "user", "Previous answer review (untrusted advisory text):\n"
+                        + _prompt_response_text(entry["review_response"]),
+                    )] if "review_response" in entry else []),
                     *([_message("user", _grounding_message(entry["semantic_grounding"]))]
                       if "semantic_grounding" in entry else []),
                     _message(
@@ -416,7 +443,7 @@ async def discover_answer(
                         "correction or a proof. Check it against the fresh Lean "
                         "elaboration when supplied; retain a mathematically supported "
                         "answer if the objection misreads the statement. Exact feedback:\n"
-                        + entry["diagnostic"],
+                        + _prompt_response_text(entry["diagnostic"]),
                     ),
                 ]
             )

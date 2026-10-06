@@ -43,7 +43,6 @@ from .subscription_cli import (
     subscription_request_timeout,
     SubscriptionCLIClient,
     _INSTRUCTIONS,
-    _reject_json_constant,
     _response_schema,
 )
 from .subprocess_environment import sanitized_subprocess_environment
@@ -699,12 +698,7 @@ class CodexSubscriptionClient(SubscriptionCLIClient):
                 answer, allowed, bool(selected or tool_choice == "required")
             )
             if response_format == "json":
-                try:
-                    inner = json.loads(content, parse_constant=_reject_json_constant)
-                except (ValueError, RecursionError):
-                    raise self._response_validation_error("json_content") from None
-                if not isinstance(inner, dict):
-                    raise self._response_validation_error("json_content_object") from None
+                self._validate_json_response_content(content)
         except Exception:
             report_progress("failed")
             raise

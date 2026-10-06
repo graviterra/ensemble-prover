@@ -953,7 +953,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                         "Claude Code client is closed", kind="capability"
                     )
                 check_subscription_transport_admission()
-                _, stderr, code = await self._process(
+                stdout, stderr, code = await self._process(
                     argv,
                     cwd=cwd,
                     input_data=payload,
@@ -965,6 +965,16 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     ),
                     on_progress=generation_advanced,
                 )
+                metadata["provider_process_completion"] = {
+                    "returncode": code,
+                    "initialized": initialized,
+                    "completed": completed,
+                    "failed_turn": failed_turn,
+                    "stdout_bytes": len(stdout),
+                    "stderr_bytes": len(stderr),
+                    "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+                }
+                publish_provider_request_metadata(metadata)
                 if completed and not failed_turn and code == 0:
                     final_progress_status = "finished"
             except asyncio.CancelledError:
@@ -1033,12 +1043,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                 answer, allowed, bool(selected or tool_choice == "required")
             )
             if response_format == "json":
-                try:
-                    inner = json.loads(content, parse_constant=_reject_json_constant)
-                except (ValueError, RecursionError):
-                    raise self._response_validation_error("json_content") from None
-                if not isinstance(inner, dict):
-                    raise self._response_validation_error("json_content_object") from None
+                self._validate_json_response_content(content)
         except Exception:
             report_progress("failed")
             raise
