@@ -7896,7 +7896,6 @@ def _graph_binder_names_from_chunk(chunk: str) -> Tuple[str, ...]:
         )
         if separator >= 0:
             body = body[:separator]
-        body = body.translate(str.maketrans({ch: " " for ch in "(){}[]⦃⦄⟨⟩"}))
         for name in _graph_lean_identifier_tokens(body):
             if name in {"forall", "exists", "fun", "by", "let", "in"}:
                 continue

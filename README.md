@@ -20,7 +20,7 @@ retrieval, proof repair, and research into alternative approaches. Give it a
 theorem or an English claim, follow the work in your browser, and inspect the
 formal mathematics behind recorded progress.
 
-**500 distinct Putnam problems with saved solutions—and counting.**
+**669 distinct Putnam problems with saved solutions—and counting.**
 
 [Results and evaluation scope](#results)
 
@@ -230,8 +230,8 @@ they can support a proof claim.
 
 | Distinct problems with saved solutions | Listed on PutnamBench |
 | :---: | :---: |
-| **500 distinct Putnam problems** | **65 problems** |
-| Cumulative archive · October 1, 2026 | Public metadata checked · September 26, 2026 |
+| **669 distinct Putnam problems** | **65 problems** |
+| Cumulative archive · October 6, 2026 | Public metadata checked · September 26, 2026 |
 
 The cumulative count combines models, configurations, and budgets and does not
 establish a controlled benchmark solve rate. Historical artifacts can have

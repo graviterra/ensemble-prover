@@ -1301,8 +1301,8 @@ def _validated_provider_call_quantum_state(
                 raw_state.get("repair_self_check_status", "") or ""
             )[:80],
             "repair_self_check_codes": [
-                str(code or "")[:20_000]
-                for code in legacy_repair_codes[-4:]
+                str(code or "")
+                for code in legacy_repair_codes
                 if str(code or "")
             ],
             "deepseek_dsml_reprompted_after_budget": False,
@@ -3236,7 +3236,7 @@ async def _call_llm_with_tools_one_round_impl(
         )
         banked_mixed_final_content = str(
             quantum_state.get("banked_mixed_final_content", "") or ""
-        )[:100_000]
+        )
         banked_mixed_finalizer_pending = bool(
             banked_mixed_final_content
             and quantum_state.get("banked_mixed_finalizer_pending", False)
@@ -8308,7 +8308,7 @@ async def _call_llm_with_tools_one_round_impl(
                 ),
                 "banked_mixed_final_content": str(
                     banked_mixed_final_content or ""
-                )[:100_000],
+                ),
                 "banked_mixed_finalizer_pending": bool(
                     banked_mixed_finalizer_pending
                 ),

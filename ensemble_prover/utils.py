@@ -10,7 +10,7 @@ import threading
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from .lean_decl_parser import _HAVE_KEYWORDS, _LET_KEYWORDS, _matches_word, find_decl_header_end
 
@@ -5124,6 +5124,10 @@ def _top_level_token_positions(
     constructor_groups: bool = False,
 ) -> list[tuple[int, str]]:
     positions: list[tuple[int, str]] = []
+    tokens_by_first: dict[str, list[str]] = {}
+    for token in tokens:
+        if token:
+            tokens_by_first.setdefault(token[0], []).append(token)
     depth = 0
     i = 0
     openers = (*_GROUP_OPEN_TO_CLOSE, "⟨") if constructor_groups else _GROUP_OPEN_TO_CLOSE
@@ -5143,7 +5147,9 @@ def _top_level_token_positions(
             i += 1
             continue
         if depth == 0:
-            matched = next((tok for tok in tokens if stmt.startswith(tok, i)), None)
+            matched = next((
+                tok for tok in tokens_by_first.get(ch, ()) if stmt.startswith(tok, i)
+            ), None)
             if matched is not None:
                 positions.append((i, matched))
                 i += len(matched)
@@ -5675,15 +5681,27 @@ def _finite_big_operator_binders(
     return names, tuple(domains), predicate, proof_name
 
 
-def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
+def _scoped_identifier_uses(
+    statement: str,
+    *,
+    free_identifier_collector: Optional[Callable[[str, set[str]], set[str]]] = None,
+) -> tuple[set[str], set[str]]:
     """Return telescope-bound names and free identifiers under lexical scopes.
 
     A conclusion's quantifiers can follow several implications. Their names
     must not be supplied again by the root context, but they cannot capture
     occurrences in earlier premises or binder types. Premise-local binders
     have their own scope and are not part of the conclusion's telescope.
-    Unknown term syntax is treated conservatively as identifier uses.
+    Unknown term syntax is treated conservatively as identifier uses. An optional
+    collector can retain full qualified token identities while sharing the same
+    binding rules; it receives the names in scope at each free-text fragment.
     """
+    def collect(text: str, bound: set[str]) -> set[str]:
+        if free_identifier_collector is not None:
+            return free_identifier_collector(text, bound)
+        return _binder_identifier_tokens(text) - bound
+
+    comma_binders = (*_COMMA_BINDER_OPERATORS, "forall")
     names: set[str] = set()
     free: set[str] = set()
     pending: list[tuple[str, set[str], bool]] = [
@@ -5693,27 +5711,91 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
             True,
         )
     ]
+
+    def collect_balanced_arguments(text: str, bound: set[str]) -> None:
+        """Term groups inside a tactic retain their own lexical boundaries."""
+        if not any(opener in text for opener in _GROUP_OPEN_TO_CLOSE):
+            free.update(collect(text, bound))
+            return
+        start = index = 0
+        while index < len(text):
+            skip = _lean_lexical_skip_end(text, index)
+            if skip is not None:
+                index = skip
+                continue
+            if text[index] in _GROUP_OPEN_TO_CLOSE:
+                end = _scan_group(text, index)
+                if end is not None:
+                    free.update(collect(text[start:index], bound))
+                    pending.append((text[index + 1:end - 1].strip(), set(bound), False))
+                    start = index = end
+                    continue
+            index += 1
+        free.update(collect(text[start:], bound))
+
     while pending:
         rest, bound, in_telescope = pending.pop()
         while rest:
             if rest.startswith("(") and _scan_group(rest, 0) == len(rest):
                 rest = rest[1:-1].strip()
                 continue
+            if rest.startswith(("(", "{", "[", "⦃")) and ("→" in rest or "->" in rest):
+                from .proof_graph import _graph_leading_telescope_step
+
+                telescope = _graph_leading_telescope_step(rest)
+                if telescope is not None:
+                    segments, body = telescope
+                    rest = f"∀ {' '.join(segments)}, {body}"
+                    continue
             # Unsupported term/tactic syntax must not let one inner lambda
             # capture identifiers from a different branch or constructor field.
             if (
                 "`" in rest
                 or any(_matches_word(rest, 0, keyword) for keyword in _UNSUPPORTED_SCOPED_TERM_KEYWORDS)
             ):
-                free.update(_binder_identifier_tokens(rest) - bound)
+                if free_identifier_collector is not None and _matches_word(rest, 0, "by") and "`" not in rest:
+                    tactic = rest[2:].lstrip()
+                    if _matches_word(tactic, 0, "exact"):
+                        term = tactic[len("exact"):].strip()
+                        # A complete single exact command can hand its term to
+                        # the term parser. A sibling tactic must keep its own
+                        # scope even if it happens to reuse a term-local name.
+                        checked_tail = term
+                        if _matches_word(term, 0, "let"):
+                            term_let = _split_top_level_let_body(term)
+                            if term_let is not None:
+                                checked_tail = term_let[1]
+                        separators = _top_level_token_positions(
+                            checked_tail, ("<;>", ";", "\n"), constructor_groups=True,
+                        )
+                        if term and not separators:
+                            rest, in_telescope = term, False
+                            continue
+                    collect_balanced_arguments(rest, bound)
+                    break
+                free.update(collect(rest, bound))
+                break
+            if free_identifier_collector is not None and not (
+                any(token in rest for token in (*comma_binders, "λ"))
+                or (":" in rest and ("→" in rest or "->" in rest))
+                or any(
+                    re.search(r"(?<![\w'.])" + keyword + r"(?![\w'])", rest)
+                    for keyword in _SCOPED_TERM_KEYWORDS
+                )
+            ):
+                # No binder can change the current scope. Avoid repeatedly
+                # splitting long connective chains only to collect their atoms.
+                free.update(collect(rest, bound))
                 break
             # A tuple/list comma terminates the preceding component's scope.
             # Quantifier-header commas instead introduce that binder's body.
             quantifier_headers = 0
             sibling_comma = None
             for index, token in _top_level_token_positions(
-                rest, (*_COMMA_BINDER_OPERATORS, ","), constructor_groups=True,
+                rest, (*comma_binders, ","), constructor_groups=True,
             ):
+                if token == "forall" and not _matches_word(rest, index, token):
+                    continue
                 if token != ",":
                     # Indexed unions/sups use a comma; unary operators such
                     # as sUnion (⋃₀) do not introduce a binding scope.
@@ -5748,14 +5830,27 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                             else_index = index
                             break
                 if then_index is not None and else_index is not None:
-                    pending.append((rest[3:then_index].strip(), set(bound), False))
-                    pending.append((rest[then_index + 4 : else_index].strip(), set(bound), False))
+                    condition = rest[3:then_index].strip()
+                    branch_bound = set(bound)
+                    colon = _first_top_level_colon(condition)
+                    proof_name = condition[:colon].strip() if colon != -1 else ""
+                    if proof_name and _BINDER_IDENT_RE.fullmatch(proof_name):
+                        # A named conditional binds its evidence in each branch,
+                        # while the proposition itself uses the outer scope.
+                        branch_bound.add(canonical_lean_identifier(proof_name))
+                        condition = condition[colon + 1:].strip()
+                    pending.append((condition, set(bound), False))
+                    pending.append((rest[then_index + 4 : else_index].strip(), branch_bound, False))
+                    bound = set(branch_bound)
                     rest, in_telescope = rest[else_index + 4 :].strip(), False
                     continue
-                free.update(_binder_identifier_tokens(rest) - bound)
+                free.update(collect(rest, bound))
                 break
             lambda_head = re.match(r"(?:fun|λ)(?=\s|[({⦃])", rest)
-            is_quantifier = rest.startswith(("∀", "∃")) and not rest.startswith(("∀ᶠ", "∃ᶠ"))
+            ascii_forall = _matches_word(rest, 0, "forall")
+            is_quantifier = ascii_forall or (
+                rest.startswith(("∀", "∃")) and not rest.startswith(("∀ᶠ", "∃ᶠ"))
+            )
             big_operator = next(
                 (op for op in _SCOPED_BIG_OPERATORS
                  if rest.startswith(op) and rest[len(op) : len(op) + 1] != "₀"),
@@ -5763,7 +5858,9 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
             )
             if is_quantifier or lambda_head or big_operator:
                 tail = rest[
-                    lambda_head.end() if lambda_head else len(big_operator) or 1 :
+                    lambda_head.end() if lambda_head else (
+                        len(big_operator) or (len("forall") if ascii_forall else 1)
+                    ) :
                 ].lstrip()
                 if big_operator:
                     in_telescope = False
@@ -5780,7 +5877,7 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                     comma = commas[0][0] if commas else -1
                     split = (tail[:comma], tail[comma + 1 :]) if comma != -1 else None
                 if split is None:
-                    free.update(_binder_identifier_tokens(rest) - bound)
+                    free.update(collect(rest, bound))
                     break
                 head, body = (part.strip() for part in split)
                 if big_operator:
@@ -5813,14 +5910,14 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                         )
                     )
                 ):
-                    free.update(_binder_identifier_tokens(rest) - bound)
+                    free.update(collect(rest, bound))
                     break
                 if big_operator in {"∑", "∏"}:
                     finite = _finite_big_operator_binders(head)
                     if finite is None:
                         # Extended/custom index syntax must retain possible
                         # outer dependencies until a full parser handles it.
-                        free.update(_binder_identifier_tokens(head + " " + body) - bound)
+                        free.update(collect(head + " " + body, bound))
                         break
                     declared, domains, predicate, proof_name = finite
                     pending.extend((domain, set(bound), False) for domain in domains)
@@ -5857,6 +5954,13 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                                 continue
                         declared = _declared_names_from_binder_segments([segment])
                         annotation = _binder_segment_annotation(segment)
+                        if free_identifier_collector is not None:
+                            # Declaration defaults are evaluated before the new
+                            # binder enters scope, just like its type annotation.
+                            _opener, content, _closer = _binder_segment_parts(segment)
+                            default_end = find_decl_header_end(content, 0)
+                            if default_end is not None:
+                                pending.append((content[default_end:], set(bound), False))
                         if not declared and not annotation:
                             _opener, annotation, _closer = _binder_segment_parts(
                                 segment
@@ -5895,7 +5999,7 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                         continue
             operators = _top_level_token_positions(
                 rest,
-                ("<->", "↔", "→", "->", "∨", "∧", "∀", "∃", *_SCOPED_BIG_OPERATORS, *_SCOPED_TERM_KEYWORDS),
+                ("<->", "↔", "→", "->", "∨", "∧", "∀", "∃", "forall", *_SCOPED_BIG_OPERATORS, *_SCOPED_TERM_KEYWORDS),
                 constructor_groups=True,
             )
             # A binder also scopes a term on an operator's RHS, e.g.
@@ -5906,6 +6010,7 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                     idx
                     for idx, op in operators
                     if op in {"∀", "∃", *_SCOPED_BIG_OPERATORS}
+                    or (op == "forall" and _matches_word(rest, idx, op))
                     or (
                         op in _SCOPED_TERM_KEYWORDS
                         and _matches_word(rest, idx, op)
@@ -5919,7 +6024,7 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
             # scope (e.g. ``f = let n := 1; n`` or a lambda containing a let).
             assignment = _first_top_level_assign(rest)
             if assignment != -1 and assignment < binder_start:
-                free.update(_binder_identifier_tokens(rest) - bound)
+                free.update(collect(rest, bound))
                 break
             precedence = {"<->": 0, "↔": 0, "→": 1, "->": 1, "∨": 2, "∧": 3}
             separators = [
@@ -5938,31 +6043,39 @@ def _scoped_identifier_uses(statement: str) -> tuple[set[str], set[str]]:
                 # groups without letting their bindings escape to siblings.
                 # Quoted Lean syntax is not an ordinary term scope.
                 if "`" in rest:
-                    free.update(_binder_identifier_tokens(rest) - bound)
+                    free.update(collect(rest, bound))
                     break
-                start = index = 0
-                while index < len(rest):
-                    skip = _lean_lexical_skip_end(rest, index)
-                    if skip is not None:
-                        index = skip
-                        continue
-                    if rest[index] in _GROUP_OPEN_TO_CLOSE:
-                        end = _scan_group(rest, index)
-                        if end is not None:
-                            free.update(
-                                _binder_identifier_tokens(rest[start:index]) - bound
-                            )
-                            pending.append(
-                                (rest[index + 1 : end - 1].strip(), set(bound), False)
-                            )
-                            start = index = end
-                            continue
-                    index += 1
-                free.update(_binder_identifier_tokens(rest[start:]) - bound)
+                collect_balanced_arguments(rest, bound)
                 break
             index, operator = min(
                 separators, key=lambda pair: (precedence[pair[1]], pair[0])
             )
+            if free_identifier_collector is not None:
+                # Each sibling at this precedence shares the outer scope. Push
+                # them together so a long chain is scanned once at this level.
+                start = 0
+                level = precedence[operator]
+                dependent_tail = False
+                for index, separator in separators:
+                    if precedence[separator] != level:
+                        continue
+                    if separator in {"→", "->"} and rest[start:index].lstrip().startswith(("(", "{", "[", "⦃")):
+                        from .proof_graph import _graph_leading_telescope_step
+
+                        if _graph_leading_telescope_step(rest[start:index] + " → True") is not None:
+                            dependent_tail = True
+                            break
+                    pending.append((rest[start:index].strip(), set(bound), False))
+                    start = index + len(separator)
+                if operator not in {"→", "->"}:
+                    in_telescope = False
+                rest = rest[start:].strip()
+                if dependent_tail and start == 0:
+                    # The leading telescope is normally consumed above; keep
+                    # unsupported framing conservative rather than looping.
+                    free.update(collect(rest, bound))
+                    break
+                continue
             premise, conclusion = rest[:index], rest[index + len(operator) :]
             pending.append((premise.strip(), set(bound), False))
             if operator not in {"→", "->"}:
@@ -6247,8 +6360,9 @@ def _declared_names_from_binder_segments(binders: Sequence[str]) -> set[str]:
         content = inner if opener else raw
         if opener == "[" and _first_top_level_colon(content) == -1:
             continue
-        if ":=" in content:
-            content = content.split(":=", 1)[0].strip()
+        assignment = _first_top_level_assign(content)
+        if assignment != -1:
+            content = content[:assignment].strip()
         colon_idx = _first_top_level_colon(content)
         # Membership binders (x ∈ s) use ∈ as a delimiter analogous to :.
         if colon_idx == -1:
@@ -6268,8 +6382,9 @@ def _binder_segment_declared_names(segment: str) -> list[str]:
     content = inner if opener else raw
     if opener == "[" and _first_top_level_colon(content) == -1:
         return []
-    if ":=" in content:
-        content = content.split(":=", 1)[0].strip()
+    assignment = _first_top_level_assign(content)
+    if assignment != -1:
+        content = content[:assignment].strip()
     colon_idx = _first_top_level_colon(content)
     # Membership binders (x ∈ s) use ∈ as a delimiter analogous to :.
     if colon_idx == -1:

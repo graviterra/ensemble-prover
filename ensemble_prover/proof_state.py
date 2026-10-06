@@ -14,7 +14,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from threading import Lock
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .state_data import clone_json_value
 from .contract_identity import (
@@ -43,6 +43,9 @@ from .lean_names import (
 )
 from .proof_graph import (
     FORMALIZATION_BRIDGE_OPEN_PREMISE_TRUST,
+    _declaration_body_marker,
+    _declaration_type_colon,
+    _helper_decl_header,
     graph_node_frontier_quarantined,
     graph_root_equivalent_suppression_decision,
     graph_statement_is_executable,
@@ -50,6 +53,12 @@ from .proof_graph import (
     helper_decl_statement,
 )
 from .utils import (
+    _binder_segment_parts,
+    _declared_names_from_binder_segments,
+    _first_top_level_colon,
+    _split_binder_segments,
+    _scan_group,
+    _scoped_identifier_uses,
     _lean_lexical_skip_end,
     _layout_local_let_prefix_expects_term_continuation,
     _layout_local_let_prefix_has_open_rhs,
@@ -57,6 +66,7 @@ from .utils import (
     _line_ends_with_open_proof_tail,
     _line_has_layout_local_let_without_body,
     _looks_like_tactic_proof_continuation_line,
+    canonical_lean_identifier,
     has_sorry_or_admit,
     normalize_subgoal_statement,
 )
@@ -1630,11 +1640,79 @@ def _lean_identifier_has_root_qualifier(text: str, start: int) -> bool:
     return start >= len("_root_.") and text[start - len("_root_.") : start] == "_root_."
 
 
-def _lean_identifier_is_record_field_label(text: str, end: int) -> bool:
-    index = max(0, end)
-    while index < len(text) and text[index].isspace():
-        index += 1
-    return text.startswith(":=", index)
+def _lean_record_field_label_checker(text: str) -> Callable[[int, int], bool]:
+    """Recognize assignment labels without discarding terminal type references.
+
+    Bracket/layout context is built lazily once for comma-separated or multiline
+    fields. Quoted names remain atomic, including any punctuation they contain.
+    """
+    record_positions: Optional[Set[int]] = None
+
+    def record_context_positions() -> Set[int]:
+        positions: Set[int] = set()
+        # Frames hold opener, last type colon, and last assignment position.
+        groups: List[List[Any]] = []
+        layouts: List[Tuple[int, List[Any]]] = []
+        line_start = 0
+        line_indent = _line_indent(text)
+        tokens = re.compile(_LEAN_QUALIFIED_NAME_PATTERN + r"|:=|[(){}\[\]⦃⦄⟨⟩,:\n]")
+        for token in tokens.finditer(text):
+            value = token.group(0)
+            if value == "\n":
+                line_start = token.end()
+                line_end = text.find("\n", line_start)
+                line = text[line_start:line_end if line_end >= 0 else len(text)]
+                line_indent = _line_indent(line)
+                if line.strip():
+                    while layouts and line_indent <= layouts[-1][0]:
+                        layouts.pop()
+                continue
+            frame = groups[-1] if groups else (layouts[-1][1] if layouts else None)
+            if frame is not None and frame[0] in {"{", "where"} and frame[1] <= frame[2]:
+                positions.add(token.start())
+            if value in {"(", "{", "[", "⦃", "⟨"}:
+                groups.append([value, -1, -1])
+            elif value in {")", "}", "]", "⦄", "⟩"}:
+                if groups:
+                    groups.pop()
+            elif value == ":" and frame is not None:
+                frame[1] = token.start()
+            elif value == ":=" and frame is not None:
+                frame[2] = token.start()
+            elif value == "where":
+                line_end = text.find("\n", token.end())
+                if not text[token.end():line_end if line_end >= 0 else len(text)].strip():
+                    layouts.append((line_indent, ["where", -1, -1]))
+        return positions
+
+    def is_label(start: int, end: int) -> bool:
+        nonlocal record_positions
+        index = end
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if not text.startswith(":=", index):
+            return False
+        previous = start - 1
+        while previous >= 0 and text[previous].isspace():
+            previous -= 1
+        if previous >= 0 and text[previous] in "({":
+            return True
+        # A record update has a field immediately after its `with` keyword.
+        with_start = previous - 3
+        after_with = (
+            with_start >= 0 and text[with_start:previous + 1] == "with"
+            and (with_start == 0 or not (
+                text[with_start - 1].isalnum() or text[with_start - 1] in "_'."
+            ))
+        )
+        line_start = text.rfind("\n", 0, start) + 1
+        if not after_with and (previous < 0 or text[previous] != ",") and text[line_start:start].strip():
+            return False
+        if record_positions is None:
+            record_positions = record_context_positions()
+        return start in record_positions
+
+    return is_label
 
 
 def _lean_identifier_is_projection_field(text: str, start: int) -> bool:
@@ -1651,7 +1729,24 @@ def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, in
         line_starts.append(offset)
         offset += len(line)
 
+    # Most local declarations bind until the next strict layout dedent. Find
+    # those boundaries once, instead of rescanning the entire remaining proof
+    # for every declaration in a long tactic block.
+    line_indents = [_line_indent(line) for line in lines]
+    next_dedents = [len(code)] * len(lines)
+    following_lines: List[int] = []
+    for line_index in range(len(lines) - 1, -1, -1):
+        if not lines[line_index].strip():
+            continue
+        while following_lines and line_indents[following_lines[-1]] >= line_indents[line_index]:
+            following_lines.pop()
+        if following_lines:
+            next_dedents[line_index] = line_starts[following_lines[-1]]
+        following_lines.append(line_index)
+
     def scope_end(line_index: int, scope_indent: int) -> int:
+        if scope_indent == line_indents[line_index] - 1:
+            return next_dedents[line_index]
         for next_index in range(line_index + 1, len(lines)):
             line = lines[next_index]
             if not line.strip():
@@ -2117,6 +2212,67 @@ def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, in
                 return index
         return len(line)
 
+    term_let_positions: Set[int] = set()
+    if "let" in code:
+        from .lean_decl_parser import _matches_word
+
+        # The declaration's result type and its proof have different scopes.
+        # A term let in the type cannot introduce a tactic local in the proof.
+        declaration_starts = [
+            match.start() for match in _LEAN_IDENTIFIER_RE.finditer(code)
+            if match.group(0) in {"lemma", "theorem", "def", "abbrev", "instance"}
+        ]
+        type_ranges: List[Tuple[int, int]] = []
+        for index, start in enumerate(declaration_starts):
+            stop = declaration_starts[index + 1] if index + 1 < len(declaration_starts) else len(code)
+            declaration = code[start:stop].rstrip()
+            parsed = _helper_decl_header(declaration)
+            if parsed is None:
+                continue
+            tail = parsed[2]
+            marker = _declaration_body_marker(tail, start=0)
+            if marker is not None:
+                type_ranges.append((start, start + len(declaration) - len(tail) + marker[0]))
+
+        groups: List[Tuple[int, bool]] = []
+        first_code = len(code) - len(code.lstrip())
+        type_index = 0
+        cursor = 0
+        while cursor < len(code):
+            skipped = _lean_lexical_skip_end(code, cursor)
+            if skipped is not None:
+                cursor = skipped
+                continue
+            char = code[cursor]
+            if char in "([{⦃⟨":
+                first = cursor + 1
+                while first < len(code) and code[first].isspace():
+                    first += 1
+                groups.append((first, _matches_word(code, first, "by")))
+            elif char in ")]}⦄⟩":
+                if groups:
+                    groups.pop()
+            elif code.startswith("let", cursor):
+                if _matches_word(code, cursor, "let"):
+                    before = cursor
+                    while before > 0 and code[before - 1].isspace():
+                        before -= 1
+                    after_exact = bool(
+                        before >= len("exact")
+                        and _matches_word(code, before - len("exact"), "exact")
+                    )
+                    while type_index < len(type_ranges) and type_ranges[type_index][1] <= cursor:
+                        type_index += 1
+                    in_type = bool(type_index < len(type_ranges) and type_ranges[type_index][0] <= cursor)
+                    if (
+                        (groups and cursor == groups[-1][0])
+                        or cursor == first_code
+                        or after_exact
+                        or (in_type and not (groups and groups[-1][1]))
+                    ):
+                        term_let_positions.add(cursor)
+            cursor += 1
+
     local_decl_re = re.compile(
         r"(?<![A-Za-z0-9_'.])(?:have|let|obtain)\s+([A-Za-z_][A-Za-z0-9_']*)\s*(?::|:=)"
     )
@@ -2148,6 +2304,8 @@ def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, in
         line_start = line_starts[line_index]
         line_indent = _line_indent(line)
         for match in local_decl_re.finditer(line):
+            if line_start + match.start() in term_let_positions:
+                continue
             bullet_pos = line.find("·", 0, match.start(1))
             scope_indent = bullet_pos if bullet_pos >= 0 else max(-1, line_indent - 1)
             decl_indent = match.start(0)
@@ -2194,6 +2352,8 @@ def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, in
                 scope_stop,
             )
         for match in local_pattern_decl_re.finditer(line):
+            if line_start + match.start() in term_let_positions:
+                continue
             bullet_pos = line.find("·", 0, match.start(1))
             scope_indent = bullet_pos if bullet_pos >= 0 else max(-1, line_indent - 1)
             decl_indent = match.start(0)
@@ -2358,11 +2518,175 @@ def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, in
             arrow_index = line.find("=>", match.end(1))
             body_start = arrow_index + 2 if arrow_index >= 0 else match.end(1)
             end = line_start + fun_scope_end(line, match.start(0), body_start)
-            for name_match in _LEAN_IDENTIFIER_RE.finditer(match.group(1)):
-                name = name_match.group(0)
-                if name not in _LEAN_BUILTIN_WORDS:
-                    record(name, line_start + match.start(1) + name_match.start(), end)
+            head = match.group(1)
+            segment_offset = 0
+            for segment in _split_binder_segments([head]):
+                segment_start = head.find(segment, segment_offset)
+                segment_offset = segment_start + len(segment)
+                _opener, content, _closer = _binder_segment_parts(segment)
+                declared = _declared_names_from_binder_segments([segment])
+                colon = _first_top_level_colon(content)
+                names_text = content[:colon] if colon != -1 else content
+                content_start = segment.find(content)
+                for name_match in _LEAN_IDENTIFIER_RE.finditer(names_text):
+                    name = name_match.group(0)
+                    if canonical_lean_identifier(name) not in declared:
+                        continue
+                    name_start = line_start + match.start(1) + segment_start + content_start + name_match.start()
+                    record(name, name_start, name_start + len(name))
+                    # The binder is visible after its complete annotation, not
+                    # in the annotation that determines its own type.
+                    record(name, line_start + match.start(1) + segment_offset, end)
     return ranges
+
+
+def _lean_lexically_free_reference_tokens(
+    source: str,
+    candidates: Set[str],
+    *,
+    reference_aliases: Optional[Mapping[str, str]] = None,
+    alias_prefix: str = "",
+) -> Set[str]:
+    """Keep full name atoms while applying shared term and telescope scopes.
+
+    A declaration telescope scopes its type and proof separately. Unrecognized
+    command framing remains conservative: one command's parameters must never
+    capture references in another command or in an attribute.
+    """
+    if not candidates:
+        return set()
+    if "@[" in source:
+        from .theorem_project import _mask_attribute_contents
+
+        masked_attributes = _mask_attribute_contents(source)
+        outside = {
+            match.group(0) for match in _LEAN_IDENTIFIER_RE.finditer(source)
+            if match.group(0) in candidates
+            and masked_attributes[match.start():match.end()] != match.group(0)
+        }
+        if outside:
+            return outside | _lean_lexically_free_reference_tokens(
+                masked_attributes, candidates - outside,
+                reference_aliases=reference_aliases, alias_prefix=alias_prefix,
+            )
+
+    def collect(text: str, bound: Set[str]) -> Set[str]:
+        aliases = reference_aliases or {}
+        bound_atoms = {lean_name_components(aliases.get(name, name)) for name in bound}
+        free: Set[str] = set()
+        for match in _LEAN_IDENTIFIER_RE.finditer(text):
+            token = match.group(0)
+            if token not in candidates:
+                continue
+            parts = lean_name_components(aliases.get(token, token))
+            rooted = len(parts) > 1 and parts[0] == "_root_"
+            if not rooted and parts[:1] in bound_atoms:
+                continue
+            free.add(token)
+        return free
+
+    def scan(text: str) -> Set[str]:
+        if alias_prefix and alias_prefix not in text:
+            return set()
+        found: Set[str] = set()
+
+        class ReferencesComplete(Exception):
+            pass
+
+        def collect_until_complete(fragment: str, bound: Set[str]) -> Set[str]:
+            free = collect(fragment, bound)
+            found.update(free)
+            if found == candidates:
+                raise ReferencesComplete
+            return free
+
+        try:
+            return _scoped_identifier_uses(
+                text, free_identifier_collector=collect_until_complete,
+            )[1]
+        except ReferencesComplete:
+            return found
+
+    # Detect command names using full lexical tokens. A declaration-prefix
+    # expression searched at every whitespace can backtrack through a long
+    # same-line proposition, so only inspect an actual command's following name.
+    declarations: List[Tuple[int, int, str, str]] = []
+    for token in _LEAN_IDENTIFIER_RE.finditer(source):
+        kind = token.group(0)
+        if kind not in {"lemma", "theorem", "def", "abbrev", "instance"}:
+            continue
+        name_start = token.end()
+        while name_start < len(source) and source[name_start].isspace():
+            name_start += 1
+        name = _LEAN_IDENTIFIER_RE.match(source, name_start)
+        if name is None:
+            continue
+        name_end = name.end()
+        if source.startswith(".{", name_end):
+            group_end = _scan_group(source, name_end + 1)
+            if group_end is not None:
+                name_end = group_end
+        declarations.append((token.start(), name_end, kind, name.group(0)))
+    if len(declarations) > 1:
+        free = collect(source[:declarations[0][0]], set())
+        for index, (start, _name_end, _kind, _name) in enumerate(declarations):
+            stop = declarations[index + 1][0] if index + 1 < len(declarations) else len(source)
+            free.update(_lean_lexically_free_reference_tokens(
+                source[start:stop], candidates - free,
+                reference_aliases=reference_aliases, alias_prefix=alias_prefix,
+            ))
+            if free == candidates:
+                break
+        return free
+    if declarations:
+        _start, name_end, kind, name = declarations[0]
+        parsed = kind, name, source[name_end:]
+    else:
+        parsed = _helper_decl_header(source)
+    if parsed is None:
+        return scan(source)
+    _kind, _name, tail = parsed
+    if tail.lstrip().startswith(":") and not any(
+        token in tail for token in (
+            "(", "{", "[", "⦃", "∀", "∃", "λ", "fun", "forall", "let", "if",
+            "∑", "∏", "⨆", "⨅", "⋃", "⋂", "∫", "⨍", "∐",
+        )
+    ):
+        # Tactic-local occurrences have empty helper resolutions, and this
+        # declaration has neither a telescope nor any term binder syntax.
+        # A long proposition does not need another structural scope walk.
+        return collect(source, set())
+    marker = _declaration_body_marker(tail, start=0)
+    colon = _declaration_type_colon(tail[:marker[0]] if marker else tail)
+    if colon is None or (marker and tail[marker[0]:].startswith("where")):
+        return collect(source, set())
+    commands = {
+        "theorem", "lemma", "def", "abbrev", "instance", "example", "axiom",
+        "class", "structure", "inductive", "namespace", "section", "end",
+        "attribute", "set_option", "variable", "variables", "include", "omit",
+        "export", "syntax", "macro", "elab", "termination_by", "decreasing_by",
+        "universe", "universes", "notation", "infix", "infixl", "infixr",
+    }
+    # Complete lexical tokens keep quoted command words and dotted field names
+    # distinct. Unsupported nested commands are conservatively left unscoped.
+    command_count = sum(
+        match.group(0) in commands for match in _LEAN_IDENTIFIER_RE.finditer(source)
+    )
+    if command_count != 1 or "#" in source:
+        return collect(source, set())
+    parameters = tail[:colon].strip()
+    statement = tail[colon + 1:marker[0] if marker else len(tail)]
+    # Attributes and command-local namespace openings are outside the telescope.
+    prefix_end = name_end if declarations else len(source.rstrip()) - len(tail)
+    prefix = source[:prefix_end]
+    free = collect(prefix, set())
+    for expression in (
+        statement,
+        tail[marker[0] + marker[1]:] if marker else "",
+    ):
+        scoped = f"∀ {parameters}, ({expression})" if parameters else expression
+        free.update(scan(scoped))
+    return free
 
 
 def lean_referenced_helper_names(
@@ -2383,26 +2707,36 @@ def lean_referenced_helper_names(
         return set()
 
     name_components = {name: lean_constant_name_components(name) for name in name_set}
+    if skip_components:
+        # Retain the self identity during longest-prefix resolution so its dot
+        # methods cannot accidentally resolve to a shorter registered helper.
+        name_components[str(skip)] = skip_components
+    names_by_components: Dict[Tuple[str, ...], str] = {}
+    for name, components in name_components.items():
+        if components:
+            names_by_components.setdefault(components, name)
 
     def helper_prefix(parts: Tuple[str, ...]) -> str:
-        matches = [
-            name
-            for name, components in name_components.items()
-            if components and (parts == components
-            or (
-                len(parts) > len(components)
-                and parts[:len(components)] == components
-                and (
-                    allow_arbitrary_dot_methods
-                    or parts[len(components)] in _LEAN_KNOWN_DOT_METHOD_SUFFIXES
-                )
-            ))
-        ]
-        if not matches:
-            return ""
-        return max(matches, key=lambda name: len(name_components[name]))
+        for length in range(len(parts), 0, -1):
+            name = names_by_components.get(parts[:length])
+            if name and (
+                length == len(parts)
+                or allow_arbitrary_dot_methods
+                or parts[length] in _LEAN_KNOWN_DOT_METHOD_SUFFIXES
+            ):
+                return name
+        return ""
 
     scan_text = _strip_lean_comments_and_strings(str(src or ""))
+    # A component must occur literally somewhere even when a namespace is
+    # opened or an identifier atom is quoted. Avoid all scope construction for
+    # large targets that cannot mention any candidate declaration.
+    if not any(
+        component in scan_text
+        for components in name_components.values()
+        for component in components
+    ):
+        return set()
     local_ranges: Dict[Tuple[str, ...], List[Tuple[int, int]]] = {}
     for local_name, ranges in _lean_local_binder_ranges_in_proof(str(src or "")).items():
         local_ranges.setdefault(lean_name_components(local_name), []).extend(ranges)
@@ -2446,10 +2780,12 @@ def lean_referenced_helper_names(
                     )
                 )
 
-    refs: Set[str] = set()
+    references_by_position: Dict[int, Set[str]] = {}
+    candidate_spellings: Set[str] = set()
+    is_record_field_label = _lean_record_field_label_checker(scan_text)
     for match in _LEAN_IDENTIFIER_RE.finditer(scan_text):
         raw_token = match.group(0)
-        if _lean_identifier_is_record_field_label(scan_text, match.end()):
+        if is_record_field_label(match.start(), match.end()):
             continue
         if _lean_identifier_is_projection_field(scan_text, match.start()):
             continue
@@ -2457,33 +2793,68 @@ def lean_referenced_helper_names(
         rooted = bool(parts and parts[0] == "_root_")
         if rooted:
             parts = parts[1:]
-        token = helper_prefix(parts)
+        # Resolve the complete self identity before considering a shorter
+        # helper prefix as a dot-method receiver.
+        if parts == skip_components:
+            continue
         token_start = match.start()
+        if not rooted and local_ranges and any(
+            start <= token_start < end
+            for local_key in (parts, parts[:1])
+            for start, end in local_ranges.get(local_key, ())
+        ):
+            continue
+        token = helper_prefix(parts)
+        if token and name_components[token] == skip_components:
+            continue
         if not token and not rooted:
             for namespace, start, end in open_namespace_ranges:
                 candidate = helper_prefix(namespace + parts)
                 if start <= match.start() < end and candidate:
                     token = candidate
                     break
+        if token and name_components[token] == skip_components:
+            continue
         if not token:
             continue
-        if not rooted and len(parts) > 1:
-            if any(
-                start <= match.start() < end
-                for start, end in local_ranges.get(parts[:1], ())
-            ):
-                continue
-        if (
-            not rooted
-            and not _lean_identifier_has_root_qualifier(scan_text, token_start)
-            and any(
-                start <= token_start < end
-                for start, end in local_ranges.get(parts, ())
-            )
-        ):
+        references_by_position.setdefault(match.start(), set()).add(token)
+        candidate_spellings.add(raw_token)
+    if not references_by_position:
+        return set()
+    # Keep ignored binder declarations intact for term scope analysis. Their
+    # empty resolution stays distinct from real references to the same name.
+    # Give each relevant resolution a private lexical identity. The collector
+    # compares its original name atoms against the current binders, while its
+    # result retains the occurrence that established a dependency. Identical
+    # spellings under different namespace openings cannot revive one another.
+    alias_prefix = "__r"
+    while alias_prefix in scan_text:
+        alias_prefix += "_"
+    aliases: Dict[str, str] = {}
+    alias_references: Dict[str, Set[str]] = {}
+    aliases_by_resolution: Dict[Tuple[str, Tuple[str, ...]], str] = {}
+    pieces = []
+    start = 0
+    for match in _LEAN_IDENTIFIER_RE.finditer(scan_text):
+        token = match.group(0)
+        if token not in candidate_spellings or token in _LEAN_BUILTIN_WORDS:
             continue
-        refs.add(token)
-    return refs
+        resolved = references_by_position.get(match.start(), set())
+        resolution = token, tuple(sorted(resolved))
+        alias = aliases_by_resolution.get(resolution)
+        if alias is None:
+            alias = f"{alias_prefix}{len(aliases)}"
+            aliases_by_resolution[resolution] = alias
+            aliases[alias] = token
+            alias_references[alias] = resolved
+        pieces.extend((scan_text[start:match.start()], alias))
+        start = match.end()
+    pieces.append(scan_text[start:])
+    free_tokens = _lean_lexically_free_reference_tokens(
+        "".join(pieces), set(aliases), reference_aliases=aliases,
+        alias_prefix=alias_prefix,
+    )
+    return {name for token in free_tokens for name in alias_references.get(token, ())}
 
 
 def _residual_target_needs_continuation(text: str) -> bool:

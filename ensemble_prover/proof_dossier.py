@@ -50,7 +50,6 @@ from .proof_graph import (
     _ROUTE_DEPENDENCY_EDGE_KINDS,
     _graph_bare_prop_atom_name,
     _graph_binder_group_chunks,
-    _helper_decl_header as graph_helper_decl_header,
     _graph_metadata_raw_lean_identities,
     _graph_statement_is_context_bare_prop_atom,
     graph_node_bound_contract_identity,
@@ -96,6 +95,7 @@ from .proof_lineage import (
 )
 from .utils import (
     _lean_lexical_skip_end,
+    _lean_qualified_identifier_segments,
     _top_level_token_positions,
     canonical_lean_identifier,
     fresh_lean_alternative_identifier,
@@ -151,10 +151,15 @@ _PUTNAM_SOLUTION_REF_RE = re.compile(
 )
 _SOLUTION_EQUIVALENCE_HINT_RE = re.compile(r"(?:↔|<->|\bIff\b)")
 _GENERATED_HELPER_REFERENCE_RE = re.compile(
-    r"(?<![A-Za-z0-9_'.])"
-    r"((?:mini|obligation|bridge|lemma)_[A-Za-z0-9_'.]*)"
-    r"(?![A-Za-z0-9_'])"
+    r"(?<![A-Za-z0-9_'.«])"
+    r"((?:«(?:mini|obligation|bridge|lemma)_[^»]*»|"
+    r"(?:mini|obligation|bridge|lemma)_[A-Za-z0-9_']*)"
+    r"(?:\.(?:«[^»]+»|[A-Za-z_][A-Za-z0-9_']*))*)"
+    r"(?![A-Za-z0-9_'»])"
 )
+_HELPER_REFERENCE_PROJECTIONS = frozenset({
+    "left", "right", "mp", "mpr", "fst", "snd", "symm", "trans", "property", "val",
+})
 _ROOT_EQUIVALENCE_PLACEHOLDER_STATEMENTS = frozenset({
     "",
     "True",
@@ -13930,7 +13935,13 @@ class ProofDossier:
             for name, item in helpers
             if str(name or "") and str(name or "") in visible_names
         }
-        renderable_names = self._verified_helper_renderable_names(by_name)
+        dependency_names_by_helper = {
+            name: self._verified_helper_generated_dependencies(item)
+            for name, item in by_name.items()
+        }
+        renderable_names = self._verified_helper_renderable_names(
+            by_name, dependency_names_by_helper=dependency_names_by_helper,
+        )
         emitted: Set[str] = set()
         ordered: List[VerifiedHelper] = []
         pending = [
@@ -13942,16 +13953,7 @@ class ProofDossier:
             progressed = False
             next_pending: List[Tuple[str, VerifiedHelper]] = []
             for name, item in pending:
-                support_names = [
-                    str(support or "").strip()
-                    for support in (
-                        list(getattr(item, "support_names", []) or [])
-                        + list(getattr(item, "replay_context_names", []) or [])
-                    )
-                    if str(support or "").strip()
-                    and str(support or "").strip() != str(name or "")
-                    and str(support or "").strip() in by_name
-                ]
+                support_names = dependency_names_by_helper[name]
                 if all(support in emitted for support in support_names):
                     ordered.append(item)
                     emitted.add(str(name or ""))
@@ -14132,11 +14134,7 @@ class ProofDossier:
             key = str(raw_name or "").strip()
             if not key:
                 return
-            clean = (
-                key
-                if key in self.verified_helpers
-                else self.resolve_verified_helper_name(key)
-            )
+            clean = self._equivalent_helper_registry_name(self.verified_helpers, key) or key
             candidate = clean or key
             if candidate and candidate not in seed_names:
                 seed_names.append(candidate)
@@ -14149,11 +14147,7 @@ class ProofDossier:
         for source in replay_sources:
             name = helper_decl_name(source)
             if name:
-                clean_name = (
-                    name
-                    if name in self.verified_helpers
-                    else self.resolve_verified_helper_name(name)
-                )
+                clean_name = self._equivalent_helper_registry_name(self.verified_helpers, name) or name
                 candidate_name = clean_name or name
                 explicit_hash_by_name[candidate_name] = text_hash(source)
                 explicit_source_by_name[candidate_name] = source
@@ -14239,11 +14233,7 @@ class ProofDossier:
             key = str(raw_name or "").strip()
             if not key:
                 return
-            clean_name = (
-                key
-                if key in self.verified_helpers
-                else self.resolve_verified_helper_name(key)
-            )
+            clean_name = self._equivalent_helper_registry_name(self.verified_helpers, key) or key
             helper = self.verified_helpers.get(clean_name)
             if helper is None:
                 explicit_source = str(
@@ -14298,34 +14288,19 @@ class ProofDossier:
                         "replay_source_hash": explicit_hash,
                     }
                 )
-            support_hashes = {
-                str(name or "").strip(): str(source_hash or "").strip()
-                for name, source_hash in dict(
-                    getattr(helper, "support_source_hashes", {}) or {}
-                ).items()
-                if str(name or "").strip() and str(source_hash or "").strip()
-            }
-            support_hashes.update(
-                {
-                    str(name or "").strip(): str(source_hash or "").strip()
-                    for name, source_hash in dict(
-                        getattr(helper, "replay_context_source_hashes", {}) or {}
-                    ).items()
-                    if str(name or "").strip() and str(source_hash or "").strip()
-                }
-            )
+            # Support and ambient replay receipts are independent evidence.
+            # A current receipt cannot replace a stale receipt of another kind.
+            support_hashes: Dict[str, Set[str]] = {}
+            for field_name in ("support_source_hashes", "replay_context_source_hashes"):
+                for name, source_hash in dict(getattr(helper, field_name, {}) or {}).items():
+                    receipt_name = str(name or "").strip()
+                    receipt_hash = str(source_hash or "").strip()
+                    if receipt_name and receipt_hash:
+                        support_hashes.setdefault(receipt_name, set()).add(receipt_hash)
             for support_name in helper_support_names(helper):
-                support_key = (
-                    support_name
-                    if support_name in self.verified_helpers
-                    else self.resolve_verified_helper_name(support_name)
-                )
+                support_key = self._equivalent_helper_registry_name(self.verified_helpers, support_name) or support_name
                 support = self.verified_helpers.get(support_key)
-                recorded_hash = str(
-                    support_hashes.get(support_name)
-                    or support_hashes.get(support_key)
-                    or ""
-                ).strip()
+                recorded_hashes = support_hashes.get(support_name, set()) | support_hashes.get(support_key, set())
                 explicit_support_hash = str(
                     explicit_hash_by_name.get(support_key)
                     or explicit_hash_by_name.get(support_name)
@@ -14341,13 +14316,14 @@ class ProofDossier:
                         {
                             "helper_name": clean_name,
                             "support_name": support_key or support_name,
-                            "recorded_support_hash": recorded_hash,
+                            "recorded_support_hash": min(recorded_hashes, default=""),
                             "current_support_hash": "",
                             "reason": "missing_current_support",
                         }
                     )
                     continue
-                if recorded_hash and current_hash and recorded_hash != current_hash:
+                stale_hashes = sorted(recorded_hashes - {current_hash}) if current_hash else []
+                for recorded_hash in stale_hashes:
                     stale_edges.append(
                         {
                             "helper_name": clean_name,
@@ -14357,6 +14333,7 @@ class ProofDossier:
                             "reason": "stale_support_hash",
                         }
                     )
+                if stale_hashes:
                     continue
                 visit(support_key or support_name)
 
@@ -14419,11 +14396,7 @@ class ProofDossier:
 
         def visit(name: str) -> bool:
             key = str(name or "").strip()
-            clean_name = (
-                key
-                if key in self.verified_helpers
-                else self.resolve_verified_helper_name(key)
-            )
+            clean_name = self._equivalent_helper_registry_name(self.verified_helpers, key) or key
             if not clean_name:
                 return False
             if clean_name in emitted:
@@ -14450,6 +14423,8 @@ class ProofDossier:
             support_names = self._canonical_support_names(
                 list(getattr(helper, "support_names", []) or [])
                 + list(getattr(helper, "replay_context_names", []) or [])
+                + list(dict(getattr(helper, "support_source_hashes", {}) or {}))
+                + list(dict(getattr(helper, "replay_context_source_hashes", {}) or {}))
                 + self._referenced_verified_helper_names(
                     getattr(helper, "source", ""),
                     skip=clean_name,
@@ -14492,11 +14467,7 @@ class ProofDossier:
         explicit_available = set(emitted) | explicit_names
         for block in explicit_blocks:
             name = helper_decl_name(block) or ""
-            clean_name = (
-                name
-                if name in self.verified_helpers
-                else self.resolve_verified_helper_name(name)
-            )
+            clean_name = self._equivalent_helper_registry_name(self.verified_helpers, name) or name
             if clean_name in self.verified_helpers and clean_name not in emitted:
                 registered = self.verified_helpers.get(clean_name)
                 registered_source = str(
@@ -14780,11 +14751,7 @@ class ProofDossier:
         out: List[str] = []
         for raw_name in list(names or ()):
             key = str(raw_name or "").strip()
-            clean = (
-                key
-                if key in self.verified_helpers
-                else self.resolve_verified_helper_name(key)
-            )
+            clean = self._equivalent_helper_registry_name(self.verified_helpers, key) or key
             if not clean or clean not in self.verified_helpers or clean in out:
                 continue
             out.append(clean)
@@ -14795,22 +14762,10 @@ class ProofDossier:
         clean = str(name or "").strip()
         if not clean:
             return ""
-        segments = clean.split(".")
-        if len(segments) == 1:
+        segments = _lean_qualified_identifier_segments(clean)
+        if len(segments) < 2:
             return clean
-        method_suffixes = {
-            "left",
-            "right",
-            "mp",
-            "mpr",
-            "fst",
-            "snd",
-            "symm",
-            "trans",
-            "property",
-            "val",
-        }
-        return segments[0] if segments[1] in method_suffixes else clean
+        return segments[0] if canonical_lean_identifier(segments[1]) in _HELPER_REFERENCE_PROJECTIONS else clean
 
     @classmethod
     def _generated_helper_reference_looks_local(cls, name: str) -> bool:
@@ -14819,51 +14774,31 @@ class ProofDossier:
             return False
         return bool(_GENERATED_HELPER_REFERENCE_RE.fullmatch(root))
 
-    @staticmethod
-    def _helper_decl_parameter_names(source: str) -> Set[str]:
-        parsed = graph_helper_decl_header(str(source or ""))
-        if parsed is None:
-            return set()
-        _kind, _name, tail = parsed
-        header_end = len(tail)
-        assign_index = tail.find(":=")
-        if assign_index >= 0:
-            header_end = assign_index
-        where_match = re.search(r"\bwhere\b", tail)
-        if where_match is not None:
-            header_end = min(header_end, where_match.start())
-        header = tail[:header_end]
-        names: Set[str] = set()
-        close_for = {"(": ")", "{": "}", "[": "]"}
-        index = 0
-        while index < len(header):
-            opener = header[index]
-            closer = close_for.get(opener)
-            if closer is None:
-                index += 1
-                continue
-            depth = 1
-            end = index + 1
-            while end < len(header) and depth:
-                if header[end] == opener:
-                    depth += 1
-                elif header[end] == closer:
-                    depth -= 1
-                end += 1
-            if depth:
-                break
-            group = header[index + 1 : end - 1]
-            if ":" in group:
-                lhs = group.split(":", 1)[0]
-                for raw_name in re.findall(
-                    r"«[^»]+»|[A-Za-z_][A-Za-z0-9_']*",
-                    lhs,
-                ):
-                    clean = raw_name.strip("«»").strip()
-                    if clean and clean != "_":
-                        names.add(clean)
-            index = end
-        return names
+    def _verified_helper_reference_root(
+        self,
+        name: str,
+        *,
+        canonical_registry_names: Optional[Mapping[str, str]] = None,
+    ) -> str:
+        """Prefer a registered declaration over projection-style spelling."""
+        def registered_name(candidate: str) -> str:
+            if candidate in self.verified_helpers:
+                return candidate
+            if canonical_registry_names is not None:
+                return canonical_registry_names.get(canonical_lean_identifier(candidate), "")
+            return self._equivalent_helper_registry_name(self.verified_helpers, candidate)
+
+        name = str(name or "").strip()
+        registered = registered_name(name)
+        if registered:
+            return registered
+        segments = _lean_qualified_identifier_segments(name)
+        for index in range(len(segments) - 1, 0, -1):
+            registered = registered_name(".".join(segments[:index]))
+            if registered:
+                return registered
+        root = self._generated_helper_reference_root(name)
+        return (registered_name(root) if root != name else "") or root
 
     def _referenced_generated_helper_names(
         self,
@@ -14888,19 +14823,38 @@ class ProofDossier:
             except Exception:
                 scan_text = source_text
         out: List[str] = []
-        for match in _GENERATED_HELPER_REFERENCE_RE.finditer(scan_text):
-            raw_name = str(match.group(1) or "").strip()
+        resolved_names: Dict[str, str] = {}
+        canonical_registry_names: Optional[Dict[str, str]] = None
+        from .lean_names import LEAN_QUALIFIED_NAME_PATTERN
+
+        for match in re.finditer(LEAN_QUALIFIED_NAME_PATTERN, scan_text):
+            raw_name = str(match.group(0) or "").strip()
+            if raw_name.startswith("_root_."):
+                raw_name = raw_name[len("_root_."):]
+            if not _GENERATED_HELPER_REFERENCE_RE.fullmatch(raw_name):
+                continue
+            if not raw_name:
+                continue
             if canonical_lean_identifier(raw_name) == canonical_lean_identifier(
                 skip_name
             ):
                 continue
-            name = self._generated_helper_reference_root(raw_name)
+            if raw_name not in resolved_names:
+                # Build this index only when exact lookup misses, and keep it
+                # local to this source scan so evidence changes cannot stale it.
+                if raw_name not in self.verified_helpers and canonical_registry_names is None:
+                    canonical_registry_names = {}
+                    for registered_name in self.verified_helpers:
+                        canonical_registry_names.setdefault(
+                            canonical_lean_identifier(registered_name), registered_name,
+                        )
+                resolved_names[raw_name] = self._verified_helper_reference_root(
+                    raw_name, canonical_registry_names=canonical_registry_names,
+                )
+            name = resolved_names[raw_name]
             if not name or name == skip_name or name in out:
                 continue
             out.append(name)
-        if out:
-            bound_parameters = self._helper_decl_parameter_names(source_text)
-            out = [name for name in out if name not in bound_parameters]
         if out and lean_referenced_helper_names is not None:
             try:
                 referenced = lean_referenced_helper_names(
@@ -14934,16 +14888,29 @@ class ProofDossier:
     ) -> List[str]:
         helper_name = str(getattr(helper, "name", "") or "").strip()
         deps: List[str] = []
-        for raw_name in list(getattr(helper, "support_names", []) or []):
-            root = self._generated_helper_reference_root(str(raw_name or ""))
+        # Hash receipts retain dependency authority even when a legacy record
+        # omitted the parallel names list. Rendering and execution scopes must
+        # follow the same evidence edges as root_replay_integrity_status.
+        # Stored edges name exact declarations; dot methods are resolved only
+        # when scanning source references below.
+        for raw_name in (
+            list(getattr(helper, "support_names", []) or [])
+            + list(dict(getattr(helper, "support_source_hashes", {}) or {}))
+        ):
+            name = str(raw_name or "").strip()
+            root = self._equivalent_helper_registry_name(self.verified_helpers, name) or name
             if (
                 root
                 and root != helper_name
                 and root not in deps
             ):
                 deps.append(root)
-        for raw_name in list(getattr(helper, "replay_context_names", []) or []):
-            root = self._generated_helper_reference_root(str(raw_name or ""))
+        for raw_name in (
+            list(getattr(helper, "replay_context_names", []) or [])
+            + list(dict(getattr(helper, "replay_context_source_hashes", {}) or {}))
+        ):
+            name = str(raw_name or "").strip()
+            root = self._equivalent_helper_registry_name(self.verified_helpers, name) or name
             if (
                 root
                 and root != helper_name
@@ -14954,7 +14921,7 @@ class ProofDossier:
             getattr(helper, "source", ""),
             skip=helper_name,
         ):
-            root = self._generated_helper_reference_root(raw_name)
+            root = self._verified_helper_reference_root(raw_name)
             if root and root != helper_name and root not in deps:
                 deps.append(root)
         return deps
@@ -14962,15 +14929,22 @@ class ProofDossier:
     def _verified_helper_renderable_names(
         self,
         by_name: Dict[str, VerifiedHelper],
+        *,
+        dependency_names_by_helper: Optional[Dict[str, List[str]]] = None,
     ) -> Set[str]:
         """Return helpers whose generated dependencies are transitively renderable."""
 
+        if dependency_names_by_helper is None:
+            dependency_names_by_helper = {
+                name: self._verified_helper_generated_dependencies(helper)
+                for name, helper in by_name.items()
+            }
         pending: Dict[str, VerifiedHelper] = dict(by_name)
         renderable: Set[str] = set()
         while pending:
             progressed = False
             for name, helper in list(pending.items()):
-                generated_deps = self._verified_helper_generated_dependencies(helper)
+                generated_deps = dependency_names_by_helper[name]
                 if all(dep in renderable for dep in generated_deps):
                     renderable.add(name)
                     pending.pop(name, None)
@@ -14996,7 +14970,7 @@ class ProofDossier:
             str(block or ""),
             skip=str(helper_name or "").strip(),
         ):
-            root = self._generated_helper_reference_root(raw_name)
+            root = self._verified_helper_reference_root(raw_name)
             if root and root not in available and root not in missing:
                 missing.append(root)
         return missing
@@ -17032,7 +17006,9 @@ class ProofDossier:
             support_key = str(support_name or "").strip()
             if not support_key or support_key == name:
                 continue
-            support = self.verified_helpers.get(support_key)
+            support = self.verified_helpers.get(
+                self._equivalent_helper_registry_name(self.verified_helpers, support_key)
+            )
             support_hash = str(getattr(support, "source_hash", "") or "").strip()
             if support_hash:
                 support_source_hashes[support_key] = support_hash
@@ -17043,7 +17019,9 @@ class ProofDossier:
                 replay_context_name_list.append(clean)
         replay_context_source_hashes: Dict[str, str] = {}
         for replay_name in replay_context_name_list:
-            replay_helper = self.verified_helpers.get(replay_name)
+            replay_helper = self.verified_helpers.get(
+                self._equivalent_helper_registry_name(self.verified_helpers, replay_name)
+            )
             replay_hash = str(
                 getattr(replay_helper, "source_hash", "") or ""
             ).strip()

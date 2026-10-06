@@ -64,12 +64,15 @@ async def repair_verified_helper_context(
     def remaining() -> float:
         return max(0.0, min(timeout_s, max_total_seconds - (time.monotonic() - started)))
 
-    def integrity(names: list[str]) -> bool:
+    def integrity(names: list[str], *, require_complete_scope: bool = False) -> bool:
         status = dossier.root_replay_integrity_status(helper_names=names, refresh_quality=False)
-        return bool(status.get("ready")) and all(
+        checked_names = set(status.get("checked_helper_names", ()))
+        return bool(status.get("ready")) and (
+            not require_complete_scope or checked_names.issubset(names)
+        ) and all(
             helper.source_hash == text_hash(helper.source)
             and helper.verification_environment_hash == dossier.current_lean_environment_hash
-            for name in status.get("checked_helper_names", ())
+            for name in checked_names
             for helper in [dossier.verified_helpers[name]]
         )
 
@@ -103,17 +106,24 @@ async def repair_verified_helper_context(
         if (
             name in visible
             or not dossier.is_verified_helper_context_visible(helper)
-            or not helper.replay_context_names
+            or not (helper.replay_context_names or helper.replay_context_source_hashes)
             or not integrity([name])
         ):
             continue
         if attempted >= max_helpers or remaining() <= 0:
             retryable = True
             break
-        supports = list(dict.fromkeys([
+        support_references = [
             *helper.support_names,
+            *helper.support_source_hashes,
             *dossier._referenced_verified_helper_names(helper.source, skip=name),
-        ]))
+        ]
+        # Compare declaration identities while preserving the recorded receipt
+        # spelling. Quoted segments can be equivalent to ordinary Lean names.
+        supports = list(dict.fromkeys(
+            dossier._equivalent_helper_registry_name(dossier.verified_helpers, support) or support
+            for support in support_references
+        ))
         if not set(supports).issubset(visible):
             continue
         blocks = dossier.root_replay_helper_closure(
@@ -122,6 +132,8 @@ async def repair_verified_helper_context(
         ) if supports else []
         names = [helper_decl_name(block) for block in blocks]
         if not set(supports).issubset(names) or not set(names).issubset(visible):
+            continue
+        if not integrity(names, require_complete_scope=True):
             continue
         dossier.validate_helper_context(blocks)
         expected_key = helper_context_repair_key(dossier, preamble, target_statement)
@@ -193,7 +205,12 @@ async def repair_verified_helper_context(
         if (dossier.is_verified_helper_context_visible(helper) or helper in conditional)
         and not helper.visibility_policy
     }
-    if len(allowed) > 64 or not integrity(list(allowed)):
+    # Integrity traverses stored replay/support receipts as well as textual
+    # references. The closure renderer can retain an explicit declaration even
+    # when one of those dependencies is outside this optional search's scope.
+    # Such a context is ineligible for composition; preserve its evidence for
+    # later repair instead of repeatedly failing the enclosing conversation.
+    if len(allowed) > 64 or not integrity(list(allowed), require_complete_scope=True):
         return outcome
     blocks = dossier.root_replay_helper_closure(replay_helpers=[
         helper.source for helper in dossier.verified_helpers.values() if helper.name in allowed

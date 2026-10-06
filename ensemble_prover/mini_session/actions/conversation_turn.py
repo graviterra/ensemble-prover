@@ -8541,7 +8541,9 @@ class ConversationTurnAction:
     _ANSWER_SAFE_RECHECK_MAX_PARKED: ClassVar[int] = 8
     _ANSWER_SAFE_RECHECK_MAX_CONTENT_CHARS: ClassVar[int] = 250_000
     _ANSWER_SAFE_RECHECK_MAX_STATE_CHARS: ClassVar[int] = 2_000_000
-    _PROVIDER_QUANTUM_CHECKPOINT_MAX_STATE_CHARS: ClassVar[int] = 500_000
+    # Targets, paid replies and exact tool inputs can exceed a small local
+    # cap. As with history, the durable writer bounds the complete record.
+    _PROVIDER_QUANTUM_CHECKPOINT_MAX_STATE_CHARS: ClassVar[int | None] = None
     _PROVIDER_QUANTUM_CHECKPOINT_MAX_BINDING_CHARS: ClassVar[int] = 300_000
     _PROVIDER_QUANTUM_CHECKPOINT_MAX_TARGET_CHARS: ClassVar[int] = 1_000_000
     _PROVIDER_QUANTUM_CHECKPOINT_MAX_LEGACY_BINDING_CHARS: ClassVar[int] = (
@@ -9974,8 +9976,8 @@ class ConversationTurnAction:
         # Repeat-detection signatures include selected calls that deliberately
         # do not charge the paid tool budget (for example cadence skips and
         # infrastructure deferrals before launch).  Their count therefore is
-        # not bounded by max_tool_calls_per_turn.  The enclosing state already
-        # has a strict serialized-size bound; retain the full set so a restart
+        # not bounded by max_tool_calls_per_turn. The durable writer bounds the
+        # complete record; retain the full set so a restart
         # cannot forget repeats merely because those calls were non-charging.
         seen_tool_call_signatures = state.get("seen_tool_call_signatures")
         if (
@@ -9992,13 +9994,13 @@ class ConversationTurnAction:
                 "is malformed"
             )
         bounded_lists = {
-            "repair_self_check_codes": 4,
+            "repair_self_check_codes": None,
             "pending_tool_replay": 4,
-            "durable_progress_tool_continuation_helper_receipts": 64,
+            "durable_progress_tool_continuation_helper_receipts": None,
         }
         for key, limit in bounded_lists.items():
             value = state.get(key)
-            if not isinstance(value, list) or len(value) > limit:
+            if not isinstance(value, list) or (limit is not None and len(value) > limit):
                 raise StateSnapshotCompatibilityError(
                     f"conversation provider quantum {key} is malformed"
                 )
