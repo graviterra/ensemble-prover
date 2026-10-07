@@ -1,39 +1,49 @@
 # Putnam results and evaluation scope
 
-Ensemble Prover's results combine a local solved archive and a public PutnamBench
-listing. They have different evidence and evaluation scopes.
+**672 distinct Putnam problems with saved solutions**, as of October 7, 2026.
+The cumulative archive covers every problem identifier in the evaluated
+672-problem PutnamBench corpus.
+
+The project archive and PutnamBench's public listing describe different records:
 
 | Record | Problems | Date | Evidence |
 | --- | ---: | --- | --- |
-| Cumulative saved solutions | **669 distinct problems** | October 6, 2026 | Distinct Putnam problem identifiers in the project’s local solved archive |
-| PutnamBench listing | **65 problems** | Public data checked September 26, 2026 | [Leaderboard](https://trishullab.github.io/PutnamBench/leaderboard.html) and [results metadata](https://trishullab.github.io/PutnamBench/results.json) |
+| Cumulative saved solutions | **672 distinct problems** | October 7, 2026 | Distinct Putnam problem identifiers in the project’s local solved archive |
+| PutnamBench listing | **65 problems** | Public data checked October 7, 2026 | [Leaderboard](https://trishullab.github.io/PutnamBench/leaderboard.html) and [results metadata](https://trishullab.github.io/PutnamBench/results.json) |
 
-The archive count combines models, configurations, and budgets and
-counts each problem once, consolidating multiple proof files or filename
-variants for the same problem. The archive continues to grow. It is not a
-controlled benchmark solve rate. The listed 65 are included in the cumulative total; the figures should not be added.
+The archive combines models, configurations, and budgets; it is not a controlled
+benchmark solve rate. The earlier 65-problem listing is included in the total.
 
-The dated archive count uses distinct `putnam_YEAR_aN` / `putnam_YEAR_bN`
-identifiers in top-level saved `.lean` filenames. It excludes graph files,
-presentation backups, and duplicate proofs. These private archive files are not
-bundled with this repository. The public listing has its own last-checked date;
-the archive update does not imply that the leaderboard was updated or rechecked.
+Each `putnam_YEAR_aN` / `putnam_YEAR_bN` identifier counts once across current and
+archived solutions. Duplicate proofs and repeat solves do not increase the count.
+The proof files are not bundled with this repository.
 
-Historical saved solutions have differing verification and axiom-policy records.
-Some artifacts use axioms outside the current export policy; the presence of a
-file in the archive does not certify a current-policy verified export. Inspect
-its verification record and recheck a selected proof against the intended Lean
-project and axiom policy before relying on it. The cumulative archive count is
-not a count of uniformly revalidated exports.
+## Corpus coverage
 
-PutnamBench's public metadata places Ensemble Prover in the **Lean with answer**
-category and describes the 65 proofs as project-claimed Lean-checked solutions
-submitted privately for independent verification. That entry does not establish
-completed independent acceptance. Its compute budget is recorded as **not
-reported**. The listing uses the benchmark's with-answer category; it does not
-measure performance on the no-answer variant.
+| Problem years | Distinct problems with saved solutions |
+| --- | ---: |
+| 1962–1969 | 90 |
+| 1970–1979 | 101 |
+| 1980–1989 | 98 |
+| 1990–1999 | 103 |
+| 2000–2009 | 103 |
+| 2010–2019 | 111 |
+| 2020–2025 | 66 |
+| **Total** | **672** |
 
-## The 65 listed problem identifiers
+These counts follow the benchmark corpus; they do not include every historical
+Putnam problem from those years.
+
+## Verification and evaluation scope
+
+Saved solutions retain individual verification and axiom records. The cumulative
+count does not imply that every historical artifact meets the current export
+policy. Use a verified export for the intended theorem and Lean project when
+reporting a formal result.
+
+## The earlier 65-problem submission
+
+<a id="the-65-listed-problem-identifiers"></a>
 
 The proof bundle was submitted privately to the PutnamBench verification team
 on August 31, 2026. The project publishes the identifiers below; the benchmark
