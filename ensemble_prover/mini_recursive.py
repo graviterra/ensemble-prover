@@ -32521,7 +32521,8 @@ async def run_mini_recursive_driver(
                             f"Typecheck was inconclusive for {_compact_text(claim.name, 120)}: "
                             f"{_compact_text(variant.statement, 260)}. Do not spend a child proof "
                             "turn on this exact obligation until it typechecks; "
-                            "repair or simplify the statement first. Diagnostic: "
+                            "retry the typecheck when the checker is available in the "
+                            "current context. Diagnostic: "
                             f"{_compact_lean_diagnostic_text(type_output, 320)}"
                         ),
                         prompt_safe=True,
@@ -38503,29 +38504,50 @@ async def _typecheck_recursive_statement_with_admission(
 
     graph = getattr(dossier, "proof_graph", None)
     project = getattr(dossier, "_record_mini_recursive_graph_native_event", None)
+    registry = getattr(graph, "_statement_admission_registry", None)
+    admission_bound = bool(
+        callable(getattr(registry, "owned_by", None)) and registry.owned_by(graph)
+    )
     ticket = None
     helper_blocks = tuple(str(item or "") for item in helpers if str(item or "").strip())
-    checker = _live_lean_capability_for_new_work(lean)
-    if (graph is not None and callable(project)
-            and callable(getattr(checker, "check_proposition_type_raw", None))
-            and graph.may_schedule_prop_check("", statement=statement)):
-        pending = dict(claim_record)
-        pending.update(phase="mini_recursive_claim_typecheck", statement=statement,
-                       verdict="variant_typecheck_pending")
-        projected = project(pending)
-        claim_id = str(projected.get("claim_id") or "")
-        ticket = graph.begin_prop_check(claim_id, statement=statement) if claim_id else None
-        if ticket is not None and not (
-            ticket.context.checker_identity is checker
-            and ticket.context.preamble == preamble
-            and ticket.context.helper_blocks == helper_blocks
-        ):
-            graph.discard_prop_check(ticket)
-            ticket = None
+
+    def begin_admission(checker: Any) -> bool:
+        nonlocal ticket
+        # Lock preparation can retire the runner. Bind the ticket only after
+        # that preparation, to the checker that will perform this operation.
+        if admission_bound:
+            context = graph.current_prop_check_context()
+            if context is None or not (
+                context.checker_identity is checker
+                and context.preamble == preamble
+                and context.helper_blocks == helper_blocks
+            ):
+                return False
+        if (graph is not None and callable(project)
+                and callable(getattr(checker, "check_proposition_type_raw", None))
+                and graph.may_schedule_prop_check("", statement=statement)):
+            pending = dict(claim_record)
+            pending.update(phase="mini_recursive_claim_typecheck", statement=statement,
+                           verdict="variant_typecheck_pending")
+            projected = project(pending)
+            claim_id = str(projected.get("claim_id") or "")
+            ticket = graph.begin_prop_check(claim_id, statement=statement) if claim_id else None
+            if ticket is None and admission_bound:
+                return False
+            if ticket is not None and not (
+                ticket.context.checker_identity is checker
+                and ticket.context.preamble == preamble
+                and ticket.context.helper_blocks == helper_blocks
+            ):
+                graph.discard_prop_check(ticket)
+                ticket = None
+                return False
+        return True
+
     try:
         result = await _typecheck_claim_statement(
-            lean=checker, statement=statement, preamble=preamble, helpers=helper_blocks,
-            timeout_s=timeout_s,
+            lean=lean, statement=statement, preamble=preamble, helpers=helper_blocks,
+            timeout_s=timeout_s, on_checker_admitted=begin_admission,
         )
         if ticket is not None and graph is not None:
             # The recorder is the driver's dispatch publication guard. This
@@ -38549,6 +38571,7 @@ async def _typecheck_claim_statement(
     preamble: str,
     helpers: Sequence[Any],
     timeout_s: float,
+    on_checker_admitted: Optional[Callable[[Any], bool]] = None,
 ) -> tuple[bool, bool, str]:
     """Return ``(ok, inconclusive, output)`` for helper proposition elaboration."""
 
@@ -38569,7 +38592,10 @@ async def _typecheck_claim_statement(
         op_timeout = 30.0
 
     async def _run_typecheck() -> Any:
-        proposition_checker = getattr(lean, "check_proposition_type_raw", None)
+        checker = _live_lean_capability_for_new_work(lean)
+        if on_checker_admitted is not None and not on_checker_admitted(checker):
+            return "admission_stale", None
+        proposition_checker = getattr(checker, "check_proposition_type_raw", None)
         if callable(proposition_checker):
             return (
                 "proposition_raw",
@@ -38578,11 +38604,11 @@ async def _typecheck_claim_statement(
                     timeout_s=operation_timeout_s,
                 ),
             )
-        checker = getattr(lean, "check_with_sorry_raw", None)
-        if checker is not None:
+        sorry_checker = getattr(checker, "check_with_sorry_raw", None)
+        if sorry_checker is not None:
             return (
                 "sorry_raw",
-                await checker(
+                await sorry_checker(
                     "True",
                     "by\n  trivial",
                     lemmas,
@@ -38593,7 +38619,7 @@ async def _typecheck_claim_statement(
         try:
             return (
                 "check",
-                await lean.check(
+                await checker.check(
                     "True",
                     "by\n  trivial",
                     lemmas,
@@ -38605,7 +38631,7 @@ async def _typecheck_claim_statement(
         except TypeError:
             return (
                 "check",
-                await lean.check(
+                await checker.check(
                     "True",
                     "by\n  trivial",
                     lemmas,
@@ -38632,6 +38658,8 @@ async def _typecheck_claim_statement(
     except Exception as exc:
         return False, True, f"{type(exc).__name__}: {exc}"
 
+    if kind == "admission_stale":
+        return False, True, "Proposition check context changed before admission"
     if kind in {"sorry_raw", "proposition_raw"}:
         parsed, output, returncode = payload
         out = str(output or "")

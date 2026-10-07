@@ -374,6 +374,52 @@ class SubscriptionCLIClient:
         self,
         argv: list[str],
         *,
+        ready_stdin: bool = False,
+        on_start_rejected: Callable[[], None] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bytes, bytes, int]:
+        launch = None
+        if ready_stdin:
+            preparation_started = time.monotonic()
+            if os.name != "posix":
+                raise self.backend_error(
+                    "Ready CLI stdin requires POSIX descriptor passing",
+                    kind="capability",
+                )
+            from ._subscription_process_bootstrap import ReadyStdinLaunch
+
+            launch = ReadyStdinLaunch(kwargs.get("input_data", b""))
+        try:
+            if launch is not None and kwargs.get("timeout") is not None:
+                kwargs["timeout"] = max(
+                    0.0, float(kwargs["timeout"]) - (time.monotonic() - preparation_started)
+                )
+            return await self._run_process_with_input(
+                argv, ready_launch=launch,
+                on_start_rejected=on_start_rejected, **kwargs,
+            )
+        finally:
+            if launch is not None:
+                try:
+                    if not launch.gate_released and on_start_rejected is not None:
+                        on_start_rejected()
+                finally:
+                    launch.close()
+
+    def _process_start_error(self, exc: OSError) -> Exception:
+        if exc.errno not in {errno.ENOENT, errno.ENOTDIR, errno.ENOEXEC, errno.EACCES}:
+            return exc
+        return self.backend_error(
+            f"{self.backend_name} CLI could not start "
+            f"(errno={errno.errorcode[exc.errno]}). Check its executable, "
+            "interpreter, permissions and working directory, then start a new run.",
+            kind="compatibility",
+        )
+
+    async def _run_process_with_input(
+        self,
+        argv: list[str],
+        *,
         cwd: str,
         input_data: bytes = b"",
         timeout: float | None,
@@ -381,6 +427,8 @@ class SubscriptionCLIClient:
         on_started: Any = None,
         inactivity_timeout: float | None = None,
         on_progress: Callable[[dict[str, Any]], bool] | None = None,
+        ready_launch: Any = None,
+        on_start_rejected: Callable[[], None] | None = None,
     ) -> tuple[bytes, bytes, int]:
         if self._closed:
             raise self.backend_error(
@@ -389,38 +437,35 @@ class SubscriptionCLIClient:
         last_progress_at = time.monotonic()
         stop_at = None if timeout is None else last_progress_at + timeout
         startup_limits = [value for value in (timeout, inactivity_timeout) if value is not None]
+        startup_stop_at = last_progress_at + min(startup_limits) if startup_limits else None
+        spawn_options = (
+            {"pass_fds": ready_launch.pass_fds} if ready_launch is not None else {}
+        )
         async with subscription_request_timeout(
             min(startup_limits) if startup_limits else None,
             f"{self.backend_name} request deadline expired during process startup",
         ):
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *argv,
+                    *(ready_launch.argv(argv) if ready_launch is not None else argv),
                     cwd=cwd,
                     env=self._process_environment(),
-                    stdin=asyncio.subprocess.PIPE,
+                    stdin=(ready_launch.stdin if ready_launch is not None else asyncio.subprocess.PIPE),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=(os.name == "posix"),
                     limit=_MAX_STREAM_BYTES,
+                    **spawn_options,
                 )
             except OSError as exc:
-                if exc.errno not in {errno.ENOENT, errno.ENOTDIR, errno.ENOEXEC, errno.EACCES}:
-                    raise
-                # A checked launcher can disappear during a CLI upgrade.
-                # Fail as infrastructure before generation, without silently
-                # dispatching through an unchecked replacement executable.
-                raise self.backend_error(
-                    f"{self.backend_name} CLI could not start "
-                    f"(errno={errno.errorcode[exc.errno]}). Check its executable, "
-                    "interpreter, permissions and working directory, then start a new run.",
-                    kind="compatibility",
-                ) from None
+                raise self._process_start_error(exc) from None
         self._starting_processes.discard(asyncio.current_task())
         self._processes.add(proc)
         tasks: list[asyncio.Task[Any]] = []
 
         async def write_input() -> None:
+            if ready_launch is not None:
+                return
             assert proc.stdin is not None
             try:
                 proc.stdin.write(input_data)
@@ -474,6 +519,8 @@ class SubscriptionCLIClient:
             return bytes(tail)
 
         try:
+            if ready_launch is not None:
+                ready_launch.observe_startup()
             if self._closed:
                 raise self.backend_error(
                     f"{self.backend_name} client is closed", kind="capability"
@@ -484,12 +531,44 @@ class SubscriptionCLIClient:
                 )
             if on_started is not None:
                 on_started()
+            if ready_launch is not None:
+                # Progress callbacks may synchronously consume the remaining
+                # deadline or retire this lane. No CLI has executed yet.
+                if self._closed:
+                    raise self.backend_error(
+                        f"{self.backend_name} client is closed", kind="capability"
+                    )
+                if startup_stop_at is not None and time.monotonic() >= startup_stop_at:
+                    raise SubscriptionRequestDeadlineExceeded(
+                        f"{self.backend_name} request deadline expired before CLI exec"
+                    )
+                check_subscription_transport_admission()
+                owner = asyncio.current_task()
+                if owner is not None and owner.cancelling():
+                    # A synchronous admission/progress callback can request
+                    # cancellation before the next await delivers it.
+                    raise asyncio.CancelledError
+                ready_launch.release()
             tasks = [
                 asyncio.create_task(write_input()),
                 asyncio.create_task(read_stdout()),
                 asyncio.create_task(read_stderr()),
                 asyncio.create_task(proc.wait()),
             ]
+            if ready_launch is not None:
+                remaining = None if stop_at is None else max(0.0, stop_at - time.monotonic())
+                limits = [value for value in (remaining, inactivity_timeout) if value is not None]
+                async with subscription_request_timeout(
+                    min(limits) if limits else None,
+                    f"{self.backend_name} request deadline expired during CLI exec",
+                ):
+                    exec_error = await ready_launch.exec_failure_errno()
+                if exec_error is not None:
+                    if on_start_rejected is not None:
+                        on_start_rejected()
+                    raise self._process_start_error(
+                        OSError(exec_error, "CLI executable could not be started")
+                    ) from None
             pending = set(tasks)
             while pending:
                 deadlines = [value for value in (

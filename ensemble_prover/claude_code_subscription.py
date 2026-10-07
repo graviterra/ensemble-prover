@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -567,9 +568,21 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
         final_progress_status = "failed"
         last_thinking_estimate = 0
         generation_messages: set[str] = set()
+        generation_retries: set[str] = set()
 
         def generation_advanced(event: dict[str, Any]) -> bool:
             nonlocal last_thinking_estimate
+            if event.get("type") == "system" and event.get("subtype") == "api_retry":
+                # A retried generation starts its thinking counter again.
+                # The retry itself is not progress; only subsequent growing
+                # output may renew the inactivity allowance.
+                identity = hashlib.sha256(json.dumps(
+                    event, sort_keys=True, ensure_ascii=True,
+                ).encode("utf-8")).hexdigest()
+                if identity not in generation_retries:
+                    generation_retries.add(identity)
+                    last_thinking_estimate = 0
+                return False
             if event.get("type") == "system" and event.get("subtype") == "thinking_tokens":
                 estimate = event.get("estimated_tokens")
                 if type(estimate) is int and estimate > last_thinking_estimate:
@@ -585,6 +598,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     if identity not in generation_messages:
                         generation_messages.add(identity)
                         last_thinking_estimate = 0
+                        generation_retries.clear()
                         return True
             return False
 
@@ -923,6 +937,12 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
             mark_provider_dispatched(**authority)
             report_progress("requesting")
 
+        def on_start_rejected() -> None:
+            nonlocal dispatched
+            # The transport proved that the CLI never received the prompt.
+            # The existing finally block retires this exact admission ticket.
+            dispatched = False
+
         with tempfile.TemporaryDirectory(prefix="ensemble-claude-code-") as cwd:
             Path(cwd, "response.json").write_text(
                 json.dumps(_claude_response_schema(
@@ -963,6 +983,8 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     timeout=remaining,
                     on_event=on_event,
                     on_started=on_started,
+                    ready_stdin=(os.name == "posix"),
+                    on_start_rejected=on_start_rejected,
                     inactivity_timeout=self._positive_finite_timeout(
                         getattr(self.cfg, "subscription_inactivity_timeout_s", None)
                     ),
@@ -977,7 +999,22 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                     "stderr_bytes": len(stderr),
                     "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
                 }
+                input_not_received = (
+                    code != 0 and not initialized and not stdout
+                    and stderr.startswith(b"Warning: no stdin data received in ")
+                    and b"Error: Input must be provided either through stdin or as a prompt argument when using --print"
+                    in stderr.splitlines()
+                )
+                if input_not_received:
+                    metadata["provider_process_completion"]["startup_failure"] = "stdin_not_received"
                 publish_provider_request_metadata(metadata)
+                if input_not_received:
+                    on_start_rejected()
+                    raise ClaudeCodeBackendError(
+                        "Claude Code exited before receiving the request on stdin. "
+                        "The local CLI input delivery failed; check the adapter before restarting.",
+                        kind="compatibility",
+                    )
                 if completed and not failed_turn and code == 0:
                     final_progress_status = "finished"
             except asyncio.CancelledError:
@@ -1017,7 +1054,7 @@ class ClaudeCodeSubscriptionClient(SubscriptionCLIClient):
                             },
                             partial=True,
                         )
-                if dispatched and final_progress_status != "finished":
+                if final_progress_status != "finished":
                     report_progress(final_progress_status)
         if code or not completed or failed_turn:
             if completed_output_limit and code in {0, 1}:

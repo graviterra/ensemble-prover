@@ -119,6 +119,11 @@ policy violation rather than undoing an action already performed by the CLI.
 - Claude Code caps piped input at 10 MiB. Oversized requests fail before dispatch
   instead of dropping required context. Observed CLI compaction is rejected as a
   context failure because required transcript contents can no longer be verified.
+- On POSIX systems, the adapter prepares stdin before starting Claude Code and
+  releases execution only after admission and deadline checks. This prevents
+  delayed parent scheduling from triggering the CLI's input timeout. A confirmed
+  missing-input exit is reported as a local compatibility failure and does not
+  count toward provider transport unavailability.
 - One dispatch means one CLI invocation. Internal model turns and structured
   output retries can consume additional usage inside that invocation.
 - Input counts include fresh input, cache reads and cache writes. Final CLI
@@ -134,8 +139,10 @@ policy violation rather than undoing an action already performed by the CLI.
   activity is throttled to one update per 30 seconds; status changes appear
   immediately. These events contain no thinking text and do not count as verified
   proof progress. Advancing generation renews the default inactivity watchdog;
-  repeated events and retry notices do not. Completion is reported only after
-  the structured response passes validation.
+  repeated events and retry notices do not. After a distinct API retry, growing
+  thinking counts can renew the watchdog even when the counter restarted below
+  its previous value. Absolute request deadlines still apply. Completion is
+  reported only after the structured response passes validation.
 - Usage is unpriced subscription usage. Claude Code's API-dollar estimate is
   not treated as an authoritative subscription charge. `--cost-budget-usd 0`
   is required; the account's applicable allowances and usage limits still apply.
