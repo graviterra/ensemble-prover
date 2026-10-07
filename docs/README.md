@@ -68,7 +68,7 @@ substitute for a proof.
 
 ## Scope and defaults
 
-These guides describe version 1.17. Features with separate opt-ins include
+These guides describe version 1.18. Features with separate opt-ins include
 formal-state search, adaptive frontier research, mathematical memory, helper
 promotion, and browser control. Their settings are independent; enabling one
 does not silently enable the others. See the

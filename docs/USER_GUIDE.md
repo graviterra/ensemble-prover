@@ -22,7 +22,7 @@ gap. Supply a built Lake project to let the same discovery run formalize candida
 arguments, search for proofs with Mini, independently check exports, and return
 feedback to research. A research assessment is not a Lean proof certificate.
 
-This guide covers version 1.17, including the local browser workspace, both
+This guide covers version 1.18, including the local browser workspace, both
 experimental NL frontends, hosted APIs, Codex and Claude Code subscription
 transports, local inference, research control, and opt-in mathematical memory. Older
 release snapshots may not include the research modules; Mini-only releases also lack the NL

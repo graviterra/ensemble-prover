@@ -25,7 +25,7 @@ research into alternative approaches in a local workspace.
 
 | 672 Putnam problems | Lean 4 | Open source |
 | :---: | :---: | :---: |
-| [With saved solutions](#results) | Inspectable statements and proofs | MIT · Version 1.17 |
+| [With saved solutions](#results) | Inspectable statements and proofs | MIT · Version 1.18 |
 
 Cumulative across models · October 7, 2026 · Research preview
 
@@ -310,14 +310,14 @@ and contributors for making this benchmark available. See
 
 ## Cite this work
 
-> Reale, M. (2026). *Ensemble Prover* (Version 1.17) [Computer software]. Graviterra.
+> Reale, M. (2026). *Ensemble Prover* (Version 1.18) [Computer software]. Graviterra.
 
 ```bibtex
 @software{reale2026ensembleprover,
   author       = {Reale, M.},
   title        = {{Ensemble Prover}},
   year         = {2026},
-  version      = {1.17},
+  version      = {1.18},
   organization = {Graviterra},
   url          = {https://github.com/graviterra/ensemble-prover}
 }
