@@ -499,12 +499,17 @@ class NativeResearchCoordinator:
 
     async def boundary(self, session: Any, outcome: Any = None, *, frontier_exhausted: bool = False,
                        background: bool = False) -> bool:
+        from .mini_research_budget import (
+            capacity_reserve_due, initialize_capacity_reserve, release_capacity_reserve,
+        )
         if not self.active or not _allowed(session):
+            release_capacity_reserve(session, "research_unavailable")
             return False
         # A single run owner services explicit child requests at their own
         # settled boundaries, using that child's existing proof allocation.
         async with self.lock:
             if not _allowed(session):
+                release_capacity_reserve(session, "research_unavailable")
                 return False
             if self._pending is None:
                 self._session = session
@@ -517,19 +522,28 @@ class NativeResearchCoordinator:
                     return False
             try:
                 state = self._state(session)
+                initialize_capacity_reserve(session)
+                if state.get("draining_checked_work") and any(
+                    not budget.exhausted() for action_id, budget in session.budgets.items()
+                    if action_id in {"conversation_turn_prove", "conversation_turn_refine"}
+                ):
+                    state.pop("draining_checked_work", None)
             except ValueError as exc:
+                release_capacity_reserve(session, "research_unavailable")
                 _event(session, "research_unavailable", error_type=type(exc).__name__)
                 return False
             if state.get("ledger_initialized") or state.get("guidance"):
                 try:
                     self._open(session, getattr(session, "prover_client", None))
                 except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                    release_capacity_reserve(session, "research_unavailable")
                     _event(session, "research_unavailable", error_type=type(exc).__name__)
                     return False
             delivery_changed = self._deliver(session) or settled
             try:
                 self._account_proof_work(session, state, outcome)
             except ValueError as exc:
+                release_capacity_reserve(session, "research_unavailable")
                 _event(session, "research_unavailable", error_type=type(exc).__name__)
                 return delivery_changed
             self._queue_planner_impasse(session, outcome, state)
@@ -541,6 +555,8 @@ class NativeResearchCoordinator:
                 # boundaries may account their work without stealing its owner.
                 return delivery_changed
             if getattr(session, "scope", "problem") == "subgoal" and not (objections or state.get("grant")):
+                if capacity_reserve_due(session):
+                    release_capacity_reserve(session, "no_applicable_research")
                 return delivery_changed
             reason = (
                 "resume_research_grant" if state.get("grant") else
@@ -550,6 +566,11 @@ class NativeResearchCoordinator:
                                           or state["requests_since_audit"] >= 10) else
                 "stagnation" if state["paid_actions"] and int(getattr(session, "stagnation_counter", 0)) >= 3 else None
             )
+            if reason is None and capacity_reserve_due(session):
+                if state["paid_actions"]:
+                    reason = "reserved_capacity"
+                else:
+                    release_capacity_reserve(session, "no_applicable_research")
             if reason is None:
                 return delivery_changed
             state["last_trigger_work"] = {key: state[key] for key in (
@@ -568,6 +589,7 @@ class NativeResearchCoordinator:
                 # A failed optional research capability is not terminal search
                 # authority. Keep the already paid grant for conservative resume.
                 _event(session, "research_unavailable", error_type=type(exc).__name__)
+                release_capacity_reserve(session, "research_unavailable")
                 return False
 
     def _directory(self) -> Path:
@@ -882,7 +904,7 @@ class NativeResearchCoordinator:
             self.store.save_run(run)
 
     async def _investigate(self, session: Any, reason: str, *, background: bool = False) -> bool:
-        from .mini_research_budget import select_donor, debit_donor
+        from .mini_research_budget import select_donor, debit_donor, release_capacity_reserve
         state = self._state(session)
         grant = state.get("grant")
         donor = select_donor(session)
@@ -915,13 +937,23 @@ class NativeResearchCoordinator:
             self._deliver(session)
             return self._guidance_for(session.conv) is not None
         if donor is None:
+            release_capacity_reserve(session, "no_borrowable_proof_capacity")
             _event(session, "research_deferred", reason="no_borrowable_proof_capacity")
+            author_budgets = [session.budgets.get(action.id) for action in session.actions
+                              if action.id in {"conversation_turn_prove", "conversation_turn_refine"}]
+            if author_budgets and all(budget is None or budget.exhausted() for budget in author_budgets):
+                if not state.get("draining_checked_work"):
+                    state["draining_checked_work"] = True
+                    _event(session, "draining_checked_work", reason="author_and_research_capacity_exhausted",
+                           policy="settle_existing_checked_work_within_current_allowances")
             return False
+        state.pop("draining_checked_work", None)
         self._open(session, donor.client)
         if reason == "reported_obstacle" and not self._objections_for(session.conv):
             # Opening a restored ledger may reveal that this exact durable
             # request was already answered by a different restored owner.
             self._deliver(session)
+            release_capacity_reserve(session, "no_applicable_research")
             return self._guidance_for(session.conv) is not None
         await self._ensure_loop(session, donor.client, donor.role)
         assert self.store is not None
@@ -1108,7 +1140,10 @@ class NativeResearchCoordinator:
                 state = self._state(session)
                 pending["settlement_stage"] = "elapsed_accounting"
                 uncharged = max(0.0, elapsed - float(grant.get("elapsed_accounted", 0.0)))
-                charge_elapsed(session, pending["donor"], uncharged)
+                charge_elapsed(
+                    session, pending["donor"], uncharged,
+                    execution_id=str(grant["id"]), cumulative_seconds=elapsed,
+                )
                 grant["elapsed_accounted"] = elapsed
                 pending["settlement_stage"] = "ledger_reconciliation"
                 self._reconcile(session, grant, elapsed_s=elapsed)
@@ -1211,8 +1246,20 @@ class NativeResearchCoordinator:
                     elapsed = saved.get("elapsed_s", grant.get("seconds", 0.0))
                     uncharged = max(0.0, elapsed - grant.get("elapsed_accounted", 0.0))
                     budget = session.budgets[grant["action_id"]]
-                    budget.total_seconds += uncharged
-                    budget.unproductive_seconds += uncharged
+                    if "elapsed_s" in saved:
+                        from .mini_research_budget import restore_elapsed
+
+                        previously_charged = budget.total_seconds
+                        restore_elapsed(
+                            session, grant["action_id"], uncharged,
+                            execution_id=grant["id"], cumulative_seconds=elapsed,
+                        )
+                        uncharged = budget.total_seconds - previously_charged
+                    else:
+                        # This preserves the conservative admission debit,
+                        # while distinguishing it from measured service.
+                        budget.consume_elapsed(uncharged)
+                        budget.historical_execution_cost_incomplete = True
                     current_elapsed = float(getattr(session, "run_governor_elapsed_s", 0))
                     overlap = (
                         max(0.0, current_elapsed - grant["governor_elapsed_at_start"])
@@ -1431,8 +1478,12 @@ class NativeResearchCoordinator:
 
 async def maybe_research(session: Any, outcome: Any = None, *, frontier_exhausted: bool = False) -> bool:
     owner = current_native_research()
+    if owner is None:
+        from .mini_research_budget import release_capacity_reserve
+        release_capacity_reserve(session, "research_unavailable")
+        return False
     return await owner.boundary(session, outcome, frontier_exhausted=frontier_exhausted,
-                                background=True) if owner is not None else False
+                                background=True)
 
 
 def pending_native_research(session: Any) -> bool:

@@ -114,6 +114,7 @@ from .tactic_attempt_telemetry import (
     notify_lean_attempt_observer,
     record_dossier_lean_attempt_event,
     tactic_attempt_telemetry_fields,
+    tactic_stage_telemetry_fields,
 )
 
 
@@ -146,6 +147,36 @@ def _registered_verified_helper_reconcile_callback(dossier: Any) -> Any:
     reference = _VERIFIED_HELPER_ACCEPT_SESSIONS.get(id(dossier))
     session = reference() if reference is not None else None
     return getattr(session, "theory_verified_helper_reconcile_callback", None)
+
+
+def _tactic_renewal_controls(dossier: Any) -> Dict[str, Any]:
+    """Read actual funded exploration and final-drain state from the run owner."""
+    reference = _VERIFIED_HELPER_ACCEPT_SESSIONS.get(id(dossier))
+    session = reference() if reference is not None else None
+    sequence = getattr(session, "provider_dispatches_started_total", 0)
+    sequence = sequence if type(sequence) is int and sequence >= 0 else 0
+    state = getattr(session, "native_research_state", {})
+    drain = isinstance(state, Mapping) and state.get("draining_checked_work") is True
+    if session is not None and not drain:
+        budgets = getattr(session, "budgets", {})
+        authors = [budget for key, budget in budgets.items()
+                   if key in {"conversation_turn_prove", "conversation_turn_refine"}]
+        # Research reserves remain funded author calls in this same ledger.
+        drain = bool(authors and all(budget.exhausted() for budget in authors))
+    return {"portfolio_provider_sequence": sequence, "portfolio_drain": drain}
+
+
+def _tactic_renewal_available(history: Any, dossier: Any, timeout_s: float, *, include_admitted: bool = True, obligation_key: Optional[str] = None) -> bool:
+    from .tactic_service_history import history_for_obligation, renewal_work_available
+
+    controls = _tactic_renewal_controls(dossier)
+    if obligation_key is not None:
+        history = history_for_obligation(history, obligation_key)
+    return renewal_work_available(
+        history, provider_sequence=controls["portfolio_provider_sequence"],
+        drain=controls["portfolio_drain"], allowance_s=timeout_s,
+        include_admitted=include_admitted,
+    )
 
 
 def _fully_funded_operation_timeout(
@@ -1000,22 +1031,28 @@ def _root_tactic_context_key(
     timeout_s: float,
     max_candidates: int,
     active_root_targets: Sequence[Mapping[str, Any]] = (),
+    environment_key: str = "",
+    answer_policy: Optional[Mapping[str, Any]] = None,
 ) -> str:
+    """Bind ordered inputs and, for completed search, its execution policy.
+
+    The policy-free form retains the stable obligation component of existing
+    generations. Completed-context callers supply their effective policy.
+    """
     canonical_goal = (
         canonicalize_lean_statement_for_identity(goal_statement)
         or str(goal_statement or "").strip()
     )
-    helper_payload = sorted(
-        [
+    # Lean commands are ordered: equal sets can establish different scopes,
+    # instances or simplification rules. The identity must retain replay order.
+    helper_payload = [
             {
                 "name": helper_decl_name(str(block or "")) or "",
                 "source_hash": text_hash(str(block or "")),
             }
             for block in helpers
             if str(block or "").strip()
-        ],
-        key=lambda item: (item["name"], item["source_hash"]),
-    )
+        ]
     active_target_payload = []
     for item in list(active_root_targets or ()):
         if not isinstance(item, Mapping):
@@ -1043,12 +1080,63 @@ def _root_tactic_context_key(
     payload = {
         "goal": canonical_goal,
         "preamble_hash": text_hash(str(preamble or "")),
+        "environment_key": str(environment_key),
         "helpers": helper_payload,
         "active_root_targets": active_target_payload,
         "timeout_s": round(max(0.0, float(timeout_s or 0.0)), 3),
         "max_candidates": max(0, int(max_candidates or 0)),
     }
+    if answer_policy is not None:
+        payload["answer_policy"] = dict(answer_policy)
     return text_hash(json.dumps(payload, sort_keys=True, default=str))
+
+
+def _root_tactic_answer_policy(*, conv: Any = None, dossier: Any) -> Dict[str, Any]:
+    """Bind the effective source/answer policy used by the root checker."""
+    return {
+        "opaque_mode": bool(getattr(conv, "opaque_mode", getattr(dossier, "opaque_mode", True))),
+        "allow_official_answer_visibility": bool(getattr(
+            conv, "allow_official_answer_visibility",
+            getattr(dossier, "allow_official_answer_visibility", False),
+        )),
+        "official_answer_payload_present": getattr(
+            conv, "official_answer_payload_present",
+            getattr(dossier, "official_answer_payload_present", None),
+        ),
+        "suppress_solution_placeholders": bool(getattr(
+            conv, "suppress_solution_placeholders",
+            getattr(dossier, "suppress_solution_placeholders", True),
+        )),
+    }
+
+
+def _root_tactic_environment_key(dossier: Any, proof_state: Any) -> str:
+    root = proof_state.nodes.get(proof_state.root_node_id)
+    return text_hash(json.dumps([
+        str(getattr(dossier, "current_lean_environment_hash", "") or ""),
+        str(getattr(proof_state, "statement_environment_hash", "") or ""),
+        str(getattr(root, "statement_environment_hash", "") or ""),
+    ]))
+
+
+def _proof_state_root_tactic_obligation_key(
+    *, conv: Any, dossier: ProofDossier, proof_state: ProofSearchState,
+) -> str:
+    """Bind renewal eligibility to the same obligation as tactic execution."""
+    policy = _root_tactic_answer_policy(conv=conv, dossier=dossier)
+    return text_hash(json.dumps({
+        "target": _root_tactic_context_key(
+            goal_statement=str(getattr(conv, "goal_statement", "") or ""),
+            preamble=_proof_state_acceptance_preamble(conv),
+            helpers=(), timeout_s=0, max_candidates=0,
+            active_root_targets=_proof_state_active_root_targets_for_frame(dossier),
+            environment_key=_root_tactic_environment_key(dossier, proof_state),
+        ),
+        "opaque": policy["opaque_mode"],
+        "answer_visible": policy["allow_official_answer_visibility"],
+        "answer_payload": policy["official_answer_payload_present"],
+        "suppress_placeholders": policy["suppress_solution_placeholders"],
+    }, sort_keys=True))
 
 
 def _root_tactic_attempted_context_keys(proof_state: ProofSearchState) -> Set[str]:
@@ -1226,7 +1314,7 @@ def _has_untried_proof_state_root_tactic_context(
 ) -> bool:
     if conv is None or dossier is None or proof_state is None:
         return False
-    if max(0, int(max_candidates or 0)) <= 0:
+    if max(0, int(max_candidates or 0)) <= 0 or float(timeout_s or 0.0) <= 0:
         return False
     helpers = _proof_state_root_tactic_helper_blocks(conv=conv, dossier=dossier)
     if not helpers:
@@ -1238,7 +1326,29 @@ def _has_untried_proof_state_root_tactic_context(
         timeout_s=timeout_s,
         max_candidates=max_candidates,
         active_root_targets=_proof_state_active_root_targets_for_frame(dossier),
+        environment_key=_root_tactic_environment_key(dossier, proof_state),
+        answer_policy=_root_tactic_answer_policy(conv=conv, dossier=dossier),
     )
+    root_node = proof_state.nodes.get(proof_state.root_node_id)
+    continuation = validated_root_tactic_portfolio_continuation(
+        getattr(root_node, "root_tactic_portfolio_continuation", {})
+    )
+    if _tactic_renewal_available(
+        getattr(root_node, "root_tactic_service_history", {}), dossier, timeout_s,
+        include_admitted=not bool(continuation),
+        obligation_key=_proof_state_root_tactic_obligation_key(
+            conv=conv, dossier=dossier, proof_state=proof_state,
+        ),
+    ):
+        return True
+    if (
+        continuation.get("context_key") == key
+        and continuation.get("pending_reference_confirmation") is True
+    ):
+        # An outer infrastructure failure may have left an attempted marker
+        # in a checkpoint. The exact paid candidate still requires a verdict;
+        # the executor revalidates its obligation binding before replay.
+        return True
     deferred_keys = _root_tactic_deferred_context_keys(proof_state)
     if key in deferred_keys:
         if not include_deferred:
@@ -1292,6 +1402,8 @@ def _has_current_root_tactic_portfolio_continuation(
         timeout_s=timeout_s,
         max_candidates=max_candidates,
         active_root_targets=_proof_state_active_root_targets_for_frame(dossier),
+        environment_key=_root_tactic_environment_key(dossier, proof_state),
+        answer_policy=_root_tactic_answer_policy(conv=conv, dossier=dossier),
     )
     if str(continuation.get("context_key") or "") != context_key:
         return False
@@ -1321,7 +1433,7 @@ def _has_current_root_tactic_portfolio_continuation(
     direct_root_tactic = not _proof_state_active_root_targets_for_frame(dossier)
     return bool(
         (direct_root_tactic and phase in {"", "direct"})
-        or (not direct_root_tactic and phase in {"", "active", "fallback"})
+        or (not direct_root_tactic and phase in {"", "active", "lift", "fallback"})
     )
 
 
@@ -8905,6 +9017,7 @@ async def _try_proof_state_root_tactic_assembly(
     deadline_monotonic: float = 0.0,
     context_timeout_s: Optional[float] = None,
     candidate_attempt_limit: int = 0,
+    service_slice_s: float = 0.0,
 ) -> Tuple[bool, Optional[str], List[str], List[Dict[str, Any]]]:
     """Try the root tactic closer once for each distinct helper context."""
 
@@ -8962,10 +9075,20 @@ async def _try_proof_state_root_tactic_assembly(
         timeout_s=context_timeout,
         max_candidates=max_candidates,
         active_root_targets=_proof_state_active_root_targets_for_frame(dossier),
+        environment_key=_root_tactic_environment_key(dossier, proof_state),
+        answer_policy=_root_tactic_answer_policy(conv=conv, dossier=dossier),
     )
     root_node = proof_state.nodes.get(proof_state.root_node_id)
     active_root_targets = _proof_state_active_root_targets_for_frame(dossier)
     direct_root_tactic = not active_root_targets
+    from .tactic_service_history import commit_renewal, history_for_obligation, record_attempts
+
+    obligation_key = _proof_state_root_tactic_obligation_key(
+        conv=conv, dossier=dossier, proof_state=proof_state,
+    )
+    service_history = history_for_obligation(
+        getattr(root_node, "root_tactic_service_history", {}), obligation_key,
+    )
     raw_continuation = (
         getattr(root_node, "root_tactic_portfolio_continuation", {})
         if root_node is not None
@@ -8974,26 +9097,49 @@ async def _try_proof_state_root_tactic_assembly(
     portfolio_continuation = validated_root_tactic_portfolio_continuation(
         raw_continuation
     )
+    generation_context_key = str(
+        portfolio_continuation.get("generation_context_key")
+        or portfolio_continuation.get("context_key") or context_key
+    )
+    helper_hashes = [text_hash(str(block)) for block in helpers]
+    previous_helper_hashes = portfolio_continuation.get("execution_helper_hashes")
+    if (portfolio_continuation.get("obligation_key") == obligation_key
+            and isinstance(previous_helper_hashes, list)
+            and helper_hashes[:len(previous_helper_hashes)] == previous_helper_hashes
+            and portfolio_continuation.get("context_key") != context_key):
+        # This carries only unexecuted search work. Every remaining candidate
+        # is checked against today's exact ordered environment. New ready root
+        # proofs/assemblies were considered before entering this lane.
+        portfolio_continuation["context_key"] = context_key
+        portfolio_continuation["generation_context_key"] = generation_context_key
     continuation_phase = str(portfolio_continuation.get("phase") or "")
     if (
         str(portfolio_continuation.get("context_key") or "") != context_key
+        or portfolio_continuation.get("obligation_key", obligation_key) != obligation_key
         or (
             direct_root_tactic
             and continuation_phase not in {"", "direct"}
         )
         or (
             not direct_root_tactic
-            and continuation_phase not in {"", "active", "fallback"}
+            and continuation_phase not in {"", "active", "lift", "fallback"}
         )
-        or len(list(portfolio_continuation.get("candidates") or ()))
-        > max(0, int(max_candidates or 0))
     ):
         portfolio_continuation = {}
-    if root_node is not None and portfolio_continuation != raw_continuation:
+    if not portfolio_continuation:
+        generation_context_key = context_key
+    if root_node is not None and not portfolio_continuation and raw_continuation:
         root_node.root_tactic_portfolio_continuation = {}
+    if _tactic_renewal_available(service_history, dossier, context_timeout, include_admitted=not bool(portfolio_continuation)):
+        _clear_root_tactic_context_retry_markers(proof_state, context_key)
     deferred_keys = _root_tactic_deferred_context_keys(proof_state)
     was_deferred = context_key in deferred_keys
-    if context_key in _root_tactic_attempted_context_keys(proof_state):
+    if (context_key in _root_tactic_attempted_context_keys(proof_state)
+            and not _tactic_renewal_available(service_history, dossier, context_timeout, include_admitted=not bool(portfolio_continuation))
+            and not (portfolio_continuation and (
+                generation_context_key != context_key
+                or portfolio_continuation.get("pending_reference_confirmation") is True
+            ))):
         if root_node is not None:
             root_node.root_tactic_portfolio_continuation = {}
         try:
@@ -9047,6 +9193,8 @@ async def _try_proof_state_root_tactic_assembly(
             "root_tactic_context_key": context_key,
             "tactic_timeout_s": str(round(max(0.0, context_timeout), 3)),
             "max_candidates": str(max(0, int(max_candidates or 0))),
+            "portfolio_service_history": service_history,
+            **_tactic_renewal_controls(dossier),
         }
     )
     resumed_candidates = tuple(
@@ -9089,6 +9237,14 @@ async def _try_proof_state_root_tactic_assembly(
                 candidate_attempt_limit=max(
                     0, int(candidate_attempt_limit or 0)
                 ),
+                service_slice_s=service_slice_s,
+                candidate_reference_confirmation_pending=bool(
+                    portfolio_continuation.get("pending_reference_confirmation", False)
+                ),
+                allow_pending_reference_confirmation=True,
+                candidate_timeout_floor_s=float(
+                    portfolio_continuation.get("candidate_timeout_floor_s", 0.0)
+                ),
                 pattern_cache=root_tactic_pattern_cache,
                 pattern_context=root_tactic_pattern_context,
                 defer_success_cache=True,
@@ -9118,7 +9274,8 @@ async def _try_proof_state_root_tactic_assembly(
             operation_label="proof_state_root_tactic",
         )
     except _LeanOperationDeadline:
-        if was_deferred and allow_deferred_retry:
+        if (was_deferred and allow_deferred_retry
+                and not portfolio_continuation.get("pending_reference_confirmation")):
             _mark_root_tactic_context_continued(proof_state, context_key)
             _mark_root_tactic_context_attempted(proof_state, context_key)
             try:
@@ -9145,7 +9302,8 @@ async def _try_proof_state_root_tactic_assembly(
             }
         ]
     except Exception as exc:
-        if was_deferred and allow_deferred_retry:
+        if (was_deferred and allow_deferred_retry
+                and not portfolio_continuation.get("pending_reference_confirmation")):
             _mark_root_tactic_context_continued(proof_state, context_key)
             _mark_root_tactic_context_attempted(proof_state, context_key)
             try:
@@ -9172,6 +9330,12 @@ async def _try_proof_state_root_tactic_assembly(
             }
         ]
     setattr(proof_state, "_tactic_pattern_cache", root_tactic_pattern_cache)
+    if root_node is not None:
+        root_node.root_tactic_service_history = record_attempts(
+            commit_renewal(service_history, getattr(root_tactic, "cache_metadata", {}) or {}),
+            list(getattr(root_tactic, "attempts", ()) or ()),
+            allowance_s=context_timeout,
+        )
     _record_completed_tactic_observer_events(
         dossier,
         "proof_state_root_tactic",
@@ -9199,7 +9363,7 @@ async def _try_proof_state_root_tactic_assembly(
     )
     portfolio_phase_timeout = bool(
         root_tactic_exit_reason == "timeout"
-        and continuation_result_phase in {"direct", "active", "fallback"}
+        and continuation_result_phase in {"direct", "active", "lift", "fallback"}
         and tuple(getattr(root_tactic, "candidate_portfolio", ()) or ())
     )
     if root_tactic_exit_reason == "candidate_quantum_exhausted" or portfolio_phase_timeout:
@@ -9216,6 +9380,14 @@ async def _try_proof_state_root_tactic_assembly(
                     PROOF_STATE_ROOT_TACTIC_PORTFOLIO_SCHEMA_VERSION
                 ),
                 "context_key": context_key,
+                "obligation_key": obligation_key,
+                "generation_context_key": generation_context_key,
+                "pending_reference_confirmation": bool(root_tactic_cache_metadata.get("pending_reference_confirmation")),
+                "execution_helper_hashes": helper_hashes,
+                "candidate_timeout_floor_s": max(
+                    float(portfolio_continuation.get("candidate_timeout_floor_s", 0.0)),
+                    float(root_tactic_cache_metadata.get("candidate_timeout_floor_s", 0.0)),
+                ),
                 "phase": continuation_result_phase,
                 "candidates": [
                     {
@@ -9239,7 +9411,7 @@ async def _try_proof_state_root_tactic_assembly(
             )
             timeout_progress = bool(
                 next_candidate_index > resumed_offset
-                or (resumed_phase, continuation_result_phase) == ("active", "fallback")
+                or (resumed_phase, continuation_result_phase) in {("active", "lift"), ("active", "fallback"), ("lift", "fallback")}
                 or any(value > previous_floors.get(key, 0)
                        for key, value in current_floors.items())
             )
@@ -9247,7 +9419,7 @@ async def _try_proof_state_root_tactic_assembly(
                 # A completed check can advance the cursor or fund a larger
                 # next attempt. Keep that exact continuation eligible. Repeated
                 # unchanged short leases still hit the existing stall bound.
-                if not timeout_progress:
+                if not timeout_progress and not root_tactic_cache_metadata.get("pending_reference_confirmation"):
                     _mark_root_tactic_context_continued(proof_state, context_key)
                     _mark_root_tactic_context_attempted(proof_state, context_key)
                     try:
@@ -9262,7 +9434,11 @@ async def _try_proof_state_root_tactic_assembly(
             "accepted_helpers": list(helper_names),
             "root_tactic_context_key": context_key,
             "tactic_candidate_count": root_tactic.candidate_count,
+            "cursor_before": resumed_offset,
+            "cursor_after": int(getattr(root_tactic, "next_candidate_index", resumed_offset)),
+            "context_identity": context_key,
             **tactic_attempt_telemetry_fields(root_tactic.attempts),
+            **tactic_stage_telemetry_fields(root_tactic.attempts),
             "tactic_attempts": root_tactic.attempts[:10],
             "tactic_success_attempt": success_attempt,
             "tactic_elapsed_s": root_tactic.elapsed_s,
@@ -9289,6 +9465,30 @@ async def _try_proof_state_root_tactic_assembly(
         return False, None, [], [record]
     if root_node is not None:
         root_node.root_tactic_portfolio_continuation = {}
+    if (generation_context_key != context_key
+            and (root_tactic_exit_reason == "exhausted"
+                 or root_tactic_exit_reason.endswith(";fallback_exhausted"))
+            and not root_tactic.ok and not is_transient_tactic_close_failure(root_tactic)):
+        # Finishing an older finite generation does not exhaust new helper
+        # opportunities in the current context. The next dispatch builds its
+        # fresh portfolio, with exact-context failure pruning and service order.
+        _mark_root_tactic_context_attempted(proof_state, generation_context_key)
+        return False, None, [], [{
+            "phase": "proof_state_root_assembly", "turn_in_phase": turn,
+            "accepted_helpers": list(helper_names),
+            "root_tactic_context_key": context_key,
+            "generation_context_key": generation_context_key,
+            "tactic_candidate_count": root_tactic.candidate_count,
+            "cursor_before": resumed_offset,
+            "cursor_after": int(getattr(root_tactic, "next_candidate_index", resumed_offset)),
+            "context_identity": context_key,
+            **tactic_attempt_telemetry_fields(root_tactic.attempts),
+            **tactic_stage_telemetry_fields(root_tactic.attempts),
+            "tactic_attempts": root_tactic.attempts[:10],
+            "tactic_elapsed_s": root_tactic.elapsed_s,
+            "tactic_exit_reason": root_tactic.exit_reason,
+            "verdict": "tactic_generation_drained",
+        }]
     transient_failure = is_transient_tactic_close_failure(root_tactic)
     should_defer = bool(
         transient_failure and _root_tactic_transient_should_defer(root_tactic)
@@ -9322,7 +9522,11 @@ async def _try_proof_state_root_tactic_assembly(
         "accepted_helpers": list(helper_names),
         "root_tactic_context_key": context_key,
         "tactic_candidate_count": root_tactic.candidate_count,
+            "cursor_before": resumed_offset,
+            "cursor_after": int(getattr(root_tactic, "next_candidate_index", resumed_offset)),
+            "context_identity": context_key,
         **tactic_attempt_telemetry_fields(root_tactic.attempts),
+        **tactic_stage_telemetry_fields(root_tactic.attempts),
         "tactic_attempts": root_tactic.attempts[:10],
         "tactic_success_attempt": success_attempt,
         "tactic_elapsed_s": root_tactic.elapsed_s,
@@ -9354,6 +9558,34 @@ async def _try_proof_state_root_tactic_assembly(
             cache_metadata.get("active_root_lift_succeeded")
         )
     if root_tactic.ok and root_tactic.proof:
+        def retain_finalization_retry() -> None:
+            if root_node is None:
+                return
+            from .tactic_service_history import admit_candidates, retain_acceptance_retry
+
+            # A successful lift may not have generated any original-root
+            # candidates. Save its exact root proof in that target's lane.
+            statement = str(getattr(conv, "goal_statement", "") or "")
+            lane_key = text_hash(f"{len(statement)}:{statement}{root_tactic_preamble}")
+            attempt = success_attempt or {}
+            candidate = TacticCandidate(
+                proof=root_tactic.proof,
+                tactic=str(attempt.get("tactic") or "root_finalization_retry"),
+                source=str(attempt.get("source") or "root_finalization_retry"),
+                helper=attempt.get("helper"),
+            )
+            history = root_node.root_tactic_service_history
+            if lane_key not in history.get("renewal_lanes", {}):
+                _, lanes = admit_candidates(
+                    [candidate], history, lane_key=lane_key,
+                    helper_hashes=helper_hashes, allowance_s=context_timeout,
+                    provider_sequence=_tactic_renewal_controls(dossier)["portfolio_provider_sequence"],
+                )
+                history = commit_renewal(history, {"portfolio_renewal_lanes": lanes})
+            root_node.root_tactic_service_history = retain_acceptance_retry(
+                history, candidate, lane_key=lane_key,
+            )
+
         contract_success_attempt = success_attempt
         if active_root_target_statement_text and isinstance(success_attempt, dict):
             contract_success_attempt = {
@@ -9393,6 +9625,7 @@ async def _try_proof_state_root_tactic_assembly(
             proof_state.record_tactic_pattern_cache_metrics(
                 getattr(root_tactic, "cache_metadata", {})
             )
+            retain_finalization_retry()
             _clear_root_tactic_context_retry_markers(proof_state, context_key)
             record["root_tactic_context_preserved"] = True
             record["root_tactic_finalization_pending"] = True
@@ -9479,6 +9712,7 @@ async def _try_proof_state_root_tactic_assembly(
         if not finalization.accepted:
             record["root_finalization_verdict"] = finalization.verdict
             if _root_tactic_finalization_pending_retryable(finalization.verdict):
+                retain_finalization_retry()
                 _clear_root_tactic_context_retry_markers(proof_state, context_key)
                 record["root_tactic_context_preserved"] = True
                 record["root_tactic_finalization_pending"] = True
@@ -11210,6 +11444,7 @@ async def _try_proof_state_one_child_closure(
     cost_controller: Optional[Any] = None,
     action_deadline_monotonic: float = 0.0,
     candidate_attempt_limit: int = 0,
+    service_slice_s: float = 0.0,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Run the declaration/tactic/assembler swarm for one proof-state node."""
 
@@ -12484,6 +12719,13 @@ async def _try_proof_state_one_child_closure(
         timeout_s=tactic_available_timeout,
         max_candidates=max_candidates,
     )
+    from .tactic_service_history import commit_renewal, history_for_obligation, record_attempts
+
+    child_service_history = history_for_obligation(node.child_tactic_service_history, tactic_base_key)
+    tactic_pattern_context.update({
+        "portfolio_service_history": child_service_history,
+        **_tactic_renewal_controls(dossier),
+    })
     continuation = _proof_state_child_tactic_portfolio_continuation(
         conv=conv, dossier=dossier, proof_state=proof_state, node=node,
         timeout_s=tactic_available_timeout, max_candidates=max_candidates,
@@ -12500,6 +12742,9 @@ async def _try_proof_state_one_child_closure(
         "helper_hashes": tactic_helper_hashes,
     }
     generation_context_changed = generation_context["context_key"] != tactic_terminal_context_key
+    if _tactic_renewal_available(child_service_history, dossier, tactic_available_timeout):
+        node.tactic_terminal_context_keys = [key for key in node.tactic_terminal_context_keys
+                                            if key != tactic_terminal_context_key]
     if tactic_terminal_context_key in set(
         getattr(node, "tactic_terminal_context_keys", []) or []
     ):
@@ -12548,6 +12793,7 @@ async def _try_proof_state_one_child_closure(
     resumed_offset = candidate_portfolio_offset
     remaining_candidate_attempts = max(0, int(candidate_attempt_limit or 0))
     candidate_timeout_floor_s = float(continuation.get("candidate_timeout_floor_s", 0.0))
+    pending_reference_confirmation = bool(continuation.get("pending_reference_confirmation", False))
 
     def save_child_portfolio() -> Dict[str, Any]:
         from .mini_tactic_closer import TacticCandidate
@@ -12572,6 +12818,7 @@ async def _try_proof_state_one_child_closure(
             "generation_context": generation_context,
             "execution_helper_hashes": tactic_helper_hashes,
             "candidate_timeout_floor_s": candidate_timeout_floor_s,
+            "pending_reference_confirmation": pending_reference_confirmation,
         })
         if saved:
             node.child_tactic_portfolio_continuation = saved
@@ -12608,7 +12855,10 @@ async def _try_proof_state_one_child_closure(
                 candidate_portfolio=candidate_portfolio,
                 candidate_portfolio_offset=candidate_portfolio_offset,
                 candidate_attempt_limit=remaining_candidate_attempts,
+                service_slice_s=service_slice_s,
                 candidate_timeout_floor_s=candidate_timeout_floor_s,
+                candidate_reference_confirmation_pending=pending_reference_confirmation,
+                allow_pending_reference_confirmation=True,
                 # The offset already excludes the vetoed prefix on resumed
                 # portfolios. Avoid sorting and copying the growing veto set.
                 suppressed_proofs=(
@@ -12656,6 +12906,12 @@ async def _try_proof_state_one_child_closure(
             for attempt in list(getattr(result, "attempts", []) or [])
             if isinstance(attempt, dict)
         ]
+        child_service_history = record_attempts(
+            commit_renewal(child_service_history, getattr(result, "cache_metadata", {}) or {}),
+            result_attempts, allowance_s=tactic_available_timeout,
+        )
+        node.child_tactic_service_history = child_service_history
+        tactic_pattern_context["portfolio_service_history"] = child_service_history
         aggregate_attempts.extend(result_attempts)
         if candidate_attempt_limit > 0:
             # A veto consumes the same dispatch quantum as a rejected check.
@@ -12691,6 +12947,10 @@ async def _try_proof_state_one_child_closure(
         # than the exact helper-sensitive verdict cache. A helper addition
         # or JSON restart must not continually shrink the same retry slice.
         result_cache_metadata = getattr(result, "cache_metadata", None)
+        pending_reference_confirmation = bool(
+            isinstance(result_cache_metadata, Mapping)
+            and result_cache_metadata.get("pending_reference_confirmation")
+        )
         raw_timeout_floor = (
             result_cache_metadata.get("candidate_timeout_floor_s", 0.0)
             if isinstance(result_cache_metadata, Mapping) else 0.0
@@ -12821,6 +13081,14 @@ async def _try_proof_state_one_child_closure(
                 aggregate_attempts[-1]["acceptance_vetoed"] = True
             candidate = TacticPatternCache.candidate_from_attempt(local_success_attempt)
             if candidate is not None:
+                from .tactic_service_history import retain_acceptance_retry
+
+                child_service_history = retain_acceptance_retry(
+                    child_service_history, candidate,
+                    lane_key=str(local_success_attempt.get("portfolio_lane_key") or ""),
+                )
+                node.child_tactic_service_history = child_service_history
+                tactic_pattern_context["portfolio_service_history"] = child_service_history
                 aggregate_cache_metadata = _merge_tactic_cache_metadata(
                     aggregate_cache_metadata,
                     tactic_pattern_cache.record_acceptance_veto(
@@ -12900,7 +13168,11 @@ async def _try_proof_state_one_child_closure(
                 "turn_in_phase": turn, "node_id": node.node_id,
                 "target": node.target,
                 "tactic_candidate_count": result.candidate_count,
+                "cursor_before": resumed_offset,
+                "cursor_after": candidate_portfolio_offset,
+                "context_identity": tactic_terminal_context_key,
                 **tactic_attempt_telemetry_fields(result.attempts),
+                **tactic_stage_telemetry_fields(result.attempts),
                 "tactic_attempts": result.attempts[:10],
                 "tactic_elapsed_s": result.elapsed_s,
                 "tactic_exit_reason": final_exit_reason,
@@ -13353,7 +13625,11 @@ async def _try_proof_state_one_child_closure(
             "turn_in_phase": turn, "node_id": node.node_id,
             "target": node.target,
             "tactic_candidate_count": result.candidate_count,
+                "cursor_before": resumed_offset,
+                "cursor_after": candidate_portfolio_offset,
+                "context_identity": tactic_terminal_context_key,
             **tactic_attempt_telemetry_fields(result.attempts),
+            **tactic_stage_telemetry_fields(result.attempts),
             "tactic_attempts": result.attempts[:10],
             "tactic_elapsed_s": result.elapsed_s,
             "tactic_exit_reason": final_exit_reason,
@@ -13451,7 +13727,11 @@ async def _try_proof_state_one_child_closure(
             "target": node.target,
             "helper_name": helper_name,
             "tactic_candidate_count": result.candidate_count,
+                "cursor_before": resumed_offset,
+                "cursor_after": candidate_portfolio_offset,
+                "context_identity": tactic_terminal_context_key,
             **tactic_attempt_telemetry_fields(result.attempts),
+            **tactic_stage_telemetry_fields(result.attempts),
             "tactic_attempts": result.attempts[:10],
             "tactic_success_attempt": success_attempt,
             "spawned_child_nodes": sorted(set(tactic_spawned)),
@@ -13515,6 +13795,7 @@ async def _try_proof_state_child_closures(
     cost_controller: Optional[Any] = None,
     action_deadline_monotonic: float = 0.0,
     candidate_attempt_limit: int = 0,
+    service_slice_s: float = 0.0,
     status_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Optional[str], List[str]]:
     """Try deterministic closures for scheduled child goals, then assemble root."""
@@ -13539,6 +13820,22 @@ async def _try_proof_state_child_closures(
     def _update_status(records: Sequence[Mapping[str, Any]]) -> None:
         if status_out is None:
             return
+        for record in records:
+            if "cursor_before" in record:
+                status_out.setdefault("cursor_before", record["cursor_before"])
+                status_out["cursor_after"] = record["cursor_after"]
+                status_out["context_identity"] = record["context_identity"]
+            count = record.get("tactic_attempt_count", 0)
+            if type(count) is int and count >= 0:
+                status_out["candidates_started"] = status_out.get("candidates_started", 0) + count
+                status_out["candidates_settled"] = status_out.get("candidates_settled", 0) + count
+            stages = record.get("tactic_stage_timings")
+            if isinstance(stages, Mapping):
+                totals = status_out.setdefault("stage_timings", {})
+                for key, value in stages.items():
+                    if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                        totals[key] = totals.get(key, 0.0) + value
+                status_out["stage_timing_scope"] = "per_check_inclusive"
         for key in ("child_tactic_continuation_pending", "child_tactic_cursor_advanced"):
             status_out[key] = bool(
                 status_out.get(key) or any(record.get(key) for record in records)
@@ -13806,9 +14103,11 @@ async def _try_proof_state_child_closures(
                 deadline_monotonic=action_deadline_monotonic,
                 context_timeout_s=timeout_s,
                 candidate_attempt_limit=candidate_attempt_limit,
+                service_slice_s=service_slice_s,
             )
         )
         _extend_accepted_helpers(root_tactic_helpers)
+        _update_status(root_tactic_records)
         if recorder is not None:
             for record in root_tactic_records:
                 recorder.record_turn(record)
@@ -13867,7 +14166,7 @@ async def _try_proof_state_child_closures(
             or not (terminal_keys or retry_keys)
         ):
             continue
-        current_key = _proof_state_child_tactic_terminal_context_key(
+        current_key, obligation_key, _ = _proof_state_child_tactic_context_keys(
             conv=conv,
             dossier=dossier,
             proof_state=proof_state,
@@ -13875,7 +14174,11 @@ async def _try_proof_state_child_closures(
             timeout_s=timeout_s,
             max_candidates=max_candidates,
         )
-        if current_key in terminal_keys or current_key in retry_keys:
+        renewal_available = _tactic_renewal_available(
+            candidate_node.child_tactic_service_history, dossier, timeout_s,
+            obligation_key=obligation_key,
+        )
+        if not renewal_available and (current_key in terminal_keys or current_key in retry_keys):
             continue
         candidate_node.tactic_terminal_context_keys = []
         candidate_node.tactic_timeout_retry_context_keys = []
@@ -14038,6 +14341,7 @@ async def _try_proof_state_child_closures(
                 proof_cache=proof_cache,
                 allowed_work_types=target_types or None,
                 candidate_attempt_limit=candidate_attempt_limit,
+                service_slice_s=service_slice_s,
                 formal_search_config=formal_search_config,
                 formal_search_client=formal_search_client,
                 cost_controller=cost_controller,
@@ -14222,9 +14526,11 @@ async def _try_proof_state_child_closures(
             deadline_monotonic=action_deadline_monotonic,
             context_timeout_s=timeout_s,
             candidate_attempt_limit=candidate_attempt_limit,
+            service_slice_s=service_slice_s,
         )
     )
     _extend_accepted_helpers(root_tactic_helpers)
+    _update_status(root_tactic_records)
     if recorder is not None:
         for record in root_tactic_records:
             recorder.record_turn(record)

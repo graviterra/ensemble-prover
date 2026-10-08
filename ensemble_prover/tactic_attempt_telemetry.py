@@ -9,6 +9,7 @@ the preview only for backward compatibility with historical records.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
 from typing import Any, Callable, Dict
 
 
@@ -187,6 +188,28 @@ def tactic_attempt_telemetry_fields(
         else:
             counts["tactic_completed_count"] += 1
     return counts
+
+
+def tactic_stage_telemetry_fields(
+    attempts: Sequence[Mapping[str, Any]] | None,
+) -> Dict[str, Any]:
+    """Sum named stages before previews are truncated, without summing stages.
+
+    A check's proof stage can include queueing or context preparation. These
+    named observations are not a partition of exclusive CPU or wall time.
+    """
+    totals: Dict[str, float] = {}
+    for attempt in attempts or ():
+        stages = attempt.get("stage_timings") if isinstance(attempt, Mapping) else None
+        if not isinstance(stages, Mapping):
+            continue
+        for key, value in stages.items():
+            if (isinstance(key, str) and type(value) in (int, float)
+                    and 0 <= value <= 1e15 and math.isfinite(value)):
+                total = totals.get(key, 0.0) + value
+                if math.isfinite(total):
+                    totals[key] = total
+    return {"tactic_stage_timings": totals, "tactic_stage_timing_scope": "per_check_inclusive"}
 
 
 def tactic_record_telemetry(record: Mapping[str, Any]) -> Dict[str, int]:

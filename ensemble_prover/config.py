@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -391,6 +392,22 @@ class LeanConfig:
     persistent_max_requests_per_worker: int = 200
     persistent_oracle_workers: int = 0
     persistent_protocol: str = "lsp"
+    # Deliberate wire bounds, independent of asyncio's small line-reader limit.
+    persistent_max_message_bytes: int = 16 * 1024 * 1024
+    persistent_lsp_max_message_bytes: int = 32 * 1024 * 1024
+    persistent_transport_failure_threshold: int = 2
+    persistent_transport_circuit_cooldown_s: float = 60.0
+    # Warm search is opt-in. Successful candidates receive fresh reference
+    # verification, independently of completed-execution caching.
+    persistent_warm_contexts: bool = False
+    persistent_context_slots: int = 4
+    persistent_context_max_rss_mb: int = 16384
+    # Yield between complete funded candidate checks; never shorten a check
+    # to fit this soft scheduler slice. Zero disables the extra yield.
+    closure_service_slice_s: float = 30.0
+    # Optional allocation within existing proof-turn limits. Unused capacity
+    # returns to proof authoring; this never increases provider allowances.
+    research_reserved_turns: int = 0
     solved_dir: str = "./runs/solved/"
     extra_imports: List[str] = field(default_factory=list)
     # Additional roots containing already-compiled Lean modules. Mini's
@@ -1812,12 +1829,31 @@ def validate_config(cfg: AppConfig) -> None:
         "lean.persistent_protocol must be one of lsp, "
         f"got {cfg.lean.persistent_protocol}",
     )
-    if str(cfg.lean.backend_mode).lower() == "persistent_process":
+    if (str(cfg.lean.backend_mode).lower() == "persistent_process"
+            or cfg.lean.persistent_warm_contexts is True):
         _require(
             int(cfg.lean.persistent_workers) > 0,
             "lean.persistent_workers must be > 0 when "
-            "lean.backend_mode=persistent_process",
+            "persistent verification or warm contexts are enabled",
         )
+    for key, lower, upper in (
+        ("persistent_workers", 0, 32),
+        ("persistent_max_message_bytes", 1024, 256 * 1024 * 1024),
+        ("persistent_lsp_max_message_bytes", 1024, 256 * 1024 * 1024),
+        ("persistent_context_slots", 1, 64),
+        ("persistent_context_max_rss_mb", 64, 131072),
+        ("persistent_transport_failure_threshold", 1, 1000),
+        ("research_reserved_turns", 0, 1000000),
+    ):
+        value = getattr(cfg.lean, key)
+        _require(type(value) is int and lower <= value <= upper,
+                 f"lean.{key} must be an integer between {lower} and {upper}")
+    for key in ("closure_service_slice_s", "persistent_transport_circuit_cooldown_s"):
+        value = getattr(cfg.lean, key)
+        _require(type(value) in (int, float) and 0 <= value <= 1e15 and math.isfinite(value),
+                 f"lean.{key} must be finite and nonnegative")
+    _require(type(cfg.lean.persistent_warm_contexts) is bool,
+             "lean.persistent_warm_contexts must be a boolean")
     _require(
         int(cfg.lean.max_full_checks) >= 0,
         f"lean.max_full_checks must be >= 0, got {cfg.lean.max_full_checks}",
@@ -3074,6 +3110,15 @@ def load_config(path: str | Path) -> AppConfig:
         persistent_protocol=str(
             lean_data.get("persistent_protocol", "lsp") or "lsp"
         ),
+        persistent_max_message_bytes=_as_int(lean_data.get("persistent_max_message_bytes", 16 * 1024 * 1024), 16 * 1024 * 1024),
+        persistent_lsp_max_message_bytes=_as_int(lean_data.get("persistent_lsp_max_message_bytes", 32 * 1024 * 1024), 32 * 1024 * 1024),
+        persistent_context_slots=_as_int(lean_data.get("persistent_context_slots", 4), 4),
+        persistent_context_max_rss_mb=_as_int(lean_data.get("persistent_context_max_rss_mb", 16384), 16384),
+        persistent_transport_failure_threshold=_as_int(lean_data.get("persistent_transport_failure_threshold", 2), 2),
+        persistent_transport_circuit_cooldown_s=_as_float(lean_data.get("persistent_transport_circuit_cooldown_s", 60.0), 60.0),
+        persistent_warm_contexts=_as_bool(lean_data.get("persistent_warm_contexts", False)),
+        closure_service_slice_s=_as_float(lean_data.get("closure_service_slice_s", 30.0), 30.0),
+        research_reserved_turns=_as_int(lean_data.get("research_reserved_turns", 0), 0),
         solved_dir=str(lean_data.get("solved_dir", "./runs/solved/")),
         extra_imports=[
             str(item).strip() for item in lean_extra_imports_raw if str(item).strip()

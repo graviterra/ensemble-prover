@@ -11890,6 +11890,27 @@ class ConversationTurnAction:
                 session,
             )
         )
+        from ...mini_research_budget import capacity_reserve_due
+
+        if capacity_reserve_due(session, self.id) and not durable_continuation_current:
+            # A held future invocation cannot interrupt already paid response
+            # processing, tool replay, or independent verifier acceptance.
+            has_paid_work = self.has_answer_safe_recheck_work()
+            if not has_paid_work and self._provider_quantum_checkpoint:
+                try:
+                    checkpoint = self._validated_provider_quantum_checkpoint(
+                        self._provider_quantum_checkpoint, conv=session.conv,
+                    )
+                    quantum = checkpoint.get("state", {})
+                    has_paid_work = bool(
+                        quantum.get("pending_tool_replay")
+                        or quantum.get("provider_calls_completed", 0)
+                        or quantum.get("provider_turn_lane_identity")
+                    )
+                except StateSnapshotCompatibilityError:
+                    has_paid_work = False
+            if not has_paid_work:
+                return False
         retired_provider_lanes = getattr(
             session,
             "provider_turn_retired_lane_identities",

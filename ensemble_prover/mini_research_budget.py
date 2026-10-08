@@ -34,6 +34,115 @@ class Donor:
     initial_invocations: int
 
 
+def _remaining_turns(budget: ActionBudget) -> int | None:
+    finite = [cap - budget.invocations for cap in (
+        budget.max_invocations, budget.max_aggregate_invocations,
+    ) if cap >= 0]
+    return max(0, min(finite)) if finite else None
+
+
+def _capacity_reserve(session: Any) -> dict[str, Any] | None:
+    state = getattr(session, "native_research_state", None)
+    reserve = state.get("capacity_reserve") if isinstance(state, dict) else None
+    if not isinstance(reserve, dict) or reserve.get("schema") != 1:
+        return None
+    if any(type(reserve.get(key)) is not int or reserve[key] < 0
+           for key in ("allocated", "spent", "released")):
+        return None
+    if reserve["spent"] + reserve["released"] > reserve["allocated"]:
+        return None
+    return reserve
+
+
+def _capacity_event(session: Any, reserve: dict[str, Any], verdict: str) -> None:
+    record = getattr(session, "_record_event", None)
+    if callable(record):
+        try:
+            budget = getattr(session, "budgets", {}).get(reserve["action_id"])
+            remaining = _remaining_turns(budget) if isinstance(budget, ActionBudget) else 0
+            held = reserve["allocated"] - reserve["spent"] - reserve["released"]
+            record({"phase": "native_research", "verdict": verdict,
+                    "action_id": reserve["action_id"], "research_turns_held": held,
+                    "research_turns_funded": reserve["spent"],
+                    "research_turns_released": reserve["released"],
+                    "proof_turns_available": max(0, remaining - held) if remaining is not None else None,
+                    "existing_total_turns_remaining": remaining})
+        except Exception:
+            pass
+
+
+def initialize_capacity_reserve(session: Any) -> None:
+    """Earmark finite existing turns once, without changing any budget cap."""
+    state = getattr(session, "native_research_state", None)
+    if not isinstance(state, dict):
+        return
+    configured = getattr(getattr(getattr(session, "lean", None), "cfg", None), "research_reserved_turns", 0)
+    if "capacity_reserve" in state:
+        if configured == 0:
+            release_capacity_reserve(session, "disabled")
+        else:
+            reserve = _capacity_reserve(session)
+            if reserve is not None and reserve.get("status") == "held":
+                donor = select_donor(session)
+                if donor is None or donor.action_id != reserve.get("action_id"):
+                    release_capacity_reserve(session, "reserved_donor_unavailable")
+        return
+    if type(configured) is not int or configured <= 0:
+        return
+    donor = select_donor(session)
+    available = _remaining_turns(session.budgets[donor.action_id]) if donor else 0
+    # Unlimited counts cannot provide a finite, non-renewing split. Ordinary
+    # on-demand research can still borrow under the existing donor policy.
+    allocated = min(configured, max(0, available - 1)) if available is not None else 0
+    if hasattr(session, "max_iterations"):
+        allocated = min(allocated, max(0, session.max_iterations - session.iteration - 1))
+    state["capacity_reserve"] = {
+        "schema": 1, "action_id": donor.action_id if donor else "",
+        "configured": configured, "allocated": allocated, "spent": 0,
+        "released": 0, "status": "held" if allocated else "released",
+        "reason": "existing_allocation" if allocated else "no_finite_donor_capacity",
+    }
+    _capacity_event(session, state["capacity_reserve"], "research_capacity_split")
+
+
+def release_capacity_reserve(session: Any, reason: str) -> None:
+    """Return an unused hold; only the existing grant ledger refunds debits."""
+    reserve = _capacity_reserve(session)
+    if reserve is None or reserve.get("status") != "held":
+        return
+    reserve["released"] = reserve["allocated"] - reserve["spent"]
+    reserve["status"] = "released"
+    reserve["reason"] = reason
+    _capacity_event(session, reserve, "research_capacity_released")
+
+
+def capacity_reserve_due(session: Any, action_id: str | None = None) -> bool:
+    reserve = _capacity_reserve(session)
+    if reserve is None or reserve.get("status") != "held":
+        return False
+    if action_id is not None and reserve.get("action_id") != action_id:
+        return False
+    budget = getattr(session, "budgets", {}).get(reserve.get("action_id"))
+    if not isinstance(budget, ActionBudget):
+        return False
+    held = reserve["allocated"] - reserve["spent"] - reserve["released"]
+    remaining = _remaining_turns(budget)
+    if hasattr(session, "max_iterations") and remaining is not None:
+        remaining = min(remaining, max(0, session.max_iterations - session.iteration))
+    return bool(held and remaining is not None and remaining <= held + 1)
+
+
+def _fund_capacity_reserve(session: Any, action_id: str) -> None:
+    reserve = _capacity_reserve(session)
+    if (reserve is None or reserve.get("status") != "held" or reserve.get("action_id") != action_id
+            or reserve["spent"] + reserve["released"] >= reserve["allocated"]):
+        return
+    reserve["spent"] += 1
+    if reserve["spent"] + reserve["released"] >= reserve["allocated"]:
+        reserve["status"] = "spent"
+    _capacity_event(session, reserve, "research_capacity_funded")
+
+
 def pending_research_reservation(session: Any, action_id: str) -> tuple[int, float]:
     """Read the funded grant's outstanding capacity, separate from usage."""
     state = getattr(session, "native_research_state", None)
@@ -180,20 +289,20 @@ def _donor(session: Any, action: Any, parent_seconds: float | None) -> Donor | N
     # Borrow conservatively inside either proof/formalization envelope; never
     # invent a hard turn limit from a soft client's request timeout.
     for name in ("llm_turn_elapsed_s", "formalization_llm_turn_elapsed_s"):
-        cap = getattr(action, name, 0.0)
-        if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not math.isfinite(cap):
+        timeout_cap = getattr(action, name, 0.0)
+        if isinstance(timeout_cap, bool) or not isinstance(timeout_cap, (int, float)) or not math.isfinite(timeout_cap):
             return None
-        if cap > 0:
-            deadlines.append(float(cap))
-    for cap, spent in (
+        if timeout_cap > 0:
+            deadlines.append(float(timeout_cap))
+    for seconds_cap, spent_seconds in (
         (budget.max_total_seconds, budget.total_seconds),
         (budget.max_aggregate_seconds, budget.unproductive_seconds),
     ):
-        if not math.isfinite(cap) or not math.isfinite(spent) or spent < 0:
+        if not math.isfinite(seconds_cap) or not math.isfinite(spent_seconds) or spent_seconds < 0:
             return None
-        if cap > 0:
+        if seconds_cap > 0:
             # Preserve some action-time capacity for the promised next proof.
-            remaining = (cap - spent) / 2
+            remaining = (seconds_cap - spent_seconds) / 2
             if remaining <= 0:
                 return None
             deadlines.append(remaining)
@@ -222,7 +331,12 @@ def select_donor(session: Any) -> Donor | None:
             if remaining is not None and (not math.isfinite(remaining) or remaining <= 0):
                 return None
         actions = {getattr(action, "id", ""): action for action in getattr(session, "actions", ())}
-        for action_id in ("conversation_turn_prove", "conversation_turn_refine"):
+        action_ids = ["conversation_turn_prove", "conversation_turn_refine"]
+        reserve = _capacity_reserve(session)
+        if reserve and reserve.get("status") == "held" and reserve.get("action_id") in action_ids:
+            action_ids.remove(reserve["action_id"])
+            action_ids.insert(0, reserve["action_id"])
+        for action_id in action_ids:
             action = actions.get(action_id)
             if action is not None:
                 donor = _donor(session, action, parent_seconds)
@@ -288,6 +402,7 @@ def debit_donor(session: Any, donor: Donor, *, grant_id: str | None = None) -> D
     # are separate and remain untouched.
     if hasattr(session, "iteration"):
         session.iteration += 1
+    _fund_capacity_reserve(session, donor.action_id)
     return replace(current, remaining_seconds=min(bounds) if bounds else None)
 
 
@@ -323,16 +438,99 @@ def settle_invocation_debit(budget: ActionBudget, grant_id: str, *, empty: bool)
     return False
 
 
-def charge_elapsed(session: Any, donor: Donor, seconds: float) -> None:
-    """Charge elapsed research time without consuming another invocation."""
+def charge_elapsed(
+    session: Any, donor: Donor, seconds: float, *, execution_id: str = "",
+    cumulative_seconds: float | None = None,
+) -> None:
+    """Settle one research interval without another semantic invocation.
+
+    The grant and cumulative endpoint own the interval. Replaying a durable
+    settlement cannot duplicate either resource time or service observations.
+    Background worker occupancy is explicitly nonadditive with proof wall time.
+    """
+    _charge_elapsed_receipt(
+        session, donor.action_id, seconds, execution_id=execution_id,
+        cumulative_seconds=cumulative_seconds,
+        initial_invocations=donor.initial_invocations,
+    )
+
+
+def restore_elapsed(
+    session: Any, action_id: str, seconds: float, *, execution_id: str,
+    cumulative_seconds: float,
+) -> None:
+    """Restore measured service from an already authorized durable grant.
+
+    Grant reconciliation owns the invocation debit, which may already have
+    been released for zero provider exposure. Resource time remains charged.
+    """
+    _charge_elapsed_receipt(
+        session, action_id, seconds, execution_id=execution_id,
+        cumulative_seconds=cumulative_seconds,
+    )
+
+
+def _charge_elapsed_receipt(
+    session: Any, action_id: str, seconds: float, *, execution_id: str,
+    cumulative_seconds: float | None,
+    initial_invocations: int | None = None,
+) -> None:
     if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds < 0:
         raise ValueError("research elapsed time must be finite and nonnegative")
-    budget = session.budgets.get(donor.action_id)
-    if not isinstance(budget, ActionBudget) or budget.invocations <= donor.initial_invocations:
+    budget = session.budgets.get(action_id)
+    if not isinstance(budget, ActionBudget):
         raise ValueError("native research donor debit is missing or stale")
-    total = budget.total_seconds + float(seconds)
-    unproductive = budget.unproductive_seconds + float(seconds)
+    endpoint = seconds if cumulative_seconds is None else cumulative_seconds
+    if (isinstance(endpoint, bool) or not isinstance(endpoint, (int, float))
+            or not math.isfinite(endpoint) or endpoint < seconds):
+        raise ValueError("invalid cumulative research elapsed interval")
+    dispatch_id = f"research:{execution_id or uuid.uuid4().hex}"
+    operation_id = f"research_elapsed:{float(endpoint).hex()}"
+    key = budget.execution_key(dispatch_id, operation_id)
+    if key in budget.execution_receipts:
+        return
+    if initial_invocations is not None and budget.invocations <= initial_invocations:
+        raise ValueError("native research donor debit is missing or stale")
+    interval_start = float(endpoint - seconds)
+    covered = sorted(
+        (max(interval_start, receipt["details"]["research_elapsed_start_seconds"]),
+         min(float(endpoint), receipt["details"]["research_elapsed_end_seconds"]))
+        for receipt in budget.execution_receipts.values()
+        if receipt["dispatch_id"] == dispatch_id
+    )
+    overlap = 0.0
+    through = interval_start
+    for start, stop in covered:
+        if stop > max(start, through):
+            overlap += stop - max(start, through)
+            through = stop
+    newly_elapsed = max(0.0, float(seconds) - overlap)
+    total = budget.total_seconds + newly_elapsed
+    unproductive = budget.unproductive_seconds + newly_elapsed
     if not math.isfinite(total) or not math.isfinite(unproductive):
         raise ValueError("research elapsed charge exceeds finite budget accounting")
-    budget.total_seconds = total
-    budget.unproductive_seconds = unproductive
+    first_interval = not any(
+        receipt["dispatch_id"] == dispatch_id for receipt in budget.execution_receipts.values()
+    )
+    receipt, fresh = budget.record_execution(
+        dispatch_id=dispatch_id, operation_id=operation_id,
+        elapsed_seconds=newly_elapsed, productive=False,
+        disposition="background_research_settled",
+        details={
+            "accounting_scope": "background_worker_elapsed_nonadditive_with_proof_wall",
+            "research_elapsed_start_seconds": interval_start,
+            "research_elapsed_end_seconds": float(endpoint),
+        },
+        ownership={
+            "session_id": str(getattr(session, "execution_session_id", "")),
+            "parent_session_id": "", "parent_dispatch_id": "", "parent_operation_id": "",
+            "timing_scope": "background_worker_elapsed_nonadditive_with_proof_wall",
+        },
+    )
+    if fresh:
+        from .mini_session.execution_service import record_execution_observation
+
+        record_execution_observation(
+            getattr(session, "dossier", None), action_id, receipt,
+            count_dispatch=first_interval,
+        )

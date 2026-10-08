@@ -597,6 +597,26 @@ def _nonnegative_finite_float_arg(value: str) -> float:
     return parsed
 
 
+def _lean_context_workers_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("Lean context workers must be an integer from 1 to 32") from exc
+    if not 1 <= parsed <= 32:
+        raise argparse.ArgumentTypeError("Lean context workers must be an integer from 1 to 32")
+    return parsed
+
+
+def _research_reserved_turns_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("research reserved turns must be an integer from 0 to 1000000") from exc
+    if not 0 <= parsed <= 1000000:
+        raise argparse.ArgumentTypeError("research reserved turns must be an integer from 0 to 1000000")
+    return parsed
+
+
 def _llm_request_timeout_arg(value: str) -> Any:
     text = str(value or "").strip()
     if text.lower() in _LLM_REQUEST_TIMEOUT_DISABLED_ALIASES:
@@ -11806,6 +11826,10 @@ async def prove_theorem_project(
     max_prove_turns: int = 30,
     max_refine_turns: int = 25,
     dossier_factory: Optional[Callable[[TheoremProblem], ProofDossier]] = None,
+    lean_warm_contexts: bool = False,
+    lean_context_workers: int = 1,
+    closure_service_slice_s: float = 30.0,
+    research_reserved_turns: int = 0,
     **prove_kwargs: Any,
 ) -> Tuple[bool, Optional[str]]:
     """Resolve and prove one arbitrary theorem-project request."""
@@ -11814,6 +11838,16 @@ async def prove_theorem_project(
         raise TypeError("prove_theorem_project derives problem from request")
     if dossier_factory is not None and prove_kwargs.get("dossier") is not None:
         raise ValueError("provide a dossier or a post-preflight dossier_factory, not both")
+    if type(lean_warm_contexts) is not bool:
+        raise ValueError("lean_warm_contexts must be a boolean")
+    if type(lean_context_workers) is not int or not 1 <= lean_context_workers <= 32:
+        raise ValueError("lean_context_workers must be an integer from 1 to 32")
+    if type(research_reserved_turns) is not int or not 0 <= research_reserved_turns <= 1000000:
+        raise ValueError("research_reserved_turns must be an integer from 0 to 1000000")
+    if (type(closure_service_slice_s) not in (int, float)
+            or closure_service_slice_s < 0 or closure_service_slice_s > 1e15
+            or not math.isfinite(closure_service_slice_s)):
+        raise ValueError("closure_service_slice_s must be finite and nonnegative")
     # Reject invalid proof-policy inputs before resolving paths, constructing a
     # Lean runner, activating a theory library, or running the project probe.
     require_falsification_search_bound(
@@ -11851,6 +11885,10 @@ async def prove_theorem_project(
             timeout_s=lean_timeout_s,
             max_parallel=max(1, min(32, int(prove_kwargs.get("parallel_samples", 1) or 1))),
             backend_mode="auto",
+            persistent_warm_contexts=lean_warm_contexts,
+            persistent_workers=lean_context_workers,
+            closure_service_slice_s=closure_service_slice_s,
+            research_reserved_turns=research_reserved_turns,
             module_search_paths=[str(path) for path in problem.module_search_paths],
             project_imports=list(problem.project_imports),
             project_import_sources=dict(
@@ -13540,6 +13578,22 @@ def _build_argparser() -> argparse.ArgumentParser:
             "set_option maxHeartbeats budget for proof verification. "
             "Bump higher (e.g. 3200000) for unusually heavy elaboration."
         ),
+    )
+    p.add_argument(
+        "--lean-warm-contexts", action=argparse.BooleanOptionalAction, default=False,
+        help="Reuse bounded Lean contexts for search; independently recheck successful candidates.",
+    )
+    p.add_argument(
+        "--lean-context-workers", type=_lean_context_workers_arg, default=1,
+        help="Maximum persistent Lean workers when warm contexts are enabled.",
+    )
+    p.add_argument(
+        "--closure-service-slice-s", type=_nonnegative_finite_float_arg, default=30.0,
+        help="Soft elapsed closure slice; yield between complete checks. Zero disables it.",
+    )
+    p.add_argument(
+        "--research-reserved-turns", type=_research_reserved_turns_arg, default=0,
+        help="Reserve existing proof turns for research without increasing the total allowance.",
     )
     p.add_argument(
         "--output-dir",
@@ -15715,6 +15769,10 @@ async def _main_async(args: argparse.Namespace) -> int:
             # retain the general Lean configuration's 32-operation ceiling.
             max_parallel=max(1, min(32, int(getattr(args, "parallel_samples", 1) or 1))),
             backend_mode="auto",
+            persistent_warm_contexts=bool(getattr(args, "lean_warm_contexts", False)),
+            persistent_workers=max(1, int(getattr(args, "lean_context_workers", 1))),
+            closure_service_slice_s=float(getattr(args, "closure_service_slice_s", 30.0)),
+            research_reserved_turns=max(0, int(getattr(args, "research_reserved_turns", 0))),
             module_search_paths=[
                 str(path) for path in getattr(problem, "module_search_paths", ())
             ],

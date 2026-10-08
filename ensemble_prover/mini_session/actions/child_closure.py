@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any, ClassVar, FrozenSet, Optional
+from typing import Any, ClassVar, FrozenSet, Mapping, Optional
 
 from ensemble_prover.lean_artifact_sanitize import sanitize_lean_artifact_text
 from ensemble_prover.mini_runtime_defaults import DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S
@@ -62,6 +62,7 @@ class ChildClosureAction:
         max_decl_applications: int = 6,
         batch_parallelism: int = 1,
         formal_search_config: Optional[Any] = None,
+        service_slice_s: Optional[float] = None,
     ) -> None:
         self.timeout_s = float(timeout_s or 0.0)
         self.max_candidates = int(max_candidates or 0)
@@ -69,6 +70,7 @@ class ChildClosureAction:
         self.max_decl_applications = int(max_decl_applications or 0)
         self.batch_parallelism = int(batch_parallelism or 1)
         self.formal_search_config = formal_search_config
+        self.service_slice_s = None if service_slice_s is None else max(0.0, float(service_slice_s))
         # Every selected proving quantum includes the bounded falsification
         # preflight followed by one fully funded Lean operation. Keep explicit
         # slack so the strict enclosing deadline cannot turn an exact grant
@@ -282,6 +284,39 @@ class ChildClosureAction:
         """Return initial loop sizing; semantic work extends it as needed."""
 
         return self.MINIMUM_SESSION_QUANTA
+
+    def should_yield_static_dispatch(self, session: Any) -> bool:
+        # A checked proof awaiting publication or a ready assembly retains
+        # priority. Fairness only interleaves unfinished candidate search.
+        from ensemble_prover.proof_state import (
+            validated_child_tactic_portfolio_continuation,
+            validated_root_tactic_portfolio_continuation,
+        )
+
+        state = getattr(session, "proof_state", None)
+        dossier = getattr(session, "dossier", None)
+        for node in (getattr(state, "nodes", {}) or {}).values():
+            if (getattr(node, "status", "") in {"proved", "obsolete", "rejected", "failed"}
+                    or getattr(node, "falsified", False)):
+                continue
+            for field, validate in (
+                ("root_tactic_portfolio_continuation", validated_root_tactic_portfolio_continuation),
+                ("child_tactic_portfolio_continuation", validated_child_tactic_portfolio_continuation),
+            ):
+                record = getattr(node, field, {})
+                if (isinstance(record, Mapping)
+                        and record.get("pending_reference_confirmation") is True
+                        and validate(record).get("pending_reference_confirmation") is True):
+                    # This grants dispatch priority only. The executor still
+                    # rebinds and independently checks the saved exact proof.
+                    return False
+        if (self._pending_typed_residual_node_ids(session)
+                or self._pending_helper_acceptance_node_ids(session)
+                or self._has_root_exact_helper_work(session, dossier, state)
+                or self._has_ready_assembly(state, getattr(dossier, "proof_graph", None))):
+            return False
+        probe = getattr(session, "_closure_service_should_yield", None)
+        return bool(callable(probe) and probe(self.id))
 
     def is_applicable(self, session: Any) -> bool:
         if self.timeout_s <= 0.0 or self.max_nodes <= 0:
@@ -732,6 +767,8 @@ class ChildClosureAction:
             ):
                 return True
             root = proof_state.nodes[proof_state.root_node_id]
+            if root.root_tactic_portfolio_continuation.get("pending_reference_confirmation") is True:
+                return True
             return int(root.root_tactic_portfolio_continuation.get(
                 "next_candidate_index", 0
             )) <= 0
@@ -899,10 +936,11 @@ class ChildClosureAction:
             return False
         try:
             from ensemble_prover.proof_state_executor import (
-                _proof_state_child_tactic_terminal_context_key,
+                _proof_state_child_tactic_context_keys,
+                _tactic_renewal_available,
             )
 
-            current_key = _proof_state_child_tactic_terminal_context_key(
+            current_key, obligation_key, _ = _proof_state_child_tactic_context_keys(
                 conv=getattr(session, "conv", None),
                 dossier=getattr(session, "dossier", None),
                 proof_state=getattr(session, "proof_state", None),
@@ -910,6 +948,12 @@ class ChildClosureAction:
                 timeout_s=self.timeout_s,
                 max_candidates=self.max_candidates,
             )
+            if _tactic_renewal_available(
+                getattr(node, "child_tactic_service_history", {}),
+                getattr(session, "dossier", None), self.timeout_s,
+                obligation_key=obligation_key,
+            ):
+                return False
         except Exception:
             # The executor remains authoritative.  A failed observational
             # probe must not suppress potentially useful proof search.
@@ -1110,6 +1154,8 @@ class ChildClosureAction:
             cost_controller=getattr(session, "cost_controller", None),
             action_deadline_monotonic=action_deadline_monotonic,
             candidate_attempt_limit=candidate_attempt_limit,
+            service_slice_s=(self.service_slice_s if self.service_slice_s is not None else
+                             float(getattr(getattr(session.lean, "cfg", None), "closure_service_slice_s", 30.0))),
             status_out=execution_status,
         )
         sync_proof_state_to_graph(
@@ -1173,7 +1219,7 @@ class ChildClosureAction:
         )
         if root_tactic_continuation_pending:
             # This outcome settled exactly one candidate, not the proof-work
-            # identity. Keep the scheduler and semantic budgets neutral until
+            # identity. Keep semantic budgets neutral until
             # the persisted exact portfolio reaches a terminal candidate,
             # while reserving one real scheduler iteration for its suffix.
             metadata["root_tactic_candidate_continuation_pending"] = True
@@ -1217,9 +1263,8 @@ class ChildClosureAction:
         if not ok and pending_verifier_work and retryable_execution_defer:
             # A partial tactic/decl proof has already paid for generation;
             # only the authoritative typed residual receipt remains. Do not
-            # charge either dispatch against the cumulative action budget:
-            # doing so can leave <300s and make verifier-only replay
-            # permanently inapplicable. The initial transition to a pending
+            # spend a completed semantic attempt on this verifier retry.
+            # Elapsed execution is still charged by the session. The initial transition to a pending
             # receipt is iteration-neutral so one fully funded verifier replay
             # remains possible at the final iteration. A dispatch that began
             # pending must consume a normal iteration, however, so repeated

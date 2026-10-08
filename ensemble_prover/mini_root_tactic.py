@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import inspect
 import re
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .lean_parser import has_infra_failure, has_timeout
 from .mini_tactic_closer import (
     OUTPUT_PREVIEW_CHARS,
     TacticCandidate,
@@ -238,7 +240,9 @@ def _merge_tactic_metadata(
     merged: Dict[str, Any] = {}
     for item in items:
         for key, value in dict(item or {}).items():
-            if isinstance(value, bool):
+            if key == "portfolio_renewal_lanes" and isinstance(value, Mapping):
+                merged[key] = {**merged.get(key, {}), **value}
+            elif isinstance(value, bool):
                 merged[key] = bool(value)
             elif isinstance(value, int):
                 merged[key] = int(merged.get(key, 0) or 0) + int(value)
@@ -255,6 +259,7 @@ async def _check_active_root_lift(
     preamble: str,
     helpers: Sequence[Any],
     timeout_s: float,
+    allow_pending_reference_confirmation: bool = False,
     suppress_solution_placeholders: bool = True,
     opaque_mode: bool = True,
     allow_official_answer_visibility: bool = False,
@@ -321,11 +326,14 @@ async def _check_active_root_lift(
                 max(1.0, max(0.1, float(timeout_s or 0.1)) / 3.0),
             ),
             check_kind="mini_root_tactic_active_root_lift",
+            **(_accepted_tactic_kwargs(check, {"allow_pending_reference_confirmation": True})
+               if allow_pending_reference_confirmation else {}),
         )
         if hasattr(result, "__await__"):
             result = await result
         output = str(getattr(result, "output", "") or "")
         ok = bool(getattr(result, "ok", False))
+        pending_reference = bool(getattr(result, "pending_reference_confirmation", False))
         attempt = {
             "index": 0,
             "ok": ok,
@@ -334,6 +342,11 @@ async def _check_active_root_lift(
             "source": "active_root_lift",
             "helper": None,
             "elapsed_s": round(time.monotonic() - started, 3),
+            "check_timeout_s": timeout_s,
+            "infrastructure_inconclusive": bool(
+                getattr(getattr(result, "parsed", None), "infra_failure", False)
+                or has_infra_failure(output)
+            ),
             "returncode": getattr(result, "returncode", None),
             "error_type": "" if ok else "active_root_lift_failed",
             "diagnostic": output[:OUTPUT_PREVIEW_CHARS],
@@ -343,6 +356,9 @@ async def _check_active_root_lift(
             "partial_stub_validated": False,
             "exception": "",
             "active_root_lift": True,
+            "pending_reference_confirmation": pending_reference,
+            "stage_timings": dict(getattr(result, "stage_timings", {}) or {}),
+            "execution_metadata": dict(getattr(result, "execution_metadata", {}) or {}),
         }
         notify_lean_attempt_observer(attempt_observer, "finished", attempt)
         return attempt
@@ -398,6 +414,10 @@ async def try_close_root_with_active_lift(
     candidate_portfolio_offset: int = 0,
     candidate_portfolio_phase: str = "direct",
     candidate_attempt_limit: int = 0,
+    service_slice_s: float = 0.0,
+    candidate_timeout_floor_s: float = 0.0,
+    candidate_reference_confirmation_pending: bool = False,
+    allow_pending_reference_confirmation: bool = False,
     pattern_cache: Optional[TacticPatternCache] = None,
     pattern_context: Optional[Dict[str, Any]] = None,
     defer_success_cache: bool = False,
@@ -413,6 +433,7 @@ async def try_close_root_with_active_lift(
     allow_official_answer_visibility: bool = False,
     official_answer_payload_present: Optional[bool] = None,
     attempt_observer: Optional[LeanAttemptObserver] = None,
+    operation_deadline_monotonic: Optional[float] = None,
 ) -> TacticCloseResult:
     """Close an active root target, then stitch the proof into the root shell.
 
@@ -423,6 +444,17 @@ async def try_close_root_with_active_lift(
     """
 
     close_with_tactics = tactic_closer or try_close_with_tactics
+
+    def remaining_timeout_s() -> float:
+        if operation_deadline_monotonic is None:
+            return float(timeout_s)
+        remaining = min(float(timeout_s), operation_deadline_monotonic - time.monotonic())
+        # The checker has a 0.1s minimum operation allowance. Do not admit
+        # another check when the shared drain cannot fund that minimum.
+        return remaining if remaining >= 0.1 else 0.0
+
+    if operation_deadline_monotonic is not None:
+        pattern_context = {**dict(pattern_context or {}), "tactic_timeout_s": timeout_s}
     helper_context_blocks = tuple(
         str(item or "")
         for item in list(tactic_source_suppression_helper_blocks or helpers or ())
@@ -473,7 +505,7 @@ async def try_close_root_with_active_lift(
         active_started = time.monotonic()
         continuation_phase = (
             requested_phase
-            if requested_phase in {"active", "fallback"}
+            if requested_phase in {"active", "lift", "fallback"}
             else "active"
         )
         active_pattern_context = {
@@ -492,6 +524,57 @@ async def try_close_root_with_active_lift(
         }
         active_failure_reason = "active_root_phase_complete"
         active_result: Optional[TacticCloseResult] = None
+        if continuation_phase == "lift":
+            # The saved candidate proves the original root. Its warm success
+            # is search evidence only, so a new runner must confirm it freshly.
+            lift_result = await _call_tactic_closer(
+                close_with_tactics, lean, goal_statement, preamble, helpers,
+                timeout_s=remaining_timeout_s(), max_candidates=max_candidates,
+                candidate_portfolio=tuple(candidate_portfolio or ()),
+                candidate_portfolio_offset=candidate_portfolio_offset,
+                candidate_attempt_limit=1,
+                candidate_timeout_floor_s=max(candidate_timeout_floor_s, timeout_s),
+                candidate_reference_confirmation_pending=True,
+                allow_pending_reference_confirmation=allow_pending_reference_confirmation,
+                pattern_cache=pattern_cache, pattern_context=pattern_context,
+                defer_success_cache=defer_success_cache,
+                suppress_solution_placeholders=suppress_solution_placeholders,
+                opaque_mode=opaque_mode,
+                allow_official_answer_visibility=allow_official_answer_visibility,
+                official_answer_payload_present=official_answer_payload_present,
+                attempt_observer=attempt_observer,
+            )
+            lift_metadata = _merge_tactic_metadata(metadata, lift_result.cache_metadata, {
+                "active_root_lift_attempted": True,
+                "active_root_lift_succeeded": bool(lift_result.ok),
+                "root_tactic_candidate_portfolio_phase": "lift",
+            })
+            lift_attempts = [
+                {**attempt, "active_root_lift": True,
+                 "active_root_target_statement": active_statement}
+                for attempt in lift_result.attempts
+            ]
+            if lift_result.ok:
+                return replace(lift_result, attempts=lift_attempts,
+                               exit_reason="active_root_lift_solved", cache_metadata=lift_metadata)
+            if (lift_metadata.get("pending_reference_confirmation")
+                    or is_transient_tactic_close_failure(lift_result)):
+                # Source admission can time out before the runner reaches the
+                # forced reference call. Retain the known candidate as well.
+                return replace(
+                    lift_result, attempts=lift_attempts, exit_reason="timeout",
+                    candidate_portfolio=tuple(candidate_portfolio or ()),
+                    next_candidate_index=candidate_portfolio_offset,
+                    cache_metadata={**lift_metadata, "pending_reference_confirmation": True},
+                )
+            # Rejecting the saved lift has checked only that proof. Preserve
+            # the complete, as-yet-unexecuted fallback portfolio for next turn.
+            return replace(
+                lift_result, attempts=lift_attempts, exit_reason="candidate_quantum_exhausted",
+                candidate_portfolio=(), next_candidate_index=0,
+                cache_metadata={**lift_metadata, "pending_reference_confirmation": False,
+                                "root_tactic_candidate_portfolio_phase": "fallback"},
+            )
         if continuation_phase == "active":
             active_start_offset = max(
                 0,
@@ -503,7 +586,7 @@ async def try_close_root_with_active_lift(
                 active_statement,
                 preamble,
                 helpers,
-                timeout_s=timeout_s,
+                timeout_s=remaining_timeout_s(),
                 max_candidates=max_candidates,
                 pattern_cache=pattern_cache,
                 pattern_context=active_pattern_context,
@@ -517,6 +600,10 @@ async def try_close_root_with_active_lift(
                     0, active_start_offset
                 ),
                 candidate_attempt_limit=attempt_limit,
+                service_slice_s=service_slice_s,
+                candidate_timeout_floor_s=candidate_timeout_floor_s,
+                candidate_reference_confirmation_pending=candidate_reference_confirmation_pending,
+                allow_pending_reference_confirmation=allow_pending_reference_confirmation,
                 suppressed_proofs=_suppressed_proofs_for_statement(
                     suppressed_proofs=suppressed_proofs,
                     suppressed_proof_records=suppressed_proof_records,
@@ -623,13 +710,31 @@ async def try_close_root_with_active_lift(
             lifted_proof_count = len(lifted_proofs)
             metadata["active_root_lift_attempted"] = bool(lifted_proofs)
             for lifted_proof in lifted_proofs:
+                lift_timeout_s = remaining_timeout_s()
+                if operation_deadline_monotonic is not None and lift_timeout_s <= 0:
+                    return TacticCloseResult(
+                        ok=False, proof=None,
+                        attempts=[*lift_attempts, *_shift_attempt_indices(
+                            _demote_active_root_attempts(active_attempts, reason="timeout"),
+                            offset=len(lift_attempts),
+                        )],
+                        candidate_count=active_candidate_count + lifted_proof_count,
+                        timeout_s=float(timeout_s), elapsed_s=round(time.monotonic() - active_started, 3),
+                        exit_reason="timeout",
+                        candidate_portfolio=(TacticCandidate(
+                            proof=lifted_proof, tactic="active_root_lift", source="active_root_lift",
+                        ),),
+                        next_candidate_index=0,
+                        cache_metadata={**metadata, "root_tactic_candidate_portfolio_phase": "lift"},
+                    )
                 lift_attempt = await _check_active_root_lift(
                     lean=lean,
                     goal_statement=goal_statement,
                     lifted_proof=lifted_proof,
                     preamble=preamble,
                     helpers=helpers,
-                    timeout_s=min(max(0.1, float(timeout_s or 0.1)), 8.0),
+                    timeout_s=max(0.1, lift_timeout_s),
+                    allow_pending_reference_confirmation=allow_pending_reference_confirmation,
                     suppress_solution_placeholders=suppress_solution_placeholders,
                     opaque_mode=opaque_mode,
                     allow_official_answer_visibility=allow_official_answer_visibility,
@@ -642,6 +747,35 @@ async def try_close_root_with_active_lift(
                 lift_attempt["active_root_target_statement"] = active_statement
                 lift_attempt["index"] = len(lift_attempts)
                 lift_attempts.append(lift_attempt)
+                limited_lift = bool(
+                    operation_deadline_monotonic is not None
+                    and not lift_attempt.get("ok")
+                    and (lift_attempt.get("infrastructure_inconclusive")
+                         or has_timeout(str(lift_attempt.get("diagnostic") or ""))
+                         or lift_attempt.get("error_type") in {"exception", "infra_failure", "timeout"})
+                )
+                if lift_attempt.get("pending_reference_confirmation") or limited_lift:
+                    return TacticCloseResult(
+                        ok=False, proof=None,
+                        attempts=[*lift_attempts, *_shift_attempt_indices(
+                            _demote_active_root_attempts(active_attempts, reason="reference_confirmation_pending"),
+                            offset=len(lift_attempts),
+                        )],
+                        candidate_count=active_candidate_count + lifted_proof_count,
+                        timeout_s=float(timeout_s), elapsed_s=round(time.monotonic() - active_started, 3),
+                        exit_reason="timeout",
+                        candidate_portfolio=(TacticCandidate(
+                            proof=lifted_proof, tactic="active_root_lift", source="active_root_lift",
+                        ),),
+                        next_candidate_index=0,
+                        cache_metadata={
+                            **metadata, "pending_reference_confirmation": bool(
+                                lift_attempt.get("pending_reference_confirmation")
+                            ),
+                            "root_tactic_candidate_portfolio_phase": "lift",
+                            "candidate_timeout_floor_s": max(candidate_timeout_floor_s, float(timeout_s)),
+                        },
+                    )
                 if bool(lift_attempt.get("ok")):
                     # Preserve every prior (failed) lift attempt and keep indices
                     # unique by shifting the active attempts past ALL lift
@@ -724,7 +858,7 @@ async def try_close_root_with_active_lift(
             goal_statement,
             preamble,
             helpers,
-            timeout_s=timeout_s,
+            timeout_s=remaining_timeout_s(),
             max_candidates=max_candidates,
             pattern_cache=pattern_cache,
             pattern_context={
@@ -736,7 +870,7 @@ async def try_close_root_with_active_lift(
             candidate_portfolio=(
                 tuple(candidate_portfolio)
                 if continuation_phase == "fallback"
-                and candidate_portfolio is not None
+                and candidate_portfolio
                 else None
             ),
             candidate_portfolio_offset=(
@@ -745,6 +879,12 @@ async def try_close_root_with_active_lift(
                 else 0
             ),
             candidate_attempt_limit=attempt_limit,
+            service_slice_s=service_slice_s,
+            candidate_timeout_floor_s=candidate_timeout_floor_s,
+            candidate_reference_confirmation_pending=(
+                candidate_reference_confirmation_pending and continuation_phase == "fallback"
+            ),
+            allow_pending_reference_confirmation=allow_pending_reference_confirmation,
             suppressed_proofs=_suppressed_proofs_for_statement(
                 suppressed_proofs=suppressed_proofs,
                 suppressed_proof_records=suppressed_proof_records,
@@ -837,7 +977,7 @@ async def try_close_root_with_active_lift(
         goal_statement,
         preamble,
         helpers,
-        timeout_s=timeout_s,
+        timeout_s=remaining_timeout_s(),
         max_candidates=max_candidates,
         candidate_portfolio=(
             tuple(candidate_portfolio)
@@ -849,6 +989,10 @@ async def try_close_root_with_active_lift(
             int(candidate_portfolio_offset or 0),
         ),
         candidate_attempt_limit=attempt_limit,
+        service_slice_s=service_slice_s,
+        candidate_timeout_floor_s=candidate_timeout_floor_s,
+        candidate_reference_confirmation_pending=candidate_reference_confirmation_pending,
+        allow_pending_reference_confirmation=allow_pending_reference_confirmation,
         pattern_cache=pattern_cache,
         pattern_context=pattern_context,
         defer_success_cache=defer_success_cache,

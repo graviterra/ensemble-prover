@@ -371,7 +371,9 @@ class RootTacticCloseAction:
         *,
         refresh_quality: bool = True,
     ) -> str:
-        from ensemble_prover.proof_state_executor import _root_tactic_context_key
+        from ensemble_prover.proof_state_executor import (
+            _root_tactic_answer_policy, _root_tactic_context_key,
+        )
 
         dossier = getattr(session, "dossier", None)
         if dossier is None:
@@ -401,6 +403,7 @@ class RootTacticCloseAction:
             helpers=helper_blocks,
             timeout_s=self.timeout_s,
             max_candidates=self.max_candidates,
+            answer_policy=_root_tactic_answer_policy(dossier=dossier),
             active_root_targets=tuple(
                 item
                 for item in list(getattr(dossier, "active_root_targets", []) or ())

@@ -45,6 +45,10 @@ _RUNTIME_LIFECYCLE_CALLBACKS_LOCK = threading.RLock()
 # ``future`` adapters may capture only the private Future they resolve; all
 # other admitted functions are non-capturing exception/registry observers.
 _TRUSTED_RUNTIME_CALLBACKS = {
+    (
+        "ensemble_prover.mini_session.execution_service",
+        "detached_execution_callback.<locals>.complete",
+    ): "execution_resources",
     ("ensemble_prover.deadline_guard", "_consume_task_exception"): "none",
     ("ensemble_prover.deadline_guard", "_release_abandoned_task"): "none",
     ("ensemble_prover.deadline_guard", "_retry_cancel_abandoned_task"): "none",
@@ -370,6 +374,12 @@ def _runtime_callback_has_internal_provenance(callback: Callable[..., Any]) -> b
         return bool(captured) and all(
             isinstance(value, asyncio.Future) for value in captured
         )
+    if policy == "execution_resources":
+        # This object owns only elapsed-time receipts and their observation
+        # map. It has no session, proof state, callback, or publication hook.
+        from .mini_session.execution_service import DetachedExecutionSettlement
+
+        return len(captured) == 1 and type(captured[0]) is DetachedExecutionSettlement
     if policy == "hard_timeout_lease":
         return bool(captured) and all(
             isinstance(value, HardTimeoutLease) for value in captured

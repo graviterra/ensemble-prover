@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import OrderedDict
+import hashlib
 import json
 import logging
 import sys
@@ -21,6 +23,8 @@ from .persistent_verifier import (
     PERSISTENT_VERIFIER_PROTOCOL,
     PERSISTENT_VERIFIER_VERSION,
     _protocol_major,
+    DEFAULT_MAX_MESSAGE_BYTES,
+    STDERR_TAIL_BYTES,
 )
 from .subprocess_cleanup import terminate_and_reap_process
 from .local_inference.network_policy import prepare_owned_subprocess, restore_owned_worker_network_policy
@@ -97,7 +101,9 @@ def _structured_diagnostics(uri: str, diagnostics: List[Dict[str, Any]]) -> List
 
 
 class LeanLspError(RuntimeError):
-    pass
+    def __init__(self, message: str, failure_kind: str = "lean_backend_crash"):
+        super().__init__(message)
+        self.failure_kind = failure_kind
 
 
 class LeanLspSession:
@@ -108,6 +114,10 @@ class LeanLspSession:
         self._request_id: int = 1
         self._current_uri: Optional[str] = None
         self._current_version: int = 0
+        self._documents: OrderedDict[str, int] = OrderedDict()
+        self._document_version_counter = 0
+        self.max_message_bytes = 32 * 1024 * 1024
+        self._stderr_tail = b""
 
     async def _drain_stderr(self) -> None:
         proc = self._proc
@@ -115,10 +125,11 @@ class LeanLspSession:
             return
         try:
             while True:
-                line = await proc.stderr.readline()
-                if not line:
+                chunk = await proc.stderr.read(8192)
+                if not chunk:
                     break
-                text = line.decode(errors="replace").rstrip()
+                self._stderr_tail = (self._stderr_tail + chunk)[-STDERR_TAIL_BYTES:]
+                text = chunk.decode(errors="replace").rstrip()
                 if text:
                     logger.debug("Lean LSP stderr: %s", text)
         except Exception:
@@ -129,6 +140,9 @@ class LeanLspSession:
         stderr_task = self._stderr_task
         self._proc = None
         self._stderr_task = None
+        self._documents.clear()
+        self._current_uri = None
+        self._current_version = 0
         if proc is None:
             return
         # The Lean server deliberately shares this worker's process group (see
@@ -168,6 +182,8 @@ class LeanLspSession:
                 proc.stdout.readuntil(b"\r\n\r\n"),
                 timeout=remaining,
             )
+        except asyncio.LimitOverrunError as exc:
+            raise LeanLspError("Lean LSP header exceeds byte limit", "transport_oversized") from exc
         except asyncio.IncompleteReadError as exc:
             partial = bytes(exc.partial or b"")
             rc = proc.returncode if proc.returncode is not None else "unknown"
@@ -176,22 +192,35 @@ class LeanLspSession:
                     f"lean server exited before completing message header (returncode={rc})"
                 ) from exc
             raise LeanLspError(
-                f"lean server truncated message header (returncode={rc}): {partial!r}"
+                f"lean server truncated message header (returncode={rc})", "transport_truncated"
             ) from exc
+        if len(header_bytes) > 8192:
+            raise LeanLspError("Lean LSP header exceeds byte limit", "transport_oversized")
         length = None
         for raw_line in header_bytes.decode("ascii", errors="replace").split("\r\n"):
             if raw_line.lower().startswith("content-length:"):
-                length = int(raw_line.split(":", 1)[1].strip())
-                break
+                if length is not None:
+                    raise LeanLspError("Lean LSP message has duplicate content lengths", "transport_malformed")
+                try:
+                    length = int(raw_line.split(":", 1)[1].strip())
+                except ValueError as exc:
+                    raise LeanLspError("Lean LSP message has invalid content length", "transport_malformed") from exc
         if length is None:
-            raise LeanLspError(f"Lean LSP message missing content length: {header_bytes!r}")
-        body = await asyncio.wait_for(proc.stdout.readexactly(length), timeout=max(0.1, deadline - time.monotonic()))
+            raise LeanLspError("Lean LSP message missing content length", "transport_malformed")
+        if length < 0:
+            raise LeanLspError("Lean LSP message has negative content length", "transport_malformed")
+        if length > self.max_message_bytes:
+            raise LeanLspError("Lean LSP message exceeds byte limit", "transport_oversized")
+        try:
+            body = await asyncio.wait_for(proc.stdout.readexactly(length), timeout=max(0.001, deadline - time.monotonic()))
+        except asyncio.IncompleteReadError as exc:
+            raise LeanLspError("Lean LSP message body truncated", "transport_truncated") from exc
         try:
             msg = json.loads(body.decode("utf-8"))
         except Exception as exc:
-            raise LeanLspError("Lean LSP emitted invalid JSON") from exc
+            raise LeanLspError("Lean LSP emitted invalid JSON", "transport_malformed") from exc
         if not isinstance(msg, dict):
-            raise LeanLspError("Lean LSP emitted non-object JSON")
+            raise LeanLspError("Lean LSP emitted non-object JSON", "transport_malformed")
         return msg
 
     async def _handle_server_request(self, msg: Dict[str, Any]) -> None:
@@ -266,25 +295,27 @@ class LeanLspSession:
         uri: str,
         text: str,
         timeout_s: float,
+        require_completion: bool = False,
+        context_slots: int = 1,
+        completion_marker: str = "",
     ) -> tuple[List[Dict[str, Any]], int]:
         if self._proc is None:
             await self.start()
         path = _uri_to_path(uri)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
-        if self._current_uri is not None and self._current_uri != uri:
+        while uri not in self._documents and len(self._documents) >= max(1, context_slots):
+            retired_uri, _ = self._documents.popitem(last=False)
             await self._write_frame(
                 {
                     "jsonrpc": "2.0",
                     "method": "textDocument/didClose",
-                    "params": {"textDocument": {"uri": self._current_uri}},
+                    "params": {"textDocument": {"uri": retired_uri}},
                 }
             )
-            self._current_uri = None
-            self._current_version = 0
-        if self._current_uri == uri:
-            self._current_version += 1
-            version = self._current_version
+        self._document_version_counter += 1
+        version = self._document_version_counter
+        if uri in self._documents:
             await self._write_frame(
                 {
                     "jsonrpc": "2.0",
@@ -296,9 +327,6 @@ class LeanLspSession:
                 }
             )
         else:
-            version = 1
-            self._current_uri = uri
-            self._current_version = version
             await self._write_frame(
                 {
                     "jsonrpc": "2.0",
@@ -313,6 +341,10 @@ class LeanLspSession:
                     },
                 }
             )
+        self._documents[uri] = version
+        self._documents.move_to_end(uri)
+        self._current_uri = uri
+        self._current_version = version
         await self._write_frame(
             {
                 "jsonrpc": "2.0",
@@ -320,6 +352,11 @@ class LeanLspSession:
                 "params": {"textDocument": {"uri": uri}, "text": text},
             }
         )
+        if require_completion:
+            return await self._completed_diagnostics(
+                uri=uri, version=version, timeout_s=timeout_s,
+                completion_marker=completion_marker,
+            ), version
         latest_diagnostics: Optional[List[Dict[str, Any]]] = None
         diagnostics_seen = False
         progress_seen = False
@@ -372,8 +409,8 @@ class LeanLspSession:
                 )
                 if str(text_document.get("uri", "") or "") != uri:
                     continue
-                progress_version = text_document.get("version", version)
-                if progress_version is not None and int(progress_version) != int(version):
+                progress_version = text_document.get("version")
+                if type(progress_version) is not int or progress_version != version:
                     continue
                 processing = params.get("processing", [])
                 if not isinstance(processing, list):
@@ -390,8 +427,8 @@ class LeanLspSession:
             params = msg.get("params", {}) if isinstance(msg, dict) else {}
             if str(params.get("uri", "") or "") != uri:
                 continue
-            msg_version = params.get("version", version)
-            if msg_version is not None and int(msg_version) != int(version):
+            msg_version = params.get("version")
+            if type(msg_version) is not int or msg_version != version:
                 continue
             diagnostics = params.get("diagnostics", [])
             if not isinstance(diagnostics, list):
@@ -420,14 +457,60 @@ class LeanLspSession:
                     )
                 )
 
+    async def _completed_diagnostics(
+        self, *, uri: str, version: int, timeout_s: float, completion_marker: str
+    ) -> List[Dict[str, Any]]:
+        """Await Lean's reporter and command/kernel tasks for this exact edit.
+
+        Lean's waitForDiagnostics handler waits for both doc.reporter and
+        cmdSnaps.waitAll. Sequential worker ownership prevents a later edit
+        from satisfying this request with a different document version.
+        """
+        request_id = self._request_id
+        self._request_id += 1
+        await self._write_frame({
+            "jsonrpc": "2.0", "id": request_id,
+            "method": "textDocument/waitForDiagnostics",
+            "params": {"uri": uri, "version": version},
+        })
+        deadline = time.monotonic() + max(0.001, timeout_s)
+        diagnostics: Optional[List[Dict[str, Any]]] = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("timed out waiting for versioned Lean completion")
+            msg = await self._read_message(remaining)
+            if "method" in msg and "id" in msg:
+                await self._handle_server_request(msg)
+                continue
+            if type(msg.get("id")) is int and msg["id"] == request_id:
+                if "error" in msg or not isinstance(msg.get("result"), dict):
+                    raise LeanLspError("Lean versioned completion request failed", "completion_unavailable")
+                if diagnostics is None:
+                    raise LeanLspError("Lean completion omitted matching-version diagnostics", "completion_unavailable")
+                if completion_marker and not any(str(d.get("message", "")) == completion_marker for d in diagnostics):
+                    raise LeanLspError("Lean completion omitted request marker", "completion_unavailable")
+                return diagnostics
+            if msg.get("method") != "textDocument/publishDiagnostics":
+                continue
+            params = msg.get("params", {})
+            if not isinstance(params, dict) or params.get("uri") != uri:
+                continue
+            if type(params.get("version")) is not int or params["version"] != version:
+                continue
+            current = params.get("diagnostics")
+            if not isinstance(current, list) or any(not isinstance(d, dict) for d in current):
+                raise LeanLspError("Lean diagnostics have invalid shape", "transport_malformed")
+            diagnostics = current
+
     async def close(self) -> None:
         try:
-            if self._current_uri is not None:
+            for uri in list(self._documents):
                 await self._write_frame(
                     {
                         "jsonrpc": "2.0",
                         "method": "textDocument/didClose",
-                        "params": {"textDocument": {"uri": self._current_uri}},
+                        "params": {"textDocument": {"uri": uri}},
                     }
                 )
         except Exception:
@@ -445,6 +528,8 @@ class PersistentVerifierServer:
         self.temp_root: Optional[Path] = None
         self._lsp: Optional[LeanLspSession] = None
         self._busy = False
+        self.max_message_bytes = DEFAULT_MAX_MESSAGE_BYTES
+        self.context_slots = 4
 
     def _message(self, msg_type: str, **extra: Any) -> Dict[str, Any]:
         return {
@@ -458,13 +543,17 @@ class PersistentVerifierServer:
         }
 
     async def _read_host_message(self) -> Dict[str, Any]:
-        raw = await asyncio.to_thread(sys.stdin.buffer.readline)
+        raw = await asyncio.to_thread(sys.stdin.buffer.readline, self.max_message_bytes + 1)
         if not raw:
             raise EOFError("host closed stdin")
+        if len(raw) > self.max_message_bytes:
+            raise LeanLspError("host message exceeds byte limit", "transport_oversized")
+        if not raw.endswith(b"\n"):
+            raise LeanLspError("host message truncated", "transport_truncated")
         try:
             msg = json.loads(raw.decode("utf-8"))
         except Exception as exc:
-            raise LeanLspError("host sent invalid JSON") from exc
+            raise LeanLspError("host sent invalid JSON", "transport_malformed") from exc
         if not isinstance(msg, dict):
             raise LeanLspError("host message must be a JSON object")
         if str(msg.get("protocol", "")) != PERSISTENT_VERIFIER_PROTOCOL:
@@ -481,6 +570,8 @@ class PersistentVerifierServer:
 
     async def _send_host_message(self, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        if len(body.encode("utf-8")) + 1 > self.max_message_bytes:
+            raise LeanLspError("worker response exceeds byte limit", "transport_oversized")
         await asyncio.to_thread(sys.stdout.write, body + "\n")
         await asyncio.to_thread(sys.stdout.flush)
 
@@ -494,6 +585,8 @@ class PersistentVerifierServer:
                     "supports_cancel": False,
                     "supports_in_memory_docs": False,
                     "supports_temp_docs": True,
+                    "supports_versioned_completion": True,
+                    "supports_stable_contexts": True,
                 },
                 implementation={
                     "transport_impl": "python-worker-stdio",
@@ -507,7 +600,10 @@ class PersistentVerifierServer:
         self.temp_root = Path(str(msg.get("temp_root", "") or "")).resolve()
         self.temp_root.mkdir(parents=True, exist_ok=True)
         self.state = "starting"
+        self.max_message_bytes = max(1024, int(msg.get("max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES)))
+        self.context_slots = max(1, int(msg.get("context_slots", 4)))
         self._lsp = LeanLspSession(self.project_dir)
+        self._lsp.max_message_bytes = max(1024, int(msg.get("lsp_max_message_bytes", 32 * 1024 * 1024)))
         await self._lsp.start()
         self.state = "idle"
         await self._send_host_message(
@@ -559,12 +655,27 @@ class PersistentVerifierServer:
         service_started = time.monotonic()
         try:
             uri = str(msg.get("document_uri", "") or "")
+            original_uri = uri
             content = str(msg.get("content", "") or "")
             timeout_s = float(msg.get("timeout_s", 45.0) or 45.0)
+            metadata = msg.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise LeanLspError("request metadata must be an object", "transport_malformed")
+            stable_context = bool(metadata.get("stable_context"))
+            context_key = str(metadata.get("context_key", ""))
+            context_family_key = str(metadata.get("context_family_key", context_key))
+            if stable_context:
+                if not context_key or not context_family_key or self.temp_root is None:
+                    raise LeanLspError("stable context requires a context identity", "protocol_desync")
+                identity = hashlib.sha256((str(msg.get("mode", "")) + "\0" + context_family_key).encode()).hexdigest()
+                uri = (self.temp_root / f"context_{identity}.lean").resolve().as_uri()
             diagnostics, _version = await self._lsp.check_document(
                 uri=uri,
                 text=content,
                 timeout_s=timeout_s,
+                context_slots=self.context_slots,
+                **({"require_completion": True,
+                    "completion_marker": str(metadata.get("completion_marker", ""))} if stable_context else {}),
             )
             if has_sorry_or_admit(content) and not any(
                 _severity_name(diag.get("severity", 3)) == "warning"
@@ -584,18 +695,10 @@ class PersistentVerifierServer:
                         },
                     },
                 ]
-            partial_output = _canonicalize_diagnostics(uri, diagnostics)
-            structured_diags = _structured_diagnostics(uri, diagnostics)
-            if structured_diags:
-                await self._send_host_message(
-                    self._message(
-                        "diagnostics",
-                        session_id=self.session_id,
-                        request_id=request_id,
-                        diagnostics=structured_diags,
-                        partial_output=partial_output,
-                    )
-                )
+            # Send the canonical output once. The caller does not consume the
+            # duplicated structured diagnostics, and large frames are bounded
+            # independently of this reduction in payload size.
+            partial_output = _canonicalize_diagnostics(original_uri, diagnostics)
             has_error = any(diag.get("severity") == 1 for diag in diagnostics)
             # Match Lean CLI semantics: returncode is set by errors only.
             # The previous logic flipped returncode to 1 on any severity=2
@@ -616,7 +719,11 @@ class PersistentVerifierServer:
                     ok=bool(returncode == 0),
                     returncode=int(returncode),
                     output=partial_output,
-                    diagnostic_count=len(structured_diags),
+                    diagnostic_count=len(diagnostics),
+                    document_version=_version,
+                    context_key=context_key if stable_context else "",
+                    context_family_key=context_family_key if stable_context else "",
+                    request_completed=stable_context,
                     service_time_s=max(0.0, time.monotonic() - service_started),
                     worker_state_after="idle",
                 )
@@ -651,7 +758,7 @@ class PersistentVerifierServer:
                         "fatal",
                         session_id=self.session_id,
                         request_id=request_id,
-                        failure_kind="lean_backend_crash",
+                        failure_kind=getattr(exc, "failure_kind", "lean_backend_crash"),
                         returncode=1,
                         output=f"persistent verifier worker crash: {exc}",
                         worker_state_after="poisoned",

@@ -25,6 +25,7 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -93,6 +94,8 @@ from .utils import (
     short_id,
 )
 
+_EXECUTION_OBSERVATION: ContextVar[dict[str, Any] | None] = ContextVar("lean_execution_observation", default=None)
+
 _OPERATION_MEMORY_MB: ContextVar[int | None] = ContextVar("lean_operation_memory_mb", default=None)
 _OPERATION_HEARTBEATS: ContextVar[int | None] = ContextVar("lean_operation_heartbeats", default=None)
 _OPERATION_DEADLINE: ContextVar[float | None] = ContextVar(
@@ -126,6 +129,42 @@ _OPERATION_PROCESSES: ContextVar[_LeanProcessAllowance | None] = ContextVar(
 
 def current_lean_deadline() -> float | None:
     return _OPERATION_DEADLINE.get()
+
+
+@contextmanager
+def lean_deadline_scope(*, deadline_monotonic: float) -> Iterator[None]:
+    """Share an elapsed deadline without changing other Lean resource limits."""
+    if not math.isfinite(deadline_monotonic):
+        raise ValueError("Lean owner deadline must be finite")
+    outer = current_lean_deadline()
+    token = _OPERATION_DEADLINE.set(
+        min(outer, deadline_monotonic) if outer is not None else deadline_monotonic
+    )
+    try:
+        yield
+    finally:
+        _OPERATION_DEADLINE.reset(token)
+
+
+@asynccontextmanager
+async def _lean_build_lock(lock: asyncio.Lock):
+    """Charge import-build admission to an existing owner deadline."""
+    _check_lean_owner_deadline()
+    deadline = current_lean_deadline()
+    if deadline is None:
+        await lock.acquire()
+    else:
+        async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+            await lock.acquire()
+    try:
+        if deadline is not None:
+            # Deliver cancellation queued at acquisition before starting a
+            # build. Keep ownership until the cancellation releases the lock.
+            await asyncio.sleep(0)
+        _check_lean_owner_deadline()
+        yield
+    finally:
+        lock.release()
 
 
 def bounded_lean_process_command(command: Sequence[str]) -> tuple[str, ...]:
@@ -668,21 +707,155 @@ run_cmd do
     return compiled_audit + before, f"\nrun_cmd _root_.{audit_function}\n"
 
 
+
+_AUDIT_RECEIPT_VERSION = 2
+_AUDIT_POLICY_VERSION = "kernel-checked-delta-v2"
+_AGGREGATE_AUDIT_MARKER_RE = re.compile(r"ENSEMBLE_AUDIT_RECEIPT:([^\r\n]*)")
+
+
+def _check_aggregate_audit_blocks(identity: str, binding: dict[str, Any]) -> tuple[str, str]:
+    """Compile policy in the trusted scope; audit the complete checked delta once."""
+    from .nl_lean import _lean_string
+
+    baseline = f"ensemble_scratch_baseline_{identity}"
+    function = f"ensemble_scratch_inventory_{identity}"
+    name_list_type = "Lean.mkApp (Lean.mkConst ``List [Lean.Level.zero]) (Lean.mkConst ``Lean.Name)"
+    before = f"""
+unsafe def _root_.{function} (bindingText goalName : String) (provenanceNames : Array String) : Lean.Elab.Command.CommandElabM Unit := do
+  let env ← Lean.getEnv
+  let baseline ← Lean.Elab.Command.liftTermElabM <|
+    Lean.Meta.evalExpr (List Lean.Name) ({name_list_type}) (Lean.mkConst `{baseline})
+  let known := baseline.foldl (fun set name => set.insert name) ({{}} : Lean.NameSet)
+  let names := (env.constants.map₂.toList.map (·.1)).filter fun name =>
+    name != `{baseline} && !known.contains name
+  for name in names do
+    unless (env.checked.get.find? name).isSome do
+      Lean.throwError m!"scratch audit: declaration not kernel checked: {{name}}"
+  let goals := names.filter fun name => name.getString! == goalName
+  unless goals.length == 1 do
+    Lean.throwError "scratch audit: missing or ambiguous target"
+  let target := goals.head!
+  let (_, unionState) := ((names.forM Lean.CollectAxioms.collect).run env).run {{}}
+  let targetAxioms ← Lean.collectAxioms target
+  let allowed := [`propext, `Classical.choice, `Quot.sound]
+  let forbidden := unionState.axioms.filter fun name => !allowed.contains name
+  let .ok binding := Lean.Json.parse bindingText | Lean.throwError "scratch audit: invalid binding"
+  let mut provenance : Array Lean.Json := #[]
+  for requested in provenanceNames do
+    let .ok parsed := Lean.Parser.runParserCategory env `term requested
+      | Lean.throwError "scratch audit: malformed provenance name"
+    unless parsed.isIdent do Lean.throwError "scratch audit: invalid provenance name"
+    let resolved ← Lean.resolveGlobalConstNoOverload parsed
+    unless names.contains resolved do Lean.throwError "scratch audit: provenance outside delta"
+    let axioms ← Lean.collectAxioms resolved
+    provenance := provenance.push <| Lean.Json.mkObj [
+      ("requested", Lean.toJson requested), ("resolved", Lean.toJson resolved.toString),
+      ("axioms", Lean.toJson (axioms.map Lean.Name.toString))]
+  let receipt := Lean.Json.mkObj [
+    ("version", Lean.toJson (2 : Nat)),
+    ("policy", Lean.toJson "kernel-checked-delta-v2"),
+    ("binding", binding), ("complete", Lean.toJson true),
+    ("target", Lean.toJson target.toString),
+    ("targetAxioms", Lean.toJson (targetAxioms.map Lean.Name.toString)),
+    ("declarations", Lean.toJson (names.map Lean.Name.toString)),
+    ("contextAxioms", Lean.toJson (unionState.axioms.map Lean.Name.toString)),
+    ("allowedAxioms", Lean.toJson (allowed.map Lean.Name.toString)),
+    ("provenance", Lean.Json.arr provenance)]
+  Lean.logInfo ("ENSEMBLE_AUDIT_RECEIPT:" ++ receipt.compress)
+  unless forbidden.isEmpty do
+    Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
+def _root_.{function}_complete (marker : String) : Lean.Elab.Command.CommandElabM Unit :=
+  Lean.logInfo marker
+run_cmd do
+  let names := (← Lean.getEnv).constants.map₂.toList.map (·.1)
+  Lean.Elab.Command.liftCoreM <| Lean.addAndCompile <| .defnDecl {{
+    name := `{baseline}, levelParams := [], type := {name_list_type},
+    value := Lean.toExpr names, hints := .opaque, safety := .safe
+  }}
+"""
+    encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+    provenance_names = "#[" + ", ".join(_lean_string(name) for name in binding.get("provenance", ())) + "]"
+    after = f"\nrun_cmd _root_.{function} {_lean_string(encoded)} {_lean_string(binding['target'])} {provenance_names}\n"
+    return before, after
+
+
+def _parse_aggregate_axiom_audit(
+    output: str, requested_names: Sequence[str], binding: dict[str, Any],
+) -> tuple[Dict[str, Tuple[str, ...]], tuple[str, ...], tuple[str, ...], str]:
+    """Require a single completed receipt for this exact source and policy."""
+    matches = _AGGREGATE_AUDIT_MARKER_RE.findall(str(output or ""))
+    empty = ({}, (), ())
+    if len(matches) != 1:
+        return *empty, "missing_or_duplicate_audit_receipt"
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate receipt field")
+            result[key] = value
+        return result
+
+    try:
+        receipt = json.loads(matches[0], object_pairs_hook=unique_object)
+    except (ValueError, TypeError, RecursionError):
+        return *empty, "malformed_audit_receipt"
+    if not isinstance(receipt, dict):
+        return *empty, "malformed_audit_receipt"
+    if (type(receipt.get("version")) is not int or receipt["version"] != _AUDIT_RECEIPT_VERSION
+            or receipt.get("policy") != _AUDIT_POLICY_VERSION
+            or receipt.get("complete") is not True or receipt.get("binding") != binding):
+        return *empty, "mismatched_or_incomplete_audit_receipt"
+    for receipt_field in ("declarations", "contextAxioms", "targetAxioms", "allowedAxioms"):
+        values = receipt.get(receipt_field)
+        if (not isinstance(values, list) or any(not isinstance(v, str) or not v for v in values)
+                or len(set(values)) != len(values)):
+            return *empty, "malformed_audit_receipt:" + receipt_field
+    names = tuple(receipt["declarations"])
+    target = receipt.get("target")
+    if (not isinstance(target, str) or target not in names
+            or not _axiom_report_name_matches(target, binding["target"])):
+        return *empty, "mismatched_audit_target"
+    if set(receipt["allowedAxioms"]) != set(_ALLOWED_CHECK_AXIOMS):
+        return *empty, "mismatched_audit_policy"
+    for expected in requested_names:
+        if not any(_axiom_report_name_matches(name, expected) for name in names):
+            return *empty, "incomplete_axiom_inventory:" + expected
+    if not set(receipt["targetAxioms"]).issubset(receipt["contextAxioms"]):
+        return *empty, "inconsistent_target_axioms"
+    parsed = {binding["target"]: tuple(receipt["targetAxioms"])}
+    provenance = receipt.get("provenance")
+    expected_provenance = binding.get("provenance", [])
+    if not isinstance(provenance, list) or len(provenance) != len(expected_provenance):
+        return *empty, "incomplete_axiom_provenance"
+    for entry, requested in zip(provenance, expected_provenance):
+        if (not isinstance(entry, dict) or entry.get("requested") != requested
+                or entry.get("resolved") not in names
+                or not _axiom_report_name_matches(entry["resolved"], requested)
+                or not isinstance(entry.get("axioms"), list)
+                or any(not isinstance(a, str) or not a for a in entry["axioms"])
+                or len(set(entry["axioms"])) != len(entry["axioms"])
+                or not set(entry["axioms"]).issubset(receipt["contextAxioms"])):
+            return *empty, "malformed_axiom_provenance"
+        parsed[requested] = tuple(entry["axioms"])
+    return parsed, tuple(receipt["contextAxioms"]), names, ""
+
 def _check_helper_usage_blocks(
     identity: str, goal_name: str, helper_names: Sequence[str],
     declaration_consumers: Sequence[tuple[str, str]] = (),
+    *, function_identity: str | None = None,
 ) -> tuple[str, str]:
     """Observe exact checked proof values; share inventory and name resolution."""
     from .nl_lean import _lean_string
 
-    function = f"ensemble_helper_usage_{identity}"
+    function = f"ensemble_helper_usage_{function_identity or identity}"
     requested_names = "#[" + ", ".join(_lean_string(name) for name in helper_names) + "]"
     consumers = "#[" + ", ".join(
-        f"({_lean_string(name)}, {_lean_string(marker)})"
+        f"({_lean_string(name)}, {_lean_string(marker.removeprefix(identity))})"
         for name, marker in declaration_consumers
     ) + "]"
     before = f"""
-private def _root_.{function} : Lean.Elab.Command.CommandElabM Unit := do
+private def _root_.{function} (goalName usageIdentity : String)
+    (requestedNames : Array String) (requestedConsumers : Array (String × String)) : Lean.Elab.Command.CommandElabM Unit := do
   try
     let env ← Lean.getEnv
     let localNames := env.constants.map₂.toList.map (·.1)
@@ -690,7 +863,7 @@ private def _root_.{function} : Lean.Elab.Command.CommandElabM Unit := do
     let localSet := localNames.foldl (fun set name => set.insert name) ({{}} : Lean.NameSet)
     let mut bindings : Array Lean.Json := #[]
     let mut resolvedBindings : Array (String × Lean.Name) := #[]
-    for requested in ({requested_names} : Array String) do
+    for requested in requestedNames do
       try
         let .ok parsed@_ := Lean.Parser.runParserCategory env `term requested | continue
         unless parsed.isIdent do continue
@@ -701,11 +874,11 @@ private def _root_.{function} : Lean.Elab.Command.CommandElabM Unit := do
             ("requested", Lean.toJson requested),
             ("resolved", Lean.toJson resolved.toString)]
       catch _ => pure ()
-    let goals := localNames.filter fun name => name.components.any (·.toString == "{goal_name}")
-    let goals := goals.filter fun name => name.getString! == "{goal_name}"
+    let goals := localNames.filter fun name => name.components.any (·.toString == goalName)
+    let goals := goals.filter fun name => name.getString! == goalName
     let mut consumers : Array (String × String × Lean.Name) := #[]
-    if goals.length == 1 then consumers := consumers.push ("", "{identity}", goals.head!)
-    for (requested@_, marker@_) in ({consumers} : Array (String × String)) do
+    if goals.length == 1 then consumers := consumers.push ("", usageIdentity, goals.head!)
+    for (requested@_, marker@_) in requestedConsumers do
       let .ok parsed@_ := Lean.Parser.runParserCategory env `term requested | continue
       unless parsed.isIdent do continue
       let requestedName := parsed.getId.replacePrefix `_root_ Lean.Name.anonymous
@@ -714,7 +887,7 @@ private def _root_.{function} : Lean.Elab.Command.CommandElabM Unit := do
       -- have that relative name; leave its proof usage unknown.
       if (localNames.filter fun name => requestedName.isSuffixOf name).length != 1 then continue
       for (bound@_, resolved@_) in resolvedBindings do
-        if bound == requested then consumers := consumers.push (requested, marker, resolved)
+        if bound == requested then consumers := consumers.push (requested, usageIdentity ++ marker, resolved)
     for (requested@_, marker@_, resolved@_) in consumers do
       let some goal@_ := env.checked.get.find? resolved | continue
       let value := match goal with
@@ -748,7 +921,10 @@ private def _root_.{function} : Lean.Elab.Command.CommandElabM Unit := do
         ("reachable", Lean.toJson (reached.map Lean.Name.toString))]).compress)
   catch _ => pure ()
 """
-    return before, f"\nrun_cmd _root_.{function}\n"
+    return before, (
+        f"\nrun_cmd _root_.{function} {_lean_string(goal_name)} {_lean_string(identity)} "
+        f"{requested_names} {consumers}\n"
+    )
 
 
 def _check_goal_audit_block(goal_name: str) -> str:
@@ -2043,6 +2219,10 @@ class _SharedExecutionInterrupted(Exception):
     """The coalesced execution owner stopped; independent callers may retry."""
 
 
+class _LeanDispatchLifecycleChanged(RuntimeError):
+    """The runner retired before a backend could dispatch new work."""
+
+
 def _consume_future_exception(fut: "asyncio.Future") -> None:
     """Done-callback that marks a Future's exception as retrieved.
 
@@ -2118,6 +2298,10 @@ class _OracleGoalProfile:
     has_analysis: bool
 
 
+class _ExecutionOutput(str):
+    """Legacy adapter output with execution metadata, without native status authority."""
+
+
 @dataclass(frozen=True)
 class _BackendExecutionResult:
     returncode: int
@@ -2144,6 +2328,10 @@ class _BuiltLeanFile:
     # emitted. Text ``#print axioms`` reports can be forged by the audited
     # proof itself, so every audited check must also carry the inventory.
     audit_inventory: bool = False
+    audit_binding: Optional[dict[str, Any]] = None
+    context_key: str = ""
+    # Slot affinity permits prefix reuse; it never identifies an audited result.
+    context_family_key: str = ""
 
 
 _ORACLE_FAMILY_SPECS: Tuple[Tuple[str, Tuple[_OracleTacticSpec, ...]], ...] = (
@@ -2859,6 +3047,11 @@ class LeanResult:
     axiom_audit: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     unexpected_axioms: Tuple[str, ...] = ()
     axiom_audit_error: str = ""
+    context_axioms: Tuple[str, ...] = ()
+    audited_declarations: Tuple[str, ...] = ()
+    stage_timings: Dict[str, float] = field(default_factory=dict)
+    execution_metadata: Dict[str, Any] = field(default_factory=dict)
+    pending_reference_confirmation: bool = False
     generated_declaration_name: str = ""
     generated_goal_start_line: int = 0
     generated_lemma_line_spans: Tuple[Tuple[int, int], ...] = ()
@@ -4131,9 +4324,76 @@ def _contract_analysis_from_payload(
     )
 
 
+@dataclass
+class _PersistentPoolAcquisitionMetrics:
+    """Lifetime maintenance measurements shared by successive runner generations."""
+
+    acquisitions: int = 0
+    failures: int = 0
+    elapsed_s: float = 0.0
+    transport_startups: int = 0
+    transport_startup_failures: int = 0
+    pending: dict[int, tuple[float, PersistentVerifierPool]] = field(default_factory=dict)
+
+    @staticmethod
+    def _transport_counts(pool: PersistentVerifierPool) -> tuple[int, int]:
+        stats = getattr(pool, "stats", None)
+        if not callable(stats):
+            return 0, 0
+        try:
+            values = stats()
+            return (
+                int(values.get("persistent_transport_startups", 0) or 0),
+                int(values.get("persistent_transport_startup_failures", 0) or 0),
+            )
+        except Exception:
+            logger.debug("Failed to read cold verifier pool statistics", exc_info=True)
+            return 0, 0
+
+    def begin(self, pool: PersistentVerifierPool) -> int:
+        self.acquisitions += 1
+        self.pending[self.acquisitions] = (time.monotonic(), pool)
+        return self.acquisitions
+
+    def settle(self, receipt: int, *, acquired: bool) -> None:
+        pending = self.pending.pop(receipt, None)
+        if pending is None:
+            return
+        started, pool = pending
+        startups, failures = self._transport_counts(pool)
+        self.elapsed_s += max(0.0, time.monotonic() - started)
+        self.failures += not acquired
+        self.transport_startups += startups
+        self.transport_startup_failures += failures
+
+    def snapshot(self) -> dict[str, Any]:
+        pending = tuple(self.pending.values())
+        counts = [self._transport_counts(pool) for _, pool in pending]
+        now = time.monotonic()
+        return {
+            "persistent_pool_acquisitions": self.acquisitions,
+            "persistent_pool_acquisitions_active": len(pending),
+            "persistent_pool_acquisition_elapsed_s": self.elapsed_s,
+            "persistent_pool_acquisition_pending_elapsed_s": sum(
+                max(0.0, now - started) for started, _ in pending
+            ),
+            "persistent_pool_acquisition_failures": self.failures,
+            "persistent_pool_acquisition_transport_startups": (
+                self.transport_startups + sum(startups for startups, _ in counts)
+            ),
+            "persistent_pool_acquisition_transport_startup_failures": (
+                self.transport_startup_failures + sum(failures for _, failures in counts)
+            ),
+            "persistent_pool_acquisition_accounting_scope": (
+                "runner_lifetime_backend_maintenance_nonadditive_with_action_wall_time"
+            ),
+        }
+
+
 class _LeanRunnerGenerationRef:
     def __init__(self, current: "LeanRunner") -> None:
         self.current = current
+        self.persistent_pool_acquisitions = _PersistentPoolAcquisitionMetrics()
 
 
 class LeanRunner:
@@ -4213,6 +4473,7 @@ class LeanRunner:
         self._quiesced = False
         self._close_generation = 0
         self._persistent_pool: Optional[PersistentVerifierPool] = None
+        self._persistent_pool_lock = asyncio.Lock()
         self._repl_init = False
         self._repl_lock = asyncio.Lock()
         self._repl_startup_time_s: float = 0.0
@@ -4231,6 +4492,7 @@ class LeanRunner:
         ] = {}
         self._completed_exec: Dict[str, tuple[tuple[int, str], str, str]] = {}
         self._completed_exec_max_entries = 256
+        self._pending_reference_confirmations: dict[str, float] = {}
         self._execution_environment_generation = 0
         self._environment_transition_condition = asyncio.Condition()
         self._environment_transitioning = False
@@ -4540,6 +4802,9 @@ class LeanRunner:
         exit_task = asyncio.create_task(proc.wait())
         try:
             deadline = time.monotonic() + max(0.01, float(timeout_s))
+            owner_deadline = current_lean_deadline()
+            if owner_deadline is not None:
+                deadline = min(deadline, owner_deadline)
             while True:
                 if communicate_task.done():
                     return communicate_task.result()
@@ -4617,21 +4882,23 @@ class LeanRunner:
         )
         if not modules or self._extra_imports_ready:
             return
+        _check_lean_owner_deadline()
         if current_lean_memory_limit() is not None:
-            _check_lean_owner_deadline()
             if self._owned_imports_prebuilt(modules):
                 return
             raise TimeoutError(
                 "Owned Lean imports require prebuilt modules; unbounded Lake bootstrap refused"
             )
-        async with self._extra_imports_lock:
+        async with _lean_build_lock(self._extra_imports_lock):
             if self._extra_imports_ready:
                 return
             command = ("lake", "build")
+            environment = prepare_owned_subprocess(command, project=self.project_dir, kind="lean")
+            _check_lean_owner_deadline()
             proc = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(self.project_dir),
-                env=prepare_owned_subprocess(command, project=self.project_dir, kind="lean"),
+                env=environment,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -4674,14 +4941,14 @@ class LeanRunner:
         )
         if not modules or (self._project_imports_ready and not force):
             return
+        _check_lean_owner_deadline()
         if current_lean_memory_limit() is not None:
-            _check_lean_owner_deadline()
             if not force and self._owned_imports_prebuilt(modules):
                 return
             raise TimeoutError(
                 "Owned Lean imports require prebuilt modules; unbounded Lake bootstrap refused"
             )
-        async with self._project_imports_lock:
+        async with _lean_build_lock(self._project_imports_lock):
             if self._project_imports_ready and not force:
                 return
             if force:
@@ -4690,10 +4957,12 @@ class LeanRunner:
                 # fails or is cancelled.
                 self._project_imports_ready = False
             command = ("lake", "build", *modules)
+            environment = prepare_owned_subprocess(command, project=self.project_dir, kind="lean")
+            _check_lean_owner_deadline()
             proc = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(self.project_dir),
-                env=prepare_owned_subprocess(command, project=self.project_dir, kind="lean"),
+                env=environment,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -4770,6 +5039,7 @@ class LeanRunner:
                 async with self._inflight_exec_lock:
                     self._execution_environment_generation += 1
                     self._completed_exec.clear()
+                    self._pending_reference_confirmations.clear()
                     getattr(self, "_helper_usage_observations", {}).clear()
                     getattr(self, "_declaration_usage_observations", {}).clear()
             finally:
@@ -4967,20 +5237,48 @@ class LeanRunner:
         return "", "", current_epoch
 
     async def _get_persistent_pool(self) -> Optional[PersistentVerifierPool]:
-        if self._closed or self._configured_backend_mode() != "persistent_process":
+        if (self._closed or _OPERATION_MEMORY_MB.get() is not None
+                or (self._configured_backend_mode() != "persistent_process"
+                    and not getattr(self.cfg, "persistent_warm_contexts", False))):
             return None
-        if self._persistent_pool is None:
-            self._persistent_pool = PersistentVerifierPool(self.cfg)
-        pool = self._persistent_pool
-        ok = await pool.start()
-        if self._closed:
-            await pool.close()
-            if self._persistent_pool is pool:
-                self._persistent_pool = None
-            return None
-        if ok:
-            return pool
-        return None
+        async with self._persistent_pool_lock:
+            deadline = _OPERATION_DEADLINE.get()
+            if self._closed or self._quiesced or (deadline is not None and time.monotonic() >= deadline):
+                return None
+            close_generation = self._close_generation
+            pool = self._persistent_pool or PersistentVerifierPool(self.cfg)
+            # Keep the resource receipt outside this generation: rejected cold
+            # startup can still be disposing its pool after the caller returns,
+            # closes the runner, or publishes a replacement generation.
+            metrics = self._generation_ref.persistent_pool_acquisitions
+            receipt = metrics.begin(pool) if self._persistent_pool is None else None
+            acquired = False
+
+            async def discard_pool() -> None:
+                if self._persistent_pool is pool:
+                    self._persistent_pool = None
+                await pool.close()
+
+            try:
+                try:
+                    ok = await pool.start()
+                except BaseException:
+                    await self._finish_cleanup_despite_cancellation(discard_pool())
+                    raise
+                task = asyncio.current_task()
+                if (not ok or self._closed or self._quiesced
+                        or self._close_generation != close_generation
+                        or (task is not None and task.cancelling())
+                        or (deadline is not None and time.monotonic() >= deadline)):
+                    await self._finish_cleanup_despite_cancellation(discard_pool())
+                    return None
+                # A cold resource becomes visible only after timely startup.
+                self._persistent_pool = pool
+                acquired = True
+                return pool
+            finally:
+                if receipt is not None:
+                    metrics.settle(receipt, acquired=acquired)
 
     async def _get_repl(self) -> Optional[LeanREPL]:
         """Lazily initialize the env-cached Lean backend if enabled."""
@@ -5219,6 +5517,12 @@ class LeanRunner:
         finally:
             self._unregister_execution_request(execution_task)
 
+    def _remember_reference_confirmation(self, key: str) -> None:
+        self._pending_reference_confirmations.pop(key, None)
+        self._pending_reference_confirmations[key] = time.monotonic()
+        while len(self._pending_reference_confirmations) > 256:
+            self._pending_reference_confirmations.pop(next(iter(self._pending_reference_confirmations)))
+
     async def _execute_content(self, **kwargs: Any) -> tuple[tuple[int, str], str, str]:
         if current_lean_memory_limit() is None:
             return await self._execute_content_owned(**kwargs)
@@ -5248,6 +5552,8 @@ class LeanRunner:
         retry_repl_termination: bool = True,
         dispatch_observer: Optional[Callable[[], None]] = None,
         operation_deadline: Optional[float] = None,
+        force_reference: bool = False,
+        allow_pending_reference_confirmation: bool = False,
     ) -> tuple[tuple[int, str], str, str]:
         deadline_monotonic = self._execution_deadline(timeout_s)
         if operation_deadline is not None:
@@ -5285,6 +5591,8 @@ class LeanRunner:
                 retry_repl_termination=retry_repl_termination,
                 deadline_monotonic=deadline_monotonic,
                 dispatch_observer=dispatch_observer,
+                force_reference=force_reference,
+                allow_pending_reference_confirmation=allow_pending_reference_confirmation,
             )
         finally:
             try:
@@ -5311,14 +5619,19 @@ class LeanRunner:
         retry_repl_termination: bool = True,
         deadline_monotonic: float,
         dispatch_observer: Optional[Callable[[], None]] = None,
+        force_reference: bool = False,
+        allow_pending_reference_confirmation: bool = False,
     ) -> tuple[tuple[int, str], str, str]:
         content = clamp_lean_heartbeat_options(content, _OPERATION_HEARTBEATS.get())
+        close_generation = self._close_generation
         if self._closed or self._quiesced:
             raise RuntimeError(
                 "LeanRunner is closed"
                 if self._closed
                 else "LeanRunner is quiesced (cancellation barrier)"
             )
+        fresh_execution_id = uuid.uuid4().hex if force_reference else ""
+        pending_reference_capable = allow_pending_reference_confirmation
         while True:
             leader = False
             async with self._inflight_exec_lock:
@@ -5343,12 +5656,27 @@ class LeanRunner:
                         retry_repl_termination=retry_repl_termination,
                         environment_epoch=execution_global_epoch,
                     )
+                    if force_reference:
+                        cache_key += ":fresh-reference:" + fresh_execution_id
+                    # Admission validates identical source regardless of
+                    # whether its caller can resume a proof confirmation.
+                    if pending_reference_capable and not mode.endswith("_source_boundary"):
+                        cache_key += ":pending-reference-capable"
                     completed = self._completed_exec.get(cache_key)
                     if completed is not None:
                         self._completed_exec.pop(cache_key, None)
                         self._completed_exec[cache_key] = completed
                         self._record_request_dedup_hit(mode)
-                        return completed
+                        (cached_code, cached_output), cached_path, cached_backend = completed
+                        reused = (LeanOutput(str(cached_output), runtime_status=cached_output.runtime_status)
+                                  if isinstance(cached_output, LeanOutput) else _ExecutionOutput(str(cached_output)))
+                        reused.execution_metadata = {
+                            **getattr(cached_output, "execution_metadata", {}),
+                            "cached_verified_execution": True,
+                            "fresh_reference_confirmation": False,
+                        }
+                        reused.stage_timings = {"queue_s": 0.0, "reference_confirmation_s": 0.0}
+                        return (cached_code, reused), cached_path, cached_backend
                     future = self._inflight_exec.get(cache_key)
                     if future is None:
                         future = asyncio.get_running_loop().create_future()
@@ -5396,6 +5724,23 @@ class LeanRunner:
                 if self._execution_time_remaining(deadline_monotonic) <= 0.0:
                     return self._execution_deadline_result("shared Lean execution")
         execution_task = asyncio.current_task()
+        confirmation_key = hash_text(json.dumps([
+            mode, content, self._execution_environment_generation, execution_global_epoch,
+        ]))
+        pending_confirmation = force_reference or confirmation_key in self._pending_reference_confirmations
+        if force_reference:
+            self._remember_reference_confirmation(confirmation_key)
+        warm_context = (
+            bool(getattr(self.cfg, "persistent_warm_contexts", False))
+            and bool(re.match(r"-- ensemble-context-v2:[0-9a-f]+\n", content))
+        )
+        warm_candidate = (
+            warm_context
+            and not mode.endswith("_source_boundary")
+            and "ENSEMBLE_AUDIT_RECEIPT:" in content
+        )
+        warm_admission = warm_context and mode.endswith("_source_boundary")
+        reference_confirmation_s = 0.0
 
         file_path = self.temp_dir / f"{goal_name}_{uuid.uuid4().hex}.lean"
         write_error = self._write_temp_lean_file(file_path, content)
@@ -5440,6 +5785,8 @@ class LeanRunner:
             except BaseException:
                 return False
 
+        execution_observation: dict[str, Any] = {}
+        observation_token = _EXECUTION_OBSERVATION.set(execution_observation)
         try:
             remaining = self._execution_time_remaining(deadline_monotonic)
             if remaining > 0.0:
@@ -5503,6 +5850,11 @@ class LeanRunner:
             check_start = time.monotonic()
             try:
                 preferred_backend = self._preferred_backend_key()
+                if pending_confirmation or (warm_candidate and not pending_reference_capable):
+                    preferred_backend = "lake"
+                elif (pending_reference_capable and (warm_candidate or warm_admission)
+                        and _OPERATION_MEMORY_MB.get() is None):
+                    preferred_backend = "persistent"
                 result: Optional[tuple[int, str]] = None
                 backend_key = "lake"
                 if preferred_backend == "persistent":
@@ -5530,35 +5882,6 @@ class LeanRunner:
                     if result is not None and backend_key != "deadline":
                         backend_key = "persistent"
                         self._persistent_check_count += 1
-                    elif result is None:
-                        remaining = self._execution_time_remaining(
-                            deadline_monotonic
-                        )
-                        if remaining <= 0.0:
-                            result = self._execution_deadline_result(
-                                "Lean backend execution",
-                                file_path=file_path,
-                            )[0]
-                            backend_key = "deadline"
-                        else:
-                            result = await self._run_via_repl(
-                                file_path,
-                                timeout_s=remaining,
-                                fast_fail_timeout_s=fast_fail_timeout_s,
-                                **(
-                                    {"retry_termination": False}
-                                    if not retry_repl_termination
-                                    else {}
-                                ),
-                                **(
-                                    {"dispatch_observer": dispatch_observer}
-                                    if dispatch_observer is not None
-                                    else {}
-                                ),
-                            )
-                            if result is not None:
-                                backend_key = "repl"
-                                self._repl_check_count += 1
                 elif preferred_backend == "repl":
                     remaining = self._execution_time_remaining(deadline_monotonic)
                     if remaining <= 0.0:
@@ -5587,12 +5910,7 @@ class LeanRunner:
                             backend_key = "repl"
                             self._repl_check_count += 1
                 if result is None:
-                    if self._closed or self._quiesced:
-                        raise RuntimeError(
-                            "LeanRunner is closed"
-                            if self._closed
-                            else "LeanRunner is quiesced (cancellation barrier)"
-                        )
+                    self._check_dispatch_lifecycle(close_generation)
                     remaining = self._execution_time_remaining(deadline_monotonic)
                     if remaining <= 0.0:
                         result = self._execution_deadline_result(
@@ -5613,6 +5931,38 @@ class LeanRunner:
                         )
                         backend_key = "lake"
                         self._lake_check_count += 1
+                if warm_candidate and backend_key == "persistent" and int(result[0]) == 0:
+                    self._remember_reference_confirmation(confirmation_key)
+                    remaining = self._execution_time_remaining(deadline_monotonic)
+                    confirmation_start = time.monotonic()
+                    if remaining > 0.0:
+                        try:
+                            self._check_dispatch_lifecycle(close_generation)
+                            result = await self._run_via_lake(
+                                file_path, timeout_s=remaining,
+                                fast_fail_timeout_s=fast_fail_timeout_s,
+                                **({"dispatch_observer": dispatch_observer} if dispatch_observer is not None else {}),
+                            )
+                            self._lake_check_count += 1
+                        except _LeanDispatchLifecycleChanged as exc:
+                            # The warm proof remains unaccepted search work.
+                            # Retain its reference intent across retirement.
+                            status = f"Lean subprocess error: independent reference confirmation deferred: {exc}"
+                            result = (1, LeanOutput(status, runtime_status=status))
+                    else:
+                        result = self._execution_deadline_result("independent reference confirmation", file_path=file_path)[0]
+                    reference_confirmation_s = time.monotonic() - confirmation_start
+                    backend_key = "reference_confirmation"
+                if pending_confirmation or backend_key == "reference_confirmation":
+                    if (int(result[0]) == 0 or not parse_lean_output(result[1], int(result[0])).infra_failure):
+                        self._pending_reference_confirmations.pop(confirmation_key, None)
+                    else:
+                        backend_key = "reference_confirmation_pending"
+                confirmation_attempted = pending_confirmation or backend_key in {
+                    "reference_confirmation", "reference_confirmation_pending",
+                }
+                if pending_confirmation:
+                    reference_confirmation_s = time.monotonic() - check_start
                 # A backend is expected to enforce the remaining timeout, but
                 # publication is the trust boundary.  Reject any response that
                 # arrives after the complete-operation deadline so a stalled or
@@ -5626,15 +5976,29 @@ class LeanRunner:
                         "Lean backend execution",
                         file_path=file_path,
                     )[0]
-                    backend_key = "deadline"
+                    if confirmation_attempted:
+                        self._remember_reference_confirmation(confirmation_key)
+                        backend_key = "reference_confirmation_pending"
+                    else:
+                        backend_key = "deadline"
                 self._last_backend_key = backend_key
             finally:
                 check_time = time.monotonic() - check_start
                 self._total_check_time_s += check_time
                 self._max_check_time_s = max(self._max_check_time_s, check_time)
                 self._active_checks -= 1
+            output = (LeanOutput(str(result[1]), runtime_status=result[1].runtime_status)
+                      if isinstance(result[1], LeanOutput) else _ExecutionOutput(str(result[1])))
+            output.execution_metadata = {
+                **execution_observation,
+                "backend": backend_key,
+                "pending_reference_confirmation": confirmation_key in self._pending_reference_confirmations,
+                "fresh_reference_confirmation": backend_key == "reference_confirmation" or pending_confirmation,
+            }
+            output.stage_timings = {"queue_s": queue_wait, "reference_confirmation_s": reference_confirmation_s}
+            result = (result[0], output)
             payload = (result, str(file_path), backend_key)
-            if int(result[0]) == 0:
+            if int(result[0]) == 0 and not force_reference:
                 cached_payload = (result, "", backend_key)
                 async with self._inflight_exec_lock:
                     with LeanREPL._GLOBAL_ENV_CACHE_LOCK:
@@ -5679,6 +6043,7 @@ class LeanRunner:
                     future.set_exception(exc)
             raise
         finally:
+            _EXECUTION_OBSERVATION.reset(observation_token)
             if sem_acquired:
                 sem.release()
             if execution_task is not None:
@@ -5705,6 +6070,8 @@ class LeanRunner:
         axiom_audit_names: Optional[Sequence[str]] = None,
         require_proposition: bool = False,
         helper_usage_sources: Sequence[str] = (),
+        axiom_provenance_names: Sequence[str] = (),
+        audit_policy_scope: str = "proof",
     ) -> "_BuiltLeanFile":
         """Assemble the Lean source for a single check.
 
@@ -5737,21 +6104,50 @@ class LeanRunner:
         # declared inside it is unavailable to the following example.
         audit_requested = axiom_audit_names is not None
         delta_before, delta_after = ("", "")
+        audit_binding = None
+        # Empty reference contexts have no intervening helper commands and no
+        # helper dependencies to observe. Warm families retain this scaffold
+        # so their trusted prefix survives the first appended helper.
+        helper_scaffolding = (
+            bool(lemma_block)
+            or bool(getattr(self.cfg, "persistent_warm_contexts", False))
+            or audit_policy_scope != "proof"
+        )
+        context_family_spec = [
+            _AUDIT_POLICY_VERSION, audit_policy_scope, str(self.project_dir.resolve()),
+            self._execution_environment_generation,
+            LeanREPL._GLOBAL_ENV_EPOCH.get(str(self.project_dir.resolve()), 0),
+            preamble, statement, target_scoped_prefix, list(target_omit_variables),
+            universe_decl, max_heartbeats, warning_as_error, require_proposition,
+            helper_scaffolding,
+        ] if audit_requested else []
+        context_family_key = hash_text(json.dumps(
+            context_family_spec, ensure_ascii=False,
+        )) if audit_requested else ""
+        context_key = hash_text(json.dumps([
+            context_family_spec, lemma_block, list(helper_usage_sources),
+        ], ensure_ascii=False)) if audit_requested else ""
         if audit_requested:
             preamble = _append_imports_to_preamble(preamble, ["Lean"])
-            if lemma_block:
-                delta_before, delta_after = _check_delta_audit_blocks(
-                    hash_text(preamble + "\0" + lemma_block + "\0" + statement + "\0" + proof_code)
-                )
-            else:
-                delta_after = _check_goal_audit_block(goal_name)
+            audit_binding = {
+                "context": context_key, "target": goal_name,
+                "source": hash_text(json.dumps([preamble, statement, lemma_block, proof_code,
+                                                universe_decl, max_heartbeats, warning_as_error,
+                                                require_proposition], ensure_ascii=False)),
+                "policy": _AUDIT_POLICY_VERSION,
+                "scope": audit_policy_scope,
+                "provenance": list(dict.fromkeys(axiom_provenance_names)),
+            }
+            audit_binding["request"] = hash_text(json.dumps(audit_binding, sort_keys=True))
+            delta_before, delta_after = _check_aggregate_audit_blocks(context_family_key, audit_binding)
         usage_before, usage_after = ("", "")
-        if audit_requested and lemma_block:
+        if audit_requested and helper_scaffolding:
             usage_before, usage_after = _check_helper_usage_blocks(
                 hash_text(statement + "\0" + proof_code + "\0" + lemma_block), goal_name,
                 tuple(axiom_audit_names or ()),
                 tuple((helper_decl_name(source), hash_text(statement + "\0" + proof_code + "\0" + lemma_block) + "_decl_" + hash_text(source))
                       for source in helper_usage_sources if helper_decl_name(source)),
+                function_identity=context_family_key,
             )
         goal_line = (
             # ``check`` also supports constructive/non-Prop targets, so a
@@ -5803,8 +6199,8 @@ class LeanRunner:
         # `example` supports both Prop-valued theorems and constructive goals.
         target_witness = ""
         target_guard = ""
-        if audit_requested and lemma_block:
-            witness_name = f"ensemble_target_{hash_text(preamble + statement)}"
+        if audit_requested and helper_scaffolding:
+            witness_name = f"ensemble_target_{context_family_key}"
             target_witness = _type_identity_probe_command(f"_root_.{witness_name}", statement)
             if target_omit_variables:
                 target_witness = f"omit {' '.join(target_omit_variables)} in\n{target_witness}"
@@ -5813,7 +6209,8 @@ class LeanRunner:
             target_witness += "\n\n" + _check_target_identity_guard_definition(witness_name)
             target_guard = _check_target_identity_guard(goal_name, witness_name)
         before_lemmas = (
-            f"{preamble}\n\n"
+            (f"-- ensemble-context-v2:{context_family_key}\n" if context_family_key else "")
+            + f"{preamble}\n\n"
             f"{head_universe_decl}"
             f"{heartbeat_option}"
             f"{target_witness}"
@@ -5836,12 +6233,12 @@ class LeanRunner:
                 ]
             )
         )
-        audit_block = ""
-        if complete_audit_names:
-            audit_block = "\n" + "\n".join(
-                f"#print axioms {name}" for name in complete_audit_names
-            ) + "\n"
-        content = f"{prefix}{scoped_block}{target_guard}{delta_after}{audit_block}{usage_after}"
+        content = f"{prefix}{scoped_block}{target_guard}{delta_after}{usage_after}"
+        if audit_binding is not None:
+            marker = "ENSEMBLE_REQUEST_COMPLETE:" + audit_binding["request"]
+            content += (f'\n-- ensemble-context-binding-v2:{context_key}\n'
+                        f'-- ensemble-completion-v2:{marker}\n'
+                        f'run_cmd _root_.ensemble_scratch_inventory_{context_family_key}_complete "{marker}"\n')
         # 1-indexed line where the scoped block (set_option wrappers + example)
         # begins. ``Try this:`` suggestions on lines below this are accepted
         # by the parser; suggestions above are rejected as off-block linter
@@ -5854,6 +6251,9 @@ class LeanRunner:
             lemma_block_start_line=lemma_block_start_line,
             axiom_audit_names=complete_audit_names,
             audit_inventory=bool(delta_after),
+            audit_binding=audit_binding,
+            context_key=context_key,
+            context_family_key=context_family_key,
         )
 
     async def _run_via_persistent(
@@ -5867,32 +6267,89 @@ class LeanRunner:
         queue_class: str = "main",
         dispatch_observer: Optional[Callable[[], None]] = None,
     ) -> Optional[tuple[int, str]]:
-        pool = await self._get_persistent_pool()
-        if pool is None:
-            self._persistent_fallback_count += 1
-            return None
+        observation = _EXECUTION_OBSERVATION.get()
+        def record_failure(reason: str) -> None:
+            if observation is not None:
+                observation["persistent_failure"] = reason
+                observation["fallback_backend"] = "lake"
+
         total_timeout_s = (
             float(timeout_s) if timeout_s is not None else float(self.cfg.timeout_s)
         )
         if total_timeout_s <= 0.0:
             total_timeout_s = 1.0
+        deadline_monotonic = self._execution_deadline(total_timeout_s)
+        close_generation = self._close_generation
+
+        async def acquire_pool() -> Optional[PersistentVerifierPool]:
+            token = _OPERATION_DEADLINE.set(deadline_monotonic)
+            try:
+                return await self._get_persistent_pool()
+            finally:
+                _OPERATION_DEADLINE.reset(token)
+
+        acquisition_started = time.monotonic()
+        try:
+            pool = await await_with_strict_deadline(
+                create_result_only_deadline_task(acquire_pool()),
+                deadline_monotonic=deadline_monotonic,
+                operation_label="persistent acquisition",
+                operation_ownership="result_only",
+            )
+        except asyncio.TimeoutError:
+            pool = None
+        acquisition_elapsed_s = time.monotonic() - acquisition_started
+        if observation is not None:
+            observation["persistent_startup_s"] = acquisition_elapsed_s
+        remaining_s = self._execution_time_remaining(deadline_monotonic)
+        if pool is None or remaining_s <= 0.0:
+            record_failure("persistent_acquisition_deadline" if remaining_s <= 0.0
+                           else "persistent_unavailable")
+            self._persistent_fallback_count += 1
+            return None
         if warning_as_error is None:
             warning_as_error = "set_option warningAsError false" not in str(content or "")
+        metadata: dict[str, Any] = {"source": "LeanRunner._execute_content"}
+        if (getattr(self.cfg, "persistent_warm_contexts", False)
+                and (match := re.match(r"-- ensemble-context-v2:([0-9a-f]+)\n", content))):
+            bindings = re.findall(r"(?m)^-- ensemble-context-binding-v2:([0-9a-f]+)$", content)
+            completions = re.findall(
+                r"(?m)^-- ensemble-completion-v2:(ENSEMBLE_REQUEST_COMPLETE:[0-9a-f]+)$", content,
+            )
+            metadata.update({
+                "stable_context": True,
+                "context_family_key": match.group(1),
+                "context_key": bindings[-1] if bindings else match.group(1),
+                "completion_marker": completions[-1] if completions else "",
+            })
         request = VerifierRequest(
             request_id=f"req-{uuid.uuid4().hex}",
             mode=str(mode or "raw"),
             content=str(content or ""),
             goal_name=str(file_path.stem or "goal"),
-            timeout_s=float(total_timeout_s),
+            timeout_s=remaining_s,
             warning_as_error=bool(warning_as_error),
             max_heartbeats=None,
             queue_class=str(queue_class or "main"),
             document_uri=file_path.resolve().as_uri(),
-            metadata={"source": "LeanRunner._execute_content"},
+            metadata=metadata,
         )
+        remaining_s = self._execution_time_remaining(deadline_monotonic)
+        if remaining_s <= 0.0:
+            record_failure("persistent_dispatch_deadline")
+            self._persistent_fallback_count += 1
+            return None
+        # Acquisition resumes through a result-only task, so a lifecycle
+        # barrier may land after that task publishes its pool. Revalidate
+        # immediately before handing any request to the shared resource.
+        if (self._closed or self._quiesced
+                or self._close_generation != close_generation):
+            record_failure("persistent_dispatch_lifecycle_changed")
+            self._persistent_fallback_count += 1
+            return None
         try:
             response = await pool.execute(
-                request,
+                dataclass_replace(request, timeout_s=remaining_s),
                 **(
                     {"dispatch_observer": dispatch_observer}
                     if dispatch_observer is not None
@@ -5904,15 +6361,27 @@ class LeanRunner:
                 "Persistent verifier backend unavailable, falling back: %s",
                 exc,
             )
+            record_failure("persistent_unavailable")
             self._persistent_fallback_count += 1
             return None
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "Persistent verifier backend unavailable, falling back",
                 exc_info=True,
             )
+            record_failure(type(exc).__name__)
             self._persistent_fallback_count += 1
             return None
+        if observation is not None:
+            observation.update({
+                "worker_id": str(getattr(response, "worker_id", "")),
+                "worker_generation": int(getattr(response, "worker_generation", 0)),
+                "document_version": int(getattr(response, "document_version", 0)),
+                "request_completed": bool(getattr(response, "request_completed", False)),
+                "persistent_queue_s": float(getattr(response, "queue_wait_s", 0.0)),
+                "persistent_startup_s": acquisition_elapsed_s + float(getattr(response, "startup_time_s", 0.0)),
+                "persistent_service_s": float(getattr(response, "service_time_s", 0.0)),
+            })
         output = str(response.output or "")
         runtime_status = getattr(response, "runtime_status", None)
         if runtime_status is not None:
@@ -5930,6 +6399,16 @@ class LeanRunner:
                 "Persistent verifier returned infrastructure failure, falling back: %s",
                 failure_kind or (output.splitlines()[-1] if output.splitlines() else output),
             )
+            record_failure(failure_kind or "lean_backend_crash")
+            self._persistent_fallback_count += 1
+            return None
+        if request.metadata.get("stable_context") and (
+            getattr(response, "request_completed", False) is not True
+            or getattr(response, "context_key", "") != request.metadata["context_key"]
+            or getattr(response, "context_family_key", "") != request.metadata["context_family_key"]
+            or int(getattr(response, "document_version", 0) or 0) < 1
+        ):
+            record_failure("completion_unavailable")
             self._persistent_fallback_count += 1
             return None
         return (int(response.returncode), output)
@@ -6150,8 +6629,19 @@ class LeanRunner:
             intercepted_cancellation = asyncio.CancelledError()
         return intercepted_cancellation
 
+    def _check_dispatch_lifecycle(self, close_generation: int) -> None:
+        if self._closed:
+            raise _LeanDispatchLifecycleChanged("LeanRunner is closed")
+        if self._quiesced:
+            raise _LeanDispatchLifecycleChanged("LeanRunner is quiesced (cancellation barrier)")
+        if self._close_generation != close_generation:
+            raise _LeanDispatchLifecycleChanged("LeanRunner generation changed before dispatch")
+
     async def _run_via_lake(self, file_path: Path, **kwargs: Any) -> tuple[int, str]:
+        close_generation = self._close_generation
+        self._check_dispatch_lifecycle(close_generation)
         async with lean_process_slot_async():
+            self._check_dispatch_lifecycle(close_generation)
             if current_lean_deadline() is not None:
                 configured = kwargs.get("timeout_s")
                 requested = (
@@ -6183,6 +6673,8 @@ class LeanRunner:
         direct lake checks rely on the hard timeout instead of silence-based
         early termination.
         """
+        close_generation = self._close_generation
+        self._check_dispatch_lifecycle(close_generation)
         total_timeout_s = (
             float(timeout_s) if timeout_s is not None else float(self.cfg.timeout_s)
         )
@@ -6210,6 +6702,7 @@ class LeanRunner:
                     tempfile.TemporaryFile() as stderr_file,
                 ):
                     lake_command = ("lake", "env", *args)
+                    self._check_dispatch_lifecycle(close_generation)
                     proc = subprocess.Popen(
                         bounded_lean_process_command(lake_command),
                         cwd=str(self.project_dir),
@@ -6325,6 +6818,7 @@ class LeanRunner:
                 if direct_environment_required and resolved_lean_executable
                 else ("lake", "env", "lean", *lean_args)
             )
+            self._check_dispatch_lifecycle(close_generation)
             proc = await asyncio.create_subprocess_exec(
                 *bounded_lean_process_command(command),
                 cwd=str(self.project_dir),
@@ -6494,6 +6988,8 @@ class LeanRunner:
         retry_repl_termination: bool = True,
         dispatch_observer: Optional[Callable[[], None]] = None,
         operation_deadline: Optional[float] = None,
+        force_reference: bool = False,
+        allow_pending_reference_confirmation: bool = False,
     ) -> tuple[Optional[Path], Optional[_BackendExecutionResult], Optional[str]]:
         """Write generated Lean content, run it, and clean up consistently."""
         result, file_path_str, backend_key = await self._execute_content(
@@ -6507,6 +7003,8 @@ class LeanRunner:
             retry_repl_termination=retry_repl_termination,
             dispatch_observer=dispatch_observer,
             **({"operation_deadline": operation_deadline} if operation_deadline is not None else {}),
+            **({"force_reference": True} if force_reference else {}),
+            **({"allow_pending_reference_confirmation": True} if allow_pending_reference_confirmation else {}),
         )
         returncode, out = result
         if backend_key == "disk_error":
@@ -6516,7 +7014,7 @@ class LeanRunner:
             file_path,
             _BackendExecutionResult(
                 returncode=int(returncode),
-                output=out if isinstance(out, LeanOutput) else str(out),
+                output=out if isinstance(out, str) else str(out),
                 backend=str(backend_key or "lake"),
             ),
             None,
@@ -6536,16 +7034,24 @@ class LeanRunner:
         warning_as_error: bool = False,
         dispatch_observer: Optional[Callable[[], None]] = None,
         helper_usage_sources: Sequence[str] = (),
+        axiom_provenance_names: Sequence[str] = (),
+        force_reference: bool = False,
+        allow_pending_reference_confirmation: bool = False,
     ) -> LeanResult:
         """Check submitted proof artifacts with mandatory source admission.
 
         The target must elaborate in the original preamble. Helpers may prove
         it but cannot redefine its meaning; definitions needed to state the
         target belong in the trusted preamble or installed theory context.
+        With warm contexts enabled, opting into pending reference confirmation
+        requires preserving the exact proof and retrying it with force_reference
+        when the returned pending_reference_confirmation flag is true.
         """
         return await self._check(
             statement, proof_code, lemmas,
             source_boundary_required=True,
+            force_reference=force_reference,
+            allow_pending_reference_confirmation=allow_pending_reference_confirmation,
             preamble_override=preamble_override,
             timeout_s=timeout_s,
             fast_fail_timeout_s=fast_fail_timeout_s,
@@ -6554,6 +7060,7 @@ class LeanRunner:
             warning_as_error=warning_as_error,
             dispatch_observer=dispatch_observer,
             helper_usage_sources=helper_usage_sources,
+            axiom_provenance_names=axiom_provenance_names,
         )
 
     async def check_feedback(
@@ -6602,9 +7109,14 @@ class LeanRunner:
         warning_as_error: bool = False,
         dispatch_observer: Optional[Callable[[], None]] = None,
         helper_usage_sources: Sequence[str] = (),
+        axiom_provenance_names: Sequence[str] = (),
+        force_reference: bool = False,
+        allow_pending_reference_confirmation: bool = False,
     ) -> LeanResult:
         from .utils import normalize_classical_tactic_prefix
 
+        check_started = time.monotonic()
+        stage_timings: Dict[str, float] = {}
         requested_proof_code = proof_code
         proof_code = normalize_classical_tactic_prefix(proof_code)
         # Stylistic warnings do not invalidate proofs by default. These include
@@ -6663,6 +7175,8 @@ class LeanRunner:
             max_heartbeats=max_heartbeats,
             axiom_audit_names=(*helper_audit_names, *anonymous_audit_names),
             helper_usage_sources=usage_sources,
+            axiom_provenance_names=axiom_provenance_names,
+            audit_policy_scope="proof" if source_boundary_required else "generated-falsification",
         )
         lemma_line_spans: Tuple[Tuple[int, int], ...] = ()
         if built.lemma_block_start_line > 0:
@@ -6714,6 +7228,13 @@ class LeanRunner:
                 goal_name=goal_name,
                 max_heartbeats=max_heartbeats,
             )
+            boundary_key = hash_text(boundary_content)
+            boundary_marker = "ENSEMBLE_REQUEST_COMPLETE:" + boundary_key
+            boundary_content = (f"-- ensemble-context-v2:{hash_text(built.context_family_key + ':source-admission')}\n"
+                                + boundary_content + f'\n-- ensemble-context-binding-v2:{boundary_key}\n'
+                                + f'-- ensemble-completion-v2:{boundary_marker}\n'
+                                + f'run_cmd Lean.logInfo "{boundary_marker}"\n')
+            stage_start = time.monotonic()
             file_path, execution, write_error = await self._execute_generated_file(
                 mode=f"{check_kind}_source_boundary",
                 goal_name=f"{goal_name}_source_boundary",
@@ -6723,7 +7244,10 @@ class LeanRunner:
                 warning_as_error=warning_as_error,
                 dispatch_observer=dispatch_observer,
                 operation_deadline=operation_deadline,
+                **({"allow_pending_reference_confirmation": True}
+                   if allow_pending_reference_confirmation else {}),
             )
+            stage_timings["source_admission_s"] = time.monotonic() - stage_start
         if not source_boundary_required or (execution is not None and execution.returncode == 0):
             remaining = self._execution_time_remaining(operation_deadline)
             if remaining <= 0:
@@ -6733,6 +7257,7 @@ class LeanRunner:
                     backend="deadline",
                 )
             else:
+                stage_start = time.monotonic()
                 file_path, execution, write_error = await self._execute_generated_file(
                     mode=check_kind,
                     goal_name=goal_name,
@@ -6742,7 +7267,10 @@ class LeanRunner:
                     warning_as_error=warning_as_error,
                     dispatch_observer=dispatch_observer,
                     operation_deadline=operation_deadline,
+                    **({"force_reference": True} if force_reference else {}),
+                    **({"allow_pending_reference_confirmation": True} if allow_pending_reference_confirmation else {}),
                 )
+                stage_timings["proof_and_audit_s"] = time.monotonic() - stage_start
         if execution is None:
             # Parse disk-write failures into LeanResult.parsed with
             # infra_failure=True so callers classify them as infrastructure
@@ -6759,8 +7287,15 @@ class LeanRunner:
                 generated_declaration_name=goal_name,
                 generated_goal_start_line=built.goal_start_line,
                 generated_lemma_line_spans=lemma_line_spans,
+                pending_reference_confirmation=force_reference,
             )
         returncode, out = execution.returncode, execution.output
+        execution_metadata = dict(getattr(out, "execution_metadata", {}))
+        execution_metadata.update({"backend": execution.backend, "context_key": built.context_key,
+                                   "context_family_key": built.context_family_key,
+                                   "audit_policy": _AUDIT_POLICY_VERSION})
+        stage_timings["total_s"] = time.monotonic() - check_started
+        execution_metadata["execution_stages"] = dict(getattr(out, "stage_timings", {}))
         usage_output = out
         usage_marker_identity = hash_text(statement + "\0" + proof_code + "\0" + lemma_block)
         cleaned_output = strip_helper_usage_output(
@@ -6781,20 +7316,28 @@ class LeanRunner:
         axiom_audit_ok: Optional[bool] = None
         unexpected_axioms: Tuple[str, ...] = ()
         axiom_audit_error = ""
+        context_axioms: Tuple[str, ...] = ()
+        audited_declarations: Tuple[str, ...] = ()
         if returncode == 0 or (
             built.audit_inventory
-            and _SCRATCH_AUDIT_MARKER_RE.search(str(out or ""))
+            and (_SCRATCH_AUDIT_MARKER_RE.search(str(out or ""))
+                 or _AGGREGATE_AUDIT_MARKER_RE.search(str(out or "")))
         ):
-            axiom_audit, axiom_audit_error = _parse_complete_axiom_audit(
-                out,
-                built.axiom_audit_names,
-                require_inventory=built.audit_inventory,
-            )
+            if built.audit_binding is not None:
+                axiom_audit, context_axioms, audited_declarations, axiom_audit_error = _parse_aggregate_axiom_audit(
+                    out, built.axiom_audit_names, built.audit_binding,
+                )
+            else:
+                # Only files explicitly built with the legacy format use the
+                # legacy parser; new requests never accept old unbound output.
+                axiom_audit, axiom_audit_error = _parse_complete_axiom_audit(
+                    out, built.axiom_audit_names, require_inventory=built.audit_inventory,
+                )
             all_axioms = tuple(
                 sorted(
                     {
                         axiom
-                        for axioms in axiom_audit.values()
+                        for axioms in (*axiom_audit.values(), context_axioms)
                         for axiom in axioms
                     }
                 )
@@ -6861,6 +7404,9 @@ class LeanRunner:
             and parsed.sorry_count == 0
             and axiom_audit_ok is True
         )
+        if (not ok and parsed.infra_failure
+                and (force_reference or execution_metadata.get("fresh_reference_confirmation"))):
+            execution_metadata["pending_reference_confirmation"] = True
         check_kind_norm = str(check_kind or "full").strip().lower()
         self._check_count += 1
         if ok:
@@ -6911,6 +7457,7 @@ class LeanRunner:
                 declaration_observations = {}
             while len(self._declaration_usage_observations) > 128:
                 self._declaration_usage_observations.pop(next(iter(self._declaration_usage_observations)))
+        stage_timings["total_s"] = time.monotonic() - check_started
         return LeanResult(
             ok=ok,
             helper_usage=observation,
@@ -6921,6 +7468,11 @@ class LeanRunner:
             parsed=parsed,
             axiom_audit_ok=axiom_audit_ok,
             axiom_audit=axiom_audit,
+            context_axioms=context_axioms,
+            stage_timings=stage_timings,
+            execution_metadata=execution_metadata,
+            pending_reference_confirmation=bool(execution_metadata.get("pending_reference_confirmation")),
+            audited_declarations=audited_declarations,
             unexpected_axioms=unexpected_axioms,
             axiom_audit_error=axiom_audit_error,
             generated_declaration_name=goal_name,
@@ -7798,11 +8350,12 @@ class LeanRunner:
             "repl_global_cache_hits": int(repl_cache_stats.get("hits", 0)),
             "repl_global_cache_misses": int(repl_cache_stats.get("misses", 0)),
             **persistent_stats,
+            **self._generation_ref.persistent_pool_acquisitions.snapshot(),
             "persistent_backend_fallbacks": int(persistent_fallbacks),
         }
 
     def reset_stats(self) -> None:
-        """Reset throughput counters (e.g. between problems)."""
+        """Reset throughput counters; runner-lifetime maintenance remains visible."""
         self._check_count = 0
         self._check_ok_count = 0
         self._check_fail_count = 0
@@ -9166,15 +9719,15 @@ private def {inventory_function} (name : Lean.Name) : Lean.Elab.Command.CommandE
         proof_literal = json.dumps(" " * proof_column + raw_proof, ensure_ascii=False)
         # Explicit variable patterns remain binders even when caller namespaces
         # expose constants with the same names (for example RingHom.id).
-        serializer = f"""
-private def {serializer_prefix}_binderInfo :
+        identity_serializer = f"""
+private def _root_.{serializer_prefix}_binderInfo :
     Lean.BinderInfo → Lean.Json
   | .default => Lean.Json.str "default"
   | .implicit => Lean.Json.str "implicit"
   | .strictImplicit => Lean.Json.str "strictImplicit"
   | .instImplicit => Lean.Json.str "instImplicit"
 
-private partial def {serializer_prefix}_level :
+private partial def _root_.{serializer_prefix}_level :
     Lean.Level → Lean.Json
   | .zero => Lean.Json.arr #[Lean.Json.str "zero"]
   | .succ level@_ =>
@@ -9190,13 +9743,13 @@ private partial def {serializer_prefix}_level :
   | .mvar id@_ =>
       Lean.Json.arr #[Lean.Json.str "mvar", Lean.Json.str id.name.toString]
 
-private def {serializer_prefix}_literal : Lean.Literal → Lean.Json
+private def _root_.{serializer_prefix}_literal : Lean.Literal → Lean.Json
   | .natVal value@_ =>
       Lean.Json.arr #[Lean.Json.str "nat", Lean.ToJson.toJson value]
   | .strVal value@_ =>
       Lean.Json.arr #[Lean.Json.str "str", Lean.Json.str value]
 
-private partial def {serializer_prefix}_expr :
+private partial def _root_.{serializer_prefix}_expr :
     Lean.Expr → Lean.Json
   | .bvar index@_ =>
       Lean.Json.arr #[Lean.Json.str "bvar", Lean.ToJson.toJson index]
@@ -9205,30 +9758,41 @@ private partial def {serializer_prefix}_expr :
   | .mvar id@_ =>
       Lean.Json.arr #[Lean.Json.str "mvar", Lean.Json.str id.name.toString]
   | .sort level@_ =>
-      Lean.Json.arr #[Lean.Json.str "sort", {serializer_prefix}_level level]
+      Lean.Json.arr #[Lean.Json.str "sort", _root_.{serializer_prefix}_level level]
   | .const name@_ levels@_ =>
       Lean.Json.arr #[Lean.Json.str "const", Lean.Json.str name.toString,
-        Lean.Json.arr (levels.toArray.map {serializer_prefix}_level)]
+        Lean.Json.arr (levels.toArray.map _root_.{serializer_prefix}_level)]
   | .app fn@_ arg@_ =>
       Lean.Json.arr #[Lean.Json.str "app", {serializer_prefix}_expr fn,
         {serializer_prefix}_expr arg]
   | .lam _ domain@_ body@_ info@_ =>
-      Lean.Json.arr #[Lean.Json.str "lam", {serializer_prefix}_binderInfo info,
+      Lean.Json.arr #[Lean.Json.str "lam", _root_.{serializer_prefix}_binderInfo info,
         {serializer_prefix}_expr domain, {serializer_prefix}_expr body]
   | .forallE _ domain@_ body@_ info@_ =>
-      Lean.Json.arr #[Lean.Json.str "forall", {serializer_prefix}_binderInfo info,
+      Lean.Json.arr #[Lean.Json.str "forall", _root_.{serializer_prefix}_binderInfo info,
         {serializer_prefix}_expr domain, {serializer_prefix}_expr body]
   | .letE _ type@_ value@_ body@_ nonDependent@_ =>
       Lean.Json.arr #[Lean.Json.str "let", Lean.ToJson.toJson nonDependent,
         {serializer_prefix}_expr type, {serializer_prefix}_expr value,
         {serializer_prefix}_expr body]
   | .lit literal@_ =>
-      Lean.Json.arr #[Lean.Json.str "lit", {serializer_prefix}_literal literal]
+      Lean.Json.arr #[Lean.Json.str "lit", _root_.{serializer_prefix}_literal literal]
   | .mdata _ body@_ => {serializer_prefix}_expr body
   | .proj typeName@_ index@_ projected@_ =>
       Lean.Json.arr #[Lean.Json.str "proj", Lean.Json.str typeName.toString,
         Lean.ToJson.toJson index, {serializer_prefix}_expr projected]
 
+private def _root_.{serializer_prefix}_sameIdentity (left right : Lean.Expr) : Bool :=
+  (_root_.{serializer_prefix}_expr left).compress == (_root_.{serializer_prefix}_expr right).compress
+
+private def _root_.{serializer_prefix}_nat (value : Nat) : Lean.Json :=
+  Lean.ToJson.toJson value
+
+private def _root_.{serializer_prefix}_emit (payload : Lean.Json) : Lean.Elab.Term.TermElabM Unit :=
+  Lean.logInfo ("MINI_RESIDUAL_BATCH_{nonce}:" ++ payload.compress)
+"""
+
+        serializer = f"""
 private def {serializer_prefix}_parse
     (category : Lean.Name) (source : String) : Lean.CoreM Lean.Syntax := do
   match Lean.Parser.runParserCategory (← Lean.getEnv) category source with
@@ -9540,6 +10104,12 @@ private def {serializer_prefix}_elabType
                 "          unless ← Lean.Meta.withNewMCtxDepth <|",
                 "              Lean.Meta.isDefEq closed replayed do",
                 '            Lean.throwError "residual source round-trip changed its type"',
+                # Definitional equality can hide different inferred instance
+                # expressions. Preserve the receipt's captured identity by
+                # falling back to explicit source whenever compact printing
+                # changes the closed expression's serialized structure.
+                f"          unless _root_.{serializer_prefix}_sameIdentity closed replayed do",
+                '            Lean.throwError "residual source round-trip changed its structural identity"',
                 "          let messages := (← Lean.Core.getMessageLog).reportedPlusUnreported.toArray",
                 "          if (messages.extract messageCount messages.size).any (fun m => m.severity matches .error) then",
                 '            Lean.throwError "residual source round-trip logged errors"',
@@ -9554,9 +10124,9 @@ private def {serializer_prefix}_elabType
                 "            renderSource true",
                 "          | exception@_ => throw exception",
                 "        pure <| Lean.Json.mkObj [",
-                '          ("slot", Lean.ToJson.toJson slot),',
+                f'          ("slot", _root_.{serializer_prefix}_nat slot),',
                 '          ("source", Lean.Json.str source),',
-                f'          ("expr", {serializer_prefix}_expr closed)',
+                f'          ("expr", _root_.{serializer_prefix}_expr closed)',
                 "        ]",
                 "      goalPayloads := goalPayloads.push goalPayload",
                 "    pure goalPayloads",
@@ -9566,11 +10136,11 @@ private def {serializer_prefix}_elabType
                 f'      Lean.throwError "{postprocess_marker}"',
                 "  | exception@_ => throw exception",
                 "  let payload := Lean.Json.mkObj [",
-                f'    ("version", Lean.ToJson.toJson {_LEAN_RESIDUAL_BATCH_FORMAT_VERSION}),',
-                f'    ("parentExpr", {serializer_prefix}_expr statementType),',
+                f'    ("version", _root_.{serializer_prefix}_nat {_LEAN_RESIDUAL_BATCH_FORMAT_VERSION}),',
+                f'    ("parentExpr", _root_.{serializer_prefix}_expr statementType),',
                 '    ("goals", Lean.Json.arr goalPayloads)',
                 "  ]",
-                f'  Lean.logInfo m!"MINI_RESIDUAL_BATCH_{nonce}:{{payload.compress}}"',
+                f"  _root_.{serializer_prefix}_emit payload",
             )
         )
         # Keep finalization and attestation in one command. Lean resets message
@@ -9612,6 +10182,9 @@ private def {serializer_prefix}_elabType
             for part in (
                 preamble.strip(),
                 universe_decl,
+                # Freeze JSON instances and equality before helper instances
+                # can alter the expression identity recorded in the receipt.
+                identity_serializer.strip(),
                 helper_inventory.strip(),
                 helper_inventory_before,
                 lemma_block.strip(),
@@ -9734,9 +10307,17 @@ private def {serializer_prefix}_elabType
                 file_path=str(file_path or ""),
                 attempted=True,
             )
+        # The CLI prints this trusted info message directly. Accept the LSP
+        # envelope only for this generated file, so text inside another
+        # diagnostic cannot masquerade as a second source-location prefix.
+        diagnostic_prefix = (
+            rf"(?:{re.escape(str(file_path.resolve()))}:\d+:\d+:[ \t]+info:[ \t]+)?"
+            if file_path is not None else ""
+        )
         marker_re = re.compile(
-            rf"(?m)^MINI_RESIDUAL_BATCH_{re.escape(nonce)}:"
-            r"(\{[^\r\n]*\})\s*$"
+            rf"(?m)^{diagnostic_prefix}"
+            rf"MINI_RESIDUAL_BATCH_{re.escape(nonce)}:"
+            r"(\{[^\r\n]*\})[ \t]*\r?$"
         )
         marker_matches = list(marker_re.finditer(output))
         if len(marker_matches) != 1:

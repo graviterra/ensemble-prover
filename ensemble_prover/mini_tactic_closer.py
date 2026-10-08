@@ -17,7 +17,7 @@ import inspect
 import math
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from .deadline_guard import outer_guard_timeout_s
@@ -168,6 +168,11 @@ class TacticAttempt:
     partial_proof_stub: str = ""
     partial_stub_validated: bool = False
     exception: str = ""
+    stage_timings: dict[str, float] = field(default_factory=dict)
+    execution_metadata: dict[str, Any] = field(default_factory=dict)
+    pending_reference_confirmation: bool = False
+    portfolio_lane_key: str = ""
+    check_timeout_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -747,6 +752,8 @@ class TacticCloserBackend(Protocol):
         candidate_portfolio_offset: int = 0,
         candidate_attempt_limit: int = 0,
         candidate_timeout_floor_s: float = 0.0,
+        candidate_reference_confirmation_pending: bool = False,
+        allow_pending_reference_confirmation: bool = False,
         suppressed_proofs: Optional[Sequence[str]] = None,
         source_prefixes: Optional[Sequence[str]] = None,
         excluded_source_prefixes: Optional[Sequence[str]] = None,
@@ -1935,6 +1942,8 @@ async def _run_check(
     timeout_s: float,
     attempt_observer: Optional[LeanAttemptObserver] = None,
     attempt_metadata: Optional[Mapping[str, Any]] = None,
+    force_reference: bool = False,
+    allow_pending_reference_confirmation: bool = False,
 ) -> Any:
     check = getattr(lean, "check", None)
     if check is None:
@@ -1956,6 +1965,10 @@ async def _run_check(
         "check_kind": "mini_tactic_closer",
         "dispatch_observer": backend_dispatch_observer,
     }
+    if force_reference:
+        proposed_kwargs["force_reference"] = True
+    if allow_pending_reference_confirmation:
+        proposed_kwargs["allow_pending_reference_confirmation"] = True
     kwargs = _accepted_kwargs(check, proposed_kwargs)
     # ``remaining`` is the checker's own budget (``timeout_s`` above). Arming
     # the lease and the wait_for with that same number made three timers race
@@ -2061,6 +2074,13 @@ def _attempt_from_result(
         remaining_goals=remaining_goals,
         partial_proof_stub=candidate.proof if partial_stub_validated else "",
         partial_stub_validated=partial_stub_validated,
+        stage_timings={
+            str(key): float(value)
+            for key, value in (getattr(result, "stage_timings", {}) or {}).items()
+            if type(value) in {int, float} and math.isfinite(value) and value >= 0
+        },
+        execution_metadata=dict(getattr(result, "execution_metadata", {}) or {}),
+        pending_reference_confirmation=bool(getattr(result, "pending_reference_confirmation", False)),
     )
 
 
@@ -2160,6 +2180,9 @@ class DeterministicTacticBackend:
         candidate_portfolio_offset: int = 0,
         candidate_attempt_limit: int = 0,
         candidate_timeout_floor_s: float = 0.0,
+        candidate_reference_confirmation_pending: bool = False,
+        allow_pending_reference_confirmation: bool = False,
+        service_slice_s: float = 0.0,
         suppressed_proofs: Optional[Sequence[str]] = None,
         source_prefixes: Optional[Sequence[str]] = None,
         excluded_source_prefixes: Optional[Sequence[str]] = None,
@@ -2169,8 +2192,14 @@ class DeterministicTacticBackend:
         official_answer_payload_present: Optional[bool] = None,
         attempt_observer: Optional[LeanAttemptObserver] = None,
     ) -> TacticCloseResult:
+        from .lean_runner import current_lean_deadline
+
         started = time.monotonic()
+        portfolio_lane_key = text_hash(f"{len(goal_statement)}:{goal_statement}{preamble}")
         deadline = started + max(0.0, float(timeout_s))
+        owner_deadline = current_lean_deadline()
+        if owner_deadline is not None:
+            deadline = min(deadline, owner_deadline)
         prefixes = tuple(
             str(prefix or "").strip()
             for prefix in list(source_prefixes or ())
@@ -2249,6 +2278,7 @@ class DeterministicTacticBackend:
             if max_candidates > 0:
                 candidates = candidates[: int(max_candidates)]
         pattern_key = ""
+        failed_proofs: set[str] = set()
         cache_metadata: dict[str, Any] = {
             "enabled": bool(self.pattern_cache is not None),
             "scope": (
@@ -2367,6 +2397,40 @@ class DeterministicTacticBackend:
             cache_metadata["suppressed_filtered"] = (
                 before_suppression - len(candidates)
             )
+        if not reused_portfolio and isinstance(pattern_context, Mapping):
+            from .tactic_service_history import admit_candidates
+
+            def candidate_allowed(candidate: TacticCandidate) -> bool:
+                # Deferred history can restore proofs absent from this generator.
+                # Apply the current filters before it spends admission grants.
+                source = str(candidate.source or "")
+                return (
+                    candidate.proof not in failed_proofs
+                    and candidate.proof not in suppressed
+                    and (not prefixes or source.startswith(prefixes))
+                    and (not excluded_prefixes or not source.startswith(excluded_prefixes))
+                )
+
+            candidates, renewal_lanes = admit_candidates(
+                candidates, pattern_context.get("portfolio_service_history", {}),
+                lane_key=portfolio_lane_key,
+                helper_hashes=[text_hash(block) for block in _helper_lemma_blocks(
+                    helpers, suppress_solution_placeholders=suppress_solution_placeholders,
+                    opaque_mode=opaque_mode,
+                    allow_official_answer_visibility=allow_official_answer_visibility,
+                    official_answer_payload_present=official_answer_payload_present,
+                )],
+                allowance_s=float(timeout_s),
+                provider_sequence=int(pattern_context.get("portfolio_provider_sequence", 0)),
+                drain=pattern_context.get("portfolio_drain") is True,
+                max_candidates=max_candidates,
+                candidate_filter=candidate_allowed,
+            )
+            if renewal_lanes:
+                cache_metadata["portfolio_renewal_lanes"] = renewal_lanes
+                cache_metadata["portfolio_deferred_candidates"] = sum(
+                    len(lane["deferred"]) - len(lane["admitted"]) for lane in renewal_lanes.values()
+                )
         candidates = tuple(candidates)
         requested_candidate_start = max(
             0,
@@ -2404,6 +2468,9 @@ class DeterministicTacticBackend:
             official_answer_payload_present=official_answer_payload_present,
         )
         attempts: list[TacticAttempt] = []
+        soft_slice = float(service_slice_s or 0.0)
+        if not math.isfinite(soft_slice) or soft_slice < 0:
+            raise ValueError("service slice must be finite and nonnegative")
         attempt_limit = max(0, int(candidate_attempt_limit or 0))
         candidate_stop = (
             min(len(candidates), candidate_start + attempt_limit)
@@ -2420,6 +2487,16 @@ class DeterministicTacticBackend:
             allow_official_answer_visibility=allow_official_answer_visibility,
         )
         maximum_opportunity_s = _candidate_maximum_opportunity_s(timeout_s, pattern_context)
+        resource_retries: dict[str, float] = {}
+        if isinstance(pattern_context, Mapping):
+            from .tactic_service_history import resource_retry_allowances
+
+            resource_retries = resource_retry_allowances(
+                pattern_context.get("portfolio_service_history", {}),
+                lane_key=portfolio_lane_key,
+                helper_hashes=[text_hash(block) for block in lemma_blocks],
+                allowance_s=maximum_opportunity_s,
+            )
         try:
             resumed_timeout_floor = float(candidate_timeout_floor_s)
         except (TypeError, ValueError, OverflowError):
@@ -2445,12 +2522,29 @@ class DeterministicTacticBackend:
         index = candidate_start
         timeout_retried = False
         while index < candidate_stop and (not attempt_limit or len(attempts) < attempt_limit):
+            # A service slice controls interleaving only. An admitted Lean
+            # check retains its complete opportunity and any timeout retry.
+            if attempts and soft_slice and time.monotonic() - started >= soft_slice:
+                cache_metadata["service_slice_elapsed_s"] = time.monotonic() - started
+                cache_metadata["service_slice_s"] = soft_slice
+                break
             candidate = candidates[index]
             remaining = deadline - time.monotonic()
             # Preserve the cursor when a portfolio tail cannot fund the
             # observed backend latency. A fresh call still gets its first
             # attempt even when the configured quantum is below that hint.
-            if remaining <= 0.0 or (
+            # Explicit tiny unscoped budgets retain their minimum-check
+            # semantics until their original deadline. Larger budgets and
+            # inherited deadlines cannot overfund a depleted portfolio tail.
+            legacy_subminimum_budget = (
+                owner_deadline is None and 0 < float(timeout_s) < 0.1
+            )
+            retry_allowance = resource_retries.get(candidate.proof)
+            retry_cannot_improve = retry_allowance is not None and _candidate_timeout_was_fully_funded(
+                allocated_timeout_s=retry_allowance,
+                intended_timeout_s=min(remaining, maximum_opportunity_s),
+            )
+            if remaining <= 0 or (remaining < 0.1 and not legacy_subminimum_budget) or retry_cannot_improve or (
                 attempts
                 and remaining < min(minimum_tail_budget_s, maximum_opportunity_s)
             ):
@@ -2468,16 +2562,21 @@ class DeterministicTacticBackend:
                 )
 
             attempt_started = time.monotonic()
+            # Admission advertised a stronger resource opportunity. Repeating
+            # the same divided slice cannot spend that grant meaningfully.
+            candidate_floor = max(
+                minimum_timeout_s, maximum_opportunity_s if retry_allowance is not None else 0.0,
+            )
             candidate_timeout = _candidate_timeout_s(
                 total_timeout_s=float(timeout_s),
                 remaining_s=remaining,
                 candidate_count=funded_candidate_count,
-                minimum_timeout_s=minimum_timeout_s,
+                minimum_timeout_s=candidate_floor,
             )
             candidate_intended_timeout = _candidate_intended_timeout_s(
                 total_timeout_s=float(timeout_s),
                 candidate_count=funded_candidate_count,
-                minimum_timeout_s=minimum_timeout_s,
+                minimum_timeout_s=candidate_floor,
             )
             candidate_timeout_fully_funded = _candidate_timeout_was_fully_funded(
                 allocated_timeout_s=candidate_timeout,
@@ -2502,6 +2601,9 @@ class DeterministicTacticBackend:
                     preamble,
                     lemma_blocks,
                     timeout_s=candidate_timeout,
+                    **({"force_reference": True} if candidate_reference_confirmation_pending
+                       and index == candidate_start else {}),
+                    **({"allow_pending_reference_confirmation": True} if allow_pending_reference_confirmation else {}),
                     attempt_observer=attempt_observer,
                     attempt_metadata={
                         "index": index,
@@ -2561,6 +2663,23 @@ class DeterministicTacticBackend:
                     diagnostic=str(exc)[:OUTPUT_PREVIEW_CHARS],
                     exception=type(exc).__name__,
                 )
+            if (
+                candidate_reference_confirmation_pending
+                and index == candidate_start
+                and not attempt.ok
+                and attempt.error_type in {
+                    "", "timeout", "lean_timeout", "infra_failure", "exception", "cancelled",
+                }
+            ):
+                # A restored paid proof may fail before the runner reaches
+                # its reference stage (for example during source admission).
+                # Keep the incoming intent until a definitive Lean verdict;
+                # an absent result flag cannot discard that saved proof.
+                attempt = replace(attempt, pending_reference_confirmation=True)
+            attempt = replace(
+                attempt, portfolio_lane_key=portfolio_lane_key,
+                check_timeout_s=max(0.1, candidate_timeout),
+            )
             notify_lean_attempt_observer(
                 attempt_observer,
                 "finished",
@@ -2572,7 +2691,7 @@ class DeterministicTacticBackend:
             minimum_tail_budget_s = max(
                 minimum_tail_budget_s, observed_timeout_floor_s / 1.25,
             )
-            if self.pattern_cache is not None:
+            if self.pattern_cache is not None and not attempt.pending_reference_confirmation:
                 add_cache_stats(
                     self.pattern_cache.record_attempt(
                         pattern_key,
@@ -2600,7 +2719,37 @@ class DeterministicTacticBackend:
                     candidate_portfolio=candidates,
                     next_candidate_index=index + 1,
                 )
+            if attempt.pending_reference_confirmation:
+                # A warm search produced a candidate, but only independent
+                # reference verification can accept it. Keep this exact work
+                # and give its next invocation the full learned opportunity.
+                learned_floor = max(minimum_timeout_s, candidate_timeout * 2.0)
+                self._timing_cache.record_candidate_timeout_floor(timing_key, learned_floor)
+                cache_metadata["candidate_timeout_floor_s"] = learned_floor
+                cache_metadata["pending_reference_confirmation"] = True
+                return TacticCloseResult(
+                    ok=False, proof=None, attempts=[asdict(a) for a in attempts],
+                    candidate_count=len(candidates), timeout_s=float(timeout_s),
+                    elapsed_s=round(time.monotonic() - started, 3), exit_reason="timeout",
+                    cache_metadata=dict(cache_metadata), candidate_portfolio=candidates,
+                    next_candidate_index=index,
+                )
             check_timed_out = _attempt_exhausted_check_budget(attempt)
+            if (retry_allowance is not None
+                    and attempt.error_type in {"timeout", "lean_timeout", "infra_failure", "exception"}
+                    and not _candidate_timeout_was_fully_funded(
+                        allocated_timeout_s=attempt.check_timeout_s,
+                        intended_timeout_s=maximum_opportunity_s,
+                    )):
+                # Keep a resource retry that received only a stronger tail,
+                # including infrastructure failures without timeout metadata.
+                return TacticCloseResult(
+                    ok=False, proof=None, attempts=[asdict(a) for a in attempts],
+                    candidate_count=len(candidates), timeout_s=float(timeout_s),
+                    elapsed_s=round(time.monotonic() - started, 3), exit_reason="timeout",
+                    cache_metadata=dict(cache_metadata), candidate_portfolio=candidates,
+                    next_candidate_index=index,
+                )
             whole_quantum_timed_out = check_timed_out and _candidate_timeout_was_fully_funded(
                 allocated_timeout_s=candidate_timeout,
                 intended_timeout_s=maximum_opportunity_s,
@@ -2699,6 +2848,9 @@ async def try_close_with_tactics(
     candidate_portfolio_offset: int = 0,
     candidate_attempt_limit: int = 0,
     candidate_timeout_floor_s: float = 0.0,
+    candidate_reference_confirmation_pending: bool = False,
+    allow_pending_reference_confirmation: bool = False,
+    service_slice_s: float = 0.0,
     suppressed_proofs: Optional[Sequence[str]] = None,
     source_prefixes: Optional[Sequence[str]] = None,
     excluded_source_prefixes: Optional[Sequence[str]] = None,
@@ -2735,6 +2887,8 @@ async def try_close_with_tactics(
         candidate_timeout_floor_s: Scheduling-only timeout history from an
             admitted portfolio continuation. The current deadline still caps
             every check; this does not carry a cached verdict.
+        service_slice_s: Soft elapsed allowance before yielding the remaining
+            portfolio. An already admitted check is never shortened by it.
         suppressed_proofs: Per-call proof bodies to skip without writing them
             into the cache's terminal failure set.
         source_prefixes: Optional source prefixes used to restrict the generated
@@ -2768,6 +2922,9 @@ async def try_close_with_tactics(
         ),
         "candidate_attempt_limit": max(0, int(candidate_attempt_limit or 0)),
         "candidate_timeout_floor_s": candidate_timeout_floor_s,
+        "candidate_reference_confirmation_pending": candidate_reference_confirmation_pending,
+        "allow_pending_reference_confirmation": allow_pending_reference_confirmation,
+        "service_slice_s": service_slice_s,
         "suppressed_proofs": tuple(suppressed_proofs or ()),
         "source_prefixes": tuple(source_prefixes or ()),
         "excluded_source_prefixes": tuple(excluded_source_prefixes or ()),

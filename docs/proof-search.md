@@ -7,6 +7,8 @@ attempts to assemble a complete proof.
 
 For executable setup examples, use the [CLI quick start](CLI_QUICKSTART.md).
 For model choices, see [providers and roles](providers.md).
+For verification reuse and resource accounting, see
+[Lean contexts and closure scheduling](lean-contexts.md).
 
 ## From input to checked result
 

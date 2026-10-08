@@ -10,6 +10,12 @@ representation; recursive work executes inside bounded child sessions.
 from __future__ import annotations
 
 from ..live_math import describe_dispatch
+from .execution_service import (
+    DetachedExecutionSettlement, detached_execution_callback,
+    ExecutionServiceFrame, activate_execution_service_frame,
+    current_execution_service_frame, reset_execution_service_frame,
+    record_execution_observation,
+)
 
 import asyncio
 import array
@@ -10829,6 +10835,10 @@ class MiniSession:
         default_factory=dict
     )
     _inflight_action_dispatch_id: str = ""
+    execution_session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    _detached_execution_settlements: List[DetachedExecutionSettlement] = field(
+        default_factory=list, repr=False,
+    )
     cost_governed_force_static_conversation_turns: int = 0
 
     # Scope tracking.
@@ -17769,7 +17779,10 @@ class MiniSession:
     ) -> None:
         """Remember revoked tails without giving them scheduler control."""
 
+        service_frame = current_execution_service_frame()
         for task in tasks:
+            if service_frame is not None and not task.done():
+                service_frame.detached_tasks.add(task)
             if not _isolated_dispatch_tail_blocks_scheduler(task):
                 continue
             self._pending_isolated_dispatch_tails.add(task)
@@ -18150,6 +18163,12 @@ class MiniSession:
         self._durabilize_inflight_provider_exposure()
         reason = str(self._dispatch_generation_recycle_reason or "").strip()
         snapshot = copy.deepcopy(self._dispatch_generation_resume_snapshot)
+        # Scheduler restoration rolls back semantic attempts, not physical
+        # execution. Preserve resource owners before replacing the budgets.
+        charged_execution_budgets = {
+            action_id: budget for action_id, budget in self.budgets.items()
+            if budget.execution_receipts
+        }
         failure_receipts = copy.deepcopy(self.deterministic_dispatch_failures)
         charged_governor_elapsed = float(self.run_governor_elapsed_s or 0.0)
         charged_governor_actions = int(
@@ -18185,6 +18204,37 @@ class MiniSession:
                 except Exception:
                     pass
                 raise
+        for action_id, charged_budget in charged_execution_budgets.items():
+            restored_budget = self.budgets.get(action_id)
+            if restored_budget is charged_budget:
+                continue
+            if restored_budget is None:
+                restored_budget = ActionBudget(
+                    max_invocations=charged_budget.max_invocations,
+                    max_total_seconds=charged_budget.max_total_seconds,
+                    scope=charged_budget.scope,
+                    max_aggregate_invocations=charged_budget.max_aggregate_invocations,
+                    max_aggregate_seconds=charged_budget.max_aggregate_seconds,
+                    historical_execution_cost_incomplete=charged_budget.historical_execution_cost_incomplete,
+                )
+                self.budgets[action_id] = restored_budget
+            for key, receipt in charged_budget.execution_receipts.items():
+                if key in restored_budget.execution_receipts:
+                    if receipt["details"].get("detached_tail_pending") is False:
+                        restored_budget.settle_execution_tail(key)
+                    continue
+                restored_budget.record_execution(
+                    dispatch_id=receipt["dispatch_id"],
+                    operation_id=receipt["operation_id"],
+                    elapsed_seconds=receipt["elapsed_seconds"],
+                    nested_seconds=receipt["nested_seconds"],
+                    productive=receipt["productive"],
+                    disposition=receipt["disposition"],
+                    details=copy.deepcopy(receipt["details"]),
+                    ownership=dict(receipt["ownership"]),
+                )
+        for settlement in self._detached_execution_settlements:
+            settlement.budget = self.budgets[settlement.action_id]
         self.deterministic_dispatch_failures.update(failure_receipts)
         self.run_governor_elapsed_s = max(
             float(self.run_governor_elapsed_s or 0.0),
@@ -24188,6 +24238,10 @@ class MiniSession:
                 return True
 
             started = time.monotonic()
+            dispatch_service_frame = ExecutionServiceFrame(
+                session_id=self.execution_session_id, dispatch_id=action_dispatch_id,
+                started=started, parent=current_execution_service_frame(),
+            )
             try:
                 dispatch_input_identity = self._dispatch_input_identity(action)
             except Exception:
@@ -24209,6 +24263,7 @@ class MiniSession:
             dispatch_session._inflight_provider_exposure_tracker = (
                 session_provider_exposure_tracker
             )
+            execution_service_token = activate_execution_service_frame(dispatch_service_frame)
             try:
                 with (
                     bind_llm_usage_context(usage_context),
@@ -24259,8 +24314,19 @@ class MiniSession:
                             # not invoked a second time.
                             dispatch_stage_authority_restored = True
                     finally:
-                        task_tracker.close()
-                        dispatch_session._durabilize_inflight_provider_exposure()
+                        try:
+                            task_tracker.close()
+                            dispatch_session._durabilize_inflight_provider_exposure()
+                        finally:
+                            try:
+                                dispatch_session._charge_action_execution(
+                                    MiniOutcome(action_id=action.id, solved=False, proof=None,
+                                                cost_seconds=time.monotonic() - started),
+                                    dispatch_id=action_dispatch_id,
+                                    service_frame=dispatch_service_frame, disposition="cancelled",
+                                )
+                            finally:
+                                reset_execution_service_frame(execution_service_token)
                 except BaseException as barrier_error:
                     if dispatch_session._dispatch_worker_poisoned:
                         self._dispatch_worker_poisoned = True
@@ -24350,7 +24416,18 @@ class MiniSession:
                     )
                     _LOGGER.exception("MiniSession action %r raised", action.id)
             except BaseException:
-                task_tracker.close()
+                try:
+                    task_tracker.close()
+                finally:
+                    try:
+                        dispatch_session._charge_action_execution(
+                            MiniOutcome(action_id=action.id, solved=False, proof=None,
+                                        cost_seconds=time.monotonic() - started),
+                            dispatch_id=action_dispatch_id,
+                            service_frame=dispatch_service_frame, disposition="failed_or_detached",
+                        )
+                    finally:
+                        reset_execution_service_frame(execution_service_token)
                 raise
             try:
                 detached_dispatch_tasks = (
@@ -24377,7 +24454,20 @@ class MiniSession:
                     )
                 raise
             finally:
-                task_tracker.close()
+                try:
+                    task_tracker.close()
+                finally:
+                    try:
+                        dispatch_session._charge_action_execution(
+                            outcome, dispatch_id=action_dispatch_id,
+                            elapsed_seconds=max(outcome.cost_seconds, time.monotonic() - started),
+                            service_frame=dispatch_service_frame,
+                            disposition=("failed_or_detached" if dispatch_exception
+                                         or dispatch_session._dispatch_generation_recycle_required
+                                         else "settled"),
+                        )
+                    finally:
+                        reset_execution_service_frame(execution_service_token)
             if detached_dispatch_tasks > 0:
                 # Settlement has restored the only protected live-dispatch
                 # fields (terminal proof authority). Do not claim a full
@@ -24450,6 +24540,14 @@ class MiniSession:
                 )
             hook_detachments = 0
             durable_planner_launch = None
+            publication_started = time.monotonic()
+            publication_frame = ExecutionServiceFrame(
+                session_id=dispatch_session.execution_session_id,
+                dispatch_id=action_dispatch_id, operation_id="outcome_publication",
+                started=publication_started, parent=dispatch_service_frame.parent,
+            )
+            publication_token = activate_execution_service_frame(publication_frame)
+            publication_settled = False
             try:
                 dispatch_session._inflight_action_dispatch_id = ""
                 dispatch_session._stamp_outcome_dispatch_metadata(
@@ -24527,6 +24625,7 @@ class MiniSession:
                     restore_dispatch_stage_authority_once()
                 # No action-owned work remains after the settlement barrier
                 # and synchronous apply hook.
+                publication_settled = True
             except BaseException:
                 self._accrue_run_governor_elapsed()
                 if dispatch_session._dispatch_generation_recycle_required:
@@ -24538,6 +24637,18 @@ class MiniSession:
                         dispatch_session._dispatch_worker_poison_reason or ""
                     )
                 raise
+            finally:
+                try:
+                    publication_elapsed = time.monotonic() - publication_started
+                    dispatch_session._charge_action_execution(
+                        replace(outcome, cost_seconds=publication_elapsed,
+                                metadata=dict(outcome.metadata)),
+                        dispatch_id=action_dispatch_id,
+                        service_frame=publication_frame,
+                        disposition="settled" if publication_settled else "failed_or_detached",
+                    )
+                finally:
+                    reset_execution_service_frame(publication_token)
             if dispatch_session._dispatch_generation_recycle_required:
                 self._resume_dispatch_generation(failed_action_id=action.id)
                 continue
@@ -24770,6 +24881,7 @@ class MiniSession:
             case_id=f"{self.scope}:iter:{int(self.iteration or 0)}",
             include_proof_state=True,
             compact_proof_state=True,
+            compact_execution=True,
         )
         self._latest_pre_select_snapshot = copy.deepcopy(snapshot)
         return snapshot
@@ -24904,6 +25016,155 @@ class MiniSession:
         outcome.metadata.clear()
         outcome.metadata.update(stamped_metadata)
 
+    def _charge_action_execution(
+        self, outcome: MiniOutcome, *, dispatch_id: str = "",
+        elapsed_seconds: Optional[float] = None, nested_seconds: float = 0.0,
+        disposition: str = "settled",
+        service_frame: Optional[ExecutionServiceFrame] = None,
+    ) -> Dict[str, Any]:
+        """Record executed service independently of mathematical publication.
+
+        The budget owns the durable receipt. Dossier observations distinguish
+        service dispatches from completed semantic attempts, including static
+        actions which have no frontier work item.
+        """
+        metadata = outcome.metadata
+        identity = str(dispatch_id or metadata.get("action_dispatch_id") or "")
+        if not identity:
+            identity = uuid.uuid4().hex
+        metadata["action_dispatch_id"] = identity
+        operation_id = service_frame.operation_id if service_frame is not None else "action_service"
+        primary_operation = operation_id == "action_service"
+        budget = self.budgets.get(outcome.action_id)
+        if budget is None:
+            action = self.registered_action(outcome.action_id)
+            budget = ActionBudget(
+                max_invocations=1, max_total_seconds=0.0,
+                scope=self._declared_action_budget_scope(action) if action else "session",
+            )
+            self.budgets[outcome.action_id] = budget
+        details = {
+            "accounting_scope": "inclusive_admission_exclusive_wall_service",
+            "selected_work_type": str(self.selected_work_item_record.get("work_type") or ""),
+            "static_dispatch": not bool(self.selected_work_item_record),
+        }
+        execution = metadata.get("child_closure_execution_status")
+        if isinstance(execution, dict):
+            # Keep only operation measurements, never proof payloads. Missing
+            # stage measurements remain absent rather than invented zeros.
+            for key in (
+                "candidate_service_seconds", "candidate_queue_seconds", "stage_timings",
+                "candidates_started", "candidates_settled", "cursor_before", "cursor_after",
+                "context_identity", "root_tactic_candidate_attempt_count",
+            ):
+                if key in execution:
+                    details[key] = copy.deepcopy(execution[key])
+        ownership = {
+            "session_id": self.execution_session_id, "parent_session_id": "",
+            "parent_dispatch_id": "", "parent_operation_id": "",
+            "timing_scope": "inclusive_admission_exclusive_wall_service",
+        }
+        if service_frame is not None:
+            service_frame.settle(time.monotonic())
+            nested_seconds = service_frame.nested_seconds(service_frame.finished)
+            ownership = service_frame.ownership()
+            details["nested_intervals_seconds"] = [
+                [start - service_frame.started, stop - service_frame.started]
+                for start, stop in service_frame.nested_intervals(service_frame.finished)
+            ]
+            if any(not task.done() for task in service_frame.detached_tasks):
+                details["detached_tail_pending"] = True
+        receipt, fresh = budget.record_execution(
+            dispatch_id=identity, operation_id=operation_id,
+            elapsed_seconds=(outcome.cost_seconds if elapsed_seconds is None else elapsed_seconds),
+            nested_seconds=nested_seconds,
+            productive=disposition == "settled" and outcome.elapsed_is_productive(),
+            disposition=disposition, details=details,
+            ownership=ownership,
+        )
+        if primary_operation:
+            metadata["execution_receipt"] = copy.deepcopy(receipt)
+        if fresh:
+            record_execution_observation(self.dossier, outcome.action_id, receipt,
+                                         count_dispatch=primary_operation)
+            if primary_operation and (receipt["service_seconds"] > 0 or not (
+                metadata.get("scheduler_neutral") or metadata.get("preserve_action_budget")
+            )):
+                self._record_native_frontier_service(
+                    outcome.action_id,
+                    exploration_eligible=(
+                        not metadata.get("scheduler_neutral")
+                        or (type(metadata.get("formal_quantum_generation")) is int
+                            and metadata["formal_quantum_generation"] > 0
+                            and metadata.get("formal_invocations") == 1)
+                    ),
+                )
+            self._record_event({
+                "phase": "session_action_execution", "action_id": outcome.action_id,
+                "action_dispatch_id": identity, "execution_receipt": copy.deepcopy(receipt),
+                "historical_execution_cost_incomplete": budget.historical_execution_cost_incomplete,
+                "verdict": "execution_service_recorded",
+            })
+        if service_frame is not None:
+            self._settle_detached_execution_when_done(outcome.action_id, service_frame)
+        return receipt
+
+    def _settle_detached_execution_when_done(
+        self, action_id: str, frame: ExecutionServiceFrame,
+    ) -> None:
+        """Retain only resource ownership after an action loses publication rights."""
+        if frame.detached_settlement_armed or frame.finished is None:
+            return
+        pending = {task for task in frame.detached_tasks if not task.done()}
+        frame.detached_tasks.clear()
+        frame.detached_settlement_armed = True
+        if not pending:
+            return
+        # All these tasks overlap the settled boundary. Their union therefore
+        # runs from that boundary to the last completion. Share the original
+        # child list: a late nested verifier keeps its own resource owner even
+        # when its parent has already lost mathematical publication rights.
+        tail_frame = ExecutionServiceFrame(
+            session_id=frame.session_id, dispatch_id=frame.dispatch_id,
+            operation_id=f"{frame.operation_id}:detached_tail",
+            started=frame.finished, parent=frame.parent, children=frame.children,
+        )
+
+        settlement = DetachedExecutionSettlement(
+            action_id=action_id, budget=self.budgets[action_id],
+            observations=getattr(self.dossier, "action_value_observations", None),
+            frame=tail_frame, pending=pending,
+            initial_receipt_key=self.budgets[action_id].execution_key(
+                frame.dispatch_id, frame.operation_id,
+            ),
+            registry=self._detached_execution_settlements,
+        )
+        self._detached_execution_settlements.append(settlement)
+        callback = detached_execution_callback(settlement)
+        for task in pending:
+            task.add_done_callback(callback, context=contextvars.Context())
+
+    def _closure_service_should_yield(self, action_id: str = "child_closure") -> bool:
+        """Give other eligible lanes time after a closure service overshoot.
+
+        This only requests a selection opportunity. The caller keeps closure
+        as its exact fallback if no funded competitor can execute.
+        """
+        budget = self.budgets.get(action_id)
+        if budget is None:
+            return False
+        own = budget.execution_elapsed_seconds
+        other = sum(
+            candidate.execution_elapsed_seconds
+            for name, candidate in self.budgets.items() if name != action_id
+        )
+        action = self.registered_action(action_id)
+        configured_quantum = getattr(action, "service_slice_s", None)
+        if configured_quantum is None:
+            configured_quantum = getattr(getattr(self.lean, "cfg", None), "closure_service_slice_s", 30.0)
+        quantum = float(configured_quantum)
+        return quantum > 0 and own >= other + quantum
+
     async def dispatch_subaction(self, action_id: str) -> Optional[MiniOutcome]:
         """Invoke a registered action by id WITHOUT going through select_next_action.
 
@@ -24937,6 +25198,12 @@ class MiniSession:
             saved_target = self.selected_work_item
             saved_action_id = self.selected_work_item_action_id
             saved_record = dict(self.selected_work_item_record)
+            parent_service_frame = current_execution_service_frame()
+            subaction_service_frame: Optional[ExecutionServiceFrame] = None
+            subaction_service_token = None
+            subaction_started: Optional[float] = None
+            reported_subaction_outcome: Optional[MiniOutcome] = None
+            completed_subaction_outcome: Optional[MiniOutcome] = None
             saved_inflight_provider_exposure_tracker = (
                 self._inflight_provider_exposure_tracker
             )
@@ -24991,6 +25258,12 @@ class MiniSession:
                     )
                     usage_context = subaction_usage_context
                 started = time.monotonic()
+                subaction_started = started
+                subaction_service_frame = ExecutionServiceFrame(
+                    session_id=self.execution_session_id, dispatch_id=action_dispatch_id,
+                    started=started, parent=parent_service_frame,
+                )
+                subaction_service_token = activate_execution_service_frame(subaction_service_frame)
                 self._synchronize_statement_environment_for_dispatch()
                 inflight_provider_exposure_tracker = ProviderDispatchExposureTracker()
                 subaction_inflight_provider_exposure_tracker = (
@@ -25022,19 +25295,9 @@ class MiniSession:
                     usage_context=usage_context,
                     action_dispatch_id=action_dispatch_id,
                 )
-                # Consume budget so subaction time counts against the cap;
-                # iteration counter and stagnation are top-level concerns.
-                if action_id in self.budgets:
-                    if not bool((outcome.metadata or {}).get("preserve_action_budget")):
-                        self.budgets[action_id].consume(
-                            outcome.cost_seconds,
-                            productive=outcome.elapsed_is_productive(),
-                        )
-                        if outcome.exception is not None:
-                            self.budgets[action_id].mark_exhausted(
-                                f"raised:{type(outcome.exception).__name__}"
-                            )
+                reported_subaction_outcome = outcome
                 outcome, subaction_metadata = self._apply_subaction_bookkeeping(outcome)
+                completed_subaction_outcome = outcome
                 subaction_lineage_metadata = {
                     key: value
                     for key, value in dict(outcome.metadata or {}).items()
@@ -25077,24 +25340,53 @@ class MiniSession:
                 )
                 return outcome
             finally:
-                if subaction_inflight_provider_exposure_tracker is not None:
-                    accounted_during_subaction = max(
-                        0,
-                        _nonnegative_metadata_int(
-                            vars(self),
-                            "provider_dispatches_started_total",
-                        )
-                        - provider_dispatches_started_before_subaction,
+                try:
+                    try:
+                        if subaction_inflight_provider_exposure_tracker is not None:
+                            accounted_during_subaction = max(
+                                0,
+                                _nonnegative_metadata_int(
+                                    vars(self), "provider_dispatches_started_total",
+                                ) - provider_dispatches_started_before_subaction,
+                            )
+                            subaction_inflight_provider_exposure_tracker.settle_forwarded_exposure(
+                                already_accounted=accounted_during_subaction,
+                            )
+                    finally:
+                        if subaction_started is not None:
+                            # Bookkeeping can verify a root or settle provider
+                            # exposure. Finalize the resource owner only after
+                            # that work; the parent excludes this same interval.
+                            elapsed = time.monotonic() - subaction_started
+                            accounting_outcome = reported_subaction_outcome or MiniOutcome(
+                                action_id=action_id, solved=False, proof=None,
+                                cost_seconds=elapsed,
+                            )
+                            receipt = self._charge_action_execution(
+                                accounting_outcome, dispatch_id=action_dispatch_id,
+                                elapsed_seconds=max(accounting_outcome.cost_seconds, elapsed),
+                                service_frame=subaction_service_frame,
+                                disposition=("settled" if completed_subaction_outcome is not None
+                                             else "cancelled_or_unpublished"),
+                            )
+                            if (reported_subaction_outcome is not None
+                                    and not reported_subaction_outcome.metadata.get("preserve_action_budget")):
+                                self.budgets[action_id].complete_execution_attempt(receipt)
+                                if reported_subaction_outcome.exception is not None:
+                                    self.budgets[action_id].mark_exhausted(
+                                        f"raised:{type(reported_subaction_outcome.exception).__name__}"
+                                    )
+                            if completed_subaction_outcome is not None:
+                                completed_subaction_outcome.metadata["execution_receipt"] = copy.deepcopy(receipt)
+                finally:
+                    if subaction_service_token is not None:
+                        reset_execution_service_frame(subaction_service_token)
+                    self._inflight_provider_exposure_tracker = (
+                        saved_inflight_provider_exposure_tracker
                     )
-                    subaction_inflight_provider_exposure_tracker.settle_forwarded_exposure(
-                        already_accounted=accounted_during_subaction,
-                    )
-                self._inflight_provider_exposure_tracker = (
-                    saved_inflight_provider_exposure_tracker
-                )
-                self.selected_work_item = saved_target
-                self.selected_work_item_action_id = saved_action_id
-                self.selected_work_item_record = saved_record
+                    self.selected_work_item = saved_target
+                    self.selected_work_item_action_id = saved_action_id
+                    self.selected_work_item_record = saved_record
         # Emit telemetry for an unregistered subaction ID so misspelled or
         # unavailable actions remain visible instead of becoming silent no-ops.
         self._record_event(
@@ -28627,6 +28919,10 @@ class MiniSession:
                 or post_provider_receipt_infrastructure_failure
             )
         )
+        execution_receipt = self._charge_action_execution(action_reported_outcome)
+        metadata["action_dispatch_id"] = execution_receipt["dispatch_id"]
+        metadata["execution_receipt"] = copy.deepcopy(execution_receipt)
+        completed_execution_attempt = False
         if preserve_action_budget:
             self._record_event(
                 {
@@ -28646,10 +28942,8 @@ class MiniSession:
             # The action-reported receipt decides spin accounting, exactly as
             # the nested subaction dispatch does. The effective-solved gate
             # governs mathematical state, not whether provider time paid off.
-            budget.consume(
-                outcome.cost_seconds,
-                productive=action_reported_outcome.elapsed_is_productive(),
-            )
+            completed_execution_attempt = budget.complete_execution_attempt(execution_receipt)
+            metadata["execution_receipt"] = copy.deepcopy(execution_receipt)
         cleanup_continuation_identity = str(
             metadata.get("recursive_helper_cleanup_continuation_identity") or ""
         ).strip()
@@ -29308,33 +29602,11 @@ class MiniSession:
             "action_value_observations",
             None,
         )
-        # Preparatory/instrumentation outcomes (FormalStateSearch rotation,
-        # falsification probes, etc.) mark scheduler_neutral so they do not
-        # advance stagnation. Budget-preserving controller redirects similarly
-        # decline to consume the action quota (`preserve_action_budget` local
-        # above). Both must stay out of empirical calibration: counting them
-        # as attempts with zero root_progress poisons the success rate and can
-        # starve the whole action lane under global root-value ranking.
-        # Align calibration with budget consumption.
-        calibrate_action_value = not (
+        # Semantic success uses completed attempts; service-cost prediction
+        # uses every settled dispatch, including neutral continuations.
+        calibrate_action_value = completed_execution_attempt and not (
             bool(metadata.get("scheduler_neutral")) or preserve_action_budget
         )
-        # A committed formal-search quantum performs mathematical work even
-        # though its neutral outcome stays out of success-rate calibration.
-        # Debit its exploration slot before the next live context generation
-        # can be promoted again. Acceptance retries carry invocation metrics
-        # too, but do not carry a newly committed quantum generation.
-        formal_generation = metadata.get("formal_quantum_generation")
-        completed_formal_quantum = bool(
-            outcome.action_id == "formal_state_search"
-            and type(formal_generation) is int
-            and formal_generation > 0
-            and metadata.get("formal_invocations") == 1
-        )
-        if calibrate_action_value or (
-            completed_formal_quantum and not preserve_action_budget
-        ):
-            self._record_native_frontier_service(str(outcome.action_id or ""))
         if isinstance(observations, dict) and calibrate_action_value:
             action_observation = observations.setdefault(
                 str(outcome.action_id or "unknown"),
@@ -29348,9 +29620,6 @@ class MiniSession:
             action_observation["attempts"] = (
                 float(action_observation.get("attempts", 0.0) or 0.0) + 1.0
             )
-            action_observation["seconds"] = float(
-                action_observation.get("seconds", 0.0) or 0.0
-            ) + max(0.0, float(outcome.cost_seconds or 0.0))
             if final_strong_progress:
                 action_observation["root_progress"] = (
                     float(action_observation.get("root_progress", 0.0) or 0.0) + 1.0
@@ -33251,7 +33520,9 @@ class MiniSession:
             return
         try:
             from ensemble_prover.proof_graph import graph_text_hash
-            from ensemble_prover.proof_state_executor import _root_tactic_context_key
+            from ensemble_prover.proof_state_executor import (
+                _root_tactic_answer_policy, _root_tactic_context_key,
+            )
         except Exception:
             return
         problem = getattr(self, "problem", None)
@@ -33348,6 +33619,7 @@ class MiniSession:
                 max_candidates=int(
                     getattr(action, "root_tactic_max_candidates", 0) or 0
                 ),
+                answer_policy=_root_tactic_answer_policy(dossier=self.dossier),
             )
             try:
                 dependency_signature = route_dependency_signature(
@@ -34147,9 +34419,10 @@ class MiniSession:
                 0.0,
                 min(attempts, finite_number(observed.get("root_progress", 0.0))),
             )
+            service_dispatches = max(0.0, finite_number(observed.get("service_dispatches", 0.0)))
             measured_seconds = max(
                 0.0,
-                finite_number(observed.get("seconds", 0.0)),
+                finite_number(observed.get("elapsed_seconds", observed.get("seconds", 0.0))),
             )
             success_rate = (successes + 1.0) / (attempts + 2.0)
             fallback_cost = max(
@@ -34157,8 +34430,8 @@ class MiniSession:
                 finite_number(getattr(action, "cost_estimate_s", 10.0), 10.0),
             )
             expected_cost = (
-                measured_seconds / attempts
-                if attempts >= 2.0 and measured_seconds > 0.0
+                measured_seconds / (service_dispatches or attempts)
+                if (service_dispatches or attempts) >= 2.0 and measured_seconds > 0.0
                 else fallback_cost
             )
             if expected_cost >= 20.0 and not route_id:
@@ -34415,9 +34688,11 @@ class MiniSession:
             return ranked
         return ranked
 
-    def _record_native_frontier_service(self, action_id: str) -> None:
-        """Debit advisory exploration only after actual normal-budget service."""
-        if str(self.selected_work_item_action_id or "") != str(action_id or ""):
+    def _record_native_frontier_service(
+        self, action_id: str, *, exploration_eligible: bool = True,
+    ) -> None:
+        """Debit advisory exploration after service, including static dispatch."""
+        if self.selected_work_item_record and str(self.selected_work_item_action_id or "") != str(action_id or ""):
             return
         record = dict(self.selected_work_item_record or {})
         if str(record.get("work_type") or "") in {"assembly", "assemble_route"}:
@@ -34431,13 +34706,13 @@ class MiniSession:
                 else None
             )
         if not isinstance(scheduler, dict) or scheduler.get("action_id") != action_id:
-            return
+            scheduler = {}
         dossier = getattr(self, "dossier", None)
         if dossier is None:
             return
         dossier.native_scheduler_state = native_service_state(
             getattr(dossier, "native_scheduler_state", {}),
-            exploration=scheduler.get("exploration_reserved") is True,
+            exploration=exploration_eligible and scheduler.get("exploration_reserved") is True,
         )
 
     def _retire_unserviceable_frontier_prefix(
@@ -35068,7 +35343,9 @@ class MiniSession:
         except Exception:
             helper_blocks = []
         try:
-            from ensemble_prover.proof_state_executor import _root_tactic_context_key
+            from ensemble_prover.proof_state_executor import (
+                _root_tactic_answer_policy, _root_tactic_context_key,
+            )
         except Exception:
             return ""
         problem = getattr(self, "problem", None)
@@ -35088,6 +35365,7 @@ class MiniSession:
             helpers=helper_blocks,
             timeout_s=float(getattr(action, "root_tactic_timeout_s", 0.0) or 0.0),
             max_candidates=int(getattr(action, "root_tactic_max_candidates", 0) or 0),
+            answer_policy=_root_tactic_answer_policy(dossier=self.dossier),
         )
 
     @staticmethod

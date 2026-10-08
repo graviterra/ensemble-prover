@@ -11,6 +11,7 @@ than a runtime sandbox.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import (
     Any,
     ClassVar,
@@ -449,6 +450,12 @@ class ActionBudget:
     unproductive_seconds: float = 0.0
     research_invocation_seal: Optional[Dict[str, Any]] = None
     research_invocation_debits: list[str] = field(default_factory=list)
+    # Resource receipts outlive semantic portfolio continuations. Their keys
+    # bind a scheduler dispatch and its accounting operation, not a theorem.
+    execution_receipts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    execution_service_seconds: float = 0.0
+    execution_elapsed_seconds: float = 0.0
+    historical_execution_cost_incomplete: bool = False
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name == "max_aggregate_invocations":
@@ -458,6 +465,50 @@ class ActionBudget:
         object.__setattr__(self, name, value)
 
     def __post_init__(self) -> None:
+        if type(self.historical_execution_cost_incomplete) is not bool:
+            raise ValueError("invalid historical execution cost marker")
+        if not isinstance(self.execution_receipts, dict):
+            raise ValueError("invalid execution receipt ledger")
+        for key, receipt in self.execution_receipts.items():
+            if not isinstance(key, str) or not isinstance(receipt, dict):
+                raise ValueError("invalid execution receipt")
+            if (type(receipt.get("schema_version")) is not int
+                    or receipt["schema_version"] != 1) or key != self.execution_key(
+                receipt.get("dispatch_id", ""), receipt.get("operation_id", "")
+            ):
+                raise ValueError("invalid execution receipt identity")
+            for metric in ("elapsed_seconds", "nested_seconds", "service_seconds"):
+                value = receipt.get(metric)
+                if (isinstance(value, bool) or not isinstance(value, (float, int))
+                        or not math.isfinite(value) or value < 0):
+                    raise ValueError("invalid execution receipt duration")
+            if abs(receipt["elapsed_seconds"] - receipt["nested_seconds"]
+                   - receipt["service_seconds"]) > 1e-6:
+                raise ValueError("invalid exclusive execution duration")
+            if type(receipt.get("semantic_attempt_completed")) is not bool:
+                raise ValueError("invalid execution semantic completion")
+            if type(receipt.get("productive")) is not bool:
+                raise ValueError("invalid execution productivity receipt")
+            if not isinstance(receipt.get("details"), dict):
+                raise ValueError("invalid execution receipt details")
+            if not isinstance(receipt.get("ownership"), dict):
+                raise ValueError("invalid execution ownership")
+        if (not math.isfinite(self.execution_service_seconds)
+                or self.execution_service_seconds < 0
+                or abs(self.execution_service_seconds - sum(
+                    float(receipt["service_seconds"]) for receipt in self.execution_receipts.values()
+                )) > 1e-5):
+            raise ValueError("execution service total does not match receipts")
+        if (not math.isfinite(self.execution_elapsed_seconds)
+                or self.execution_elapsed_seconds < 0
+                or abs(self.execution_elapsed_seconds - sum(
+                    float(receipt["elapsed_seconds"]) for receipt in self.execution_receipts.values()
+                )) > 1e-5):
+            raise ValueError("execution elapsed total does not match receipts")
+        if (self.execution_elapsed_seconds > self.total_seconds + 1e-5
+                or sum(int(r["semantic_attempt_completed"])
+                       for r in self.execution_receipts.values()) > self.invocations):
+            raise ValueError("execution receipts exceed action budget accounting")
         debits = self.research_invocation_debits
         if (not isinstance(debits, list)
                 or any(not isinstance(token, str) or not token for token in debits)
@@ -492,6 +543,50 @@ class ActionBudget:
         }:
             raise ValueError(f"unsupported action budget scope: {self.scope!r}")
 
+        # Runtime-only version history is deliberately outside the dataclass
+        # fields: standalone checkpoints retain the ordinary receipt map.
+        from .execution_receipt_history import ExecutionReceiptHistory
+
+        self._execution_history = ExecutionReceiptHistory(self.execution_receipts)
+        self._execution_version = 0
+        self._execution_completed_count = sum(
+            int(r["semantic_attempt_completed"]) for r in self.execution_receipts.values()
+        )
+        self._execution_pending_count = sum(
+            r["details"].get("detached_tail_pending") is True
+            for r in self.execution_receipts.values()
+        )
+        self._execution_projection_only = False
+        self._execution_projection_cursor: Dict[str, Any] = {}
+
+    def execution_cursor(self) -> Dict[str, Any]:
+        """Capture exact local receipt ownership without copying its history."""
+        if self._execution_projection_only:
+            return dict(self._execution_projection_cursor)
+        return {
+            "schema_version": 1,
+            "history_id": self._execution_history.identity,
+            "version": self._execution_version,
+            "receipt_count": len(self.execution_receipts),
+            "completed_count": self._execution_completed_count,
+            "pending_count": self._execution_pending_count,
+        }
+
+    def _require_execution_ownership(self) -> None:
+        if self._execution_projection_only:
+            raise ValueError("scheduler accounting projection cannot resume execution")
+
+    def settle_execution_tail(self, key: str) -> None:
+        """Version a pending-tail update so older cutpoints remain immutable."""
+        self._require_execution_ownership()
+        receipt = self.execution_receipts.get(key)
+        if receipt is not None and receipt["details"].get("detached_tail_pending") is True:
+            receipt["details"]["detached_tail_pending"] = False
+            self._execution_pending_count -= 1
+            self._execution_version = self._execution_history.append(
+                self._execution_version, key, "detached_tail_pending", False,
+            )
+
     def exhausted(self) -> bool:
         if (
             self.scope == "session"
@@ -519,10 +614,82 @@ class ActionBudget:
         return False
 
     def consume(self, cost_seconds: float, *, productive: bool = False) -> None:
+        self.consume_elapsed(cost_seconds, productive=productive)
         self.invocations += 1
-        self.total_seconds += float(cost_seconds or 0.0)
+
+    def consume_elapsed(self, cost_seconds: float, *, productive: bool = False) -> None:
+        """Debit executed resource time without finishing a semantic attempt."""
+        seconds = float(cost_seconds or 0.0)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("action elapsed time must be finite and nonnegative")
+        self.total_seconds += seconds
         if not productive:
-            self.unproductive_seconds += float(cost_seconds or 0.0)
+            self.unproductive_seconds += seconds
+
+    @staticmethod
+    def execution_key(dispatch_id: str, operation_id: str) -> str:
+        if not isinstance(dispatch_id, str) or not dispatch_id:
+            raise ValueError("execution receipt requires dispatch identity")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("execution receipt requires operation identity")
+        return f"{len(dispatch_id)}:{dispatch_id}{operation_id}"
+
+    def record_execution(
+        self, *, dispatch_id: str, operation_id: str, elapsed_seconds: float,
+        nested_seconds: float = 0.0, productive: bool = False,
+        disposition: str = "settled", details: Optional[Dict[str, Any]] = None,
+        ownership: Optional[Dict[str, str]] = None,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Commit one resource debit; replay never charges the same owner twice.
+
+        Admission and fairness retain inclusive duration; exclusive service
+        has a separate total for resource rollups across nested operations.
+        """
+        self._require_execution_ownership()
+        key = self.execution_key(dispatch_id, operation_id)
+        existing = self.execution_receipts.get(key)
+        if existing is not None:
+            return existing, False
+        elapsed = float(elapsed_seconds)
+        nested = float(nested_seconds)
+        if (not math.isfinite(elapsed) or not math.isfinite(nested)
+                or elapsed < 0 or nested < 0):
+            raise ValueError("invalid execution elapsed duration")
+        nested = min(elapsed, nested)
+        receipt: Dict[str, Any] = {
+            "schema_version": 1, "dispatch_id": dispatch_id,
+            "operation_id": operation_id, "elapsed_seconds": elapsed,
+            "nested_seconds": nested, "service_seconds": elapsed - nested,
+            "productive": bool(productive),
+            "semantic_attempt_completed": False, "disposition": disposition,
+            "details": dict(details or {}),
+            "ownership": dict(ownership or {}),
+        }
+        self.consume_elapsed(elapsed, productive=productive)
+        self.execution_service_seconds += receipt["service_seconds"]
+        self.execution_elapsed_seconds += elapsed
+        self.execution_receipts[key] = receipt
+        self._execution_pending_count += receipt["details"].get("detached_tail_pending") is True
+        self._execution_version = self._execution_history.append(
+            self._execution_version, key, "receipt", receipt,
+        )
+        return receipt, True
+
+    def complete_execution_attempt(self, receipt: Dict[str, Any]) -> bool:
+        """Count portfolio completion independently from its executed slices."""
+        self._require_execution_ownership()
+        key = self.execution_key(receipt["dispatch_id"], receipt["operation_id"])
+        if self.execution_receipts.get(key) is not receipt:
+            raise ValueError("execution receipt is not owned by this budget")
+        if receipt["semantic_attempt_completed"]:
+            return False
+        receipt["semantic_attempt_completed"] = True
+        self.invocations += 1
+        self._execution_completed_count += 1
+        self._execution_version = self._execution_history.append(
+            self._execution_version, key, "semantic_attempt_completed", True,
+        )
+        return True
 
     def mark_exhausted(self, reason: str) -> None:
         # Bumps invocation count past the cap so ``exhausted()`` returns True.

@@ -207,6 +207,7 @@ _SESSION_SCALAR_STATE_KEYS: tuple[str, ...] = (
     "run_governor_terminal_recorded",
     "root_finalized",
     "scope",
+    "execution_session_id",
 )
 
 _SESSION_BOOLEAN_STATE_KEYS = frozenset(
@@ -272,6 +273,7 @@ _SESSION_NONNEGATIVE_COUNTER_STATE_KEYS = frozenset(
 )
 _SESSION_STRING_STATE_KEYS = frozenset(
     {
+        "execution_session_id",
         "pending_fallback_action_id",
         "last_llm_content",
         "last_giveup_match",
@@ -671,8 +673,19 @@ class ReplayDecision:
     evidence: str
 
 
-def _budget_to_record(budget: ActionBudget) -> JSONDict:
-    return {
+def _budget_to_record(budget: ActionBudget, *, compact_execution: bool = False) -> JSONDict:
+    # Small settled cutpoints stay self-contained for inspection and legacy
+    # tools. A live tail needs local ownership even below the size bound so
+    # recycling does not turn its temporary gap into historical cost loss.
+    # Durable session records always retain full receipt evidence.
+    compact = compact_execution and (
+        len(budget.execution_receipts) > 64
+        or budget._execution_pending_count > 0
+        or budget._execution_projection_only
+    )
+    if budget._execution_projection_only and not compact:
+        raise ValueError("scheduler accounting projection is not a durable checkpoint")
+    record = {
         "max_invocations": int(budget.max_invocations),
         "max_total_seconds": float(budget.max_total_seconds),
         "invocations": int(budget.invocations),
@@ -684,14 +697,65 @@ def _budget_to_record(budget: ActionBudget) -> JSONDict:
         "unproductive_seconds": float(budget.unproductive_seconds),
         "research_invocation_seal": copy.deepcopy(budget.research_invocation_seal),
         "research_invocation_debits": list(budget.research_invocation_debits),
+        "execution_service_seconds": budget.execution_service_seconds,
+        "execution_elapsed_seconds": budget.execution_elapsed_seconds,
+        # A checkpoint cannot reconstruct process-local work that is still
+        # detached. Preserve the known debit and explicitly label the missing
+        # tail; a later checkpoint after completion contains its full receipt.
+        "historical_execution_cost_incomplete": (
+            budget.historical_execution_cost_incomplete
+            or budget._execution_pending_count > 0
+        ),
     }
+    if compact:
+        record["execution_receipt_cursor"] = budget.execution_cursor()
+        # The diagnostic completeness flag includes live tails. Keep its
+        # historical component separate for a local rollback that still owns
+        # those tasks and can settle their exact intervals later.
+        record["execution_prior_cost_incomplete"] = budget.historical_execution_cost_incomplete
+    else:
+        record["execution_receipts"] = copy.deepcopy(budget.execution_receipts)
+    return record
 
 
-def _budget_from_record(record: Any) -> ActionBudget:
+def _budget_from_record(
+    record: Any, *, receipt_owner: Optional[ActionBudget] = None,
+    allow_execution_projection: bool = False,
+) -> ActionBudget:
     if not isinstance(record, Mapping):
         raise InvalidActionBudgetRecord("action budget record must be a mapping")
     try:
-        return ActionBudget(
+        cursor = record.get("execution_receipt_cursor")
+        projection_only = False
+        receipts = record.get("execution_receipts", {})
+        if "execution_receipt_cursor" in record:
+            from .execution_receipt_history import validate_execution_cursor
+
+            validate_execution_cursor(cursor)
+            if "execution_receipts" in record:
+                raise ValueError("conflicting execution receipt representations")
+            if type(record.get("execution_prior_cost_incomplete")) is not bool:
+                raise ValueError("invalid historical execution cost marker")
+            if (type(record.get("historical_execution_cost_incomplete")) is not bool
+                    or record["historical_execution_cost_incomplete"] != (
+                        record["execution_prior_cost_incomplete"] or cursor["pending_count"] > 0
+                    )):
+                raise ValueError("inconsistent execution cost completeness marker")
+            if (receipt_owner is not None and not receipt_owner._execution_projection_only
+                    and receipt_owner._execution_history.identity == cursor["history_id"]):
+                receipts = receipt_owner._execution_history.restore(cursor)
+            elif allow_execution_projection:
+                projection_only = True
+                receipts = {}
+            else:
+                raise ValueError("execution receipt cursor requires its local owner or a full checkpoint")
+        service_seconds = _durable_budget_seconds(
+            record.get("execution_service_seconds"), field="execution_service_seconds"
+        )
+        elapsed_seconds = _durable_budget_seconds(
+            record.get("execution_elapsed_seconds"), field="execution_elapsed_seconds"
+        )
+        budget = ActionBudget(
             max_invocations=_durable_budget_counter(
                 record.get("max_invocations"),
                 field="max_invocations",
@@ -729,7 +793,31 @@ def _budget_from_record(record: Any) -> ActionBudget:
             ),
             research_invocation_seal=copy.deepcopy(record.get("research_invocation_seal")),
             research_invocation_debits=copy.deepcopy(record.get("research_invocation_debits", [])),
+            execution_receipts=copy.deepcopy(receipts),
+            execution_service_seconds=0.0 if projection_only else service_seconds,
+            execution_elapsed_seconds=0.0 if projection_only else elapsed_seconds,
+            historical_execution_cost_incomplete=record.get(
+                "execution_prior_cost_incomplete" if cursor is not None and not projection_only
+                else "historical_execution_cost_incomplete",
+                "execution_receipts" not in record and cursor is None,
+            ),
         )
+        if cursor is not None:
+            if (service_seconds > elapsed_seconds + 1e-5
+                    or elapsed_seconds > budget.total_seconds + 1e-5
+                    or cursor["completed_count"] > budget.invocations):
+                raise ValueError("execution receipt projection exceeds action budget accounting")
+            budget._execution_version = cursor["version"]
+            budget._execution_completed_count = cursor["completed_count"]
+            budget._execution_pending_count = cursor["pending_count"]
+            if projection_only:
+                budget._execution_projection_only = True
+                budget._execution_projection_cursor = dict(cursor)
+                budget.execution_service_seconds = service_seconds
+                budget.execution_elapsed_seconds = elapsed_seconds
+            else:
+                budget._execution_history = receipt_owner._execution_history
+        return budget
     except InvalidActionBudgetRecord:
         raise
     except (TypeError, ValueError) as exc:
@@ -2082,6 +2170,7 @@ def scheduler_snapshot(
     expected: Optional[Mapping[str, Any]] = None,
     include_proof_state: bool = True,
     compact_proof_state: bool = False,
+    compact_execution: bool = False,
 ) -> JSONDict:
     """Capture the provider-free state needed before ``select_next_action``.
 
@@ -2314,7 +2403,7 @@ def scheduler_snapshot(
         "action_specs": _action_specs(session),
         "action_runtime_states": _action_runtime_states(session),
         "budgets": {
-            str(action_id): _budget_to_record(budget)
+            str(action_id): _budget_to_record(budget, compact_execution=compact_execution)
             for action_id, budget in dict(getattr(session, "budgets", {}) or {}).items()
             if isinstance(budget, ActionBudget)
         },
@@ -2400,7 +2489,11 @@ def _restore_scheduler_replay_state(session: Any, snapshot: Mapping[str, Any]) -
             pass
 
 
-def apply_scheduler_snapshot(session: Any, snapshot: Mapping[str, Any]) -> None:
+def apply_scheduler_snapshot(
+    session: Any, snapshot: Mapping[str, Any], *,
+    allow_execution_projection: bool = False,
+    allow_local_execution_cursors: bool = True,
+) -> None:
     """Apply scheduler state from ``scheduler_snapshot`` to a session.
 
     This is intentionally narrow: it restores selection-related fields and
@@ -2434,7 +2527,13 @@ def apply_scheduler_snapshot(session: Any, snapshot: Mapping[str, Any]) -> None:
     if not isinstance(raw_budgets, Mapping):
         raise InvalidActionBudgetRecord("action budgets are malformed")
     prepared_budgets: Optional[Dict[str, ActionBudget]] = {
-        str(action_id): _budget_from_record(record)
+        str(action_id): _budget_from_record(
+            record, receipt_owner=(
+                getattr(session, "budgets", {}).get(str(action_id))
+                if allow_local_execution_cursors else None
+            ),
+            allow_execution_projection=allow_execution_projection,
+        )
         for action_id, record in raw_budgets.items()
     }
     # Resolve registered-action authority before any runtime cursor is
@@ -3074,7 +3173,7 @@ def replay_scheduler_selection(session: Any, snapshot: Mapping[str, Any]) -> JSO
             f"{type(exc).__name__}: {exc}"
         )
     try:
-        apply_scheduler_snapshot(replay_session, snapshot)
+        apply_scheduler_snapshot(replay_session, snapshot, allow_execution_projection=True)
         action = replay_session.select_next_action()
         actual_action_id = str(getattr(action, "id", "") or "")
         selected_work_item = dict(

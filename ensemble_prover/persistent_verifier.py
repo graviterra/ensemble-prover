@@ -9,7 +9,8 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 PERSISTENT_VERIFIER_PROTOCOL = "persistent_verifier_transport"
 PERSISTENT_VERIFIER_VERSION = "1.0"
+DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+STDERR_TAIL_BYTES = 64 * 1024
 
 # Upper bound on how long a caller parked on an empty lane may sleep before
 # re-checking availability. Lane changes normally wake it immediately via the
@@ -116,6 +119,11 @@ class VerifierResponse:
     # None preserves legacy adapter behavior; native completion carries an
     # explicit empty status, distinct from any words quoted by diagnostics.
     runtime_status: Optional[str] = None
+    document_version: int = 0
+    context_key: str = ""
+    request_completed: bool = False
+    startup_time_s: float = 0.0
+    context_family_key: str = ""
 
 
 class PersistentVerifierError(RuntimeError):
@@ -124,6 +132,68 @@ class PersistentVerifierError(RuntimeError):
 
 class PersistentVerifierUnavailableError(PersistentVerifierError):
     pass
+
+
+class PersistentVerifierFrameError(PersistentVerifierError):
+    """A bounded transport failure, distinct from a Lean process crash."""
+
+    def __init__(self, message: str, failure_kind: str):
+        super().__init__(message)
+        self.failure_kind = failure_kind
+
+
+async def read_bounded_json_line(
+    reader: asyncio.StreamReader, *, max_bytes: int, timeout_s: float
+) -> bytes:
+    """Read fragmented NDJSON without relying on StreamReader's line limit."""
+    parts: list[bytes] = []
+    size = 0
+    async with asyncio.timeout(max(0.001, timeout_s)):
+        while True:
+            try:
+                part = await reader.readuntil(b"\n")
+            except asyncio.LimitOverrunError as exc:
+                # Consume only this frame's known non-delimiter prefix. Bytes
+                # belonging to a subsequent frame remain in the reader.
+                part = await reader.readexactly(min(exc.consumed, max_bytes - size + 1))
+                size += len(part)
+                if size > max_bytes:
+                    raise PersistentVerifierFrameError(
+                        "persistent verifier message exceeds byte limit", "transport_oversized"
+                    ) from exc
+                parts.append(part)
+                continue
+            except asyncio.IncompleteReadError as exc:
+                if size or exc.partial:
+                    raise PersistentVerifierFrameError(
+                        "persistent verifier message ended before newline", "transport_truncated"
+                    ) from exc
+                raise PersistentVerifierError("persistent verifier worker closed stdout") from exc
+            size += len(part)
+            if size > max_bytes:
+                raise PersistentVerifierFrameError(
+                    "persistent verifier message exceeds byte limit", "transport_oversized"
+                )
+            parts.append(part)
+            return b"".join(parts)
+
+
+def _process_tree_rss_bytes(pid: int) -> int:
+    """Read resident memory for the owned worker and its Lean descendants."""
+    total = 0
+    pending = [pid]
+    seen: set[int] = set()
+    while pending:
+        child = pending.pop()
+        if child in seen:
+            continue
+        seen.add(child)
+        try:
+            total += int(Path(f"/proc/{child}/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+            pending.extend(int(value) for value in Path(f"/proc/{child}/task/{child}/children").read_text().split())
+        except (OSError, ValueError, IndexError):
+            continue
+    return total
 
 
 class PersistentVerifierFatalError(PersistentVerifierError):
@@ -188,6 +258,11 @@ class PersistentVerifierWorker:
         self._worker_protocol_failures: int = 0
         self._worker_recycles: int = 0
         self._worker_cancellations: int = 0
+        self._stderr_tail = b""
+        # Document-family affinity only; exact audited identities remain in
+        # each request and response and never authorize a result from this LRU.
+        self._context_keys: OrderedDict[str, None] = OrderedDict()
+        self._rss_bytes = 0
 
     def _message_envelope(self, msg_type: str) -> Dict[str, Any]:
         return {
@@ -208,10 +283,11 @@ class PersistentVerifierWorker:
             return
         try:
             while True:
-                line = await proc.stderr.readline()
-                if not line:
+                chunk = await proc.stderr.read(8192)
+                if not chunk:
                     break
-                text = line.decode(errors="replace").rstrip()
+                self._stderr_tail = (self._stderr_tail + chunk)[-STDERR_TAIL_BYTES:]
+                text = chunk.decode(errors="replace").rstrip()
                 if text:
                     logger.debug(
                         "Persistent verifier worker stderr [%s gen=%d]: %s",
@@ -230,15 +306,21 @@ class PersistentVerifierWorker:
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise PersistentVerifierError("persistent verifier worker stdin unavailable")
-        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        proc.stdin.write((body + "\n").encode("utf-8"))
+        body = (json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+        if len(body) > int(getattr(self.cfg, "persistent_max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES)):
+            raise PersistentVerifierFrameError("persistent verifier request exceeds byte limit", "transport_oversized")
+        proc.stdin.write(body)
         await proc.stdin.drain()
 
     async def _read_message(self, timeout_s: float) -> Dict[str, Any]:
         proc = self._proc
         if proc is None or proc.stdout is None:
             raise PersistentVerifierError("persistent verifier worker stdout unavailable")
-        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=max(0.1, timeout_s))
+        raw = await read_bounded_json_line(
+            proc.stdout,
+            max_bytes=int(getattr(self.cfg, "persistent_max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES)),
+            timeout_s=timeout_s,
+        )
         if not raw:
             rc = proc.returncode if proc.returncode is not None else "unknown"
             raise PersistentVerifierError(
@@ -248,28 +330,30 @@ class PersistentVerifierWorker:
             msg = json.loads(raw.decode("utf-8"))
         except Exception as exc:
             self._transport_protocol_errors += 1
-            raise PersistentVerifierError(
-                f"invalid persistent verifier JSON: {raw[:200]!r}"
+            raise PersistentVerifierFrameError(
+                "invalid persistent verifier JSON", "transport_malformed"
             ) from exc
         if not isinstance(msg, dict):
             self._transport_protocol_errors += 1
-            raise PersistentVerifierError("persistent verifier message must be a JSON object")
+            raise PersistentVerifierFrameError("persistent verifier message must be a JSON object", "transport_malformed")
+        if type(msg.get("worker_generation")) is not int:
+            raise PersistentVerifierFrameError("persistent verifier generation must be an integer", "transport_malformed")
         if str(msg.get("protocol", "")) != PERSISTENT_VERIFIER_PROTOCOL:
             self._transport_protocol_errors += 1
-            raise PersistentVerifierError(
-                f"unexpected persistent verifier protocol: {msg.get('protocol')!r}"
+            raise PersistentVerifierFrameError(
+                "unexpected persistent verifier protocol", "protocol_desync"
             )
         if _protocol_major(str(msg.get("version", ""))) != _protocol_major(
             PERSISTENT_VERIFIER_VERSION
         ):
             self._transport_protocol_errors += 1
-            raise PersistentVerifierError(
-                f"unexpected persistent verifier version: {msg.get('version')!r}"
+            raise PersistentVerifierFrameError(
+                "unexpected persistent verifier version", "protocol_desync"
             )
         if str(msg.get("worker_id", "")) != self.worker_id:
             self._transport_protocol_errors += 1
-            raise PersistentVerifierError(
-                f"unexpected persistent verifier worker id: {msg.get('worker_id')!r}"
+            raise PersistentVerifierFrameError(
+                "unexpected persistent verifier worker id", "protocol_desync"
             )
         return msg
 
@@ -278,6 +362,8 @@ class PersistentVerifierWorker:
         stderr_task = self._stderr_task
         self._proc = None
         self._stderr_task = None
+        self._context_keys.clear()
+        self._rss_bytes = 0
         if proc is None:
             return
         await terminate_and_reap_process(
@@ -356,6 +442,9 @@ class PersistentVerifierWorker:
                             self.cfg.persistent_worker_start_timeout_s
                         ),
                         "log_level": "INFO",
+                        "max_message_bytes": int(getattr(self.cfg, "persistent_max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES)),
+                        "lsp_max_message_bytes": int(getattr(self.cfg, "persistent_lsp_max_message_bytes", 32 * 1024 * 1024)),
+                        "context_slots": int(getattr(self.cfg, "persistent_context_slots", 4)),
                     }
                 )
                 while True:
@@ -412,7 +501,8 @@ class PersistentVerifierWorker:
 
     def needs_recycle(self) -> bool:
         limit = int(getattr(self.cfg, "persistent_max_requests_per_worker", 200) or 200)
-        return limit > 0 and self._requests_served >= limit
+        rss_limit = int(getattr(self.cfg, "persistent_context_max_rss_mb", 16384)) * 1024 * 1024
+        return (limit > 0 and self._requests_served >= limit) or (rss_limit > 0 and self._rss_bytes > rss_limit)
 
     def reset_stats(self) -> None:
         self._transport_startups = 0
@@ -561,7 +651,7 @@ class PersistentVerifierWorker:
                     "metadata": dict(request.metadata or {}),
                 }
             )
-        except Exception:
+        except Exception as exc:
             # The subprocess can die between the liveness check and this write
             # (or its stdin pipe can already be broken). Convert that transport
             # failure into the same bounded fatal used for a mid-request crash
@@ -576,7 +666,7 @@ class PersistentVerifierWorker:
                 queue_wait_s=queue_wait_s,
             )
             await self._kill_process()
-            raise PersistentVerifierFatalError(response, "lean_backend_crash")
+            raise PersistentVerifierFatalError(response, getattr(exc, "failure_kind", "lean_backend_crash"))
         if dispatch_observer is not None:
             try:
                 dispatch_observer()
@@ -620,15 +710,20 @@ class PersistentVerifierWorker:
                 )
                 await self._kill_process()
                 raise PersistentVerifierFatalError(response, "timeout_poison")
-            except Exception:
-                self._worker_crashes += 1
+            except Exception as exc:
+                failure_kind = getattr(exc, "failure_kind", "lean_backend_crash")
+                if isinstance(exc, PersistentVerifierFrameError):
+                    self._worker_protocol_failures += 1
+                    self._transport_protocol_errors += 1
+                else:
+                    self._worker_crashes += 1
                 self.state = "poisoned"
                 response = VerifierResponse(
                     request_id=str(request.request_id),
                     ok=False,
                     returncode=1,
                     output=_status_with_output(
-                        "persistent verifier worker crashed",
+                        str(exc) if isinstance(exc, PersistentVerifierFrameError) else "persistent verifier worker crashed",
                         partial_output,
                     ),
                     backend_kind="persistent_process",
@@ -638,7 +733,7 @@ class PersistentVerifierWorker:
                     queue_wait_s=float(queue_wait_s),
                 )
                 await self._kill_process()
-                raise PersistentVerifierFatalError(response, "lean_backend_crash")
+                raise PersistentVerifierFatalError(response, failure_kind)
             if not self._message_matches_generation(msg):
                 self._transport_stale_messages += 1
                 continue
@@ -668,6 +763,18 @@ class PersistentVerifierWorker:
                 partial_output = str(msg.get("partial_output", "") or partial_output)
                 continue
             if msg_type == "completed":
+                if (request.metadata or {}).get("stable_context") and (
+                    msg.get("request_completed") is not True
+                    or type(msg.get("document_version")) is not int
+                    or msg["document_version"] <= 0
+                    or msg.get("context_key") != (request.metadata or {}).get("context_key")
+                    or ((request.metadata or {}).get("context_family_key") is not None
+                        and msg.get("context_family_key") != request.metadata["context_family_key"])
+                ):
+                    self.state = "poisoned"
+                    response = self._transport_failure_response(request, "persistent verifier omitted versioned context completion", partial_output="", queue_wait_s=queue_wait_s)
+                    await self._kill_process()
+                    raise PersistentVerifierFatalError(response, "protocol_desync")
                 response = VerifierResponse(
                     request_id=str(request.request_id),
                     ok=bool(msg.get("ok", False)),
@@ -681,11 +788,25 @@ class PersistentVerifierWorker:
                     ),
                     queue_wait_s=float(queue_wait_s),
                     runtime_status="",
+                    document_version=int(msg.get("document_version", 0)),
+                    context_key=str(msg.get("context_key", "")),
+                    context_family_key=str(msg.get("context_family_key", "")),
+                    request_completed=msg.get("request_completed") is True,
                 )
                 self.state = str(msg.get("worker_state_after", "idle") or "idle")
                 self._transport_completions += 1
                 self._transport_service_time_s += max(0.0, response.service_time_s)
                 self._requests_served += 1
+                context_family_key = str((request.metadata or {}).get(
+                    "context_family_key", (request.metadata or {}).get("context_key", ""),
+                ))
+                if context_family_key and (request.metadata or {}).get("stable_context"):
+                    self._context_keys[context_family_key] = None
+                    self._context_keys.move_to_end(context_family_key)
+                    while len(self._context_keys) > max(1, int(getattr(self.cfg, "persistent_context_slots", 4))):
+                        self._context_keys.popitem(last=False)
+                if self._proc is not None and getattr(self._proc, "pid", None):
+                    self._rss_bytes = _process_tree_rss_bytes(self._proc.pid)
                 return response
             if msg_type == "failed":
                 response = VerifierResponse(
@@ -908,6 +1029,8 @@ class PersistentVerifierPool:
         self._queue_wait_max_s: float = 0.0
         self._service_time_total_s: float = 0.0
         self._service_time_max_s: float = 0.0
+        self._restart_elapsed_s: float = 0.0
+        self._restarts_active: int = 0
         # Per-lane count of workers currently checked out of a sub-pool
         # queue (busy serving a request or being restarted). A lane with
         # a non-zero count can still put a worker back on its queue; a
@@ -920,6 +1043,37 @@ class PersistentVerifierPool:
         # pool.stats() so operators can verify separation in prod.
         self._request_count_main: int = 0
         self._request_count_oracle: int = 0
+        self._transport_consecutive_failures = 0
+        self._transport_failure_counts: OrderedDict[tuple[str, str], int] = OrderedDict()
+        self._transport_circuit_open_until = 0.0
+        self._transport_circuit_reason = ""
+
+    def _record_transport_failure(self, failure_kind: str, scope: str = "") -> None:
+        if failure_kind not in {"transport_oversized", "transport_truncated", "transport_malformed", "protocol_desync", "lean_backend_crash", "startup_failure", "completion_unavailable"}:
+            return
+        key = (scope, failure_kind)
+        self._transport_failure_counts[key] = self._transport_failure_counts.get(key, 0) + 1
+        self._transport_failure_counts.move_to_end(key)
+        while len(self._transport_failure_counts) > 64:
+            self._transport_failure_counts.popitem(last=False)
+        self._transport_consecutive_failures = max(self._transport_failure_counts.values())
+        threshold = max(1, int(getattr(self.cfg, "persistent_transport_failure_threshold", 2)))
+        if self._transport_consecutive_failures >= threshold:
+            self._transport_circuit_open_until = time.monotonic() + max(0.0, float(getattr(self.cfg, "persistent_transport_circuit_cooldown_s", 60.0)))
+            self._transport_circuit_reason = failure_kind
+
+    @staticmethod
+    def _take_available_worker(source_queue: "asyncio.Queue[PersistentVerifierWorker]", context_key: str) -> PersistentVerifierWorker:
+        workers = []
+        for _ in range(source_queue.qsize()):
+            workers.append(source_queue.get_nowait())
+        if not workers:
+            raise asyncio.QueueEmpty
+        selected = next((worker for worker in workers if context_key and context_key in getattr(worker, "_context_keys", {})), workers[0])
+        for worker in workers:
+            if worker is not selected:
+                source_queue.put_nowait(worker)
+        return selected
 
     def _target_queue_for(
         self, worker: PersistentVerifierWorker
@@ -1039,27 +1193,36 @@ class PersistentVerifierPool:
         worker: PersistentVerifierWorker,
         target_queue: "asyncio.Queue[PersistentVerifierWorker]",
     ) -> None:
+        started = time.monotonic()
+        self._restarts_active += 1
         try:
-            restarted = await worker.restart()
-        except BaseException:
-            restarted = False
-        if restarted and not self._closing and self._started:
-            await target_queue.put(worker)
-        elif restarted:
-            await self._close_worker_best_effort(worker)
-        elif not self._closing:
-            # Recovery failed: the worker cannot serve this lane unless a
-            # later start() rebuilds it, so it must not keep the lane looking
-            # recoverable. A worker left in a "starting"/"restarting" state
-            # would hold queued callers until the lane timeout; mark it
-            # terminal so the done callback below, which releases the lane
-            # slot and wakes those callers, lets them fall back promptly. A
-            # closing pool has already retired the worker, so leave its
-            # terminal state alone.
             try:
-                worker.state = "poisoned"
-            except Exception:
-                pass
+                restarted = await worker.restart()
+            except BaseException:
+                restarted = False
+            if restarted and not self._closing and self._started:
+                await target_queue.put(worker)
+            elif restarted:
+                await self._close_worker_best_effort(worker)
+            elif not self._closing:
+                # Recovery failed: the worker cannot serve this lane unless a
+                # later start() rebuilds it, so it must not keep the lane looking
+                # recoverable. A worker left in a "starting"/"restarting" state
+                # would hold queued callers until the lane timeout; mark it
+                # terminal so the done callback below, which releases the lane
+                # slot and wakes those callers, lets them fall back promptly. A
+                # closing pool has already retired the worker, so leave its
+                # terminal state alone.
+                try:
+                    worker.state = "poisoned"
+                except Exception:
+                    pass
+        finally:
+            # Recovery can outlive the caller and overlap other checks. Keep
+            # its complete lifetime in backend maintenance telemetry without
+            # adding it to action, startup, queue, or request-service totals.
+            self._restart_elapsed_s += max(0.0, time.monotonic() - started)
+            self._restarts_active -= 1
 
     async def _close_worker_best_effort(
         self, worker: PersistentVerifierWorker
@@ -1110,6 +1273,7 @@ class PersistentVerifierPool:
         self,
         source_queue: "asyncio.Queue[PersistentVerifierWorker]",
         request_queue_class: str,
+        context_key: str = "",
     ) -> PersistentVerifierWorker:
         """Wait for a worker without stranding a caller on a dead lane.
 
@@ -1128,7 +1292,7 @@ class PersistentVerifierPool:
         changed = getattr(source_queue, "changed", None)
         while True:
             try:
-                return source_queue.get_nowait()
+                return self._take_available_worker(source_queue, context_key)
             except asyncio.QueueEmpty:
                 pass
             if not self._lane_may_supply_worker(source_queue):
@@ -1144,7 +1308,7 @@ class PersistentVerifierPool:
             # above and the wait below is never lost.
             changed.clear()
             try:
-                return source_queue.get_nowait()
+                return self._take_available_worker(source_queue, context_key)
             except asyncio.QueueEmpty:
                 pass
             if not self._lane_may_supply_worker(source_queue):
@@ -1191,20 +1355,36 @@ class PersistentVerifierPool:
         *,
         dispatch_observer: Optional[Callable[[], None]] = None,
     ) -> VerifierResponse:
-        if not await self.start():
+        operation_started = time.monotonic()
+        if operation_started < self._transport_circuit_open_until:
+            raise PersistentVerifierUnavailableError(f"persistent transport circuit open: {self._transport_circuit_reason}")
+        try:
+            async with asyncio.timeout(max(0.001, request.timeout_s)):
+                started = await self.start()
+        except asyncio.TimeoutError as exc:
+            self._record_transport_failure("startup_failure")
+            raise PersistentVerifierUnavailableError("persistent verifier startup exceeded request deadline") from exc
+        if not started:
+            self._record_transport_failure("startup_failure")
             raise PersistentVerifierUnavailableError(
                 "persistent verifier pool unavailable"
             )
         queue_started = time.monotonic()
+        startup_time_s = max(0.0, queue_started - operation_started)
         request_queue_class = str(
             getattr(request, "queue_class", "main") or "main"
         )
         source_queue = self._pick_request_queue(request_queue_class)
-        lane_wait_s = max(1.0, float(self.cfg.persistent_worker_start_timeout_s))
+        remaining_s = request.timeout_s - (time.monotonic() - operation_started)
+        if remaining_s <= 0:
+            raise PersistentVerifierUnavailableError("persistent verifier request deadline exhausted during startup")
+        lane_wait_s = min(remaining_s, max(1.0, float(self.cfg.persistent_worker_start_timeout_s)))
         try:
             async with asyncio.timeout(lane_wait_s):
                 worker = await self._acquire_worker(
-                    source_queue, request_queue_class
+                    source_queue, request_queue_class,
+                    str((request.metadata or {}).get("context_family_key", (request.metadata or {}).get("context_key", "")))
+                    if (request.metadata or {}).get("stable_context") else "",
                 )
         except asyncio.TimeoutError as exc:
             raise PersistentVerifierUnavailableError(
@@ -1237,8 +1417,11 @@ class PersistentVerifierPool:
         worker_owned = True
 
         try:
+            remaining_s = request.timeout_s - (time.monotonic() - operation_started)
+            if remaining_s <= 0:
+                raise PersistentVerifierUnavailableError("persistent verifier request deadline exhausted in queue")
             response = await worker.execute(
-                request,
+                replace(request, timeout_s=remaining_s),
                 queue_wait_s=queue_wait_s,
                 **(
                     {"dispatch_observer": dispatch_observer}
@@ -1246,6 +1429,7 @@ class PersistentVerifierPool:
                     else {}
                 ),
             )
+            response.startup_time_s = startup_time_s
             self._service_time_total_s += max(0.0, response.service_time_s)
             self._service_time_max_s = max(
                 self._service_time_max_s, max(0.0, response.service_time_s)
@@ -1254,9 +1438,20 @@ class PersistentVerifierPool:
                 self._success_count += 1
             else:
                 self._failure_count += 1
+            # A small source-admission success does not demonstrate that the
+            # proof lane can carry a large audit result. Reset only the lane
+            # whose complete response has actually succeeded.
+            for key in list(self._transport_failure_counts):
+                if key[0] == request.mode or key[1] == "startup_failure":
+                    self._transport_failure_counts.pop(key)
+            self._transport_consecutive_failures = max(self._transport_failure_counts.values(), default=0)
+            if not self._transport_consecutive_failures:
+                self._transport_circuit_reason = ""
             return response
         except PersistentVerifierFatalError as exc:
             response = exc.response
+            response.startup_time_s = startup_time_s
+            self._record_transport_failure(exc.failure_kind, request.mode)
             self._failure_count += 1
             self._service_time_total_s += max(0.0, response.service_time_s)
             self._service_time_max_s = max(
@@ -1265,7 +1460,10 @@ class PersistentVerifierPool:
             worker_owned = False
             cleanup_task = self._schedule_restart_and_requeue(worker, target_queue)
             try:
-                await asyncio.shield(cleanup_task)
+                # Recovery belongs to the pool; it must not consume a fresh
+                # startup allowance before the caller can fund its fallback.
+                async with asyncio.timeout(max(0.001, min(0.05, request.timeout_s - (time.monotonic() - operation_started)))):
+                    await asyncio.shield(cleanup_task)
             except BaseException:
                 pass
             return response
@@ -1279,8 +1477,9 @@ class PersistentVerifierPool:
             worker_owned = False
             cleanup_task = self._schedule_restart_and_requeue(worker, target_queue)
             try:
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError:
+                async with asyncio.timeout(0.05):
+                    await asyncio.shield(cleanup_task)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             raise cancel_exc
         finally:
@@ -1295,7 +1494,8 @@ class PersistentVerifierPool:
                         target_queue,
                     )
                     try:
-                        await asyncio.shield(cleanup_task)
+                        async with asyncio.timeout(0.05):
+                            await asyncio.shield(cleanup_task)
                     except BaseException:
                         pass
                 else:
@@ -1360,6 +1560,7 @@ class PersistentVerifierPool:
         self._queue_wait_max_s = 0.0
         self._service_time_total_s = 0.0
         self._service_time_max_s = 0.0
+        self._restart_elapsed_s = 0.0
         for worker in self._workers:
             worker.reset_stats()
 
@@ -1390,6 +1591,14 @@ class PersistentVerifierPool:
             "persistent_queue_wait_s_max": float(self._queue_wait_max_s),
             "persistent_service_time_s_total": float(self._service_time_total_s),
             "persistent_service_time_s_max": float(self._service_time_max_s),
+            "persistent_restart_elapsed_s": float(self._restart_elapsed_s),
+            "persistent_restarts_active": int(self._restarts_active),
+            "persistent_restart_accounting_scope": (
+                "settled_backend_maintenance_nonadditive_with_action_wall_time"
+            ),
+            "persistent_transport_circuit_open": time.monotonic() < self._transport_circuit_open_until,
+            "persistent_transport_circuit_reason": self._transport_circuit_reason,
+            "persistent_transport_consecutive_failures": self._transport_consecutive_failures,
             "persistent_transport_startups": 0,
             "persistent_transport_startup_failures": 0,
             "persistent_transport_handshake_failures": 0,

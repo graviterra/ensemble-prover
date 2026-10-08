@@ -17,6 +17,7 @@ from threading import Lock
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .state_data import clone_json_value
+from .tactic_service_history import validate_service_history
 from .contract_identity import (
     LEAN_CONTRACT_IDENTITY_VERSION,
     has_current_lean_contract_identity,
@@ -301,9 +302,37 @@ def _proof_state_durable_sequence(value: Any) -> List[Any]:
 def validated_root_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
     """Return a bounded executable root-tactic cursor or fail closed."""
 
-    return _validated_tactic_portfolio_continuation(
+    result = _validated_tactic_portfolio_continuation(
         value, max_candidates=PROOF_STATE_ROOT_TACTIC_PORTFOLIO_MAX_CANDIDATES
     )
+    if result:
+        if "pending_reference_confirmation" in value:
+            if type(value["pending_reference_confirmation"]) is not bool:
+                return {}
+            result["pending_reference_confirmation"] = value["pending_reference_confirmation"]
+        if "candidate_timeout_floor_s" in value:
+            floor = value["candidate_timeout_floor_s"]
+            try:
+                if type(floor) not in (int, float) or not math.isfinite(floor) or floor < 0:
+                    return {}
+                result["candidate_timeout_floor_s"] = float(floor)
+            except OverflowError:
+                return {}
+        for key in ("obligation_key", "generation_context_key"):
+            if key in value:
+                item = value[key]
+                if not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{16}", item) is None:
+                    return {}
+                result[key] = item
+        if "execution_helper_hashes" in value:
+            hashes = value["execution_helper_hashes"]
+            if not isinstance(hashes, (list, tuple)) or any(
+                not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{16}", item) is None
+                for item in hashes
+            ):
+                return {}
+            result["execution_helper_hashes"] = list(hashes)
+    return result
 
 
 def _validated_tactic_portfolio_continuation(
@@ -320,7 +349,7 @@ def _validated_tactic_portfolio_continuation(
     ):
         return {}
     phase = str(value.get("phase") or "")
-    if phase not in {"direct", "active", "fallback"}:
+    if phase not in {"direct", "active", "lift", "fallback"}:
         return {}
     context_key = str(value.get("context_key") or "")
     if re.fullmatch(r"[0-9a-f]{16}", context_key) is None:
@@ -432,6 +461,10 @@ def validated_child_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
         seen.add(key)
         normalized.append({"proof": proof, "source": source})
     validated["residual_candidates"] = normalized
+    if "pending_reference_confirmation" in value:
+        if type(value["pending_reference_confirmation"]) is not bool:
+            return {}
+        validated["pending_reference_confirmation"] = value["pending_reference_confirmation"]
     if "candidate_timeout_floor_s" in value:
         floor = value["candidate_timeout_floor_s"]
         if type(floor) not in (int, float):
@@ -5434,7 +5467,10 @@ class ProofStateNode:
     # This private proof-bearing payload is emitted only by execution records;
     # generic/prompt-safe records omit it and therefore fail closed.
     root_tactic_portfolio_continuation: Dict[str, Any] = field(default_factory=dict)
+    # Scheduling history is independent of context-bound Lean acceptance.
+    root_tactic_service_history: Dict[str, Any] = field(default_factory=dict)
     child_tactic_portfolio_continuation: Dict[str, Any] = field(default_factory=dict)
+    child_tactic_service_history: Dict[str, Any] = field(default_factory=dict)
     # Durable "this child goal is provably FALSE" marker. Set only from a
     # Lean-checked + axiom-audited negation certificate (never an LLM claim), so
     # proving-oriented work (decl_probe / child_llm_prove) can be permanently
@@ -7166,6 +7202,12 @@ class ProofSearchState:
                 validated_root_tactic_portfolio_continuation(
                     record.get("root_tactic_portfolio_continuation")
                 )
+            ),
+            root_tactic_service_history=validate_service_history(
+                record.get("root_tactic_service_history")
+            ),
+            child_tactic_service_history=validate_service_history(
+                record.get("child_tactic_service_history")
             ),
             child_tactic_portfolio_continuation=(
                 validated_child_tactic_portfolio_continuation(
@@ -14273,6 +14315,7 @@ class ProofSearchState:
                             "continuation": validated_child_tactic_portfolio_continuation(
                                 node.child_tactic_portfolio_continuation
                             ),
+                            "renewal": validate_service_history(node.child_tactic_service_history),
                         }, sort_keys=True))
                         if work_type == "tactic_swarm" and node.kind == "child_goal"
                         else ""
@@ -16075,6 +16118,12 @@ class ProofSearchState:
                         validated_root_tactic_portfolio_continuation(
                             node.root_tactic_portfolio_continuation
                         )
+                    ),
+                    "root_tactic_service_history": validate_service_history(
+                        node.root_tactic_service_history
+                    ),
+                    "child_tactic_service_history": validate_service_history(
+                        node.child_tactic_service_history
                     ),
                     "child_tactic_portfolio_continuation": (
                         validated_child_tactic_portfolio_continuation(

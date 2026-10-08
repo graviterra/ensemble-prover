@@ -88,6 +88,7 @@ from .mini_subgoal_planner import (
 )
 from .mini_tactic_closer import (
     OUTPUT_PREVIEW_CHARS,
+    TacticCandidate,
     TacticCloseResult,
     TacticPatternCache,
     is_transient_tactic_close_failure,
@@ -22758,6 +22759,14 @@ async def run_mini_recursive_driver(
         if isinstance(root_tactic_portfolio_state, Mapping)
         else resume_frame
     )
+    from .mini_recursive_root_portfolio import (
+        root_portfolio_state, resumable_portfolio_generation, validated_portfolio_generation,
+    )
+    from .tactic_service_history import commit_renewal, history_for_obligation, record_attempts, renewal_work_available
+
+    root_portfolio_frame = root_portfolio_state(root_portfolio_frame)
+    root_tactic_portfolio_generation = dict(root_portfolio_frame["root_tactic_portfolio_generation"])
+    root_tactic_service_history = dict(root_portfolio_frame["root_tactic_service_history"])
     root_tactic_attempted_context_keys: set[str] = {
         str(item or "")
         for item in tuple(prior_root_tactic_context_keys or ())
@@ -22771,7 +22780,7 @@ async def run_mini_recursive_driver(
     # portfolios use absolute cursors, so this cache must not reorder/filter
     # semantic candidates as the proof-state cache is allowed to do.
     root_tactic_timing_cache = TacticPatternCache(max_entries=256, record_verdicts=False)
-    saved_tactic_timing = resume_frame.get("root_tactic_timing_cache")
+    saved_tactic_timing = root_portfolio_frame.get("root_tactic_timing_cache") or resume_frame.get("root_tactic_timing_cache")
     if isinstance(saved_tactic_timing, Mapping):
         root_tactic_timing_cache.restore_checkpoint_state(saved_tactic_timing)
     root_tactic_portfolio_continuations: dict[str, int] = {}
@@ -22781,7 +22790,7 @@ async def run_mini_recursive_driver(
         root_tactic_portfolio_phases = {
             str(key): str(phase)
             for key, phase in list(raw_portfolio_phases.items())[:256]
-            if len(str(key)) == 64 and isinstance(phase, str) and phase in {"active", "fallback"}
+            if len(str(key)) == 64 and isinstance(phase, str) and phase in {"direct", "active", "lift", "fallback"}
         }
     raw_root_tactic_portfolio_continuations = root_portfolio_frame.get(
         "root_tactic_portfolio_continuations"
@@ -23515,6 +23524,8 @@ async def run_mini_recursive_driver(
                 root_tactic_attempted_context_keys
             ),
             "root_tactic_timing_cache": root_tactic_timing_cache.checkpoint_state(),
+            "root_tactic_portfolio_generation": copy.deepcopy(root_tactic_portfolio_generation),
+            "root_tactic_service_history": copy.deepcopy(root_tactic_service_history),
             "root_tactic_portfolio_continuations": {
                 key: int(offset)
                 for key, offset in sorted(root_tactic_portfolio_continuations.items())[
@@ -24381,16 +24392,24 @@ async def run_mini_recursive_driver(
 
     async def _refresh_active_root_targets_for_helpers(
         helpers: Optional[Sequence[Any]] = None,
+        *,
+        operation_deadline_monotonic: Optional[float] = None,
     ) -> list[dict[str, Any]]:
         nonlocal active_root_targets
         helper_snapshot = list(get_helpers() if helpers is None else helpers)
+        probe_timeout_s = float(config.tactic_timeout_s)
+        if operation_deadline_monotonic is not None:
+            remaining_s = operation_deadline_monotonic - time.monotonic()
+            if remaining_s < 0.1:
+                return []
+            probe_timeout_s = min(probe_timeout_s, remaining_s) if probe_timeout_s > 0 else remaining_s
         refreshed = _frame_active_root_targets(
             await _probe_active_root_targets(
                 lean=lean,
                 root_statement=root_statement,
                 preamble=current_lean_check_preamble(),
                 helpers=helper_snapshot,
-                timeout_s=float(config.tactic_timeout_s),
+                timeout_s=probe_timeout_s,
                 record_event=_record_active_root_probe_event,
             ),
             root_statement=root_statement,
@@ -24432,12 +24451,17 @@ async def run_mini_recursive_driver(
         after_helper: str,
         helpers: Sequence[Any],
         publish_checkpoint: Optional[Callable[[str], Awaitable[None]]] = None,
+        final_drain: bool = False,
+        operation_deadline_monotonic: Optional[float] = None,
     ) -> TacticCloseResult:
+        nonlocal root_tactic_portfolio_generation, root_tactic_service_history
         helpers_snapshot = list(helpers or ())
         current_active_root_targets = _current_active_root_targets(helpers_snapshot)
         if raw_active_root_targets and not current_active_root_targets:
             current_active_root_targets = (
-                await _refresh_active_root_targets_for_helpers(helpers_snapshot)
+                await _refresh_active_root_targets_for_helpers(
+                    helpers_snapshot, operation_deadline_monotonic=operation_deadline_monotonic,
+                )
             )
         # Do not short-circuit on a durable proof when root-solved reporting is
         # suppressed (subclaim run on a shared parent dossier): the dossier's
@@ -24469,6 +24493,8 @@ async def run_mini_recursive_driver(
                 enforce_root_finalization_contract=enforce_root_finalization_contract,
                 root_tactic_timeout_s=root_tactic_timeout_s,
                 root_tactic_max_candidates=root_tactic_max_candidates,
+                **({"operation_deadline_monotonic": operation_deadline_monotonic}
+                   if operation_deadline_monotonic is not None else {}),
             )
         fingerprint = _root_tactic_context_fingerprint(
             root_statement=root_statement,
@@ -24502,6 +24528,45 @@ async def run_mini_recursive_driver(
             allow_official_answer_visibility=allow_official_answer_visibility,
             official_answer_payload_present=official_answer_payload_present,
         )
+        obligation_inputs = {
+            "root_statement": root_statement, "preamble": current_lean_check_preamble(),
+            "helpers": (), "active_root_targets": current_active_root_targets,
+            "proof_environment_fingerprint": current_root_tactic_environment_fingerprint(),
+            "suppress_solution_placeholders": suppress_solution_placeholders,
+            "opaque_mode": opaque_mode,
+            "allow_official_answer_visibility": allow_official_answer_visibility,
+            "official_answer_payload_present": official_answer_payload_present,
+        }
+        obligation_key = text_hash(_root_tactic_portfolio_execution_key(
+            **obligation_inputs, tactic_timeout_s=0.0, tactic_max_candidates=0,
+        ))
+        generation_policy_key = _root_tactic_portfolio_execution_key(
+            **obligation_inputs, tactic_timeout_s=effective_root_tactic_timeout_s,
+            tactic_max_candidates=effective_root_tactic_max_candidates,
+        )
+        helper_hashes = [text_hash(source) for helper in helpers_snapshot
+                         for source in [_helper_source_text(helper)] if source]
+        generation = resumable_portfolio_generation(
+            root_tactic_portfolio_generation, obligation_key=obligation_key,
+            execution_key=portfolio_execution_key, helper_hashes=helper_hashes,
+            generation_policy_key=generation_policy_key,
+        )
+        generation_context_key = generation.get("generation_context_key", context_key)
+        generation_execution_key = generation.get("generation_execution_key", portfolio_execution_key)
+        root_tactic_service_history = history_for_obligation(root_tactic_service_history, obligation_key)
+        from .proof_state_executor import _tactic_renewal_controls
+
+        renewal_controls = _tactic_renewal_controls(dossier)
+        renewal_controls["portfolio_drain"] = final_drain or renewal_controls["portfolio_drain"]
+        renewal_available = renewal_work_available(
+            root_tactic_service_history,
+            provider_sequence=renewal_controls["portfolio_provider_sequence"],
+            drain=renewal_controls["portfolio_drain"],
+            allowance_s=effective_root_tactic_timeout_s,
+        )
+        if renewal_available:
+            root_tactic_attempted_context_keys.discard(context_key)
+            root_tactic_direct_portfolio_exhausted_execution_keys.discard(portfolio_execution_key)
         candidate_portfolio_offset = max(
             0, int(root_tactic_portfolio_continuations.get(portfolio_execution_key, 0) or 0),
         )
@@ -24509,7 +24574,12 @@ async def run_mini_recursive_driver(
             root_tactic_portfolio_phases.get(portfolio_execution_key, "active")
             if current_active_root_targets else "direct"
         )
-        if context_key and context_key in root_tactic_attempted_context_keys:
+        if generation:
+            candidate_portfolio_offset = generation["next_candidate_index"]
+            candidate_portfolio_phase = generation["phase"]
+        if (context_key and context_key in root_tactic_attempted_context_keys
+                and not (generation and (generation_context_key != context_key
+                         or generation.get("pending_reference_confirmation")))):
             stats.root_tactic_duplicate_context_skips += 1
             result = TacticCloseResult(
                 ok=False,
@@ -24560,6 +24630,16 @@ async def run_mini_recursive_driver(
             enforce_root_finalization_contract=enforce_root_finalization_contract,
             candidate_portfolio_offset=candidate_portfolio_offset,
             candidate_portfolio_phase=candidate_portfolio_phase,
+            candidate_portfolio=(tuple(TacticCandidate(**item) for item in generation["candidates"])
+                                 if generation and generation["candidates"] else None),
+            candidate_timeout_floor_s=float(generation.get("candidate_timeout_floor_s", 0.0)),
+            candidate_reference_confirmation_pending=generation.get("pending_reference_confirmation", False),
+            allow_pending_reference_confirmation=True,
+            portfolio_service_history=root_tactic_service_history,
+            portfolio_renewal_controls=renewal_controls,
+            service_slice_s=(0.0 if final_drain else float(
+                getattr(getattr(lean, "cfg", None), "closure_service_slice_s", 30.0)
+            )),
             direct_portfolio_already_exhausted=bool(
                 not current_active_root_targets
                 and portfolio_execution_key
@@ -24568,6 +24648,8 @@ async def run_mini_recursive_driver(
             root_tactic_timeout_s=root_tactic_timeout_s,
             root_tactic_max_candidates=root_tactic_max_candidates,
             tactic_pattern_cache=root_tactic_timing_cache,
+            **({"operation_deadline_monotonic": operation_deadline_monotonic}
+               if operation_deadline_monotonic is not None else {}),
         )
         result_portfolio = tuple(getattr(result, "candidate_portfolio", ()) or ())
         next_candidate_index = max(
@@ -24575,6 +24657,28 @@ async def run_mini_recursive_driver(
             int(getattr(result, "next_candidate_index", 0) or 0),
         )
         result_cache_metadata = dict(getattr(result, "cache_metadata", {}) or {})
+        root_tactic_service_history = record_attempts(
+            commit_renewal(root_tactic_service_history, result_cache_metadata), result.attempts,
+            allowance_s=effective_root_tactic_timeout_s,
+        )
+        retry_candidate = result_cache_metadata.get("root_tactic_contract_retry_candidate")
+        if result_cache_metadata.get("root_tactic_contract_transient") is True and isinstance(retry_candidate, Mapping):
+            from .tactic_service_history import admit_candidates, retain_acceptance_retry
+
+            candidate = TacticCandidate(**retry_candidate)
+            lane_key = text_hash(f"{len(root_statement)}:{root_statement}{current_lean_check_preamble()}")
+            if lane_key not in root_tactic_service_history.get("renewal_lanes", {}):
+                _, lanes = admit_candidates(
+                    [candidate], root_tactic_service_history, lane_key=lane_key,
+                    helper_hashes=helper_hashes, allowance_s=effective_root_tactic_timeout_s,
+                    provider_sequence=renewal_controls["portfolio_provider_sequence"],
+                )
+                root_tactic_service_history = commit_renewal(
+                    root_tactic_service_history, {"portfolio_renewal_lanes": lanes},
+                )
+            root_tactic_service_history = retain_acceptance_retry(
+                root_tactic_service_history, candidate, lane_key=lane_key,
+            )
         result_portfolio_phase = str(
             result_cache_metadata.get("root_tactic_candidate_portfolio_phase") or "direct"
         )
@@ -24597,7 +24701,7 @@ async def run_mini_recursive_driver(
         )
         active_phase_pending = bool(
             current_active_root_targets
-            and result_portfolio_phase in {"active", "fallback"}
+            and result_portfolio_phase in {"active", "lift", "fallback"}
             and (
                 str(result.exit_reason) in {"timeout", "candidate_quantum_exhausted"}
                 or is_transient_tactic_close_failure(result)
@@ -24606,15 +24710,35 @@ async def run_mini_recursive_driver(
         )
         resumable_suffix = bool(
             not result.ok
-            and result_portfolio
-            and next_candidate_index < len(result_portfolio)
+            and (next_candidate_index < len(result_portfolio)
+                 or (active_phase_pending and result_portfolio_phase == "fallback"
+                     and not result_portfolio and next_candidate_index == 0))
             and (
                 active_phase_pending
+                or result_cache_metadata.get("pending_reference_confirmation") is True
+                or result_cache_metadata.get("root_tactic_contract_transient") is True
+                or is_transient_tactic_close_failure(result)
                 or (not current_active_root_targets and next_candidate_index > 0
                     and (advanced_suffix or stalled_resumable_suffix))
             )
         )
         if resumable_suffix:
+            prior_generation = root_tactic_portfolio_generation
+            root_tactic_portfolio_generation = validated_portfolio_generation({
+                "schema_version": 1, "obligation_key": obligation_key,
+                "execution_key": portfolio_execution_key,
+                "generation_context_key": generation_context_key,
+                "generation_execution_key": generation_execution_key,
+                "generation_policy_key": generation_policy_key,
+                "execution_helper_hashes": helper_hashes,
+                "phase": result_portfolio_phase, "next_candidate_index": next_candidate_index,
+                "candidates": [asdict(item) for item in result_portfolio],
+                "candidate_timeout_floor_s": max(
+                    float(generation.get("candidate_timeout_floor_s", 0.0)),
+                    float(result_cache_metadata.get("candidate_timeout_floor_s", 0.0)),
+                ),
+                "pending_reference_confirmation": result_cache_metadata.get("pending_reference_confirmation") is True,
+            })
             prior_offset = root_tactic_portfolio_continuations.get(
                 portfolio_execution_key
             )
@@ -24622,7 +24746,7 @@ async def run_mini_recursive_driver(
                 next_candidate_index
             )
             prior_phase = root_tactic_portfolio_phases.get(portfolio_execution_key)
-            if active_phase_pending:
+            if active_phase_pending or next_candidate_index == 0:
                 root_tactic_portfolio_phases[portfolio_execution_key] = result_portfolio_phase
             try:
                 if publish_checkpoint is not None:
@@ -24640,6 +24764,7 @@ async def run_mini_recursive_driver(
                         pass_helpers_accepted_before=pass_helpers_before,
                     )
             except BaseException:
+                root_tactic_portfolio_generation = prior_generation
                 if prior_phase is None:
                     root_tactic_portfolio_phases.pop(portfolio_execution_key, None)
                 else:
@@ -24666,6 +24791,7 @@ async def run_mini_recursive_driver(
                 },
             )
         else:
+            root_tactic_portfolio_generation = {}
             root_tactic_portfolio_phases.pop(portfolio_execution_key, None)
             root_tactic_portfolio_continuations.pop(
                 portfolio_execution_key,
@@ -24679,11 +24805,11 @@ async def run_mini_recursive_driver(
         )
         if direct_portfolio_exhausted and not completed_for_budget:
             newly_exhausted = bool(
-                portfolio_execution_key
+                generation_execution_key
                 not in root_tactic_direct_portfolio_exhausted_execution_keys
             )
             root_tactic_direct_portfolio_exhausted_execution_keys.add(
-                portfolio_execution_key
+                generation_execution_key
             )
             if newly_exhausted:
                 try:
@@ -24703,7 +24829,7 @@ async def run_mini_recursive_driver(
                         )
                 except BaseException:
                     root_tactic_direct_portfolio_exhausted_execution_keys.discard(
-                        portfolio_execution_key
+                        generation_execution_key
                     )
                     raise
         elif result.ok or completed_for_budget:
@@ -24716,7 +24842,105 @@ async def run_mini_recursive_driver(
             and not resumable_suffix
             and completed_for_budget
         ):
-            root_tactic_attempted_context_keys.add(context_key)
+            root_tactic_attempted_context_keys.add(generation_context_key)
+        return result
+
+    async def finish_standalone_root_drain(result: MiniRecursiveResult) -> MiniRecursiveResult:
+        """Drain finite root work under one existing elapsed allowance."""
+        if (progress_callback is not None or result.ok or result.disproved
+                or effective_root_tactic_timeout_s <= 0 or effective_root_tactic_max_candidates <= 0):
+            return result
+
+        def pending_context() -> tuple[str, list[str], bool]:
+            helpers = list(get_helpers())
+            fingerprint = _root_tactic_context_fingerprint(
+                root_statement=root_statement, preamble=current_lean_check_preamble(),
+                helpers=helpers, active_root_targets=_current_active_root_targets(helpers),
+                dossier=dossier, suppress_solution_placeholders=suppress_solution_placeholders,
+                opaque_mode=opaque_mode, allow_official_answer_visibility=allow_official_answer_visibility,
+                official_answer_payload_present=official_answer_payload_present,
+                tactic_timeout_s=effective_root_tactic_timeout_s,
+                tactic_max_candidates=effective_root_tactic_max_candidates,
+                proof_environment_fingerprint=current_root_tactic_environment_fingerprint(),
+            )
+            key = str(fingerprint.get("key") or "")
+            hashes = [text_hash(source) for helper in helpers
+                      for source in [_helper_source_text(helper)] if source]
+            # Draining an older immutable suffix does not generate the latest
+            # helper opportunities. Keep that unmaterialized work visible.
+            needs_generation = bool(key and key not in root_tactic_attempted_context_keys
+                                    and root_tactic_portfolio_generation.get("generation_context_key") != key)
+            return key, hashes, needs_generation
+
+        _, _, needs_generation = pending_context()
+        if (not needs_generation and not root_tactic_portfolio_generation
+                and not renewal_work_available(root_tactic_service_history, drain=True,
+                                               allowance_s=effective_root_tactic_timeout_s)):
+            return result
+        from .lean_runner import current_lean_deadline, lean_deadline_scope
+
+        deadline = time.monotonic() + effective_root_tactic_timeout_s
+        outer_deadline = current_lean_deadline()
+        if outer_deadline is not None:
+            deadline = min(deadline, outer_deadline)
+        seen_states: set[str] = set()
+        while deadline - time.monotonic() >= 0.1:
+            # Service counters and latency hints can change without advancing
+            # the finite queue. They must not grant an endless acceptance or
+            # infrastructure retry when the exact same work remains pending.
+            state_key = json.dumps({
+                "generation": {
+                    key: value for key, value in root_tactic_portfolio_generation.items()
+                    if key != "candidate_timeout_floor_s"
+                },
+                "lanes": {
+                    key: {field: lane.get(field) for field in (
+                        "helper_hashes", "deferred", "admitted", "resource_wait",
+                    )}
+                    for key, lane in root_tactic_service_history.get("renewal_lanes", {}).items()
+                },
+                "contexts": sorted(root_tactic_attempted_context_keys),
+                "current_context": pending_context()[0],
+            }, sort_keys=True)
+            if state_key in seen_states:
+                break
+            seen_states.add(state_key)
+            with lean_deadline_scope(deadline_monotonic=deadline):
+                final = await _try_root_close_once_per_context(
+                    pass_index=pass_index, after_helper="final_checked_work_drain",
+                    helpers=get_helpers(), final_drain=True,
+                    operation_deadline_monotonic=deadline,
+                )
+            if final.ok and final.proof:
+                return dataclass_replace(result, ok=True, proof=final.proof, failure_reason="",
+                                         root_tactic_attempts=tuple(final.attempts))
+            _, _, needs_generation = pending_context()
+            if (not needs_generation and not root_tactic_portfolio_generation
+                    and not renewal_work_available(root_tactic_service_history, drain=True,
+                                                   allowance_s=effective_root_tactic_timeout_s)):
+                break
+        context_key, helper_hashes, needs_generation = pending_context()
+        pending = needs_generation or bool(root_tactic_portfolio_generation) or renewal_work_available(
+            root_tactic_service_history, drain=True, allowance_s=effective_root_tactic_timeout_s,
+        )
+        _record(record_event, {
+            "phase": "mini_recursive_root_tactic", "verdict": "draining_checked_work",
+            "remaining_checked_work": pending,
+            "root_tactic_context_key": context_key,
+            "root_tactic_execution_helper_hashes": helper_hashes,
+            "root_tactic_generation_required": needs_generation,
+            "root_tactic_portfolio_generation": copy.deepcopy(root_tactic_portfolio_generation),
+            "root_tactic_service_history": copy.deepcopy(root_tactic_service_history),
+        })
+        # Pending closure work refines a generic scheduler stop. Preserve a
+        # provider or controller blocker that explains why the search ended.
+        scheduler_stop = result.failure_reason in {
+            "recursive_passes_exhausted", "recursive_progress_fixed_point",
+            "recursive_planner_empty_fixed_point", "recursive_planner_transport_empty_fixed_point",
+            "recursive_helper_only_fixed_point", "recursive_search_impasse",
+        }
+        if pending and scheduler_stop:
+            return dataclass_replace(result, failure_reason="recursive_checked_work_budget_exhausted")
         return result
 
     def _root_equivalent_certificate_names(
@@ -25835,7 +26059,7 @@ async def run_mini_recursive_driver(
             pass_outcome_kind="research_impasse",
             pass_helpers_accepted_before=pass_helpers_before,
         )
-        return result
+        return await finish_standalone_root_drain(result)
 
     # Set when the previous non-resume pass compiled claims but ended with NO
     # root route (schema-missing root_assembly OR every root claim filtered):
@@ -27082,7 +27306,7 @@ async def run_mini_recursive_driver(
                     previous_pass_outcome_kind = "planner_scoped_failure"
                     pass_index += 1
                     if terminal_result is not None:
-                        return terminal_result
+                        return await finish_standalone_root_drain(terminal_result)
                     quantum_result = pass_quantum_yield_result()
                     if quantum_result is not None:
                         return quantum_result
@@ -27120,7 +27344,7 @@ async def run_mini_recursive_driver(
             )
             pass_index += 1
             if terminal_result is not None:
-                return terminal_result
+                return await finish_standalone_root_drain(terminal_result)
             quantum_result = pass_quantum_yield_result()
             if quantum_result is not None:
                 return quantum_result
@@ -31157,7 +31381,7 @@ async def run_mini_recursive_driver(
             )
             pass_index += 1
             if terminal_result is not None:
-                return terminal_result
+                return await finish_standalone_root_drain(terminal_result)
             quantum_result = pass_quantum_yield_result()
             if quantum_result is not None:
                 return quantum_result
@@ -33868,7 +34092,7 @@ async def run_mini_recursive_driver(
         resume_frame = {}
         pass_index += 1
         if terminal_result is not None:
-            return terminal_result
+            return await finish_standalone_root_drain(terminal_result)
         quantum_result = pass_quantum_yield_result()
         if quantum_result is not None:
             return quantum_result
@@ -33884,7 +34108,7 @@ async def run_mini_recursive_driver(
                 "verdict": "fixed_point_no_new_verified_progress",
             },
         )
-    return MiniRecursiveResult(
+    return await finish_standalone_root_drain(MiniRecursiveResult(
         ok=False,
         proof=None,
         stats=stats,
@@ -33897,7 +34121,7 @@ async def run_mini_recursive_driver(
                 else "recursive_passes_exhausted"
             )
         ),
-    )
+    ))
 
 
 def _render_proposed_helpers_for_planner(
@@ -38904,6 +39128,16 @@ def _root_tactic_context_fingerprint(
 ) -> dict[str, Any]:
     """Fingerprint root context *and tactic budget* for scheduler dedupe."""
 
+    suppress_solution_placeholders = effective_solution_placeholder_suppression(
+        suppress_solution_placeholders=(
+            getattr(dossier, "suppress_solution_placeholders", True)
+            if suppress_solution_placeholders is None
+            else suppress_solution_placeholders
+        ),
+        opaque_mode=opaque_mode,
+        allow_official_answer_visibility=allow_official_answer_visibility,
+        official_answer_payload_present=official_answer_payload_present,
+    )
     visible_blocks = _answer_safe_helper_blocks(
         helpers=helpers,
         suppress_solution_placeholders=suppress_solution_placeholders,
@@ -38936,15 +39170,11 @@ def _root_tactic_context_fingerprint(
         "preamble_hash": hashlib.sha256(
             str(preamble or "").encode("utf-8")
         ).hexdigest(),
-        # Root-close exhaustion tracks mathematical evidence, not declaration
-        # spelling or insertion order.  A renamed theorem proving an already
-        # visible proposition cannot make the deterministic portfolio new;
-        # treating it as new lets helper aliases restart candidate one
-        # indefinitely.  Unparseable helper records retain a source-hash
-        # fallback through the shared evidence fingerprint helper.
-        "visible_helpers": sorted(
-            _root_tactic_helper_environment_fingerprints(visible_blocks)
-        ),
+        # Completed checks bind the exact ordered Lean context. Even a helper
+        # alias or reordered source can change elaboration and resolution.
+        # Candidate service history controls repeated search without treating
+        # an old context's exhaustion as evidence about the new environment.
+        "visible_helpers": [text_hash(block) for block in visible_blocks],
         "root_equivalent_helpers": sorted(
             _root_tactic_helper_environment_fingerprints(
                 [block for _name, block in root_equivalent_blocks]
@@ -38960,6 +39190,12 @@ def _root_tactic_context_fingerprint(
             "max_candidates": max(0, int(tactic_max_candidates or 0)),
         },
         "proof_environment_fingerprint": str(proof_environment_fingerprint or ""),
+        "answer_policy": {
+            "suppress_solution_placeholders": suppress_solution_placeholders,
+            "opaque_mode": bool(opaque_mode),
+            "allow_official_answer_visibility": bool(allow_official_answer_visibility),
+            "official_answer_payload_present": official_answer_payload_present,
+        },
     }
     encoded = json.dumps(
         payload,
@@ -38991,11 +39227,9 @@ def _root_tactic_portfolio_execution_key(
 ) -> str:
     """Return the exact deterministic root-portfolio execution identity.
 
-    The completed-context fingerprint above intentionally treats renamed
-    helper aliases as the same mathematical evidence.  A portfolio cursor
-    cannot: generated candidates may name those helpers, so resuming an old
-    offset after a rename could skip a newly generated candidate.  Bind the
-    cursor to the exact ordered source inputs and to a generator schema.
+    Generated candidates may name helpers, so an offset alone cannot cross a
+    rename. Saved candidate text may cross an exact ordered helper append;
+    every remaining candidate still runs against the new execution identity.
     """
 
     helper_sources = [
@@ -39636,6 +39870,7 @@ async def _try_root_equivalent_helper_promotion(
     opaque_mode: bool = True,
     allow_official_answer_visibility: bool = False,
     official_answer_payload_present: Optional[bool] = None,
+    operation_deadline_monotonic: Optional[float] = None,
 ) -> Optional[TacticCloseResult]:
     framed_active_target_statements = tuple(
         str(item or "").strip()
@@ -39679,6 +39914,12 @@ async def _try_root_equivalent_helper_promotion(
         {"candidate_count": len(candidates), "source": "root_equivalent_helper_exact"},
     )
     for index, (helper_name, helper_block) in enumerate(candidates):
+        candidate_timeout_s = operation_timeout_s
+        if operation_deadline_monotonic is not None:
+            remaining_s = operation_deadline_monotonic - time.monotonic()
+            if remaining_s < 0.1:
+                break
+            candidate_timeout_s = min(candidate_timeout_s or remaining_s, remaining_s)
         proof = f"by\n  exact @{helper_name}"
         helper_blocks = _root_equivalent_helper_replay_context(
             dossier=dossier,
@@ -39707,8 +39948,8 @@ async def _try_root_equivalent_helper_promotion(
                 proof,
                 helper_blocks,
                 preamble_override=str(preamble or ""),
-                timeout_s=operation_timeout_s,
-                fast_fail_timeout_s=operation_timeout_s,
+                timeout_s=candidate_timeout_s,
+                fast_fail_timeout_s=candidate_timeout_s,
                 check_kind="mini_recursive_root_equivalent_helper",
             )
             if hasattr(check_result, "__await__"):
@@ -39723,6 +39964,7 @@ async def _try_root_equivalent_helper_promotion(
                 "source": "root_equivalent_helper_exact",
                 "helper": helper_name,
                 "elapsed_s": round(time.monotonic() - attempt_started, 3),
+                "check_timeout_s": candidate_timeout_s,
                 "returncode": getattr(check_result, "returncode", None),
                 "error_type": "" if ok else "root_equivalent_helper_exact_failed",
                 "diagnostic": output[:OUTPUT_PREVIEW_CHARS],
@@ -39814,7 +40056,9 @@ async def _try_root_equivalent_helper_promotion(
         timeout_s=reported_timeout_s,
         elapsed_s=round(time.monotonic() - started, 3),
         backend="root_equivalent_helper_preflight",
-        exit_reason="root_equivalent_helper_preflight_failed",
+        exit_reason=("timeout" if operation_deadline_monotonic is not None
+                     and operation_deadline_monotonic - time.monotonic() < 0.1
+                     else "root_equivalent_helper_preflight_failed"),
         cache_metadata={"root_equivalent_helper_preflight_attempted": True},
     )
 
@@ -39906,10 +40150,18 @@ async def _try_root_close(
     enforce_root_finalization_contract: bool = True,
     candidate_portfolio_offset: int = 0,
     candidate_portfolio_phase: str = "direct",
+    candidate_portfolio: Optional[Sequence[TacticCandidate]] = None,
+    candidate_timeout_floor_s: float = 0.0,
+    candidate_reference_confirmation_pending: bool = False,
+    allow_pending_reference_confirmation: bool = False,
+    portfolio_service_history: Optional[Mapping[str, Any]] = None,
+    portfolio_renewal_controls: Optional[Mapping[str, Any]] = None,
+    service_slice_s: float = 0.0,
     direct_portfolio_already_exhausted: bool = False,
     root_tactic_timeout_s: Optional[float] = None,
     root_tactic_max_candidates: Optional[int] = None,
     tactic_pattern_cache: Optional[TacticPatternCache] = None,
+    operation_deadline_monotonic: Optional[float] = None,
 ) -> TacticCloseResult:
     # Honor suppression at the SOURCE: this internal durable short-circuit runs
     # for every caller, so guarding only the call sites would let a suppressed
@@ -40014,6 +40266,13 @@ async def _try_root_close(
             timeout_s=direct_timeout_s,
             max_candidates=direct_max_candidates,
             pattern_cache=tactic_pattern_cache,
+            pattern_context={"portfolio_service_history": dict(portfolio_service_history or {}),
+                             **dict(portfolio_renewal_controls or {})},
+            service_slice_s=service_slice_s,
+            candidate_portfolio=candidate_portfolio,
+            candidate_timeout_floor_s=candidate_timeout_floor_s,
+            candidate_reference_confirmation_pending=candidate_reference_confirmation_pending,
+            allow_pending_reference_confirmation=allow_pending_reference_confirmation,
             tactic_source_suppression_records=config.tactic_source_suppression_records,
             candidate_portfolio_phase=candidate_portfolio_phase,
             candidate_portfolio_offset=max(
@@ -40028,6 +40287,8 @@ async def _try_root_close(
                 dossier,
                 "mini_recursive_root_tactic",
             ),
+            **({"operation_deadline_monotonic": operation_deadline_monotonic}
+               if operation_deadline_monotonic is not None else {}),
         )
         direct_portfolio = tuple(
             getattr(direct_result, "candidate_portfolio", ()) or ()
@@ -40063,6 +40324,8 @@ async def _try_root_close(
         opaque_mode=opaque_mode,
         allow_official_answer_visibility=allow_official_answer_visibility,
         official_answer_payload_present=official_answer_payload_present,
+        **({"operation_deadline_monotonic": operation_deadline_monotonic}
+           if operation_deadline_monotonic is not None else {}),
     )
     preflight_selected = bool(preflight_result is not None and preflight_result.ok)
     if preflight_selected:
@@ -40117,6 +40380,37 @@ async def _try_root_close(
                     ),
                 },
             )
+    def contract_rejection(checked: TacticCloseResult, *, transient: bool) -> TacticCloseResult:
+        metadata = dict(checked.cache_metadata or {})
+        portfolio = tuple(checked.candidate_portfolio or ())
+        retry_index = max(0, int(checked.next_candidate_index or 0))
+        if transient:
+            # Contract creation can fail after Lean accepts a proof. Carry
+            # that exact proof, including synthesized lifts, independently of
+            # whether a later generator still emits it.
+            success = next((attempt for attempt in checked.attempts
+                            if attempt.get("ok") and attempt.get("proof") == checked.proof), {})
+            candidate = TacticCandidate(
+                proof=str(checked.proof),
+                tactic=str(success.get("tactic") or "root_contract_retry"),
+                source=str(success.get("source") or "root_contract_retry"),
+                helper=success.get("helper"),
+            )
+            retry_index = max(0, retry_index - 1)
+            if retry_index >= len(portfolio) or portfolio[retry_index].proof != checked.proof:
+                portfolio, retry_index = (candidate,), 0
+            metadata.update({
+                "root_tactic_contract_transient": True,
+                "root_tactic_contract_retry_candidate": asdict(candidate),
+            })
+            if metadata.get("active_root_lift_succeeded"):
+                metadata["root_tactic_candidate_portfolio_phase"] = "lift"
+        return dataclass_replace(
+            checked, ok=False, proof=None, exit_reason="root_route_contract_not_ready",
+            candidate_portfolio=portfolio, next_candidate_index=retry_index,
+            cache_metadata=metadata,
+        )
+
     contract_status: dict[str, Any] = {}
     verdict_override = ""
     if (
@@ -40171,31 +40465,7 @@ async def _try_root_close(
                 str(contract_status.get("verdict") or "")
                 == "root_tactic_contract_creation_exception"
             )
-            retry_candidate_index = max(
-                0,
-                int(getattr(result, "next_candidate_index", 0) or 0)
-                - (
-                    1
-                    if contract_transient
-                    and tuple(getattr(result, "candidate_portfolio", ()) or ())
-                    else 0
-                ),
-            )
-            result = dataclass_replace(
-                result,
-                ok=False,
-                proof=None,
-                exit_reason="root_route_contract_not_ready",
-                next_candidate_index=retry_candidate_index,
-                cache_metadata={
-                    **dict(getattr(result, "cache_metadata", {}) or {}),
-                    **(
-                        {"root_tactic_contract_transient": True}
-                        if contract_transient
-                        else {}
-                    ),
-                },
-            )
+            result = contract_rejection(result, transient=contract_transient)
     if (
         preflight_selected
         and verdict_override == "root_route_contract_not_ready"
@@ -40275,31 +40545,7 @@ async def _try_root_close(
                     str(contract_status.get("verdict") or "")
                     == "root_tactic_contract_creation_exception"
                 )
-                retry_candidate_index = max(
-                    0,
-                    int(getattr(result, "next_candidate_index", 0) or 0)
-                    - (
-                        1
-                        if contract_transient
-                        and tuple(getattr(result, "candidate_portfolio", ()) or ())
-                        else 0
-                    ),
-                )
-                result = dataclass_replace(
-                    result,
-                    ok=False,
-                    proof=None,
-                    exit_reason="root_route_contract_not_ready",
-                    next_candidate_index=retry_candidate_index,
-                    cache_metadata={
-                        **dict(getattr(result, "cache_metadata", {}) or {}),
-                        **(
-                            {"root_tactic_contract_transient": True}
-                            if contract_transient
-                            else {}
-                        ),
-                    },
-                )
+                result = contract_rejection(result, transient=contract_transient)
     if result.ok:
         stats.root_tactic_solved += 1
     tactic_extra: dict[str, Any] = {}

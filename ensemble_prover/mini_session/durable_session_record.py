@@ -45,7 +45,8 @@ _RUNTIME_FIELDS = frozenset({
     "problem", "dossier", "proof_state", "conv", "actions", "budgets",
     "cost_controller", "parent", "checkpoint_registry", "checkpoint_lane_key",
     "theory_context_pair", "session_activation_id", "_mini_planner_job_broker",
-    "_pending_isolated_dispatch_tails", "_quarantined_lean_runners",
+    "_pending_isolated_dispatch_tails", "_detached_execution_settlements",
+    "_quarantined_lean_runners",
     "_latest_pre_select_snapshot", "_dispatch_generation_resume_snapshot",
     "_dispatch_generation_late_rollback_snapshot", "_run_governor_last_tick_monotonic",
     "_applying_action_dispatch_ids", "_duplicate_action_dispatch_events_in_progress",
@@ -477,6 +478,10 @@ def _prepare_bound_publication(session: Any, staged: Any) -> tuple[Any, ...]:
 async def restore_session_record(session: Any, record: dict[str, Any], *, expected_identity: dict[str, Any]) -> None:
     """Validate in isolation, recheck proofs, then install into bound objects."""
     _require_settled(session)
+    if getattr(session, "_detached_execution_settlements", ()):
+        # Capture can preserve an incomplete tail, but replacing a live owner
+        # would strand its callback on the old budget and observation map.
+        raise ValueError("checkpoint restore requires settled detached execution resources")
     data = clone_json_value(record, label="durable session restore")
     if type(data) is not dict or type(data.get("schema_version")) is not int or data["schema_version"] != SCHEMA_VERSION:
         raise ValueError("unsupported durable session checkpoint schema")
@@ -577,7 +582,7 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
         cloned_action.__dict__ = copy.deepcopy(vars(action), memo)
         staged.actions.append(cloned_action)
     staged.recorder = staged.on_event = staged.checkpoint_registry = None
-    apply_scheduler_snapshot(staged, data["scheduler"])
+    apply_scheduler_snapshot(staged, data["scheduler"], allow_local_execution_cursors=False)
     # Enrich the same private dossier/graph that owns the validated cursors.
     # Preparing a second dossier and copying only root receipts would discard
     # fresh typed helper evidence and its corresponding visibility metadata.

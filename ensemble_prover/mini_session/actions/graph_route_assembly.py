@@ -2299,7 +2299,9 @@ class GraphRouteAssemblyAction:
             and getattr(session, "lean", None) is not None
         ):
             from ensemble_prover.mini_prover import _try_root_tactic_close
-            from ensemble_prover.proof_state_executor import _root_tactic_context_key
+            from ensemble_prover.proof_state_executor import (
+                _root_tactic_answer_policy, _root_tactic_context_key,
+            )
 
             goal_statement = self._session_goal_statement(session)
             preamble = (
@@ -2318,6 +2320,7 @@ class GraphRouteAssemblyAction:
                 helpers=helper_blocks,
                 timeout_s=self.root_tactic_timeout_s,
                 max_candidates=self.root_tactic_max_candidates,
+                answer_policy=_root_tactic_answer_policy(dossier=session.dossier),
             )
             proof_hash = graph_text_hash(
                 json.dumps(
