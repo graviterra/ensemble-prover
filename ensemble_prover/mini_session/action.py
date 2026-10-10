@@ -156,7 +156,7 @@ class RepairTicket:
     max_policy_attempts: int = 1
     root_ticket_id: str = ""
     repair_depth: int = 0
-    max_chain_depth: int = 3
+    max_chain_depth: int = -1
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

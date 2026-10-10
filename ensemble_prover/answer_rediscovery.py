@@ -79,9 +79,13 @@ def _checkpoint(directory: Path, *, current: bool) -> tuple[dict[str, Any], dict
         or snapshot.get("identity") != manifest["identity"]
         or snapshot.get("attempt_id") != manifest["attempt_id"]
         or type(snapshot.get("schema_version")) is not int
-        or snapshot["schema_version"] not in (1, 2)
+        or snapshot["schema_version"] not in (1, 2, 3)
     ):
         raise ValueError("invalid candidate generation checkpoint binding")
+    if snapshot["schema_version"] == 3:
+        from .mini_session.attempt_checkpoint import validate_archive_reference_shapes
+
+        validate_archive_reference_shapes(snapshot)
     return manifest, snapshot
 
 

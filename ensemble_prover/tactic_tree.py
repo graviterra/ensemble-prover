@@ -805,7 +805,20 @@ class TacticTree:
     ) -> None:
         if not candidates:
             return
-        self._evict_if_full(self._policy_cache)
+        if len(self._policy_cache) >= self._max_cache:
+            # A policy for an open node owns unchecked paid candidates, not
+            # merely a performance cache entry. Evict only retired policies;
+            # a crowded live frontier must survive checkpoint continuation.
+            live_prefixes = {
+                node.tactics_from_root
+                for node in self.nodes.values()
+                if node.status == TacticNodeStatus.OPEN
+            }
+            victims = [
+                key for key in self._policy_cache if key[1] not in live_prefixes
+            ][: max(1, len(self._policy_cache) // 4)]
+            for key in victims:
+                del self._policy_cache[key]
         self._policy_cache[
             (self.goal_state_key(goals), tuple(tactics_from_root))
         ] = list(candidates)
@@ -1816,6 +1829,7 @@ async def tactic_tree_beam_search(
     backtrack_limit: int = 8,
     cancel_grace_s: Optional[float] = None,
     should_continue: Optional[ShouldContinueFunc] = None,
+    should_continue_operation: Optional[ShouldContinueFunc] = None,
     feedback_fn: Optional[Callable] = None,
     resume_state: Optional[TacticBeamState] = None,
     durable_progress_fn: Optional[DurableProgressFunc] = None,
@@ -1943,6 +1957,21 @@ async def tactic_tree_beam_search(
 
     def _time_left() -> float:
         return deadline - time.monotonic()
+
+    def _progress() -> SearchProgress:
+        return SearchProgress(
+            iteration=step,
+            nodes_expanded=stats["nodes_expanded"],
+            max_depth_reached=stats["max_depth_reached"],
+            elapsed_s=elapsed_before + (time.monotonic() - t0),
+            best_score=best_score,
+            best_score_elapsed_s=best_score_time,
+            beam_size=len(beam),
+            solved_non_root=0,
+            cache_hits=stats["cache_hits"],
+            cache_misses=0,
+            search_time_limit=time_limit,
+        )
 
     def _snapshot() -> TacticBeamState:
         state = TacticBeamState(
@@ -2242,6 +2271,14 @@ async def tactic_tree_beam_search(
                     # cutpoint: replay must materialize and score that child
                     # from the cached Lean state without rerunning Lean.
                     continue
+                if should_continue_operation is not None:
+                    cont, reason = should_continue_operation(_progress())
+                    if not cont:
+                        # Keep the complete cached policy and its open parent.
+                        # Candidate receipts already committed remain reusable;
+                        # yielding cannot discard an unexecuted policy tail.
+                        _rotate_after_quantum_timeout(node)
+                        return _unsolved(reason or "callback_stop")
                 remaining = _time_left()
                 if remaining <= 0.0:
                     _rotate_after_quantum_timeout(node)
@@ -2377,20 +2414,7 @@ async def tactic_tree_beam_search(
             return _unsolved("retryable_operation_failure")
 
         if should_continue is not None:
-            progress = SearchProgress(
-                iteration=step,
-                nodes_expanded=stats["nodes_expanded"],
-                max_depth_reached=stats["max_depth_reached"],
-                elapsed_s=elapsed_before + (time.monotonic() - t0),
-                best_score=best_score,
-                best_score_elapsed_s=best_score_time,
-                beam_size=len(beam),
-                solved_non_root=0,
-                cache_hits=stats["cache_hits"],
-                cache_misses=0,
-                search_time_limit=time_limit,
-            )
-            cont, reason = should_continue(progress)
+            cont, reason = should_continue(_progress())
             if not cont:
                 exit_reason = reason or "callback_stop"
                 break

@@ -8,6 +8,8 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
+from ensemble_prover.deep_json import loads_deep_json
+
 
 def digest(value: str | bytes) -> str:
     return hashlib.sha256(
@@ -100,7 +102,7 @@ class DeclarationProfile:
                 )
             if len(self.binder_kinds) != len(self.binder_dependencies):
                 raise ValueError("incomplete binder metadata")
-            json.loads(self.exact_expr_json)
+            loads_deep_json(self.exact_expr_json)
 
     @property
     def declaration_id(self) -> str:

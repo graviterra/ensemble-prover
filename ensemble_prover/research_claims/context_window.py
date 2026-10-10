@@ -1,7 +1,7 @@
 """Bound working context while preserving exact, addressable source records."""
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, Callable
 
 from .model import json_text
 
@@ -243,6 +243,7 @@ def read_page(
     path: list[Any] | None = None,
     offset: int = 0,
     length: int = 6000,
+    text_transform: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     if (
         type(offset) is not int
@@ -271,6 +272,8 @@ def read_page(
         except (ValueError, TypeError, KeyError, IndexError, RecursionError) as exc:
             raise ValueError("artifact path does not exist") from exc
         content = value if isinstance(value, str) else json_text(value)
+    if text_transform is not None:
+        content = text_transform(content)
     # Full selected text, independent of the containing envelope/path alias.
     # Archival adds a derived artifact; original source bytes stay untouched.
     canonical = store.put_artifact(content.encode(), name="retrieval-content.txt")

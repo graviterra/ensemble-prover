@@ -8,7 +8,7 @@ ordinary local proof-search failures.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .mini_lean_extract import _lean_comment_text
 
@@ -48,7 +48,7 @@ _REFUTATION_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            r"\b(?:claim|statement|target|assertion)\b[^\n]{0,120}"
+            r"\b(?:claim|statement|target|assertion)\b[^\n.!?;]{0,120}?"
             r"\bnot\s+derivable\b",
             re.IGNORECASE,
         ),
@@ -90,7 +90,8 @@ _REFUTATION_EXCLUSION_RE = re.compile(
 )
 
 _CONTRADICTION_ASSUMPTION_RE = re.compile(
-    r"\b(?:assume|suppose)\s+(?:the\s+)?(?:claim|statement|target|route)\s+"
+    r"(?:^|[,;:]\s*)\s*(?:we\s+)?(?:assume|suppose)\s+"
+    r"(?:the\s+)?(?:claim|statement|target|route)\s+"
     r"(?:is|was)\s+false\b|"
     r"\bby\s+contradiction\b[^\n]{0,160}\b(?:claim|statement|target|route)\s+"
     r"(?:is|was)\s+false\b|"
@@ -101,12 +102,37 @@ _CONTRADICTION_ASSUMPTION_RE = re.compile(
 
 _LEAN_BY_CONTRA_RE = re.compile(r"\bby_contra\b|\bbyContradiction\b")
 
+_REPORTED_QUOTATION_START_RE = re.compile(
+    r"\b(?:phrase|wording|quotation|quoted\s+text|instruction|error\s+message|"
+    r"(?:earlier|previous|rejected|quoted)\s+(?:message|response|assertion|claim))"
+    r"(?:\s+(?:says?|said|states?|stated|reads?|read|was|is|contains?|contained|"
+    r"included?|wrote|asserted|claimed|that|as|follows|literally|explicitly))*"
+    r"\s*:?\s*(?P<quote>[\"'`“‘])",
+    re.IGNORECASE,
+)
+
+_QUOTATION_DELIMITER_RE = re.compile(r"[\"'`“‘]")
+_ASSERTION_SUBJECT_PREFIX = (
+    r"(?:\s*(?:that|the|this|our|a|an)\b|\s*[\"'`“‘])*\s*"
+    r"(?:(?:claim|statement|target|assertion|conclusion|goal|theorem|route)\s+)?$"
+)
+_NEGATED_ASSERTION_PREFIX_RE = re.compile(
+    r"(?:\b(?:do\s+not|does\s+not|did\s+not|don't|doesn't|didn't|"
+    r"cannot|can't|must\s+not|should\s+not|shouldn't)\s+"
+    r"(?:claim|assert|conclude|say|infer|establish|show|prove|mean)|"
+    r"\b(?:no|insufficient)\s+(?:evidence|reason|grounds|proof)"
+    r"(?:\s+to\s+(?:conclude|say|assert))?|"
+    r"\b(?:not|isn't|wasn't)\s+(?:true|correct|established|shown|proved|proven))"
+    + _ASSERTION_SUBJECT_PREFIX,
+    re.IGNORECASE,
+)
+
 _FAKE_CONTRADICTION_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
-            r"\b(?:claim|statement|target|assertion)\b[^\n]{0,120}"
+            r"\b(?:claim|statement|target|assertion)\b[^\n.!?;]{0,120}?"
             r"\bnot\s+mathematically\s+correct\b|"
-            r"\bnot\s+mathematically\s+correct\b[^\n]{0,120}"
+            r"\bnot\s+mathematically\s+correct\b[^\n.!?;]{0,120}?"
             r"\b(?:claim|statement|target|assertion)\b",
             re.IGNORECASE,
         ),
@@ -138,7 +164,7 @@ _FAKE_CONTRADICTION_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            r"\bonly\s+way\s+to\s+close\b[^\n]{0,160}\bnot\b",
+            r"\bonly\s+way\s+to\s+close\b[^\n]{0,160}?\bnot\b",
             re.IGNORECASE,
         ),
         "only way to close is invalid",
@@ -182,10 +208,150 @@ def _first_match(
     patterns: Tuple[Tuple[re.Pattern[str], str], ...],
 ) -> Optional[Tuple[str, str]]:
     for regex, label in patterns:
-        match = regex.search(text)
-        if match:
+        for match in _assertion_matches(regex, text):
+            if _assertion_is_discussion(text, match):
+                continue
             return label, _one_line(match.group(0))
     return None
+
+
+def _assertion_matches(regex: re.Pattern[str], text: str) -> Iterator[re.Match[str]]:
+    """Keep later subjects visible inside a discarded broad-pattern match."""
+
+    position = 0
+    while match := regex.search(text, position):
+        yield match
+        # Subject-to-predicate patterns have a bounded span but may include
+        # both a negated assertion and a later affirmative assertion. Moving
+        # to the end of an excluded match would silently discard the latter.
+        position = match.start() + 1
+
+
+def _assertion_context(text: str, match: re.Match[str]) -> Tuple[str, str]:
+    """Keep an exclusion local to the assertion it actually qualifies."""
+
+    before = re.split(r"[\n.!?;]", text[: match.start()])[-1]
+    before = re.split(
+        r"\b(?:but|however|yet|nevertheless|nonetheless)\b",
+        before,
+        flags=re.IGNORECASE,
+    )[-1]
+    after = re.split(r"[\n.!?;]", text[match.end() :], maxsplit=1)[0]
+    return before, after
+
+
+def _quotation_delimiter_is_literal(text: str, index: int) -> bool:
+    escape_start = index
+    while escape_start > 0 and text[escape_start - 1] == "\\":
+        escape_start -= 1
+    escaped = (index - escape_start) % 2 == 1
+    word_apostrophe = (
+        text[index] in {"'", "’"}
+        and 0 < index < len(text) - 1
+        and text[index - 1].isalnum()
+        and text[index + 1].isalnum()
+    )
+    return escaped or word_apostrophe
+
+
+def _reported_quotation_end(text: str, start: int, end: int, closer: str) -> int:
+    """Find a closing quote, preserving escapes and intra-word apostrophes."""
+
+    index = text.find(closer, start, end)
+    while index >= 0:
+        if not _quotation_delimiter_is_literal(text, index):
+            return index
+        index = text.find(closer, index + 1, end)
+    return -1
+
+
+def _assertion_is_in_negated_quotation(
+    text: str,
+    match: re.Match[str],
+    line_start: int,
+    line_end: int,
+) -> bool:
+    closing_indices = set()
+    for quotation in _QUOTATION_DELIMITER_RE.finditer(text, line_start, match.end()):
+        index = quotation.start()
+        if index in closing_indices or _quotation_delimiter_is_literal(text, index):
+            continue
+        opener = quotation.group(0)
+        closer = {"“": "”", "‘": "’"}.get(opener, opener)
+        close_index = _reported_quotation_end(text, quotation.end(), line_end, closer)
+        if close_index < 0:
+            continue
+        closing_indices.add(close_index)
+        before, _ = _assertion_context(text, quotation)
+        negation = _NEGATED_ASSERTION_PREFIX_RE.search(before)
+        # A broad assertion can begin at the negated reporting verb "claim".
+        # Earlier subjects and predicates outside this quotation stay visible.
+        if negation is not None:
+            negation_start = index - len(before) + negation.start()
+            if negation_start <= match.start() and close_index >= match.end():
+                return True
+    return False
+
+
+def _assertion_is_discussion(text: str, match: re.Match[str]) -> bool:
+    """Exclude explicit negation and reported wording, not other assertions.
+
+    This is deliberately a prose filter, not evidence about the proposition.
+    A separate affirmative assertion in the same response must still be found.
+    """
+
+    before, _ = _assertion_context(text, match)
+    # The longer patterns can begin at the verb in "do not claim that ...".
+    # Include that verb in the prefix before deciding whether it is negated.
+    claim_verb = re.match(r"claim\s+(?=that\b|the\b|this\b|our\b)", match.group(0), re.I)
+    if claim_verb is not None:
+        before += claim_verb.group(0)
+    if _NEGATED_ASSERTION_PREFIX_RE.search(before):
+        return True
+    if re.search(
+        r"^\s*(?:--\s*)?(?:we\s+)?(?:assume|suppose|if)"
+        + _ASSERTION_SUBJECT_PREFIX,
+        before,
+        re.IGNORECASE,
+    ):
+        return True
+
+    # An explicitly reported quotation can contain several assertions. Locate
+    # its whole span before considering clause boundaries inside the quote.
+    # Bounded assertion spans stop at their first predicate so a later quote
+    # cannot absorb an already complete assertion. A broad match may still
+    # start at a reporting noun such as "earlier claim" before the quote.
+    # Include openers within the match only when its subject begins inside
+    # the reporting descriptor. An assertion begun earlier, or a predicate
+    # beyond the closing quote, must still remain visible.
+    # Bare quotation marks still leave an affirmative conclusion visible.
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    line_end = text.find("\n", match.start())
+    if line_end < 0:
+        line_end = len(text)
+    if _assertion_is_in_negated_quotation(text, match, line_start, line_end):
+        return True
+    for quotation in _REPORTED_QUOTATION_START_RE.finditer(
+        text, line_start, match.end()
+    ):
+        opener = quotation.group("quote")
+        closer = {"“": "”", "‘": "’"}.get(opener, opener)
+        close_index = _reported_quotation_end(text, quotation.end(), line_end, closer)
+        if quotation.start() <= match.start() and close_index >= match.end():
+            return True
+    return False
+
+
+def _derivation_has_other_subject(text: str, match: re.Match[str]) -> bool:
+    before, _ = _assertion_context(text, match)
+    return bool(
+        re.search(
+            r"\b(?:contradiction|(?:(?:unproved\s+|proof\s+)?step|proof))"
+            r"(?:\s*,?\s*(?:that|which))?\s+$",
+            before,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _counterexample_refutation_excluded(text: str, match: re.Match[str]) -> bool:
@@ -199,16 +365,28 @@ def _counterexample_refutation_excluded(text: str, match: re.Match[str]) -> bool
     return False
 
 
-def _first_refutation_match(text: str) -> Optional[Tuple[str, str]]:
+def _first_refutation_match(text: str, proof: str) -> Optional[Tuple[str, str]]:
     for regex, label in _REFUTATION_PATTERNS:
-        match = regex.search(text)
-        if not match:
-            continue
-        if label == "counterexample" and _counterexample_refutation_excluded(
-            text, match
-        ):
-            continue
-        return label, _one_line(match.group(0))
+        for match in _assertion_matches(regex, text):
+            if _assertion_is_discussion(text, match):
+                continue
+            if label == "counterexample" and _counterexample_refutation_excluded(
+                text, match
+            ):
+                continue
+            if label in {"cannot be derived", "does not follow"} and (
+                _derivation_has_other_subject(text, match)
+            ):
+                continue
+            if label in {
+                "claim is false", "statement is false", "target is false", "route is false"
+            }:
+                before, after = _assertion_context(text, match)
+                if _looks_like_contradiction_assumption(
+                    before + match.group(0) + after, proof
+                ):
+                    continue
+            return label, _one_line(match.group(0))
     return None
 
 
@@ -451,25 +629,16 @@ def classify_target_integrity_signals(
         signal["label"] = label
         signals.append(signal)
     else:
-        refutation = _first_refutation_match(text)
+        refutation = _first_refutation_match(text, proof)
         if refutation is not None:
             label, match = refutation
-            false_statement_labels = {
-                "claim is false",
-                "statement is false",
-                "target is false",
-                "route is false",
-            }
-            if label not in false_statement_labels or not (
-                _looks_like_contradiction_assumption(text, proof)
-            ):
-                signal = _base_signal(
-                    "unverified_target_refutation",
-                    match or label,
-                    target_statement,
-                )
-                signal["label"] = label
-                signals.append(signal)
+            signal = _base_signal(
+                "unverified_target_refutation",
+                match or label,
+                target_statement,
+            )
+            signal["label"] = label
+            signals.append(signal)
 
     semantic = _semantic_bridge_direction_signal(dict(failure_analysis or {}))
     if semantic is not None:

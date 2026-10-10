@@ -113,13 +113,13 @@ class ControllerProvenanceRegistry:
         policy_version: int = 1,
         sequence_authority: Callable[[ConsumerProvenance], int | None] | None = None,
         chronology_authority: Callable[[MemoryProvenance], bool] | None = None,
-        closure_cap: int = 1024,
+        closure_cap: int = 0,
     ) -> None:
         if (
             type(policy_version) is not int
             or policy_version < 1
             or type(closure_cap) is not int
-            or closure_cap < 1
+            or closure_cap < 0
         ):
             raise ValueError("invalid provenance registry limits")
         if sequence_authority is not None and not callable(sequence_authority):
@@ -131,6 +131,8 @@ class ControllerProvenanceRegistry:
                 "chronology validation requires a live controller authority"
             )
         self.chronology_authority = chronology_authority
+        # A positive limit is an explicit admission policy. Local retrieval
+        # windows must not limit the ancestry of a completed mathematical fact.
         self.closure_cap = closure_cap
         self._sources: dict[str, SourceProvenance] = {}
         self._source_ids_by_digest: dict[str, set[str]] = {}
@@ -187,7 +189,7 @@ class ControllerProvenanceRegistry:
             identities = tuple(
                 sorted(self._source_ids_by_digest.get(source_digest, ()))
             )
-        if len(identities) > self.closure_cap:
+        if self.closure_cap > 0 and len(identities) > self.closure_cap:
             return ()
         return tuple(
             identity
@@ -342,45 +344,39 @@ class ControllerProvenanceRegistry:
         active: set[str] = set()
         result = []
 
-        def visit(identity: str) -> bool:
-            if identity in active:
-                return False
-            if identity in visited:
-                return True
-            if len(visited) + len(active) >= self.closure_cap:
-                return False
-            # Registered versions are immutable and never removed. Capturing
-            # each requested record under the lock preserves its version while
-            # avoiding a full campaign-registry copy for every bounded read.
-            with self._lock:
-                source = self._sources.get(identity)
-            if source is None:
-                return False
-            active.add(identity)
-            for dependency in source.dependency_source_ids:
-                if not visit(dependency):
-                    return False
-            active.remove(identity)
-            visited.add(identity)
-            try:
-                if (
-                    source.visibility_authority() is not True
-                    or source.integrity_authority(source.source_digest) is not True
-                ):
-                    return False
-            except Exception:
-                return False
-            result.append(source)
-            return True
-
-        try:
-            return (
-                tuple(result)
-                if all(visit(identity) for identity in source_ids)
-                else None
-            )
-        except RecursionError:
-            return None
+        for root in source_ids:
+            pending: list[tuple[str, SourceProvenance | None]] = [(root, None)]
+            while pending:
+                identity, completed = pending.pop()
+                if completed is not None:
+                    active.remove(identity)
+                    try:
+                        if (
+                            completed.visibility_authority() is not True
+                            or completed.integrity_authority(completed.source_digest) is not True
+                        ):
+                            return None
+                    except Exception:
+                        return None
+                    visited.add(identity)
+                    result.append(completed)
+                    continue
+                if identity in active:
+                    return None
+                if identity in visited:
+                    continue
+                if self.closure_cap > 0 and len(visited) + len(active) >= self.closure_cap:
+                    return None
+                # Registered versions are immutable and never removed. Read
+                # only reachable records; unrelated campaign size is irrelevant.
+                with self._lock:
+                    source = self._sources.get(identity)
+                if source is None:
+                    return None
+                active.add(identity)
+                pending.append((identity, source))
+                pending.extend((dependency, None) for dependency in reversed(source.dependency_source_ids))
+        return tuple(result)
 
     def issue_provenance(
         self, source_record_ids: Sequence[str], *, run_id: str, accepted: bool = False

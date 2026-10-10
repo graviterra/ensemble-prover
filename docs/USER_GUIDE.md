@@ -806,14 +806,14 @@ Lean retains proof authority. See [research policies](proof-search.md#research-a
 
 | Option | Default | Meaning |
 | --- | ---: | --- |
-| `--max-prove-turns` | 30 | Direct prover conversation turns |
-| `--max-refine-turns` | 25 | Refiner turns when a refiner is configured |
-| `--mini-recursive-passes` | 6 | Recursive plan/prove/integrate passes |
-| `--mini-recursive-claims` | 20 | Helper-plus-root claims across planner tranches |
-| `--mini-recursive-turns-per-claim` | 6 | Model turns per recursive claim |
-| `--recursive-helper-max-depth` | 3 | Child-session recursion depth |
-| `--recursive-helper-max-attempts-per-node` | 2 | Child-session attempts for one node |
-| `--recursive-helper-turns` | 5 | Turns in one child session |
+| `--max-prove-turns` | -1 | Direct prover turns; unlimited by default |
+| `--max-refine-turns` | -1 | Refiner turns; unlimited when a refiner is configured |
+| `--mini-recursive-passes` | -1 | Recursive passes; unlimited by default |
+| `--mini-recursive-claims` | -1 | Helper-plus-root claims across incremental planner tranches; unlimited |
+| `--mini-recursive-turns-per-claim` | -1 | Model turns per recursive claim; unlimited |
+| `--recursive-helper-max-depth` | 0 | Child recursion depth; zero is unlimited |
+| `--recursive-helper-max-attempts-per-node` | 0 | Child attempts per node; zero is unlimited |
+| `--recursive-helper-turns` | -1 | Turns in one child session; unlimited |
 
 Disable major lanes only for controlled experiments:
 
@@ -854,16 +854,17 @@ are not overall run limits.
 
 ### Formal-state search
 
-Bounded persistent formal-state search is disabled by default:
+Persistent formal-state search is disabled by default:
 
 ```bash
 --formal-state-search
 ```
 
 Its `--formal-state-search-*` options tune one resumable search quantum,
-provider tactic generation, beam width, depth, candidates, backtracking, and
-no-improvement retirement. Enable it deliberately; it adds Lean checks and may
-add model calls.
+provider tactic generation, active beam width, renewable depth and backtracking
+windows, and optional candidate, retry, and non-improvement limits. The default
+candidate and retry settings retain pending work without a lifetime count cap.
+Enable it deliberately; it adds Lean checks and may add model calls.
 
 ## 9. Retrieval, tools, and caches
 

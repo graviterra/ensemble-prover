@@ -124,7 +124,7 @@ def read_mini_run(directory: Path) -> dict[str, Any]:
     )
     snapshot = json.loads(data)  # Data only: never deserialize checkpoint objects.
     expanded_checkpoint = None
-    if snapshot.get("schema_version") == 2:
+    if snapshot.get("schema_version") in {2, 3}:
         from ..mini_session.attempt_checkpoint import (
             AttemptCheckpointRegistry, expand_completed_children,
         )
@@ -132,7 +132,9 @@ def read_mini_run(directory: Path) -> dict[str, Any]:
         manifest = AttemptCheckpointRegistry._load_manifest(directory)
         if manifest != metadata:
             raise ValueError("Mini checkpoint metadata changed during adoption")
-        snapshot = expand_completed_children(snapshot, Path(manifest["registry_root"]))
+        snapshot = expand_completed_children(
+            snapshot, Path(manifest["registry_root"]), hydrate_provider_lanes=False,
+        )
         expanded_checkpoint = json_text(snapshot).encode()
     contracts = _saved_contracts(snapshot, head["snapshot_hash"])
     statements = {contract["statement"] for contract in contracts}

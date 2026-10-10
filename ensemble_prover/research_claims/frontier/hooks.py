@@ -575,6 +575,10 @@ def authorize_control_admission(
 
     campaign = _campaign(controller, state)
     _bind_native_job(controller, state, run, job)
+    # Native run deadlines belong to renewable donated service quanta. They
+    # fence each request in admit_control; freezing the first quantum's expiry
+    # into a durable operation would permanently forbid its later retries.
+    retry_deadline = None if run.get("native_parent_authorization") else run.get("deadline")
     if job["role"] == "review":
         authorization = campaign["review_authorizations"].get(job.get("frontier_review_authorization", ""))
         if authorization is None and job.get("strategy_review_id"):
@@ -645,7 +649,7 @@ def authorize_control_admission(
             probe = bool(lane.get("paused") and lane.get("recovery_open"))
             try:
                 authorize_execution(
-                    campaign, lineage, lane_id="provider", now=controller.clock(), deadline=run.get("deadline")
+                    campaign, lineage, lane_id="provider", now=controller.clock(), deadline=retry_deadline
                 )
             except FrontierRefusal as exc:
                 _yield("research_review_" + exc.reason)
@@ -704,13 +708,13 @@ def authorize_control_admission(
                         job.get("frontier_operation_lineage") or approach["lineage_id"],
                         lane_id="provider",
                         now=controller.clock(),
-                        deadline=run.get("deadline"),
+                        deadline=retry_deadline,
                     )
                     job["frontier_retry_pending"] = False
                 if lane.get("paused"):
                     lane["recovery_open"] = False
             except FrontierRefusal as exc:
-                _yield("paused_operational" if exc.reason in {"retry_exhausted", "retry_deadline", "lane_paused"} else exc.reason)
+                _yield("paused_operational" if exc.reason == "lane_paused" else exc.reason)
             job["frontier_lane_probe"] = probe
         campaign["history"]["provider_requests"] += 1
         campaign["history"]["costs_by_approach"][approach_id]["provider_requests"] += 1
@@ -759,7 +763,7 @@ def authorize_control_admission(
         lane = campaign["lanes"].get("provider") or {}
         probe = bool(lane.get("paused") and lane.get("recovery_open"))
         authorize_execution(
-            campaign, lineage, lane_id="provider", now=controller.clock(), deadline=run.get("deadline")
+            campaign, lineage, lane_id="provider", now=controller.clock(), deadline=retry_deadline
         )
     except FrontierRefusal as exc:
         _yield("paused_operational" if exc.reason == "lane_paused" else exc.reason)
@@ -1601,7 +1605,9 @@ def ensure_adaptive_work(integration: Any) -> bool:
     store = integration.store
     if store.stop_reason() or store.run_record(scheduling=True)["status"] != "running":
         return False
-    jobs = store.jobs()
+    from ..research_control import _focused_jobs
+
+    jobs = _focused_jobs(store, store.run_record(scheduling=True))
     if any(job["status"] in {"pending", "responded", "running", "tool_running"} for job in jobs):
         return False
     with controller._edit() as (state, run):
@@ -1627,9 +1633,12 @@ def ensure_adaptive_work(integration: Any) -> bool:
                 request_readmission(campaign, approach_id, now=now)
         fill_resident_slots(campaign, now=now)
         reviewer = next((
-            job for job in store.jobs()
+            job for job in jobs
             if job["role"] == "review" and job["status"] == "waiting"
-            and job.get("last_error") == "research_control_deferred"
+            and job.get("last_error") in {
+                "research_control_deferred", "research_review_paused_operational", "research_review_lane_paused",
+            }
+            and not (campaign["retries"].get(job.get("frontier_operation_lineage") or "") or {}).get("paused")
             and (job.get("frontier_review_admitted") or can_admit_review(campaign))
         ), None)
         if reviewer is not None:
@@ -1638,7 +1647,7 @@ def ensure_adaptive_work(integration: Any) -> bool:
             _save(controller, state, run, campaign)
             return True
         waiting = False
-        for job in store.jobs():
+        for job in jobs:
             approach_id = job.get("frontier_approach_id")
             approach = campaign["approaches"].get(approach_id or "")
             if (
@@ -1664,16 +1673,18 @@ def ensure_adaptive_work(integration: Any) -> bool:
         if selected is None:
             return False
         if any(
-            job.get("frontier_approach_id") == selected
+            job["role"] == "research"
+            and job.get("frontier_approach_id") == selected
             and job["status"] in {"pending", "waiting", "running", "responded", "tool_running"}
-            for job in store.jobs()
+            for job in jobs
         ):
             from .approaches import eligible
 
             selected_permit = active_permit(campaign, selected)
-            for job in store.jobs():
+            for job in jobs:
                 if (
-                    job.get("frontier_approach_id") == selected
+                    job["role"] == "research"
+                    and job.get("frontier_approach_id") == selected
                     and job["status"] == "waiting"
                     and not (job.get("research_control") or {}).get("waiting_for")
                     and eligible(campaign, selected)
@@ -1700,7 +1711,7 @@ def ensure_adaptive_work(integration: Any) -> bool:
         # A waiting investigation bound to another approach keeps its dependency.
         # Do not retarget that job.
         job = store.add_job(
-            run["target_id"],
+            run.get("native_active_target_claim_id") or run["target_id"],
             "Execute the next quantum of frontier approach " + selected + ".",
         )
         requirement = 0
@@ -1711,6 +1722,9 @@ def ensure_adaptive_work(integration: Any) -> bool:
             alternative_requirement=requirement,
             frontier_approach_id=selected,
         )
+        if run.get("native_active_target_claim_id") is not None:
+            job["native_target_claim_id"] = run["native_active_target_claim_id"]
+            job["native_context_binding"] = run.get("native_active_target_context_binding")
         store.save_job(job)
         return True
 

@@ -21,6 +21,21 @@ _LEAN_CONTRACT_IDENTITY_RE = re.compile(
 )
 
 
+def lean_contract_statement_source_key(statement: str) -> str:
+    """Bind Lean observations to exact retained source, not a search alias.
+
+    Extensible syntax may inspect binder names, grouping, and token layout.
+    An alpha-equivalent search key therefore cannot authenticate which source
+    was elaborated. Older alias-bound receipts require a fresh observation.
+    """
+    source = str(statement or "").strip()
+    if not source:
+        return ""
+    return "lean-contract-source-v1:" + hashlib.sha256(
+        source.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+
+
 def make_lean_contract_identity(
     full_expr_hash: str,
     contract_profile_hash: Optional[str],
@@ -128,6 +143,8 @@ def make_lean_contract_binder_evidence_receipt(
     environment_hash: str,
     binder_sorts: tuple[str, ...],
     proof_binder_types: tuple[str, ...],
+    *,
+    allow_empty_binders: bool = False,
 ) -> str:
     """Bind helper binder metadata to the checked statement and environment.
 
@@ -139,7 +156,7 @@ def make_lean_contract_binder_evidence_receipt(
     if (
         not has_lean_contract_identity(identity)
         or not statement_key
-        or not binder_sorts
+        or (not binder_sorts and not allow_empty_binders)
         or any(sort not in {"data", "proof"} for sort in binder_sorts)
         or binder_sorts.count("proof") != len(proof_binder_types)
         or any(not value.strip() for value in proof_binder_types)

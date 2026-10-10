@@ -815,8 +815,8 @@ def compile_mini_subgoal_plan(
     bottleneck_claim: str = "",
     answer_safe_preamble_used: bool = False,
     name_prefix: str = "mini_subgoal",
-    max_prefix_chars: int = 600,
-    max_variants: int = 4,
+    max_prefix_chars: int = 0,
+    max_variants: int = -1,
 ) -> MiniSubgoalPlan:
     """Compile raw claim payloads into a MiniSubgoalPlan.
 
@@ -1006,8 +1006,8 @@ def compile_parsed_mini_subgoal_plan(
     root_statement: str,
     goal_state: object = None,
     answer_safe_preamble_used: bool = False,
-    max_prefix_chars: int = 600,
-    max_variants: int = 4,
+    max_prefix_chars: int = 0,
+    max_variants: int = -1,
 ) -> MiniSubgoalPlan:
     """Compile a parsed planner response against the live root/goal context."""
 
@@ -1033,7 +1033,7 @@ def render_mini_subgoal_planner_prompt(
     root_statement: str,
     goal_state: object = None,
     answer_safe_preamble_summary: str = "",
-    max_claims: int = 16,
+    max_claims: int = -1,
     suppress_solution_placeholders: bool = True,
     solution_placeholder_filter_active: object = None,
 ) -> str:
@@ -1290,8 +1290,13 @@ def render_mini_subgoal_planner_prompt(
                 indent=2,
             ),
             "",
-            f"Keep the plan to at most {max(1, int(max_claims))} helper claims "
-            "plus one root_assembly claim.",
+            (
+                f"Keep the plan to at most {int(max_claims)} helper claims "
+                "plus one root_assembly claim."
+                if int(max_claims) >= 0 else
+                "Include the helper claims needed for the route. Use durable "
+                "tranches when the complete plan needs another response."
+            ),
             "Set `plan_complete` to true only when this response contains a "
             "root_assembly with a complete dependency chain to the root. Set "
             "it to false when another durable tranche is needed, even if this "
@@ -1307,7 +1312,7 @@ def render_mini_subgoal_plan_summary(
     plan: MiniSubgoalPlan,
     *,
     include_variants: bool = True,
-    max_variants_per_claim: int = 2,
+    max_variants_per_claim: int = -1,
 ) -> str:
     """Render a compact human-readable summary of a compiled plan."""
 
@@ -1336,7 +1341,9 @@ def render_mini_subgoal_plan_summary(
         if claim.counting_classification:
             lines.append(f"   cases: {claim.counting_classification}")
         if include_variants:
-            for variant in claim.variants[: max(0, int(max_variants_per_claim))]:
+            variants = (claim.variants if max_variants_per_claim < 0 else
+                        claim.variants[:max_variants_per_claim])
+            for variant in variants:
                 lines.append(f"   variant/{variant.mode}: {variant.statement}")
     if plan.notes:
         lines.append("Notes: " + "; ".join(plan.notes))

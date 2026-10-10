@@ -14,7 +14,11 @@ from .tactic_service_history import validate_service_history
 
 
 def validated_portfolio_generation(value: Any) -> dict[str, Any]:
-    """Validate saved search text and its exact ordered execution binding."""
+    """Validate saved search text and its exact ordered execution binding.
+
+    Retain the configured portfolio in full. These candidates are pending work;
+    each resumed proof still requires verification in its current context.
+    """
     if not isinstance(value, Mapping) or type(value.get("schema_version")) is not int or value["schema_version"] != 1:
         return {}
     for name, width in (("obligation_key", 16), ("execution_key", 64),
@@ -29,7 +33,7 @@ def validated_portfolio_generation(value: Any) -> dict[str, Any]:
         return {}
     phase, offset, candidates = value.get("phase"), value.get("next_candidate_index"), value.get("candidates")
     if (phase not in {"direct", "active", "lift", "fallback"} or type(offset) is not int
-            or not isinstance(candidates, (list, tuple)) or len(candidates) > 4096
+            or not isinstance(candidates, (list, tuple))
             or not (0 <= offset < len(candidates)
                     or (phase == "fallback" and not candidates and offset == 0))):
         return {}
@@ -110,14 +114,14 @@ def root_portfolio_state(record: Mapping[str, Any]) -> dict[str, Any]:
     raw_offsets = record.get("root_tactic_portfolio_continuations", {})
     offsets: dict[str, int] = {}
     if isinstance(raw_offsets, Mapping):
-        for key, raw_offset in list(raw_offsets.items())[:256]:
+        for key, raw_offset in raw_offsets.items():
             if not isinstance(key, str) or len(key) != 64 or isinstance(raw_offset, bool):
                 continue
             try:
                 offset = int(raw_offset)
             except (TypeError, ValueError, OverflowError):
                 continue
-            if 0 < offset <= 4096 or (
+            if offset > 0 or (
                 offset == 0 and phases.get(key) in ("direct", "active", "lift", "fallback")
             ):
                 offsets[key] = offset
@@ -137,7 +141,7 @@ def root_portfolio_state(record: Mapping[str, Any]) -> dict[str, Any]:
             item for item in _record_keys(record.get(
                 "root_tactic_direct_portfolio_exhausted_execution_keys"
             )) if len(item) == 64
-        })[:256],
+        }),
     }
 
 

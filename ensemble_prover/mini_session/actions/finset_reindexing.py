@@ -53,7 +53,7 @@ class FinsetReindexingAction:
         *,
         phase: str = "finset_reindexing_prepass",
         timeout_s: float = 12.0,
-        max_candidates: int = 18,
+        max_candidates: int = -1,
         max_infrastructure_retries: int = 1,
     ) -> None:
         self.phase = str(phase or "finset_reindexing_prepass")
@@ -71,7 +71,7 @@ class FinsetReindexingAction:
 
 
     def is_applicable(self, session: Any) -> bool:
-        if self.timeout_s <= 0.0 or self.max_candidates <= 0:
+        if self.timeout_s <= 0.0 or self.max_candidates == 0:
             return False
         if session.dossier is None or session.lean is None:
             return False
@@ -565,7 +565,7 @@ class FinsetReindexingAction:
     def next_eligible_at(self, session: Any) -> float:
         """Expose the durable retry wake time to MiniSession's wait lane."""
 
-        if self.timeout_s <= 0.0 or self.max_candidates <= 0:
+        if self.timeout_s <= 0.0 or self.max_candidates == 0:
             return 0.0
         goal = self._goal_statement(session)
         if not goal:

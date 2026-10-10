@@ -10,13 +10,17 @@ import json
 import math
 import re
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
+from heapq import merge
 from threading import Lock
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .state_data import clone_json_value
+from .deep_json import dumps_deep_json, loads_deep_json
 from .tactic_service_history import validate_service_history
 from .contract_identity import (
     LEAN_CONTRACT_IDENTITY_VERSION,
@@ -47,9 +51,12 @@ from .proof_graph import (
     _declaration_body_marker,
     _declaration_type_colon,
     _helper_decl_header,
+    graph_helper_bound_contract_identity,
+    graph_node_bound_contract_identity,
     graph_node_frontier_quarantined,
     graph_root_equivalent_suppression_decision,
     graph_statement_is_executable,
+    graph_statement_key,
     graph_statement_local_name_kind,
     helper_decl_statement,
 )
@@ -88,7 +95,6 @@ PROOF_STATE_VERIFIER_RETRY_MAX_COOLDOWN_S = 1800.0
 PROOF_STATE_VERIFIER_RETRY_MAX_STATES_PER_NODE = 64
 PROOF_STATE_EXECUTION_SCHEMA_VERSION = 2
 PROOF_STATE_ROOT_TACTIC_PORTFOLIO_SCHEMA_VERSION = 1
-PROOF_STATE_ROOT_TACTIC_PORTFOLIO_MAX_CANDIDATES = 256
 PROOF_STATE_CHILD_TACTIC_POLICY_VERSION = "child_tactic_portfolio_v1"
 _PROOF_STATE_KNOWN_RESIDUAL_SOURCE_PREFIXES = (
     "try_skeleton_tool",
@@ -237,7 +243,7 @@ def _proof_state_exact_sha256(value: Any) -> str:
 
 
 def _proof_state_canonical_json_sha256(value: Any) -> str:
-    encoded = json.dumps(
+    encoded = dumps_deep_json(
         value,
         sort_keys=True,
         separators=(",", ":"),
@@ -300,11 +306,9 @@ def _proof_state_durable_sequence(value: Any) -> List[Any]:
 
 
 def validated_root_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
-    """Return a bounded executable root-tactic cursor or fail closed."""
+    """Return an executable root-tactic cursor or fail closed."""
 
-    result = _validated_tactic_portfolio_continuation(
-        value, max_candidates=PROOF_STATE_ROOT_TACTIC_PORTFOLIO_MAX_CANDIDATES
-    )
+    result = _validated_tactic_portfolio_continuation(value)
     if result:
         if "pending_reference_confirmation" in value:
             if type(value["pending_reference_confirmation"]) is not bool:
@@ -337,9 +341,14 @@ def validated_root_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
 
 def _validated_tactic_portfolio_continuation(
     value: Any, *, max_candidates: Optional[int] = None, allow_completed: bool = False,
-    bounded_fields: bool = True,
 ) -> Dict[str, Any]:
-    """Validate an exact portfolio without changing the configured search size."""
+    """Validate an exact portfolio without changing the configured search size.
+
+    Candidate text is private search work, not a proof-acceptance receipt. Long
+    helper statements can generate equally long tactic labels and proofs; their
+    size must not discard the entire paid cursor. Every resumed candidate still
+    passes through the current Lean verifier before it can prove anything.
+    """
 
     if not isinstance(value, Mapping):
         return {}
@@ -398,12 +407,6 @@ def _validated_tactic_portfolio_continuation(
             or not source.strip()
             or (helper is not None and not isinstance(helper, str))
             or proof in seen_proofs
-            or (bounded_fields and (
-                len(proof) > 16_384
-                or len(tactic) > 8_192
-                or len(source) > 256
-                or (isinstance(helper, str) and len(helper) > 512)
-            ))
         ):
             return {}
         seen_proofs.add(proof)
@@ -432,7 +435,7 @@ def validated_child_tactic_portfolio_continuation(value: Any) -> Dict[str, Any]:
     """Validate private child search work, never a proof-acceptance receipt."""
 
     validated = _validated_tactic_portfolio_continuation(
-        value, allow_completed=True, bounded_fields=False
+        value, allow_completed=True
     )
     if validated.get("phase") != "direct":
         return {}
@@ -656,10 +659,10 @@ def proof_state_residual_goal_batch_digest(
 def _proof_state_residual_expr_hash(canonical_expr_json: Any) -> str:
     text = str(canonical_expr_json or "")
     try:
-        parsed = json.loads(text)
+        parsed = loads_deep_json(text)
     except (TypeError, ValueError, json.JSONDecodeError):
         return ""
-    canonical = json.dumps(
+    canonical = dumps_deep_json(
         parsed,
         sort_keys=True,
         separators=(",", ":"),
@@ -1109,14 +1112,14 @@ def _residual_goal_attestation_authorities(
 def _erase_lean_comments_text(text: str) -> str:
     """Erase Lean comments while preserving their lexical whitespace role.
 
-    Comments carry no proposition identity, but deleting them byte-for-byte can
-    join adjacent identifiers into a different token.  Replace each comment
-    with its line breaks (or one separating space when it has none) for
-    layout-sensitive syntax.  Strings, raw strings, character literals, and
-    quoted identifiers remain verbatim.
+    Comments carry no proposition identity, but deleting them can join tokens
+    or change the indentation of a token after a block comment. In multiline
+    source preserve every character's column and all line breaks. Strings, raw
+    strings, character literals, and quoted identifiers remain verbatim.
     """
 
     raw = str(text or "")
+    preserve_columns = "\n" in raw or "\r" in raw
     out: List[str] = []
     index = 0
     while index < len(raw):
@@ -1127,8 +1130,10 @@ def _erase_lean_comments_text(text: str) -> str:
             continue
         lexical = raw[index:lexical_end]
         if raw.startswith(("/-", "--"), index):
-            line_breaks = "".join(ch for ch in lexical if ch in "\r\n")
-            out.append(line_breaks or " ")
+            out.append(
+                "".join(ch if ch in "\r\n" else " " for ch in lexical)
+                if preserve_columns else " "
+            )
         else:
             out.append(lexical)
         index = lexical_end
@@ -1210,10 +1215,20 @@ def _replace_type_symbols_capture_safe(text: str) -> str:
     # statement (a binder named Nat shadowing the real ℕ). Mixed statements
     # where both spellings appear free (e.g. ``∀ n : Nat, (0 : ℕ) < n``)
     # unify safely and keep doing so.
-    try:
-        bound = set(lean_statement_bound_names(str(text or "")))
-    except Exception:
-        bound = set()
+    source = str(text or "")
+    active_pairs = tuple(
+        (symbol, replacement)
+        for symbol, replacement in _LEAN_TYPE_SYMBOLS.items()
+        if symbol in source
+    )
+    if not active_pairs:
+        return source
+    bound: Set[str] = set()
+    if any(replacement in source for _symbol, replacement in active_pairs):
+        try:
+            bound = set(lean_statement_bound_names(source))
+        except Exception:
+            bound = set()
 
     def replace_segment(segment: str) -> str:
         out = str(segment or "")
@@ -1230,10 +1245,9 @@ def _replace_type_symbols_capture_safe(text: str) -> str:
     return _replace_outside_lean_quotes_text(text, replace_segment)
 
 
-# A bare ascription/binder colon — not the first/second half of ``:=`` or
-# ``::``. Identity must be invariant under colon spacing (``(0:ℝ)`` ≡
-# ``(0 : ℝ)``): before this normalization, spacing depended on which
-# canonicalization path a subterm happened to take .
+# A binder colon, excluding the first/second half of ``:=`` or ``::``.
+# Only grammar-owned binder heads authorize this spacing normalization;
+# an arbitrary ascription or notation token must retain its exact source.
 _IDENTITY_COLON_SPACING_RE = re.compile(r"[ \t]*(?<!:)(:)(?![:=])[ \t]*")
 
 
@@ -1245,9 +1259,10 @@ def _normalize_colon_spacing_outside_lean_quotes(text: str) -> str:
 
 
 def normalize_lean_colon_spacing_for_identity(text: str) -> str:
-    """Public conservative normalization for exact-source identity checks."""
+    """Normalize binder spacing only when the source has established scopes."""
 
-    return _normalize_colon_spacing_outside_lean_quotes(str(text or ""))
+    raw = str(text or "")
+    return raw if _identity_requires_exact_source(raw) else _normalize_colon_spacing_outside_lean_quotes(raw)
 
 
 _LEMMA_DAG_TERMINAL_SOURCE_REJECTIONS = {
@@ -1448,6 +1463,23 @@ def _normalize_proof_state_context_item(value: Any) -> str:
 
 def _identity_source_text(statement: str) -> str:
     raw = _erase_lean_comments_text(str(statement or "")).strip()
+    if "\n" in raw or "\r" in raw:
+        # Declaration and rendered-goal wrappers have dedicated lexical
+        # extractors. Bare checked expressions must retain every line; the
+        # model-output prose normalizer is not an identity parser.
+        if _helper_decl_header(raw) is not None:
+            return helper_decl_statement(raw) or raw
+        if raw.startswith("⊢") or raw.startswith("case ") or re.match(r"[^\n]+:[^\n]*\n⊢", raw):
+            index = 0
+            while index < len(raw):
+                lexical_end = _lean_lexical_skip_end(raw, index)
+                if lexical_end is not None:
+                    index = lexical_end
+                elif raw[index] == "⊢":
+                    return raw[index + 1:].strip()
+                else:
+                    index += 1
+        return raw
     # Identity is allowed to normalize binders in the lexer-aware routines
     # below, but it must not pre-collapse raw whitespace inside Lean literals
     # or quotations.  Preserve the executable spelling here.
@@ -2580,6 +2612,30 @@ def _lean_lexically_free_reference_tokens(
     reference_aliases: Optional[Mapping[str, str]] = None,
     alias_prefix: str = "",
 ) -> Set[str]:
+    from .proof_graph import _large_lexical_result
+
+    frozen_candidates = frozenset(candidates)
+    aliases = tuple((reference_aliases or {}).items())
+    return set(_large_lexical_result(
+        (
+            "lexically_free_references", source, frozen_candidates, aliases,
+            alias_prefix, _uncached_lean_lexically_free_reference_tokens,
+            _scoped_identifier_uses,
+        ),
+        lambda: frozenset(_uncached_lean_lexically_free_reference_tokens(
+            source, set(frozen_candidates), reference_aliases=dict(aliases),
+            alias_prefix=alias_prefix,
+        )),
+    ))
+
+
+def _uncached_lean_lexically_free_reference_tokens(
+    source: str,
+    candidates: Set[str],
+    *,
+    reference_aliases: Optional[Mapping[str, str]] = None,
+    alias_prefix: str = "",
+) -> Set[str]:
     """Keep full name atoms while applying shared term and telescope scopes.
 
     A declaration telescope scopes its type and proof separately. Unrecognized
@@ -2722,6 +2778,21 @@ def _lean_lexically_free_reference_tokens(
     return free
 
 
+@lru_cache(maxsize=4096)
+def _cached_reference_name_components(
+    name: str, parser: Callable[[str], Tuple[str, ...]],
+) -> Tuple[str, ...]:
+    return parser(name)
+
+
+def _reference_name_components(name: str) -> Tuple[str, ...]:
+    # Bound retained names by both size and entry count. Long Lean names keep
+    # the same parsing semantics without retaining large keys in this cache.
+    if len(name) > 256:
+        return lean_constant_name_components(name)
+    return _cached_reference_name_components(name, lean_constant_name_components)
+
+
 def lean_referenced_helper_names(
     src: str,
     names: Sequence[str],
@@ -2729,17 +2800,17 @@ def lean_referenced_helper_names(
     skip: Optional[str] = None,
     allow_arbitrary_dot_methods: bool = False,
 ) -> Set[str]:
-    skip_components = lean_constant_name_components(str(skip or ""))
+    skip_components = _reference_name_components(str(skip or ""))
     name_set = {
         str(name or "").strip()
         for name in list(names or ())
         if str(name or "").strip()
-        and lean_constant_name_components(str(name or "").strip()) != skip_components
+        and _reference_name_components(str(name or "").strip()) != skip_components
     }
     if not name_set:
         return set()
 
-    name_components = {name: lean_constant_name_components(name) for name in name_set}
+    name_components = {name: _reference_name_components(name) for name in name_set}
     if skip_components:
         # Retain the self identity during longest-prefix resolution so its dot
         # methods cannot accidentally resolve to a shorter registered helper.
@@ -3185,7 +3256,7 @@ def _leading_quantifier_body(
     return "", "", expr
 
 
-def _find_identity_quantifier_comma(text: str) -> int:
+def _find_identity_quantifier_comma(text: str, *, stop_at_scope_end: bool = False) -> int:
     """Find the comma ending a Lean quantifier binder sequence.
 
     A plain top-level-comma scan is unsound for bounded binders whose bound
@@ -3209,6 +3280,8 @@ def _find_identity_quantifier_comma(text: str) -> int:
             index = lexical_end
             continue
         ch = raw[index]
+        if stop_at_scope_end and depth == 0 and ch in ")]}⟩":
+            return -1
         if (
             depth == 0
             and ch in {"⋃", "⋂", "∑", "∏", "⨆", "⨅"}
@@ -3542,7 +3615,7 @@ def _balanced_group_end(text: str, start: int) -> int:
     return -1
 
 
-def _parse_binder_names(lhs: str) -> List[str]:
+def _parse_binder_names(lhs: str, *, include_anonymous: bool = False) -> List[str]:
     out: List[str] = []
     source = str(lhs or "").strip()
     index = 0
@@ -3562,7 +3635,7 @@ def _parse_binder_names(lhs: str) -> List[str]:
             return []
         clean = match.group(0).strip()
         index = match.end()
-        if not clean or clean == "_" or clean in _LEAN_RESERVED_LOCAL_NAMES:
+        if not clean or (clean == "_" and not include_anonymous) or clean in _LEAN_RESERVED_LOCAL_NAMES:
             continue
         out.append(clean)
     return out
@@ -3923,7 +3996,7 @@ def _canonicalize_binder_group(
     relation_left, relation_op, relation_right = _split_relation_binder_inner(
         inner
     )
-    relation_names = _parse_binder_names(relation_left)
+    relation_names = _parse_binder_names(relation_left, include_anonymous=True)
     if (
         relation_left
         and relation_op
@@ -3934,8 +4007,10 @@ def _canonicalize_binder_group(
         name_replacements: Dict[str, str] = {}
         normalized_names: List[str] = []
         for offset, name in enumerate(relation_names):
-            name_replacements[name] = f"_b{next_index + offset}"
-            normalized_names.append(name_replacements[name])
+            normalized_name = f"_b{next_index + offset}"
+            if name != "_":
+                name_replacements[name] = normalized_name
+            normalized_names.append(normalized_name)
         next_index += len(relation_names)
         scoped_replacements = dict(replacements)
         scoped_replacements.update(name_replacements)
@@ -3963,13 +4038,15 @@ def _canonicalize_binder_group(
                 _replace_local_names_tokenwise_text(inner, replacements)
             )
             return opener + normalized_inner + closer, next_index, []
-        names = _parse_binder_names(inner)
+        names = _parse_binder_names(inner, include_anonymous=True)
         if names:
             new_names: List[str] = []
             for name in names:
-                replacements[name] = f"_b{next_index}"
+                normalized_name = f"_b{next_index}"
+                if name != "_":
+                    replacements[name] = normalized_name
                 next_index += 1
-                new_names.append(replacements[name])
+                new_names.append(normalized_name)
             normalized_inner = " ".join(new_names)
             return (
                 opener + normalized_inner + closer if opener else normalized_inner,
@@ -3993,7 +4070,7 @@ def _canonicalize_binder_group(
         )
     lhs = inner[:colon].strip()
     typ = inner[colon + 1 :].strip()
-    names = _parse_binder_names(lhs)
+    names = _parse_binder_names(lhs, include_anonymous=True)
     if not names:
         lhs_norm = _replace_local_names_tokenwise_text(lhs, replacements)
         typ_norm, next_index = _canonicalize_identity_expr(
@@ -4012,8 +4089,10 @@ def _canonicalize_binder_group(
     new_names: List[str] = []
     name_replacements: Dict[str, str] = {}
     for offset, name in enumerate(names):
-        name_replacements[name] = f"_b{next_index + offset}"
-        new_names.append(name_replacements[name])
+        normalized_name = f"_b{next_index + offset}"
+        if name != "_":
+            name_replacements[name] = normalized_name
+        new_names.append(normalized_name)
     typ_norm, next_index = _canonicalize_identity_expr(
         _normalize_ascii_arrows_outside_lean_quotes(
             _replace_local_names_tokenwise_text(typ, replacements)
@@ -4339,27 +4418,31 @@ def _canonicalize_identity_expr(
     quantifier, binder_text, body = _leading_identity_quantifier_body(expr)
     if binder_text:
         scoped_replacements = dict(replacements)
-        group_texts = _split_binder_groups(binder_text) or [binder_text]
-        normalized_groups: List[str] = []
-        for group in group_texts:
-            normalized_group, next_index, _names = _canonicalize_binder_group(
-                group,
-                replacements=scoped_replacements,
-                next_index=next_index,
-            )
-            if normalized_group:
-                normalized_groups.append(normalized_group)
-        chained_binder, _chained_body = _implicit_chained_relation_binder(body)
-        recursive_body = f"{quantifier} {body}" if chained_binder else body
+        prefixes: List[str] = []
+        # Consecutive binders share a nested scope but do not need a Python
+        # stack frame each. Keep their order and dependent-name environment.
+        while binder_text:
+            group_texts = _split_binder_groups(binder_text) or [binder_text]
+            normalized_groups = []
+            for group in group_texts:
+                normalized_group, next_index, _names = _canonicalize_binder_group(
+                    group,
+                    replacements=scoped_replacements,
+                    next_index=next_index,
+                )
+                if normalized_group:
+                    normalized_groups.append(normalized_group)
+            prefix = " ".join(normalized_groups)
+            prefixes.append(f"{quantifier} {prefix}, " if prefix else f"{quantifier} ")
+            chained_binder, _chained_body = _implicit_chained_relation_binder(body)
+            recursive_body = f"{quantifier} {body}" if chained_binder else body
+            quantifier, binder_text, body = _leading_identity_quantifier_body(recursive_body)
         body_norm, next_index = _canonicalize_identity_expr(
             recursive_body,
             replacements=scoped_replacements,
             next_index=next_index,
         )
-        prefix = " ".join(normalized_groups)
-        if prefix:
-            return f"{quantifier} {prefix}, {body_norm}", next_index
-        return f"{quantifier} {body_norm}", next_index
+        return "".join(prefixes) + body_norm, next_index
 
     if expr.startswith("¬"):
         raw_tail = expr[1:].strip()
@@ -4552,7 +4635,7 @@ def _canonicalize_identity_expr(
 
 
 _CANONICAL_STATEMENT_CACHE_MAX_BYTES = 4 * 1024 * 1024
-_CANONICAL_STATEMENT_CACHE_MAX_ENTRIES = 128
+_CANONICAL_STATEMENT_CACHE_MAX_ENTRIES: Optional[int] = None
 _CANONICAL_STATEMENT_CACHE: OrderedDict[Tuple[Any, ...], Tuple[str, int]] = OrderedDict()
 _CANONICAL_STATEMENT_CACHE_BYTES = 0
 _CANONICAL_STATEMENT_CACHE_LOCK = Lock()
@@ -4562,8 +4645,9 @@ def canonicalize_lean_statement_for_identity(
     statement: str,
     *,
     extra_bound_names: Sequence[str] = (),
+    normalize_type_symbols: bool = True,
 ) -> str:
-    """Syntactically alpha-normalize a Lean proposition for graph/cache identity."""
+    """Alpha-normalize binders, optionally retaining environment-dependent notation."""
 
     from .proof_graph import _lexical_retained_bytes
 
@@ -4573,14 +4657,14 @@ def canonicalize_lean_statement_for_identity(
     global _CANONICAL_STATEMENT_CACHE_BYTES
     source = str(statement or "")
     names = tuple(str(name or "").strip() for name in extra_bound_names)
-    key = (source, names)
+    key = (source, names, normalize_type_symbols)
     with _CANONICAL_STATEMENT_CACHE_LOCK:
         entry = _CANONICAL_STATEMENT_CACHE.get(key)
         if entry is not None:
             _CANONICAL_STATEMENT_CACHE.move_to_end(key)
             return entry[0]
     result = _canonicalize_lean_statement_for_identity_uncached(
-        source, extra_bound_names=names,
+        source, extra_bound_names=names, normalize_type_symbols=normalize_type_symbols,
     )
     weight = _lexical_retained_bytes(key) + _lexical_retained_bytes(result) + 256
     if weight > _CANONICAL_STATEMENT_CACHE_MAX_BYTES:
@@ -4591,24 +4675,375 @@ def canonicalize_lean_statement_for_identity(
             _CANONICAL_STATEMENT_CACHE_BYTES -= previous[1]
         while _CANONICAL_STATEMENT_CACHE and (
             _CANONICAL_STATEMENT_CACHE_BYTES + weight > _CANONICAL_STATEMENT_CACHE_MAX_BYTES
-            or len(_CANONICAL_STATEMENT_CACHE) >= _CANONICAL_STATEMENT_CACHE_MAX_ENTRIES
+            or (
+                _CANONICAL_STATEMENT_CACHE_MAX_ENTRIES is not None
+                and len(_CANONICAL_STATEMENT_CACHE) >= _CANONICAL_STATEMENT_CACHE_MAX_ENTRIES
+            )
         ):
             _, (_, evicted_weight) = _CANONICAL_STATEMENT_CACHE.popitem(last=False)
             _CANONICAL_STATEMENT_CACHE_BYTES -= evicted_weight
-        if _CANONICAL_STATEMENT_CACHE_MAX_ENTRIES > 0:
+        if _CANONICAL_STATEMENT_CACHE_MAX_ENTRIES is None or _CANONICAL_STATEMENT_CACHE_MAX_ENTRIES > 0:
             _CANONICAL_STATEMENT_CACHE[key] = (result, weight)
             _CANONICAL_STATEMENT_CACHE_BYTES += weight
     return result
+
+
+def _identity_simple_let_head(head: str) -> bool:
+    """Only a single local identifier has the simple-let binding scope."""
+    colon = _find_top_level_colon(head)
+    name = (head[:colon] if colon >= 0 else head).strip()
+    names = _parse_binder_names(name)
+    return len(names) == 1 and name == names[0]
+
+
+def _identity_requires_exact_source(text: str) -> bool:
+    """Retain source whose binder scope this identity parser cannot establish.
+
+    The printable identity parser handles a binder through its closing group,
+    but a tuple comma can end it earlier. Keep such source exact until that
+    syntax has a complete scope parser, including binders after tuple items.
+    Local functions, recursive lets and patterns also have different binding
+    scopes from a simple ``let name := value; body`` and must stay exact.
+    """
+    if "\n" in text or "\r" in text:
+        return True
+    owned_binder_groups: Set[int] = set()
+    owned_binder_colons: Set[int] = set()
+    index = 0
+    while index < len(text):
+        lexical_end = _lean_lexical_skip_end(text, index)
+        if lexical_end is not None:
+            index = lexical_end
+            continue
+        binder_text = ""
+        if text[index] in "∀∃" or any(
+            _starts_word_at(text, index, keyword) for keyword in ("forall", "exists")
+        ):
+            # Only the header owns binder groups and colons. Finding the end
+            # of every quantifier body repeatedly scans the whole telescope.
+            keyword = next((word for word in ("∀", "∃", "forall", "exists")
+                            if text.startswith(word + " ", index)), "")
+            if keyword:
+                rest = text[index + len(keyword):]
+                comma = _find_identity_quantifier_comma(rest, stop_at_scope_end=True)
+                if comma >= 0:
+                    binder_text = rest[:comma].strip()
+        elif text[index] == "λ" or _starts_word_at(text, index, "fun"):
+            parsed_lambda = _parse_lambda_at(text, index)
+            if parsed_lambda is not None:
+                binder_text = str(parsed_lambda["binder"])
+        elif text[index] in {"∑", "∏", "⋃", "⋂", "⨆", "⨅"}:
+            parsed_operator = _parse_big_operator_at(text, index)
+            if parsed_operator is not None:
+                binder_text = str(parsed_operator["binder"])
+                if parsed_operator["delimiter"] == ":":
+                    binder_start = text.find(binder_text, index + len(str(parsed_operator["operator"])))
+                    delimiter_index = binder_start + len(binder_text)
+                    while delimiter_index < len(text) and text[delimiter_index].isspace():
+                        delimiter_index += 1
+                    if binder_start >= 0 and text[delimiter_index:delimiter_index + 1] == ":":
+                        owned_binder_colons.add(delimiter_index)
+        elif _starts_word_at(text, index, "let"):
+            let_head, _let_value, _let_body = _leading_identity_let_body(
+                text[index:_find_lambda_body_end(text, index)],
+            )
+            if let_head:
+                head_start = text.find(let_head, index + 3)
+                head_colon = _find_top_level_colon(let_head)
+                if head_start >= 0 and head_colon >= 0:
+                    owned_binder_colons.add(head_start + head_colon)
+        if binder_text:
+            binder_cursor = text.find(binder_text, index)
+            for group in _split_binder_groups(binder_text):
+                group_start = text.find(group, binder_cursor)
+                if group_start < 0:
+                    break
+                if group.startswith("("):
+                    owned_binder_groups.add(group_start)
+                inner_start = 1 if group[:1] in "({[" else 0
+                inner = group[inner_start:-1] if inner_start else group
+                group_colon = _find_top_level_colon(inner)
+                if group_colon >= 0:
+                    owned_binder_colons.add(group_start + inner_start + group_colon)
+                binder_cursor = group_start + len(group)
+        if (
+            text[index] == ":"
+            and text[index:index + 2] not in {":=", "::"}
+            and (index == 0 or text[index - 1] != ":")
+            and index not in owned_binder_colons
+        ):
+            return True
+        if text[index] == "(":
+            group_end = _balanced_group_end(text, index)
+            if group_end >= 0:
+                inner = text[index + 1:group_end].strip()
+                quantifier, binder, body = _leading_identity_quantifier_body(inner)
+                lambda_keyword, lambda_binder, lambda_body = _leading_identity_fun_body(inner)
+                let_head, let_value, let_body = _leading_identity_let_body(inner)
+                big_operator = _parse_big_operator_at(inner, 0) if inner else None
+                if not (
+                    index in owned_binder_groups
+                    or (quantifier and binder and body)
+                    or (lambda_keyword and lambda_binder and lambda_body)
+                    or (let_head and let_value and let_body)
+                    or big_operator is not None
+                ):
+                    # Unknown grouping can be custom notation: `(f 2)` need
+                    # not have the same token stream as `( f 2 )`. Only known
+                    # binder scopes authorize printable alpha normalization.
+                    return True
+        # These term grammars include layout-sensitive blocks and scopes that
+        # the printable identity parser does not model. A whitespace rewrite
+        # can change their meaning even without renaming any local binder.
+        if any(_starts_word_at(text, index, keyword) for keyword in ("do", "by", "match", "where")):
+            return True
+        index += 1
+    pending = [text]
+    while pending:
+        expression = pending.pop()
+        # A layout let's body is outside its value's lambda scope. Retain
+        # that existing parse boundary instead of scanning past a line break.
+        if expression.lstrip().startswith("let "):
+            head, value, body = _leading_identity_let_body(expression)
+            if head and value and body:
+                if not _identity_simple_let_head(head):
+                    return True
+                pending.extend((head, value, body))
+                continue
+        if expression.lstrip().startswith(("∀ ", "∃ ", "forall ", "exists ")):
+            quantifier, binder, body = _leading_identity_quantifier_body(expression)
+            if quantifier and binder and body:
+                pending.append(binder)
+                # A chained bounded binder owns its closing comma even when
+                # its bound contains an indexed union or another big operator.
+                # Scan the known binder/body pieces separately so that comma
+                # is not mistaken for a tuple separator inside the operator.
+                while True:
+                    chained_binder, chained_body = _implicit_chained_relation_binder(body)
+                    if not (chained_binder and chained_body):
+                        break
+                    pending.append(chained_binder)
+                    body = chained_body
+                pending.append(body)
+                continue
+        if _identity_expression_requires_exact_source(expression, pending=pending):
+            return True
+    return False
+
+
+def _identity_expression_requires_exact_source(text: str, *, pending: List[str]) -> bool:
+    index = 0
+    depth = 0
+    while index < len(text):
+        lexical_end = _lean_lexical_skip_end(text, index)
+        if lexical_end is not None:
+            index = lexical_end
+            continue
+        body = ""
+        if text[index] == "λ" or _starts_word_at(text, index, "fun"):
+            parsed = _parse_lambda_at(text, index)
+            if parsed is not None:
+                body = str(parsed["body"])
+        elif text[index] in {"∑", "∏", "⋃", "⋂", "⨆", "⨅"}:
+            parsed = _parse_big_operator_at(text, index)
+            if parsed is not None:
+                body = str(parsed["body"])
+        elif (
+            text[index] in "∀∃"
+            or _starts_word_at(text, index, "forall")
+            or _starts_word_at(text, index, "exists")
+            or _starts_word_at(text, index, "let")
+        ):
+            candidate = text[index:_find_lambda_body_end(text, index)]
+            quantifier, binder, tail = _leading_identity_quantifier_body(candidate)
+            if quantifier and binder:
+                # Its binder comma belongs to the quantifier, including a
+                # bounded binder whose RHS contains another indexed operator.
+                # Visit those established pieces instead of rescanning the
+                # operator with the quantifier's closing comma still attached.
+                scope_tail = tail
+                while True:
+                    nested_quantifier, nested_binder, nested_tail = _leading_identity_quantifier_body(scope_tail)
+                    if nested_quantifier and nested_binder and nested_tail:
+                        scope_tail = nested_tail
+                        continue
+                    chained_binder, chained_body = _implicit_chained_relation_binder(scope_tail)
+                    if chained_binder and chained_body:
+                        scope_tail = chained_body
+                        continue
+                    break
+                if _find_identity_quantifier_comma(scope_tail) >= 0:
+                    return True
+                pending.append(candidate)
+                index += len(candidate)
+                continue
+            else:
+                head, value, tail = _leading_identity_let_body(candidate)
+                if head and value:
+                    if not _identity_simple_let_head(head):
+                        return True
+                    body = tail
+        if body:
+            while True:
+                quantifier, binder, tail = _leading_identity_quantifier_body(body)
+                if not (quantifier and binder and tail):
+                    break
+                body = tail
+            if _find_identity_quantifier_comma(body) >= 0:
+                return True
+        depth = _scan_lean_depth(text, index, depth)
+        index += 1
+    return False
+
+
+def _completion_nested_binders(text: str, next_index: int) -> Optional[str]:
+    """Normalize recognized parenthesized binder scopes without losing grouping.
+
+    Quantifiers used as application arguments or equality operands are not
+    top-level logical connectives. Visit those scopes before the enclosing
+    expression so a local shadow is renamed before outer names are replaced.
+    Every generated name is fresh across the complete source. Unknown syntax
+    stays literal, and the stack avoids adding a recursion limit for grouping.
+    """
+    frames: List[List[str]] = [[]]
+    index = 0
+    while index < len(text):
+        lexical_end = _lean_lexical_skip_end(text, index)
+        if lexical_end is not None:
+            frames[-1].append(text[index:lexical_end])
+            index = lexical_end
+            continue
+        char = text[index]
+        if char == "(":
+            frames.append([])
+        elif char == ")" and len(frames) > 1:
+            body = "".join(frames.pop())
+            quantifier, binder, tail = _leading_identity_quantifier_body(body)
+            let_head, let_value, let_body = _leading_identity_let_body(body)
+            lambda_keyword, lambda_binder, lambda_body = _leading_identity_fun_body(body)
+            scope_tail = tail if quantifier else (let_body if let_head else lambda_body)
+            # A parenthesis can also be a tuple. Only consume commas known
+            # to belong to consecutive quantifier binders; an unowned comma
+            # may end this scope before the closing parenthesis.
+            while True:
+                nested_quantifier, nested_binder, nested_tail = _leading_identity_quantifier_body(scope_tail)
+                if not (nested_quantifier and nested_binder and nested_tail):
+                    break
+                scope_tail = nested_tail
+            recognized = bool(
+                (quantifier and binder and tail)
+                or (let_head and let_value and let_body)
+                or (lambda_keyword and lambda_binder and lambda_body)
+            )
+            if recognized and _find_identity_quantifier_comma(scope_tail) >= 0:
+                # The general printable canonicalizer does not parse tuple
+                # separator scope. Preserve this statement exactly instead
+                # of letting a binder capture a later tuple component.
+                return None
+            if recognized:
+                body, next_index = _canonicalize_identity_expr(
+                    body, replacements={}, next_index=next_index,
+                )
+            frames[-1].append("(" + body + ")")
+        else:
+            frames[-1].append(char)
+        index += 1
+    if len(frames) != 1:
+        # Malformed grouping cannot establish a new completion equivalence.
+        return None
+    return "".join(frames[0])
+
+
+def _completion_credit_quantifier_spelling(statement: str) -> str:
+    """Provide optional spelling normalization only for withholding repeat credit."""
+    def separate_quantifier_tokens(segment: str) -> str:
+        # Lean does not require whitespace between a quantifier token and its
+        # first binder. Preserve longer operators such as ∀ᶠ, ∀ᵐ, and ∃!.
+        segment = re.sub(
+            r"([∀∃])(?=([^\W\d]|[({\[«]))",
+            lambda match: match.group(1) + (
+                "" if unicodedata.category(match.group(2)) in {"Lm", "No"} else " "
+            ),
+            segment,
+        )
+        return re.sub(r"\b(forall|exists)(?=[({\[«])", r"\1 ", segment)
+
+    return _replace_outside_lean_quotes_text(
+        _identity_source_text(statement), separate_quantifier_tokens,
+    )
+
+
+def lean_statement_completion_identity(
+    statement: str, *, normalize_nested_binders: bool = False,
+) -> str:
+    """Encode alpha-bound names independently of their fresh-name spelling.
+
+    The printable canonicalizer reserves every source ``_bN`` token to avoid
+    capturing free identifiers. Its generated starting index therefore also
+    changes when a bound name is spelled ``_bN``. Completion identities encode
+    generated tokens separately from literal text, retaining that capture
+    protection while giving alpha-renamed binders the same identity.
+    """
+    from .contract_normalization import compact_contract_surface
+
+    source = _identity_source_text(statement)
+    first_generated = _next_free_alpha_index(source)
+    if normalize_nested_binders:
+        if _identity_requires_exact_source(source):
+            return json.dumps(
+                ["exact", _identity_source_text(statement)],
+                ensure_ascii=True, separators=(",", ":"),
+            )
+        normalized_source = _completion_nested_binders(source, first_generated)
+        if normalized_source is None:
+            return json.dumps(
+                ["exact", _identity_source_text(statement)],
+                ensure_ascii=True, separators=(",", ":"),
+            )
+        source = normalized_source
+    canonical = compact_contract_surface(canonicalize_lean_statement_for_identity(
+        source, normalize_type_symbols=False,
+    ))
+    parts: List[Any] = []
+    generated_indices: Dict[int, int] = {}
+    literal_start = 0
+    index = 0
+    while index < len(canonical):
+        lexical_end = _lean_lexical_skip_end(canonical, index)
+        if lexical_end is not None:
+            index = lexical_end
+            continue
+        token = _ALPHA_NAME_TOKEN_RE.match(canonical, index)
+        if token is not None and int(token.group(1)) >= first_generated:
+            parts.append(canonical[literal_start:index])
+            generated_index = int(token.group(1)) - first_generated
+            if normalize_nested_binders:
+                # Redundant parentheses can revisit an already normalized
+                # scope. Encode only names retained by the final expression,
+                # with an injective order independent of discarded indices.
+                generated_index = generated_indices.setdefault(
+                    generated_index, len(generated_indices),
+                )
+            parts.append([generated_index])
+            index = token.end()
+            literal_start = index
+        else:
+            index += 1
+    parts.append(canonical[literal_start:])
+    return json.dumps(parts, ensure_ascii=True, separators=(",", ":"))
 
 
 def _canonicalize_lean_statement_for_identity_uncached(
     statement: str,
     *,
     extra_bound_names: Sequence[str] = (),
+    normalize_type_symbols: bool = True,
 ) -> str:
     text = _identity_source_text(statement)
-    text = _replace_type_symbols_capture_safe(text)
-    text = _normalize_colon_spacing_outside_lean_quotes(text)
+    if _identity_requires_exact_source(text):
+        return text
+    if normalize_type_symbols:
+        text = _replace_type_symbols_capture_safe(text)
     replacements: Dict[str, str] = {}
     # Reserve fresh-name space: a statement literally containing _bN tokens
     # must not collide with generated alpha names (canon of
@@ -4633,7 +5068,9 @@ def lean_statement_bound_names(statement: str) -> List[str]:
 
     text = _identity_source_text(statement)
     out: List[str] = []
-    def visit(expr: str) -> None:
+    pending = [text]
+    while pending:
+        expr = pending.pop()
         expr = _strip_balanced_outer_parens(str(expr or "").strip())
         let_head, let_value, let_body = _leading_identity_let_body(expr)
         if let_head and let_body:
@@ -4641,9 +5078,8 @@ def lean_statement_bound_names(statement: str) -> List[str]:
             lhs = let_head[:colon].strip() if colon >= 0 else let_head
             names = _parse_binder_names(lhs)
             out.extend(names[:1])
-            visit(let_value)
-            visit(let_body)
-            return
+            pending.extend((let_body, let_value))
+            continue
         _lambda_keyword, lambda_binder_text, lambda_body = _leading_identity_fun_body(expr)
         if lambda_binder_text:
             scoped_names: List[str] = []
@@ -4655,8 +5091,8 @@ def lean_statement_bound_names(statement: str) -> List[str]:
                 lhs = raw[:colon].strip() if colon >= 0 else raw
                 scoped_names.extend(_parse_binder_names(lhs))
             out.extend(scoped_names)
-            visit(lambda_body)
-            return
+            pending.append(lambda_body)
+            continue
         _quantifier, binder_text, body = _leading_identity_quantifier_body(expr)
         if binder_text:
             scoped_names: List[str] = []
@@ -4668,11 +5104,11 @@ def lean_statement_bound_names(statement: str) -> List[str]:
                 lhs = raw[:colon].strip() if colon >= 0 else raw
                 scoped_names.extend(_parse_binder_names(lhs))
             out.extend(scoped_names)
-            visit(body)
-            return
+            pending.append(body)
+            continue
         if expr.startswith("¬ "):
-            visit(expr[2:].strip())
-            return
+            pending.append(expr[2:].strip())
+            continue
         for operator_group in (
             ("↔",),
             ("→", "->"),
@@ -4683,11 +5119,9 @@ def lean_statement_bound_names(statement: str) -> List[str]:
             if split is None:
                 continue
             parts, _operators = split
-            for part in parts:
-                visit(part)
-            return
+            pending.extend(reversed(parts))
+            break
 
-    visit(text)
     for name in _big_operator_bound_names(text):
         if name not in out:
             out.append(name)
@@ -5443,6 +5877,9 @@ class ProofStateNode:
     # This is executable scheduler state, not advisory telemetry: retry
     # acceptance directly instead of paying to rediscover the proof.
     pending_helper_acceptance: Dict[str, Any] = field(default_factory=dict)
+    # Advisory completed cache attempts, bound by the executor to the exact
+    # checking context and allowance. Kept out of public graph projections.
+    cache_lookup_progress: Dict[str, Any] = field(default_factory=dict)
     proved_helper_name: str = ""
     # recursive helper prover telemetry.
     # ``recursive_attempts`` increments each time a
@@ -5878,9 +6315,14 @@ class ProofSearchState:
     def _target_environment_index_key(
         normalized_statement_hash: str,
         statement_environment_hash: str = "",
+        *,
+        statement_source: str,
     ) -> str:
         statement_hash = str(normalized_statement_hash or "").strip()
         environment_hash = str(statement_environment_hash or "").strip()
+        # This index can reuse terminal status and checked residual authority.
+        # Keep heuristic alpha normalization separate from executable identity.
+        statement_hash += ":source:" + text_hash(str(statement_source or "").strip())
         if not environment_hash:
             return statement_hash
         return f"{statement_hash}:environment:{environment_hash}"
@@ -5922,6 +6364,7 @@ class ProofSearchState:
             self._target_environment_index_key(
                 root_goal.normalized_statement_hash,
                 self.statement_environment_hash,
+                statement_source=root,
             ): self.root_node_id
         }
         self._graph_state_node_aliases: Dict[str, str] = {}
@@ -6332,6 +6775,7 @@ class ProofSearchState:
                     state._target_environment_index_key(
                         node.goal.normalized_statement_hash,
                         node.statement_environment_hash,
+                        statement_source=node.target,
                     )
                 ] = node.node_id
         root = state.nodes.get(state.root_node_id)
@@ -6344,6 +6788,7 @@ class ProofSearchState:
                 state._target_environment_index_key(
                     root.goal.normalized_statement_hash,
                     root.statement_environment_hash,
+                    statement_source=root.target,
                 )
             ] = state.root_node_id
             state.plan_hints = state._plan_hints(root.goal)
@@ -6652,6 +7097,16 @@ class ProofSearchState:
                 )
             except (TypeError, ValueError):
                 pending_helper_acceptance = {}
+        cache_lookup_progress: Dict[str, Any] = {}
+        raw_cache_progress = record.get("cache_lookup_progress")
+        if isinstance(raw_cache_progress, Mapping):
+            try:
+                cache_lookup_progress = clone_json_value(
+                    dict(raw_cache_progress),
+                    label=f"proof node {node_id} cache lookup progress",
+                )
+            except (TypeError, ValueError):
+                cache_lookup_progress = {}
         verifier_retry_states: Dict[str, Dict[str, Any]] = {}
         raw_verifier_retry_states = _proof_state_durable_mapping(
             record.get("verifier_retry_states")
@@ -7120,6 +7575,7 @@ class ProofSearchState:
                 if str(item or "").strip()
             ],
             pending_helper_acceptance=pending_helper_acceptance,
+            cache_lookup_progress=cache_lookup_progress,
             proved_helper_name=str(record.get("proved_helper_name") or ""),
             falsified=bool(record.get("falsified") or False),
             falsification_reason=str(record.get("falsification_reason") or ""),
@@ -7527,6 +7983,7 @@ class ProofSearchState:
                     self._target_environment_index_key(
                         node.goal.normalized_statement_hash,
                         node.statement_environment_hash,
+                        statement_source=node.target,
                     )
                 )
                 existing_node = self.nodes.get(existing_id or "")
@@ -7560,6 +8017,7 @@ class ProofSearchState:
                     self._target_environment_index_key(
                         node.goal.normalized_statement_hash,
                         node.statement_environment_hash,
+                        statement_source=node.target,
                     ),
                     node.node_id,
                 )
@@ -7684,6 +8142,31 @@ class ProofSearchState:
                 preserved_edges.append(edge)
         for node in self.nodes.values():
             _reconcile_proof_state_decl_application_quarantine(node)
+        retained_contract_observations: Dict[str, Dict[str, str]] = {}
+        for node in self.nodes.values():
+            prior = graph.nodes.get(self._graph_node_id(node.node_id))
+            if (
+                prior is None
+                or prior.statement != node.target
+                or _proof_state_durable_text(node.target) != node.target
+                or str(prior.metadata.get("statement_environment_hash") or "")
+                != str(node.statement_environment_hash or "")
+            ):
+                continue
+            identity = graph_node_bound_contract_identity(prior)
+            if not identity:
+                continue
+            # Projection is not an elaboration boundary. Preserve only an
+            # existing receipt for these exact executable bytes/environment;
+            # copying arbitrary old metadata could revive stale authority.
+            retained_contract_observations[node.node_id] = {
+                "contract_identity": identity,
+                **{key: str(prior.metadata[key]) for key in (
+                    "contract_identity_statement_key",
+                    "contract_identity_environment_hash",
+                    "contract_identity_evidence_receipt",
+                )},
+            }
         record = self.to_record()
         setattr(dossier, "proof_state_record", record)
         self._write_durable_metrics_to_graph_root(dossier, record)
@@ -7730,6 +8213,7 @@ class ProofSearchState:
                     "blocked_by_node_ids": list(node.blocked_by_node_ids),
                     "last_rejection_evidence_hash": node.rejection_evidence_hash,
                     "priority": node.priority,
+                    **retained_contract_observations.get(node.node_id, {}),
                 },
             )
             if node.node_id == self.root_node_id:
@@ -8820,7 +9304,7 @@ class ProofSearchState:
                 )
             else:
                 helper_name = str(node.proved_helper_name or "").strip()
-                graph_node = graph_nodes.get(self._graph_node_id(node.node_id))
+                graph_node = self._state_node_graph_certificate_target(graph, node)
                 helper_node = graph_nodes.get(
                     str(helper_ids.get(helper_name) or "")
                 )
@@ -8891,7 +9375,7 @@ class ProofSearchState:
         if not isinstance(helpers, dict) or not helpers:
             return []
 
-        helper_records: List[Tuple[str, str, str]] = []
+        helper_records: List[Tuple[str, str]] = []
         for helper_name, helper in helpers.items():
             name = str(helper_name or "").strip()
             if not name:
@@ -8900,16 +9384,11 @@ class ProofSearchState:
             helper_statement = helper_decl_statement(helper_source)
             if not helper_statement:
                 continue
-            helper_records.append(
-                (
-                    name,
-                    helper_statement,
-                    canonicalize_lean_statement_for_identity(helper_statement),
-                )
-            )
+            helper_records.append((name, helper_statement))
         if not helper_records:
             return []
 
+        candidates_for_node = self._verified_helper_candidates(dossier, helper_records)
         requested_target_id = str(target_node_id or "").strip()
         candidate_nodes = (
             [self.nodes[requested_target_id]]
@@ -8932,13 +9411,12 @@ class ProofSearchState:
             # not undo.
             if node.status != "open":
                 continue
-            target_key = canonicalize_lean_statement_for_identity(node.target)
-            if not target_key:
+            if not node.target.strip():
                 continue
-            for helper_name, helper_statement, helper_key in helper_records:
+            for helper_name, helper_statement in candidates_for_node(node):
                 if not self._verified_helper_match_allowed_for_node(node, helper_name):
                     continue
-                if helper_key != target_key:
+                if not self._verified_helper_certifies_state_node(dossier, node, helper_name):
                     continue
                 node.status = "proved"
                 node.action = "available_for_assembly"
@@ -9062,11 +9540,8 @@ class ProofSearchState:
                 node.priority = self._priority(node)
                 continue
             helper_record = getattr(dossier, "verified_helpers", {}).get(helper_name)
-            helper_source = str(getattr(helper_record, "source", "") or "")
-            helper_statement = helper_decl_statement(helper_source)
-            if helper_record is not None and (
-                canonicalize_lean_statement_for_identity(helper_statement)
-                == canonicalize_lean_statement_for_identity(node.target)
+            if helper_record is not None and self._verified_helper_certifies_state_node(
+                dossier, node, helper_name,
             ):
                 continue
             node.status = "open"
@@ -9851,13 +10326,9 @@ class ProofSearchState:
         ]
 
     def _residual_targets_are_equivalent(self, left: str, right: str) -> bool:
-        left_text = str(left or "")
-        right_text = str(right or "")
-        if left_text == right_text:
-            return True
-        return canonicalize_lean_statement_for_identity(
-            left_text
-        ) == canonicalize_lean_statement_for_identity(right_text)
+        # This comparison transfers checked residual-goal attestations without
+        # an elaboration context. Even binder renaming can change a Lean macro.
+        return str(left or "").strip() == str(right or "").strip()
 
     def _lemma_dag_live_child_ids(self, task: ProofStateNode) -> List[str]:
         out: List[str] = []
@@ -10495,7 +10966,7 @@ class ProofSearchState:
 
         if dossier is None:
             return []
-        helper_records: List[Tuple[str, str, str]] = []
+        helper_records: List[Tuple[str, str]] = []
         seen_helpers: Set[str] = set()
         for raw_name in helper_names:
             helper_name = str(raw_name or "").strip()
@@ -10507,16 +10978,11 @@ class ProofSearchState:
             helper_statement = helper_decl_statement(helper_source)
             if not helper_statement:
                 continue
-            helper_records.append(
-                (
-                    helper_name,
-                    helper_statement,
-                    canonicalize_lean_statement_for_identity(helper_statement),
-                )
-            )
+            helper_records.append((helper_name, helper_statement))
         if not helper_records:
             return []
 
+        candidates_for_node = self._verified_helper_candidates(dossier, helper_records)
         matched: List[Dict[str, Any]] = []
         for node in self.nodes.values():
             if node.node_id == self.root_node_id:
@@ -10530,13 +10996,12 @@ class ProofSearchState:
             # into orphaned ghost work without informing scheduling.
             if node.status == "obsolete":
                 continue
-            target_key = canonicalize_lean_statement_for_identity(node.target)
-            if not target_key:
+            if not node.target.strip():
                 continue
-            for helper_name, helper_statement, helper_key in helper_records:
+            for helper_name, helper_statement in candidates_for_node(node):
                 if not self._verified_helper_match_allowed_for_node(node, helper_name):
                     continue
-                if helper_key != target_key:
+                if not self._verified_helper_certifies_state_node(dossier, node, helper_name):
                     continue
                 node.status = "proved"
                 node.action = "available_for_assembly"
@@ -10584,6 +11049,139 @@ class ProofSearchState:
                 )
                 break
         return matched
+
+    def _verified_helper_candidates(
+        self,
+        dossier: ProofDossier,
+        helper_records: Sequence[Tuple[str, str]],
+    ) -> Callable[[ProofStateNode], Iterable[Tuple[str, str]]]:
+        """Group possible matches for this synchronous reconciliation only.
+
+        Source keys nominate the surface fallback; checked full expressions
+        also nominate semantically matching declarations with different source.
+        Neither group grants authority: each candidate still passes the live
+        graph certificate check. Rebuild on every operation so direct source,
+        environment and receipt changes cannot retain an old selection.
+        """
+
+        graph = getattr(dossier, "proof_graph", None)
+        groups: Dict[Tuple[str, str], List[int]] = {}
+        for index, (name, _statement) in enumerate(helper_records):
+            helper = (
+                graph.nodes.get(graph.helper_name_to_node_id.get(name, ""))
+                if graph is not None else None
+            )
+            if helper is None:
+                continue
+            source_key = graph_statement_key(helper.statement)
+            if source_key:
+                groups.setdefault(("source", source_key), []).append(index)
+            identity = (
+                parse_lean_contract_identity(graph_helper_bound_contract_identity(helper))
+                if helper.metadata.get("verified_helper_contract_identity_evidence_receipt")
+                else None
+            )
+            if identity is not None:
+                groups.setdefault(("expression", identity[0]), []).append(index)
+
+        def candidates(node: ProofStateNode) -> Iterable[Tuple[str, str]]:
+            source_indices = groups.get(("source", graph_statement_key(node.target)), ())
+            expression_indices: Iterable[int] = ()
+            if graph is not None:
+                prior = graph.nodes.get(self._graph_node_id(node.node_id))
+                if prior is not None and prior.metadata.get("contract_identity_evidence_receipt"):
+                    target = self._state_node_graph_certificate_target(graph, node)
+                    identity = parse_lean_contract_identity(graph_node_bound_contract_identity(target))
+                    if identity is not None:
+                        expression_indices = groups.get(("expression", identity[0]), ())
+            # Preserve the caller's checked helper order across both groups.
+            # Nominate lazily: a first matching helper must not enumerate every
+            # other equivalent fact retained by a long campaign.
+            previous_index = -1
+            for index in merge(source_indices, expression_indices):
+                if index != previous_index:
+                    yield helper_records[index]
+                    previous_index = index
+
+        return candidates
+
+    def _verified_helper_certifies_state_node(
+        self,
+        dossier: ProofDossier,
+        node: ProofStateNode,
+        helper_name: str,
+        *,
+        target_observation: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
+        """Validate live source and target evidence without publishing a close.
+
+        An internal fresh observation can validate a private target projection
+        before its owning operation publishes it. It never changes the live
+        graph, executable target or environment, or bypasses source checks.
+        """
+
+        graph = getattr(dossier, "proof_graph", None)
+        if graph is None:
+            return False
+        helper_record = dossier.verified_helpers.get(helper_name)
+        helper = graph.nodes.get(graph.helper_name_to_node_id.get(helper_name, ""))
+        if helper_record is None or helper is None:
+            return False
+        # Registration strips outer whitespace; all remaining bytes and the
+        # registry name must still match the graph's checked declaration.
+        source = str(getattr(helper_record, "source", "") or "").strip()
+        source_hash = str(getattr(helper_record, "source_hash", "") or "")
+        if (
+            not source
+            or not source_hash
+            or getattr(helper_record, "name", "") != helper_name
+            or helper.name != helper_name
+            or source != str(helper.metadata.get("verified_helper_source") or "").strip()
+            or source_hash != str(helper.metadata.get("verified_helper_source_hash") or "")
+        ):
+            return False
+        # The graph independently validates its source digest, proof,
+        # environment and target observation against the current node.
+        target = self._state_node_graph_certificate_target(graph, node)
+        if target_observation is not None:
+            from .proof_graph import _GRAPH_CONTRACT_IDENTITY_KEYS, graph_node_bound_contract_identity
+
+            for key in _GRAPH_CONTRACT_IDENTITY_KEYS:
+                target.metadata.pop(key, None)
+            for key in (
+                "contract_identity", "contract_identity_statement_key",
+                "contract_identity_environment_hash", "contract_identity_evidence_receipt",
+            ):
+                # A partial fresh observation cannot borrow missing authority
+                # fields from an earlier graph observation.
+                target.metadata.pop(key, None)
+                if key in target_observation:
+                    target.metadata[key] = target_observation[key]
+            if not graph_node_bound_contract_identity(target):
+                return False
+        return graph._helper_certifies_node(helper, target)
+
+    @staticmethod
+    def _state_node_graph_certificate_target(graph: Any, node: ProofStateNode) -> Any:
+        """Keep target observations bound to the current executable state."""
+
+        from .proof_graph import ProofGraphNode
+
+        graph_node_id = ProofSearchState._graph_node_id(node.node_id)
+        graph_node = graph.nodes.get(graph_node_id)
+        metadata: Dict[str, Any] = {}
+        if graph_node is not None and graph_node.statement == node.target:
+            metadata = dict(graph_node.metadata or {})
+        metadata["statement_environment_hash"] = node.statement_environment_hash
+        # Preserve an existing source-bound target observation only when its
+        # exact source matches. Otherwise the target remains unobserved.
+        return ProofGraphNode(
+            node_id=graph_node_id,
+            kind="proof_state_child_goal",
+            name=node.node_id,
+            statement=node.target,
+            metadata=metadata,
+        )
 
     def _statement_identity_helper_match_allowed(self, node: ProofStateNode) -> bool:
         """Allow global statement matches only for context-free child goals."""
@@ -10717,7 +11315,7 @@ class ProofSearchState:
         structural_nodes = self.spawn_structural_decomposition(
             node_id=self.root_node_id,
             source=f"{phase}:{turn_index}:construction_collapse",
-            max_goals=4,
+            max_goals=-1,
         )
         if structural_nodes:
             root.action = "assemble_from_children"
@@ -10899,7 +11497,7 @@ class ProofSearchState:
         *,
         node_id: str,
         source: str,
-        max_goals: int = 4,
+        max_goals: int = -1,
     ) -> List[str]:
         node = self.nodes.get(str(node_id or ""))
         if node is None:
@@ -10911,7 +11509,7 @@ class ProofSearchState:
             if group.source.startswith(f"structural:{kind}:") and group.child_node_ids:
                 return list(dict.fromkeys(group.child_node_ids))
         spawned = self.spawn_remaining_goals(
-            goals[: max(0, int(max_goals or 0))],
+            goals if int(max_goals or 0) < 0 else goals[: int(max_goals or 0)],
             source=f"structural:{kind}:{source}",
             parent_node_id=node.node_id,
             parent_proof_stub=proof_stub,
@@ -11378,6 +11976,7 @@ class ProofSearchState:
         target_index_key = self._target_environment_index_key(
             signature.normalized_statement_hash,
             target_environment_hash,
+            statement_source=target,
         )
         existing = (
             requested_target.node_id
@@ -12465,7 +13064,16 @@ class ProofSearchState:
                 exact_source
             )
             or not exact_stub
-            or max(0, int(max_goals or 0)) <= 0
+            or (
+                int(max_goals or 0) == 0
+                and (
+                    not isinstance(action_metadata, Mapping)
+                    or action_metadata.get(
+                        "typed_residual_closed_pending_acceptance"
+                    ) is not True
+                )
+            )
+            or int(max_goals or 0) < -1
             or not _proof_state_is_sha256(request_hash)
             or (context_hash and not _proof_state_is_sha256(context_hash))
             or isinstance(retry_count, bool)
@@ -12497,7 +13105,7 @@ class ProofSearchState:
             "parent_target_sha256": _proof_state_exact_sha256(parent.target),
             "parent_proof_stub": exact_stub,
             "parent_proof_stub_sha256": _proof_state_exact_sha256(exact_stub),
-            "max_goals": max(1, int(max_goals or 0)),
+            "max_goals": int(max_goals or 0),
             "statement_environment_hash": self.statement_environment_hash,
             "elaboration_context_hash": context_hash,
             "request_context_hash": request_hash,
@@ -12725,6 +13333,7 @@ class ProofSearchState:
 
         node.pending_residual_goal_extraction = {}
         node.pending_helper_acceptance = {}
+        node.cache_lookup_progress = {}
         node.verifier_retry_states = {}
         node.child_tactic_portfolio_continuation = {}
 
@@ -12770,7 +13379,16 @@ class ProofSearchState:
             or (stored_context_hash and not _proof_state_is_sha256(stored_context_hash))
             or isinstance(record.get("max_goals"), bool)
             or not isinstance(record.get("max_goals"), int)
-            or int(record.get("max_goals") or 0) <= 0
+            or (
+                int(record.get("max_goals") or 0) == 0
+                and (
+                    not isinstance(record.get("action_metadata"), Mapping)
+                    or record["action_metadata"].get(
+                        "typed_residual_closed_pending_acceptance"
+                    ) is not True
+                )
+            )
+            or int(record.get("max_goals") or 0) < -1
             or not isinstance(record.get("origin_metadata"), Mapping)
             or not isinstance(record.get("action_metadata"), Mapping)
             or not isinstance(record.get("verifier_failure", {}), Mapping)
@@ -13165,13 +13783,11 @@ class ProofSearchState:
                 obligation_statement != child_statement
                 or obligation_environment_hash != child_environment_hash
             ):
-                # The same graph obligation ID may be re-recorded after a
-                # preamble extension because its durable mathematical/work
-                # identity intentionally excludes the environment. Never let
-                # that metadata update retain an old-environment proof-state
-                # child. Detach the stale projection and allow normal
-                # environment-qualified promotion below to create/reuse the
-                # correct child.
+                # Legacy records or an in-place metadata update may retain a
+                # projection from another source/environment. New graph
+                # allocations keep those contexts distinct; reconciliation
+                # must also detach an existing stale link and create/reuse
+                # the correctly qualified child.
                 detach_promoted_child(obligation, child_id=child.node_id)
                 still_referenced = any(
                     promoted_child_id_from_metadata(other) == child.node_id
@@ -13213,6 +13829,7 @@ class ProofSearchState:
                 stale_index_key = self._target_environment_index_key(
                     child.goal.normalized_statement_hash,
                     child_environment_hash,
+                    statement_source=child.target,
                 )
                 if self._node_by_target.get(stale_index_key) == child.node_id:
                     self._node_by_target.pop(stale_index_key, None)
@@ -13397,6 +14014,7 @@ class ProofSearchState:
             target_index_key = self._target_environment_index_key(
                 signature.normalized_statement_hash,
                 obligation_environment_hash,
+                statement_source=statement,
             )
             existing_id = self._node_by_target.get(target_index_key)
             if existing_id:
@@ -16114,6 +16732,10 @@ class ProofSearchState:
                     "pending_helper_acceptance": dict(
                         node.pending_helper_acceptance or {}
                     ),
+                    "cache_lookup_progress": clone_json_value(
+                        node.cache_lookup_progress,
+                        label=f"proof node {node.node_id} cache lookup progress",
+                    ),
                     "root_tactic_portfolio_continuation": (
                         validated_root_tactic_portfolio_continuation(
                             node.root_tactic_portfolio_continuation
@@ -16392,6 +17014,7 @@ class ProofSearchState:
         target_index_key = self._target_environment_index_key(
             signature.normalized_statement_hash,
             target_environment_hash,
+            statement_source=statement,
         )
         existing = self._node_by_target.get(target_index_key)
         if existing:
@@ -17518,7 +18141,7 @@ class ProofSearchState:
         source: str,
         parent_node_id: str,
         parent_proof_stub: str,
-        max_goals: int = 4,
+        max_goals: int = -1,
     ) -> ResidualBatchAdmission:
         """Bind one Lean runner receipt and atomically admit its child goals.
 
@@ -17580,7 +18203,7 @@ class ProofSearchState:
         parent_node_id: str,
         parent_proof_stub: str,
         elaboration_context_hash: str,
-        max_goals: int = 4,
+        max_goals: int = -1,
     ) -> ResidualBatchAdmission:
         """Atomically admit an already-bound ordered residual-goal batch.
 
@@ -17592,7 +18215,7 @@ class ProofSearchState:
         records = list(attestations or ())
         parent = str(parent_node_id or self.root_node_id)
         parent_node = self.nodes.get(parent)
-        limit = max(0, int(max_goals or 0))
+        limit = int(max_goals or 0)
         goal_count = len(records)
         if parent_node is None:
             return self._residual_batch_admission(
@@ -17622,7 +18245,7 @@ class ProofSearchState:
                 parent_node=parent_node,
                 source=source,
             )
-        if len(records) > limit:
+        if limit >= 0 and len(records) > limit:
             return self._residual_batch_admission(
                 status="terminal_rejected",
                 reason="attested_residual_goal_cap_exceeded",
@@ -17749,6 +18372,7 @@ class ProofSearchState:
             target_index_key = self._target_environment_index_key(
                 signature.normalized_statement_hash,
                 self.statement_environment_hash,
+                statement_source=statement,
             )
             identity = str(record.get("structural_identity") or "")
             prospective = prospective_by_index.get(target_index_key)
@@ -17895,7 +18519,7 @@ class ProofSearchState:
         source: str,
         parent_node_id: str,
         parent_proof_stub: str = "",
-        max_goals: int = 4,
+        max_goals: int = -1,
         allow_unvalidated_spawn: bool = False,
     ) -> List[str]:
         """Admit diagnostic remaining goals, truncating to ``max_goals``.
@@ -17977,9 +18601,10 @@ class ProofSearchState:
                     plain_target = self._plain_remaining_goal_target(item)
                     if plain_target:
                         goal_items.append({"target": plain_target, "hypotheses": []})
-            if len(goal_items) >= max(0, int(max_goals or 0)):
+            if int(max_goals or 0) >= 0 and len(goal_items) >= int(max_goals or 0):
                 break
-        goal_items = goal_items[: max(0, int(max_goals or 0))]
+        if int(max_goals or 0) >= 0:
+            goal_items = goal_items[: int(max_goals or 0)]
         for goal in goal_items:
             rejection = self._remaining_goal_item_rejection(
                 goal,
@@ -18054,7 +18679,7 @@ class ProofSearchState:
         source: str,
         parent_node_id: str,
         parent_proof_stub: str = "",
-        max_goals: int = 3,
+        max_goals: int = -1,
         allow_unvalidated_spawn: bool = False,
     ) -> List[str]:
         goals = self._goals_from_rendered_text(rendered, max_goals=max_goals)
@@ -18074,7 +18699,7 @@ class ProofSearchState:
         max_goals: int,
     ) -> List[Dict[str, Any]]:
         text = str(rendered or "")
-        if "⊢" not in text:
+        if int(max_goals or 0) == 0 or "⊢" not in text:
             return []
         blocks = self._split_rendered_goal_blocks(text)
         if not blocks:
@@ -18149,7 +18774,7 @@ class ProofSearchState:
                         "rendered_target": True,
                     }
                 )
-            if len(goals) >= max(0, int(max_goals or 0)):
+            if int(max_goals or 0) >= 0 and len(goals) >= int(max_goals or 0):
                 break
         return goals
 

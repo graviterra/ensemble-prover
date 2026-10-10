@@ -34,6 +34,7 @@ from .model import (
     canonical_json,
     content_digest,
     integer,
+    strings,
     text,
 )
 
@@ -944,13 +945,8 @@ class MemoryCatalog:
             )
         if snapshot:
             usable = usable and snapshot.policy_version == policy.policy_version
-            # An external snapshot is bounded too. Unknown omitted masks never
-            # produce an eligible view; local history is queried by identity.
-            if (
-                len(snapshot.denied_event_ids) + len(snapshot.denied_source_ids)
-                > self.query_scan_cap
-            ):
-                return events, sources, False
+            # The query window bounds returned events, not the complete set of
+            # current revocations. Every supplied mask remains authoritative.
             for destination, identities in (
                 (events, snapshot.denied_event_ids),
                 (sources, snapshot.denied_source_ids),
@@ -984,8 +980,6 @@ class MemoryCatalog:
                 + event.provenance.ancestry_source_ids
             )
         )
-        if len(identities) > 4096:
-            raise MemoryUnavailable("memory source closure exceeds bounded mask lookup")
         with self._connect(deadline_monotonic) as conn:
             denied = conn.execute(
                 "SELECT 1 FROM invalidations WHERE identity=? AND kind='event'",
@@ -993,15 +987,8 @@ class MemoryCatalog:
             ).fetchone()
             if denied is not None:
                 return False
-            if identities:
-                denied = conn.execute(
-                    "SELECT 1 FROM invalidations WHERE kind='source' AND identity IN ("
-                    + ",".join("?" for _ in identities)
-                    + ") LIMIT 1",
-                    identities,
-                ).fetchone()
-                if denied is not None:
-                    return False
+            if self._source_mask_denied(conn, identities, deadline_monotonic):
+                return False
         marker = self.outbox_root / (content_digest(event.event_id) + ".conflict")
         if marker.exists():
             return False
@@ -1200,6 +1187,52 @@ class MemoryCatalog:
         except (ValueError, KeyError, TypeError, MemoryUnavailable):
             return None
 
+    @staticmethod
+    def _source_mask_denied(
+        conn: sqlite3.Connection,
+        identities: tuple[str, ...],
+        deadline_monotonic: float | None,
+    ) -> bool:
+        """Check complete ancestry in bounded SQL statements on one connection."""
+        batch_size = min(512, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+        if batch_size < 1:
+            raise MemoryUnavailable("memory source mask lookup unavailable")
+        for offset in range(0, len(identities), batch_size):
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise MemoryUnavailable("memory deadline exhausted")
+            batch = identities[offset:offset + batch_size]
+            denied = conn.execute(
+                "SELECT 1 FROM invalidations WHERE kind='source' AND identity IN ("
+                + ",".join("?" for _ in batch) + ") LIMIT 1",
+                batch,
+            ).fetchone()
+            if denied is not None:
+                return True
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise MemoryUnavailable("memory deadline exhausted")
+        return False
+
+    def sources_eligible(
+        self,
+        source_record_ids: tuple[str, ...],
+        policy: EligibilityPolicy,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> bool:
+        """Consult current masks for every source with one catalog connection.
+
+        This checks local masks only; callers separately validate live source
+        integrity, complete ancestry and policy before exposing a candidate.
+        """
+        identities = strings(source_record_ids, "source identities")
+        with self._connect(deadline_monotonic) as conn:
+            _, denied_sources, usable = self._read_context(
+                conn, policy, deadline_monotonic
+            )
+            if not usable or denied_sources.intersection(identities):
+                return False
+            return not self._source_mask_denied(conn, identities, deadline_monotonic)
+
     def source_eligible(
         self,
         source_record_id: str,
@@ -1207,21 +1240,11 @@ class MemoryCatalog:
         *,
         deadline_monotonic: float | None = None,
     ) -> bool:
-        """Consult current catalog reconciliation and source invalidation masks.
-
-        This checks local masks only; callers separately validate live source
-        integrity, complete ancestry and policy before exposing a candidate.
-        """
+        """Consult current catalog reconciliation for one source identity."""
         text(source_record_id, "source identity")
-        with self._connect(deadline_monotonic) as conn:
-            _, denied_sources, usable = self._read_context(
-                conn, policy, deadline_monotonic
-            )
-            denied = conn.execute(
-                "SELECT 1 FROM invalidations WHERE identity=? AND kind='source'",
-                (source_record_id,),
-            ).fetchone()
-        return usable and source_record_id not in denied_sources and denied is None
+        return self.sources_eligible(
+            (source_record_id,), policy, deadline_monotonic=deadline_monotonic,
+        )
 
     def inspect(self) -> dict[str, Any]:
         with self._connect() as conn:

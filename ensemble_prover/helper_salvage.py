@@ -21,10 +21,17 @@ from .proof_dossier import (
     verified_helper_bound_contract_identity,
     verified_helper_has_typed_binder_evidence,
     verified_helper_semantic_statement_changed,
+    text_hash,
 )
 from .contract_identity import parse_lean_contract_identity
-from .lean_names import lean_name_key
-from .proof_graph import graph_exact_statement_text, helper_decl_statement
+from .lean_names import lean_constant_name_components, lean_name_key
+from .proof_graph import (
+    _graph_leading_binder_analysis,
+    graph_exact_statement_text,
+    helper_decl_body,
+    helper_decl_kind,
+    helper_decl_statement,
+)
 from .proof_state import lean_referenced_helper_names
 from .proof_state_cache import (
     _proof_state_helper_policy_rejection,
@@ -91,7 +98,7 @@ def _helper_has_target_token_overlap(src: str, targets: Sequence[str]) -> bool:
 
 
 def _helper_statement_signature(block: str) -> str:
-    """Return a whitespace-normalized signature of a helper's statement.
+    """Return the source-sensitive signature of a helper's statement.
 
     Used to dedup helpers on (name, statement) pairs so model self-corrections
     that re-declare a helper with the same name but a different statement
@@ -1589,10 +1596,25 @@ class HelperSalvageResult:
     deferred: List[str] = field(default_factory=list)
     deferred_before_launch: List[str] = field(default_factory=list)
     infrastructure_after_launch: List[str] = field(default_factory=list)
+    reused: Dict[str, str] = field(default_factory=dict)
 
     @property
     def any_accepted(self) -> bool:
         return bool(self.accepted)
+
+
+def helper_salvage_reuse_feedback(result: Optional[HelperSalvageResult]) -> str:
+    """Identify the retained declarations without claiming new proof progress."""
+    reused = dict(getattr(result, "reused", {}) or {})
+    if not reused:
+        return ""
+    return (
+        "These helper submissions repeat an existing verified statement and proof. "
+        "Reuse the existing declaration names: "
+        + "; ".join(f"{submitted} → {existing}" for submitted, existing in reused.items())
+        + ". Their premises remain required. Continue with an unproved obligation "
+        "or a different proof approach."
+    )
 
 
 def helper_salvage_telemetry_fields(
@@ -1613,12 +1635,13 @@ def helper_salvage_telemetry_fields(
         "rejected": list(result.rejected),
         "skipped": list(result.skipped),
         "deferred": list(getattr(result, "deferred", ()) or ()),
+        "reused": list(getattr(result, "reused", {}) or {}),
     }
     categories = [category for category, entries in outcomes.items() if entries]
     primary_category = next(
         (
             category
-            for category in ("accepted", "rejected", "deferred", "skipped")
+            for category in ("accepted", "rejected", "deferred", "skipped", "reused")
             if outcomes[category]
         ),
         "no_change",
@@ -1629,7 +1652,128 @@ def helper_salvage_telemetry_fields(
         "helper_outcome_categories": categories,
         "helper_outcomes_mixed": len(categories) > 1,
         "verdict": f"helpers_{primary_category}",
+        "reused_helper_aliases": dict(getattr(result, "reused", {}) or {}),
     }
+
+
+def _checked_duplicate_helper_name(
+    dossier: ProofDossier,
+    source: str,
+    contract_fields: Mapping[str, Any],
+    checked_context: Sequence[str],
+    *,
+    submitted_name: str,
+) -> str:
+    """Reuse an existing theorem after checking an identical proof submission.
+
+    Source formatting never establishes type equivalence. The candidate must
+    already have passed full verification and fresh, source-bound Lean contract
+    analysis. Only a formatting retry under the same submitted name qualifies;
+    other declaration names can carry graph obligations or scoped references.
+    """
+    environment = str(dossier.current_lean_environment_hash or "")
+    identity = str(contract_fields.get("contract_identity") or "")
+    submitted_key = lean_name_key(submitted_name)
+    if (
+        not environment
+        or not parse_lean_contract_identity(identity)
+        or contract_fields.get("_verification_environment_hash") != environment
+        or contract_fields.get("_contract_identity_statement") != helper_decl_statement(source)
+        or not contract_fields.get("_contract_binder_observation_complete")
+        or helper_decl_kind(source) not in {"theorem", "lemma"}
+        or tuple(checked_context) != tuple(dossier.verified_helper_blocks())
+        or any(lean_name_key(name) == submitted_key for name in dossier.proposed_helpers)
+    ):
+        return ""
+    from .proof_dossier import _proposal_node_aliases
+
+    graph = getattr(dossier, "proof_graph", None)
+    if graph is not None and any(
+        node.status != "proved"
+        and any(lean_name_key(alias) == submitted_key for alias in _proposal_node_aliases(node))
+        for node in graph.nodes.values()
+    ):
+        # Ordinary admission retains the existing graph promotion and bridge
+        # checks whenever a claim or child still owns this submitted name.
+        return ""
+    proof = _plain_reusable_proof_body(source)
+    binder_names = _plain_reusable_binder_names(
+        source, len(contract_fields.get("contract_binder_sorts", ())),
+    )
+    namespace = lean_constant_name_components(helper_decl_name(source))[:-1]
+    if not proof or binder_names is None:
+        return ""
+    prefix: List[str] = []
+    for block in checked_context:
+        name = helper_decl_name(block)
+        existing = dossier.verified_helpers.get(name)
+        if (
+            existing is not None
+            and lean_name_key(name) == submitted_key
+            and existing.source == block
+            and existing.source_hash == text_hash(block)
+            and helper_decl_kind(block) in {"theorem", "lemma"}
+            # A qualified declaration also creates its namespace. Retaining
+            # that scope keeps later `open` commands and short references valid.
+            and lean_constant_name_components(name)[:-1] == namespace
+            and _plain_reusable_proof_body(block) == proof
+            and _plain_reusable_binder_names(block, len(existing.contract_binder_sorts)) == binder_names
+            and existing.verification_environment_hash == environment
+            and verified_helper_bound_contract_identity(existing) == identity
+            and verified_helper_has_typed_binder_evidence(existing)
+            and list(existing.replay_context_names) == prefix
+            and all(
+                dependency in dossier.verified_helpers
+                and dossier.verified_helpers[dependency].source_hash == expected_hash
+                and text_hash(dossier.verified_helpers[dependency].source) == expected_hash
+                for dependency, expected_hash in {
+                    **existing.support_source_hashes,
+                    **existing.replay_context_source_hashes,
+                }.items()
+            )
+            and all(
+                dependency in existing.replay_context_source_hashes
+                for dependency in prefix
+            )
+            and all(
+                dependency in existing.support_source_hashes
+                for dependency in existing.support_names
+            )
+        ):
+            return name
+        if name:
+            prefix.append(name)
+    return ""
+
+
+def _plain_reusable_binder_names(source: str, checked_binder_count: int) -> Optional[Tuple[str, ...]]:
+    """Preserve the named-argument interface erased by structural type identity."""
+    _body, binders = _graph_leading_binder_analysis(
+        helper_decl_statement(source), include_implications=True,
+    )
+    if any(not names or ambiguous for _raw, names, _type, _proof, ambiguous in binders):
+        return None
+    names = tuple(name for _raw, group, _type, _proof, _ambiguous in binders for name in group)
+    # Hidden auto-implicit parameters or unparsed telescopes require ordinary
+    # admission. A replacement must support all of the candidate's call sites.
+    return names if len(names) == checked_binder_count else None
+
+
+def _plain_reusable_proof_body(source: str) -> str:
+    """Exclude declaration behavior not represented by a proposition identity."""
+    if re.match(r"^(?:theorem|lemma)\s", source) is None:
+        # Attributes and local command scopes can add behavior to the same
+        # theorem. Keep these declarations even when their proof is repeated.
+        return ""
+    proof = helper_decl_body(source)
+    if not proof or not source.endswith(proof):
+        return ""
+    header = source[:-len(proof)].rstrip()
+    if not header.endswith(":=") or ":=" in header[:-2]:
+        # Default arguments are erased by type extraction but affect callers.
+        # A header containing another assignment requires ordinary admission.
+        return ""
+    return proof
 
 
 def merge_context_helpers(
@@ -1850,12 +1994,12 @@ class HelperSalvager:
     async def _analyze_helper_contract(
         self, dossier: ProofDossier, source: str, context: Sequence[str],
     ) -> Mapping[str, Any]:
-        from .verified_helper_contract import analyze_verified_helper_contract
+        from .verified_helper_contract import analyze_verified_helper_source_contract
 
         preamble = self.answer_safe_preamble if self._answer_safe_preamble_differs() else self.preamble
         environment = str(dossier.current_lean_environment_hash or "")
-        return await analyze_verified_helper_contract(
-            self.lean, helper_decl_statement(source),
+        return await analyze_verified_helper_source_contract(
+            self.lean, source,
             preamble=preamble, context=context, environment_hash=environment,
             timeout_s=float(self.timeout_s or 30.0),
             context_is_current=lambda: (
@@ -2090,12 +2234,24 @@ class HelperSalvager:
                             }.items()
                         )
                     ):
-                        from .verified_helper_contract import refresh_verified_helper_contract
+                        from .verified_helper_contract import (
+                            refresh_verified_helper_contract, helper_contract_context_is_plain,
+                            helper_source_contract_is_context_sensitive,
+                        )
 
                         contract_fields = await self._analyze_helper_contract(
                             dossier, existing.source, validation_context,
                         )
-                        refresh_verified_helper_contract(dossier, existing, contract_fields)
+                        refresh_verified_helper_contract(
+                            dossier, existing, contract_fields,
+                            contract_observation_required=helper_source_contract_is_context_sensitive(
+                                existing.source, context_is_plain=helper_contract_context_is_plain(
+                                    self.lean,
+                                    preamble=self.answer_safe_preamble if self._answer_safe_preamble_differs() else self.preamble,
+                                    context=validation_context,
+                                ),
+                            ),
+                        )
                         context = list(dossier.verified_helper_blocks())
                     # Evidence enrichment is not another accepted proof.
                     result.skipped.append(name)
@@ -2262,6 +2418,19 @@ class HelperSalvager:
                 contract_fields = await self._analyze_helper_contract(
                     dossier, src, validation_context,
                 )
+                reused_name = (
+                    _checked_duplicate_helper_name(
+                        dossier, src, contract_fields, validation_context,
+                        submitted_name=pending_collision[0],
+                    )
+                    if pending_collision is not None else ""
+                )
+                if reused_name:
+                    submitted_name = pending_collision[0] if pending_collision else name
+                    result.reused[submitted_name] = reused_name
+                    continue
+                from .verified_helper_contract import helper_contract_context_is_plain, helper_source_contract_is_context_sensitive
+
                 recorded = dossier.record_verified_helper(
                     src,
                     phase=phase,
@@ -2271,6 +2440,13 @@ class HelperSalvager:
                         for block in validation_context
                         if helper_decl_name(block) and helper_decl_name(block) != name
                     ],
+                    contract_observation_required=helper_source_contract_is_context_sensitive(
+                        src, context_is_plain=helper_contract_context_is_plain(
+                            self.lean,
+                            preamble=self.answer_safe_preamble if self._answer_safe_preamble_differs() else self.preamble,
+                            context=validation_context,
+                        ),
+                    ),
                     **contract_fields,
                 )
                 if recorded is None:

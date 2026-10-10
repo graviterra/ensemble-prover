@@ -20,6 +20,7 @@ import logging
 import re
 import time
 import weakref
+from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -48,7 +49,7 @@ from .mini_runtime_defaults import (
 )
 from .mini_tactic_closer import generate_tactic_candidates
 from .mini_prompt_support import tactic_gen_multi_messages
-from .proof_dossier import is_answer_unsafe_statement_text
+from .proof_dossier import helper_prompt_signature, is_answer_unsafe_statement_text
 from .provider_tool_protocol import (
     MiniRequestEnvelopePolicy,
     mini_model_context_window,
@@ -959,22 +960,28 @@ class FormalStateSearchConfig:
     provider_reasoning_effort: str = (
         DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT
     )
-    provider_max_attempts: int = 2
+    # Zero retains retryable work across quanta without a lifetime attempt cap.
+    provider_max_attempts: int = 0
     provider_retry_backoff_s: float = 5.0
     beam_width: int = 4
+    # Depth and reserve budgets are renewable scheduling windows; every live
+    # boundary and deferred branch is retained in the continuation checkpoint.
     max_steps: int = 8
-    max_candidates_per_state: int = 6
-    deterministic_candidates_per_state: int = 4
+    # Zero retains every candidate from the finite policy response. A positive
+    # value is an explicit operator cap, not the size of a scheduling quantum.
+    max_candidates_per_state: int = 0
+    # Negative retains the complete finite portfolio; zero disables this lane.
+    deterministic_candidates_per_state: int = -1
     backtrack_limit: int = 8
     # Consecutive completed search quanta without kernel-facing or diagnostic
     # improvement. Zero explicitly disables this progress governor.
-    max_no_improvement_quanta: int = 6
+    max_no_improvement_quanta: int = 0
     # Consecutive completed quanta with ZERO complete candidates and no
     # substantive rank improvement (novelty-only churn). A much tighter
     # governor than the stall window above: a lane that never produces a
     # checkable candidate switches strategy after this many quanta instead of
     # paying the full window. Zero explicitly disables.
-    max_zero_yield_quanta: int = 2
+    max_zero_yield_quanta: int = 0
     value_weight: float = 0.25
     novelty_weight: float = 0.15
     # None is an automatic phase choice. Explicit numbers remain strict even
@@ -1011,17 +1018,17 @@ class FormalStateSearchConfig:
                 ),
             ),
             provider_reasoning_effort=reasoning,
-            provider_max_attempts=max(1, int(self.provider_max_attempts or 1)),
+            provider_max_attempts=max(0, int(self.provider_max_attempts or 0)),
             provider_retry_backoff_s=max(
                 0.0, float(self.provider_retry_backoff_s or 0.0)
             ),
             beam_width=max(1, int(self.beam_width or 1)),
             max_steps=max(1, int(self.max_steps or 1)),
             max_candidates_per_state=max(
-                1, int(self.max_candidates_per_state or 1)
+                0, int(self.max_candidates_per_state or 0)
             ),
             deterministic_candidates_per_state=max(
-                0, int(self.deterministic_candidates_per_state or 0)
+                -1, int(self.deterministic_candidates_per_state or 0)
             ),
             backtrack_limit=max(0, int(self.backtrack_limit or 0)),
             max_no_improvement_quanta=max(
@@ -1362,7 +1369,7 @@ def _formal_policy_identity(client: Any, cfg: FormalStateSearchConfig) -> str:
             }
         )
     payload = {
-        "request_envelope_schema": 1,
+        "request_envelope_schema": 2,
         "targets": targets,
         "provider_timeout_s": float(cfg.provider_timeout_s),
         "provider_max_tokens": int(cfg.provider_max_tokens),
@@ -1437,14 +1444,15 @@ def _merge_candidates(
     # Preserve at least one cheap candidate when available, then interleave
     # learned and deterministic policies without allowing duplicates to spend
     # Lean checks twice.
-    lanes = [list(deterministic), list(learned)]
+    lanes = [deque(deterministic), deque(learned)]
     lane_index = 0
-    while any(lanes) and len(merged) < max(1, int(limit or 1)):
+    cap = max(0, int(limit or 0))
+    while any(lanes) and (cap == 0 or len(merged) < cap):
         lane = lanes[lane_index % len(lanes)]
         lane_index += 1
         if not lane:
             continue
-        tactic, prior = lane.pop(0)
+        tactic, prior = lane.popleft()
         clean = str(tactic or "").strip()
         # Tactics are executable Lean text. Internal whitespace in string
         # literals, quotations, and layout-sensitive syntax is semantic.
@@ -1459,6 +1467,17 @@ def _merge_candidates(
         seen.add(canonical)
         merged.append((clean, clamp_probability(prior, default=0.5)))
     return merged
+
+
+def _policy_attempts_exhausted(cfg: FormalStateSearchConfig, attempts: int) -> bool:
+    return cfg.provider_max_attempts > 0 and attempts >= cfg.provider_max_attempts
+
+
+def _policy_retry_delay(cfg: FormalStateSearchConfig, attempts: int) -> float:
+    """Back off retryable work without overflowing a long-lived retry ledger."""
+
+    base = cfg.provider_retry_backoff_s
+    return min(max(base, 300.0), base * (2 ** min(20, max(0, attempts - 1))))
 
 
 def _heal_inflight_policy_retry_records(
@@ -1484,11 +1503,11 @@ def _heal_inflight_policy_retry_records(
         attempts = max(0, int(retry_record.get("attempts", 0) or 0))
         retry_record["inflight"] = False
         retry_record["last_kind"] = "interrupted_after_provider_dispatch"
-        retry_record["exhausted"] = attempts >= cfg.provider_max_attempts
+        retry_record["exhausted"] = _policy_attempts_exhausted(cfg, attempts)
         if not retry_record["exhausted"]:
             retry_record["next_retry_at"] = max(
                 float(retry_record.get("next_retry_at", 0.0) or 0.0),
-                now + cfg.provider_retry_backoff_s * (2 ** max(0, attempts - 1)),
+                now + _policy_retry_delay(cfg, attempts),
             )
 
 
@@ -1651,35 +1670,63 @@ async def run_goal_conditioned_formal_search(
         deterministic_raw = generate_tactic_candidates(
             primary_target,
             helper_blocks,
-            max_candidates=max(1, cfg.deterministic_candidates_per_state),
+            max_candidates=cfg.deterministic_candidates_per_state,
             suppress_solution_placeholders=suppress_solution_placeholders,
             opaque_mode=opaque_mode,
             allow_official_answer_visibility=allow_official_answer_visibility,
             official_answer_payload_present=official_answer_payload_present,
         )
+        if cfg.deterministic_candidates_per_state >= 0:
+            deterministic_raw = deterministic_raw[: cfg.deterministic_candidates_per_state]
         deterministic = [
             (str(candidate.tactic or ""), 0.45)
-            for candidate in deterministic_raw[: cfg.deterministic_candidates_per_state]
+            for candidate in deterministic_raw
             if str(candidate.tactic or "").strip()
         ]
-        context_lemmas = "\n\n".join(helper_blocks[-12:])
-        if retrieval_names:
-            context_lemmas = "\n\n".join(
-                item
-                for item in (
-                    context_lemmas,
-                    "Retrieved declarations available in this Lean environment:\n"
-                    + "\n".join(f"- {name}" for name in retrieval_names[-32:]),
-                )
-                if item
-            )
+        # Request a finite batch, retaining the entire response when no
+        # operator cap is configured. Pending checks live in the checkpoint.
+        requested_candidates = cfg.max_candidates_per_state or 6
         messages = tactic_gen_multi_messages(
             search_statement,
             current_goals,
             tactics_so_far,
-            num_candidates=cfg.max_candidates_per_state,
-            context_lemmas=context_lemmas,
+            num_candidates=requested_candidates,
         )
+        # Fit helper visibility to the serving model's actual context window,
+        # not a helper-count cutoff. Contracts omit proof bodies, and optional
+        # atomic entries can be packed by the transport without cutting the
+        # exact Lean state. Full helper sources remain in the frozen search
+        # context and in every verification/deterministic candidate request.
+        optional_context = [
+            {
+                "role": "user",
+                "content": "Available verified helper:\n" + helper_prompt_signature(
+                    helper, redact_solution_refs=suppress_solution_placeholders,
+                ),
+            }
+            for helper in helper_blocks
+        ]
+        if retrieval_names:
+            optional_context.append({
+                "role": "user",
+                "content": "Retrieved declarations available in this Lean environment:\n"
+                + "\n".join(f"- {name}" for name in retrieval_names),
+            })
+        messages[-1].update({
+            "pinned": True,
+            "preserve_context": True,
+            "required_atomic_context": True,
+            "_required_prompt_context": {
+                "kind": "formal_policy_state",
+                "units": ["statement", "current_goals", "tactic_prefix"],
+                "context_digest": context_hash,
+            },
+        })
+        if optional_context:
+            messages[0]["content"] += (
+                "- You may reference declarations from the available context.\n"
+            )
+            messages[1:1] = optional_context
         if proof_idea_context:
             messages.append(
                 {
@@ -1800,7 +1847,7 @@ async def run_goal_conditioned_formal_search(
                     # Requiring the client keyword above prevents silent
                     # under-reservation if an adapter lacks phase controls.
                     max_tokens_override=provider_output_policy,
-                    candidate_count=cfg.max_candidates_per_state,
+                    candidate_count=requested_candidates,
                     metadata={
                         "formal_state_search": True,
                         "policy_request_key": request_key,
@@ -1815,14 +1862,18 @@ async def run_goal_conditioned_formal_search(
                         "formal_policy_reasoning_effort": str(
                             cfg.provider_reasoning_effort
                         ),
-                        # This logical invocation may use only the paid
-                        # attempts which its durable request ledger has not
-                        # already consumed.  The transport observer above
-                        # checkpoints each admitted leaf independently.
-                        "provider_dispatch_max_attempts": max(
-                            1,
-                            int(cfg.provider_max_attempts)
-                            - int(retry_record.get("attempts", 0) or 0),
+                        # An explicit lifetime cap also bounds remaining
+                        # transport admissions. With no cap, the provider's
+                        # configured retry policy and the quantum deadline
+                        # govern dispatch; every leaf still receives a WAL.
+                        "provider_dispatch_max_attempts": (
+                            max(
+                                1,
+                                cfg.provider_max_attempts
+                                - int(retry_record.get("attempts", 0) or 0),
+                            )
+                            if cfg.provider_max_attempts > 0
+                            else 0
                         ),
                         "proof_idea_context_digest": str(
                             proof_idea_context_digest or ""
@@ -1834,8 +1885,9 @@ async def run_goal_conditioned_formal_search(
 
         exhausted = bool(retry_record.get("exhausted", False)) or bool(
             not retry_record.get("inflight", False)
-            and int(retry_record.get("attempts", 0) or 0)
-            >= cfg.provider_max_attempts
+            and _policy_attempts_exhausted(
+                cfg, int(retry_record.get("attempts", 0) or 0)
+            )
         )
         backed_off = bool(
             not retry_record.get("inflight", False)
@@ -1947,12 +1999,11 @@ async def run_goal_conditioned_formal_search(
                 attempts = int(retry_record.get("attempts", 0) or 0)
                 retry_record["inflight"] = False
                 retry_record["last_kind"] = provider_error_kind
-                retry_record["exhausted"] = attempts >= cfg.provider_max_attempts
+                retry_record["exhausted"] = _policy_attempts_exhausted(cfg, attempts)
                 if not retry_record["exhausted"]:
                     retry_record["next_retry_at"] = (
                         time.time()
-                        + cfg.provider_retry_backoff_s
-                        * (2 ** max(0, attempts - 1))
+                        + _policy_retry_delay(cfg, attempts)
                     )
             else:
                 policy_retry_records.pop(request_key, None)
@@ -2122,6 +2173,7 @@ async def run_goal_conditioned_formal_search(
         backtrack_limit=cfg.backtrack_limit,
         cancel_grace_s=0.0,
         should_continue=continue_at_structural_cutpoint,
+        should_continue_operation=continue_at_structural_cutpoint,
         feedback_fn=observe_transition,
         resume_state=resume_state,
         durable_progress_fn=durable_progress,

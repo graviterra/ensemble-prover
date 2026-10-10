@@ -885,8 +885,8 @@ def run_cli(args: argparse.Namespace, argv: Sequence[str]) -> int:
             f"Answer discovery: {request.theorem_name}; artifacts: {directory}",
             flush=True,
         )
-        if type(args.answer_attempts) is not int or args.answer_attempts < 1:
-            raise ValueError("answer attempts must be a positive integer")
+        if type(args.answer_attempts) is not int or args.answer_attempts < -1:
+            raise ValueError("answer attempts must be -1 or a nonnegative integer")
         limits = [
             float(getattr(args, key, 0) or 0)
             for key in (

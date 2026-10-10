@@ -773,6 +773,11 @@ class StrategyController:
                 "artifacts": [],
                 "ingress_deadline": run["deadline"],
             }
+            from .native_deadline import native_admission_deadline_only, paid_work_deadline
+
+            if native_admission_deadline_only(run):
+                receipt["native_paid_settlement"] = True
+                receipt["ingress_deadline"] = paid_work_deadline(run)
             if job.get("frontier_approach_allocation_id"):
                 receipt["approach_allocation_id"] = job["frontier_approach_allocation_id"]
             if self._frontier_mode(state) == "adaptive":
@@ -808,12 +813,36 @@ class StrategyController:
                 outcome=receipt["status"],
             )
 
+    def bind_native_response(
+        self, attempt_id: str, *, job_id: str, turn: int, artifact_id: str,
+    ) -> bool:
+        """Bind paid tool lifetime to the exact archived response in every mode."""
+        with self._edit() as (state, run):
+            receipt = state["attempts"][attempt_id]
+            if receipt.get("native_paid_settlement") is not True:
+                return False
+            if (
+                run.get("native_parent_authorization") is not True
+                or receipt.get("consumer_id") != job_id
+                or receipt.get("consumer_turn") != turn
+                or receipt.get("native_response_artifact", artifact_id) != artifact_id
+            ):
+                raise ValueError("native paid response does not match its dispatch")
+            receipt["native_response_artifact"] = artifact_id
+            return True
+
     def receive_artifact(self, attempt_id: str, content: bytes) -> str:
         if not isinstance(content, bytes) or len(content) > self.MAX_ARTIFACT_BYTES:
             raise ValueError("artifact ingress size exceeded")
         with self._edit() as (state, _):
             attempt = state["attempts"].get(attempt_id)
-            if attempt is None or self.clock() > attempt["ingress_deadline"]:
+            if attempt is None or (
+                attempt["ingress_deadline"] is None
+                and attempt.get("native_paid_settlement") is not True
+            ) or (
+                attempt["ingress_deadline"] is not None
+                and self.clock() > attempt["ingress_deadline"]
+            ):
                 raise ValueError("artifact ingress expired or unknown")
             digest = hashlib.sha256(content).hexdigest()
             if digest not in attempt["artifacts"]:

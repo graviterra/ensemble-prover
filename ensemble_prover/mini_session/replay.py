@@ -221,10 +221,22 @@ _SESSION_BOOLEAN_STATE_KEYS = frozenset(
         "run_governor_terminal_recorded",
     }
 )
+_SESSION_OPTIONAL_COUNT_LIMIT_KEYS = frozenset(
+    {
+        "max_iterations",
+        "max_frontier_progress_retries",
+        "recursive_pass_budget_remaining",
+        "adaptive_recursive_pass_budget_remaining",
+        "graph_recursive_decompose_remaining",
+        "max_no_applicable_recoveries",
+        "policy_repair_redirect_global_limit",
+        "max_repair_ticket_chain_depth",
+    }
+)
+
 _SESSION_NONNEGATIVE_COUNTER_STATE_KEYS = frozenset(
     {
         "iteration",
-        "max_iterations",
         "stagnation_counter",
         "max_stagnation",
         "soft_progress_streak",
@@ -239,18 +251,13 @@ _SESSION_NONNEGATIVE_COUNTER_STATE_KEYS = frozenset(
         "provider_dispatches_started_total",
         "consecutive_lean_infra_errors",
         "max_consecutive_lean_infra_errors",
-        "max_no_applicable_recoveries",
         "no_applicable_recovery_budget_increment",
         "no_applicable_recovery_count",
         "cost_governed_continuations_without_action",
         "max_cost_governed_continuations_without_action",
         "progress_continuation_grants",
-        "max_frontier_progress_retries",
         "max_model_call_deferred_frontier_retries",
         "max_model_call_deferred_static_retries",
-        "recursive_pass_budget_remaining",
-        "adaptive_recursive_pass_budget_remaining",
-        "graph_recursive_decompose_remaining",
         "recursion_depth",
         "max_recursion_depth",
         "_conversation_turn_count",
@@ -259,8 +266,6 @@ _SESSION_NONNEGATIVE_COUNTER_STATE_KEYS = frozenset(
         "local_repair_quota_limit",
         "local_repair_quota_used",
         "policy_repair_redirect_limit",
-        "policy_repair_redirect_global_limit",
-        "max_repair_ticket_chain_depth",
         "max_materialization_pending_no_applicable_recoveries",
         "run_governor_actions_since_strong_progress",
         "max_identical_no_progress_actions",
@@ -322,6 +327,7 @@ def validate_durable_session_scalar_state(state: Mapping[str, Any]) -> None:
     classified = (
         _SESSION_BOOLEAN_STATE_KEYS
         | _SESSION_NONNEGATIVE_COUNTER_STATE_KEYS
+        | _SESSION_OPTIONAL_COUNT_LIMIT_KEYS
         | _SESSION_STRING_STATE_KEYS
         | _SESSION_OPTIONAL_STRING_STATE_KEYS
         | _SESSION_NONNEGATIVE_SECONDS_STATE_KEYS
@@ -338,6 +344,14 @@ def validate_durable_session_scalar_state(state: Mapping[str, Any]) -> None:
         if key in state and not isinstance(state[key], bool):
             raise InvalidSessionScalarState(
                 f"session state {key} must be a boolean"
+            )
+    for key in _SESSION_OPTIONAL_COUNT_LIMIT_KEYS:
+        if key not in state:
+            continue
+        value = state[key]
+        if type(value) is not int or value < -1 or value > _MAX_DURABLE_COUNTER:
+            raise InvalidSessionScalarState(
+                f"session state {key} must be -1 or a nonnegative count"
             )
     for key in _SESSION_NONNEGATIVE_COUNTER_STATE_KEYS:
         if key not in state:
@@ -398,6 +412,7 @@ _SESSION_MAPPING_STATE_KEYS: tuple[str, ...] = (
     "mathematical_memory_state",
     "deterministic_dispatch_failures",
     "_conversation_role_turn_counts",
+    "conversation_role_service_quanta",
     "local_repair_quota_used_by_signature",
     "local_repair_quota_selected_work_record",
     "repair_policy_narrowing_selected_work_record",
@@ -899,7 +914,7 @@ def _repair_ticket_from_record(record: Any) -> Optional[RepairTicket]:
         ),
         root_ticket_id=str(record.get("root_ticket_id") or ""),
         repair_depth=max(0, _safe_int(record.get("repair_depth"), default=0)),
-        max_chain_depth=max(1, _safe_int(record.get("max_chain_depth"), default=3)),
+        max_chain_depth=_safe_int(record.get("max_chain_depth"), default=-1),
         metadata=dict(record.get("metadata") or {}),
     )
 
@@ -942,14 +957,14 @@ _REPAIR_TICKET_SNAPSHOT_NONNEGATIVE_INT_FIELDS = frozenset(
     }
 )
 _REPAIR_TICKET_SNAPSHOT_POSITIVE_INT_FIELDS = frozenset(
-    {"max_attempts", "max_chain_depth"}
+    {"max_attempts"}
 )
 _REPAIR_TICKET_SNAPSHOT_KEYS = (
     _REPAIR_TICKET_SNAPSHOT_STRING_FIELDS
     | _REPAIR_TICKET_SNAPSHOT_SEQUENCE_FIELDS
     | _REPAIR_TICKET_SNAPSHOT_NONNEGATIVE_INT_FIELDS
     | _REPAIR_TICKET_SNAPSHOT_POSITIVE_INT_FIELDS
-    | {"metadata"}
+    | {"metadata", "max_chain_depth"}
 )
 
 
@@ -967,6 +982,10 @@ def _repair_ticket_from_snapshot_record(record: Any) -> RepairTicket:
         record.get("proof") or ""
     ):
         raise InvalidSessionStateShape("session repair ticket is incomplete")
+    if "max_chain_depth" in record:
+        depth = record["max_chain_depth"]
+        if type(depth) is not int or depth == 0 or depth < -1 or depth > _MAX_DURABLE_COUNTER:
+            raise InvalidSessionStateShape("session repair-ticket chain limit is malformed")
     for key in _REPAIR_TICKET_SNAPSHOT_SEQUENCE_FIELDS:
         value = record.get(key, [])
         if not isinstance(value, list) or any(
@@ -1291,6 +1310,7 @@ _SESSION_STRING_SET_KEYS = frozenset(
 _SESSION_STRING_COUNTER_MAPPING_KEYS = frozenset(
     {
         "_conversation_role_turn_counts",
+        "conversation_role_service_quanta",
         "local_repair_quota_used_by_signature",
         "repair_self_check_continuation_counts",
         "model_call_deferred_static_retry_counts",
@@ -2642,9 +2662,23 @@ def apply_scheduler_snapshot(
         conv is not None
         and hasattr(conv, "_provider_turn_repair_cycle_identity")
     )
+    prompt_scope_memo: Dict[int, Any] = {}
     prior_conversation_history = copy.deepcopy(
-        getattr(conv, "history", None)
+        getattr(conv, "history", None), prompt_scope_memo,
     )
+    # A provider lane can restore its target-local prompt during action
+    # synchronization. Keep these fields in the same transaction as history,
+    # sharing the copy memo so a scope anchor still points into that history.
+    prior_prompt_scope = [
+        (owner, key, hasattr(owner, key), copy.deepcopy(getattr(owner, key, None), prompt_scope_memo))
+        for owner, keys in (
+            (session, ("last_premise_block", "last_premise_names", "_last_premise_block_injected")),
+            (conv, ("_graph_selected_work_last_scope_key", "_graph_selected_work_scope_anchor_message",
+                    "_graph_selected_work_scope_changed", "_last_llm_content")),
+        )
+        if owner is not None
+        for key in keys
+    ]
     prior_selected_work_item = getattr(session, "selected_work_item", None)
     prior_selected_work_item_action_id = str(
         getattr(session, "selected_work_item_action_id", "") or ""
@@ -2805,6 +2839,14 @@ def apply_scheduler_snapshot(
                     delattr(conv, "_provider_turn_repair_cycle_identity")
                 if prior_conversation_history is not None:
                     conv.history = prior_conversation_history
+            except BaseException as rollback_error:
+                rollback_errors.append(rollback_error)
+        for owner, key, was_present, prior_value in prior_prompt_scope:
+            try:
+                if was_present:
+                    setattr(owner, key, prior_value)
+                elif hasattr(owner, key):
+                    delattr(owner, key)
             except BaseException as rollback_error:
                 rollback_errors.append(rollback_error)
         for rollback_error in rollback_errors:

@@ -43,6 +43,7 @@ from .contract_identity import (
     LEAN_CONTRACT_IDENTITY_VERSION,
     make_lean_contract_identity,
 )
+from .deep_json import decode_json_iterative as _decode_json_iterative, dumps_deep_json, loads_deep_json
 from .deadline_guard import (
     await_with_strict_deadline,
     create_result_only_deadline_task,
@@ -430,24 +431,24 @@ def _name_anonymous_check_roots(
 
 
 _CHECK_SOURCE_BOUNDARY_GUARD = r"""
-private partial def ensembleCheckCommandBoundary (command : Lean.Syntax) (allowAxioms : Bool := false) : Bool :=
-  if command.isOfKind ``Lean.Parser.Command.declaration then
-    (allowAxioms && command[1].isOfKind ``Lean.Parser.Command.axiom) ||
-    [``Lean.Parser.Command.definition, ``Lean.Parser.Command.abbrev,
-     ``Lean.Parser.Command.theorem, ``Lean.Parser.Command.opaque,
-     ``Lean.Parser.Command.example, ``Lean.Parser.Command.instance,
-     ``Lean.Parser.Command.structure, ``Lean.Parser.Command.inductive,
-     ``Lean.Parser.Command.classInductive].contains command[1].getKind
-  else if command.isOfKind ``Lean.Parser.Command.in then
+private partial def _root_.ensembleCheckCommandBoundary (command : _root_.Lean.Syntax) (allowAxioms : _root_.Bool := false) : _root_.Bool :=
+  if command.isOfKind ``_root_.Lean.Parser.Command.declaration then
+    (allowAxioms && command[1].isOfKind ``_root_.Lean.Parser.Command.axiom) ||
+    [``_root_.Lean.Parser.Command.definition, ``_root_.Lean.Parser.Command.abbrev,
+     ``_root_.Lean.Parser.Command.theorem, ``_root_.Lean.Parser.Command.opaque,
+     ``_root_.Lean.Parser.Command.example, ``_root_.Lean.Parser.Command.instance,
+     ``_root_.Lean.Parser.Command.structure, ``_root_.Lean.Parser.Command.inductive,
+     ``_root_.Lean.Parser.Command.classInductive].contains command[1].getKind
+  else if command.isOfKind ``_root_.Lean.Parser.Command.in then
     ensembleCheckCommandBoundary command[0] allowAxioms && ensembleCheckCommandBoundary command[2] allowAxioms
-  else if command.isOfKind ``Lean.Parser.Command.mutual then
+  else if command.isOfKind ``_root_.Lean.Parser.Command.mutual then
     command[1].getArgs.all (fun command => ensembleCheckCommandBoundary command allowAxioms)
   else
-    [``Lean.Parser.Command.namespace, ``Lean.Parser.Command.end,
-     ``Lean.Parser.Command.section, ``Lean.Parser.Command.open,
-     ``Lean.Parser.Command.variable, ``Lean.Parser.Command.universe,
-     ``Lean.Parser.Command.include, ``Lean.Parser.Command.omit,
-     ``Lean.Parser.Command.set_option, `lemma,
+    [``_root_.Lean.Parser.Command.namespace, ``_root_.Lean.Parser.Command.end,
+     ``_root_.Lean.Parser.Command.section, ``_root_.Lean.Parser.Command.open,
+     ``_root_.Lean.Parser.Command.variable, ``_root_.Lean.Parser.Command.universe,
+     ``_root_.Lean.Parser.Command.include, ``_root_.Lean.Parser.Command.omit,
+     ``_root_.Lean.Parser.Command.set_option, `lemma,
      `Batteries.Tactic.Lemma.lemmaCmd].contains command.getKind
 """
 
@@ -458,6 +459,42 @@ def _type_identity_probe_command(name: str, statement: str) -> str:
         f"noncomputable def {name} (_miniStatement : {str(statement).strip()}\n"
         ") := @_miniStatement"
     )
+
+
+def _check_target_identity_probe_command(
+    name: str, statement: str, *, require_proposition: bool = False,
+) -> str:
+    """Freeze the target and all original section binders before helpers.
+
+    An opaque proof can generalize section variables used only by its body.
+    Explicit witness binders retain those variables even when the target does
+    not mention them, so the later comparison can specialize only variables
+    that were already available in the original frame. A fixed True conclusion
+    lets Lean finalize recursive target auxiliaries before inferring any result
+    type from a term of the target type.
+    """
+    from .nl_lean import _lean_string
+
+    source = " " * len(f"noncomputable def {name} (_miniStatement : ") + statement
+    declaration = (
+        """set_option linter.unusedSectionVars false in
+    theorem $name:ident (_miniStatement : $original) : _root_.True := _root_.True.intro"""
+        if require_proposition
+        else """set_option linter.unusedSectionVars false in
+    theorem $name:ident $binders* (_miniStatement : $original) : _root_.True := _root_.True.intro"""
+    )
+    return f"""run_cmd do
+  let original ← match _root_.Lean.Parser.runParserCategory
+      (← _root_.Lean.MonadEnv.getEnv) `term {_lean_string(source)} with
+    | .ok stx@_ => pure stx
+    | .error error@_ => _root_.Lean.throwError error
+  let original : _root_.Lean.TSyntax `term := ⟨original⟩
+  let binders := (← _root_.Lean.Elab.Command.getScope).varDecls
+  let name := _root_.Lean.mkIdent (_root_.Lean.Name.mkSimple "{name.removeprefix('_root_.')}")
+  let name := _root_.Lean.mkIdent (`_root_ ++ name.getId)
+  _root_.Lean.Elab.Command.elabCommand (← `(command|
+    {declaration}))
+"""
 
 
 # Untrusted proof terms and helper streams are followed in the same file by
@@ -606,57 +643,70 @@ def _check_source_boundary_file(
             continue
         helper_checks += f"""
 run_cmd do
-  let input := Lean.Parser.mkInputContext {_lean_string(helper_source)} "scratch-helpers.lean"
-  let (parsedHeader@_, initialState@_, initialMessages@_) ← Lean.Parser.parseHeader input
-  let header : Lean.Elab.HeaderSyntax := ⟨parsedHeader.raw⟩
+  let input := _root_.Lean.Parser.mkInputContext {_lean_string(helper_source)} "scratch-helpers.lean"
+  let (parsedHeader@_, initialState@_, initialMessages@_) ← _root_.Lean.Parser.parseHeader input
+  let header : _root_.Lean.Elab.HeaderSyntax := ⟨parsedHeader.raw⟩
   unless (header.imports (includeInit := false)).isEmpty do
-    Lean.throwError "scratch source boundary: helper imports are not permitted"
+    _root_.Lean.throwError "scratch source boundary: helper imports are not permitted"
   let mut state := initialState
   let mut messages := initialMessages
   repeat
-    let (command@_, nextState@_, nextMessages@_) := Lean.Parser.parseCommand input
-      {{ env := ← Lean.getEnv, options := ← Lean.getOptions,
-         currNamespace := ← Lean.getCurrNamespace, openDecls := ← Lean.getOpenDecls }} state messages
+    let (command@_, nextState@_, nextMessages@_) := _root_.Lean.Parser.parseCommand input
+      {{ env := ← _root_.Lean.MonadEnv.getEnv, options := ← _root_.Lean.MonadOptions.getOptions,
+         currNamespace := ← _root_.Lean.MonadResolveName.getCurrNamespace, openDecls := ← _root_.Lean.MonadResolveName.getOpenDecls }} state messages
     state := nextState
     messages := nextMessages
     if messages.hasErrors then
       for message in messages.toList do
-        Lean.logError (← message.toString)
-      Lean.throwError "scratch source boundary: failed to parse helpers"
-    if command.isOfKind ``Lean.Parser.Command.eoi then break
-    unless ensembleCheckCommandBoundary command {str(allow_axioms).lower()} do
-      Lean.throwError m!"scratch source boundary: unsupported helper command {{command.getKind}}"
+        _root_.Lean.logError (← message.toString)
+      _root_.Lean.throwError "scratch source boundary: failed to parse helpers"
+    if command.isOfKind ``_root_.Lean.Parser.Command.eoi then break
+    unless _root_.ensembleCheckCommandBoundary command {str(allow_axioms).lower()} do
+      _root_.Lean.throwError m!"scratch source boundary: unsupported helper command {{command.getKind}}"
     -- Only scope changes are elaborated during admission, never candidate
     -- declarations or command macros. Later syntax sees trusted scoped notation.
-    if command.isOfKind ``Lean.Parser.Command.open then
+    if command.isOfKind ``_root_.Lean.Parser.Command.open then
       let decl := command[1]
-      let nameArg := if decl.isOfKind ``Lean.Parser.Command.openSimple then some 0
-        else if decl.isOfKind ``Lean.Parser.Command.openScoped then some 1 else none
+      let nameArg := if decl.isOfKind ``_root_.Lean.Parser.Command.openSimple then some 0
+        else if decl.isOfKind ``_root_.Lean.Parser.Command.openScoped then some 1 else none
       let opens := match nameArg with
         | some index@_ => decl[index].getArgs.map fun name =>
-          command.setArg 1 (decl.setArg index (Lean.mkNullNode #[name]))
+          command.setArg 1 (decl.setArg index (_root_.Lean.mkNullNode #[name]))
         | none => #[command]
       for opened in opens do
         let saved ← get
         try
-          Lean.Elab.Command.elabCommand opened
+          _root_.Lean.Elab.Command.elabCommand opened
           if (← get).messages.hasErrors then set saved
         catch _ => set saved
       -- Unelaborated helper declarations may introduce new namespaces.
       -- Defer only their open-name resolution to final checking, retaining
       -- each successfully activated trusted scope in a mixed open command.
-    else if [``Lean.Parser.Command.namespace, ``Lean.Parser.Command.section,
-        ``Lean.Parser.Command.end].contains command.getKind then
-      Lean.Elab.Command.elabCommand command
+    else if [``_root_.Lean.Parser.Command.namespace, ``_root_.Lean.Parser.Command.section,
+        ``_root_.Lean.Parser.Command.end].contains command.getKind then
+      _root_.Lean.Elab.Command.elabCommand command
 """
-    return trusted + "\n\n" + _CHECK_SOURCE_BOUNDARY_GUARD + helper_checks + f"""
+    # Syntax indexing can solve its implicit True obligation using a user's
+    # section hypothesis, which would add that hypothesis to this trusted
+    # function. Compile the parser guard without section locals, then restore
+    # the original scope for candidate parsing and target elaboration.
+    boundary_guard = f"""run_cmd do
+  let guard ← match _root_.Lean.Parser.runParserCategory
+      (← _root_.Lean.MonadEnv.getEnv) `command {_lean_string(_CHECK_SOURCE_BOUNDARY_GUARD)} with
+    | .ok stx@_ => pure stx
+    | .error error@_ => _root_.Lean.throwError error
+  _root_.Lean.Elab.Command.withScope
+    (fun scope => {{ scope with varDecls := #[], varUIds := #[], includedVars := [], omittedVars := [] }})
+    (_root_.Lean.Elab.Command.elabCommand guard)
+"""
+    return trusted + "\n\n" + boundary_guard + helper_checks + f"""
 {target_context}
 run_cmd do
-  match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(statement_input)} with
-  | .error error@_ => Lean.throwError m!"scratch source boundary: invalid target term: {{error}}"
+  match _root_.Lean.Parser.runParserCategory (← _root_.Lean.MonadEnv.getEnv) `term {_lean_string(statement_input)} with
+  | .error error@_ => _root_.Lean.throwError m!"scratch source boundary: invalid target term: {{error}}"
   | .ok _ => pure ()
-  match Lean.Parser.runParserCategory (← Lean.getEnv) `term {_lean_string(proof_input)} with
-  | .error error@_ => Lean.throwError m!"scratch source boundary: invalid proof term: {{error}}"
+  match _root_.Lean.Parser.runParserCategory (← _root_.Lean.MonadEnv.getEnv) `term {_lean_string(proof_input)} with
+  | .error error@_ => _root_.Lean.throwError m!"scratch source boundary: invalid proof term: {{error}}"
   | .ok _ => pure ()
 """
 
@@ -664,44 +714,44 @@ run_cmd do
 def _check_delta_audit_blocks(identity: str) -> tuple[str, str]:
     """Inventory only constants introduced after the trusted preamble."""
     baseline = f"ensemble_scratch_baseline_{identity}"
-    name_list_type = "Lean.mkApp (Lean.mkConst ``List [Lean.Level.zero]) (Lean.mkConst ``Lean.Name)"
+    name_list_type = "_root_.Lean.mkApp (_root_.Lean.mkConst ``_root_.List [_root_.Lean.Level.zero]) (_root_.Lean.mkConst ``_root_.Lean.Name)"
     before = f"""
 run_cmd do
-  let names := (← Lean.getEnv).constants.map₂.toList.map (·.1)
-  Lean.Elab.Command.liftCoreM <| Lean.addAndCompile <| .defnDecl {{
+  let names := (← _root_.Lean.MonadEnv.getEnv).constants.map₂.toList.map (·.1)
+  _root_.Lean.Elab.Command.liftCoreM <| _root_.Lean.addAndCompile <| .defnDecl {{
     name := `{baseline}, levelParams := [], type := {name_list_type},
-    value := Lean.toExpr names, hints := .opaque, safety := .safe
+    value := _root_.Lean.ToExpr.toExpr names, hints := .opaque, safety := .safe
   }}
 """
     after = f"""
 run_cmd do
-  let names := (← Lean.getEnv).constants.map₂.toList.map (·.1)
-  let baseline ← Lean.Elab.Command.liftTermElabM <|
-    Lean.Meta.evalExpr (List Lean.Name) ({name_list_type}) (Lean.mkConst `{baseline})
-  let known := baseline.foldl (fun set name => set.insert name) ({{}} : Lean.NameSet)
+  let names := (← _root_.Lean.MonadEnv.getEnv).constants.map₂.toList.map (·.1)
+  let baseline ← _root_.Lean.Elab.Command.liftTermElabM <|
+    _root_.Lean.Meta.evalExpr (_root_.List _root_.Lean.Name) ({name_list_type}) (_root_.Lean.mkConst `{baseline})
+  let known := baseline.foldl (fun set name => set.insert name) ({{}} : _root_.Lean.NameSet)
   let names := names.filter fun name => name != `{baseline} && !known.contains name
   let allowed := [`propext, `Classical.choice, `Quot.sound]
-  let mut inventory : Array Lean.Json := #[]
-  let mut forbidden : Array Lean.Name := #[]
+  let mut inventory : _root_.Array _root_.Lean.Json := #[]
+  let mut forbidden : _root_.Array _root_.Lean.Name := #[]
   for name in names do
-    let axioms ← Lean.collectAxioms name
+    let axioms ← _root_.Lean.collectAxioms name
     for axiomName in axioms do
       unless allowed.contains axiomName do
         if !forbidden.contains axiomName then forbidden := forbidden.push axiomName
-    inventory := inventory.push <| Lean.Json.mkObj [
-      ("name", Lean.toJson name.toString),
-      ("axioms", Lean.toJson (axioms.map Lean.Name.toString))]
-  Lean.logInfo ("ENSEMBLE_SCRATCH_AUDIT_ROOTS:" ++ (Lean.Json.arr inventory).compress)
+    inventory := inventory.push <| _root_.Lean.Json.mkObj [
+      ("name", _root_.Lean.ToJson.toJson name.toString),
+      ("axioms", _root_.Lean.ToJson.toJson (axioms.map _root_.Lean.Name.toString))]
+  _root_.Lean.logInfo ("ENSEMBLE_SCRATCH_AUDIT_ROOTS:" ++ (_root_.Lean.Json.arr inventory).compress)
   unless forbidden.isEmpty do
-    Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
+    _root_.Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
 """
     # Elaborate the audit implementation in the trusted scope. Candidate
-    # instances (including aliases of Lean.Name) must not influence equality,
+    # instances (including aliases of _root_.Lean.Name) must not influence equality,
     # JSON encoding or axiom membership tests used by the inventory.
     audit_function = f"ensemble_scratch_inventory_{identity}"
     audit_body = after.split("run_cmd do\n", 1)[1]
     compiled_audit = (
-        f"\nunsafe def _root_.{audit_function} : Lean.Elab.Command.CommandElabM Unit := do\n"
+        f"\nunsafe def _root_.{audit_function} : _root_.Lean.Elab.Command.CommandElabM _root_.Unit := do\n"
         + audit_body
     )
     return compiled_audit + before, f"\nrun_cmd _root_.{audit_function}\n"
@@ -710,6 +760,8 @@ run_cmd do
 
 _AUDIT_RECEIPT_VERSION = 2
 _AUDIT_POLICY_VERSION = "kernel-checked-delta-v2"
+_AUDIT_OBSERVER_GENERATION = 4
+_HELPER_USAGE_VERSION = 2
 _AGGREGATE_AUDIT_MARKER_RE = re.compile(r"ENSEMBLE_AUDIT_RECEIPT:([^\r\n]*)")
 
 
@@ -719,58 +771,58 @@ def _check_aggregate_audit_blocks(identity: str, binding: dict[str, Any]) -> tup
 
     baseline = f"ensemble_scratch_baseline_{identity}"
     function = f"ensemble_scratch_inventory_{identity}"
-    name_list_type = "Lean.mkApp (Lean.mkConst ``List [Lean.Level.zero]) (Lean.mkConst ``Lean.Name)"
+    name_list_type = "_root_.Lean.mkApp (_root_.Lean.mkConst ``_root_.List [_root_.Lean.Level.zero]) (_root_.Lean.mkConst ``_root_.Lean.Name)"
     before = f"""
-unsafe def _root_.{function} (bindingText goalName : String) (provenanceNames : Array String) : Lean.Elab.Command.CommandElabM Unit := do
-  let env ← Lean.getEnv
-  let baseline ← Lean.Elab.Command.liftTermElabM <|
-    Lean.Meta.evalExpr (List Lean.Name) ({name_list_type}) (Lean.mkConst `{baseline})
-  let known := baseline.foldl (fun set name => set.insert name) ({{}} : Lean.NameSet)
+unsafe def _root_.{function} (bindingText goalName : _root_.String) (provenanceNames : _root_.Array _root_.String) : _root_.Lean.Elab.Command.CommandElabM _root_.Unit := do
+  let env ← _root_.Lean.MonadEnv.getEnv
+  let baseline ← _root_.Lean.Elab.Command.liftTermElabM <|
+    _root_.Lean.Meta.evalExpr (_root_.List _root_.Lean.Name) ({name_list_type}) (_root_.Lean.mkConst `{baseline})
+  let known := baseline.foldl (fun set name => set.insert name) ({{}} : _root_.Lean.NameSet)
   let names := (env.constants.map₂.toList.map (·.1)).filter fun name =>
     name != `{baseline} && !known.contains name
   for name in names do
     unless (env.checked.get.find? name).isSome do
-      Lean.throwError m!"scratch audit: declaration not kernel checked: {{name}}"
+      _root_.Lean.throwError m!"scratch audit: declaration not kernel checked: {{name}}"
   let goals := names.filter fun name => name.getString! == goalName
   unless goals.length == 1 do
-    Lean.throwError "scratch audit: missing or ambiguous target"
+    _root_.Lean.throwError "scratch audit: missing or ambiguous target"
   let target := goals.head!
-  let (_, unionState) := ((names.forM Lean.CollectAxioms.collect).run env).run {{}}
-  let targetAxioms ← Lean.collectAxioms target
+  let (_, unionState) := ((names.forM _root_.Lean.CollectAxioms.collect).run env).run {{}}
+  let targetAxioms ← _root_.Lean.collectAxioms target
   let allowed := [`propext, `Classical.choice, `Quot.sound]
   let forbidden := unionState.axioms.filter fun name => !allowed.contains name
-  let .ok binding := Lean.Json.parse bindingText | Lean.throwError "scratch audit: invalid binding"
-  let mut provenance : Array Lean.Json := #[]
+  let .ok binding := _root_.Lean.Json.parse bindingText | _root_.Lean.throwError "scratch audit: invalid binding"
+  let mut provenance : _root_.Array _root_.Lean.Json := #[]
   for requested in provenanceNames do
-    let .ok parsed := Lean.Parser.runParserCategory env `term requested
-      | Lean.throwError "scratch audit: malformed provenance name"
-    unless parsed.isIdent do Lean.throwError "scratch audit: invalid provenance name"
-    let resolved ← Lean.resolveGlobalConstNoOverload parsed
-    unless names.contains resolved do Lean.throwError "scratch audit: provenance outside delta"
-    let axioms ← Lean.collectAxioms resolved
-    provenance := provenance.push <| Lean.Json.mkObj [
-      ("requested", Lean.toJson requested), ("resolved", Lean.toJson resolved.toString),
-      ("axioms", Lean.toJson (axioms.map Lean.Name.toString))]
-  let receipt := Lean.Json.mkObj [
-    ("version", Lean.toJson (2 : Nat)),
-    ("policy", Lean.toJson "kernel-checked-delta-v2"),
-    ("binding", binding), ("complete", Lean.toJson true),
-    ("target", Lean.toJson target.toString),
-    ("targetAxioms", Lean.toJson (targetAxioms.map Lean.Name.toString)),
-    ("declarations", Lean.toJson (names.map Lean.Name.toString)),
-    ("contextAxioms", Lean.toJson (unionState.axioms.map Lean.Name.toString)),
-    ("allowedAxioms", Lean.toJson (allowed.map Lean.Name.toString)),
-    ("provenance", Lean.Json.arr provenance)]
-  Lean.logInfo ("ENSEMBLE_AUDIT_RECEIPT:" ++ receipt.compress)
+    let .ok parsed := _root_.Lean.Parser.runParserCategory env `term requested
+      | _root_.Lean.throwError "scratch audit: malformed provenance name"
+    unless parsed.isIdent do _root_.Lean.throwError "scratch audit: invalid provenance name"
+    let resolved ← _root_.Lean.resolveGlobalConstNoOverload parsed
+    unless names.contains resolved do _root_.Lean.throwError "scratch audit: provenance outside delta"
+    let axioms ← _root_.Lean.collectAxioms resolved
+    provenance := provenance.push <| _root_.Lean.Json.mkObj [
+      ("requested", _root_.Lean.ToJson.toJson requested), ("resolved", _root_.Lean.ToJson.toJson resolved.toString),
+      ("axioms", _root_.Lean.ToJson.toJson (axioms.map _root_.Lean.Name.toString))]
+  let receipt := _root_.Lean.Json.mkObj [
+    ("version", _root_.Lean.ToJson.toJson (2 : _root_.Nat)),
+    ("policy", _root_.Lean.ToJson.toJson "kernel-checked-delta-v2"),
+    ("binding", binding), ("complete", _root_.Lean.ToJson.toJson true),
+    ("target", _root_.Lean.ToJson.toJson target.toString),
+    ("targetAxioms", _root_.Lean.ToJson.toJson (targetAxioms.map _root_.Lean.Name.toString)),
+    ("declarations", _root_.Lean.ToJson.toJson (names.map _root_.Lean.Name.toString)),
+    ("contextAxioms", _root_.Lean.ToJson.toJson (unionState.axioms.map _root_.Lean.Name.toString)),
+    ("allowedAxioms", _root_.Lean.ToJson.toJson (allowed.map _root_.Lean.Name.toString)),
+    ("provenance", _root_.Lean.Json.arr provenance)]
+  _root_.Lean.logInfo ("ENSEMBLE_AUDIT_RECEIPT:" ++ receipt.compress)
   unless forbidden.isEmpty do
-    Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
-def _root_.{function}_complete (marker : String) : Lean.Elab.Command.CommandElabM Unit :=
-  Lean.logInfo marker
+    _root_.Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
+def _root_.{function}_complete (marker : _root_.String) : _root_.Lean.Elab.Command.CommandElabM _root_.Unit :=
+  _root_.Lean.logInfo marker
 run_cmd do
-  let names := (← Lean.getEnv).constants.map₂.toList.map (·.1)
-  Lean.Elab.Command.liftCoreM <| Lean.addAndCompile <| .defnDecl {{
+  let names := (← _root_.Lean.MonadEnv.getEnv).constants.map₂.toList.map (·.1)
+  _root_.Lean.Elab.Command.liftCoreM <| _root_.Lean.addAndCompile <| .defnDecl {{
     name := `{baseline}, levelParams := [], type := {name_list_type},
-    value := Lean.toExpr names, hints := .opaque, safety := .safe
+    value := _root_.Lean.ToExpr.toExpr names, hints := .opaque, safety := .safe
   }}
 """
     encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"))
@@ -854,34 +906,33 @@ def _check_helper_usage_blocks(
         for name, marker in declaration_consumers
     ) + "]"
     before = f"""
-private def _root_.{function} (goalName usageIdentity : String)
-    (requestedNames : Array String) (requestedConsumers : Array (String × String)) : Lean.Elab.Command.CommandElabM Unit := do
+private def _root_.{function} (goalName usageIdentity : _root_.String)
+    (requestedNames : _root_.Array _root_.String) (requestedConsumers : _root_.Array (_root_.String × _root_.String)) : _root_.Lean.Elab.Command.CommandElabM _root_.Unit := do
   try
-    let env ← Lean.getEnv
+    let env ← _root_.Lean.MonadEnv.getEnv
     let localNames := env.constants.map₂.toList.map (·.1)
-    if localNames.length > 10000 then return
-    let localSet := localNames.foldl (fun set name => set.insert name) ({{}} : Lean.NameSet)
-    let mut bindings : Array Lean.Json := #[]
-    let mut resolvedBindings : Array (String × Lean.Name) := #[]
+    let localSet := localNames.foldl (fun set name => set.insert name) ({{}} : _root_.Lean.NameSet)
+    let mut bindings : _root_.Array _root_.Lean.Json := #[]
+    let mut resolvedBindings : _root_.Array (_root_.String × _root_.Lean.Name) := #[]
     for requested in requestedNames do
       try
-        let .ok parsed@_ := Lean.Parser.runParserCategory env `term requested | continue
+        let .ok parsed@_ := _root_.Lean.Parser.runParserCategory env `term requested | continue
         unless parsed.isIdent do continue
-        let resolved ← Lean.resolveGlobalConstNoOverload parsed
+        let resolved ← _root_.Lean.resolveGlobalConstNoOverload parsed
         if localSet.contains resolved then
           resolvedBindings := resolvedBindings.push (requested, resolved)
-          bindings := bindings.push <| Lean.Json.mkObj [
-            ("requested", Lean.toJson requested),
-            ("resolved", Lean.toJson resolved.toString)]
+          bindings := bindings.push <| _root_.Lean.Json.mkObj [
+            ("requested", _root_.Lean.ToJson.toJson requested),
+            ("resolved", _root_.Lean.ToJson.toJson resolved.toString)]
       catch _ => pure ()
     let goals := localNames.filter fun name => name.components.any (·.toString == goalName)
     let goals := goals.filter fun name => name.getString! == goalName
-    let mut consumers : Array (String × String × Lean.Name) := #[]
+    let mut consumers : _root_.Array (_root_.String × _root_.String × _root_.Lean.Name) := #[]
     if goals.length == 1 then consumers := consumers.push ("", usageIdentity, goals.head!)
     for (requested@_, marker@_) in requestedConsumers do
-      let .ok parsed@_ := Lean.Parser.runParserCategory env `term requested | continue
+      let .ok parsed@_ := _root_.Lean.Parser.runParserCategory env `term requested | continue
       unless parsed.isIdent do continue
-      let requestedName := parsed.getId.replacePrefix `_root_ Lean.Name.anonymous
+      let requestedName := parsed.getId.replacePrefix `_root_ _root_.Lean.Name.anonymous
       -- Source blocks may change namespace scope. A final surface-name
       -- resolution cannot identify the source when multiple declarations
       -- have that relative name; leave its proof usage unknown.
@@ -897,28 +948,33 @@ private def _root_.{function} (goalName usageIdentity : String)
         | _ => none
       let some value@_ := value | continue
       let direct := value.getUsedConstants
-      let mut pending := direct.toList
-      let mut seen : Lean.NameSet := {{}}
-      let mut reached : Array Lean.Name := #[]
-      let mut fuel := 10000
-      while !pending.isEmpty && fuel > 0 do
-        fuel := fuel - 1
-        let name := pending.head!
-        pending := pending.tail!
+      let mut seen : _root_.Lean.NameSet := {{}}
+      let mut pending : _root_.List _root_.Lean.Name := []
+      for name in direct do
         unless seen.contains name do
           seen := seen.insert name
-          reached := reached.push name
-          if localSet.contains name then
-            if let some info@_ := env.checked.get.find? name then
-              pending := info.getUsedConstantsAsSet.toList ++ pending
-      Lean.logInfo ("ENSEMBLE_HELPER_USAGE:" ++ marker ++ ":" ++ (Lean.Json.mkObj [
-        ("consumer", Lean.toJson requested),
-        ("resolvedConsumer", Lean.toJson resolved.toString),
-        ("bindings", Lean.Json.arr bindings),
-        ("complete", Lean.toJson pending.isEmpty),
-        ("declarations", Lean.toJson (localNames.map Lean.Name.toString)),
-        ("direct", Lean.toJson (direct.map Lean.Name.toString)),
-        ("reachable", Lean.toJson (reached.map Lean.Name.toString))]).compress)
+          pending := name :: pending
+      let mut reached : _root_.Array _root_.Lean.Name := #[]
+      -- Queue each constant once; shared dependencies cannot exhaust an
+      -- arbitrary visit allowance before a finite proof graph is observed.
+      while !pending.isEmpty do
+        let name := pending.head!
+        pending := pending.tail!
+        reached := reached.push name
+        if localSet.contains name then
+          if let some info@_ := env.checked.get.find? name then
+            for dependency in info.getUsedConstantsAsSet.toList do
+              unless seen.contains dependency do
+                seen := seen.insert dependency
+                pending := dependency :: pending
+      _root_.Lean.logInfo ("ENSEMBLE_HELPER_USAGE:" ++ marker ++ ":" ++ (_root_.Lean.Json.mkObj [
+        ("consumer", _root_.Lean.ToJson.toJson requested),
+        ("resolvedConsumer", _root_.Lean.ToJson.toJson resolved.toString),
+        ("bindings", _root_.Lean.Json.arr bindings),
+        ("complete", _root_.Lean.ToJson.toJson pending.isEmpty),
+        ("declarations", _root_.Lean.ToJson.toJson (localNames.map _root_.Lean.Name.toString)),
+        ("direct", _root_.Lean.ToJson.toJson (direct.map _root_.Lean.Name.toString)),
+        ("reachable", _root_.Lean.ToJson.toJson (reached.map _root_.Lean.Name.toString))]).compress)
   catch _ => pure ()
 """
     return before, (
@@ -938,47 +994,107 @@ def _check_goal_audit_block(goal_name: str) -> str:
     return f"""
 run_cmd do
   let target := "{goal_name}"
-  let names := (← Lean.getEnv).constants.map₂.toList.map (·.1)
+  let names := (← _root_.Lean.MonadEnv.getEnv).constants.map₂.toList.map (·.1)
     |>.filter fun name => name.components.any (·.toString == target)
   if names.isEmpty then
-    Lean.throwError "scratch audit: goal declaration not found"
+    _root_.Lean.throwError "scratch audit: goal declaration not found"
   let allowed := [`propext, `Classical.choice, `Quot.sound]
-  let mut inventory : Array Lean.Json := #[]
-  let mut forbidden : Array Lean.Name := #[]
+  let mut inventory : _root_.Array _root_.Lean.Json := #[]
+  let mut forbidden : _root_.Array _root_.Lean.Name := #[]
   for name in names do
-    let axioms ← Lean.collectAxioms name
+    let axioms ← _root_.Lean.collectAxioms name
     for axiomName in axioms do
       unless allowed.contains axiomName do
         if !forbidden.contains axiomName then forbidden := forbidden.push axiomName
-    inventory := inventory.push <| Lean.Json.mkObj [
-      ("name", Lean.toJson name.toString),
-      ("axioms", Lean.toJson (axioms.map Lean.Name.toString))]
-  Lean.logInfo ("ENSEMBLE_SCRATCH_AUDIT_ROOTS:" ++ (Lean.Json.arr inventory).compress)
+    inventory := inventory.push <| _root_.Lean.Json.mkObj [
+      ("name", _root_.Lean.ToJson.toJson name.toString),
+      ("axioms", _root_.Lean.ToJson.toJson (axioms.map _root_.Lean.Name.toString))]
+  _root_.Lean.logInfo ("ENSEMBLE_SCRATCH_AUDIT_ROOTS:" ++ (_root_.Lean.Json.arr inventory).compress)
   unless forbidden.isEmpty do
-    Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
+    _root_.Lean.throwError m!"unapproved axioms in scratch declarations: {{forbidden}}"
 """
 
 
-def _check_target_identity_guard_definition(witness: str) -> str:
+def _check_target_identity_guard_definition(
+    witness: str, *, require_proposition: bool = False,
+) -> str:
     """Elaborate the type comparison before candidate instances are in scope."""
-    return f"""
-def _root_.{witness}_guard (goal : Lean.Name) : Lean.Elab.Command.CommandElabM Unit :=
- Lean.Elab.Command.liftTermElabM do
-  let goalInfo ← Lean.getConstInfo goal
-  let .defnInfo witnessInfo@_ ← Lean.getConstInfo (Lean.Name.mkSimple "{witness}")
-    | Lean.throwError "scratch target type witness missing"
-  let expected ← Lean.Meta.lambdaTelescope witnessInfo.value fun params body => do
-    unless params.size > 0 && body == params.back! do
-      Lean.throwError "scratch target type witness is not an identity"
-    Lean.Meta.mkForallFVars params.pop (← Lean.Meta.inferType body)
-  let expectedParams := (Lean.collectLevelParams {{}} expected).params.toList
-  let actualParams := (Lean.collectLevelParams {{}} goalInfo.type).params.toList
+    if require_proposition:
+        return f"""
+def _root_.{witness}_guard (goal : _root_.Lean.Name) : _root_.Lean.Elab.Command.CommandElabM _root_.Unit :=
+ _root_.Lean.Elab.Command.liftTermElabM do
+  let goalInfo ← _root_.Lean.getConstInfo goal
+  let .thmInfo witnessInfo@_ ← _root_.Lean.getConstInfo ``_root_.{witness}
+    | _root_.Lean.throwError "scratch target type witness missing"
+  let expected ← _root_.Lean.Meta.forallTelescope witnessInfo.type fun params body => do
+    unless params.size > 0 && body.isConstOf (_root_.Lean.Name.mkSimple "True") do
+      _root_.Lean.throwError "scratch target type witness has an invalid shape"
+    _root_.Lean.Meta.mkForallFVars params.pop (← _root_.Lean.Meta.inferType params.back!)
+  let expectedParams := (_root_.Lean.collectLevelParams {{}} expected).params.toList
+  let actualParams := (_root_.Lean.collectLevelParams {{}} goalInfo.type).params.toList
   unless expectedParams.length == actualParams.length do
-    Lean.throwError "helpers changed the target universe arity"
-  let levels := expectedParams.map Lean.Level.param
+    _root_.Lean.throwError "helpers changed the target universe arity"
+  let levels := expectedParams.map _root_.Lean.Level.param
   let actual := goalInfo.type.instantiateLevelParams actualParams levels
-  unless ← Lean.Meta.isDefEq expected actual do
-    Lean.throwError "helpers changed the target statement"
+  unless ← _root_.Lean.Meta.isDefEq expected actual do
+    _root_.Lean.throwError "helpers changed the target statement"
+"""
+    return f"""
+def _root_.{witness}_guard (goal : _root_.Lean.Name) : _root_.Lean.Elab.Command.CommandElabM _root_.Unit :=
+ _root_.Lean.Elab.Command.liftTermElabM do
+  let goalInfo ← _root_.Lean.getConstInfo goal
+  let .thmInfo witnessInfo@_ ← _root_.Lean.getConstInfo ``_root_.{witness}
+    | _root_.Lean.throwError "scratch target type witness missing"
+  _root_.Lean.Meta.forallTelescope witnessInfo.type fun params body => do
+    unless params.size > 0 && body.isConstOf (_root_.Lean.Name.mkSimple "True") do
+      _root_.Lean.throwError "scratch target type witness has an invalid shape"
+    let expected ← _root_.Lean.Meta.inferType params.back!
+    let sectionVars := params.pop
+    let actualParams := (_root_.Lean.collectLevelParams {{}} goalInfo.type).params.toList
+    let levels ← _root_.Lean.Meta.mkFreshLevelMVars actualParams.length
+    let actual := goalInfo.type.instantiateLevelParams actualParams levels
+    let initial ← _root_.Lean.MonadMCtx.getMCtx
+    let mut pending : _root_.Array (_root_.Lean.Expr × _root_.Nat × _root_.Lean.MetavarContext × _root_.List _root_.Lean.Level) :=
+      #[(actual, 0, initial, levels)]
+    let mut matched := false
+    for _ in [:params.size] do
+      let mut next := #[]
+      for (actual, first, saved, _) in pending do
+        _root_.Lean.setMCtx saved
+        if ← _root_.Lean.Meta.isDefEq expected actual then
+          let mut renamed : _root_.Array _root_.Lean.Name := #[]
+          let mut validLevels := true
+          for level in levels do
+            match ← _root_.Lean.instantiateLevelMVars level with
+            | .param name =>
+              if renamed.contains name then validLevels := false
+              renamed := renamed.push name
+            | _ => validLevels := false
+          if validLevels then
+            matched := true
+            break
+        let .forallE name domain body _ := actual | continue
+        for index in [first:sectionVars.size] do
+          _root_.Lean.setMCtx saved
+          let argument := sectionVars[index]!
+          let decl ← argument.fvarId!.getDecl
+          if decl.userName.eraseMacroScopes == name.eraseMacroScopes then
+            if ← _root_.Lean.Meta.isDefEq domain decl.type then
+              let remaining ← _root_.Lean.instantiateMVars (body.instantiate1 argument)
+              let renamed ← levels.mapM _root_.Lean.instantiateLevelMVars
+              -- Original section variables generalize in declaration order.
+              -- Equivalent states with more variables available subsume later
+              -- choices, avoiding permutations of duplicate unused binders.
+              unless next.any (fun (other, start, _, assignments) =>
+                  other == remaining && start ≤ index + 1 && assignments == renamed) do
+                next := next.filter fun (other, start, _, assignments) =>
+                  !(other == remaining && index + 1 ≤ start && assignments == renamed)
+                next := next.push (remaining, index + 1,
+                  ← _root_.Lean.MonadMCtx.getMCtx, renamed)
+      if matched then break
+      pending := next
+    unless matched do
+      _root_.Lean.throwError "helpers changed the target statement"
 """
 
 
@@ -3134,10 +3250,9 @@ class LeanStatementContractAnalysis:
 
 
 _LEAN_RESIDUAL_BATCH_FORMAT_VERSION = 2
-_LEAN_RESIDUAL_BATCH_MAX_GOALS = 256
 _LEAN_RESIDUAL_SOURCE_MAX_CHARS = 1_000_000
 LEAN_RESIDUAL_VERIFIER_GENERATION = (
-    f"lean-residual-batch-v{_LEAN_RESIDUAL_BATCH_FORMAT_VERSION}"
+    f"lean-residual-batch-v{_LEAN_RESIDUAL_BATCH_FORMAT_VERSION}:observer-v2"
 )
 
 
@@ -3189,6 +3304,7 @@ def lean_residual_elaboration_context_hash(
         json.dumps(
             {
                 "format": _LEAN_RESIDUAL_BATCH_FORMAT_VERSION,
+                "verifier_generation": LEAN_RESIDUAL_VERIFIER_GENERATION,
                 "resolved_preamble": resolved_preamble,
                 "ordered_lemmas": [str(item or "") for item in ordered_lemmas],
             },
@@ -3334,154 +3450,25 @@ def _residual_failure_evidence(
     return fingerprint, preview
 
 
-_JSON_NUMBER_TOKEN_RE = re.compile(
-    r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
-)
-
-
-def _decode_json_iterative(source: str) -> Any:
-    """Decode JSON with an explicit container stack.
-
-    Lean expressions are naturally much deeper than Python call stacks. The
-    standard decoder rejects otherwise valid, bounded receipt payloads around
-    that implementation limit, so the receipt boundary uses a non-recursive
-    decoder rather than imposing a mathematical expression-depth cap.
-    """
-
-    text = str(source)
-    length = len(text)
-    position = 0
-    unset = object()
-    root: Any = unset
-    # frame: [kind, container, state, pending_key]
-    stack: list[list[Any]] = []
-
-    def skip_space(index: int) -> int:
-        while index < length and text[index] in " \t\r\n":
-            index += 1
-        return index
-
-    def parse_value(index: int) -> tuple[Any, Optional[list[Any]], int]:
-        index = skip_space(index)
-        if index >= length:
-            raise ValueError("unexpected end of JSON input")
-        token = text[index]
-        if token == "[":
-            container: list[Any] = []
-            return container, ["array", container, "value_or_end", None], index + 1
-        if token == "{":
-            container = {}
-            return container, ["object", container, "key_or_end", None], index + 1
-        if token == '"':
-            value, end = json.decoder.scanstring(text, index + 1, True)
-            return value, None, end
-        for literal, value in (("true", True), ("false", False), ("null", None)):
-            if text.startswith(literal, index):
-                return value, None, index + len(literal)
-        match = _JSON_NUMBER_TOKEN_RE.match(text, index)
-        if match is None:
-            raise ValueError(f"invalid JSON token at offset {index}")
-        token_text = match.group(0)
-        value = (
-            float(token_text)
-            if any(marker in token_text for marker in ".eE")
-            else int(token_text)
-        )
-        return value, None, match.end()
-
-    while True:
-        position = skip_space(position)
-        if not stack:
-            if root is not unset:
-                if position != length:
-                    raise ValueError(f"trailing JSON data at offset {position}")
-                return root
-            root, frame, position = parse_value(position)
-            if frame is not None:
-                stack.append(frame)
-            continue
-
-        frame = stack[-1]
-        kind, container, state, pending_key = frame
-        position = skip_space(position)
-        if kind == "array":
-            if state in {"value_or_end", "value"}:
-                if (
-                    state == "value_or_end"
-                    and position < length
-                    and text[position] == "]"
-                ):
-                    stack.pop()
-                    position += 1
-                    continue
-                value, child_frame, position = parse_value(position)
-                container.append(value)
-                frame[2] = "comma_or_end"
-                if child_frame is not None:
-                    stack.append(child_frame)
-                continue
-            if position < length and text[position] == ",":
-                frame[2] = "value"
-                position += 1
-                continue
-            if position < length and text[position] == "]":
-                stack.pop()
-                position += 1
-                continue
-            raise ValueError(f"expected ',' or ']' at offset {position}")
-
-        if state in {"key_or_end", "key"}:
-            if (
-                state == "key_or_end"
-                and position < length
-                and text[position] == "}"
-            ):
-                stack.pop()
-                position += 1
-                continue
-            if position >= length or text[position] != '"':
-                raise ValueError(f"expected object key at offset {position}")
-            key, position = json.decoder.scanstring(text, position + 1, True)
-            frame[3] = key
-            frame[2] = "colon"
-            continue
-        if state == "colon":
-            if position >= length or text[position] != ":":
-                raise ValueError(f"expected ':' at offset {position}")
-            frame[2] = "value"
-            position += 1
-            continue
-        if state == "value":
-            value, child_frame, position = parse_value(position)
-            if pending_key in container:
-                raise ValueError(f"duplicate object key {pending_key!r}")
-            container[pending_key] = value
-            frame[3] = None
-            frame[2] = "comma_or_end"
-            if child_frame is not None:
-                stack.append(child_frame)
-            continue
-        if position < length and text[position] == ",":
-            frame[2] = "key"
-            position += 1
-            continue
-        if position < length and text[position] == "}":
-            stack.pop()
-            position += 1
-            continue
-        raise ValueError(f"expected ',' or '}}' at offset {position}")
-
 
 def _is_nonnegative_json_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _lean_serialized_level_is_closed(value: Any) -> bool:
-    stack = [value]
+    stack = [(value, False)]
+    active: set[int] = set()
     while stack:
-        item = stack.pop()
+        item, leaving = stack.pop()
+        if leaving:
+            active.remove(id(item))
+            continue
+        if id(item) in active:
+            return False
         if not isinstance(item, list) or not item or not isinstance(item[0], str):
             return False
+        active.add(id(item))
+        stack.append((item, True))
         tag = item[0]
         if tag == "zero":
             if len(item) != 1:
@@ -3489,11 +3476,11 @@ def _lean_serialized_level_is_closed(value: Any) -> bool:
         elif tag == "succ":
             if len(item) != 2:
                 return False
-            stack.append(item[1])
+            stack.append((item[1], False))
         elif tag in {"max", "imax"}:
             if len(item) != 3:
                 return False
-            stack.extend((item[1], item[2]))
+            stack.extend(((item[1], False), (item[2], False)))
         elif tag == "param":
             if len(item) != 2 or not isinstance(item[1], str) or not item[1]:
                 return False
@@ -3506,12 +3493,20 @@ def _lean_serialized_level_is_closed(value: Any) -> bool:
 
 def _lean_serialized_expr_is_closed(value: Any, *, depth: int = 0) -> bool:
     """Validate the exact serializer grammar and reject every open ``Expr``."""
-    stack: list[tuple[Any, int]] = [(value, depth)]
+    stack: list[tuple[Any, int | None]] = [(value, depth)]
+    active: set[int] = set()
     binder_infos = {"default", "implicit", "strictImplicit", "instImplicit"}
     while stack:
         item, item_depth = stack.pop()
+        if item_depth is None:
+            active.remove(id(item))
+            continue
+        if id(item) in active:
+            return False
         if not isinstance(item, list) or not item or not isinstance(item[0], str):
             return False
+        active.add(id(item))
+        stack.append((item, None))
         tag = item[0]
         if tag == "bvar":
             if not (
@@ -3539,7 +3534,7 @@ def _lean_serialized_expr_is_closed(value: Any, *, depth: int = 0) -> bool:
                 return False
             stack.extend(((item[1], item_depth), (item[2], item_depth)))
         elif tag in {"lam", "forall"}:
-            if len(item) != 4 or item[1] not in binder_infos:
+            if len(item) != 4 or not isinstance(item[1], str) or item[1] not in binder_infos:
                 return False
             stack.extend(((item[2], item_depth), (item[3], item_depth + 1)))
         elif tag == "let":
@@ -3666,9 +3661,6 @@ def _residual_batch_receipt_from_payload(
     raw_goals = payload.get("goals")
     if not isinstance(raw_goals, list):
         return None, "residual_goals_not_array"
-    if len(raw_goals) > _LEAN_RESIDUAL_BATCH_MAX_GOALS:
-        return None, "residual_goal_count_exceeds_limit"
-
     parent_expr_json = _canonical_residual_expr_json(parent_expr)
     parent_expr_hash, parent_identity = _residual_expr_identity(parent_expr_json)
     if not parent_identity:
@@ -3882,192 +3874,125 @@ _CONTRACT_ANALYSIS_FORMAT_VERSION = LEAN_CONTRACT_IDENTITY_VERSION
 
 
 def _canonical_contract_expr_payload(value: Any) -> Any:
-    """Canonicalize universe-parameter names in serialized Lean ``Expr`` JSON."""
-
+    """Copy JSON in deterministic DFS order and alpha-rename universe params."""
     level_params: dict[str, str] = {}
-
-    def visit(item: Any) -> Any:
-        if isinstance(item, list):
-            if (
-                len(item) == 2
-                and item[0] == "param"
-                and isinstance(item[1], str)
-            ):
-                normalized = level_params.setdefault(
-                    item[1], f"u{len(level_params)}"
-                )
-                return ["param", normalized]
-            return [visit(child) for child in item]
-        if isinstance(item, dict):
-            return {
-                str(key): visit(child)
-                for key, child in sorted(item.items(), key=lambda pair: str(pair[0]))
-            }
-        return item
-
-    return visit(value)
+    root: list[Any] = [None]
+    active: set[int] = set()
+    stack: list[tuple[Any, Any, Any]] = [(value, root, 0)]
+    while stack:
+        item, parent, key = stack.pop()
+        if parent is None:
+            active.remove(item)
+            continue
+        if isinstance(item, (list, dict)):
+            if id(item) in active:
+                raise ValueError("cyclic contract payload")
+            if (isinstance(item, list) and len(item) == 2 and item[0] == "param"
+                    and isinstance(item[1], str)):
+                parent[key] = ["param", level_params.setdefault(item[1], f"u{len(level_params)}")]
+                continue
+            active.add(id(item))
+            stack.append((id(item), None, None))
+            children: list[tuple[Any, Any, int | str]]
+            if isinstance(item, list):
+                copied: Any = [None] * len(item)
+                children = [(child, copied, index) for index, child in enumerate(item)]
+            else:
+                copied = {}
+                children = [(child, copied, str(name)) for name, child in sorted(item.items(), key=lambda pair: str(pair[0]))]
+            parent[key] = copied
+            stack.extend(reversed(children))
+        else:
+            parent[key] = item
+    return root[0]
 
 
 def _contract_expr_has_open_universe(value: Any) -> bool:
-    """Whether a component Expr carries a non-concrete universe level.
-
-    Premise/conclusion hashes are compared independently during structural
-    forward chaining. Independently alpha-normalizing universe parameters
-    would erase the correlation in `A.{u} → B.{u}` and could combine an
-    `A.{u}` premise with a `B.{v}` consumer. Whole-statement identities retain
-    their existing universe-alpha semantics; component support evidence fails
-    closed whenever such cross-component correlation may matter.
-    """
-
-    if isinstance(value, list):
-        if (
-            len(value) >= 1
-            and isinstance(value[0], str)
-            and value[0] in {"param", "mvar"}
-        ):
-            return True
-        return any(_contract_expr_has_open_universe(item) for item in value)
-    if isinstance(value, dict):
-        return any(
-            _contract_expr_has_open_universe(item)
-            for item in value.values()
-        )
+    """Reject correlated open levels in independently hashed components."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            if item and isinstance(item[0], str) and item[0] in {"param", "mvar"}:
+                return True
+            stack.extend(item)
+        elif isinstance(item, dict):
+            stack.extend(item.values())
     return False
 
 
 def _contract_expr_has_open_context(value: Any, *, depth: int = 0) -> bool:
-    """Reject local Expr IDs and loose indices in standalone components.
-
-    Free-variable names are allocation IDs, not mathematical identities.
-    Renumbering them independently would also erase correlations between
-    theorem parameters. Only variables bound inside the component are safe.
-    """
-
-    if not isinstance(value, list) or not value:
-        return False
-    tag = value[0]
-    if not isinstance(tag, str):
-        return any(_contract_expr_has_open_context(item, depth=depth) for item in value)
-    if tag in {"fvar", "mvar"}:
-        return True
-    if tag == "bvar":
-        return not (
-            len(value) == 2
-            and type(value[1]) is int
-            and 0 <= value[1] < depth
-        )
-    if tag in {"forall", "lam"} and len(value) == 4:
-        return _contract_expr_has_open_context(value[2], depth=depth) or (
-            _contract_expr_has_open_context(value[3], depth=depth + 1)
-        )
-    if tag == "let" and len(value) == 5:
-        return any(
-            _contract_expr_has_open_context(item, depth=depth)
-            for item in value[2:4]
-        ) or _contract_expr_has_open_context(value[4], depth=depth + 1)
-    return any(_contract_expr_has_open_context(item, depth=depth) for item in value[1:])
+    """Reject free locals and loose indices without recursing over the Expr."""
+    stack = [(value, depth)]
+    while stack:
+        item, local_depth = stack.pop()
+        if not isinstance(item, list) or not item:
+            continue
+        tag = item[0]
+        if not isinstance(tag, str):
+            stack.extend((child, local_depth) for child in item)
+        elif tag in {"fvar", "mvar"}:
+            return True
+        elif tag == "bvar":
+            if not (len(item) == 2 and type(item[1]) is int and 0 <= item[1] < local_depth):
+                return True
+        elif tag in {"forall", "lam"} and len(item) == 4:
+            stack.extend(((item[2], local_depth), (item[3], local_depth + 1)))
+        elif tag == "let" and len(item) == 5:
+            stack.extend(((item[2], local_depth), (item[3], local_depth), (item[4], local_depth + 1)))
+        else:
+            stack.extend((child, local_depth) for child in item[1:])
+    return False
 
 
-def _shift_contract_bvars_after_removed_binder(
-    expr: Any,
-    *,
-    depth: int = 0,
-) -> Any | None:
-    """Remove one enclosing de Bruijn slot, failing if its proof is referenced."""
+def _shift_contract_bvars_after_removed_binder(expr: Any, *, depth: int = 0) -> Any | None:
+    """Remove one de Bruijn slot, refusing any reference to its proof."""
+    root: list[Any] = [None]
+    stack = [(expr, depth, root, 0)]
+    while stack:
+        item, local_depth, parent, key = stack.pop()
+        if not isinstance(item, list) or not item:
+            if item is None:
+                return None
+            parent[key] = item
+            continue
+        tag = item[0]
+        if isinstance(tag, str) and tag == "bvar" and len(item) == 2 and isinstance(item[1], int):
+            index = item[1]
+            if index == local_depth:
+                return None
+            parent[key] = ["bvar", index - 1 if index > local_depth else index]
+            continue
+        copied = item[:]
+        parent[key] = copied
+        if isinstance(tag, str) and tag in {"forall", "lam"} and len(item) == 4:
+            children = [(item[2], local_depth, copied, 2), (item[3], local_depth + 1, copied, 3)]
+        elif isinstance(tag, str) and tag == "let" and len(item) == 5:
+            children = [(item[2], local_depth, copied, 2), (item[3], local_depth, copied, 3), (item[4], local_depth + 1, copied, 4)]
+        else:
+            children = [(child, local_depth, copied, index) for index, child in enumerate(item[1:], 1)]
+        stack.extend(reversed(children))
+    return root[0]
 
-    if not isinstance(expr, list) or not expr:
-        return expr
-    tag = expr[0]
-    if (
-        isinstance(tag, str)
-        and tag == "bvar"
-        and len(expr) == 2
-        and isinstance(expr[1], int)
-    ):
-        index = expr[1]
-        if index == depth:
+
+def _proof_erased_contract_expr(expr: Any, binder_sorts: Sequence[str]) -> Any | None:
+    """Erase independent leading proof binders in legacy contract payloads."""
+    frames = []
+    node = expr
+    for sort in binder_sorts:
+        sort = str(sort or "").strip().lower()
+        if not isinstance(node, list) or len(node) != 4 or node[0] != "forall" or sort not in {"proof", "data"}:
             return None
-        return ["bvar", index - 1 if index > depth else index]
-    if isinstance(tag, str) and tag in {"forall", "lam"} and len(expr) == 4:
-        domain = _shift_contract_bvars_after_removed_binder(
-            expr[2],
-            depth=depth,
-        )
-        body = _shift_contract_bvars_after_removed_binder(
-            expr[3],
-            depth=depth + 1,
-        )
-        if domain is None or body is None:
+        frames.append((node, sort))
+        node = node[3]
+    for original, sort in reversed(frames):
+        if node is None:
             return None
-        return [tag, expr[1], domain, body]
-    if isinstance(tag, str) and tag == "let" and len(expr) == 5:
-        type_expr = _shift_contract_bvars_after_removed_binder(
-            expr[2],
-            depth=depth,
-        )
-        value = _shift_contract_bvars_after_removed_binder(
-            expr[3],
-            depth=depth,
-        )
-        body = _shift_contract_bvars_after_removed_binder(
-            expr[4],
-            depth=depth + 1,
-        )
-        if type_expr is None or value is None or body is None:
-            return None
-        return [tag, expr[1], type_expr, value, body]
-    shifted: list[Any] = [tag]
-    for child in expr[1:]:
-        normalized = _shift_contract_bvars_after_removed_binder(
-            child,
-            depth=depth,
-        )
-        if normalized is None:
-            return None
-        shifted.append(normalized)
-    return shifted
-
-
-def _proof_erased_contract_expr(
-    expr: Any,
-    binder_sorts: Sequence[str],
-) -> Any | None:
-    """Erase leading proof Pi binders while preserving data telescope structure.
-
-    This gives root-route matching a Lean-derived conclusion profile.  It
-    equates an assembly ``H → root`` with ``root`` without letting surface
-    normalization erase genuine type differences in their conclusions.
-    Proof-dependent types deliberately have no profile and therefore fail
-    closed unless their complete structural identities match.
-    """
-
-    sorts = tuple(str(item or "").strip().lower() for item in binder_sorts)
-
-    def visit(node: Any, index: int) -> tuple[Any | None, int]:
-        if index >= len(sorts):
-            return node, index
-        if (
-            not isinstance(node, list)
-            or len(node) != 4
-            or node[0] != "forall"
-        ):
-            return None, index
-        body, next_index = visit(node[3], index + 1)
-        if body is None:
-            return None, next_index
-        if sorts[index] == "proof":
-            return (
-                _shift_contract_bvars_after_removed_binder(body),
-                next_index,
-            )
-        if sorts[index] != "data":
-            return None, next_index
-        return ["forall", node[1], node[2], body], next_index
-
-    normalized, consumed = visit(expr, 0)
-    if normalized is None or consumed != len(sorts):
-        return None
-    return normalized
+        if sort == "proof":
+            node = _shift_contract_bvars_after_removed_binder(node)
+        else:
+            node = ["forall", original[1], original[2], node]
+    return node
 
 
 def _contract_analysis_from_payload(
@@ -4078,7 +4003,7 @@ def _contract_analysis_from_payload(
     if not isinstance(payload, dict):
         return LeanStatementContractAnalysis(display_type=display_type)
     payload_format = payload.get("format")
-    if payload_format not in {2, _CONTRACT_ANALYSIS_FORMAT_VERSION}:
+    if type(payload_format) is not int or payload_format not in {2, _CONTRACT_ANALYSIS_FORMAT_VERSION}:
         return LeanStatementContractAnalysis(display_type=display_type)
     expr = payload.get("expr")
     if expr is None:
@@ -4097,8 +4022,12 @@ def _contract_analysis_from_payload(
         )
     ):
         return LeanStatementContractAnalysis(display_type=display_type)
+    for field_name in ("defeq", "contractDefeq", "defeqChecked", "contractDefeqChecked"):
+        indices = payload.get(field_name, [])
+        if not isinstance(indices, list) or any(type(index) is not int or index < 0 for index in indices):
+            return LeanStatementContractAnalysis(display_type=display_type)
     canonical_expr = _canonical_contract_expr_payload(expr)
-    full_identity_payload = json.dumps(
+    full_identity_payload = dumps_deep_json(
         {
             "format": payload_format,
             "expr": canonical_expr,
@@ -4131,6 +4060,14 @@ def _contract_analysis_from_payload(
         if not isinstance(binder, dict):
             return LeanStatementContractAnalysis(display_type=display_type)
         if semantic_format:
+            if any(
+                not isinstance(binder.get(field), str)
+                for field in ("sort", "type")
+            ) or (
+                "normalizedType" in binder
+                and not isinstance(binder["normalizedType"], str)
+            ):
+                return LeanStatementContractAnalysis(display_type=display_type)
             indices = dependencies(binder.get("dependencies"), binder_index)
             if indices is None:
                 return LeanStatementContractAnalysis(display_type=display_type)
@@ -4162,7 +4099,7 @@ def _contract_analysis_from_payload(
                     )
                     or _contract_expr_has_open_context(canonical_binder_expr)
                     else hash_text(
-                        json.dumps(
+                        dumps_deep_json(
                             {
                                 "format": payload_format,
                                 "expr": canonical_binder_expr,
@@ -4192,7 +4129,7 @@ def _contract_analysis_from_payload(
         # retained data telescope. Re-alpha-normalize after erasure so those
         # discarded parameters cannot renumber an otherwise identical profile.
         contract_expr = _canonical_contract_expr_payload(contract_expr)
-        contract_profile_payload = json.dumps(
+        contract_profile_payload = dumps_deep_json(
             {
                 "format": payload_format,
                 "contract_expr": contract_expr,
@@ -4218,7 +4155,7 @@ def _contract_analysis_from_payload(
                 canonical_conclusion_expr
             ) and not _contract_expr_has_open_context(canonical_conclusion_expr):
                 contract_conclusion_structural_hash = hash_text(
-                    json.dumps(
+                    dumps_deep_json(
                         {
                             "format": payload_format,
                             "expr": canonical_conclusion_expr,
@@ -4235,26 +4172,25 @@ def _contract_analysis_from_payload(
         and semantic_format == 1
         and exact_expr is not None
         and _lean_serialized_expr_is_closed(exact_expr)
-        and all(binder.get("kind") in {
+        and all(isinstance(binder.get("kind"), str) and binder.get("kind") in {
             "default", "implicit", "strictImplicit", "instImplicit"
         } for binder in binders)
     )
     universe_parameters: set[str] = set()
     resolved_constants: set[str] = set()
-    def collect_profile(node: Any) -> None:
-        if not isinstance(node, list):
-            return
-        tag = node[0] if node and isinstance(node[0], str) else None
-        if len(node) >= 2 and tag == "param" and isinstance(node[1], str):
-            universe_parameters.add(node[1])
-        if len(node) >= 2 and tag in {"const", "proj"} and isinstance(node[1], str):
-            resolved_constants.add(node[1])
-        for child in node:
-            if isinstance(child, list):
-                collect_profile(child)
     if profile_complete:
         exact_expr = _canonical_contract_expr_payload(exact_expr)
-        collect_profile(exact_expr)
+        pending = [exact_expr]
+        while pending:
+            node = pending.pop()
+            if not isinstance(node, list):
+                continue
+            tag = node[0] if node and isinstance(node[0], str) else None
+            if len(node) >= 2 and tag == "param" and isinstance(node[1], str):
+                universe_parameters.add(node[1])
+            if len(node) >= 2 and tag in {"const", "proj"} and isinstance(node[1], str):
+                resolved_constants.add(node[1])
+            pending.extend(child for child in node if isinstance(child, list))
     return LeanStatementContractAnalysis(
         display_type=str(display_type or "").strip(),
         structural_identity=make_lean_contract_identity(
@@ -4274,7 +4210,7 @@ def _contract_analysis_from_payload(
         binder_dependencies=tuple(binder_dependencies),
         conclusion_dependencies=conclusion_dependencies,
         profile_format_version=1 if profile_complete else 0,
-        exact_expr_json=(json.dumps(exact_expr, separators=(",", ":"), ensure_ascii=True)
+        exact_expr_json=(dumps_deep_json(exact_expr, separators=(",", ":"), ensure_ascii=True)
                          if profile_complete else ""),
         binder_kinds=tuple(binder["kind"] for binder in binders) if profile_complete else (),
         universe_parameters=tuple(sorted(universe_parameters)),
@@ -6114,7 +6050,8 @@ class LeanRunner:
             or audit_policy_scope != "proof"
         )
         context_family_spec = [
-            _AUDIT_POLICY_VERSION, audit_policy_scope, str(self.project_dir.resolve()),
+            _AUDIT_POLICY_VERSION, _AUDIT_OBSERVER_GENERATION, _HELPER_USAGE_VERSION,
+            audit_policy_scope, str(self.project_dir.resolve()),
             self._execution_environment_generation,
             LeanREPL._GLOBAL_ENV_EPOCH.get(str(self.project_dir.resolve()), 0),
             preamble, statement, target_scoped_prefix, list(target_omit_variables),
@@ -6201,12 +6138,16 @@ class LeanRunner:
         target_guard = ""
         if audit_requested and helper_scaffolding:
             witness_name = f"ensemble_target_{context_family_key}"
-            target_witness = _type_identity_probe_command(f"_root_.{witness_name}", statement)
+            target_witness = _check_target_identity_probe_command(
+                f"_root_.{witness_name}", statement, require_proposition=require_proposition,
+            )
             if target_omit_variables:
                 target_witness = f"omit {' '.join(target_omit_variables)} in\n{target_witness}"
             if target_scoped_prefix:
                 target_witness = f"{target_scoped_prefix}\n{target_witness}"
-            target_witness += "\n\n" + _check_target_identity_guard_definition(witness_name)
+            target_witness += "\n\n" + _check_target_identity_guard_definition(
+                witness_name, require_proposition=require_proposition,
+            )
             target_guard = _check_target_identity_guard(goal_name, witness_name)
         before_lemmas = (
             (f"-- ensemble-context-v2:{context_family_key}\n" if context_family_key else "")
@@ -7233,7 +7174,7 @@ class LeanRunner:
             boundary_content = (f"-- ensemble-context-v2:{hash_text(built.context_family_key + ':source-admission')}\n"
                                 + boundary_content + f'\n-- ensemble-context-binding-v2:{boundary_key}\n'
                                 + f'-- ensemble-completion-v2:{boundary_marker}\n'
-                                + f'run_cmd Lean.logInfo "{boundary_marker}"\n')
+                                + f'run_cmd _root_.Lean.logInfo "{boundary_marker}"\n')
             stage_start = time.monotonic()
             file_path, execution, write_error = await self._execute_generated_file(
                 mode=f"{check_kind}_source_boundary",
@@ -7488,7 +7429,12 @@ class LeanRunner:
         checked_proof = normalize_classical_tactic_prefix(proof)
         return (
             source_digest(statement), source_digest(proof),
-            source_digest(self._resolve_preamble(preamble, proof_code=checked_proof) + "\0" + str(self._execution_environment_generation) + "\0" + str(LeanREPL._GLOBAL_ENV_EPOCH.get(str(self.project_dir.resolve()), 0))),
+            source_digest("\0".join((
+                self._resolve_preamble(preamble, proof_code=checked_proof),
+                str(_AUDIT_OBSERVER_GENERATION),
+                str(self._execution_environment_generation),
+                str(LeanREPL._GLOBAL_ENV_EPOCH.get(str(self.project_dir.resolve()), 0)),
+            ))),
             tuple(source_digest(block) for block in lemmas),
         )
 
@@ -9157,9 +9103,9 @@ run_cmd Lean.Elab.Command.liftTermElabM do
             decode_theorem_target_context(resolved_preamble)
         )
         candidate_name = f"miniSourceCandidate_{uuid.uuid4().hex}"
-        # Module-mode declarations are private by default. The comparison
-        # uses the stable root name, including from a separate fallback module.
-        candidate_command = "public " + _type_identity_probe_command(
+        # Keep module-private target references in their original visibility.
+        # The fallback exports only the resolved candidate name for lookup.
+        candidate_command = _type_identity_probe_command(
             f"_root_.{candidate_name}", candidate
         )
         if target_omit_variables:
@@ -9218,7 +9164,8 @@ run_cmd Lean.Elab.Command.liftTermElabM do
   if {str(require_proposition).lower()} then
     unless ← Lean.Meta.isProp sourceInfo.type do
       Lean.throwError "source declaration is not proposition-valued"
-  let .defnInfo candidateDef@_ ← Lean.getConstInfo (Lean.Name.mkSimple "{candidate_name}")
+  let candidateName := ``_root_.{candidate_name}
+  let .defnInfo candidateDef@_ ← Lean.getConstInfo candidateName
     | Lean.throwError "candidate type witness is not a definition"
   let candidateType ← Lean.Meta.lambdaTelescope candidateDef.value fun params body => do
     unless params.size > 0 && body == params.back! do
@@ -9262,6 +9209,10 @@ run_cmd Lean.Elab.Command.liftTermElabM do
         olean_path = self.temp_dir / f"{module_name}.olean"
         probe_path = self.temp_dir / f"{module_name}Probe.lean"
         source_witness = f"miniSourceName_{uuid.uuid4().hex}"
+        candidate_witness = f"miniSourceCandidateName_{uuid.uuid4().hex}"
+        candidate_name_command = (
+            f"\npublic def _root_.{candidate_witness} : Lean.Name := ``_root_.{candidate_name}\n"
+        )
         witness_command = (
             f"\npublic def _root_.{source_witness} : Lean.Name := ``_root_.{sanitized}\n"
         )
@@ -9280,13 +9231,18 @@ run_cmd Lean.Elab.Command.liftTermElabM do
     Lean.Meta.evalExpr Lean.Name (Lean.mkConst ``Lean.Name)
       (Lean.mkConst (Lean.Name.mkSimple "{source_witness}"))
 """)
+        fallback_probe = fallback_probe.replace(
+            f"  let candidateName := ``_root_.{candidate_name}",
+            f"  let candidateName ← Lean.Meta.evalExpr Lean.Name (Lean.mkConst ``Lean.Name)\n"
+            f'    (Lean.mkConst (Lean.Name.mkSimple "{candidate_witness}"))',
+        )
         module_probe = (
             f"import Lean.Elab.Command\nimport Lean.Meta.Eval\n"
             f"import {module_name}\n\n{fallback_probe}"
         )
         compile_units = [(module_path, olean_path,
-                          module_content if independent_expected_context
-                          else module_content + witness_command)]
+                          module_content + candidate_name_command if independent_expected_context
+                          else module_content + candidate_name_command + witness_command)]
         cleanup_paths = [*self._source_probe_module_paths(module_path), probe_path]
         if independent_expected_context:
             source_module_name = f"MiniSourceOriginal{uuid.uuid4().hex}"
@@ -9693,25 +9649,25 @@ run_cmd Lean.Elab.Command.liftTermElabM do
             inventory_function = f"{serializer_prefix}_inventory"
             before_name = f"{serializer_prefix}_beforeHelpers"
             after_name = f"{serializer_prefix}_afterHelpers"
-            name_list_type = "Lean.mkApp (Lean.mkConst ``List [Lean.Level.zero]) (Lean.mkConst ``Lean.Name)"
+            name_list_type = "_root_.Lean.mkApp (_root_.Lean.mkConst ``_root_.List [_root_.Lean.Level.zero]) (_root_.Lean.mkConst ``_root_.Lean.Name)"
             # Compile inventory operations in the trusted preamble scope so
             # helper-local instances cannot alter Name/collection operations.
             helper_inventory = f"""
-private def {inventory_function} (name : Lean.Name) : Lean.Elab.Command.CommandElabM Unit := do
-  let names := (← Lean.getEnv).constants.map₂.toList.map (·.1)
-  Lean.Elab.Command.liftCoreM <| Lean.addAndCompile <| .defnDecl {{
+private def {inventory_function} (name : _root_.Lean.Name) : _root_.Lean.Elab.Command.CommandElabM _root_.Unit := do
+  let names := (← _root_.Lean.MonadEnv.getEnv).constants.map₂.toList.map (·.1)
+  _root_.Lean.Elab.Command.liftCoreM <| _root_.Lean.addAndCompile <| .defnDecl {{
     name := name, levelParams := [], type := {name_list_type},
-    value := Lean.toExpr names, hints := .opaque, safety := .safe
+    value := _root_.Lean.ToExpr.toExpr names, hints := .opaque, safety := .safe
   }}
 """
             helper_inventory_before = f"run_cmd {inventory_function} `{before_name}"
             helper_inventory_after = f"run_cmd {inventory_function} `{after_name}"
             helper_expansion = f"""
-  let beforeHelpers ← Lean.Meta.evalExpr (List Lean.Name) ({name_list_type}) (Lean.mkConst `{before_name})
-  let afterHelpers ← Lean.Meta.evalExpr (List Lean.Name) ({name_list_type}) (Lean.mkConst `{after_name})
-  let baseline := beforeHelpers.foldl (fun names name => names.insert name) ({{}} : Lean.NameSet)
+  let beforeHelpers ← _root_.Lean.Meta.evalExpr (_root_.List _root_.Lean.Name) ({name_list_type}) (_root_.Lean.mkConst `{before_name})
+  let afterHelpers ← _root_.Lean.Meta.evalExpr (_root_.List _root_.Lean.Name) ({name_list_type}) (_root_.Lean.mkConst `{after_name})
+  let baseline := beforeHelpers.foldl (fun names name => names.insert name) ({{}} : _root_.Lean.NameSet)
   let helperNames := afterHelpers.foldl (fun names name =>
-    if baseline.contains name then names else names.insert name) ({{}} : Lean.NameSet)
+    if baseline.contains name then names else names.insert name) ({{}} : _root_.Lean.NameSet)
 """
         statement_literal = json.dumps(raw_statement, ensure_ascii=False)
         proof_header = f"opaque goal_{short_id(raw_statement + raw_proof)} : {raw_statement} := "
@@ -9719,230 +9675,236 @@ private def {inventory_function} (name : Lean.Name) : Lean.Elab.Command.CommandE
         proof_literal = json.dumps(" " * proof_column + raw_proof, ensure_ascii=False)
         # Explicit variable patterns remain binders even when caller namespaces
         # expose constants with the same names (for example RingHom.id).
+        # Trusted observer types and APIs use their absolute declaration names;
+        # caller namespaces may legitimately redefine Nat, Array or Lean.Expr.
+        # User statements and proof strings keep their original scope below.
         identity_serializer = f"""
 private def _root_.{serializer_prefix}_binderInfo :
-    Lean.BinderInfo → Lean.Json
-  | .default => Lean.Json.str "default"
-  | .implicit => Lean.Json.str "implicit"
-  | .strictImplicit => Lean.Json.str "strictImplicit"
-  | .instImplicit => Lean.Json.str "instImplicit"
+    _root_.Lean.BinderInfo → _root_.Lean.Json
+  | .default => _root_.Lean.Json.str "default"
+  | .implicit => _root_.Lean.Json.str "implicit"
+  | .strictImplicit => _root_.Lean.Json.str "strictImplicit"
+  | .instImplicit => _root_.Lean.Json.str "instImplicit"
 
 private partial def _root_.{serializer_prefix}_level :
-    Lean.Level → Lean.Json
-  | .zero => Lean.Json.arr #[Lean.Json.str "zero"]
+    _root_.Lean.Level → _root_.Lean.Json
+  | .zero => _root_.Lean.Json.arr #[_root_.Lean.Json.str "zero"]
   | .succ level@_ =>
-      Lean.Json.arr #[Lean.Json.str "succ", {serializer_prefix}_level level]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "succ", {serializer_prefix}_level level]
   | .max left@_ right@_ =>
-      Lean.Json.arr #[Lean.Json.str "max", {serializer_prefix}_level left,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "max", {serializer_prefix}_level left,
         {serializer_prefix}_level right]
   | .imax left@_ right@_ =>
-      Lean.Json.arr #[Lean.Json.str "imax", {serializer_prefix}_level left,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "imax", {serializer_prefix}_level left,
         {serializer_prefix}_level right]
   | .param name@_ =>
-      Lean.Json.arr #[Lean.Json.str "param", Lean.Json.str name.toString]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "param", _root_.Lean.Json.str name.toString]
   | .mvar id@_ =>
-      Lean.Json.arr #[Lean.Json.str "mvar", Lean.Json.str id.name.toString]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "mvar", _root_.Lean.Json.str id.name.toString]
 
-private def _root_.{serializer_prefix}_literal : Lean.Literal → Lean.Json
+private def _root_.{serializer_prefix}_literal : _root_.Lean.Literal → _root_.Lean.Json
   | .natVal value@_ =>
-      Lean.Json.arr #[Lean.Json.str "nat", Lean.ToJson.toJson value]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "nat", _root_.Lean.ToJson.toJson value]
   | .strVal value@_ =>
-      Lean.Json.arr #[Lean.Json.str "str", Lean.Json.str value]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "str", _root_.Lean.Json.str value]
 
 private partial def _root_.{serializer_prefix}_expr :
-    Lean.Expr → Lean.Json
+    _root_.Lean.Expr → _root_.Lean.Json
   | .bvar index@_ =>
-      Lean.Json.arr #[Lean.Json.str "bvar", Lean.ToJson.toJson index]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "bvar", _root_.Lean.ToJson.toJson index]
   | .fvar id@_ =>
-      Lean.Json.arr #[Lean.Json.str "fvar", Lean.Json.str id.name.toString]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "fvar", _root_.Lean.Json.str id.name.toString]
   | .mvar id@_ =>
-      Lean.Json.arr #[Lean.Json.str "mvar", Lean.Json.str id.name.toString]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "mvar", _root_.Lean.Json.str id.name.toString]
   | .sort level@_ =>
-      Lean.Json.arr #[Lean.Json.str "sort", _root_.{serializer_prefix}_level level]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "sort", _root_.{serializer_prefix}_level level]
   | .const name@_ levels@_ =>
-      Lean.Json.arr #[Lean.Json.str "const", Lean.Json.str name.toString,
-        Lean.Json.arr (levels.toArray.map _root_.{serializer_prefix}_level)]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "const", _root_.Lean.Json.str name.toString,
+        _root_.Lean.Json.arr (levels.toArray.map _root_.{serializer_prefix}_level)]
   | .app fn@_ arg@_ =>
-      Lean.Json.arr #[Lean.Json.str "app", {serializer_prefix}_expr fn,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "app", {serializer_prefix}_expr fn,
         {serializer_prefix}_expr arg]
   | .lam _ domain@_ body@_ info@_ =>
-      Lean.Json.arr #[Lean.Json.str "lam", _root_.{serializer_prefix}_binderInfo info,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "lam", _root_.{serializer_prefix}_binderInfo info,
         {serializer_prefix}_expr domain, {serializer_prefix}_expr body]
   | .forallE _ domain@_ body@_ info@_ =>
-      Lean.Json.arr #[Lean.Json.str "forall", _root_.{serializer_prefix}_binderInfo info,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "forall", _root_.{serializer_prefix}_binderInfo info,
         {serializer_prefix}_expr domain, {serializer_prefix}_expr body]
   | .letE _ type@_ value@_ body@_ nonDependent@_ =>
-      Lean.Json.arr #[Lean.Json.str "let", Lean.ToJson.toJson nonDependent,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "let", _root_.Lean.ToJson.toJson nonDependent,
         {serializer_prefix}_expr type, {serializer_prefix}_expr value,
         {serializer_prefix}_expr body]
   | .lit literal@_ =>
-      Lean.Json.arr #[Lean.Json.str "lit", _root_.{serializer_prefix}_literal literal]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "lit", _root_.{serializer_prefix}_literal literal]
   | .mdata _ body@_ => {serializer_prefix}_expr body
   | .proj typeName@_ index@_ projected@_ =>
-      Lean.Json.arr #[Lean.Json.str "proj", Lean.Json.str typeName.toString,
-        Lean.ToJson.toJson index, {serializer_prefix}_expr projected]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "proj", _root_.Lean.Json.str typeName.toString,
+        _root_.Lean.ToJson.toJson index, {serializer_prefix}_expr projected]
 
-private def _root_.{serializer_prefix}_sameIdentity (left right : Lean.Expr) : Bool :=
+private def _root_.{serializer_prefix}_sameIdentity (left right : _root_.Lean.Expr) : _root_.Bool :=
   (_root_.{serializer_prefix}_expr left).compress == (_root_.{serializer_prefix}_expr right).compress
 
-private def _root_.{serializer_prefix}_nat (value : Nat) : Lean.Json :=
-  Lean.ToJson.toJson value
+private def _root_.{serializer_prefix}_nat (value : _root_.Nat) : _root_.Lean.Json :=
+  _root_.Lean.ToJson.toJson value
 
-private def _root_.{serializer_prefix}_emit (payload : Lean.Json) : Lean.Elab.Term.TermElabM Unit :=
-  Lean.logInfo ("MINI_RESIDUAL_BATCH_{nonce}:" ++ payload.compress)
+private def _root_.{serializer_prefix}_emit (payload : _root_.Lean.Json) : _root_.Lean.Elab.Term.TermElabM _root_.Unit :=
+  _root_.Lean.logInfo ("MINI_RESIDUAL_BATCH_{nonce}:" ++ payload.compress)
 """
 
         serializer = f"""
 private def {serializer_prefix}_parse
-    (category : Lean.Name) (source : String) : Lean.CoreM Lean.Syntax := do
-  match Lean.Parser.runParserCategory (← Lean.getEnv) category source with
+    (category : _root_.Lean.Name) (source : _root_.String) : _root_.Lean.Core.CoreM _root_.Lean.Syntax := do
+  match _root_.Lean.Parser.runParserCategory (← _root_.Lean.MonadEnv.getEnv) category source with
   | .ok stx@_ => pure stx
-  | .error error@_ => Lean.throwError error
+  | .error error@_ => _root_.Lean.throwError error
 
-private def {serializer_prefix}_prepare : Lean.Elab.Command.CommandElabM Unit := do
+private def {serializer_prefix}_prepare : _root_.Lean.Elab.Command.CommandElabM _root_.Unit := do
   let source := {statement_literal}
   let name := `{witness_name}
   let headerText := "noncomputable def _root_." ++ name.toString ++ " (_miniStatement : "
-  let parserSource := String.ofList (List.replicate headerText.length ' ') ++ source
-  let stx ← Lean.Elab.Command.liftCoreM <|
+  let parserSource := _root_.String.ofList (_root_.List.replicate headerText.length ' ') ++ source
+  let stx ← _root_.Lean.Elab.Command.liftCoreM <|
     {serializer_prefix}_parse `term parserSource
-  let stx : Lean.TSyntax `term := ⟨stx⟩
-  let ident := Lean.mkIdent (`_root_ ++ name)
-  let before ← Lean.getEnv
-  Lean.Elab.Command.elabCommand (← `(command|
+  let stx : _root_.Lean.TSyntax `term := ⟨stx⟩
+  let ident := _root_.Lean.mkIdent (`_root_ ++ name)
+  let before ← _root_.Lean.MonadEnv.getEnv
+  _root_.Lean.Elab.Command.elabCommand (← `(command|
     noncomputable def $ident:ident (_miniStatement : $stx) := @_miniStatement))
-  for (introduced@_, _) in (← Lean.getEnv).constants.map₂.toList do
-    if name.isPrefixOf introduced && before.contains introduced then
-      Lean.throwError "residual witness name collides with an existing declaration"
+  for (introduced@_, _) in (← _root_.Lean.MonadEnv.getEnv).constants.map₂.toList do
+    if name.isPrefixOf (_root_.Lean.privateToUserName introduced) && before.contains introduced then
+      _root_.Lean.throwError "residual witness name collides with an existing declaration"
 
-private def {serializer_prefix}_parentType : Lean.Elab.Term.TermElabM Lean.Expr := do
-  let name := `{witness_name}
-  let .defnInfo witness@_ ← Lean.getConstInfo name
-    | Lean.throwError "residual parent witness is not a definition"
-  let type ← Lean.Meta.lambdaTelescope witness.value fun params body => do
+private def {serializer_prefix}_parentType : _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr := do
+  let name ← _root_.Lean.resolveGlobalConstNoOverloadCore `_root_.{witness_name}
+  let .defnInfo witness@_ ← _root_.Lean.getConstInfo name
+    | _root_.Lean.throwError "residual parent witness is not a definition"
+  let type ← _root_.Lean.Meta.lambdaTelescope witness.value fun params body => do
     if params.isEmpty || body != params.back! then
-      Lean.throwError "residual parent witness is not an identity"
-    Lean.Meta.mkForallFVars params.pop (← Lean.Meta.inferType body)
+      _root_.Lean.throwError "residual parent witness is not an identity"
+    _root_.Lean.Meta.mkForallFVars params.pop (← _root_.Lean.Meta.inferType body)
   -- Fresh recursive auxiliaries cannot appear in a durable receipt or in its
   -- standalone goal sources. Preserve all trusted context declarations.
-  let imported := (← Lean.getEnv).constants.map₁
+  let imported := (← _root_.Lean.MonadEnv.getEnv).constants.map₁
   let isAux := fun constant =>
     !imported.contains constant && name.isPrefixOf constant && constant != name
-  let type ← Lean.Meta.deltaExpand type isAux
+  let type ← _root_.Lean.Meta.deltaExpand type isAux
   if type.find? (fun expr => match expr with
       | .const constant@_ _ => isAux constant
       | _ => false) |>.isSome then
-    Lean.throwError "residual parent auxiliary could not be serialized"
+    _root_.Lean.throwError "residual parent auxiliary could not be serialized"
   if type.hasMVar || type.hasFVar || type.hasLooseBVars || type.hasSorry then
-    Lean.throwError "residual parent type is not closed and sound"
+    _root_.Lean.throwError "residual parent type is not closed and sound"
   pure type
 
 private def {serializer_prefix}_elabType
-    (source : String) : Lean.Elab.Term.TermElabM Lean.Expr := do
+    (source : _root_.String) : _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr := do
   let stx ← {serializer_prefix}_parse `term source
-  let type ← Lean.Elab.Term.withoutErrToSorry do
-    Lean.Elab.Term.elabType stx
-  Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing
-  let type ← Lean.instantiateMVars type
+  let type ← _root_.Lean.Elab.Term.withoutErrToSorry do
+    _root_.Lean.Elab.Term.elabType stx
+  _root_.Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing
+  let type ← _root_.Lean.instantiateMVars type
   if type.hasMVar || type.hasFVar || type.hasLooseBVars then
-    Lean.throwError "elaborated type is not closed"
+    _root_.Lean.throwError "elaborated type is not closed"
   pure type
 """
+        # A registered term elaborator is public/meta in module mode. Keep
+        # the capture implementation private so it can use the admitted
+        # frame, then invoke it in the checked definition with by_elab.
         capture = "\n".join(
             (
-                f'elab "{capture_syntax}" : term => Lean.Meta.withLCtx {{}} #[] do',
+                f"private def {capture_syntax} : _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr := _root_.Lean.Meta.withLCtx {{}} #[] do",
                 f"  let statementType ← {serializer_prefix}_parentType",
                 "  let proofMessageCount :=",
-                "    (\u2190 Lean.Core.getMessageLog).reportedPlusUnreported.size",
+                "    (\u2190 _root_.Lean.Core.getMessageLog).reportedPlusUnreported.size",
                 "  let proofStx ← try",
                 f"    {serializer_prefix}_parse `term {proof_literal}",
                 "  catch",
                 "  | .error ref@_ message@_ =>",
-                "      Lean.logErrorAt ref message",
-                f'      Lean.throwError "{proof_rejection_marker}"',
+                "      _root_.Lean.logErrorAt ref message",
+                f'      _root_.Lean.throwError "{proof_rejection_marker}"',
                 "  | exception@_ => throw exception",
                 "  let tacticStx ← try",
                 "    match proofStx with",
                 "    | `(term| by $tactics:tacticSeq) => pure tactics.raw",
                 "    | _ =>",
-                "      let term : Lean.TSyntax `term := ⟨proofStx⟩",
+                "      let term : _root_.Lean.TSyntax `term := ⟨proofStx⟩",
                 "      pure (← `(tactic| refine $term)).raw",
                 "  catch",
                 "  | .error ref@_ message@_ =>",
-                "      Lean.logErrorAt ref message",
-                f'      Lean.throwError "{proof_rejection_marker}"',
+                "      _root_.Lean.logErrorAt ref message",
+                f'      _root_.Lean.throwError "{proof_rejection_marker}"',
                 "  | exception@_ => throw exception",
-                "  let rootGoal ← Lean.Meta.mkFreshExprSyntheticOpaqueMVar statementType",
+                "  let rootGoal ← _root_.Lean.Meta.mkFreshExprSyntheticOpaqueMVar statementType",
                 "  let tacticResult ← try",
-                "    Lean.Elab.runTactic rootGoal.mvarId! tacticStx (← read) (← get)",
+                "    _root_.Lean.Elab.runTactic rootGoal.mvarId! tacticStx (← read) (← get)",
                 "  catch",
                 "  | .error ref@_ message@_ =>",
-                "      Lean.logErrorAt ref message",
-                f'      Lean.throwError "{proof_rejection_marker}"',
+                "      _root_.Lean.logErrorAt ref message",
+                f'      _root_.Lean.throwError "{proof_rejection_marker}"',
                 "  | exception@_ => throw exception",
                 "  let (goals@_, tacticState@_) := tacticResult",
                 "  set tacticState",
                 "  let proofMessages :=",
-                "    (\u2190 Lean.Core.getMessageLog).reportedPlusUnreported.toArray",
+                "    (\u2190 _root_.Lean.Core.getMessageLog).reportedPlusUnreported.toArray",
                 "  let proofLoggedError :=",
                 "    (proofMessages.extract proofMessageCount proofMessages.size).any",
                 "      fun message => message.severity matches .error",
                 "  if proofLoggedError then",
-                f'    Lean.throwError "{proof_rejection_marker}"',
+                f'    _root_.Lean.throwError "{proof_rejection_marker}"',
                 "  try",
-                "    let rootProof ← Lean.instantiateMVars rootGoal",
-                "    Lean.Meta.check rootProof",
-                "    let rootProofType ← Lean.Meta.inferType rootProof",
-                "    unless ← Lean.Meta.withNewMCtxDepth <|",
-                "        Lean.Meta.isDefEq rootProofType statementType do",
-                '      Lean.throwError "residual root proof has the wrong type"',
-                "    let rootProof ← Lean.instantiateMVars rootGoal",
+                "    let rootProof ← _root_.Lean.instantiateMVars rootGoal",
+                "    _root_.Lean.Meta.check rootProof",
+                "    let rootProofType ← _root_.Lean.Meta.inferType rootProof",
+                "    unless ← _root_.Lean.Meta.withNewMCtxDepth <|",
+                "        _root_.Lean.Meta.isDefEq rootProofType statementType do",
+                '      _root_.Lean.throwError "residual root proof has the wrong type"',
+                "    let rootProof ← _root_.Lean.instantiateMVars rootGoal",
                 "    if rootProof.hasSorry then",
-                '      Lean.throwError "residual proof contains sorry"',
-                "    let mut allReachableGoals ← Lean.Meta.getMVarsNoDelayed rootProof",
-                "    for auxiliary in (← Lean.Elab.Term.getLetRecsToLift) do",
-                "      let auxiliaryHoles ← Lean.Meta.withLCtx auxiliary.lctx auxiliary.localInstances do",
-                "        let value ← Lean.instantiateMVars auxiliary.val",
+                '      _root_.Lean.throwError "residual proof contains sorry"',
+                "    let mut allReachableGoals ← _root_.Lean.Meta.getMVarsNoDelayed rootProof",
+                "    for auxiliary in (← _root_.Lean.Elab.Term.getLetRecsToLift) do",
+                "      let auxiliaryHoles ← _root_.Lean.Meta.withLCtx auxiliary.lctx auxiliary.localInstances do",
+                "        let value ← _root_.Lean.instantiateMVars auxiliary.val",
                 "        if value.hasSorry then",
-                '          Lean.throwError "residual recursive helper contains sorry"',
-                "        Lean.Meta.getMVarsNoDelayed value",
+                '          _root_.Lean.throwError "residual recursive helper contains sorry"',
+                "        _root_.Lean.Meta.getMVarsNoDelayed value",
                 "      for goalId in auxiliaryHoles do",
                 "        if !allReachableGoals.contains goalId then",
                 "          allReachableGoals := allReachableGoals.push goalId",
                 "    let reachableGoals ← allReachableGoals.filterM fun goalId => do",
-                "      return !(← Lean.Elab.Term.isLetRecAuxMVar goalId)",
+                "      return !(← _root_.Lean.Elab.Term.isLetRecAuxMVar goalId)",
                 "    let returnedGoals := goals.toArray",
                 "    let goalsMatch :=",
                 "      reachableGoals.size == returnedGoals.size &&",
                 "      reachableGoals.all (fun goalId => returnedGoals.contains goalId) &&",
                 "      returnedGoals.all (fun goalId => reachableGoals.contains goalId)",
                 "    unless goalsMatch do",
-                '      Lean.throwError "residual proof goal accounting mismatch"',
+                '      _root_.Lean.throwError "residual proof goal accounting mismatch"',
                 "    for goalId in goals do",
                 "      if ← goalId.isAssigned then",
-                '        Lean.throwError "residual proof returned an assigned goal"',
+                '        _root_.Lean.throwError "residual proof returned an assigned goal"',
                 "      goalId.withContext do",
-                "        let target ← Lean.instantiateMVars (← goalId.getType)",
-                "        let fvars := (← Lean.getLCtx).getFVarIds.map Lean.mkFVar",
+                "        let target ← _root_.Lean.instantiateMVars (← goalId.getType)",
+                "        let fvars := (← _root_.Lean.MonadLCtx.getLCtx).getFVarIds.map _root_.Lean.mkFVar",
                 # Scan the same closure the residual target keeps. A hole
                 # inside a local have or let value is unresolved context.
-                "        let closed ← Lean.Meta.mkForallFVars fvars target",
+                "        let closed ← _root_.Lean.Meta.mkForallFVars fvars target",
                 "          (usedOnly := false) (usedLetOnly := false) (generalizeNondepLet := false)",
-                "        let closed ← Lean.instantiateMVars closed",
-                "        for hole in (← Lean.Meta.getMVarsNoDelayed closed) do",
-                "          unless ← Lean.Elab.Term.isLetRecAuxMVar hole do",
-                '            Lean.throwError "residual goal depends on unresolved metavariables; choose the existential witnesses or resolve dependent holes before extracting standalone goals"',
+                "        let closed ← _root_.Lean.instantiateMVars closed",
+                "        for hole in (← _root_.Lean.Meta.getMVarsNoDelayed closed) do",
+                "          unless ← _root_.Lean.Elab.Term.isLetRecAuxMVar hole do",
+                '            _root_.Lean.throwError "residual goal depends on unresolved metavariables; choose the existential witnesses or resolve dependent holes before extracting standalone goals"',
                 "        if closed.hasSorry then",
-                '          Lean.throwError "residual proof goal contains sorry"',
+                '          _root_.Lean.throwError "residual proof goal contains sorry"',
                 "  catch",
                 "  | .error ref@_ message@_ =>",
-                "      Lean.logErrorAt ref message",
-                f'      Lean.throwError "{proof_rejection_marker}"',
+                "      _root_.Lean.logErrorAt ref message",
+                f'      _root_.Lean.throwError "{proof_rejection_marker}"',
                 "  | exception@_ => throw exception",
                 "  let closedGoals ← goals.mapM fun goalId => goalId.withContext do",
-                "    let target ← Lean.instantiateMVars (← goalId.getType)",
-                "    let lctx ← Lean.getLCtx",
-                "    let fvars := lctx.getFVarIds.map Lean.mkFVar",
+                "    let target ← _root_.Lean.instantiateMVars (← goalId.getType)",
+                "    let lctx ← _root_.Lean.MonadLCtx.getLCtx",
+                "    let fvars := lctx.getFVarIds.map _root_.Lean.mkFVar",
                 # Preserve proved facts as hypotheses rather than embedding
                 # their derivations in every standalone target. In particular,
                 # those derivations may name helpers unavailable to the trusted
@@ -9950,60 +9912,60 @@ private def {serializer_prefix}_elabType
                 # passed the unresolved-hole/sorry audit above. Proof
                 # irrelevance permits this change only for Prop-valued locals;
                 # data-valued lets must retain their defining values.
-                "    let instances ← Lean.Meta.getLocalInstances",
+                "    let instances ← _root_.Lean.Meta.getLocalInstances",
                 "    let mut residualLCtx := lctx",
                 "    for decl in lctx do",
                 "      if let .ldecl index@_ id@_ name@_ type@_ _ _ kind@_ := decl then",
-                "        if ← Lean.Meta.isProp type then",
+                "        if ← _root_.Lean.Meta.isProp type then",
                 "          let bi := if instances.any (fun inst => inst.fvar.fvarId! == id)",
-                "            then Lean.BinderInfo.instImplicit else Lean.BinderInfo.default",
+                "            then _root_.Lean.BinderInfo.instImplicit else _root_.Lean.BinderInfo.default",
                 "          residualLCtx := residualLCtx.modifyLocalDecl id fun _ =>",
                 "            .cdecl index id name type bi kind",
-                "    let closed ← Lean.Meta.withLCtx residualLCtx instances <|",
-                "      Lean.Meta.mkForallFVars fvars target",
+                "    let closed ← _root_.Lean.Meta.withLCtx residualLCtx instances <|",
+                "      _root_.Lean.Meta.mkForallFVars fvars target",
                 "        (usedOnly := false) (usedLetOnly := false) (generalizeNondepLet := false)",
                 # Apply the generalized proof hypotheses using their original
                 # local proofs. Lean checks this bridge in the original context.
                 "    let args := fvars.filter fun fvar => !((residualLCtx.get! fvar.fvarId!).isLet (allowNondep := true))",
-                "    let fresh ← Lean.Meta.withLCtx {} #[] <|",
-                "      Lean.Meta.mkFreshExprSyntheticOpaqueMVar closed",
-                "    let replacement := Lean.mkAppN fresh args",
-                "    Lean.Meta.check replacement",
+                "    let fresh ← _root_.Lean.Meta.withLCtx {} #[] <|",
+                "      _root_.Lean.Meta.mkFreshExprSyntheticOpaqueMVar closed",
+                "    let replacement := _root_.Lean.mkAppN fresh args",
+                "    _root_.Lean.Meta.check replacement",
                 "    goalId.assign replacement",
                 "    pure fresh.mvarId!",
-                "  let rec package (remaining : List Lean.MVarId) :",
-                "      Lean.Elab.Term.TermElabM Lean.Expr := do",
+                "  let rec package (remaining : _root_.List _root_.Lean.MVarId) :",
+                "      _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr := do",
                 "    match remaining with",
                 "    | [] =>",
-                "      let proof ← Lean.instantiateMVars rootGoal",
-                "      Lean.Meta.mkAppM ``PProd.mk #[proof, Lean.mkNatLit goals.length]",
+                "      let proof ← _root_.Lean.instantiateMVars rootGoal",
+                "      _root_.Lean.Meta.mkAppM ``_root_.PProd.mk #[proof, _root_.Lean.mkNatLit goals.length]",
                 "    | goalId@_ :: rest@_ =>",
-                "      Lean.Meta.withLocalDeclD `residualProof (← goalId.getType) fun parameter => do",
+                "      _root_.Lean.Meta.withLocalDeclD `residualProof (← goalId.getType) fun parameter => do",
                 # Delayed assignments created by local recursion must know the
                 # parameter's scope before lambda abstraction can traverse them.
                 # The recursive auxiliaries themselves must not capture it.
-                "        let parameterDecl := (← Lean.getLCtx).get! parameter.fvarId!",
+                "        let parameterDecl := (← _root_.Lean.MonadLCtx.getLCtx).get! parameter.fvarId!",
                 "        let needed ← rootGoal.getMVarDependencies (includeDelayed := true)",
                 "        for id in needed.toList do",
                 "          let decl ← id.getDecl",
-                "          if !(← Lean.Elab.Term.isLetRecAuxMVar id) &&",
+                "          if !(← _root_.Lean.Elab.Term.isLetRecAuxMVar id) &&",
                 "              !decl.lctx.contains parameter.fvarId! then",
-                "            Lean.modifyMCtx fun mctx => mctx.modifyExprMVarLCtx id fun lctx =>",
+                "            _root_.Lean.MonadMCtx.modifyMCtx fun mctx => mctx.modifyExprMVarLCtx id fun lctx =>",
                 "              lctx.mkLocalDecl parameter.fvarId! parameterDecl.userName",
                 "                parameterDecl.type parameterDecl.binderInfo",
                 "        goalId.assign parameter",
-                "        Lean.Meta.mkLambdaFVars #[parameter] (← package rest)",
+                "        _root_.Lean.Meta.mkLambdaFVars #[parameter] (← package rest)",
                 "  package closedGoals",
             )
         )
         finalize = f"""run_cmd do
   let before := (← get).messages.reportedPlusUnreported.size
   try
-    let ident := Lean.mkIdent `_root_.{proof_witness}
-    Lean.Elab.Command.elabCommand (← `(command|
-      noncomputable def $ident:ident := {capture_syntax}))
+    let ident := _root_.Lean.mkIdent `_root_.{proof_witness}
+    _root_.Lean.Elab.Command.elabCommand (← `(command|
+      noncomputable def $ident:ident := by_elab {capture_syntax}))
   catch
-  | .error ref@_ message@_ => Lean.logErrorAt ref message
+  | .error ref@_ message@_ => _root_.Lean.logErrorAt ref message
   | exception@_ => throw exception
   let messages := (← get).messages.reportedPlusUnreported.toArray
   let fresh := messages.extract before messages.size
@@ -10012,33 +9974,35 @@ private def {serializer_prefix}_elabType
     if ((← message.toString).splitOn "{proof_rejection_marker}").length > 1 then
       marked := true
   if !marked && fresh.any (fun message => message.severity matches .error) then
-    Lean.throwError "{proof_rejection_marker}"
+    _root_.Lean.throwError "{proof_rejection_marker}"
 """
         probe = "\n".join(
             (
-                "run_cmd Lean.Elab.Command.liftTermElabM do",
+                "run_cmd _root_.Lean.Elab.Command.liftTermElabM do",
                 f"  let statementType ← {serializer_prefix}_parentType",
-                f"  let .defnInfo conditional@_ ← Lean.getConstInfo `{proof_witness}",
-                '    | Lean.throwError "residual conditional proof is not a definition"',
+                f"  let proofName ← _root_.Lean.resolveGlobalConstNoOverloadCore `_root_.{proof_witness}",
+                f"  let parentName ← _root_.Lean.resolveGlobalConstNoOverloadCore `_root_.{witness_name}",
+                "  let .defnInfo conditional@_ ← _root_.Lean.getConstInfo proofName",
+                '    | _root_.Lean.throwError "residual conditional proof is not a definition"',
                 "  if conditional.value.hasSorry || conditional.type.hasSorry then",
-                '    Lean.throwError "residual conditional proof contains sorry"',
+                '    _root_.Lean.throwError "residual conditional proof contains sorry"',
                 "  let (closedGoals@_, rootProofType@_) ←",
-                "    Lean.Meta.lambdaTelescope conditional.value fun parameters packet => do",
+                "    _root_.Lean.Meta.lambdaTelescope conditional.value fun parameters packet => do",
                 "      let args := packet.getAppArgs",
-                "      unless packet.getAppFn.constName? == some ``PProd.mk && args.size == 4 do",
-                '        Lean.throwError "residual conditional proof packet is malformed"',
-                "      let some count@_ ← Lean.Meta.getNatValue? args[3]!",
-                '        | Lean.throwError "residual conditional proof count is malformed"',
+                "      unless packet.getAppFn.constName? == some ``_root_.PProd.mk && args.size == 4 do",
+                '        _root_.Lean.throwError "residual conditional proof packet is malformed"',
+                "      let some count@_ ← _root_.Lean.Meta.getNatValue? args[3]!",
+                '        | _root_.Lean.throwError "residual conditional proof count is malformed"',
                 "      unless count == parameters.size do",
-                '        Lean.throwError "residual conditional proof parameter count changed"',
-                "      let closedGoals ← parameters.mapM fun parameter => Lean.Meta.inferType parameter",
-                "      pure (closedGoals, ← Lean.Meta.inferType args[2]!)",
-                "  unless ← Lean.Meta.isDefEq rootProofType statementType do",
-                '    Lean.throwError "residual conditional proof changed the parent type"',
-                "  let imported := (← Lean.getEnv).constants.map₁",
+                '        _root_.Lean.throwError "residual conditional proof parameter count changed"',
+                "      let closedGoals ← parameters.mapM fun parameter => _root_.Lean.Meta.inferType parameter",
+                "      pure (closedGoals, ← _root_.Lean.Meta.inferType args[2]!)",
+                "  unless ← _root_.Lean.Meta.isDefEq rootProofType statementType do",
+                '    _root_.Lean.throwError "residual conditional proof changed the parent type"',
+                "  let imported := (← _root_.Lean.MonadEnv.getEnv).constants.map₁",
                 "  let isAux := fun constant => !imported.contains constant && (",
-                f"    (`{proof_witness}).isPrefixOf constant && constant != `{proof_witness} ||",
-                f"    (`{witness_name}).isPrefixOf constant && constant != `{witness_name})",
+                "    proofName.isPrefixOf constant && constant != proofName ||",
+                "    parentName.isPrefixOf constant && constant != parentName)",
                 helper_expansion.rstrip(),
                 # Standalone target witnesses run before candidate helpers.
                 # Inline helper-defined data without changing its value; never
@@ -10048,17 +10012,32 @@ private def {serializer_prefix}_elabType
                 "  let expandTarget := fun constant => isAux constant || helperNames.contains constant"
                 if exact_lemmas else "  let expandTarget := isAux",
                 "  let goalPayloads ← try",
-                "    let mut goalPayloads : Array Lean.Json := #[]",
+                "    let mut goalPayloads : _root_.Array _root_.Lean.Json := #[]",
                 "    for slot in [:closedGoals.size] do",
                 "      let goalPayload ← do",
-                "        let closed ← Lean.Meta.deltaExpand closedGoals[slot]! expandTarget",
+                "        let closed ← _root_.Lean.Meta.deltaExpand closedGoals[slot]! expandTarget",
+                # Lean's printer renders primitive Expr.proj nodes as named
+                # projection applications. Normalize to that replayable form
+                # before capturing identity, retaining the original type check
+                # and the exact structural round-trip check below.
+                "        let closed ← if (closed.find? _root_.Lean.Expr.isProj).isSome then",
+                "          _root_.Lean.Meta.transform closed (post := fun expression => do",
+                "            match expression with",
+                "            | .proj name@_ index@_ major@_ =>",
+                "              let some info := _root_.Lean.getStructureInfo? (← _root_.Lean.MonadEnv.getEnv) name",
+                "                | return .done expression",
+                "              let some field := info.fieldNames[index]?",
+                "                | return .done expression",
+                "              return .done (← _root_.Lean.Meta.mkProjection major field)",
+                "            | _ => return .done expression)",
+                "          else pure closed",
                 # Recursive definitions deliberately resist smart unfolding at
                 # symbolic arguments. Compare their expanded bodies using
                 # kernel transparency without changing proof-search options.
-                "        unless ← Lean.withOptions (fun options => options.setBool `smartUnfolding false) <|",
-                "            Lean.Meta.withTransparency .all <| Lean.Meta.withNewMCtxDepth <|",
-                "              Lean.Meta.isDefEq closed closedGoals[slot]! do",
-                '          Lean.throwError "residual helper normalization changed its type"',
+                "        unless ← _root_.Lean.MonadWithOptions.withOptions (fun options => options.setBool `smartUnfolding false) <|",
+                "            _root_.Lean.Meta.withTransparency .all <| _root_.Lean.Meta.withNewMCtxDepth <|",
+                "              _root_.Lean.Meta.isDefEq closed closedGoals[slot]! do",
+                '          _root_.Lean.throwError "residual helper normalization changed its type"',
                 # Opaque constants and fresh inductive types cannot be erased
                 # definitionally. Do not certify a standalone child that the
                 # normal target checker cannot elaborate. Required theory
@@ -10067,14 +10046,14 @@ private def {serializer_prefix}_elabType
                 "        if let some dependent@_ := closed.find? (fun expr => match expr with",
                 "            | .const name@_ _ | .proj name@_ _ _ => expandTarget name",
                 "            | _ => false) then",
-                '          Lean.throwError m!"residual target requires helper-local declaration {dependent}; place required theory declarations in the trusted preamble or continue the parent proof"',
+                '          _root_.Lean.throwError m!"residual target requires helper-local declaration {dependent}; place required theory declarations in the trusted preamble or continue the parent proof"',
                 "        if closed.hasMVar || closed.hasFVar || closed.hasLooseBVars then",
-                '          Lean.throwError "residual goal did not close"',
+                '          _root_.Lean.throwError "residual goal did not close"',
                 "        if closed.hasSorry then",
-                '          Lean.throwError "residual goal contains sorry"',
-                "        let renderSource (explicit : Bool) : Lean.Elab.Term.TermElabM String := do",
-                "          let messageCount := (← Lean.Core.getMessageLog).reportedPlusUnreported.size",
-                "          let rendered ← Lean.withOptions (fun options =>",
+                '          _root_.Lean.throwError "residual goal contains sorry"',
+                "        let renderSource (explicit : _root_.Bool) : _root_.Lean.Elab.Term.TermElabM _root_.String := do",
+                "          let messageCount := (← _root_.Lean.Core.getMessageLog).reportedPlusUnreported.size",
+                "          let rendered ← _root_.Lean.MonadWithOptions.withOptions (fun options =>",
                 "            options",
                 "              |>.setBool `pp.fullNames true",
                 "              |>.setBool `pp.explicit explicit",
@@ -10086,10 +10065,10 @@ private def {serializer_prefix}_elabType
                 "              |>.setBool `pp.letVarTypes true",
                 "              |>.setBool `pp.deepTerms true",
                 "              |>.setBool `pp.proofs true",
-                "              |>.set `pp.maxSteps (1000000 : Nat)) do",
-                "            Lean.Meta.ppExpr closed",
+                "              |>.set `pp.maxSteps (1000000 : _root_.Nat)) do",
+                "            _root_.Lean.Meta.ppExpr closed",
                 f"          if rendered.pretty.length > {_LEAN_RESIDUAL_SOURCE_MAX_CHARS} then",
-                '            Lean.throwError "residual source exceeded size limit"',
+                '            _root_.Lean.throwError "residual source exceeded size limit"',
                 # Delaborated lets can span several lines. Give the term its
                 # own layout boundary so its meaning does not depend on the
                 # length of a later example/theorem declaration header.
@@ -10097,48 +10076,48 @@ private def {serializer_prefix}_elabType
                 '            then "(\\n" ++ rendered.pretty ++ "\\n)" else rendered.pretty',
                 # The checked definition generalized Type* and other universe
                 # parameters. Replay in that same declared level context.
-                "          let replayed ← Lean.Elab.Term.withLevelNames conditional.levelParams <|",
+                "          let replayed ← _root_.Lean.Elab.Term.withLevelNames conditional.levelParams <|",
                 f"            {serializer_prefix}_elabType source",
                 "          if replayed.hasSorry then",
-                '            Lean.throwError "replayed residual contains sorry"',
-                "          unless ← Lean.Meta.withNewMCtxDepth <|",
-                "              Lean.Meta.isDefEq closed replayed do",
-                '            Lean.throwError "residual source round-trip changed its type"',
+                '            _root_.Lean.throwError "replayed residual contains sorry"',
+                "          unless ← _root_.Lean.Meta.withNewMCtxDepth <|",
+                "              _root_.Lean.Meta.isDefEq closed replayed do",
+                '            _root_.Lean.throwError "residual source round-trip changed its type"',
                 # Definitional equality can hide different inferred instance
                 # expressions. Preserve the receipt's captured identity by
                 # falling back to explicit source whenever compact printing
                 # changes the closed expression's serialized structure.
                 f"          unless _root_.{serializer_prefix}_sameIdentity closed replayed do",
-                '            Lean.throwError "residual source round-trip changed its structural identity"',
-                "          let messages := (← Lean.Core.getMessageLog).reportedPlusUnreported.toArray",
+                '            _root_.Lean.throwError "residual source round-trip changed its structural identity"',
+                "          let messages := (← _root_.Lean.Core.getMessageLog).reportedPlusUnreported.toArray",
                 "          if (messages.extract messageCount messages.size).any (fun m => m.severity matches .error) then",
-                '            Lean.throwError "residual source round-trip logged errors"',
+                '            _root_.Lean.throwError "residual source round-trip logged errors"',
                 "          pure source",
                 # A compact presentation is usable only after the identical
                 # closed Expr round-trips in the actual elaboration context.
                 # Failed delaboration attempts must not leak errors or state.
-                "        let saved ← Lean.Elab.Term.saveState",
+                "        let saved ← _root_.Lean.Elab.Term.saveState",
                 "        let source ← try renderSource false catch",
                 "          | .error _ _ =>",
                 "            saved.restore",
                 "            renderSource true",
                 "          | exception@_ => throw exception",
-                "        pure <| Lean.Json.mkObj [",
+                "        pure <| _root_.Lean.Json.mkObj [",
                 f'          ("slot", _root_.{serializer_prefix}_nat slot),',
-                '          ("source", Lean.Json.str source),',
+                '          ("source", _root_.Lean.Json.str source),',
                 f'          ("expr", _root_.{serializer_prefix}_expr closed)',
                 "        ]",
                 "      goalPayloads := goalPayloads.push goalPayload",
                 "    pure goalPayloads",
                 "  catch",
                 "  | .error ref@_ message@_ =>",
-                "      Lean.logErrorAt ref message",
-                f'      Lean.throwError "{postprocess_marker}"',
+                "      _root_.Lean.logErrorAt ref message",
+                f'      _root_.Lean.throwError "{postprocess_marker}"',
                 "  | exception@_ => throw exception",
-                "  let payload := Lean.Json.mkObj [",
+                "  let payload := _root_.Lean.Json.mkObj [",
                 f'    ("version", _root_.{serializer_prefix}_nat {_LEAN_RESIDUAL_BATCH_FORMAT_VERSION}),',
                 f'    ("parentExpr", _root_.{serializer_prefix}_expr statementType),',
-                '    ("goals", Lean.Json.arr goalPayloads)',
+                '    ("goals", _root_.Lean.Json.arr goalPayloads)',
                 "  ]",
                 f"  _root_.{serializer_prefix}_emit payload",
             )
@@ -10149,7 +10128,7 @@ private def {serializer_prefix}_elabType
         finalize = (
             finalize.rstrip()
             + "\n  unless fresh.any (fun message => message.severity matches .error) do\n"
-            + "    Lean.Elab.Command.liftTermElabM do\n"
+            + "    _root_.Lean.Elab.Command.liftTermElabM do\n"
             + "\n".join("    " + line for line in probe.splitlines()[1:])
         )
         # Hard-math goals can contain hundreds of nested applications. Keep
@@ -10189,7 +10168,7 @@ private def {serializer_prefix}_elabType
                 helper_inventory_before,
                 lemma_block.strip(),
                 helper_inventory_after,
-                "open Lean Elab Command Meta",
+                "open _root_.Lean _root_.Lean.Elab _root_.Lean.Elab.Command _root_.Lean.Meta",
                 serializer.strip(),
                 capture,
                 prepare,
@@ -10377,6 +10356,9 @@ private def {serializer_prefix}_elabType
         _operation_deadline: float | None = None,
         _preamble_resolved: bool = False,
         max_heartbeats: int | None = None,
+        declaration_names: Sequence[str] = (),
+        declaration_sources: Sequence[str] = (),
+        declaration_context: Sequence[str] = (),
     ) -> tuple[tuple[LeanStatementContractAnalysis, ...], str, int]:
         """Elaborate propositions and return structural contract evidence.
 
@@ -10384,6 +10366,16 @@ private def {serializer_prefix}_elabType
         delaboration and separately reports the complete reduced Pi telescope.
         Pretty-printer output remains available for diagnostics and conservative
         surface matching, but is never used as structural identity.
+
+        With ``declaration_names``, observe those existing constants' kernel
+        types instead of elaborating statement text in the final namespace.
+        The caller owns the binding between supplied source statements and
+        independently verified declarations; this observation is not a proof.
+        ``declaration_sources`` additionally binds each name to the identifier's
+        exact source position, preserving qualified declaration scope even when
+        later commands make ordinary name resolution ambiguous.
+        Pass checked helper blocks in ``declaration_context`` so configured
+        preamble commands are resolved before those declarations, as in check.
         """
 
         operation_started = time.monotonic()
@@ -10400,6 +10392,17 @@ private def {serializer_prefix}_elabType
         raw_statements = tuple(str(statement or "").strip() for statement in statements)
         if not raw_statements:
             return (), "", 0
+        observed_names = tuple(str(name or "").strip() for name in declaration_names)
+        observed_sources = tuple(str(source or "").strip() for source in declaration_sources)
+        if observed_names and (
+            len(observed_names) != len(raw_statements) or not all(observed_names)
+            or defeq_anchor_indices or defeq_candidate_indices
+        ):
+            raise ValueError("declared-contract observation requires one name per statement and no comparison anchors")
+        if observed_sources and (
+            not observed_names or len(observed_sources) != len(observed_names)
+        ):
+            raise ValueError("source-bound declaration observation requires one source per name")
         requested_anchor_indices = tuple(
             dict.fromkeys(
                 int(index)
@@ -10415,6 +10418,33 @@ private def {serializer_prefix}_elabType
             and raw_statements[int(index)]
         )
         preamble = str(preamble_override or "") if _preamble_resolved else self._resolve_preamble(preamble_override)
+        if declaration_context:
+            preamble = "\n\n".join(
+                part for part in (preamble, *declaration_context) if part
+            )
+        declaration_positions = [(0, 0)] * len(observed_names)
+        if observed_sources:
+            from .proof_graph import _helper_decl_header, helper_decl_statement
+
+            positioned_preamble = preamble.strip()
+            for index, source in enumerate(observed_sources):
+                header = _helper_decl_header(source)
+                start = positioned_preamble.find(source) if source else -1
+                if (
+                    header is None or header[1] != observed_names[index]
+                    or helper_decl_statement(source).strip() != raw_statements[index]
+                    or start < 0 or positioned_preamble.find(source, start + 1) >= 0
+                ):
+                    raise ValueError("declaration source does not identify a unique checked source span")
+                # The parser preserves the complete original tail after the
+                # identifier, including comments and any later declarations.
+                name_offset = len(source) - len(header[2]) - len(header[1])
+                position = start + name_offset
+                if positioned_preamble[position:position + len(header[1])] != header[1]:
+                    raise ValueError("declaration identifier source position is unavailable")
+                line = positioned_preamble.count("\n", 0, position) + 1
+                column = position - positioned_preamble.rfind("\n", 0, position) - 1
+                declaration_positions[index] = (line + (2 if max_heartbeats is not None else 0), column)
         nonce = short_id("\n".join(raw_statements) + str(time.monotonic_ns()))
         names = tuple(
             f"mini_contract_identity_{nonce}_{index}"
@@ -10424,7 +10454,7 @@ private def {serializer_prefix}_elabType
         witness_names = {
             statement: f"mini_contract_witness_{nonce}_{index}"
             for index, statement in enumerate(raw_statements)
-            if statement
+            if statement and not observed_names
         }
         witness_prefixes = ", ".join(f"`{name}" for name in witness_names.values())
         witness_lookup = "\n".join(
@@ -10433,38 +10463,40 @@ private def {serializer_prefix}_elabType
         )
         # Explicit variable patterns remain binders even when caller namespaces
         # expose constants with the same names (for example RingHom.id).
+        # Root qualification applies only to the observer implementation. Its
+        # embedded statements still elaborate in the caller's original scope.
         serializer = f"""
 private def {serializer_prefix}_binderInfo :
-    Lean.BinderInfo → Lean.Json
-  | .default => Lean.Json.str "default"
-  | .implicit => Lean.Json.str "implicit"
-  | .strictImplicit => Lean.Json.str "strictImplicit"
-  | .instImplicit => Lean.Json.str "instImplicit"
+    _root_.Lean.BinderInfo → _root_.Lean.Json
+  | .default => _root_.Lean.Json.str "default"
+  | .implicit => _root_.Lean.Json.str "implicit"
+  | .strictImplicit => _root_.Lean.Json.str "strictImplicit"
+  | .instImplicit => _root_.Lean.Json.str "instImplicit"
 
 private partial def {serializer_prefix}_level :
-    Lean.Level → Lean.Json
-  | .zero => Lean.Json.arr #[Lean.Json.str "zero"]
+    _root_.Lean.Level → _root_.Lean.Json
+  | .zero => _root_.Lean.Json.arr #[_root_.Lean.Json.str "zero"]
   | .succ level@_ =>
-      Lean.Json.arr #[Lean.Json.str "succ", {serializer_prefix}_level level]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "succ", {serializer_prefix}_level level]
   | .max left@_ right@_ =>
-      Lean.Json.arr #[Lean.Json.str "max", {serializer_prefix}_level left,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "max", {serializer_prefix}_level left,
         {serializer_prefix}_level right]
   | .imax left@_ right@_ =>
-      Lean.Json.arr #[Lean.Json.str "imax", {serializer_prefix}_level left,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "imax", {serializer_prefix}_level left,
         {serializer_prefix}_level right]
   | .param name@_ =>
-      Lean.Json.arr #[Lean.Json.str "param", Lean.Json.str name.toString]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "param", _root_.Lean.Json.str name.toString]
   | .mvar id@_ =>
-      Lean.Json.arr #[Lean.Json.str "mvar", Lean.Json.str id.name.toString]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "mvar", _root_.Lean.Json.str id.name.toString]
 
-private def {serializer_prefix}_literal : Lean.Literal → Lean.Json
+private def {serializer_prefix}_literal : _root_.Lean.Literal → _root_.Lean.Json
   | .natVal value@_ =>
-      Lean.Json.arr #[Lean.Json.str "nat", Lean.ToJson.toJson value]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "nat", _root_.Lean.ToJson.toJson value]
   | .strVal value@_ =>
-      Lean.Json.arr #[Lean.Json.str "str", Lean.Json.str value]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "str", _root_.Lean.Json.str value]
 
 private def {serializer_prefix}_printerOptions
-    (options : Lean.Options) : Lean.Options :=
+    (options : _root_.Lean.Options) : _root_.Lean.Options :=
   options
     |>.setBool `pp.universes false
     |>.setBool `pp.piBinderTypes true
@@ -10472,73 +10504,73 @@ private def {serializer_prefix}_printerOptions
     |>.setBool `pp.fullNames true
 
 private partial def {serializer_prefix}_expr :
-    Lean.Expr → Lean.Json
+    _root_.Lean.Expr → _root_.Lean.Json
   | .bvar index@_ =>
-      Lean.Json.arr #[Lean.Json.str "bvar", Lean.ToJson.toJson index]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "bvar", _root_.Lean.ToJson.toJson index]
   | .fvar id@_ =>
-      Lean.Json.arr #[Lean.Json.str "fvar", Lean.Json.str id.name.toString]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "fvar", _root_.Lean.Json.str id.name.toString]
   | .mvar id@_ =>
-      Lean.Json.arr #[Lean.Json.str "mvar", Lean.Json.str id.name.toString]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "mvar", _root_.Lean.Json.str id.name.toString]
   | .sort level@_ =>
-      Lean.Json.arr #[Lean.Json.str "sort",
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "sort",
         {serializer_prefix}_level level]
   | .const name@_ levels@_ =>
-      Lean.Json.arr #[Lean.Json.str "const", Lean.Json.str name.toString,
-        Lean.Json.arr (levels.toArray.map {serializer_prefix}_level)]
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "const", _root_.Lean.Json.str name.toString,
+        _root_.Lean.Json.arr (levels.toArray.map {serializer_prefix}_level)]
   | .app fn@_ arg@_ =>
-      Lean.Json.arr #[Lean.Json.str "app", {serializer_prefix}_expr fn,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "app", {serializer_prefix}_expr fn,
         {serializer_prefix}_expr arg]
   | .lam _ domain@_ body@_ info@_ =>
-      Lean.Json.arr #[Lean.Json.str "lam",
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "lam",
         {serializer_prefix}_binderInfo info,
         {serializer_prefix}_expr domain, {serializer_prefix}_expr body]
   | .forallE _ domain@_ body@_ info@_ =>
-      Lean.Json.arr #[Lean.Json.str "forall",
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "forall",
         {serializer_prefix}_binderInfo info,
         {serializer_prefix}_expr domain, {serializer_prefix}_expr body]
   | .letE _ type@_ value@_ body@_ nonDependent@_ =>
-      Lean.Json.arr #[Lean.Json.str "let",
-        Lean.ToJson.toJson nonDependent,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "let",
+        _root_.Lean.ToJson.toJson nonDependent,
         {serializer_prefix}_expr type, {serializer_prefix}_expr value,
         {serializer_prefix}_expr body]
   | .lit literal@_ =>
-      Lean.Json.arr #[Lean.Json.str "lit",
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "lit",
         {serializer_prefix}_literal literal]
   | .mdata _ body@_ => {serializer_prefix}_expr body
   | .proj typeName@_ index@_ projected@_ =>
-      Lean.Json.arr #[Lean.Json.str "proj",
-        Lean.Json.str typeName.toString, Lean.ToJson.toJson index,
+      _root_.Lean.Json.arr #[_root_.Lean.Json.str "proj",
+        _root_.Lean.Json.str typeName.toString, _root_.Lean.ToJson.toJson index,
         {serializer_prefix}_expr projected]
 
 private def {serializer_prefix}_localDependencies
-    (type : Lean.Expr) (locals : Array Lean.Expr) : Array Nat := Id.run do
+    (type : _root_.Lean.Expr) (locals : _root_.Array _root_.Lean.Expr) : _root_.Array _root_.Nat := _root_.Id.run do
   let mut dependencies := #[]
   for index in [:locals.size] do
     if type.containsFVar locals[index]!.fvarId! then
       dependencies := dependencies.push index
   return dependencies
 
-private def {serializer_prefix}_binders (type : Lean.Expr) :
-    Lean.MetaM (Array Lean.Json × Array Nat) :=
-  Lean.Meta.forallTelescope type fun fvars body => do
-    let mut binders : Array Lean.Json := #[]
+private def {serializer_prefix}_binders (type : _root_.Lean.Expr) :
+    _root_.Lean.Meta.MetaM (_root_.Array _root_.Lean.Json × _root_.Array _root_.Nat) :=
+  _root_.Lean.Meta.forallTelescope type fun fvars body => do
+    let mut binders : _root_.Array _root_.Lean.Json := #[]
     for index in [:fvars.size] do
       let fvar := fvars[index]!
       let localDecl ← fvar.fvarId!.getDecl
       let domain := localDecl.type
-      let proof ← Lean.Meta.isProp domain
-      let rendered ← Lean.withOptions {serializer_prefix}_printerOptions do
-        Lean.Meta.ppExpr domain
-      let normalizedDomain ← Lean.Meta.whnf domain
+      let proof ← _root_.Lean.Meta.isProp domain
+      let rendered ← _root_.Lean.MonadWithOptions.withOptions {serializer_prefix}_printerOptions do
+        _root_.Lean.Meta.ppExpr domain
+      let normalizedDomain ← _root_.Lean.Meta.whnf domain
       let normalizedRendered ←
-        Lean.withOptions {serializer_prefix}_printerOptions do
-          Lean.Meta.ppExpr normalizedDomain
-      binders := binders.push <| Lean.Json.mkObj [
+        _root_.Lean.MonadWithOptions.withOptions {serializer_prefix}_printerOptions do
+          _root_.Lean.Meta.ppExpr normalizedDomain
+      binders := binders.push <| _root_.Lean.Json.mkObj [
           ("kind", {serializer_prefix}_binderInfo localDecl.binderInfo),
-          ("sort", Lean.Json.str (if proof then "proof" else "data")),
-          ("type", Lean.Json.str rendered.pretty),
-          ("normalizedType", Lean.Json.str normalizedRendered.pretty),
-          ("dependencies", Lean.ToJson.toJson
+          ("sort", _root_.Lean.Json.str (if proof then "proof" else "data")),
+          ("type", _root_.Lean.Json.str rendered.pretty),
+          ("normalizedType", _root_.Lean.Json.str normalizedRendered.pretty),
+          ("dependencies", _root_.Lean.ToJson.toJson
             ({serializer_prefix}_localDependencies domain (fvars.extract 0 index))),
           ("expr", {serializer_prefix}_expr normalizedDomain)
         ]
@@ -10546,63 +10578,65 @@ private def {serializer_prefix}_binders (type : Lean.Expr) :
 
 -- A declaration compiles local recursive auxiliaries; standalone elabType
 -- deliberately leaves those auxiliaries pending until declaration finalization.
-private def {serializer_prefix}_parserSource (source : String) (name : Lean.Name) : String :=
+private def {serializer_prefix}_parserSource (source : _root_.String) (name : _root_.Lean.Name) : _root_.String :=
   let headerText := "noncomputable def _root_." ++ name.toString ++ " (_miniStatement : "
-  String.ofList (List.replicate headerText.length ' ') ++ source
+  _root_.String.ofList (_root_.List.replicate headerText.length ' ') ++ source
 
-private def {serializer_prefix}_prepare (source : String) (name : Lean.Name) :
-    Lean.Elab.Command.CommandElabM Unit := do
+private def {serializer_prefix}_prepare (source : _root_.String) (name : _root_.Lean.Name) :
+    _root_.Lean.Elab.Command.CommandElabM _root_.Unit := do
   let stx ←
-    match Lean.Parser.runParserCategory (← Lean.getEnv) `term
+    match _root_.Lean.Parser.runParserCategory (← _root_.Lean.MonadEnv.getEnv) `term
         ({serializer_prefix}_parserSource source name) with
     | .ok stx@_ => pure stx
-    | .error error@_ => Lean.throwError error
-  let stx : Lean.TSyntax `term := ⟨stx⟩
-  let ident := Lean.mkIdent (`_root_ ++ name)
-  let before ← Lean.getEnv
-  Lean.Elab.Command.elabCommand (← `(command|
+    | .error error@_ => _root_.Lean.throwError error
+  let stx : _root_.Lean.TSyntax `term := ⟨stx⟩
+  let ident := _root_.Lean.mkIdent (`_root_ ++ name)
+  let before ← _root_.Lean.MonadEnv.getEnv
+  _root_.Lean.Elab.Command.elabCommand (← `(command|
     noncomputable def $ident:ident (_miniStatement : $stx) := @_miniStatement))
   -- Never unfold a trusted declaration whose name happens to share a prefix.
-  for (introduced@_, _) in (← Lean.getEnv).constants.map₂.toList do
-    if name.isPrefixOf introduced && before.contains introduced then
-      Lean.throwError "contract witness name collides with an existing declaration"
+  for (introduced@_, _) in (← _root_.Lean.MonadEnv.getEnv).constants.map₂.toList do
+    if name.isPrefixOf (_root_.Lean.privateToUserName introduced) && before.contains introduced then
+      _root_.Lean.throwError "contract witness name collides with an existing declaration"
 
-private def {serializer_prefix}_witnessName (source : String) : Lean.Name :=
+private def {serializer_prefix}_witnessName (source : _root_.String) : _root_.Lean.Name :=
   match source with
 {witness_lookup}
   | _ => .anonymous
 
 private def {serializer_prefix}_isRecursiveAux
-    (env : Lean.Environment) (constant : Lean.Name) : Bool :=
+    (env : _root_.Lean.Environment) (constant : _root_.Lean.Name) : _root_.Bool :=
   !env.constants.map₁.contains constant &&
-    ([{witness_prefixes}] : List Lean.Name).any fun name =>
-      name.isPrefixOf constant && constant != name
+    ([{witness_prefixes}] : _root_.List _root_.Lean.Name).any fun name =>
+      name.isPrefixOf (_root_.Lean.privateToUserName constant) &&
+        (_root_.Lean.privateToUserName constant) != name
 
-private def {serializer_prefix}_recursiveType (source : String) :
-    Lean.Elab.Term.TermElabM Lean.Expr := do
-  let name := {serializer_prefix}_witnessName source
-  if name.isAnonymous then Lean.throwError "missing recursive contract witness"
-  let .defnInfo witness@_ ← Lean.getConstInfo name
-    | Lean.throwError "recursive contract witness is not a definition"
-  let type ← Lean.Meta.lambdaTelescope witness.value fun params body => do
+private def {serializer_prefix}_recursiveType (source : _root_.String) :
+    _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr := do
+  let logicalName := {serializer_prefix}_witnessName source
+  if logicalName.isAnonymous then _root_.Lean.throwError "missing recursive contract witness"
+  let name ← _root_.Lean.resolveGlobalConstNoOverloadCore (`_root_ ++ logicalName)
+  let .defnInfo witness@_ ← _root_.Lean.getConstInfo name
+    | _root_.Lean.throwError "recursive contract witness is not a definition"
+  let type ← _root_.Lean.Meta.lambdaTelescope witness.value fun params body => do
     if params.isEmpty || body != params.back! then
-      Lean.throwError "recursive contract witness is not an identity"
-    Lean.Meta.mkForallFVars params.pop (← Lean.Meta.inferType body)
+      _root_.Lean.throwError "recursive contract witness is not an identity"
+    _root_.Lean.Meta.mkForallFVars params.pop (← _root_.Lean.Meta.inferType body)
   pure type
 
-private def {serializer_prefix}_elabType (source : String) :
-    Lean.Elab.Term.TermElabM Lean.Expr :=
-  Lean.Elab.withoutModifyingStateWithInfoAndMessages do
+private def {serializer_prefix}_elabType (source : _root_.String) :
+    _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr :=
+  _root_.Lean.Elab.withoutModifyingStateWithInfoAndMessages do
   let stx ←
-    match Lean.Parser.runParserCategory (← Lean.getEnv) `term
+    match _root_.Lean.Parser.runParserCategory (← _root_.Lean.MonadEnv.getEnv) `term
         ({serializer_prefix}_parserSource source ({serializer_prefix}_witnessName source)) with
     | .ok stx@_ => pure stx
-    | .error error@_ => Lean.throwError error
-  let type ← Lean.Elab.Term.withoutErrToSorry do
-    Lean.Elab.Term.elabType stx
-  Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing
-  let type ← Lean.instantiateMVars type
-  let type ← if (← Lean.Elab.Term.getLetRecsToLift).isEmpty then
+    | .error error@_ => _root_.Lean.throwError error
+  let type ← _root_.Lean.Elab.Term.withoutErrToSorry do
+    _root_.Lean.Elab.Term.elabType stx
+  _root_.Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing
+  let type ← _root_.Lean.instantiateMVars type
+  let type ← if (← _root_.Lean.Elab.Term.getLetRecsToLift).isEmpty then
       pure type
     else {serializer_prefix}_recursiveType source
   -- Ordinary match expressions also reuse compiled witness auxiliaries even
@@ -10610,90 +10644,124 @@ private def {serializer_prefix}_elabType (source : String) :
   -- Remove only fresh auxiliary constants. Their nonce names must never enter
   -- persisted identities; trusted library constants retain existing semantics.
   -- Lean may share a compiled matcher across witnesses in this batch.
-  let isAux := {serializer_prefix}_isRecursiveAux (← Lean.getEnv)
-  let type ← Lean.Meta.deltaExpand type isAux
+  let isAux := {serializer_prefix}_isRecursiveAux (← _root_.Lean.MonadEnv.getEnv)
+  let type ← _root_.Lean.Meta.deltaExpand type isAux
   if type.find? (fun expr => match expr with
       | .const constant@_ _ => isAux constant
       | _ => false) |>.isSome then
-    Lean.throwError "recursive contract auxiliary could not be serialized"
-  let type ← Lean.Elab.Term.levelMVarToParam type
+    _root_.Lean.throwError "recursive contract auxiliary could not be serialized"
+  let type ← _root_.Lean.Elab.Term.levelMVarToParam type
   if type.hasMVar then
-    Lean.throwError "statement type contains unresolved metavariables"
+    _root_.Lean.throwError "statement type contains unresolved metavariables"
   if type.hasSorry then
-    Lean.throwError "statement type contains an admitted term"
-  unless ← Lean.Meta.isProp type do
-    Lean.throwError "statement is not a proposition"
+    _root_.Lean.throwError "statement type contains an admitted term"
+  unless ← _root_.Lean.Meta.isProp type do
+    _root_.Lean.throwError "statement is not a proposition"
   pure type
 
-private partial def {serializer_prefix}_contractTypeCore (type : Lean.Expr) :
-    Lean.MetaM (Option Lean.Expr) := do
-  match type with
-  | .forallE name@_ domain@_ body@_ info@_ =>
-      let proof ← Lean.Meta.isProp domain
-      Lean.Meta.withLocalDecl name info domain fun localExpr => do
-        let some rest@_ ←
-          {serializer_prefix}_contractTypeCore (body.instantiate1 localExpr)
-          | pure none
-        if proof then
-          if rest.containsFVar localExpr.fvarId! then
-            pure none
-          else
-            pure (some rest)
-        else
-          pure (some (← Lean.Meta.mkForallFVars #[localExpr] rest))
-  | _ => pure (some type)
+private def {serializer_prefix}_declaredType (source : _root_.String) (line column : _root_.Nat) :
+    _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr := do
+  let env ← _root_.Lean.MonadEnv.getEnv
+  let ident ← match _root_.Lean.Parser.runParserCategory env `term source with
+    | .ok stx@_ => pure stx
+    | .error error@_ => _root_.Lean.throwError error
+  unless ident.isIdent do _root_.Lean.throwError "expected a declaration identifier"
+  -- A later source may change the namespace in which this name resolves.
+  -- Require one source-compatible local declaration before accepting its type;
+  -- ambiguous batches fall back to observation in each declaration's prefix.
+  -- Lean treats a leading quoted `_root_` component as a root qualifier too.
+  -- Remove only that leading component; later literal components stay intact.
+  let rooted := (`_root_).isPrefixOf ident.getId && ident.getId != `_root_
+  let requested := if rooted then
+      ident.getId.replacePrefix `_root_ _root_.Lean.Name.anonymous
+    else ident.getId
+  let mut candidates := env.constants.map₂.toList.filter fun (name, _) =>
+    let sourceName := if line != 0 then _root_.Lean.privateToUserName name else name
+    if rooted then sourceName == requested else requested.isSuffixOf sourceName
+  if line != 0 then
+    candidates ← candidates.filterM fun (name, _) => do
+      let some ranges ← _root_.Lean.findDeclarationRangesCore? name | pure false
+      pure (ranges.selectionRange.pos.line == line &&
+        ranges.selectionRange.pos.column == column)
+  unless candidates.length == 1 do
+    _root_.Lean.throwError "declaration source name does not identify a unique local constant"
+  let name := candidates.head!.1
+  if line == 0 then
+    let resolved ← _root_.Lean.Elab.realizeGlobalConstNoOverloadWithInfo ident
+    unless resolved == name do
+      _root_.Lean.throwError "declaration resolution changed after its source"
+  let info ← _root_.Lean.getConstInfo name
+  let type := info.type
+  if type.hasMVar || type.hasSorry then
+    _root_.Lean.throwError "declaration type is incomplete"
+  unless ← _root_.Lean.Meta.isProp type do
+    _root_.Lean.throwError "declaration type is not a proposition"
+  pure type
 
-private def {serializer_prefix}_contractType (type : Lean.Expr) :
-    Lean.MetaM (Option Lean.Expr) := do
-  {serializer_prefix}_contractTypeCore (← Lean.Meta.whnf type)
+private def {serializer_prefix}_contractTypeCore (type : _root_.Lean.Expr) :
+    _root_.Lean.Meta.MetaM (_root_.Option _root_.Lean.Expr) := do
+  _root_.Lean.Meta.forallTelescope type fun parameters body => do
+    let mut result := body
+    for parameter in parameters.reverse do
+      if ← _root_.Lean.Meta.isProp (← _root_.Lean.Meta.inferType parameter) then
+        if result.containsFVar parameter.fvarId! then
+          return none
+      else
+        result ← _root_.Lean.Meta.mkForallFVars #[parameter] result
+    pure (some result)
+
+private def {serializer_prefix}_contractType (type : _root_.Lean.Expr) :
+    _root_.Lean.Meta.MetaM (_root_.Option _root_.Lean.Expr) := do
+  {serializer_prefix}_contractTypeCore (← _root_.Lean.Meta.whnf type)
 
 -- Whole-statement identities already alpha-normalize universe parameters in
 -- Python. Do the same bijective, rigid renaming for batch comparisons only;
 -- never unify a generic universe with a concrete or shared candidate level.
-private def {serializer_prefix}_alphaType (type : Lean.Expr) :
-    Lean.MetaM Lean.Expr := do
-  let type ← Lean.Meta.whnf type
-  let names := (Lean.collectLevelParams {{}} type).params
+private def {serializer_prefix}_alphaType (type : _root_.Lean.Expr) :
+    _root_.Lean.Meta.MetaM _root_.Lean.Expr := do
+  let type ← _root_.Lean.Meta.whnf type
+  let names := (_root_.Lean.collectLevelParams {{}} type).params
   let levels := names.mapIdx fun index _ =>
-    Lean.mkLevelParam (Lean.Name.num `_miniContractUniverse index)
+    _root_.Lean.mkLevelParam (_root_.Lean.Name.num `_miniContractUniverse index)
   pure (type.instantiateLevelParamsArray names levels)
 
 private def {serializer_prefix}_defeq
-    (type : Lean.Expr) (source : String) :
-    Lean.Elab.Term.TermElabM (Option Bool) := do
+    (type : _root_.Lean.Expr) (source : _root_.String) :
+    _root_.Lean.Elab.Term.TermElabM (_root_.Option _root_.Bool) := do
   try
     let other ← {serializer_prefix}_elabType source
     let type ← {serializer_prefix}_alphaType type
     let other ← {serializer_prefix}_alphaType other
-    pure (some (← Lean.Meta.withNewMCtxDepth <| Lean.Meta.isDefEq type other))
+    pure (some (← _root_.Lean.Meta.withNewMCtxDepth <| _root_.Lean.Meta.isDefEq type other))
   catch _ => pure none
 
 private def {serializer_prefix}_contractDefeq
-    (type : Lean.Expr) (source : String) :
-    Lean.Elab.Term.TermElabM (Option Bool) := do
+    (type : _root_.Lean.Expr) (source : _root_.String) :
+    _root_.Lean.Elab.Term.TermElabM (_root_.Option _root_.Bool) := do
   try
     let other ← {serializer_prefix}_elabType source
     let some left@_ ← {serializer_prefix}_contractType type | pure none
     let some right@_ ← {serializer_prefix}_contractType other | pure none
     let left ← {serializer_prefix}_alphaType left
     let right ← {serializer_prefix}_alphaType right
-    pure (some (← Lean.Meta.withNewMCtxDepth <| Lean.Meta.isDefEq left right))
+    pure (some (← _root_.Lean.Meta.withNewMCtxDepth <| _root_.Lean.Meta.isDefEq left right))
   catch _ => pure none
 """
         probes = [
             "\n".join(
                 (
-                    "run_cmd Lean.Elab.Command.liftTermElabM do",
+                    "run_cmd _root_.Lean.Elab.Command.liftTermElabM do",
                     "  try",
-                    f"    let type ← {serializer_prefix}_elabType",
-                    f"      {json.dumps(statement, ensure_ascii=False)}",
-                    "    let displayType ← Lean.withOptions",
+                    f"    let type ← {serializer_prefix}_{'declaredType' if observed_names else 'elabType'}",
+                    f"      {json.dumps(observed_names[index] if observed_names else statement, ensure_ascii=False)}"
+                    + (f" {declaration_positions[index][0]} {declaration_positions[index][1]}" if observed_names else ""),
+                    "    let displayType ← _root_.Lean.MonadWithOptions.withOptions",
                     f"      {serializer_prefix}_printerOptions do",
-                    "      Lean.Meta.ppExpr type",
-                    "    let mut defeq : Array Lean.Json := #[]",
-                    "    let mut contractDefeq : Array Lean.Json := #[]",
-                    "    let mut defeqChecked : Array Lean.Json := #[]",
-                    "    let mut contractDefeqChecked : Array Lean.Json := #[]",
+                    "      _root_.Lean.Meta.ppExpr type",
+                    "    let mut defeq : _root_.Array _root_.Lean.Json := #[]",
+                    "    let mut contractDefeq : _root_.Array _root_.Lean.Json := #[]",
+                    "    let mut defeqChecked : _root_.Array _root_.Lean.Json := #[]",
+                    "    let mut contractDefeqChecked : _root_.Array _root_.Lean.Json := #[]",
                     *tuple(
                         "\n".join(
                             (
@@ -10701,19 +10769,19 @@ private def {serializer_prefix}_contractDefeq
                                 f"{json.dumps(other, ensure_ascii=False)} with",
                                 "    | some equal@_ =>",
                                 "      defeqChecked := defeqChecked.push "
-                                f"(Lean.ToJson.toJson {other_index})",
+                                f"(_root_.Lean.ToJson.toJson {other_index})",
                                 "      if equal then defeq := defeq.push "
-                                f"(Lean.ToJson.toJson {other_index})",
+                                f"(_root_.Lean.ToJson.toJson {other_index})",
                                 "    | none => pure ()",
                                 f"    match ← {serializer_prefix}_contractDefeq type "
                                 f"{json.dumps(other, ensure_ascii=False)} with",
                                 "    | some equal@_ =>",
                                 "      contractDefeqChecked := "
                                 "contractDefeqChecked.push "
-                                f"(Lean.ToJson.toJson {other_index})",
+                                f"(_root_.Lean.ToJson.toJson {other_index})",
                                 "      if equal then contractDefeq := "
                                 "contractDefeq.push "
-                                f"(Lean.ToJson.toJson {other_index})",
+                                f"(_root_.Lean.ToJson.toJson {other_index})",
                                 "    | none => pure ()",
                             )
                         )
@@ -10724,38 +10792,38 @@ private def {serializer_prefix}_contractDefeq
                         )
                         for other in (raw_statements[other_index],)
                     ),
-                    "    let normalizedType ← Lean.Meta.whnf type",
+                    "    let normalizedType ← _root_.Lean.Meta.whnf type",
                     f"    let (binders@_, conclusionDependencies@_) ← {serializer_prefix}_binders normalizedType",
                     f"    let contractType ← {serializer_prefix}_contractType type",
                     "    let contractExpr := match contractType with",
                     f"      | some value@_ => {serializer_prefix}_expr value",
-                    "      | none => Lean.Json.null",
+                    "      | none => _root_.Lean.Json.null",
                     "    let contractConclusionExpr ←",
                     "      match contractType with",
                     "      | some contractType@_ =>",
                     "        pure <| "
-                    f"{serializer_prefix}_expr (← Lean.Meta.whnf contractType)",
-                    "      | none => pure Lean.Json.null",
-                    "    let payload := Lean.Json.mkObj [",
-                    f'      ("format", Lean.ToJson.toJson {_CONTRACT_ANALYSIS_FORMAT_VERSION}),',
-                    '      ("semanticFormat", Lean.ToJson.toJson (1 : Nat)),',
-                    '      ("profileFormat", Lean.ToJson.toJson (1 : Nat)),',
+                    f"{serializer_prefix}_expr (← _root_.Lean.Meta.whnf contractType)",
+                    "      | none => pure _root_.Lean.Json.null",
+                    "    let payload := _root_.Lean.Json.mkObj [",
+                    f'      ("format", _root_.Lean.ToJson.toJson {_CONTRACT_ANALYSIS_FORMAT_VERSION}),',
+                    '      ("semanticFormat", _root_.Lean.ToJson.toJson (1 : _root_.Nat)),',
+                    '      ("profileFormat", _root_.Lean.ToJson.toJson (1 : _root_.Nat)),',
                     f'      ("originalExpr", {serializer_prefix}_expr type),',
                     f'      ("expr", {serializer_prefix}_expr normalizedType),',
-                    '      ("binders", Lean.Json.arr binders),',
+                    '      ("binders", _root_.Lean.Json.arr binders),',
                     '      ("contractExpr", contractExpr),',
-                    '      ("conclusionDependencies", Lean.ToJson.toJson conclusionDependencies),',
+                    '      ("conclusionDependencies", _root_.Lean.ToJson.toJson conclusionDependencies),',
                     '      ("contractConclusionExpr", contractConclusionExpr),',
-                    '      ("defeq", Lean.Json.arr defeq),',
-                    '      ("contractDefeq", Lean.Json.arr contractDefeq),',
-                    '      ("defeqChecked", Lean.Json.arr defeqChecked),',
-                    '      ("contractDefeqChecked", Lean.Json.arr contractDefeqChecked)',
+                    '      ("defeq", _root_.Lean.Json.arr defeq),',
+                    '      ("contractDefeq", _root_.Lean.Json.arr contractDefeq),',
+                    '      ("defeqChecked", _root_.Lean.Json.arr defeqChecked),',
+                    '      ("contractDefeqChecked", _root_.Lean.Json.arr contractDefeqChecked)',
                     "    ]",
-                    f'    Lean.logInfo m!"MINI_CONTRACT_ANALYSIS_{nonce}_{index}:'
+                    f'    _root_.Lean.logInfo m!"MINI_CONTRACT_ANALYSIS_{nonce}_{index}:'
                     '{payload.compress}"',
-                    f'    Lean.logInfo m!"{name} : {{displayType}}"',
+                    f'    _root_.Lean.logInfo m!"{name} : {{displayType}}"',
                     "  catch error =>",
-                    f'    Lean.throwError m!"{name}: {{error.toMessageData}}"',
+                    f'    _root_.Lean.throwError m!"{name}: {{error.toMessageData}}"',
                 )
             )
             for index, (name, statement) in enumerate(zip(names, raw_statements))
@@ -10781,7 +10849,7 @@ private def {serializer_prefix}_contractDefeq
                 preamble.strip(),
                 f"set_option maxHeartbeats {max_heartbeats}" if max_heartbeats is not None else "",
                 universe_decl,
-                "open Lean Elab Command Meta",
+                "open _root_.Lean _root_.Lean.Elab _root_.Lean.Elab.Command _root_.Lean.Meta",
                 serializer,
                 *(
                     "run_cmd do\n"
@@ -11081,6 +11149,10 @@ private def {serializer_prefix}_contractDefeq
                                 _operation_deadline=operation_deadline,
                                 _preamble_resolved=True,
                                 max_heartbeats=max_heartbeats,
+                                **({"declaration_names": tuple(observed_names[index] for index in group)}
+                                   if observed_names else {}),
+                                **({"declaration_sources": tuple(observed_sources[index] for index in group)}
+                                   if observed_sources else {}),
                             ),
                             timeout=remaining_timeout_s,
                         )
@@ -11255,13 +11327,28 @@ private def {serializer_prefix}_contractDefeq
             returncode=execution.returncode,
         )
         payloads: dict[int, Any] = {}
-        marker_re = re.compile(
-            rf"(?m)^MINI_CONTRACT_ANALYSIS_{re.escape(nonce)}_"
-            r"(\d+):(\{[^\r\n]*\})\s*$"
+        # Persistent diagnostics retain the compiler's location/info header.
+        # Match only this generated observer's path and nonce; an imported
+        # file or a warning quoting a marker cannot supply typed evidence.
+        owned_info_prefix = (
+            rf"(?:{re.escape(str(_path))}:\d+:\d+:[ \t]+info:[ \t]*)?"
+            if _path is not None else ""
         )
+        marker_re = re.compile(
+            rf"(?m)^{owned_info_prefix}MINI_CONTRACT_ANALYSIS_{re.escape(nonce)}_"
+            r"(\d+):(\{[^\r\n]*\})[ \t]*$"
+        )
+        seen_payload_indices: set[int] = set()
         for marker in marker_re.finditer(output):
             try:
-                payloads[int(marker.group(1))] = json.loads(marker.group(2))
+                index = int(marker.group(1))
+                if not 0 <= index < len(raw_statements):
+                    continue
+                if index in seen_payload_indices:
+                    payloads[index] = None
+                    continue
+                seen_payload_indices.add(index)
+                payloads[index] = loads_deep_json(marker.group(2), reject_duplicates=True)
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
         analyses = tuple(
@@ -11320,6 +11407,7 @@ private def {serializer_prefix}_contractDefeq
         *,
         preamble_override: str | None = None,
         timeout_s: float = 60.0,
+        declaration_context: Sequence[str] = (),
     ) -> tuple[tuple[str, ...], str, int]:
         """Compatibility wrapper returning diagnostic display types only."""
 
@@ -11327,6 +11415,7 @@ private def {serializer_prefix}_contractDefeq
             statements,
             preamble_override=preamble_override,
             timeout_s=timeout_s,
+            **({"declaration_context": declaration_context} if declaration_context else {}),
         )
         return (
             tuple(
@@ -11437,7 +11526,7 @@ private def {serializer_prefix}_contractDefeq
         # sorry, and therefore cannot serve as a mathematical certificate.
         content = built.content + f"""
 run_cmd Lean.Elab.Command.liftTermElabM do
-  let declaration ← Lean.getConstInfo `{name}
+  let declaration ← Lean.getConstInfo ``_root_.{name}
   if declaration.type.hasMVar || declaration.type.hasSorry then
     Lean.throwError "proposition preflight: unresolved or admitted statement type"
   unless ← Lean.Meta.isProp declaration.type do

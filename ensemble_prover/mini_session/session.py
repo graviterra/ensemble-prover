@@ -96,6 +96,7 @@ from ensemble_prover.deadline_guard import (
 from ensemble_prover.contract_identity import (
     has_lean_contract_identity,
     lean_contract_evidence_receipt_matches,
+    lean_contract_statement_source_key,
 )
 from ensemble_prover.contract_normalization import (
     compact_contract_surface,
@@ -109,6 +110,7 @@ from ensemble_prover.proof_graph import (
     graph_node_bound_contract_identity,
     graph_node_frontier_quarantined,
     graph_node_frontier_promoted_to_proof_state,
+    graph_node_requires_target_integrity_adjudication,
     graph_statement_is_executable,
     graph_statement_root_equivalent,
     graph_text_hash,
@@ -10561,7 +10563,7 @@ class MiniSession:
         # Normal scheduler headroom already routes the action through ordinary
         # applicability and budget policy. This exceptional admission exists
         # only to reconstruct a job whose paid cursor survived that headroom.
-        if int(self.iteration or 0) < int(self.max_iterations or 0):
+        if self.max_iterations < 0 or int(self.iteration or 0) < int(self.max_iterations or 0):
             return None
         if self.proof_state is not None and self._proof_state_root_solved():
             return None
@@ -10623,7 +10625,7 @@ class MiniSession:
 
     # Loop control.
     iteration: int = 0
-    max_iterations: int = 30
+    max_iterations: int = -1
     stagnation_counter: int = 0
     max_stagnation: int = 3
     last_proof_state_signature: Optional[str] = None
@@ -10642,30 +10644,22 @@ class MiniSession:
     run_governor_actions_since_strong_progress: int = 0
     run_governor_terminal_recorded: bool = False
     _run_governor_last_tick_monotonic: float = 0.0
-    # ``max_stagnation`` remains an early routing signal: three deterministic
-    # misses must not kill a difficult theorem before a model turn runs.  The
-    # controller still needs a terminal fixed point, however.  Count only
-    # fully paid, non-neutral actions whose complete durable mathematical
-    # state is byte-for-byte unchanged.  Any new proof/graph/helper state
-    # resets the window.  Twenty-four identical actions is deliberately much
-    # larger than the routing threshold while remaining finite for the
-    # stopped-run class that accumulated stagnation 30/3 on the same state.
-    max_identical_no_progress_actions: int = 24
+    # Stagnation redirects scheduling. Optional repeat ceilings may be supplied
+    # by a caller; no default count makes an open mathematical task terminal.
+    max_identical_no_progress_actions: int = 0
     identical_no_progress_actions: int = 0
     identical_no_progress_search_signature: str = ""
     identical_no_progress_action_families_seen: Set[str] = field(default_factory=set)
-    max_no_progress_semantic_signature_recurrences: int = 24
+    max_no_progress_semantic_signature_recurrences: int = 0
     max_no_progress_semantic_signatures: int = 256
     no_progress_semantic_signature_counts: Dict[str, int] = field(default_factory=dict)
     no_progress_semantic_signature_order: List[str] = field(default_factory=list)
     no_progress_semantic_signature_action_families: Dict[str, List[str]] = field(
         default_factory=dict
     )
-    # ``proof_work`` scopes can reveal arbitrarily many independent child
-    # contracts, so aggregate action invocations are not a correctness cap.
-    # They must nevertheless bound retries of the *same* executable contract.
-    # A changed Lean environment/helper context hashes to a fresh identity.
-    max_proof_work_no_progress_attempts: int = 2
+    # Optional per-contract repeat policy. Exact deterministic misses remain
+    # memoized by their owning portfolios independently of provider attempts.
+    max_proof_work_no_progress_attempts: int = 0
     max_proof_work_no_progress_identities: int = 4096
     proof_work_no_progress_attempt_counts: Dict[str, int] = field(default_factory=dict)
     # Monotone maximum repetition count per executable identity.  Recent
@@ -10721,7 +10715,7 @@ class MiniSession:
     # discharging this session's root/obligation. Count accepted-helper
     # provider quanta separately; checked helpers remain valid local progress.
     # Zero disables this intervention, not ordinary semantic retry budgets.
-    max_helper_only_provider_quanta: int = 24
+    max_helper_only_provider_quanta: int = 0
     helper_only_provider_quanta: int = 0
     helper_only_progress_identity: str = ""
     # action ids treated as "fallback" — if stagnation
@@ -10802,14 +10796,9 @@ class MiniSession:
     # root fallback.  Exhausting one exact selected route closes only the
     # static alias; a genuinely new selected cognition remains eligible.
     _action_start_conversation_static_root_identity: str = ""
-    # Generic proof-graph actions receive another dispatch only when their
-    # failed attempt leaves a fresh, durable formal state or the tool loop
-    # explicitly certifies a better normalized Lean diagnostic.  The ledger
-    # is keyed by the exact selected work/action identity, so progress on one
-    # route cannot rearm an unrelated route.  Seen-signature memory makes the
-    # continuation crash-safe and fixed-point terminating; the per-key count
-    # is an additional ceiling, not a blind retry schedule.
-    max_frontier_progress_retries: int = 2
+    # Fresh formal or diagnostic progress can renew the exact affected route.
+    # Receipts prevent duplicate grants; an optional count ceiling is separate.
+    max_frontier_progress_retries: int = -1
     frontier_progress_retry_counts: Dict[Tuple[str, str, str, str, str, str], int] = (
         field(default_factory=dict)
     )
@@ -10826,6 +10815,9 @@ class MiniSession:
     _action_start_frontier_formal_signature: str = ""
     _action_start_frontier_formal_evidence: Tuple[str, ...] = ()
     _action_start_proved_graph_node_ids: Set[str] = field(default_factory=set)
+    _action_start_open_graph_contracts: Dict[str, Tuple[str, str, str, str]] = field(
+        default_factory=dict
+    )
     _action_start_frontier_action_key: Optional[Tuple[str, str, str, str, str, str]] = (
         None
     )
@@ -11018,7 +11010,7 @@ class MiniSession:
     # forever (helper sub-conversation gives up → action decomposes →
     # sub-sub-conversation gives up → ...).
     recursion_depth: int = 0
-    max_recursion_depth: int = 3
+    max_recursion_depth: int = 0
 
     # Absolute turn-index counter. ConversationTurnAction calls
     # run_conversation(max_turns=1), which stamps every internal record
@@ -11026,6 +11018,7 @@ class MiniSession:
     # ``apply()``'s outcome metadata.
     _conversation_turn_count: int = 0
     _conversation_role_turn_counts: Dict[str, int] = field(default_factory=dict)
+    conversation_role_service_quanta: Dict[str, int] = field(default_factory=dict)
     # Invocation-local physical turn exposure.  Unlike the durable scheduler
     # count above, this is deliberately excluded from replay snapshots so a
     # dispatch-generation rollback cannot erase an outer turn that started.  A
@@ -11089,14 +11082,14 @@ class MiniSession:
     )
     last_giveup_cluster: Optional[str] = None
     proof_cache_seed_same_problem: bool = True
-    proof_cache_seed_max_helpers: int = 64
+    proof_cache_seed_max_helpers: int = -1
     # None follows the configured Lean allowance; explicit values (including
     # older checkpoints' 12s override) retain their original authority.
     proof_cache_seed_timeout_s: Optional[float] = None
     _proof_cache_seed_attempted: bool = False
     last_giveup_match: str = ""
     hard_pivot_threshold: int = 2
-    hard_pivot_max_per_session: int = 4
+    hard_pivot_max_per_session: int = -1
     last_wall_signature: str = ""
     repeated_wall_count: int = 0
     hard_pivot_count: int = 0
@@ -11112,13 +11105,13 @@ class MiniSession:
         default_factory=dict
     )
     policy_repair_redirect_limit: int = 2
-    policy_repair_redirect_global_limit: int = 4
+    policy_repair_redirect_global_limit: int = -1
     repair_self_check_continuation_counts: Dict[str, int] = field(default_factory=dict)
     pending_repair_ticket: Optional[RepairTicket] = None
     pending_repair_ticket_queue: List[RepairTicket] = field(default_factory=list)
     repair_ticket_history: List[Dict[str, Any]] = field(default_factory=list)
-    max_repair_ticket_chain_depth: int = 3
-    repeated_repair_retirement_threshold: int = 3
+    max_repair_ticket_chain_depth: int = -1
+    repeated_repair_retirement_threshold: int = 0
     repair_failure_target_counts: Dict[str, int] = field(default_factory=dict)
     retired_repair_target_keys: Set[str] = field(default_factory=set)
     repair_failure_exact_counts: Dict[str, int] = field(default_factory=dict)
@@ -11372,7 +11365,7 @@ class MiniSession:
         if int(self.max_iterations or 0) >= required_max_iterations:
             return
         old_max_iterations = int(self.max_iterations or 0)
-        self.max_iterations = required_max_iterations
+        self.extend_iteration_budget(required_max_iterations)
         self._record_event(
             {
                 "phase": "session_semantic_budget_headroom",
@@ -11395,10 +11388,10 @@ class MiniSession:
         cap long before their configured provider/cost authority.
         """
 
-        total_budget = max(0, int(total_llm_turn_budget or 0))
+        total_budget = int(total_llm_turn_budget or 0)
         self.max_no_applicable_recoveries = total_budget
-        self.no_applicable_recovery_budget_increment = 1 if total_budget > 0 else 0
-        if total_budget > 0:
+        self.no_applicable_recovery_budget_increment = 1 if total_budget != 0 else 0
+        if total_budget != 0:
             self.no_applicable_recovery_action_ids = tuple(
                 dict.fromkeys(
                     (
@@ -11652,6 +11645,9 @@ class MiniSession:
             "dossier_current_lean_environment_hash": str(
                 getattr(dossier, "current_lean_environment_hash", "") or ""
             ),
+            "dossier_lean_environment_plain_syntax": copy.deepcopy(
+                getattr(dossier, "lean_environment_plain_syntax", {}) or {}
+            ),
             "dossier_lean_environment_ancestor_hashes": copy.deepcopy(
                 getattr(dossier, "lean_environment_ancestor_hashes", {}) or {}
             ),
@@ -11706,6 +11702,9 @@ class MiniSession:
         if self.dossier is not None:
             self.dossier.current_lean_environment_hash = str(
                 state.get("dossier_current_lean_environment_hash") or ""
+            )
+            self.dossier.lean_environment_plain_syntax = copy.deepcopy(
+                state.get("dossier_lean_environment_plain_syntax") or {}
             )
             self.dossier.lean_environment_ancestor_hashes = copy.deepcopy(
                 state.get("dossier_lean_environment_ancestor_hashes") or {}
@@ -11909,6 +11908,11 @@ class MiniSession:
                 total += max_invocations
         return total
 
+    def extend_iteration_budget(self, minimum: int) -> None:
+        """Increase finite scheduler headroom while retaining unlimited search."""
+        if self.max_iterations >= 0:
+            self.max_iterations = max(self.max_iterations, int(minimum))
+
     def expand_max_iterations_to_action_budgets(self, *, headroom: int = 5) -> int:
         """Align the loop guard with registered action invocation budgets.
 
@@ -11918,7 +11922,7 @@ class MiniSession:
 
         target = self.registered_invocation_budget_total() + max(0, int(headroom or 0))
         if target > int(self.max_iterations or 0):
-            self.max_iterations = target
+            self.extend_iteration_budget(target)
         return int(self.max_iterations or 0)
 
     def _local_compute_remainder_available(self) -> bool:
@@ -12715,10 +12719,10 @@ class MiniSession:
         self._retain_materialization_pending_action_logical_keys()
         self.skipped_frontier_action_keys.update(materialization_pending_action_keys)
         recovery_units = max(1, int(total_granted or increment))
-        self.max_iterations = max(
+        self.extend_iteration_budget(max(
             int(self.max_iterations or 0),
             int(self.iteration or 0) + recovery_units + 2,
-        )
+        ))
         self.expand_max_iterations_to_action_budgets(headroom=max(5, increment + 2))
         self._increment_dossier_metric(
             "mini_session_cost_governed_continuations",
@@ -12887,10 +12891,10 @@ class MiniSession:
                     "granted_prompt_turn_budget": int(prompt_turn_budget_granted),
                 }
 
-        self.max_iterations = max(
+        self.extend_iteration_budget(max(
             int(self.max_iterations or 0),
             int(self.iteration or 0) + int(self.local_repair_quota_remaining) + 2,
-        )
+        ))
         self._increment_dossier_metric("mini_session_local_repair_quota_armed", 1)
         record = {
             "phase": "session_local_repair_quota",
@@ -13023,7 +13027,7 @@ class MiniSession:
         ):
             statement = str(getattr(dossier, "root_statement", "") or "").strip()
         if node is None and contract_identity:
-            statement_key = canonical_dossier_statement_key(statement)
+            statement_key = lean_contract_statement_source_key(statement)
             environment_hash = str(
                 record.get("contract_identity_environment_hash") or ""
             ).strip()
@@ -13505,6 +13509,7 @@ class MiniSession:
         record: Optional[Dict[str, Any]] = None,
         *,
         mutate: bool = True,
+        ignore_dependency_blocked: bool = False,
     ) -> Dict[str, Any]:
         """Return whether a restored graph-native selected work record is live."""
 
@@ -13564,7 +13569,6 @@ class MiniSession:
                 "route_dependency_contradicted",
                 "proposal_invalidated",
                 "retired_by_repeated_repair_failure",
-                "formalization_repeated_unrelated_bridge_suppressed",
                 "route_assembly_contract_replan_obsolete",
                 "superseded_by_source",
             ):
@@ -13581,7 +13585,7 @@ class MiniSession:
                     return "blocked_by_unresolved"
                 try:
                     if not bool(blockers_resolved(node.node_id)):
-                        return "blocked_by_unresolved"
+                        return "" if ignore_dependency_blocked else "blocked_by_unresolved"
                 except Exception:
                     return "blocked_by_unresolved"
                 return ""
@@ -13845,6 +13849,81 @@ class MiniSession:
                 return status
         return {"live": True, "verdict": "graph_target_live"}
 
+    def provider_checkpoint_graph_retention_status(
+        self, record: Mapping[str, Any], *, target: str,
+    ) -> str:
+        """Retain paid identity through dependency waits, without dispatch authority.
+
+        Every target and selected route is checked even if another coordinate
+        is blocked. A reversible dependency cannot conceal stale route policy.
+        """
+        payload = dict(record)
+        work_type = str(payload.get("work_type") or "")
+        graph = getattr(getattr(self, "dossier", None), "proof_graph", None)
+        nodes = getattr(graph, "nodes", {}) or {}
+        layers = selected_work_mapping_layers(payload)
+        targets, explicit = self._selected_graph_dispatch_targets(payload)
+        if explicit - set(nodes):
+            return "stale"
+        if any(
+            str(layer.get("graph_node_id") or "").strip()
+            and str(layer["graph_node_id"]).strip() not in nodes
+            for layer in layers
+        ):
+            return "stale"
+        if work_type == "target_integrity_adjudication":
+            adjudications = self._selected_target_integrity_adjudication_nodes(payload)
+            if (len(adjudications) != 1
+                    or set(targets) != {adjudications[0].node_id}
+                    or (explicit - {adjudications[0].node_id})
+                    or any(str(layer.get("work_type") or "") not in {"", work_type}
+                           for layer in layers)
+                    or str(adjudications[0].statement).strip() != target):
+                return "stale"
+            if self._frontier_item_executable_statement(
+                payload, for_capability=True, for_prop_check=True,
+            ) != target:
+                return "stale"
+        else:
+            for layer in layers:
+                for field in ("obligation_id", "graph_node_id", "variant_id", "claim_id"):
+                    node_id = str(layer.get(field) or "")
+                    if node_id and node_id not in nodes:
+                        return "stale"
+            current = self._frontier_item_executable_statement(
+                payload, for_capability=True, for_prop_check=True,
+            )
+            if current and current != target:
+                return "stale"
+        routes = list(dict.fromkeys(
+            str(layer.get("route_id") or "").strip() for layer in layers
+            if str(layer.get("route_id") or "").strip()
+        )) or [""]
+        target_records = (
+            self._selected_target_integrity_adjudication_liveness_targets(
+                payload, adjudications[0].node_id,
+            )
+            if work_type == "target_integrity_adjudication" else
+            [{**dict(layer), "work_type": work_type} for layer in layers]
+        )
+        if target_records is None:
+            return "stale"
+        waiting = False
+        for selected in target_records:
+            for route_id in routes:
+                coordinate = {**selected, "route_id": route_id}
+                retained = self.selected_work_graph_liveness_status(
+                    coordinate, mutate=False, ignore_dependency_blocked=True,
+                )
+                if not retained.get("live", True):
+                    return "stale"
+                ordinary = self.selected_work_graph_liveness_status(coordinate, mutate=False)
+                if not ordinary.get("live", True):
+                    if ordinary.get("reason") != "blocked_by_unresolved":
+                        return "stale"
+                    waiting = True
+        return "temporarily_blocked" if waiting else "current"
+
     def _selected_work_targets_terminal_graph_work(
         self,
         record: Dict[str, Any],
@@ -14094,6 +14173,106 @@ class MiniSession:
                     return True
         return True
 
+    def _selected_graph_dispatch_targets(
+        self,
+        record: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Set[str]]:
+        """Resolve actual graph target references without trusting saved flags."""
+
+        dossier = getattr(self, "dossier", None)
+        graph = getattr(dossier, "proof_graph", None)
+        graph_nodes = getattr(graph, "nodes", {}) or {}
+        root_node_id = str(getattr(graph, "root_node_id", "") or "")
+        targets: Dict[str, Any] = {}
+        explicit_obligations: Set[str] = set()
+        for layer in selected_work_mapping_layers(record):
+            # Claims and variants can describe producer provenance. These
+            # fields select the obligation; a default root cannot hide it.
+            for field_name in (
+                "obligation_id", "graph_node_id", "node_id", "target_id", "replan_id",
+            ):
+                referenced_id = str(layer.get(field_name) or "").strip()
+                if field_name == "obligation_id" and referenced_id:
+                    explicit_obligations.add(referenced_id)
+                node = graph_nodes.get(referenced_id)
+                if node is None:
+                    continue
+                if str(getattr(node, "kind", "")) == "replan_queue_item":
+                    metadata = getattr(node, "metadata", {}) or {}
+                    obligation_id = str(
+                        metadata.get("obligation_id")
+                        or metadata.get("resolved_by_obligation_id")
+                        or ""
+                    ).strip()
+                    node = graph_nodes.get(obligation_id, node)
+                if str(node.node_id) not in {"root", root_node_id}:
+                    targets[str(node.node_id)] = node
+        return targets, explicit_obligations
+
+    def _selected_target_integrity_adjudication_nodes(
+        self,
+        record: Dict[str, Any],
+    ) -> List[Any]:
+        """Return current adjudication nodes named by any selected-work layer."""
+
+        targets, _explicit_obligations = self._selected_graph_dispatch_targets(record)
+        return [
+            node for node in targets.values()
+            if graph_node_requires_target_integrity_adjudication(node)
+        ]
+
+    def _selected_target_integrity_adjudication_liveness_targets(
+        self,
+        record: Dict[str, Any],
+        node_id: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Keep explicit replan policy beside its resolved adjudication target.
+
+        A failed producer claim is provenance. A selected replan is an active
+        control, even when target resolution projects it onto its obligation.
+        """
+        graph = getattr(getattr(self, "dossier", None), "proof_graph", None)
+        nodes = getattr(graph, "nodes", {}) or {}
+        controls = {node_id}
+        for layer in selected_work_mapping_layers(record):
+            for field_name in ("graph_node_id", "node_id", "target_id", "replan_id"):
+                referenced_id = str(layer.get(field_name) or "").strip()
+                if not referenced_id:
+                    continue
+                node = nodes.get(referenced_id)
+                if node is None:
+                    return None
+                if str(getattr(node, "kind", "")) == "replan_queue_item":
+                    controls.add(referenced_id)
+        return [
+            {"work_type": "target_integrity_adjudication", "graph_node_id": control}
+            for control in sorted(controls)
+        ]
+
+    def _selected_target_integrity_adjudication_is_live(
+        self,
+        record: Dict[str, Any],
+        node_id: str,
+    ) -> bool:
+        """Check the exact obligation without dropping selected route controls."""
+
+        targets = self._selected_target_integrity_adjudication_liveness_targets(record, node_id)
+        if targets is None:
+            return False
+        route_ids = list(dict.fromkeys(
+            str(layer.get("route_id") or "").strip()
+            for layer in selected_work_mapping_layers(record)
+            if str(layer.get("route_id") or "").strip()
+        ))
+        for target in targets:
+            for route_id in route_ids or [""]:
+                current_target = {**target, "route_id": route_id}
+                if not self.selected_work_graph_liveness_status(
+                    current_target, mutate=False,
+                ).get("live", True):
+                    return False
+        return True
+
     def _selected_work_record_dispatch_block_reason(
         self,
         record: Dict[str, Any],
@@ -14110,11 +14289,7 @@ class MiniSession:
         # scheduler or provider.
         proof_state = getattr(self, "proof_state", None)
         proof_state_nodes = getattr(proof_state, "nodes", {}) or {}
-        layers: List[Mapping[str, Any]] = [record]
-        for nested_key in ("graph_record", "selected_work_item"):
-            nested = record.get(nested_key)
-            if isinstance(nested, Mapping):
-                layers.append(nested)
+        layers = selected_work_mapping_layers(record)
         candidate_node_ids: List[str] = []
         for layer in layers:
             for key in (
@@ -14208,11 +14383,56 @@ class MiniSession:
                     return "residual_elaboration_attestation_required"
         if (
             str(action_id or "").startswith("conversation_turn")
-            and work_type == "target_integrity_adjudication"
-            and self._frontier_item_targets_dossier_graph_node(record)
-            and not self._frontier_item_executable_statement(record)
+            and work_type != "materialize_replay_source"
         ):
-            return "target_integrity_nonexecutable"
+            targets, explicit_obligations = self._selected_graph_dispatch_targets(record)
+            adjudications = {
+                node_id: node for node_id, node in targets.items()
+                if graph_node_requires_target_integrity_adjudication(node)
+            }
+            if len(adjudications) > 1:
+                return "target_integrity_target_mismatch"
+            if adjudications:
+                if work_type != "target_integrity_adjudication" or any(
+                    str(layer.get("work_type") or "").strip()
+                    not in {"", "target_integrity_adjudication"}
+                    for layer in layers
+                ):
+                    return "target_integrity_work_type_mismatch"
+                node_id, node = next(iter(adjudications.items()))
+                if (set(targets) | explicit_obligations) - {node_id}:
+                    return "target_integrity_target_mismatch"
+                metadata = getattr(node, "metadata", {}) or {}
+                # Rebuild only the authority-bearing target fields from the
+                # current graph. Saved flags or an executable fallback node
+                # cannot authorize a different target after restoration.
+                current_target = {
+                    "work_type": work_type,
+                    "obligation_id": node_id,
+                    "target_integrity_adjudication": True,
+                    "allow_root_equivalent_target_integrity_adjudication": bool(
+                        metadata.get("allow_root_equivalent_target_integrity_adjudication")
+                    ),
+                }
+                if not self._selected_target_integrity_adjudication_is_live(
+                    record, node_id,
+                ):
+                    return "target_integrity_not_live"
+                current_target["selected_work_item"] = record
+                if not self._frontier_item_executable_statement(
+                    current_target, for_prop_check=True,
+                ):
+                    return "target_integrity_nonexecutable"
+            elif work_type == "target_integrity_adjudication" and (
+                targets or explicit_obligations
+            ):
+                return "target_integrity_target_mismatch"
+            elif (
+                work_type == "target_integrity_adjudication"
+                and self._frontier_item_targets_dossier_graph_node(record)
+                and not self._frontier_item_executable_statement(record)
+            ):
+                return "target_integrity_nonexecutable"
         return ""
 
     def _selected_work_record_dispatch_blocked(
@@ -14365,7 +14585,6 @@ class MiniSession:
                 "route_dependency_contradicted",
                 "proposal_invalidated",
                 "retired_by_repeated_repair_failure",
-                "formalization_repeated_unrelated_bridge_suppressed",
                 "route_assembly_contract_replan_obsolete",
                 "superseded_by_source",
                 "target_integrity_contaminated",
@@ -15149,7 +15368,7 @@ class MiniSession:
                 int(self.repair_failure_exact_counts.get(exact_key, 0) or 0) + 1
             )
             self.repair_failure_exact_counts[exact_key] = exact_count
-        threshold = max(1, int(self.repeated_repair_retirement_threshold or 3))
+        threshold = max(0, int(self.repeated_repair_retirement_threshold or 0))
         self._increment_dossier_metric(
             "mini_session_repair_failure_observations",
             1,
@@ -15176,7 +15395,7 @@ class MiniSession:
                 "verdict": "repeated_repair_failure_observed",
             }
         )
-        if target_count >= threshold:
+        if threshold > 0 and target_count >= threshold:
             self._retire_repeated_repair_target(
                 ticket,
                 target_key=target_key,
@@ -15734,10 +15953,10 @@ class MiniSession:
         )
         self.pending_fallback_action_id = ordered_available[0]
         self.stagnation_counter = threshold
-        self.max_iterations = max(
+        self.extend_iteration_budget(max(
             int(self.max_iterations or 0),
             int(self.iteration or 0) + 2,
-        )
+        ))
         self.last_failure_reason = ""
         self._record_event(
             {
@@ -15837,11 +16056,11 @@ class MiniSession:
             if (
                 predecessor_root_id
                 and ticket_root_id == predecessor_root_id
-                and predecessor_max_depth > 0
+                and predecessor_max_depth != 0
                 and ticket_max_depth == predecessor_max_depth
                 and predecessor_depth >= 0
                 and ticket_depth == predecessor_depth + 1
-                and ticket_depth < ticket_max_depth
+                and (ticket_max_depth < 0 or ticket_depth < ticket_max_depth)
             ):
                 return False
         self._increment_dossier_metric(
@@ -16798,10 +17017,10 @@ class MiniSession:
                     "verdict": "prompt_turn_budget_granted",
                 }
             )
-        self.max_iterations = max(
+        self.extend_iteration_budget(max(
             int(self.max_iterations or 0),
             int(self.iteration or 0) + 2,
-        )
+        ))
 
     @staticmethod
     def _no_progress_action_family(action: Any) -> str:
@@ -16966,9 +17185,14 @@ class MiniSession:
             budget = self.budgets.get(action_id)
             if not action_id or budget is None:
                 continue
-            finite_invocations_remaining = bool(
-                budget.max_invocations >= 0
-                and budget.invocations < budget.max_invocations
+            invocations_remaining = bool(
+                (budget.max_invocations < 0 and action_id in {
+                    "conversation_turn_prove", "conversation_turn_refine",
+                    "recursive_controller", "adaptive_recursive",
+                    "graph_recursive_decompose", "graph_root_replan",
+                    "recursive_helper_prover",
+                })
+                or (budget.max_invocations >= 0 and budget.invocations < budget.max_invocations)
             )
             finite_seconds_remaining = bool(
                 budget.max_total_seconds > 0.0
@@ -16978,7 +17202,7 @@ class MiniSession:
                 budget.scope != "session"
                 or budget.exhausted()
                 or self._model_call_deferred_static_action_effective(action_id)
-                or not (finite_invocations_remaining or finite_seconds_remaining)
+                or not (invocations_remaining or finite_seconds_remaining)
             ):
                 continue
             if self._safe_is_applicable(
@@ -17492,10 +17716,10 @@ class MiniSession:
         if self._identical_no_progress_fixed_point_exhausted():
             return False
         if self._active_repair_ticket() is not None:
-            self.max_iterations = max(
+            self.extend_iteration_budget(max(
                 int(self.max_iterations or 0),
                 int(self.iteration or 0) + 1,
-            )
+            ))
             return True
         if self.proof_state is not None and self._proof_state_root_solved():
             # A proved proof-state root is not, by itself, a completed session.
@@ -17512,7 +17736,7 @@ class MiniSession:
                 except Exception:
                     pass
                 if not self._proof_state_root_solved():
-                    return self.iteration < self.max_iterations
+                    return self.max_iterations < 0 or self.iteration < self.max_iterations
             if self._grant_ready_root_route_drain_headroom(
                 reason="root_solved_without_finalization",
             ):
@@ -17528,13 +17752,13 @@ class MiniSession:
                 # verifier outage.  Root closure is still unfinalized, so the
                 # durable wake receipt remains authoritative even though the
                 # route-drain grant itself cannot be issued twice.
-                self.max_iterations = max(
+                self.extend_iteration_budget(max(
                     int(self.max_iterations or 0),
                     int(self.iteration or 0) + 1,
-                )
+                ))
                 return True
             return False
-        if self.iteration >= self.max_iterations:
+        if self.max_iterations >= 0 and self.iteration >= self.max_iterations:
             if self._grant_ready_root_route_drain_headroom(
                 reason="max_iterations_reached",
             ):
@@ -18235,6 +18459,10 @@ class MiniSession:
                 )
         for settlement in self._detached_execution_settlements:
             settlement.budget = self.budgets[settlement.action_id]
+            if self.checkpoint_registry is not None and self.checkpoint_lane_key:
+                self.checkpoint_registry.retain_execution_tail(
+                    self.checkpoint_lane_key, self, settlement,
+                )
         self.deterministic_dispatch_failures.update(failure_receipts)
         self.run_governor_elapsed_s = max(
             float(self.run_governor_elapsed_s or 0.0),
@@ -18414,6 +18642,7 @@ class MiniSession:
         export = getattr(action, "scheduler_runtime_state", None)
         if not callable(export):
             return ""
+        provider_identity = getattr(action, "provider_lane_runtime_identity", None)
 
         def raw_record(value: Any) -> dict[str, Any]:
             if value is None:
@@ -18462,7 +18691,9 @@ class MiniSession:
             },
             "graph_edges": list(getattr(graph, "edges", ()) or ()),
             "work": dict(work),
-            "cursor": export(),
+            "cursor": (
+                provider_identity() if callable(provider_identity) else export()
+            ),
         }
         return hashlib.sha256(json.dumps(
             payload, sort_keys=True, ensure_ascii=True, default=encode_inert_record,
@@ -19480,10 +19711,10 @@ class MiniSession:
                 except Exception:
                     pass
         old_max_iterations = int(self.max_iterations or 0)
-        self.max_iterations = max(
+        self.extend_iteration_budget(max(
             old_max_iterations,
             int(self.iteration or 0) + 2,
-        )
+        ))
         self.fallback_actions_attempted = False
         self.stagnation_counter = 0
         self._increment_dossier_metric(
@@ -19654,6 +19885,7 @@ class MiniSession:
             enumerate(self.actions),
             key=lambda pair: (
                 pair[1].priority,
+                self._conversation_role_service_rank(pair[1].id),
                 pair[1].cost_estimate_s,
                 pair[0],
             ),
@@ -19734,6 +19966,7 @@ class MiniSession:
             enumerate(self.actions),
             key=lambda pair: (
                 pair[1].priority,
+                self._conversation_role_service_rank(pair[1].id),
                 pair[1].cost_estimate_s,
                 pair[0],
             ),
@@ -21097,6 +21330,7 @@ class MiniSession:
             enumerate(self.actions),
             key=lambda pair: (
                 pair[1].priority,
+                self._conversation_role_service_rank(pair[1].id),
                 pair[1].cost_estimate_s,
                 pair[0],
             ),
@@ -22247,6 +22481,7 @@ class MiniSession:
             enumerate(self.actions),
             key=lambda pair: (
                 pair[1].priority,
+                self._conversation_role_service_rank(pair[1].id),
                 pair[1].cost_estimate_s,
                 pair[0],
             ),
@@ -22434,14 +22669,14 @@ class MiniSession:
                 # Keep the grant available until deferred root repair needs it.
                 old_max_iterations = int(self.max_iterations or 0)
                 required_max_iterations = int(self.iteration or 0) + 2
-                extends_ceiling = required_max_iterations > old_max_iterations
+                extends_ceiling = old_max_iterations >= 0 and required_max_iterations > old_max_iterations
                 fresh_headroom = extends_ceiling and (
                     prepass_signature
                     not in self.static_prepass_headroom_signatures_seen
                 )
                 if fresh_headroom:
                     self.static_prepass_headroom_signatures_seen.add(prepass_signature)
-                    self.max_iterations = required_max_iterations
+                    self.extend_iteration_budget(required_max_iterations)
                 if not extends_ceiling:
                     headroom_verdict = "static_prepass_iteration_headroom_not_needed"
                 elif fresh_headroom:
@@ -23793,6 +24028,21 @@ class MiniSession:
                         retained.append(receipt.identity)
                 preserve_ready = tuple(retained)
             return result
+        except BaseException as error:
+            # A paused child can leave its parent at a sealed pre-action
+            # checkpoint. Publish physical service separately: replacing that
+            # checkpoint would also publish unfinished mathematical mutations
+            # and invalidate the prepared child's parent-record identity.
+            registry = self.checkpoint_registry
+            if registry is not None and self.checkpoint_lane_key:
+                try:
+                    await registry.commit_execution_service(self.checkpoint_lane_key, self)
+                except BaseException as checkpoint_error:
+                    error.add_note(
+                        "execution service checkpoint failed: "
+                        f"{type(checkpoint_error).__name__}: {checkpoint_error}"
+                    )
+            raise
         finally:
             # Nested MiniSessions share their parent's broker. Their return is
             # only a scheduler quantum boundary; the final live session owner
@@ -23802,7 +24052,7 @@ class MiniSession:
 
             research_owner = current_native_research()
             try:
-                if research_owner is not None:
+                if research_owner is not None and not getattr(self, "_scheduler_service_yielded", False):
                     await research_owner.release_session(self)
             finally:
                 if planner_broker is not None:
@@ -23813,6 +24063,12 @@ class MiniSession:
     async def _run_scheduler(self) -> Tuple[bool, Optional[str]]:
         from ..mini_research import pending_native_research
 
+        # A resumable nested owner may ask for a service slice. This is a
+        # scheduling boundary, separate from the session's cumulative budget;
+        # it is observed only after action settlement and durable publication.
+        self._scheduler_service_yielded = False
+        service_slice_s = max(0.0, float(getattr(self, "scheduler_service_slice_s", 0.0) or 0.0))
+        service_started = time.monotonic()
         planner_broker = self.planner_job_broker()
         self._retire_terminal_ready_planner_jobs()
         if self._operator_cancelled_dispatch_reuse_fenced:
@@ -24072,10 +24328,10 @@ class MiniSession:
                     governor_remaining = self._run_governor_remaining_s()
                     if governor_remaining is not None:
                         delay = min(delay, governor_remaining)
-                    self.max_iterations = max(
+                    self.extend_iteration_budget(max(
                         int(self.max_iterations or 0),
                         int(self.iteration or 0) + 1,
-                    )
+                    ))
                     self._record_event(
                         {
                             "phase": "session_scheduled_action_wait",
@@ -24665,6 +24921,11 @@ class MiniSession:
                 completed_action_id,
                 None,
             )
+            from ..mini_research import record_native_proof_work
+
+            # The completed outcome and its audit-work receipt share one
+            # checkpoint. Research itself starts only after publication below.
+            record_native_proof_work(self, outcome)
             if self.checkpoint_registry is not None:
                 if not self.checkpoint_lane_key:
                     raise ValueError("durable checkpoint lane is not registered")
@@ -24713,6 +24974,23 @@ class MiniSession:
             # All action-owned work is settled and its checkpoint committed.
             # A finalized proof above returns before research can dispatch.
             await self._native_research_boundary(outcome)
+            if (service_slice_s > 0.0
+                    and time.monotonic() - service_started >= service_slice_s
+                    and self.should_continue()):
+                # Work accounting is already sealed with the action. Persist
+                # any subsequent research grant or advice before changing owners.
+                if (self.checkpoint_registry is not None
+                        and getattr(self, "native_research_state", None)):
+                    await self.checkpoint_registry.commit_session(
+                        self.checkpoint_lane_key, self,
+                    )
+                self._scheduler_service_yielded = True
+                self._record_event({
+                    "phase": "session_service_slice", "action_id": outcome.action_id,
+                    "elapsed_s": time.monotonic() - service_started,
+                    "verdict": "settled_child_service_yield",
+                })
+                return False, None
         durable_proof = self._durable_final_proof()
         if durable_proof and self.root_finalized:
             self._retire_terminal_ready_planner_jobs()
@@ -25140,6 +25418,10 @@ class MiniSession:
             registry=self._detached_execution_settlements,
         )
         self._detached_execution_settlements.append(settlement)
+        if self.checkpoint_registry is not None and self.checkpoint_lane_key:
+            self.checkpoint_registry.retain_execution_tail(
+                self.checkpoint_lane_key, self, settlement,
+            )
         callback = detached_execution_callback(settlement)
         for task in pending:
             task.add_done_callback(callback, context=contextvars.Context())
@@ -25519,6 +25801,7 @@ class MiniSession:
             outcome.metadata.update(metadata)
         self._apply_repair_ticket_bookkeeping(effective_outcome, metadata)
         self._discharge_repair_policy_narrowing_after_action(effective_outcome)
+        self._record_conversation_role_service(outcome)
         self.last_action_outcome_metadata = metadata
         giveup_cluster = self.last_action_outcome_metadata.get("giveup_cluster")
         if giveup_cluster:
@@ -28985,10 +29268,10 @@ class MiniSession:
                         # mathematical attempt.
                         budget.max_invocations = int(budget.invocations) + 1
                     old_max_iterations = int(self.max_iterations or 0)
-                    self.max_iterations = max(
+                    self.extend_iteration_budget(max(
                         old_max_iterations,
                         int(self.iteration or 0) + 2,
-                    )
+                    ))
                     self._record_event(
                         {
                             "phase": "session_recursive_helper_cleanup_retry",
@@ -29041,10 +29324,10 @@ class MiniSession:
                 ):
                     budget.max_invocations = int(budget.invocations) + 1
                 old_max_iterations = int(self.max_iterations or 0)
-                self.max_iterations = max(
+                self.extend_iteration_budget(max(
                     old_max_iterations,
                     int(self.iteration or 0) + 2,
-                )
+                ))
                 self._record_event(
                     {
                         "phase": "session_primary_verifier_retry",
@@ -29098,10 +29381,10 @@ class MiniSession:
             ):
                 budget.max_invocations = int(budget.invocations) + 1
             old_max_iterations = int(self.max_iterations or 0)
-            self.max_iterations = max(
+            self.extend_iteration_budget(max(
                 old_max_iterations,
                 int(self.iteration or 0) + 2,
-            )
+            ))
             self._record_event(
                 {
                     "phase": "session_paid_tool_retry",
@@ -29190,10 +29473,10 @@ class MiniSession:
                 ):
                     budget.max_invocations = int(budget.invocations) + 1
                 old_max_iterations = int(self.max_iterations or 0)
-                self.max_iterations = max(
+                self.extend_iteration_budget(max(
                     old_max_iterations,
                     int(self.iteration or 0) + 2,
-                )
+                ))
                 self._record_event(
                     {
                         "phase": "session_durable_tool_continuation",
@@ -29247,6 +29530,10 @@ class MiniSession:
         # changing the receipt on an already-proved node is not fresh work.
         newly_proved_children = []
         newly_proved_graph_targets = []
+        certified_completed_obligations = []
+        certified_completion_identities: Set[str] = set()
+        completion_seen = self.formal_progress_evidence_seen
+        completion_owners = None
         if (
             self._action_start_frontier_formal_signature
             and self.proof_state is not None
@@ -29274,9 +29561,17 @@ class MiniSession:
         graph_certificate = getattr(
             graph, "_proved_node_has_durable_certificate", None
         )
+        # Proof-state transitions have their own acceptance boundary. Graph
+        # records require the source-bound completion path below: a legacy
+        # graph proof hash alone is not sufficient authority.
+        fresh_structural_formal_evidence = {
+            item for item in fresh_action_formal_evidence
+            if item.startswith("proof_state:")
+        }
         if self._action_start_frontier_formal_signature and callable(graph_certificate):
             from .progress_identity import graph_progress_projection
             _, _, graph_keys = graph_progress_projection(self.dossier, self._progress_node_record)
+            replayable_completion_sources = None
             for node_id, target in dict(getattr(graph, "nodes", {}) or {}).items():
                 if (
                     getattr(target, "kind", "")
@@ -29286,26 +29581,80 @@ class MiniSession:
                     continue
                 if (
                     node_id not in self._action_start_proved_graph_node_ids
-                    and node_id in graph_keys
-                    and f"proof_graph:{graph_keys[node_id]}" in fresh_action_formal_evidence
                     and graph_certificate(target)
                 ):
-                    newly_proved_graph_targets.append(node_id)
+                    if (
+                        node_id in graph_keys
+                        and f"proof_graph:{graph_keys[node_id]}" in fresh_action_formal_evidence
+                    ):
+                        newly_proved_graph_targets.append(node_id)
+                    observed_contract = self._action_start_open_graph_contracts.get(node_id)
+                    current_contract = self._graph_obligation_progress_contract(target)
+                    if (
+                        observed_contract is not None
+                        and observed_contract[:3] == current_contract[:3]
+                        and (not observed_contract[3] or observed_contract[3] == current_contract[3])
+                    ):
+                        if replayable_completion_sources is None:
+                            # Share this current closure within the synchronous
+                            # action boundary; never retain mutable authority
+                            # across actions or an await.
+                            completion_helpers = {
+                                helper.name
+                                for candidate_id, candidate in graph.nodes.items()
+                                if candidate_id not in self._action_start_proved_graph_node_ids
+                                and candidate_id in self._action_start_open_graph_contracts
+                                and getattr(candidate, "status", "") == "proved"
+                                and getattr(candidate, "kind", "") in {
+                                    "proposed_claim", "formal_variant", "missing_obligation",
+                                }
+                                for prior in [self._action_start_open_graph_contracts[candidate_id]]
+                                for current in [self._graph_obligation_progress_contract(candidate)]
+                                if prior[:3] == current[:3] and (not prior[3] or prior[3] == current[3])
+                                for helper in [self._graph_obligation_certifying_helper(candidate)]
+                                if helper is not None
+                            }
+                            replayable_completion_sources = set(self.dossier.root_replay_helper_closure(
+                                support_helper_names=completion_helpers, refresh_quality=False,
+                                require_current_environment=True,
+                            ))
+                        if not self._graph_obligation_has_accepted_helper(
+                            target, replayable_sources=replayable_completion_sources,
+                        ):
+                            continue
+                        completion_identities = self._graph_obligation_completion_identities(
+                            target, include_credit_spelling_guard=True,
+                        )
+                        if completion_owners is None:
+                            completion_owners = self._obligation_completion_credit_owners(completion_seen)
+                        fresh_completion, owner_receipts = self._record_obligation_completion_credit(
+                            completion_identities, completion_seen, completion_owners,
+                        )
+                        if fresh_completion:
+                            certified_completed_obligations.append(node_id)
+                        # All newly completed equivalent targets remain visible
+                        # in this action's attribution; the action receives one
+                        # continuation grant. Publish receipts atomically.
+                        certified_completion_identities.update(completion_identities)
+                        certified_completion_identities.update(owner_receipts)
+        metadata["certified_completed_obligation_node_ids"] = (
+            sorted(certified_completed_obligations)
+        )
         non_helper_parent_progress = bool(
             preexisting_strong_progress
             and (not outcome.helpers_added or newly_proved_graph_targets)
             and action_parent_progress
-            and fresh_action_formal_evidence
+            and fresh_structural_formal_evidence
         )
         non_helper_structural_strong = bool(
             preexisting_strong_progress
             and (not outcome.helpers_added or newly_proved_graph_targets)
-            and fresh_action_formal_evidence
+            and fresh_structural_formal_evidence
         )
         if non_helper_parent_progress:
             metadata["parent_progress"] = True
         ledger_parent_progress = bool(
-            fresh_action_formal_evidence
+            certified_completed_obligations
             and (helper_progress_metadata.get("parent_progress")
                  or helper_progress_metadata.get("strong_progress"))
         )
@@ -29313,7 +29662,10 @@ class MiniSession:
             root_strong_progress
             or non_helper_structural_strong
             or ledger_parent_progress
+            or certified_completed_obligations
         )
+        if certified_completed_obligations and not outcome.progress:
+            outcome = replace(outcome, progress=True, metadata=metadata)
         duplicate_helper_names = set(
             helper_progress_metadata.get("duplicate_helper_names", ())
         )
@@ -29466,6 +29818,8 @@ class MiniSession:
                 metadata["strong_progress_reason"] = "root_finalization"
             elif ledger_parent_progress or non_helper_parent_progress:
                 metadata["strong_progress_reason"] = "parent_progress"
+            elif certified_completed_obligations:
+                metadata["strong_progress_reason"] = "certified_obligation_completion"
             else:
                 metadata["strong_progress_reason"] = "action_structural"
         elif metadata.get("theory_progress"):
@@ -29617,6 +29971,8 @@ class MiniSession:
                     "verified_facts": 0.0,
                 },
             )
+            for field in ("attempts", "seconds", "root_progress", "verified_facts"):
+                action_observation.setdefault(field, 0.0)
             action_observation["attempts"] = (
                 float(action_observation.get("attempts", 0.0) or 0.0) + 1.0
             )
@@ -29661,6 +30017,7 @@ class MiniSession:
             self._action_start_frontier_formal_signature = ""
             self._action_start_frontier_formal_evidence = ()
             self._action_start_proved_graph_node_ids.clear()
+            self._action_start_open_graph_contracts.clear()
             self._action_start_frontier_action_key = None
         conversation_attempt_identity = str(
             self._action_start_proof_work_semantic_identity or ""
@@ -29756,6 +30113,7 @@ class MiniSession:
             self._action_start_frontier_formal_signature = ""
             self._action_start_frontier_formal_evidence = ()
             self._action_start_proved_graph_node_ids.clear()
+            self._action_start_open_graph_contracts.clear()
             self._action_start_frontier_action_key = None
         if outcome.progress or root_strong_progress:
             if final_strong_progress:
@@ -29779,6 +30137,7 @@ class MiniSession:
         if isinstance(action_reported_outcome.metadata, dict):
             action_reported_outcome.metadata.update(metadata)
         self._apply_repair_ticket_bookkeeping(outcome, metadata)
+        self._record_conversation_role_service(outcome)
         self.last_action_outcome_metadata = metadata
         giveup_cluster = self.last_action_outcome_metadata.get("giveup_cluster")
         if giveup_cluster:
@@ -30677,7 +31036,7 @@ class MiniSession:
             min_next_iteration_budget = int(self.iteration or 0) + 2
             if int(self.max_iterations or 0) < min_next_iteration_budget:
                 old_max_iterations = int(self.max_iterations or 0)
-                self.max_iterations = min_next_iteration_budget
+                self.extend_iteration_budget(min_next_iteration_budget)
                 self._record_event(
                     {
                         "phase": "session_policy_repair_redirect",
@@ -30978,6 +31337,7 @@ class MiniSession:
             self._clear_policy_repair_redirect_selected_work()
             self._clear_selected_work_item()
         self.formal_progress_evidence_seen.update(action_end_formal_evidence)
+        self.formal_progress_evidence_seen.update(certified_completion_identities)
         return replace(
             outcome,
             solved=effective_solved,
@@ -31028,6 +31388,7 @@ class MiniSession:
         if (
             self.dossier is None
             or self._durable_final_proof()
+            or self.max_iterations < 0
             or committed_iteration < int(self.max_iterations or 0)
         ):
             return
@@ -31042,10 +31403,10 @@ class MiniSession:
         if grants >= 1:
             return
         self._increment_dossier_metric(metric_name, 1)
-        self.max_iterations = max(
+        self.extend_iteration_budget(max(
             int(self.max_iterations or 0),
             committed_iteration + 1,
-        )
+        ))
 
     def _maybe_trigger_hard_pivot(self, outcome: MiniOutcome) -> bool:
         """Reset the LLM prompt when it repeats the same non-progress wall."""
@@ -31071,7 +31432,7 @@ class MiniSession:
         threshold = max(2, int(self.hard_pivot_threshold or 2))
         if self.repeated_wall_count < threshold:
             return False
-        if self.hard_pivot_count >= max(0, int(self.hard_pivot_max_per_session or 0)):
+        if self.hard_pivot_max_per_session >= 0 and self.hard_pivot_count >= self.hard_pivot_max_per_session:
             return False
         if self.conv is None:
             return False
@@ -31815,7 +32176,322 @@ class MiniSession:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    def _graph_obligation_progress_contract(self, node: Any) -> Tuple[str, str, str, str]:
+        """Keep the observed typed target exact while its receipts are refined."""
+
+        from ensemble_prover.contract_identity import parse_lean_contract_identity
+        from ensemble_prover.proof_graph import graph_node_bound_contract_identity
+
+        bound = parse_lean_contract_identity(graph_node_bound_contract_identity(node))
+        return (
+            str(getattr(node, "kind", "") or ""),
+            str(getattr(node, "statement", "") or ""),
+            str(
+                (getattr(node, "metadata", {}) or {}).get("statement_environment_hash")
+                or getattr(self.dossier, "current_lean_environment_hash", "") or ""
+            ),
+            bound[0] if bound is not None else "",
+        )
+
+    @staticmethod
+    def _legacy_obligation_surface_text(statement: str) -> str:
+        """Reproduce the historical receipt encoding without changing its meaning."""
+        from ensemble_prover.utils import _lean_lexical_skip_end
+
+        out = []
+        index = 0
+        while index < len(statement):
+            lexical_end = _lean_lexical_skip_end(statement, index)
+            if lexical_end is not None:
+                if statement.startswith(("/-", "--"), index):
+                    if out and out[-1] != " ":
+                        out.append(" ")
+                else:
+                    out.append(statement[index:lexical_end])
+                index = lexical_end
+                continue
+            if not statement[index].isspace():
+                out.append(statement[index])
+                index += 1
+                continue
+            end = index + 1
+            while end < len(statement) and statement[end].isspace():
+                end += 1
+            if (out and end < len(statement)
+                    and (out[-1][-1].isalnum() or out[-1][-1] in "_'»")
+                    and (statement[end].isalnum() or statement[end] in "_'«")):
+                out.append(" ")
+            index = end
+        return "".join(out).strip()
+
+    @staticmethod
+    def _obligation_statement_completion_identities(statement: str, environment: str) -> Set[str]:
+        from ensemble_prover.proof_state import (
+            lean_statement_completion_identity,
+        )
+
+        # Use scoped binder normalization, not the broader graph matcher that
+        # can discard distinctions between typed contracts. These keys only
+        # deduplicate progress; the observed target and proof stay exact.
+        return {
+            f"completed_obligation:{kind}:" + text_hash(json.dumps(
+                [value, environment], separators=(",", ":"),
+            ))
+            for kind, value in (
+                ("surface_v2", statement),
+                ("alpha_v5", lean_statement_completion_identity(
+                    statement, normalize_nested_binders=True,
+                )),
+            )
+        }
+
+    @staticmethod
+    def _obligation_statement_completion_credit_guard(statement: str, environment: str) -> str:
+        """Conservatively withhold repeat credit without identifying propositions."""
+        from ensemble_prover.proof_state import (
+            _completion_credit_quantifier_spelling, lean_statement_completion_identity,
+        )
+
+        # Tight quantifier spelling may be custom notation. Normalizing it is
+        # allowed only in this denial path, never in a proposition identity.
+        parts = json.loads(lean_statement_completion_identity(
+            _completion_credit_quantifier_spelling(statement), normalize_nested_binders=True,
+        ))
+        if parts and parts[0] == "exact":
+            return ""
+        # Only the string fragments lose token-boundary whitespace. Bound-name
+        # slots stay structured, and literal islands/free names stay distinct.
+        # This can deny credit to distinct notation; it must never establish
+        # equality, certify a proof, retire work, or recover a stale identity.
+        guard_parts = [
+            MiniSession._legacy_obligation_surface_text(part) if isinstance(part, str) else part
+            for part in parts
+        ]
+        return "completed_obligation:credit_spelling_v1:" + text_hash(json.dumps(
+            [guard_parts, environment], separators=(",", ":"),
+        ))
+
+    @staticmethod
+    def _obligation_completion_credit_owners(seen: Set[str]) -> Dict[str, Set[str]]:
+        """Recover the observed owners captured when a spelling receipt was made."""
+        prefix = "completed_obligation:credit_owner_v1:"
+        owners: Dict[str, Set[str]] = {}
+        digest_length = len(text_hash(""))
+        for receipt in seen:
+            if not receipt.startswith(prefix):
+                continue
+            key, separator, owner = receipt[len(prefix):].partition(":")
+            if separator and len(key) == digest_length and (
+                len(owner) == digest_length or owner == "unobserved"
+            ):
+                owners.setdefault(key, set()).add(owner)
+        return owners
+
+    @staticmethod
+    def _record_obligation_completion_credit(
+        identities: Set[str], seen: Set[str], owners: Dict[str, Set[str]],
+    ) -> Tuple[bool, Set[str]]:
+        """Credit distinct checked expressions despite advisory spelling collisions.
+
+        A spelling can stand for several expressions in an extensible syntax.
+        Its complete history must be observed before disjoint checked owners
+        can override conservative duplicate denial. Legacy or unobserved
+        receipts permanently retain that denial; later elaboration cannot
+        retroactively authenticate the original completion.
+        """
+        advisory = {key for key in identities if key.startswith((
+            "completed_obligation:alpha_v5:",
+            "completed_obligation:credit_spelling_v1:",
+        ))}
+        semantic = {key.rsplit(":", 1)[-1] for key in identities
+                    if key.startswith("completed_obligation:lean:")}
+        observed_owner = next(iter(semantic)) if len(semantic) == 1 else "unobserved"
+        fresh = (identities - advisory).isdisjoint(seen)
+        for key in advisory & seen:
+            previous = owners.get(text_hash(key), set())
+            if (observed_owner == "unobserved" or not previous
+                    or "unobserved" in previous or observed_owner in previous):
+                fresh = False
+        receipts: Set[str] = set()
+        for key in advisory:
+            digest = text_hash(key)
+            previous = owners.setdefault(digest, set())
+            # An older ledger has no provenance for this key. Keep that fact
+            # even if today's completion supplies a checked expression.
+            additions = {observed_owner}
+            if key in seen and not previous:
+                additions.add("unobserved")
+            receipts.update(
+                "completed_obligation:credit_owner_v1:" + digest + ":" + owner
+                for owner in additions - previous
+            )
+            previous.update(additions)
+        return fresh, receipts
+
+    def _graph_obligation_completion_identities(
+        self, node: Any, *, include_credit_spelling_guard: bool = False,
+    ) -> Set[str]:
+        """Remember completed propositions independently of diagnostic changes."""
+
+        from ensemble_prover.contract_identity import parse_lean_contract_identity
+        from ensemble_prover.proof_dossier import (
+            verified_helper_bound_contract_identity, verified_helper_progress_statement,
+        )
+        from ensemble_prover.proof_graph import graph_node_bound_contract_identity
+
+        environment = str((getattr(node, "metadata", {}) or {}).get("statement_environment_hash") or "")
+        statements = [str(getattr(node, "statement", "") or "")]
+        bound_identities = [graph_node_bound_contract_identity(node)]
+        # The caller has checked this helper's source authority. Its stable
+        # spelling and elaborated identity link equivalent target spellings,
+        # including targets whose own contract has not yet been elaborated.
+        helper_node = self.dossier.proof_graph.nodes.get(str(
+            (getattr(node, "metadata", {}) or {}).get("verified_by_helper_node_id") or ""
+        ))
+        helper = self.dossier.verified_helpers.get(getattr(helper_node, "name", ""))
+        if helper is not None:
+            statements.append(verified_helper_progress_statement(helper))
+            bound_identities.append(verified_helper_bound_contract_identity(helper))
+        identities = set().union(*(
+            self._obligation_statement_completion_identities(statement, environment)
+            for statement in statements
+        ))
+        if include_credit_spelling_guard:
+            identities.update(
+                guard for statement in statements
+                if (guard := self._obligation_statement_completion_credit_guard(statement, environment))
+            )
+        for identity in bound_identities:
+            bound = parse_lean_contract_identity(identity)
+            if bound is not None:
+                identities.add("completed_obligation:lean:" + text_hash(json.dumps(
+                    [bound[0], environment], separators=(",", ":"),
+                )))
+        return identities
+
+    def _graph_obligation_certifying_helper(self, target: Any) -> Any:
+        """Require current accepted source authority for automatic progress credit.
+
+        Some legacy graph records carry only a proof hash. They can remain
+        diagnostic evidence, but cannot independently reset a progress window.
+        """
+
+        from ensemble_prover.proof_dossier import (
+            verified_helper_admission_quality, verified_helper_is_premise_projection,
+        )
+
+        dossier = self.dossier
+        graph = getattr(dossier, "proof_graph", None)
+        metadata = getattr(target, "metadata", {}) or {}
+        if graph is None or any(metadata.get(key) for key in (
+            "proposal_superseded", "route_retired", "route_dependency_contradicted",
+        )):
+            return None
+        if not graph._proved_node_has_durable_certificate(target):
+            return None
+        helper_node = graph.nodes.get(str(metadata.get("verified_by_helper_node_id") or ""))
+        if helper_node is None:
+            return None
+        helper = (getattr(dossier, "verified_helpers", {}) or {}).get(helper_node.name)
+        if helper is None:
+            return None
+        source = str(getattr(helper, "source", "") or "")
+        source_hash = str(getattr(helper, "source_hash", "") or "")
+        if (
+            not source or source_hash != text_hash(source)
+            or helper_node.source_hash != source_hash
+            or (helper_node.metadata or {}).get("verified_helper_source") != source
+            or not verified_helper_admission_quality(helper).generic_novelty
+            or verified_helper_is_premise_projection(helper)
+        ):
+            return None
+        environment = str(getattr(helper, "verification_environment_hash", "") or "")
+        current_environment = str(getattr(dossier, "current_lean_environment_hash", "") or "")
+        if current_environment and not dossier.lean_environment_is_compatible(
+            environment, current_environment,
+        ):
+            return None
+        if not graph._helper_certifies_node(helper_node, target):
+            return None
+        return helper
+
+    def _graph_obligation_has_accepted_helper(
+        self, target: Any, *, replayable_sources: Optional[set[str]] = None,
+    ) -> bool:
+        helper = self._graph_obligation_certifying_helper(target)
+        if helper is None:
+            return False
+        dossier = self.dossier
+        source = str(helper.source or "")
+        if replayable_sources is None:
+            replayable_sources = set(dossier.root_replay_helper_closure(
+                support_helper_names=[helper.name], refresh_quality=False,
+                require_current_environment=True,
+            ))
+        return source.strip() in replayable_sources
+
+    def _recover_obligation_completion_aliases(self) -> None:
+        """Expand old exact completion receipts only from recoverable source text."""
+        from ensemble_prover.proof_dossier import verified_helper_progress_statement
+        from ensemble_prover.proof_state import lean_statement_completion_identity
+
+        seen = self.formal_progress_evidence_seen
+        marker = "completed_obligation:alpha_format:5"
+        if marker in seen:
+            return
+        # Persist completion of this compatibility pass in the same ledger.
+        # New sessions record exact and scoped keys; a hash whose original text
+        # is absent from a legacy checkpoint cannot be safely reconstructed.
+        seen.add(marker)
+        if not any(item.startswith((
+            "completed_obligation:surface:", "completed_obligation:surface_v2:",
+            "completed_obligation:alpha_v4:",
+        )) for item in seen):
+            return
+        statements = [
+            (str(node.statement or ""), str((node.metadata or {}).get("statement_environment_hash") or ""))
+            for node in getattr(getattr(self.dossier, "proof_graph", None), "nodes", {}).values()
+            if node.kind in {"proposed_claim", "formal_variant", "missing_obligation"}
+        ]
+        statements.extend(
+            (verified_helper_progress_statement(helper), str(helper.verification_environment_hash or ""))
+            for helper in getattr(self.dossier, "verified_helpers", {}).values()
+            if helper.source_hash == text_hash(helper.source)
+        )
+        for statement, environment in statements:
+            # Graph records are not new credit. An existing durable completion
+            # must match before its alpha spelling joins the remembered set.
+            identities = self._obligation_statement_completion_identities(statement, environment)
+            exact = next(item for item in identities if item.startswith("completed_obligation:surface_v2:"))
+            legacy_surface = "completed_obligation:surface:" + text_hash(json.dumps(
+                [self._legacy_obligation_surface_text(statement), environment], separators=(",", ":"),
+            ))
+            # Old surface receipts erased token boundaries and indentation.
+            # Even a familiar-looking source cannot authenticate a proposition
+            # through that hash. Version 4's explicit exact-source fallback
+            # retained layout and can still identify its original source.
+            identity = lean_statement_completion_identity(statement, normalize_nested_binders=True)
+            legacy_exact = "completed_obligation:alpha_v4:" + text_hash(json.dumps(
+                [identity, environment], separators=(",", ":"),
+            ))
+            if (
+                exact in seen
+                or (identity.startswith('["exact",') and legacy_exact in seen)
+            ):
+                seen.update(identities)
+                guard = self._obligation_statement_completion_credit_guard(statement, environment)
+                if guard:
+                    seen.add(guard)
+            elif legacy_surface in seen:
+                # This receipt can only deny another grant. A token collision
+                # may withhold credit for distinct mathematics, but must never
+                # establish a current scoped or exact completion identity.
+                guard = self._obligation_statement_completion_credit_guard(statement, environment)
+                if guard:
+                    seen.add(guard)
+
     def _begin_action_progress_observation(self, *, action_id: str = "") -> None:
+        self._recover_obligation_completion_aliases()
         signature = self._durable_search_progress_signature()
         self._action_start_durable_progress_signature = signature
         if signature:
@@ -31830,6 +32506,16 @@ class MiniSession:
             node_id for node_id, node in dict(
                 getattr(getattr(self.dossier, "proof_graph", None), "nodes", {}) or {}
             ).items() if getattr(node, "status", "") == "proved"
+        }
+        self._action_start_open_graph_contracts = {
+            node_id: self._graph_obligation_progress_contract(node)
+            for node_id, node in dict(
+                getattr(getattr(self.dossier, "proof_graph", None), "nodes", {}) or {}
+            ).items()
+            if getattr(node, "status", "") in {"open", "blocked", "failed", "rejected"}
+            and getattr(node, "kind", "") in {
+                "proposed_claim", "formal_variant", "missing_obligation",
+            }
         }
         self._action_start_frontier_formal_signature = text_hash(
             json.dumps(formal_evidence, separators=(",", ":"))
@@ -31967,6 +32653,7 @@ class MiniSession:
         self._action_start_frontier_formal_signature = ""
         self._action_start_frontier_formal_evidence = ()
         self._action_start_proved_graph_node_ids.clear()
+        self._action_start_open_graph_contracts.clear()
         self._action_start_frontier_action_key = None
         if (
             action_key is None
@@ -32052,7 +32739,7 @@ class MiniSession:
         ]
         primary_receipt_keys = [(*retry_key, receipt) for receipt in progress_receipts]
         retry_count = int(self.frontier_progress_retry_counts.get(retry_key, 0) or 0)
-        retry_limit = max(0, int(self.max_frontier_progress_retries or 0))
+        retry_limit = int(self.max_frontier_progress_retries)
         fresh_receipt_keys = [
             key
             for key in primary_receipt_keys
@@ -32060,13 +32747,13 @@ class MiniSession:
         ]
         signature_fresh = bool(fresh_receipt_keys)
         self.frontier_progress_signatures_seen.update(receipt_keys)
-        if not signature_fresh or retry_count >= retry_limit:
+        if not signature_fresh or (retry_limit >= 0 and retry_count >= retry_limit):
             metadata.update(
                 {
                     "frontier_progress_retry_granted": False,
                     "frontier_progress_retry_stagnant": not signature_fresh,
                     "frontier_progress_retry_limit_reached": (
-                        signature_fresh and retry_count >= retry_limit
+                        signature_fresh and (retry_limit >= 0 and retry_count >= retry_limit)
                     ),
                     "frontier_progress_signature": progress_signature,
                     "frontier_progress_retry_count": retry_count,
@@ -32153,10 +32840,10 @@ class MiniSession:
             min_turn_budget=int(budget.invocations) + 1,
         )
         old_max_iterations = int(self.max_iterations or 0)
-        self.max_iterations = max(
+        self.extend_iteration_budget(max(
             old_max_iterations,
             int(self.iteration or 0) + 2,
-        )
+        ))
         self.fallback_actions_attempted = False
         metadata.update(
             {
@@ -32270,7 +32957,7 @@ class MiniSession:
         old_max_iterations = int(self.max_iterations or 0)
         min_next_iteration_budget = int(self.iteration or 0) + 2
         if old_max_iterations < min_next_iteration_budget:
-            self.max_iterations = min_next_iteration_budget
+            self.extend_iteration_budget(min_next_iteration_budget)
 
         if (
             budget.scope == "session"
@@ -32736,10 +33423,10 @@ class MiniSession:
             self.fallback_actions_attempted = False
             self.stagnation_counter = 0
             self.soft_progress_streak = 0
-            self.max_iterations = max(
+            self.extend_iteration_budget(max(
                 int(self.max_iterations or 0),
                 int(self.iteration or 0) + 2,
-            )
+            ))
             self.expand_max_iterations_to_action_budgets(headroom=2)
             self.last_failure_reason = ""
             self._increment_dossier_metric(
@@ -32837,11 +33524,8 @@ class MiniSession:
             elif apply_materialization_pending_recovery():
                 return True
             elif (
-                self.no_applicable_recovery_count
-                >= max(
-                    0,
-                    int(self.max_no_applicable_recoveries or 0),
-                )
+                self.max_no_applicable_recoveries >= 0
+                and self.no_applicable_recovery_count >= self.max_no_applicable_recoveries
                 and not released_deferred_action_ids
             ):
                 # A model-defer release is independently bounded by its own
@@ -32889,10 +33573,10 @@ class MiniSession:
                 released_action_id = self._release_action_local_transient_cooldown()
                 if released_action_id:
                     self.fallback_actions_attempted = False
-                    self.max_iterations = max(
+                    self.extend_iteration_budget(max(
                         int(self.max_iterations or 0),
                         int(self.iteration or 0) + 2,
-                    )
+                    ))
                     self.last_failure_reason = ""
                     self._increment_dossier_metric(
                         "mini_session_action_local_cooldown_recoveries",
@@ -33134,10 +33818,10 @@ class MiniSession:
                 self.fallback_actions_attempted = False
                 self.stagnation_counter = 0
                 self.soft_progress_streak = 0
-                self.max_iterations = max(
+                self.extend_iteration_budget(max(
                     int(self.max_iterations or 0),
                     int(self.iteration or 0) + 2,
-                )
+                ))
                 self.expand_max_iterations_to_action_budgets(headroom=2)
                 self.last_failure_reason = ""
                 self._increment_dossier_metric(
@@ -33191,10 +33875,10 @@ class MiniSession:
                 self.fallback_actions_attempted = False
                 self.stagnation_counter = 0
                 self.soft_progress_streak = 0
-                self.max_iterations = max(
+                self.extend_iteration_budget(max(
                     int(self.max_iterations or 0),
                     int(self.iteration or 0) + 2,
-                )
+                ))
                 self.expand_max_iterations_to_action_budgets(headroom=2)
                 self.last_failure_reason = ""
                 self._increment_dossier_metric(
@@ -33256,8 +33940,8 @@ class MiniSession:
             }
             if (
                 funded_serviceable_conversation_ids
-                and self.no_applicable_recovery_count
-                < max(0, int(self.max_no_applicable_recoveries or 0))
+                and (self.max_no_applicable_recoveries < 0
+                     or self.no_applicable_recovery_count < self.max_no_applicable_recoveries)
             ):
                 # The recovery probe just proved these actions applicable for
                 # live frontier work, and their ordinary budgets need no
@@ -33272,10 +33956,10 @@ class MiniSession:
                 self.fallback_actions_attempted = False
                 self.stagnation_counter = 0
                 self.soft_progress_streak = 0
-                self.max_iterations = max(
+                self.extend_iteration_budget(max(
                     int(self.max_iterations or 0),
                     int(self.iteration or 0) + 2,
-                )
+                ))
                 self.last_failure_reason = ""
                 self._increment_dossier_metric(
                     "mini_session_no_applicable_serviceable_conversation_reanchors",
@@ -33297,8 +33981,8 @@ class MiniSession:
             if (
                 self._repair_first_scheduler_blocked
                 and serviceable_action_ids
-                and self.no_applicable_recovery_count
-                < max(0, int(self.max_no_applicable_recoveries or 0))
+                and (self.max_no_applicable_recoveries < 0
+                     or self.no_applicable_recovery_count < self.max_no_applicable_recoveries)
             ):
                 # A live session may contain a terminal graph target plus a
                 # now-unserviceable quota that promised its repair. A
@@ -33307,10 +33991,10 @@ class MiniSession:
                 # replaying the stale target.
                 self.no_applicable_recovery_count += 1
                 self._repair_first_scheduler_blocked = False
-                self.max_iterations = max(
+                self.extend_iteration_budget(max(
                     int(self.max_iterations or 0),
                     int(self.iteration or 0) + 2,
-                )
+                ))
                 self.last_failure_reason = ""
                 self._increment_dossier_metric(
                     "mini_session_no_applicable_repair_restore_reanchors",
@@ -33374,10 +34058,10 @@ class MiniSession:
         self.materialization_pending_frontier_logical_keys.clear()
         self.materialization_pending_frontier_action_logical_keys.clear()
         recovery_units = max(1, int(total_granted or 0))
-        self.max_iterations = max(
+        self.extend_iteration_budget(max(
             int(self.max_iterations or 0),
             int(self.iteration or 0) + recovery_units + 2,
-        )
+        ))
         self.expand_max_iterations_to_action_budgets(headroom=max(5, increment + 2))
         self._increment_dossier_metric("mini_session_no_applicable_recoveries", 1)
         self._increment_dossier_metric(
@@ -36158,6 +36842,32 @@ class MiniSession:
         )
         return count
 
+    def _conversation_role_service_rank(self, action_id: str) -> int:
+        """Share settled provider quanta when a conversation role is unlimited.
+
+        Paid tool/verifier continuations are selected before ordinary scheduling.
+        This rank affects only the subsequent choice among eligible roles.
+        """
+        ids = ("conversation_turn_prove", "conversation_turn_refine")
+        if action_id not in ids or not any(
+            self.budgets.get(role_id) is not None
+            and self.budgets[role_id].max_invocations < 0
+            for role_id in ids
+        ):
+            return 0
+        return max(0, int(self.conversation_role_service_quanta.get(action_id, 0)))
+
+    def _record_conversation_role_service(self, outcome: MiniOutcome) -> None:
+        if outcome.action_id not in {"conversation_turn_prove", "conversation_turn_refine"}:
+            return
+        completed = _nonnegative_metadata_int(
+            outcome.metadata, "provider_calls_completed"
+        )
+        if completed:
+            self.conversation_role_service_quanta[outcome.action_id] = (
+                self.conversation_role_service_quanta.get(outcome.action_id, 0) + completed
+            )
+
     def _frontier_candidate_ids_for_work_type(self, work_type: str) -> List[str]:
         work_type = str(work_type or "")
         # Optional refinement must inherit the same scoped work as proving.
@@ -36167,6 +36877,10 @@ class MiniSession:
             ["conversation_turn_refine"]
             if self.registered_action("conversation_turn_refine") is not None
             else []
+        )
+        conversation_ids = sorted(
+            ["conversation_turn_prove", *refiner_ids],
+            key=self._conversation_role_service_rank,
         )
         if work_type == "root_replan":
             return ["graph_root_replan"]
@@ -36190,8 +36904,7 @@ class MiniSession:
         if work_type == "assemble_route":
             return [
                 "graph_route_assembly",
-                "conversation_turn_prove",
-                "conversation_turn_refine",
+                *conversation_ids,
             ]
         if work_type in {"mine_missing_obligation", "route_replan"}:
             recursive_ids = [
@@ -36213,24 +36926,22 @@ class MiniSession:
             return [
                 *dict.fromkeys(recursive_ids),
                 "graph_native_shortcut",
-                "conversation_turn_prove",
-                *refiner_ids,
+                *conversation_ids,
             ]
         if work_type == "target_integrity_adjudication":
-            return ["conversation_turn_prove", *refiner_ids]
+            return conversation_ids
         if work_type in {
             "formalize_claim",
             "prove_claim_variant",
         }:
             return [
                 "graph_native_shortcut",
-                "conversation_turn_prove",
-                *refiner_ids,
+                *conversation_ids,
             ]
         if work_type == "materialize_replay_source":
-            return ["conversation_turn_prove", *refiner_ids]
+            return conversation_ids
         if work_type == "formalize_missing_obligation":
-            return ["conversation_turn_prove", *refiner_ids]
+            return conversation_ids
         if work_type == "root_repair":
             # Root-repair is itself a formal-state bottleneck.  Keeping formal
             # search exclusive to ``formal_state_expand`` made the feature
@@ -36243,8 +36954,7 @@ class MiniSession:
             # would otherwise multiply that prepass per child).
             return [
                 "formal_state_search",
-                "conversation_turn_prove",
-                "conversation_turn_refine",
+                *conversation_ids,
             ]
         return []
 
@@ -38006,10 +38716,10 @@ class MiniSession:
         if not renewed:
             return False
         self.fallback_actions_attempted = False
-        self.max_iterations = max(
+        self.extend_iteration_budget(max(
             int(self.max_iterations or 0),
             int(self.iteration or 0) + 2,
-        )
+        ))
         self.last_failure_reason = ""
         return True
 
@@ -40941,6 +41651,7 @@ class MiniSession:
         work_item: Any,
         *,
         for_capability: bool = False,
+        for_prop_check: bool = False,
     ) -> str:
         """Return the exact executable graph statement carried by work.
 
@@ -40948,6 +41659,8 @@ class MiniSession:
         target. Capability resolution asks only whether the exact graph-bound
         resource is a proposition; terminality and materialization remain
         independent dispatch gates.
+        Adjudication may instead request its existing local proposition
+        preflight; that capability cannot authorize a provider request.
         """
 
         work_type = str(self._work_item_field(work_item, "work_type", "") or "").strip()
@@ -41002,10 +41715,23 @@ class MiniSession:
             **graph_record,
             **dict(getattr(work_item, "to_record", lambda: {})() or {}),
         }
-        target_integrity_root_equiv_allowed = bool(
-            record.get("target_integrity_adjudication")
-            and record.get("allow_root_equivalent_target_integrity_adjudication")
-        )
+        if work_type == "target_integrity_adjudication":
+            adjudications = self._selected_target_integrity_adjudication_nodes(record)
+            if len(adjudications) != 1:
+                return ""
+            node_id = str(adjudications[0].node_id)
+            # Wrapper defaults can name the root while the exact obligation
+            # has completed or is waiting for dependencies. Resolve liveness
+            # on that obligation before local checking or provider dispatch.
+            if not for_capability and not self._selected_target_integrity_adjudication_is_live(
+                inline_record or record, node_id,
+            ):
+                return ""
+            record.update(
+                obligation_id=node_id,
+                graph_node_id=node_id,
+                node_id=node_id,
+            )
         if (
             bool(record.get("formalization_required"))
             and work_type not in {"route_replan", "target_integrity_adjudication"}
@@ -41163,6 +41889,11 @@ class MiniSession:
             ):
                 continue
             node_metadata = dict(getattr(node, "metadata", {}) or {})
+            target_integrity_root_equiv_allowed = bool(
+                work_type == "target_integrity_adjudication"
+                and graph_node_requires_target_integrity_adjudication(node)
+                and node_metadata.get("allow_root_equivalent_target_integrity_adjudication")
+            )
             materialization_root_equiv_allowed = bool(
                 work_type == "materialize_replay_source"
                 and node_metadata.get("needs_replay_materialization")
@@ -41174,6 +41905,12 @@ class MiniSession:
             ):
                 continue
             if self._graph_statement_is_executable(statement, node_id=node_id):
+                return statement
+            if (
+                for_prop_check
+                and work_type == "target_integrity_adjudication"
+                and graph.may_schedule_prop_check(node_id, statement=statement)
+            ):
                 return statement
         return ""
 
@@ -41428,7 +42165,9 @@ class MiniSession:
                     action.id.startswith("conversation_turn")
                     and work_type == "target_integrity_adjudication"
                     and self._frontier_item_targets_dossier_graph_node(work_item)
-                    and not self._frontier_item_executable_statement(work_item)
+                    and not self._frontier_item_executable_statement(
+                        work_item, for_prop_check=True,
+                    )
                 ):
                     continue
                 if (

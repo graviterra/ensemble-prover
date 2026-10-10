@@ -50,7 +50,7 @@ class GraphRouteAssemblyAction:
         *,
         max_routes: int = 3,
         root_tactic_timeout_s: float = 20.0,
-        root_tactic_max_candidates: int = 32,
+        root_tactic_max_candidates: int = -1,
     ) -> None:
         self.max_routes = int(max_routes or 0)
         self.root_tactic_timeout_s = float(root_tactic_timeout_s or 0.0)
@@ -560,7 +560,7 @@ class GraphRouteAssemblyAction:
         executable_root_tactic_available = bool(
             helper_names
             and self.root_tactic_timeout_s > 0.0
-            and self.root_tactic_max_candidates > 0
+            and self.root_tactic_max_candidates != 0
             and getattr(session, "lean", None) is not None
         )
         if (
@@ -590,7 +590,7 @@ class GraphRouteAssemblyAction:
             return True
         return bool(
             self.root_tactic_timeout_s > 0.0
-            and self.root_tactic_max_candidates > 0
+            and self.root_tactic_max_candidates != 0
             and getattr(session, "lean", None) is not None
         )
 
@@ -2041,7 +2041,7 @@ class GraphRouteAssemblyAction:
         executable_root_tactic_available = bool(
             helper_names
             and self.root_tactic_timeout_s > 0.0
-            and self.root_tactic_max_candidates > 0
+            and self.root_tactic_max_candidates != 0
             and getattr(session, "lean", None) is not None
         )
         if (
@@ -2295,7 +2295,7 @@ class GraphRouteAssemblyAction:
         if (
             helper_names
             and self.root_tactic_timeout_s > 0.0
-            and self.root_tactic_max_candidates > 0
+            and self.root_tactic_max_candidates != 0
             and getattr(session, "lean", None) is not None
         ):
             from ensemble_prover.mini_prover import _try_root_tactic_close

@@ -18,6 +18,7 @@ from ..utils import strip_lean_noncode_for_token_checks
 from .lean_check import safe_helper_sources
 from .model import (
     CounterexampleCandidate,
+    KERNEL_NEGATION_VERIFIER_VERSION,
     LeanCounterexampleCertificate,
     TrustLevel,
     authoritative_certificate_record_is_valid,
@@ -28,6 +29,7 @@ from .policy import FalsificationPolicy
 
 _DEPENDS_RE = re.compile(r"'([^\r\n]+)'\s+depends\s+on\s+axioms:\s*\[([^\]]*)\]")
 _NONE_RE = re.compile(r"'([^\r\n]+)'\s+does\s+not\s+depend\s+on\s+any\s+axioms")
+_NEGATION_TYPE_MISMATCH = "falsification certificate does not prove the original target's kernel negation"
 
 # Process-local admission receipts. Serialized certificate fields are
 # deliberately forgeable data; only this module adds a content identity after
@@ -71,7 +73,11 @@ def authoritative_certificate_has_process_receipt(
 ) -> bool:
     """Return whether this exact certificate content was minted this process."""
 
-    if certificate is None or not bool(getattr(certificate, "authoritative", False)):
+    if (
+        certificate is None
+        or not bool(getattr(certificate, "authoritative", False))
+        or getattr(certificate, "verifier_version", "") != KERNEL_NEGATION_VERIFIER_VERSION
+    ):
         return False
     try:
         certificate_hash = str(
@@ -93,7 +99,10 @@ def authoritative_certificate_record_has_process_receipt(
     """Check a single materialized certificate record against minted receipts."""
 
     record = dict(certificate_record or {})
-    if not authoritative_certificate_record_is_valid(record):
+    if (
+        not authoritative_certificate_record_is_valid(record)
+        or record.get("verifier_version") != KERNEL_NEGATION_VERIFIER_VERSION
+    ):
         return False
     certificate_hash = str(record.get("certificate_hash") or "")
     return (
@@ -111,7 +120,10 @@ def _record_authoritative_certificate_receipt(
         certificate.to_record().get("certificate_hash", "") or ""
     )
     environment_hash = str(target_environment_hash or "").strip()
-    if certificate_hash and environment_hash:
+    if (
+        certificate_hash and environment_hash
+        and certificate.verifier_version == KERNEL_NEGATION_VERIFIER_VERSION
+    ):
         _AUTHORITATIVE_CERTIFICATE_RECEIPTS.add(
             (certificate_hash, environment_hash)
         )
@@ -729,15 +741,88 @@ async def _axiom_audit(
         guard_timeout_s=timeout_s,
         operation_ownership="result_only",
     )
+    from ..lean_runner import _append_imports_to_preamble, _free_universe_decl
+    from ..nl_lean import _lean_string
+    from ..theorem_project import decode_theorem_target_context
+
+    resolved_preamble, target_prefix, target_omit = decode_theorem_target_context(
+        _append_imports_to_preamble(resolved_preamble, ["Lean"]),
+    )
     helper_block = "\n".join(safe_helper_sources(helpers))
+    universe_decl = _free_universe_decl(
+        "\n".join((statement, helper_block, proof)), declared_in=resolved_preamble,
+    )
     # An active namespace in the admitted preamble affects the printed
     # declaration name. Root-qualify only our fresh audit declaration so its
     # identity is stable while the target/proof keep their original scopes.
+    # Inherit declaration visibility so module-private targets remain usable;
+    # Lean name quotations below resolve the generated private kernel names.
     audit_name = "_root_." + theorem_name
+    witness_name = theorem_name + "_original_target"
+    # Finalize the independently parsed original proposition before comparing
+    # its type. A theorem retains included section assumptions; a definition
+    # can drop them. The harmless True conclusion uses the original only as a
+    # binder domain, avoiding a second elaboration of let-rec auxiliaries.
+    # Keep source as quoted data until it parses as one term, then splice AST.
+    parser_source = " " * len(f"theorem _root_.{witness_name} (_miniStatement : ") + statement
+    original_witness = f"""run_cmd do
+  let original ← match _root_.Lean.Parser.runParserCategory
+      (← _root_.Lean.MonadEnv.getEnv) `term {_lean_string(parser_source)} with
+    | .ok stx@_ => pure stx
+    | .error error@_ => _root_.Lean.throwError error
+  let original : _root_.Lean.TSyntax `term := ⟨original⟩
+  let name := _root_.Lean.mkIdent (`_root_ ++ _root_.Lean.Name.mkSimple "{witness_name}")
+  _root_.Lean.Elab.Command.elabCommand (← `(command|
+    theorem $name:ident (_miniStatement : $original) : _root_.True := _root_.True.intro))
+"""
+    target_context = "\n".join(filter(None, (
+        target_prefix, f"omit {' '.join(target_omit)} in" if target_omit else "",
+    )))
+    # The spelling `¬ (...)` is extensible Lean syntax. Even fresh replay plus
+    # an axiom audit may prove a different proposition if a macro changes that
+    # wrapper. Construct Not in the kernel expression API and compare types.
+    # Preserve generalized section parameters outside the negation, as Lean
+    # does for the checked declaration itself, and align rigid universe names.
+    type_guard = f"""run_cmd _root_.Lean.Elab.Command.liftTermElabM do
+  let .thmInfo witness@_ ← _root_.Lean.getConstInfo ``_root_.{witness_name}
+    | _root_.Lean.throwError "original target witness is not a theorem"
+  let expected ← _root_.Lean.Meta.forallTelescope witness.type fun params body => do
+    unless params.size > 0 && body.isConstOf (_root_.Lean.Name.mkSimple "True") do
+      _root_.Lean.throwError "original target witness has an invalid shape"
+    let last := (← _root_.Lean.MonadLCtx.getLCtx).get! params.back!.fvarId!
+    unless last.userName.eraseMacroScopes == _root_.Lean.Name.mkSimple "_miniStatement" do
+      _root_.Lean.throwError "original target witness lost its statement binder"
+    let original ← _root_.Lean.Meta.inferType params.back!
+    if original.hasMVar || original.hasSorry then
+      _root_.Lean.throwError "original target contains unresolved or admitted terms"
+    unless ← _root_.Lean.Meta.isProp original do
+      _root_.Lean.throwError "original target is not a proposition"
+    let negation := _root_.Lean.mkApp
+      (_root_.Lean.mkConst (_root_.Lean.Name.mkSimple "Not")) original
+    _root_.Lean.Meta.mkForallFVars params.pop negation
+  let actualName := ``{audit_name}
+  let actual ← _root_.Lean.getConstInfo actualName
+  let expectedParams := (_root_.Lean.collectLevelParams {{}} expected).params.toList
+  let actualParams := (_root_.Lean.collectLevelParams {{}} actual.type).params.toList
+  unless expectedParams.length == actualParams.length do
+    _root_.Lean.throwError "{_NEGATION_TYPE_MISMATCH}"
+  let commonLevels := expectedParams.map _root_.Lean.Level.param
+  let expected := expected.instantiateLevelParams expectedParams commonLevels
+  let actual := actual.type.instantiateLevelParams actualParams commonLevels
+  unless ← _root_.Lean.Meta.isDefEq actual expected do
+    _root_.Lean.throwError "{_NEGATION_TYPE_MISMATCH}"
+  let axioms ← _root_.Lean.collectAxioms actualName
+  let names := _root_.String.intercalate ", " (axioms.toList.map _root_.Lean.Name.toString)
+  _root_.Lean.logInfo ("'{theorem_name}' depends on axioms: [" ++ names ++ "]")
+"""
+    # Bind the original proposition in the admitted target frame. Helpers can
+    # affect elaboration even without changing its source spelling; their
+    # environment effects must not redefine what the negation certifies.
     content = (
-        f"{resolved_preamble}\n\n{helper_block}\n\n"
-        f"theorem {audit_name} : ¬ ({statement}) := {proof}\n\n"
-        f"#print axioms {audit_name}\n"
+        f"{resolved_preamble}\n\n{universe_decl}\n\n"
+        f"{target_context}\n{original_witness}\n{helper_block}\n\n"
+        f"{target_context}\ntheorem {audit_name} : ¬ ({statement}) := {proof}\n\n"
+        f"{type_guard}\n"
     )
     execution, _path, _backend = await invoke_with_strict_deadline(
         execute,
@@ -953,6 +1038,9 @@ async def certify_negation_proof_result(
             axioms=axioms,
             trust=trust,
             environment_hash=environment_identity,
+            verifier_version=(
+                KERNEL_NEGATION_VERIFIER_VERSION if trust is TrustLevel.LEAN_AXIOM_AUDITED else ""
+            ),
         )
 
     audit_output = ""
@@ -978,6 +1066,11 @@ async def certify_negation_proof_result(
             ],
         )
     if audited is None:
+        if _NEGATION_TYPE_MISMATCH in audit_output:
+            return CertificationResult(
+                CertificationStatus.DEFINITIVE_REJECTION,
+                reason=_NEGATION_TYPE_MISMATCH,
+            )
         return CertificationResult(
             CertificationStatus.RETRYABLE_INFRASTRUCTURE,
             certificate=build_certificate(

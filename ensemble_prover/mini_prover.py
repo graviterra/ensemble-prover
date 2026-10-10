@@ -423,6 +423,7 @@ from .proof_state_executor import (
     _proof_state_check_preamble,
     retain_pending_helper_acceptance_retry,
     stage_pending_helper_acceptance,
+    helper_acceptance_settlement_current,
     stage_closed_typed_residual_acceptance,
     _try_proof_state_child_closures,
     _try_proof_state_lemma_dag_helpers,
@@ -614,6 +615,16 @@ def _research_reserved_turns_arg(value: str) -> int:
         raise argparse.ArgumentTypeError("research reserved turns must be an integer from 0 to 1000000") from exc
     if not 0 <= parsed <= 1000000:
         raise argparse.ArgumentTypeError("research reserved turns must be an integer from 0 to 1000000")
+    return parsed
+
+
+def _search_count_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("search count must be -1 or a nonnegative integer") from exc
+    if parsed < -1:
+        raise argparse.ArgumentTypeError("search count must be -1 or a nonnegative integer")
     return parsed
 
 
@@ -1011,11 +1022,11 @@ PROVER_SYSTEM = (
     "objects, prove the smallest next local fact, and assemble those facts "
     "when the route is complete.\n"
     "\n"
-    "You have a fixed turn budget for this proof phase. Spend each turn on a "
+    "Follow the proof-phase budget supplied by the host. Spend each turn on a "
     "checkable artifact: a Lean proof attempt, a Lean patch against the latest "
-    "attempt, or tool calls that directly support that artifact. Late turns "
-    "should repair Lean errors without changing the mathematical route unless "
-    "the route is actually wrong.\n"
+    "attempt, or tool calls that directly support that artifact. Repair Lean "
+    "errors while preserving useful mathematical work; revise the route when "
+    "the evidence calls for it.\n"
     "\n"
     + _PROVER_TURN_SUBMISSION_RULES
     + _ANSWER_PLACEHOLDER_RULES
@@ -1037,7 +1048,7 @@ REFINER_SYSTEM = (
     "the smallest checked lemma, definition, or local `have` that moves the "
     "proof closer to assembly.\n"
     "\n"
-    "Use your fixed refiner turn budget deliberately: repair the formalization "
+    "Use the refiner budget supplied by the host deliberately: repair the formalization "
     "when Lean diagnostics point to a local fix, and pivot only when checked "
     "evidence shows the route is wrong. "
     + _REFINER_TURN_SUBMISSION_RULES
@@ -1484,6 +1495,7 @@ class Conversation:
             else ()
         )
         retained_tool_ids: Dict[str, str] = {}
+        retained_tool_names: Dict[str, str] = {}
 
         def bounded_recent_tool_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             role = str(msg.get("role", "") or "")
@@ -1499,6 +1511,7 @@ class Conversation:
                 # provider serialization can normalize the result IDs. Signed
                 # continuation messages retain their original IDs here.
                 retained_tool_ids.clear()
+                retained_tool_names.clear()
                 used_ids: Set[str] = set()
                 for raw_call, safe_call in zip(
                     msg["tool_calls"], safe["tool_calls"]
@@ -1512,6 +1525,9 @@ class Conversation:
                     used_ids.add(candidate)
                     safe_call["id"] = candidate
                     retained_tool_ids[str(raw_call["id"])] = candidate
+                    retained_tool_names[str(raw_call["id"])] = str(
+                        safe_call["function"]["name"]
+                    )
                 return safe
             if role == "tool":
                 safe = dict(msg)
@@ -1519,6 +1535,18 @@ class Conversation:
                 safe["tool_call_id"] = retained_tool_ids.get(raw_tool_id, raw_tool_id)
                 raw_content = str(msg.get("content", "") or "")
                 redact = _conversation_should_redact_solution_refs(self)
+                if retained_tool_names.get(raw_tool_id) in {
+                    "read_verified_helpers", "read_native_research_artifact",
+                }:
+                    # These tool results carry character pages of text or JSON,
+                    # possibly ending inside a token: generic literal redaction
+                    # erases content, and truncation invalidates the page offsets.
+                    # Keep the complete observation under the historical evidence
+                    # boundary, with the current provider answer policy applied.
+                    safe["content"] = _provider_safe_chat_message(
+                        msg, redact_solution_refs=redact,
+                    ).get("content", "")
+                    return safe
                 try:
                     structured_content = json.loads(raw_content)
                 except Exception:
@@ -1581,6 +1609,7 @@ class Conversation:
                     )
                 return safe
             retained_tool_ids.clear()
+            retained_tool_names.clear()
             return msg
 
         evidence_boundary_content = (
@@ -2094,9 +2123,8 @@ class Conversation:
                 "artifacts, then spend remaining turns on Lean repair."
             )
         return (
-            "Turn budget: you have a small fixed number of turns. Produce "
-            "checkable Lean proof artifacts first, then spend remaining turns "
-            "on Lean repair."
+            "No fixed turn count is imposed. Develop the mathematics and "
+            "check Lean artifacts incrementally, retaining useful partial work."
         )
 
     def _preserves_nl_context(self) -> bool:
@@ -2707,6 +2735,7 @@ def _messages_with_dossier_context(
     preamble: str = "",
     context_lemmas: Sequence[str] = (),
     helper_context_override: Optional[Sequence[str]] = None,
+    helper_lookup_available: bool = False,
 ) -> List[Dict[str, Any]]:
     """Attach the proof workbench snapshot as a synthetic user message."""
     if dossier is None:
@@ -2715,6 +2744,10 @@ def _messages_with_dossier_context(
         current_goal_statement=goal_statement,
         current_preamble=preamble,
         current_context_lemmas=context_lemmas,
+        **({"helper_lookup_available": True} if (
+            helper_lookup_available
+            and _callable_accepts_keyword(dossier.render_context, "helper_lookup_available")
+        ) else {}),
         **(
             {"helper_context_override": helper_context_override}
             if helper_context_override is not None
@@ -3070,6 +3103,7 @@ def _messages_with_search_context(
     context_lemmas: Sequence[str] = (),
     session_scope: str = "problem",
     helper_context_override: Optional[Sequence[str]] = None,
+    helper_lookup_available: bool = False,
 ) -> List[Dict[str, Any]]:
     """Attach durable dossier context plus run-local scheduler context."""
 
@@ -3160,6 +3194,7 @@ def _messages_with_search_context(
         preamble=preamble,
         context_lemmas=context_lemmas,
         helper_context_override=helper_context_override,
+        helper_lookup_available=helper_lookup_available,
     )
     if proof_state is None:
         return out
@@ -4409,7 +4444,7 @@ async def _sync_apply_decl_to_proof_state(
     residual_preamble: str = "",
     active_root_targets: Sequence[Dict[str, Any]] = (),
     timeout_s: float = 300.0,
-    max_residual_goals: int = 4,
+    max_residual_goals: int = -1,
     deadline_exhausted: Optional[Callable[[], bool]] = None,
     deadline_monotonic: float = 0.0,
 ) -> Dict[str, Any]:
@@ -4456,7 +4491,7 @@ async def _sync_apply_decl_to_proof_state(
         "\n".join(
             [
                 str(decl_name or ""),
-                f"residual_goal_limit={max(0, int(max_residual_goals or 0))}",
+                f"residual_goal_limit={int(max_residual_goals or 0)}",
             ]
         )
     )
@@ -4466,7 +4501,7 @@ async def _sync_apply_decl_to_proof_state(
         else ""
     )
     if applicable and proof_stub:
-        residual_goal_limit = max(0, int(max_residual_goals or 0))
+        residual_goal_limit = int(max_residual_goals or 0)
         residual_source = f"llm_tool_decl_application:{decl_name}"
         authoritative_residual_preamble = str(
             residual_preamble
@@ -4628,7 +4663,7 @@ async def _sync_apply_decl_to_proof_state(
                 parent_node=node,
                 parent_proof_stub=authoritative_proof_stub,
                 source=f"llm_tool_decl_application:{decl_name}",
-                max_goals=max(0, int(max_residual_goals or 0)),
+                max_goals=int(max_residual_goals or 0),
                 origin_metadata={
                     "kind": "llm_tool_decl_application",
                     "decl_name": decl_name,
@@ -4726,6 +4761,7 @@ async def _sync_apply_decl_to_proof_state(
             timeout_s=closure_operation_timeout_s,
             proof_cache=proof_cache,
             proof_state=proof_state,
+            target_node_id=node.node_id,
             status_out=accept_status,
             target_statement=node.target,
             deadline_exhausted=combined_deadline_exhausted,
@@ -4736,6 +4772,7 @@ async def _sync_apply_decl_to_proof_state(
                 "node_id": node.node_id,
                 "status": "llm_turn_elapsed_budget_exhausted",
             }
+        accepted = helper_acceptance_settlement_current(proof_state, node, accept_status) and accepted
         if accepted:
             node.pending_helper_acceptance = {}
             if deadline_elapsed():
@@ -4814,7 +4851,7 @@ async def _run_apply_decl_to_goal_tool_impl(
     proof_cache: Optional[MiniVerifiedLemmaCache] = None,
     turn_index: int = 0,
     tool_call_index: int = 0,
-    max_residual_goals: int = 4,
+    max_residual_goals: int = -1,
     goal_statement_override: str = "",
     redact_solution_refs: bool = True,
     deadline_exhausted: Optional[Callable[[], bool]] = None,
@@ -5691,7 +5728,7 @@ async def run_conversation(
     repair_retrieval_top_k: int = 6,
     proof_state_child_tactics_enabled: bool = True,
     proof_state_child_tactic_timeout_s: float = DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-    proof_state_child_tactic_max_candidates: int = 32,
+    proof_state_child_tactic_max_candidates: int = -1,
     proof_state_child_goal_limit: int = 3,
     proof_state_decl_application_limit: int = 6,
     proof_state_batch_parallelism: int = 1,
@@ -5700,9 +5737,9 @@ async def run_conversation(
     tactic_source_suppression_records: Sequence[Mapping[str, Any]] = (),
     session_scope: str = "problem",
 ) -> Tuple[bool, Optional[str]]:
-    """Drive one prove-or-refine conversation for a bounded turn budget.
+    """Drive a prove-or-refine conversation with an optional turn budget.
 
-    ``max_turns`` is the public LLM-attempt budget. A reused-fragment policy
+    ``max_turns`` is the public LLM-attempt budget; -1 leaves it unlimited. A reused-fragment policy
     redirect may grant a small bounded bonus turn so the model sees the local
     repair feedback that caused the redirect; telemetry reports both the base
     budget and the effective turn limit.
@@ -5761,6 +5798,13 @@ async def run_conversation(
     if native_tools:
         base_tools_list.extend(native_tools)
         base_use_tools = True
+    from .helper_inventory import READ_VERIFIED_HELPERS_TOOL, run_read_verified_helpers_tool
+
+    helper_lookup_enabled = bool(
+        base_use_tools and callable(getattr(dossier, "validate_helper_context", None))
+    )
+    if helper_lookup_enabled:
+        base_tools_list.append(READ_VERIFIED_HELPERS_TOOL)
 
     def _current_feedback_lemmas() -> List[str]:
         if dossier is None:
@@ -5854,7 +5898,7 @@ async def run_conversation(
     repair_self_check_redirect_bonus_remaining = 1
     format_policy_redirect_bonus_remaining = 1
     base_recorder = recorder
-    while turn < turn_limit:
+    while turn_limit < 0 or turn < turn_limit:
         turn += 1
         conv._last_run_turns_used = turn
         handoff_compaction_record: Dict[str, Any] = {}
@@ -6146,6 +6190,12 @@ async def run_conversation(
                     preamble=_proof_state_check_preamble(conv),
                     context_lemmas=_current_feedback_lemmas(),
                     session_scope=session_scope,
+                    helper_lookup_available=bool(
+                        helper_lookup_enabled
+                        and use_tools
+                        and tool_calls_used < max_tool_calls_per_turn
+                        and not force_finalize_without_tools
+                    ),
                 )
                 # Tools are callable iff enabled AND we still have tool-call
                 # budget. Once the budget is exhausted, the provider-aware
@@ -6809,6 +6859,10 @@ async def run_conversation(
                             from .mini_research import native_research_tool
 
                             result_text = json.dumps(native_research_tool(name, args, conv), ensure_ascii=False)
+                        elif name == "read_verified_helpers" and helper_lookup_enabled:
+                            result_text = run_read_verified_helpers_tool(
+                                dossier, _current_verified_helper_blocks(), args,
+                            )
                         elif name == "read_strategy_artifact" and strategy_runtime is not None:
                             result_text = json.dumps(strategy_runtime.read_artifact(args), ensure_ascii=False)
                         elif name == "request_strategy_review" and strategy_runtime is not None:
@@ -7080,10 +7134,7 @@ async def run_conversation(
                                 proof_cache=proof_cache,
                                 turn_index=turn,
                                 tool_call_index=tool_calls_used + 1,
-                                max_residual_goals=max(
-                                    0,
-                                    int(proof_state_child_goal_limit or 0),
-                                ),
+                                max_residual_goals=-1,
                                 goal_statement_override=(
                                     _active_root_tool_goal_statement(
                                         dossier,
@@ -7923,7 +7974,7 @@ async def run_conversation(
                 )
                 if policy_repair_redirect:
                     repair_self_check_redirect_bonus_remaining -= 1
-                    turn_limit += 1
+                    turn_limit = -1 if turn_limit < 0 else turn_limit + 1
                 _record_repair_policy_attempt(
                     dossier,
                     phase=conv.role,
@@ -7954,7 +8005,7 @@ async def run_conversation(
                         "turn_in_phase": turn,
                         "max_turns_base": max_turns,
                         "turn_limit_effective": turn_limit,
-                        "policy_repair_redirect_bonus_turn": turn > max_turns,
+                        "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                         "model": model_id,
                         **repair_self_check_record_fields,
                         "tool_calls_used": tool_calls_used,
@@ -8069,7 +8120,7 @@ async def run_conversation(
                     "turn_in_phase": turn,
                     "max_turns_base": max_turns,
                     "turn_limit_effective": turn_limit,
-                    "policy_repair_redirect_bonus_turn": turn > max_turns,
+                    "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                     "model": model_id,
                     **repair_self_check_record_fields,
                     "tool_calls_used": tool_calls_used,
@@ -8237,7 +8288,7 @@ async def run_conversation(
                     "turn_in_phase": turn,
                     "max_turns_base": max_turns,
                     "turn_limit_effective": turn_limit,
-                    "policy_repair_redirect_bonus_turn": turn > max_turns,
+                    "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                     "model": model_id,
                     **repair_self_check_record_fields,
                     "tool_calls_used": tool_calls_used,
@@ -8290,7 +8341,7 @@ async def run_conversation(
                     "turn_in_phase": turn,
                     "max_turns_base": max_turns,
                     "turn_limit_effective": turn_limit,
-                    "policy_repair_redirect_bonus_turn": turn > max_turns,
+                    "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                     "model": model_id,
                     **repair_self_check_record_fields,
                     "tool_calls_used": tool_calls_used,
@@ -8334,18 +8385,18 @@ async def run_conversation(
             )
             format_policy_redirect_granted = False
             if (
-                turn >= turn_limit
+                (turn_limit >= 0 and turn >= turn_limit)
                 and format_policy_redirect_bonus_remaining > 0
                 and turn_giveup is None
             ):
                 format_policy_redirect_bonus_remaining -= 1
-                turn_limit += 1
+                turn_limit = -1 if turn_limit < 0 else turn_limit + 1
                 format_policy_redirect_granted = True
                 _increment_dossier_tool_metric(
                     "mini_format_policy_redirect_granted",
                     1,
                 )
-            elif turn >= turn_limit:
+            elif (turn_limit >= 0 and turn >= turn_limit):
                 _increment_dossier_tool_metric(
                     "mini_policy_rejection_final_turn_no_retry",
                     1,
@@ -8356,7 +8407,7 @@ async def run_conversation(
                     "turn_in_phase": turn,
                     "max_turns_base": max_turns,
                     "turn_limit_effective": turn_limit,
-                    "policy_repair_redirect_bonus_turn": turn > max_turns,
+                    "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                     "model": model_id,
                     **repair_self_check_record_fields,
                     "tool_calls_used": tool_calls_used,
@@ -8421,18 +8472,18 @@ async def run_conversation(
             )
             format_policy_redirect_granted = False
             if (
-                turn >= turn_limit
+                (turn_limit >= 0 and turn >= turn_limit)
                 and format_policy_redirect_bonus_remaining > 0
                 and turn_giveup is None
             ):
                 format_policy_redirect_bonus_remaining -= 1
-                turn_limit += 1
+                turn_limit = -1 if turn_limit < 0 else turn_limit + 1
                 format_policy_redirect_granted = True
                 _increment_dossier_tool_metric(
                     "mini_format_policy_redirect_granted",
                     1,
                 )
-            elif turn >= turn_limit:
+            elif (turn_limit >= 0 and turn >= turn_limit):
                 _increment_dossier_tool_metric(
                     "mini_policy_rejection_final_turn_no_retry",
                     1,
@@ -8443,7 +8494,7 @@ async def run_conversation(
                     "turn_in_phase": turn,
                     "max_turns_base": max_turns,
                     "turn_limit_effective": turn_limit,
-                    "policy_repair_redirect_bonus_turn": turn > max_turns,
+                    "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                     "model": model_id,
                     **repair_self_check_record_fields,
                     "tool_calls_used": tool_calls_used,
@@ -8502,18 +8553,18 @@ async def run_conversation(
             )
             format_policy_redirect_granted = False
             if (
-                turn >= turn_limit
+                (turn_limit >= 0 and turn >= turn_limit)
                 and format_policy_redirect_bonus_remaining > 0
                 and turn_giveup is None
             ):
                 format_policy_redirect_bonus_remaining -= 1
-                turn_limit += 1
+                turn_limit = -1 if turn_limit < 0 else turn_limit + 1
                 format_policy_redirect_granted = True
                 _increment_dossier_tool_metric(
                     "mini_format_policy_redirect_granted",
                     1,
                 )
-            elif turn >= turn_limit:
+            elif (turn_limit >= 0 and turn >= turn_limit):
                 _increment_dossier_tool_metric(
                     "mini_policy_rejection_final_turn_no_retry",
                     1,
@@ -8528,7 +8579,7 @@ async def run_conversation(
                     "turn_in_phase": turn,
                     "max_turns_base": max_turns,
                     "turn_limit_effective": turn_limit,
-                    "policy_repair_redirect_bonus_turn": turn > max_turns,
+                    "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                     "model": model_id,
                     **repair_self_check_record_fields,
                     "tool_calls_used": tool_calls_used,
@@ -8648,7 +8699,7 @@ async def run_conversation(
             )
             if policy_repair_redirect:
                 reused_fragment_redirect_bonus_remaining -= 1
-                turn_limit += 1
+                turn_limit = -1 if turn_limit < 0 else turn_limit + 1
             _trace(
                 trace_prefix,
                 "  rejected repair: "
@@ -8685,7 +8736,7 @@ async def run_conversation(
                     "turn_in_phase": turn,
                     "max_turns_base": max_turns,
                     "turn_limit_effective": turn_limit,
-                    "policy_repair_redirect_bonus_turn": turn > max_turns,
+                    "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                     "model": model_id,
                     **repair_self_check_record_fields,
                     "tool_calls_used": tool_calls_used,
@@ -9109,6 +9160,11 @@ async def run_conversation(
                     phase=f"{conv.role}:helper_only_salvage",
                     turn_index=turn,
                 )
+                from ensemble_prover.helper_salvage import helper_salvage_reuse_feedback
+
+                reuse_feedback = helper_salvage_reuse_feedback(salvage_result)
+                if reuse_feedback:
+                    conv.append_user(reuse_feedback)
                 invalidated_helpers = [
                     *list(getattr(salvage_result, "replaced", []) or []),
                     *list(getattr(salvage_result, "evicted", []) or []),
@@ -9227,7 +9283,7 @@ async def run_conversation(
                                 )
                             return True, state_proof
                     if (
-                        int(proof_state_child_tactic_max_candidates or 0) > 0
+                        int(proof_state_child_tactic_max_candidates or 0) != 0
                     ):
                         # Use the proof-state acceptance preamble so this
                         # tactic-close arm validates against the same preamble
@@ -9247,10 +9303,7 @@ async def run_conversation(
                             ),
                             active_root_frame_helper_blocks=dossier.verified_helper_blocks(),
                             timeout_s=helper_probe_timeout,
-                            max_candidates=max(
-                                1,
-                                int(proof_state_child_tactic_max_candidates or 1),
-                            ),
+                            max_candidates=int(proof_state_child_tactic_max_candidates or 0),
                             suppress_solution_placeholders=bool(
                                 getattr(conv, "suppress_solution_placeholders", True)
                             ),
@@ -9579,7 +9632,7 @@ async def run_conversation(
                     "turn_in_phase": turn,
                     "max_turns_base": max_turns,
                     "turn_limit_effective": turn_limit,
-                    "policy_repair_redirect_bonus_turn": turn > max_turns,
+                    "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                     "model": model_id,
                     **repair_self_check_record_fields,
                     "tool_calls_used": tool_calls_used,
@@ -9689,7 +9742,7 @@ async def run_conversation(
                     "turn_in_phase": turn,
                     "max_turns_base": max_turns,
                     "turn_limit_effective": turn_limit,
-                    "policy_repair_redirect_bonus_turn": turn > max_turns,
+                    "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                     "model": model_id,
                     **repair_self_check_record_fields,
                     "tool_calls_used": tool_calls_used,
@@ -10068,6 +10121,30 @@ async def run_conversation(
             _trace(trace_prefix, f"  ✓ Lean accepted ({lean_elapsed}s). Proof found.")
             helper_names = _helper_names_from_blocks(check_lemmas)
             if dossier is not None:
+                from .verified_helper_contract import analyze_verified_helper_context
+                from .mini_recursive import _recursive_contract_operation_timeout_s
+
+                checked_context = tuple(check_lemmas)
+                checked_preamble = _proof_state_check_preamble(conv)
+                checked_target = str(conv.goal_statement)
+                checked_environment = str(dossier.current_lean_environment_hash or "")
+
+                def helper_context_is_current() -> bool:
+                    return (
+                        tuple(check_lemmas) == checked_context
+                        and _proof_state_check_preamble(conv) == checked_preamble
+                        and str(conv.goal_statement) == checked_target
+                        and str(dossier.current_lean_environment_hash or "") == checked_environment
+                    )
+
+                helper_contracts = await analyze_verified_helper_context(
+                    lean, checked_context, preamble=checked_preamble,
+                    environment_hash=checked_environment,
+                    timeout_s=_recursive_contract_operation_timeout_s(lean, 0.0),
+                    context_is_current=helper_context_is_current,
+                )
+                if not helper_context_is_current():
+                    raise RuntimeError("Verified helper context changed during contract observation")
                 checked_helper_sources = set(check_lemmas)
                 semantic_replacement_names: List[str] = []
                 for helper in helpers:
@@ -10085,6 +10162,7 @@ async def run_conversation(
                         turn_index=turn,
                         replay_context_names=helper_replay_context_names,
                         replace_existing_same_name=True,
+                        **helper_contracts.get(helper, {}),
                     )
                     if helper_record is None:
                         continue
@@ -10199,7 +10277,7 @@ async def run_conversation(
                     "turn_in_phase": turn,
                     "max_turns_base": max_turns,
                     "turn_limit_effective": turn_limit,
-                    "policy_repair_redirect_bonus_turn": turn > max_turns,
+                    "policy_repair_redirect_bonus_turn": (max_turns >= 0 and turn > max_turns),
                     "model": model_id,
                     **repair_self_check_record_fields,
                     "tool_calls_used": tool_calls_used,
@@ -10507,6 +10585,11 @@ async def run_conversation(
                 phase=conv.role,
                 turn_index=turn,
             )
+            from ensemble_prover.helper_salvage import helper_salvage_reuse_feedback
+
+            reuse_feedback = helper_salvage_reuse_feedback(salvage_result)
+            if reuse_feedback:
+                conv.append_user(reuse_feedback)
             invalidated_helpers = [
                 *list(getattr(salvage_result, "replaced", []) or []),
                 *list(getattr(salvage_result, "evicted", []) or []),
@@ -10578,7 +10661,7 @@ async def run_conversation(
                             )
                         return True, state_proof
                 root_tactic = None
-                if helper_probe_candidates > 0:
+                if helper_probe_candidates != 0:
                     # see helper-only-reply path above.
                     # The post-failure salvage cascade must use the same
                     # preamble as the proof-state assembly arm.
@@ -10597,7 +10680,7 @@ async def run_conversation(
                         ),
                         active_root_frame_helper_blocks=dossier.verified_helper_blocks(),
                         timeout_s=helper_probe_timeout,
-                        max_candidates=max(1, helper_probe_candidates),
+                        max_candidates=helper_probe_candidates,
                         suppress_solution_placeholders=bool(
                             getattr(conv, "suppress_solution_placeholders", True)
                         ),
@@ -10939,6 +11022,7 @@ async def run_conversation(
                         "accepted": salvage_result.accepted,
                         "rejected": salvage_result.rejected,
                         "skipped": salvage_result.skipped,
+                        "reused": dict(getattr(salvage_result, "reused", {}) or {}),
                     }
                     if salvage_result is not None
                     else None
@@ -11080,15 +11164,15 @@ _PROVE_PROBLEM_OPERATIONAL_DEFAULTS: Dict[str, Any] = {
     **_PROVE_PROBLEM_COMPAT_DEFAULTS,
     "max_tool_calls_per_turn": 60,
     "premise_retrieval_top_k": max(PREMISE_DEFAULT_TOP_K, 64),
-    "proof_state_child_tactic_max_candidates": 36,
+    "proof_state_child_tactic_max_candidates": -1,
     "proof_state_cache_enabled": True,
     "mini_recursive_enabled": True,
     "adaptive_recursive_on_stall": True,
-    "mini_recursive_passes": 6,
+    "mini_recursive_passes": -1,
     "mini_recursive_max_claims": PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
-    "mini_recursive_turns_per_claim": 3,
+    "mini_recursive_turns_per_claim": -1,
     "mini_recursive_tactic_timeout_s": 60.0,
-    "mini_recursive_tactic_max_candidates": max(48, 36),
+    "mini_recursive_tactic_max_candidates": -1,
     "recursive_helper_prover_enabled": True,
     "recursive_helper_refine": True,
     "mini_phase_temperatures_enabled": True,
@@ -11190,13 +11274,13 @@ async def prove_problem(
     formal_state_search_provider_reasoning_effort: str = (
         DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT
     ),
-    formal_state_search_provider_max_attempts: int = 2,
+    formal_state_search_provider_max_attempts: int = 0,
     formal_state_search_provider_retry_backoff_s: float = 5.0,
     formal_state_search_beam_width: int = 4,
     formal_state_search_max_steps: int = 8,
-    formal_state_search_max_candidates: int = 6,
+    formal_state_search_max_candidates: int = 0,
     formal_state_search_backtrack_limit: int = 8,
-    formal_state_search_max_no_improvement_quanta: int = 6,
+    formal_state_search_max_no_improvement_quanta: int = 0,
     falsification_enabled: bool = True,
     falsification_max_checks: int = 32,
     falsification_operation_timeout_s: float = (
@@ -11207,7 +11291,7 @@ async def prove_problem(
     proof_state_cache_path: Optional[Path] = None,
     root_tactic_prepass_enabled: bool = False,
     root_tactic_timeout_s: float = 40.0,
-    root_tactic_max_candidates: int = 64,
+    root_tactic_max_candidates: int = -1,
     startup_root_fast_lane_enabled: Optional[bool] = None,
     startup_root_fast_lane_tactic_timeout_s: float = 300.0,
     startup_root_fast_lane_tactic_max_candidates: int = 12,
@@ -11225,10 +11309,10 @@ async def prove_problem(
     default_profile: str = "operational",
     # recursive helper prover.
     recursive_helper_prover_enabled: Optional[bool] = None,
-    recursive_helper_budget: int = 0,
-    recursive_helper_max_depth: int = 3,
-    recursive_helper_max_attempts_per_node: int = 2,
-    recursive_helper_turns: int = 5,
+    recursive_helper_budget: int = -1,
+    recursive_helper_max_depth: int = 0,
+    recursive_helper_max_attempts_per_node: int = 0,
+    recursive_helper_turns: int = -1,
     recursive_helper_refine: Optional[bool] = None,
     theory_library: Optional[Any] = None,
     theory_candidate_builder: Optional[Any] = None,
@@ -11823,8 +11907,8 @@ async def prove_theorem_project(
     refiner_client: Optional[OpenAICompatClient] = None,
     lean: Optional[LeanRunner] = None,
     scratch_dir: Optional[Path] = None,
-    max_prove_turns: int = 30,
-    max_refine_turns: int = 25,
+    max_prove_turns: int = -1,
+    max_refine_turns: int = -1,
     dossier_factory: Optional[Callable[[TheoremProblem], ProofDossier]] = None,
     lean_warm_contexts: bool = False,
     lean_context_workers: int = 1,
@@ -13459,15 +13543,15 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--max-prove-turns",
-        type=int,
-        default=30,
-        help="Maximum direct prover conversation turns (default: %(default)s).",
+        type=_search_count_arg,
+        default=-1,
+        help='Maximum prover conversation turns; -1 is unlimited (default). Zero disables the role.',
     )
     p.add_argument(
         "--max-refine-turns",
-        type=int,
-        default=25,
-        help="Maximum refiner conversation turns (default: %(default)s).",
+        type=_search_count_arg,
+        default=-1,
+        help='Maximum refiner conversation turns; -1 is unlimited (default). Zero disables the role.',
     )
     p.add_argument(
         "--autonomous-research",
@@ -13853,11 +13937,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--proof-state-child-tactic-max-candidates",
-        type=int,
-        default=36,
+        type=_search_count_arg,
+        default=-1,
         help=(
             "Maximum deterministic tactic candidates per proof-state child "
-            "goal (default: %(default)s)."
+            "goal (-1 keeps the full generated portfolio; zero disables it)."
         ),
     )
     p.add_argument(
@@ -13949,8 +14033,8 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--formal-state-search-provider-max-attempts",
         type=int,
-        default=2,
-        help="Maximum paid attempts for one identical formal policy request.",
+        default=0,
+        help="Maximum attempts for one formal policy request; zero leaves retries unlimited (default), with backoff.",
     )
     p.add_argument(
         "--formal-state-search-provider-retry-backoff-s",
@@ -13968,24 +14052,24 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--formal-state-search-max-steps",
         type=int,
         default=8,
-        help="Maximum tactic-prefix depth for one formal-state search.",
+        help="Tactic-prefix depth window per formal-search quantum; pending deeper states continue in later quanta.",
     )
     p.add_argument(
         "--formal-state-search-max-candidates",
         type=int,
-        default=6,
-        help="Maximum generated tactics checked per expanded Lean state.",
+        default=0,
+        help="Maximum generated tactics checked per Lean state; zero retains the full generated batch (default).",
     )
     p.add_argument(
         "--formal-state-search-backtrack-limit",
         type=int,
         default=8,
-        help="Maximum checked reserve states restored after a beam dead end.",
+        help="Checked reserve states restored per quantum; remaining reserve states stay queued.",
     )
     p.add_argument(
         "--formal-state-search-max-no-improvement-quanta",
         type=int,
-        default=6,
+        default=0,
         help=(
             "Consecutive completed formal-search quanta without kernel-facing "
             "or diagnostic improvement before retiring that unchanged context; "
@@ -14301,11 +14385,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--root-tactic-max-candidates",
-        type=int,
-        default=64,
+        type=_search_count_arg,
+        default=-1,
         help=(
             "Maximum deterministic root-close candidates for the prepass "
-            "(default: %(default)s)."
+            "(-1 keeps the full generated portfolio; zero disables it)."
         ),
     )
     p.add_argument(
@@ -14366,31 +14450,26 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mini-recursive-passes",
-        type=int,
-        default=6,
+        type=_search_count_arg,
+        default=-1,
         help=(
-            "Number of recursive plan/prove/integrate passes when "
-            "--mini-recursive is enabled (default: %(default)s)."
+            'Recursive plan/prove passes; -1 is unlimited (default). Zero disables the lane.'
         ),
     )
     p.add_argument(
         "--mini-recursive-claims",
-        type=int,
+        type=_search_count_arg,
         default=PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
         help=(
-            "Maximum helper-plus-root claims across planner tranches "
-            "(default: %(default)s). One tranche is 6 claims; this leaves "
-            "room for a later root_assembly instead of filling the cap "
-            "with helpers and proving a route-less ladder."
+            'Maximum helper-plus-root claims across planner tranches; -1 is unlimited (default). Planning remains incremental.'
         ),
     )
     p.add_argument(
         "--mini-recursive-turns-per-claim",
-        type=int,
-        default=6,
+        type=_search_count_arg,
+        default=-1,
         help=(
-            "Prover/refiner turns allocated to each recursive helper goal "
-            "(default: %(default)s)."
+            'Conversation turns per recursive helper; -1 is unlimited (default).'
         ),
     )
     p.add_argument(
@@ -14404,11 +14483,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mini-recursive-tactic-max-candidates",
-        type=int,
-        default=48,
+        type=_search_count_arg,
+        default=-1,
         help=(
             "Maximum deterministic tactic candidates per mini recursive closer "
-            "call (default: %(default)s)."
+            "call (-1 keeps the full generated portfolio; zero disables it)."
         ),
     )
     p.add_argument(
@@ -14498,45 +14577,38 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--recursive-helper-budget",
         dest="recursive_helper_budget",
-        type=int,
-        default=0,
+        type=_search_count_arg,
+        default=-1,
         help=(
-            "Maximum invocations of RecursiveHelperProverAction per "
-            "session. 0 (default) auto-derives from max_prove_turns × 2."
+            "Recursive helper invocations per session; -1 is unlimited (default). "
+            "Zero derives the allocation from prover turns."
         ),
     )
     p.add_argument(
         "--recursive-helper-max-depth",
         dest="recursive_helper_max_depth",
         type=int,
-        default=3,
+        default=0,
         help=(
-            "Maximum recursion depth for child sub-sessions. At the cap, "
-            "the give-up gate's nudge stops asking for further "
-            "decomposition and instructs the LLM to make a direct "
-            "attempt. Default 3 — beyond that, sub-sessions chain into "
-            "diminishing returns."
+            'Maximum child recursion depth; zero leaves depth unlimited (default).'
         ),
     )
     p.add_argument(
         "--recursive-helper-max-attempts-per-node",
         dest="recursive_helper_max_attempts_per_node",
         type=int,
-        default=2,
+        default=0,
         help=(
-            "Maximum recursive-helper-prover attempts on a single open "
-            "child_goal node. Once exceeded, the node sits open until "
-            "deterministic actions close it or budget exhausts."
+            'Maximum recursive helper attempts per open node; zero leaves attempts unlimited (default).'
         ),
     )
     p.add_argument(
         "--recursive-helper-turns",
         dest="recursive_helper_turns",
-        type=int,
-        default=5,
+        type=_search_count_arg,
+        default=-1,
         help=(
-            "Maximum LLM turns the child sub-session can spend on each "
-            "helper goal. Default 5."
+            'Conversation turns per recursive helper; -1 is unlimited (default).'
         ),
     )
     p.add_argument(
@@ -14617,11 +14689,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--answer-attempts",
-        type=int,
-        default=3,
+        type=_search_count_arg,
+        default=-1,
         help=(
             "Proposal/review attempts for answer(sorry) questions before ordinary "
-            "proof search; uses the prover model and shares cost/time limits (default: %(default)s)."
+            "proof search; -1 leaves attempts unlimited (default), zero disables proposals. "
+            "Uses the prover model and shares cost/time limits."
         ),
     )
     return p
@@ -16048,17 +16121,14 @@ async def _main_async(args: argparse.Namespace) -> int:
                         or 0.0
                     ),
                 ),
-                proof_state_child_tactic_max_candidates=max(
-                    0,
-                    int(
+                proof_state_child_tactic_max_candidates=int(
                         getattr(
                             args,
                             "proof_state_child_tactic_max_candidates",
-                            36,
+                            -1,
                         )
                         or 0
                     ),
-                ),
                 proof_state_child_goal_limit=max(
                     0, int(getattr(args, "proof_state_child_goal_limit", 3) or 0)
                 ),
@@ -16137,12 +16207,12 @@ async def _main_async(args: argparse.Namespace) -> int:
                     or DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT
                 ),
                 formal_state_search_provider_max_attempts=max(
-                    1,
+                    0,
                     int(
                         getattr(
                             args,
                             "formal_state_search_provider_max_attempts",
-                            2,
+                            0,
                         )
                         or 1
                     ),
@@ -16167,10 +16237,10 @@ async def _main_async(args: argparse.Namespace) -> int:
                     int(getattr(args, "formal_state_search_max_steps", 8) or 1),
                 ),
                 formal_state_search_max_candidates=max(
-                    1,
+                    0,
                     int(
-                        getattr(args, "formal_state_search_max_candidates", 6)
-                        or 1
+                        getattr(args, "formal_state_search_max_candidates", 0)
+                        or 0
                     ),
                 ),
                 formal_state_search_backtrack_limit=max(
@@ -16186,7 +16256,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                         getattr(
                             args,
                             "formal_state_search_max_no_improvement_quanta",
-                            6,
+                            0,
                         )
                         or 0
                     ),
@@ -16211,9 +16281,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 root_tactic_timeout_s=max(
                     0.0, float(getattr(args, "root_tactic_timeout_s", 40.0) or 0.0)
                 ),
-                root_tactic_max_candidates=max(
-                    0, int(getattr(args, "root_tactic_max_candidates", 64) or 0)
-                ),
+                root_tactic_max_candidates=int(getattr(args, "root_tactic_max_candidates", -1) or 0),
                 startup_root_fast_lane_enabled=bool(
                     getattr(args, "startup_root_fast_lane", False)
                 ),
@@ -16245,24 +16313,9 @@ async def _main_async(args: argparse.Namespace) -> int:
                 adaptive_recursive_on_stall=bool(
                     getattr(args, "adaptive_recursive_on_stall", True)
                 ),
-                mini_recursive_passes=max(
-                    1, int(getattr(args, "mini_recursive_passes", 6) or 6)
-                ),
-                mini_recursive_max_claims=max(
-                    1,
-                    int(
-                        getattr(
-                            args,
-                            "mini_recursive_claims",
-                            PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
-                        )
-                        or PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS
-                    ),
-                ),
-                mini_recursive_turns_per_claim=max(
-                    1,
-                    int(getattr(args, "mini_recursive_turns_per_claim", 6) or 6),
-                ),
+                mini_recursive_passes=int(getattr(args, "mini_recursive_passes", -1)),
+                mini_recursive_max_claims=int(getattr(args, "mini_recursive_claims", -1)),
+                mini_recursive_turns_per_claim=int(getattr(args, "mini_recursive_turns_per_claim", -1)),
                 mini_recursive_tactic_timeout_s=max(
                     1.0,
                     float(
@@ -16270,37 +16323,34 @@ async def _main_async(args: argparse.Namespace) -> int:
                         or 60.0
                     ),
                 ),
-                mini_recursive_tactic_max_candidates=max(
-                    1,
-                    int(
+                mini_recursive_tactic_max_candidates=int(
                         getattr(
                             args,
                             "mini_recursive_tactic_max_candidates",
-                            48,
+                            -1,
                         )
                         or 48
                     ),
-                ),
                 dossier=proof_dossier,
                 recursive_helper_prover_enabled=bool(
                     getattr(args, "recursive_helper_prover", True)
                 ),
                 recursive_helper_budget=int(
-                    getattr(args, "recursive_helper_budget", 0) or 0
+                    getattr(args, "recursive_helper_budget", -1)
                 ),
                 recursive_helper_max_depth=int(
-                    getattr(args, "recursive_helper_max_depth", 3)
-                    if getattr(args, "recursive_helper_max_depth", 3) is not None
-                    else 3
+                    getattr(args, "recursive_helper_max_depth", 0)
+                    if getattr(args, "recursive_helper_max_depth", 0) is not None
+                    else 0
                 ),
                 recursive_helper_max_attempts_per_node=int(
-                    getattr(args, "recursive_helper_max_attempts_per_node", 2)
-                    if getattr(args, "recursive_helper_max_attempts_per_node", 2)
+                    getattr(args, "recursive_helper_max_attempts_per_node", 0)
+                    if getattr(args, "recursive_helper_max_attempts_per_node", 0)
                     is not None
-                    else 2
+                    else 0
                 ),
                 recursive_helper_turns=int(
-                    getattr(args, "recursive_helper_turns", 5) or 5
+                    getattr(args, "recursive_helper_turns", -1)
                 ),
                 recursive_helper_refine=bool(
                     getattr(args, "recursive_helper_refine", True)
@@ -17153,17 +17203,14 @@ async def _main_async(args: argparse.Namespace) -> int:
                             or 0.0
                         ),
                     ),
-                    "proof_state_child_tactic_max_candidates": max(
-                        0,
-                        int(
+                    "proof_state_child_tactic_max_candidates": int(
                             getattr(
                                 args,
                                 "proof_state_child_tactic_max_candidates",
-                                36,
+                                -1,
                             )
                             or 0
                         ),
-                    ),
                     "proof_state_child_goal_limit": max(
                         0,
                         int(
@@ -17245,12 +17292,12 @@ async def _main_async(args: argparse.Namespace) -> int:
                         or DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT
                     ),
                     "formal_state_search_provider_max_attempts": max(
-                        1,
+                        0,
                         int(
                             getattr(
                                 args,
                                 "formal_state_search_provider_max_attempts",
-                                2,
+                                0,
                             )
                             or 1
                         ),
@@ -17281,10 +17328,10 @@ async def _main_async(args: argparse.Namespace) -> int:
                         ),
                     ),
                     "formal_state_search_max_candidates": max(
-                        1,
+                        0,
                         int(
-                            getattr(args, "formal_state_search_max_candidates", 6)
-                            or 1
+                            getattr(args, "formal_state_search_max_candidates", 0)
+                            or 0
                         ),
                     ),
                     "formal_state_search_backtrack_limit": max(
@@ -17300,7 +17347,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                             getattr(
                                 args,
                                 "formal_state_search_max_no_improvement_quanta",
-                                6,
+                                0,
                             )
                             or 0
                         ),
@@ -17331,13 +17378,10 @@ async def _main_async(args: argparse.Namespace) -> int:
                             or 0.0
                         ),
                     ),
-                    "root_tactic_max_candidates": max(
-                        0,
-                        int(
-                            getattr(args, "root_tactic_max_candidates", 64)
+                    "root_tactic_max_candidates": int(
+                            getattr(args, "root_tactic_max_candidates", -1)
                             or 0
                         ),
-                    ),
                     "startup_root_fast_lane_enabled": bool(
                         getattr(args, "startup_root_fast_lane", False)
                     ),
@@ -17363,53 +17407,11 @@ async def _main_async(args: argparse.Namespace) -> int:
                     "adaptive_recursive_on_stall": bool(
                         getattr(args, "adaptive_recursive_on_stall", True)
                     ),
-                    "mini_recursive_passes": max(
-                        1, int(getattr(args, "mini_recursive_passes", 6) or 6)
-                    ),
-                    "mini_recursive_max_claims": max(
-                        1,
-                        int(
-                            getattr(
-                                args,
-                                "mini_recursive_claims",
-                                PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
-                            )
-                            or PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS
-                        ),
-                    ),
-                    "mini_recursive_claims_configured": max(
-                        1,
-                        int(
-                            getattr(
-                                args,
-                                "mini_recursive_claims",
-                                PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
-                            )
-                            or PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS
-                        ),
-                    ),
-                    "mini_recursive_claims": max(
-                        1,
-                        int(
-                            getattr(
-                                args,
-                                "mini_recursive_claims",
-                                PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
-                            )
-                            or PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS
-                        ),
-                    ),
-                    "mini_recursive_turns_per_claim": max(
-                        1,
-                        int(
-                            getattr(
-                                args,
-                                "mini_recursive_turns_per_claim",
-                                6,
-                            )
-                            or 6
-                        ),
-                    ),
+                    "mini_recursive_passes": int(getattr(args, "mini_recursive_passes", -1)),
+                    "mini_recursive_max_claims": int(getattr(args, "mini_recursive_claims", -1)),
+                    "mini_recursive_claims_configured": int(getattr(args, "mini_recursive_claims", -1)),
+                    "mini_recursive_claims": int(getattr(args, "mini_recursive_claims", -1)),
+                    "mini_recursive_turns_per_claim": int(getattr(args, "mini_recursive_turns_per_claim", -1)),
                     "mini_recursive_tactic_timeout_s": max(
                         1.0,
                         float(
@@ -17421,17 +17423,14 @@ async def _main_async(args: argparse.Namespace) -> int:
                             or 60.0
                         ),
                     ),
-                    "mini_recursive_tactic_max_candidates": max(
-                        1,
-                        int(
+                    "mini_recursive_tactic_max_candidates": int(
                             getattr(
                                 args,
                                 "mini_recursive_tactic_max_candidates",
-                                48,
+                                -1,
                             )
                             or 48
                         ),
-                    ),
                     "lean_project_dir": args.lean_project_dir,
                     "lean_timeout_s": int(args.lean_timeout_s),
                     # The solved export must replay under the same budget the

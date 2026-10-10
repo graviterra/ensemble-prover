@@ -12,6 +12,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from itertools import count
 from pathlib import Path
 from typing import Any
 
@@ -279,7 +280,7 @@ async def discover_answer(
     directory: Path,
     ask: Callable[[list[dict[str, Any]], str], Awaitable[str]],
     validate: Callable[[Path, list[str]], Awaitable[str | None]],
-    max_attempts: int = 3,
+    max_attempts: int = -1,
     prior_refutation: str = "",
     refuted_answers: list[str] | None = None,
     require_semantic_grounding: bool = False,
@@ -291,9 +292,10 @@ async def discover_answer(
     proof search. An unsuccessful proof is not evidence that its answer is false.
     Injected validators may retain their historical None return; the production
     frontend explicitly requires fresh elaboration before requesting review.
+    Negative one leaves proposal count unlimited; zero disables proposals.
     """
-    if type(max_attempts) is not int or max_attempts < 1:
-        raise ValueError("answer attempts must be a positive integer")
+    if type(max_attempts) is not int or max_attempts < -1:
+        raise ValueError("answer attempts must be -1 or a nonnegative integer")
     if request.lean_file.read_bytes() != template.original_bytes:
         raise ValueError("original question changed before answer discovery")
     directory.mkdir(parents=True, exist_ok=False)
@@ -329,12 +331,13 @@ async def discover_answer(
         save_record(directory, record)
         messages.append(_message("user", prior_refutation))
     try:
-        for index in range(1, max_attempts + 1):
+        for index in count(1) if max_attempts < 0 else range(1, max_attempts + 1):
             entry: dict[str, Any] = {"index": index, "status": "requesting"}
             record["attempts"].append(entry)
             save_record(directory, record)
             print(
-                f"[answer_discovery] proposing answer {index}/{max_attempts}",
+                f"[answer_discovery] proposing answer {index}"
+                + (f"/{max_attempts}" if max_attempts >= 0 else ""),
                 flush=True,
             )
             content = await ask(messages, "answer_proposal")

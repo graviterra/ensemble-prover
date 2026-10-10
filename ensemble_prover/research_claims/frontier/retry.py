@@ -190,4 +190,5 @@ def new_recovery_epoch(
     budget["execution_admissions"] = 0
     budget["preflight_failures"] = 0
     budget["paused"] = False
+    budget["deadline"] = None
     return budget

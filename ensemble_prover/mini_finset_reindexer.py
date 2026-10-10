@@ -537,9 +537,9 @@ def finset_reindexing_scripts(
     profile: FinsetReindexingProfile,
     *,
     needs_intro: bool,
-    max_scripts: int = 18,
+    max_scripts: int = -1,
 ) -> tuple[FinsetReindexingScript, ...]:
-    """Generate bounded finite reindexing tactic scripts for a profile."""
+    """Generate the finite reindexing grammar, with optional explicit capping."""
 
     if not profile.should_attempt:
         return ()
@@ -582,8 +582,8 @@ def finset_reindexing_scripts(
     if profile.finite_product_count > 0:
         _add_product_scripts(add, profile)
 
-    cap = max(0, int(max_scripts or 0))
-    return tuple(scripts[:cap] if cap else ())
+    cap = int(max_scripts or 0)
+    return tuple(scripts if cap < 0 else scripts[:cap])
 
 
 def finset_reindexing_context_key(text: str, helper_names: Sequence[str] = ()) -> str:

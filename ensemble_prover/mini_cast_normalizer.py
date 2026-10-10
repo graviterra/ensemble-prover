@@ -372,7 +372,7 @@ def cast_normalization_scripts(
     profile: CastNormalizationProfile,
     *,
     needs_intro: bool,
-    max_scripts: int = 8,
+    max_scripts: int = -1,
 ) -> tuple[CastNormalizationScript, ...]:
     """Generate guarded cast-normalization tactic scripts for a profile."""
 
@@ -430,8 +430,8 @@ def cast_normalization_scripts(
         source="cast_normalization_zify",
     )
 
-    cap = max(0, int(max_scripts or 0))
-    return tuple(scripts[:cap] if cap else ())
+    cap = int(max_scripts or 0)
+    return tuple(scripts if cap < 0 else scripts[:cap])
 
 
 def cast_normalization_context_key(text: str, helper_names: Sequence[str] = ()) -> str:

@@ -50,7 +50,7 @@ class HelperAdmissionQuality:
 
 
 _HELPER_QUALITY_CACHE_MAX_BYTES = 4 * 1024 * 1024
-_HELPER_QUALITY_CACHE_MAX_ENTRIES = 128
+_HELPER_QUALITY_CACHE_MAX_ENTRIES: int | None = None
 _HELPER_QUALITY_CACHE: OrderedDict[
     tuple[int, str, tuple[str, ...]], tuple[tuple[Any, ...], int]
 ] = OrderedDict()
@@ -717,11 +717,14 @@ def classify_auxiliary_statement_quality(
             _HELPER_QUALITY_CACHE_BYTES -= previous[1]
         while _HELPER_QUALITY_CACHE and (
             _HELPER_QUALITY_CACHE_BYTES + weight > _HELPER_QUALITY_CACHE_MAX_BYTES
-            or len(_HELPER_QUALITY_CACHE) >= _HELPER_QUALITY_CACHE_MAX_ENTRIES
+            or (
+                _HELPER_QUALITY_CACHE_MAX_ENTRIES is not None
+                and len(_HELPER_QUALITY_CACHE) >= _HELPER_QUALITY_CACHE_MAX_ENTRIES
+            )
         ):
             _, (_, evicted_weight) = _HELPER_QUALITY_CACHE.popitem(last=False)
             _HELPER_QUALITY_CACHE_BYTES -= evicted_weight
-        if _HELPER_QUALITY_CACHE_MAX_ENTRIES > 0:
+        if _HELPER_QUALITY_CACHE_MAX_ENTRIES is None or _HELPER_QUALITY_CACHE_MAX_ENTRIES > 0:
             _HELPER_QUALITY_CACHE[key] = (values, weight)
             _HELPER_QUALITY_CACHE_BYTES += weight
     return result
@@ -808,7 +811,8 @@ def verified_helper_admission_quality(helper: Any) -> HelperAdmissionQuality:
 
     This adapter keeps consumers from inferring quality from visibility,
     helper counts, or dynamic graph tags.  It deliberately reads only the
-    stable theorem statement.
+    theorem statement and source-bound binder evidence. A required observation
+    cannot be replaced by a familiar type spelling in the source text.
     """
 
     statement = ""
@@ -843,6 +847,24 @@ def verified_helper_admission_quality(helper: Any) -> HelperAdmissionQuality:
         statement = str(helper_decl_statement(source) or "").strip()
     if not statement and isinstance(helper, str):
         statement = helper.strip()
+    observation_required = (
+        helper.get("contract_observation_required", False)
+        if isinstance(helper, Mapping)
+        else getattr(helper, "contract_observation_required", False)
+    )
+    if observation_required:
+        from types import SimpleNamespace
+        from .proof_dossier import verified_helper_has_typed_binder_evidence
+
+        evidence = SimpleNamespace(**helper) if isinstance(helper, Mapping) else helper
+        if not verified_helper_has_typed_binder_evidence(evidence):
+            return HelperAdmissionQuality(
+                schema_version=HELPER_ADMISSION_QUALITY_SCHEMA_VERSION,
+                classification="unresolved_binder_contract",
+                generic_novelty=False,
+                cache_publishable=False,
+                auxiliary_target_admissible=False,
+            )
     if not has_lean_contract_identity(contract_identity):
         proof_binder_types = ()
     return classify_auxiliary_statement_quality(

@@ -784,7 +784,7 @@ async def _run_try_skeleton_tool_impl(
     helper_context_override: Optional[Sequence[str]] = None,
     turn_index: int = 0,
     tool_call_index: int = 0,
-    max_residual_goals: int = 4,
+    max_residual_goals: int = -1,
     timeout_s: Optional[float] = None,
     max_heartbeats: Optional[int] = 1600000,
     redact_solution_refs: bool = True,
@@ -915,8 +915,8 @@ async def _run_try_skeleton_tool_impl(
             message="try_skeleton error: no open parent goal is available.",
             redact_solution_refs=redact_solution_refs,
         )
-    limit = max(0, int(max_residual_goals or 0))
-    if limit <= 0:
+    limit = int(max_residual_goals or 0)
+    if limit == 0:
         return _reject(
             dossier=dossier,
             reason="residual_goal_budget_disabled",
@@ -1276,7 +1276,7 @@ async def _run_try_skeleton_tool_impl(
                 )
             },
         )
-    if len(goals) > limit:
+    if limit >= 0 and len(goals) > limit:
         return _reject(
             dossier=dossier,
             reason="residual_goal_cap_exceeded",

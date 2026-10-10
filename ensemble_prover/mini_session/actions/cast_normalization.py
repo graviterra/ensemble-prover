@@ -50,7 +50,7 @@ class CastNormalizationAction:
         *,
         phase: str = "cast_normalization_prepass",
         timeout_s: float = 12.0,
-        max_candidates: int = 16,
+        max_candidates: int = -1,
         max_transient_attempts: int = 3,
     ) -> None:
         self.phase = str(phase or "cast_normalization_prepass")
@@ -64,7 +64,7 @@ class CastNormalizationAction:
 
 
     def is_applicable(self, session: Any) -> bool:
-        if self.timeout_s <= 0.0 or self.max_candidates <= 0:
+        if self.timeout_s <= 0.0 or self.max_candidates == 0:
             return False
         if session.dossier is None or session.lean is None:
             return False

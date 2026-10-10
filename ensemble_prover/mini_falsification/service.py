@@ -30,6 +30,7 @@ from .model import (
     FalsificationFinding,
     FalsificationOutcome,
     FalsificationReport,
+    KERNEL_NEGATION_VERIFIER_VERSION,
     TargetKind,
     candidate_from_record,
     content_hash,
@@ -169,6 +170,9 @@ def falsification_environment_hash(
             "preamble": str(preamble or ""),
             "helpers": safe_helper_sources(helpers),
             "policy_hash": policy.policy_hash,
+            # Verifier upgrades invalidate campaign/replay authority without
+            # changing user policy or the session checkpoint action identity.
+            "negation_verifier": KERNEL_NEGATION_VERIFIER_VERSION,
             "lean_config": {
                 "project_dir": project_dir,
                 "preamble_import": str(getattr(cfg, "preamble_import", "") or ""),

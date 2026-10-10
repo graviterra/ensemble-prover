@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, ClassVar, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 try:  # The Mini prover runs on POSIX hosts; retain a fail-closed fallback.
     import fcntl
@@ -24,7 +24,9 @@ from .proof_dossier import (
     verified_helper_is_premise_projection,
 )
 from .helper_quality import classify_auxiliary_statement_quality
+from .contract_identity import lean_contract_statement_source_key
 from .proof_graph import (
+    graph_statement_candidate_key,
     graph_statement_key,
     graph_statement_non_theorem_reason,
     helper_decl_statement,
@@ -347,7 +349,12 @@ def _strip_lean_comments_and_strings(src: str) -> str:
 
 def _find_forbidden_lean_command(helpers: List[str], proof: str) -> Optional[str]:
     src = "\n\n".join([*helpers, proof])
-    stripped = _strip_lean_comments_and_strings(src)
+    return _find_forbidden_masked_lean_command(_strip_lean_comments_and_strings(src))
+
+
+def _find_forbidden_masked_lean_command(stripped: str) -> Optional[str]:
+    """Inspect an already masked source without repeating its lexical scan."""
+
     for match in _FORBIDDEN_LEAN_COMMAND_RE.finditer(stripped):
         command = match.group(1)
         leading = stripped[match.start() : match.start(1)]
@@ -366,11 +373,12 @@ def _find_forbidden_lean_command(helpers: List[str], proof: str) -> Optional[str
     return None
 
 
-def _split_top_level_chunks(src: str) -> Tuple[str, List[str]]:
+def _top_level_chunk_matches(scan_src: str) -> List[re.Match[str]]:
+    """Locate declarations in one exact comment/string-masked source."""
+
     from .mini_lean_extract import _find_top_level_assign
     from .lean_syntax import lean_expression_delimiters_balanced
 
-    scan_src = _strip_lean_comments_and_strings(src)
     matches: List[re.Match[str]] = []
     for match in _TOP_LEVEL_HEADER_RE.finditer(scan_src):
         if match.group(1) == "by" and matches and matches[-1].group(1) != "by":
@@ -387,6 +395,11 @@ def _split_top_level_chunks(src: str) -> Tuple[str, List[str]]:
                     # an indented second theorem is still a second command.
                     continue
         matches.append(match)
+    return matches
+
+
+def _split_top_level_chunks(src: str) -> Tuple[str, List[str]]:
+    matches = _top_level_chunk_matches(_strip_lean_comments_and_strings(src))
     if not matches:
         return src.strip(), []
     leading = src[: matches[0].start()].strip()
@@ -399,7 +412,20 @@ def _split_top_level_chunks(src: str) -> Tuple[str, List[str]]:
 
 
 def _normalize_cache_statement(statement: str) -> str:
-    return graph_statement_key(canonicalize_lean_statement_for_identity(statement))
+    return graph_statement_candidate_key(statement)
+
+
+def _cache_candidate_source_keys(source: str) -> Tuple[str, ...]:
+    """Rank exact declaration types before broader advisory search aliases."""
+    statement = helper_decl_statement(source)
+    keys = [lean_contract_statement_source_key(statement)]
+    if statement.startswith("(\n") and statement.endswith("\n)"):
+        # Type extraction wraps multiline source to protect its first-line
+        # column. The original query lacks that wrapper; remove only this
+        # outer frame for ranking, preserving all internal layout/grouping.
+        # These keys select candidates and never authorize proof reuse.
+        keys.append(lean_contract_statement_source_key(statement[2:-2].strip()))
+    return tuple(keys)
 
 
 @lru_cache(maxsize=32768)
@@ -565,9 +591,9 @@ class MiniVerifiedLemmaCache:
         self._deadline_publication_disabled = self._disabled_marker_path(
             self.path
         ).exists()
-        # Tier 1: (canonical_stmt_hash, preamble_hash) → records (most-recent first).
+        # Tier 1: (canonical_stmt_hash, preamble_hash) → candidate records.
         self._by_exact_key: Dict[str, List[Dict[str, Any]]] = {}
-        # Tier 2: canonical_stmt_hash → records (most-recent first), used for
+        # Tier 2: canonical_stmt_hash → candidate records, used for
         # cross-preamble fallback. Same record may appear in both tiers.
         self._by_canonical_statement: Dict[str, List[Dict[str, Any]]] = {}
         # Owner namespace → records.  Same-problem seeding is an ownership
@@ -744,21 +770,18 @@ class MiniVerifiedLemmaCache:
         statements: Sequence[str],
         *,
         preamble: str,
-        max_hits: int = 3,
+        max_hits: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Describe the capped helper frontier without changing hit ranks.
+        """Describe the available helper frontier without changing hit ranks.
 
         Recursive model-lane accounting must distinguish two calls when the
-        cache would serve different helpers.  The ordinary lookup is
-        intentionally hit-ranked and mutates recency, so corpus identity alone
-        is insufficient.  This method records the exact ordered candidates
-        without touching them.  Ordinary lookup updates the selected batch in
-        an order-preserving transaction, so a repeat read stays stable while a
-        real external rank change remains visible.
+        available helper bodies change. Selection retains lookup priorities
+        and any explicit bound, but reordering the same available bodies must
+        not mint a fresh model lane. This method never touches hit ranks.
         """
 
-        cap = max(0, int(max_hits or 0))
-        if self._cache_is_disabled() or cap <= 0:
+        cap = None if max_hits is None or int(max_hits) < 0 else int(max_hits)
+        if self._cache_is_disabled() or cap == 0:
             return {
                 "schema_version": 1,
                 "max_hits": cap,
@@ -766,12 +789,12 @@ class MiniVerifiedLemmaCache:
             }
         self.refresh_read_paths()
         targets: List[Dict[str, Any]] = []
-        normalized_statements = {
-            normalized
+        source_statements = {
+            lean_contract_statement_source_key(str(statement or "")): str(statement or "")
             for statement in statements
-            if (normalized := _normalize_cache_statement(str(statement or "")))
+            if _normalize_cache_statement(str(statement or ""))
         }
-        for statement in sorted(normalized_statements):
+        for source_key, statement in sorted(source_statements.items()):
             canonical_key = self._canonical_key(statement)
             exposed = [
                 {
@@ -786,13 +809,15 @@ class MiniVerifiedLemmaCache:
                     cap=cap,
                 )
             ]
+            exposed.sort(key=lambda item: (
+                item["tier"], item["source_hash"], item["preamble_hash"], item["name"],
+            ))
             targets.append(
                 {
                     "statement_hash": canonical_key,
-                    # Ordered identity is solver-semantic: verification is
-                    # sequential and deadline-bounded. ``lookup`` batch-touches
-                    # this selection without permuting it, so a repeat read is
-                    # stable while an external rank change remains visible.
+                    "statement_source_key": source_key,
+                    # Corpus exposure grants model opportunity; service rank
+                    # controls deterministic replay order independently.
                     "exposed": tuple(exposed),
                 }
             )
@@ -1429,13 +1454,14 @@ class MiniVerifiedLemmaCache:
         statement: str,
         *,
         preamble: str,
-        max_hits: int = 3,
+        max_hits: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Return matching cache records, Tier 1 then Tier 2.
 
         Tier 1 hits (same preamble) are returned first; Tier 2 hits
         (cross-preamble, same canonical statement) follow, deduplicated by
-        ``source_hash``. The combined result is capped at ``max_hits``.
+        ``source_hash``. An explicit nonnegative ``max_hits`` bounds the
+        combined result; omitted or negative limits retain every candidate.
 
         Callers re-compile the returned bodies via
         ``_accept_proof_state_helper`` before treating them as proven, so
@@ -1444,8 +1470,8 @@ class MiniVerifiedLemmaCache:
 
         if self._cache_is_disabled():
             return []
-        cap = max(0, int(max_hits or 0))
-        if cap <= 0:
+        cap = None if max_hits is None or int(max_hits) < 0 else int(max_hits)
+        if cap == 0:
             return []
         self.refresh_read_paths()
         selected = self._select_lookup_records(
@@ -1470,33 +1496,77 @@ class MiniVerifiedLemmaCache:
         statement: str,
         *,
         preamble: str,
-        cap: int,
+        cap: Optional[int],
     ) -> List[Tuple[str, Dict[str, Any]]]:
-        """Select a capped Tier-1/Tier-2 batch without touching hit ranks."""
+        """Select a Tier-1/Tier-2 batch without touching hit ranks."""
+
+        return list(self._iter_lookup_records(statement, preamble=preamble, cap=cap))
+
+    def iter_lookup(
+        self, statement: str, *, preamble: str, max_hits: Optional[int] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """Yield replay candidates without charging or ranking unexecuted work.
+
+        Selection preserves source priority, tier order, rank, and body
+        deduplication. Only yielded records are cloned. The executor records
+        actual checks separately; merely exposing work is not a cache hit.
+        """
+
+        if self._cache_is_disabled():
+            return
+        cap = None if max_hits is None or int(max_hits) < 0 else int(max_hits)
+        if cap == 0:
+            return
+        self.refresh_read_paths()
+        for tier, record in self._iter_lookup_records(statement, preamble=preamble, cap=cap):
+            copy = _clone_cache_record(record)
+            copy["_lookup_tier"] = tier
+            yield copy
+
+    def _iter_lookup_records(
+        self, statement: str, *, preamble: str, cap: Optional[int],
+    ) -> Iterator[Tuple[str, Dict[str, Any]]]:
+        """Iterate a stable ranked frontier without touching hit ranks."""
 
         exact_key = self._exact_key(statement, preamble=preamble)
         canonical_key = self._canonical_key(statement)
+        exact_source_key = lean_contract_statement_source_key(statement)
+        surface_key = graph_statement_key(
+            canonicalize_lean_statement_for_identity(statement),
+        )
         seen_source_hashes: Set[str] = set()
-        selected: List[Tuple[str, Dict[str, Any]]] = []
+        selected_count = 0
         for tier, index, key in (
             ("tier1", self._by_exact_key, exact_key),
             ("tier2", self._by_canonical_statement, canonical_key),
         ):
-            for record in list(index.get(key, [])):
+            # Broad advisory aliases must not crowd a source-matching proof
+            # out of a bounded lookup batch. Order each source-match class by
+            # hit rank here so uncapped ingestion can append without sorting.
+            candidates = sorted(index.get(key, []), key=lambda record: (
+                exact_source_key not in _cache_candidate_source_keys(
+                    str(record.get("source") or ""),
+                ),
+                graph_statement_key(canonicalize_lean_statement_for_identity(
+                    helper_decl_statement(str(record.get("source") or "")),
+                )) != surface_key,
+                tuple(-value for value in self._cache_record_rank(record)),
+            ))
+            for record in candidates:
                 source_hash = str(record.get("source_hash") or "")
                 if source_hash in seen_source_hashes:
                     continue
                 seen_source_hashes.add(source_hash)
-                selected.append((tier, record))
-                if len(selected) >= max(0, int(cap or 0)):
-                    return selected
-        return selected
+                yield tier, record
+                selected_count += 1
+                if cap is not None and selected_count >= cap:
+                    return
 
     def records_for_theorem(
         self,
         theorem_name: str,
         *,
-        max_records: int = 64,
+        max_records: int = -1,
         preamble: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Return cached helpers previously proved for ``theorem_name``.
@@ -1506,13 +1576,14 @@ class MiniVerifiedLemmaCache:
         prior attempts, not only helpers whose statements already match an
         open proof-state frontier node. Consumers must still re-kernel-check
         every returned helper under the current preamble before recording it.
+        Negative limits retain every fact; zero explicitly disables retrieval.
         """
 
         if self._cache_is_disabled():
             return []
         name = str(theorem_name or "").strip()
-        cap = max(0, int(max_records or 0))
-        if not name or cap <= 0:
+        cap = int(max_records or 0)
+        if not name or cap == 0:
             return []
         self.refresh_read_paths()
 
@@ -1565,7 +1636,7 @@ class MiniVerifiedLemmaCache:
                 continue
             selected_fact_keys.add(fact_key)
             ordered_fact_keys.append(fact_key)
-            if len(ordered_fact_keys) >= cap:
+            if cap > 0 and len(ordered_fact_keys) >= cap:
                 break
 
         # The cap counts mathematical candidate facts, not proof bodies. Keep
@@ -1771,7 +1842,7 @@ class MiniVerifiedLemmaCache:
             if str(record.get("source") or "").strip() == exact_source
         ), None)
 
-    def retrieval_records(self, *, max_records: int = 50_000) -> List[Dict[str, Any]]:
+    def retrieval_records(self, *, max_records: Optional[int] = None) -> List[Dict[str, Any]]:
         """Return unique verified bodies for semantic discovery.
 
         These rows are *candidates*, not certificates in the caller's current
@@ -1779,13 +1850,14 @@ class MiniVerifiedLemmaCache:
         before making a declaration available to proof generation.  Keeping
         this boundary on the cache avoids exposing its private indexes to the
         federated retrieval service while preserving the cache's fail-closed
-        disabled-marker and incremental refresh semantics.
+        disabled-marker and incremental refresh semantics. All bodies remain
+        discoverable by default; an explicit nonnegative limit bounds the result.
         """
 
         if self._cache_is_disabled():
             return []
-        cap = max(0, int(max_records or 0))
-        if cap <= 0:
+        cap = None if max_records is None or int(max_records) < 0 else int(max_records)
+        if cap == 0:
             return []
         self.refresh_read_paths()
         candidates: List[Dict[str, Any]] = []
@@ -1807,7 +1879,7 @@ class MiniVerifiedLemmaCache:
                 str(record.get("source_hash") or ""),
             )
         )
-        return candidates[:cap]
+        return candidates if cap is None else candidates[:cap]
 
     @staticmethod
     def _owner_record_id(
@@ -1966,14 +2038,10 @@ class MiniVerifiedLemmaCache:
     def _key(statement: str, *, preamble: str) -> str:
         return MiniVerifiedLemmaCache._exact_key(statement, preamble=preamble)
 
-    # Per-bucket caps: Tier 1 bucket holds records for ONE
-    # (canonical_stmt, preamble) — at most a handful of distinct
-    # bodies for the same fact under the same preamble is realistic.
-    # Tier 2 bucket holds records for ONE canonical statement across
-    # ALL preambles ever seen — for popular generic lemmas this can
-    # be much wider, so the cap is higher.
-    _TIER1_BUCKET_CAP = 8
-    _TIER2_BUCKET_CAP = 64
+    # Optional explicit retention limits. Ordinary replay preserves every
+    # paid proof body; rank controls service order rather than deleting work.
+    _TIER1_BUCKET_CAP: Optional[int] = None
+    _TIER2_BUCKET_CAP: Optional[int] = None
 
     def _next_access_seq(self) -> int:
         self._cache_access_seq += 1
@@ -1988,9 +2056,11 @@ class MiniVerifiedLemmaCache:
             float(record.get("created_ts") or 0.0),
         )
 
-    def _trim_cache_bucket(self, bucket: List[Dict[str, Any]], cap: int) -> None:
+    def _trim_cache_bucket(self, bucket: List[Dict[str, Any]], cap: Optional[int]) -> None:
+        if cap is None or cap < 0:
+            return
         bucket.sort(key=self._cache_record_rank, reverse=True)
-        del bucket[max(0, int(cap or 0)) :]
+        del bucket[cap:]
 
     def _runtime_rank_snapshot(
         self,
@@ -2033,8 +2103,10 @@ class MiniVerifiedLemmaCache:
             str,
             Mapping[Tuple[str, str, str], Mapping[str, int]],
         ],
+        *,
+        known_source_keys: Optional[Set[str]] = None,
     ) -> None:
-        """Restore survivor tier membership/ranks, then enforce tier caps."""
+        """Restore tier membership/ranks and any explicit retention limits."""
 
         known_identities = {
             identity
@@ -2058,6 +2130,10 @@ class MiniVerifiedLemmaCache:
                             str(record.get("statement_hash") or ""),
                         )
                         not in known_identities
+                        and (
+                            f"{str(record.get('source_hash') or '')}:"
+                            f"{str(record.get('preamble_hash') or '')}"
+                        ) not in (known_source_keys or ())
                         or (
                             str(record.get("source_hash") or ""),
                             str(record.get("preamble_hash") or ""),
@@ -2109,7 +2185,10 @@ class MiniVerifiedLemmaCache:
             return
 
         access_sequences = [self._next_access_seq() for _item in valid]
-        affected: Dict[int, Tuple[List[Dict[str, Any]], int]] = {}
+        affected: Dict[
+            int,
+            Tuple[List[Dict[str, Any]], Optional[int], Dict[Tuple[str, str], int]],
+        ] = {}
         for (source_hash, preamble_hash, statement_hash), access_seq in zip(
             valid,
             reversed(access_sequences),
@@ -2125,34 +2204,32 @@ class MiniVerifiedLemmaCache:
                     self._TIER2_BUCKET_CAP,
                 ),
             ):
-                touched = False
-                for candidate in bucket:
-                    if (
-                        str(candidate.get("source_hash") or "") == source_hash
-                        and str(candidate.get("preamble_hash") or "")
-                        == preamble_hash
-                    ):
-                        candidate["_cache_hits"] = (
-                            int(candidate.get("_cache_hits") or 0) + 1
-                        )
-                        candidate["_cache_last_hit_seq"] = access_seq
-                        touched = True
-                if touched:
-                    affected[id(bucket)] = (bucket, cap)
-        for bucket, cap in affected.values():
-            self._trim_cache_bucket(bucket, cap)
+                if bucket:
+                    updates = affected.setdefault(id(bucket), (bucket, cap, {}))[2]
+                    updates[(source_hash, preamble_hash)] = access_seq
+        for bucket, cap, updates in affected.values():
+            touched = False
+            for candidate in bucket:
+                matched_access_seq = updates.get((
+                    str(candidate.get("source_hash") or ""),
+                    str(candidate.get("preamble_hash") or ""),
+                ))
+                if matched_access_seq is not None:
+                    candidate["_cache_hits"] = int(candidate.get("_cache_hits") or 0) + 1
+                    candidate["_cache_last_hit_seq"] = matched_access_seq
+                    touched = True
+            if touched:
+                self._trim_cache_bucket(bucket, cap)
 
     def _index_record(
         self,
         record: Dict[str, Any],
     ) -> None:
-        """Insert ``record`` into both Tier 1 and Tier 2 buckets, with
-        hit-aware per-tier caps (8 / 64). The Tier 2 cap is higher because a
-        popular canonical statement may have been proven under many
-        problem-specific preambles; capping at 8 silently evicts
-        cross-problem witnesses. Hot entries are retained by lookup count with recency
-        as the tie-breaker, so a useful cross-problem witness is not displaced
-        by a stream of cold variants."""
+        """Insert a body into both ranked lookup tiers.
+
+        Ordinary buckets retain every body. Explicit retention limits, when
+        supplied, preserve hot entries with recency as the tie-breaker.
+        """
 
         statement = str(record.get("statement") or "")
         preamble_hash = str(record.get("preamble_hash") or "")
@@ -2471,6 +2548,10 @@ class MiniVerifiedLemmaCache:
         if self._storage_reload_depth > 0:
             return 0
         lookup_ranks = self._runtime_rank_snapshot()
+        # A body evicted from both explicitly capped tiers still remains a
+        # known source. Re-reading it must not give it a fresh insertion rank
+        # that displaces a surviving cold entry after an unchanged replacement.
+        known_source_keys = set(self._source_hashes)
         loaded = 0
         self._storage_reload_depth += 1
         try:
@@ -2485,7 +2566,7 @@ class MiniVerifiedLemmaCache:
         finally:
             self._defer_cache_bucket_trim = False
             self._storage_reload_depth -= 1
-        self._apply_runtime_rank_snapshot(lookup_ranks)
+        self._apply_runtime_rank_snapshot(lookup_ranks, known_source_keys=known_source_keys)
         return loaded
 
     def _load_new_records(
@@ -2936,13 +3017,14 @@ def _proof_state_helper_policy_rejection(
     while scoped_open := _SCOPED_OPEN_DECL_PREFIX_RE.match(masked[declaration_offset:]):
         declaration_offset += scoped_open.end()
     policy_source = source[declaration_offset:]
-    forbidden = _find_forbidden_lean_command([policy_source], "by\n  trivial")
+    policy_masked = masked[declaration_offset:]
+    forbidden = _find_forbidden_masked_lean_command(policy_masked + "\n\nby\n  trivial")
     if forbidden is not None:
         return f"forbidden_lean_command:{forbidden}"
-    leading, chunks = _split_top_level_chunks(policy_source)
-    if leading.strip() or len(chunks) != 1:
+    matches = _top_level_chunk_matches(policy_masked)
+    if len(matches) != 1 or policy_source[:matches[0].start()].strip():
         return "not_single_helper_declaration"
-    sanitized_chunk = _strip_lean_comments_and_strings(chunks[0])
+    sanitized_chunk = policy_masked[matches[0].start():].strip()
     if _SAFE_TOP_LEVEL_HELPER_RE.match(sanitized_chunk) is None:
         return "not_safe_theorem_or_lemma"
     if helper_decl_name(source) is None:
@@ -2959,12 +3041,10 @@ def _proof_state_helper_policy_rejection(
         # statement extracted from this same source; avoid re-running both
         # identity pipelines for that common case. Different spellings still
         # receive the complete capture-safe normalization and comparison.
-        left = _normalize_cache_statement(statement)
-        right = _normalize_cache_statement(expected_statement)
+        left = graph_statement_key(canonicalize_lean_statement_for_identity(statement))
+        right = graph_statement_key(canonicalize_lean_statement_for_identity(expected_statement))
         if left != right:
             return "statement_mismatch"
-    stripped_source = _strip_lean_comments_and_strings(policy_source).strip()
-    stripped_chunk = _strip_lean_comments_and_strings(chunks[0]).strip()
-    if stripped_source != stripped_chunk:
+    if policy_masked.strip() != sanitized_chunk:
         return "not_single_helper_declaration"
     return ""

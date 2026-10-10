@@ -147,6 +147,11 @@ class RecursiveControllerAction:
         ):
             self._recursive_root_portfolio_ledger = copy.deepcopy(state)
 
+    def should_yield_static_dispatch(self, session: Any) -> bool:
+        """Offer another parent action service before resuming the child."""
+        del session
+        return bool(self._recursive_driver_state.pop("yield_to_parent", False))
+
     def scheduler_runtime_state(self) -> dict[str, Any]:
         """Return versioned provider-free cursor state for exact replay."""
 
@@ -237,9 +242,9 @@ class RecursiveControllerAction:
         repair_retrieval_top_k: int = 6,
         proof_state_child_tactics_enabled: bool = True,
         proof_state_child_tactic_timeout_s: float = DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-        proof_state_child_tactic_max_candidates: int = 32,
+        proof_state_child_tactic_max_candidates: int = -1,
         root_tactic_timeout_s: float = 40.0,
-        root_tactic_max_candidates: int = 64,
+        root_tactic_max_candidates: int = -1,
         proof_state_child_goal_limit: int = 3,
         proof_state_decl_application_limit: int = 6,
         proof_state_batch_parallelism: int = 1,
@@ -565,7 +570,7 @@ class RecursiveControllerAction:
             setattr(
                 session,
                 pool_attr,
-                current + outstanding_extension_credit,
+                (-1 if current < 0 else current + outstanding_extension_credit),
             )
         reservations.pop(self.id, None)
         if pass_already_committed:
@@ -582,7 +587,7 @@ class RecursiveControllerAction:
                 )
             return outstanding_extension_credit
         current = int(getattr(session, pool_attr, 0) or 0)
-        setattr(session, pool_attr, current + reserved)
+        setattr(session, pool_attr, -1 if current < 0 else current + reserved)
         recorder = getattr(session, "_record_event", None)
         if callable(recorder):
             recorder(
@@ -677,6 +682,8 @@ class RecursiveControllerAction:
         )
 
     def is_applicable(self, session: Any) -> bool:
+        if int(getattr(self.config, "max_claims", -1)) == 0:
+            return False
         if session.dossier is None or session.lean is None or session.prover_client is None:
             return False
         wait = self._planner_equivalent_wait
@@ -711,12 +718,13 @@ class RecursiveControllerAction:
             ):
                 return False
         available_passes = int(getattr(session, self.budget_attr, 0) or 0)
-        available_passes += self._inflight_recoverable_passes(session)
+        if available_passes >= 0:
+            available_passes += self._inflight_recoverable_passes(session)
         # Replaying a committed terminal receipt performs no mathematical or
         # provider work.  It must remain dispatchable after the pass that made
         # it consumed the final budget unit, otherwise the durable outcome is
         # stranded before ``on_outcome_applied`` can publish its fixed point.
-        if available_passes <= 0 and not self._terminal_receipt_pending_publication(
+        if available_passes == 0 and not self._terminal_receipt_pending_publication(
             session
         ):
             return False
@@ -787,10 +795,8 @@ class RecursiveControllerAction:
         # durable to keep that frontier, so preserve the legacy complete-run
         # behavior for standalone/tests rather than yielding lossy state.
         cfg = self.config
-        remaining_before = max(
-            0,
-            int(getattr(session, self.budget_attr, 0) or 0),
-        )
+        remaining_before = int(getattr(session, self.budget_attr, 0) or 0)
+        unlimited_pool = remaining_before < 0
         configured_passes = 1
         if cfg is not None and hasattr(cfg, "passes"):
             try:
@@ -817,9 +823,11 @@ class RecursiveControllerAction:
                 or 0
             ),
         )
-        reserved_passes = min(
-            1 if quantized_persistent_run else configured_passes,
-            remaining_before,
+        reserved_passes = (
+            1 if unlimited_pool else min(
+                1 if quantized_persistent_run else configured_passes,
+                remaining_before,
+            )
         )
         terminal_receipt_replay = self._terminal_receipt_pending_publication(session)
         if reserved_passes <= 0 and not terminal_receipt_replay:
@@ -897,7 +905,7 @@ class RecursiveControllerAction:
                     )
                 cfg = replace(
                     cfg,
-                    passes=driver_pass_ceiling,
+                    passes=(-1 if unlimited_pool else driver_pass_ceiling),
                     pass_quantum=(reserved_passes if quantized_persistent_run else 0),
                 )
             except Exception as exc:
@@ -910,7 +918,7 @@ class RecursiveControllerAction:
         # post-hoc stats. If the driver raises or reports only one started
         # pass from a multi-pass allocation, later fallback actions must not
         # spend the remainder as independent p1 attempts.
-        remaining_after_reserve = max(0, remaining_before - reserved_passes)
+        remaining_after_reserve = -1 if unlimited_pool else max(0, remaining_before - reserved_passes)
         if reserved_passes > 0:
             self._reserve_inflight(session, reserved_passes)
         setattr(session, self.budget_attr, remaining_after_reserve)
@@ -930,11 +938,11 @@ class RecursiveControllerAction:
                 else True
             )
         )
-        raw_recursive_helper_max_depth = getattr(session, "max_recursion_depth", 3)
+        raw_recursive_helper_max_depth = getattr(session, "max_recursion_depth", 0)
         recursive_helper_max_depth = int(
             raw_recursive_helper_max_depth
             if raw_recursive_helper_max_depth is not None
-            else 3
+            else 0
         )
 
         async def checkpoint_recursive_driver(
@@ -1102,13 +1110,13 @@ class RecursiveControllerAction:
             recursive_helper_prover_enabled=recursive_helper_enabled,
             recursive_helper_max_depth=recursive_helper_max_depth,
             recursive_helper_max_attempts_per_node=int(
-                getattr(recursive_helper_action, "max_attempts_per_node", 2)
-                if getattr(recursive_helper_action, "max_attempts_per_node", 2)
+                getattr(recursive_helper_action, "max_attempts_per_node", 0)
+                if getattr(recursive_helper_action, "max_attempts_per_node", 0)
                 is not None
-                else 2
+                else 0
             ),
             recursive_helper_turns=int(
-                getattr(recursive_helper_action, "helper_turns", 5) or 5
+                getattr(recursive_helper_action, "helper_turns", -1)
             ),
             recursive_helper_refine=bool(
                 getattr(recursive_helper_action, "refine_enabled", False)
@@ -1260,14 +1268,17 @@ class RecursiveControllerAction:
             setattr(
                 session,
                 self.budget_attr,
-                max(0, int(getattr(session, self.budget_attr, 0) or 0))
-                + reserved_passes,
+                -1 if unlimited_pool else (
+                    max(0, int(getattr(session, self.budget_attr, 0) or 0))
+                    + reserved_passes
+                ),
             )
 
         passes_used = int(getattr(getattr(result, "stats", None), "passes_started", 0) or 0)
         failure_reason = str(
             getattr(result, "failure_reason", "") or ""
         ).strip()
+        child_service_yielded = failure_reason == "recursive_child_service_yield"
         helper_accept_yielded = bool(
             failure_reason == "recursive_helper_accept_yield"
         )
@@ -1297,7 +1308,7 @@ class RecursiveControllerAction:
             or identity_service_blocked
             or identity_infrastructure_unknown
         )
-        if identity_prepass_deferred or helper_accept_yielded:
+        if identity_prepass_deferred or helper_accept_yielded or child_service_yielded:
             # Identity-pending yields happen before a mathematical pass is
             # admitted. Helper-accept yields happen mid-pass so MiniSession
             # can apply the helper receipt before speculative root-close;
@@ -1320,7 +1331,7 @@ class RecursiveControllerAction:
         # phantom passes in the session pool. Cumulative resumed stats are
         # offset by the durable pre-invocation checkpoint value.
         invocation_passes_used = max(0, passes_used - prior_driver_passes_started)
-        if not quantum_yielded and invocation_passes_used > reserved_passes:
+        if not unlimited_pool and not quantum_yielded and invocation_passes_used > reserved_passes:
             additional_used = min(
                 max(0, invocation_passes_used - reserved_passes),
                 max(0, int(getattr(session, self.budget_attr, 0) or 0)),
@@ -1347,7 +1358,7 @@ class RecursiveControllerAction:
                 0,
                 extension_grants - prior_driver_extension_grants,
             )
-            if newly_earned_extensions:
+            if newly_earned_extensions and not unlimited_pool:
                 setattr(
                     session,
                     self.budget_attr,
@@ -1584,6 +1595,8 @@ class RecursiveControllerAction:
             or strong_progress_for_accepted_helpers(session.dossier, helpers_added)
         )
         cost = time.monotonic() - started
+        if child_service_yielded:
+            self._recursive_driver_state["yield_to_parent"] = True
         return MiniOutcome(
             action_id=self.id,
             solved=solved,
@@ -1612,6 +1625,12 @@ class RecursiveControllerAction:
                 else None
             ),
             metadata={
+                **({
+                    "child_service_yielded": True, "preserve_action_budget": True,
+                    "preserve_selected_frontier_action": True, "iteration_neutral": True,
+                    "scheduler_neutral": True, "stagnation_neutral": True,
+                    "hard_pivot_neutral": True,
+                } if child_service_yielded else {}),
                 "passes_used": passes_used,
                 "passes_reserved": reserved_passes,
                 "recursive_pass_quantum_yield": quantum_yielded,

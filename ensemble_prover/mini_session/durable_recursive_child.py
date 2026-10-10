@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from functools import wraps
+import copy
 import hashlib
+import inspect
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -29,7 +31,7 @@ class RecursiveChildLimits:
             float(getattr(session, "recursive_elapsed_deadline_epoch_s", 0.0) or 0.0),
             bool(getattr(session, "strict_progress_accounting", False)),
             max(0, int(getattr(session, "max_soft_progress_streak", 4))),
-            max(0, int(getattr(session, "max_helper_only_provider_quanta", 24))),
+            max(0, int(getattr(session, "max_helper_only_provider_quanta", 0))),
         )
 
     def intersect_restored(self, child: Any, parent: Any) -> None:
@@ -52,6 +54,61 @@ class RecursiveChildLimits:
         )
 
 
+def capture_retained_child_helper_authority(dossier: Any) -> Any:
+    """Detach admitted fact authority from a dossier replaced during restore.
+
+    Copy only proof records and their retirement/invalidation evidence. Child
+    conversations, graphs, histories, and runtime services are not included.
+    """
+    fields = {
+        "verified_helpers": {},
+        "superseded_verified_helper_hashes": {},
+        "verified_helper_source_hash_history": {},
+        "mini_recursive_invalidated_statement_reasons": {},
+        "mini_authoritative_negations": {},
+        "mini_falsification_ledger": [],
+        "mini_falsification_pending_certificates": [],
+        "mini_falsification_certificate_replay_dispositions": {},
+    }
+    return SimpleNamespace(**copy.deepcopy({
+        name: getattr(dossier, name, default) for name, default in fields.items()
+    }))
+
+
+def refresh_retained_child_helpers(child_dossier: Any, admitted_dossier: Any) -> None:
+    """Refresh admitted parent facts while retaining the child's own work.
+
+    The incoming dossier has already applied the route's answer and dependency
+    filters. Preserve source-history tombstones and use the ordinary import
+    contract for replacements, including removal of stale dependent proofs.
+    """
+    from ensemble_prover.helper_salvage import (
+        helper_source_hash_was_superseded, helper_uses_superseded_support,
+        preflight_dependency_ordered_verified_helper_items,
+    )
+    for field in ("superseded_verified_helper_hashes", "verified_helper_source_hash_history"):
+        target = getattr(child_dossier, field)
+        for name, hashes in getattr(admitted_dossier, field, {}).items():
+            target[name] = list(dict.fromkeys([*target.get(name, []), *hashes]))
+    # Remove retired bindings before importing replacements, otherwise the
+    # collision policy correctly renames a new proposition and strands the
+    # parent's exact dependency name on the retired declaration.
+    for name, helper in list(child_dossier.verified_helpers.items()):
+        if (helper_source_hash_was_superseded(child_dossier, name, helper.source_hash)
+                or helper_uses_superseded_support(child_dossier, helper)):
+            child_dossier.remove_verified_helper(name)
+    incoming = [
+        (name, helper) for name, helper in admitted_dossier.verified_helpers.items()
+        if child_dossier.verified_helpers.get(name) != helper
+    ]
+    for _name, helper in preflight_dependency_ordered_verified_helper_items(
+        child_dossier, incoming,
+    ):
+        child_dossier.record_imported_verified_helper(helper)
+    from ensemble_prover.proof_dossier import propagate_invalidated_statements
+    propagate_invalidated_statements(child_dossier, admitted_dossier, record_graph=False)
+
+
 def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
                                      separators=(",", ":")).encode()).hexdigest()
@@ -67,8 +124,15 @@ def bind_controller_checkpoint_callback(
 ) -> Any:
     """Carry the exact action owner into its existing factory callback."""
     callback = action.run_conversation_fn
-    if callback is None or getattr(session, "checkpoint_registry", None) is None:
+    if callback is None:
         return callback
+    if getattr(session, "checkpoint_registry", None) is None:
+        # Runtime-only sessions still need an action owner for retained service
+        # slices. Legacy strict callbacks keep their original argument contract.
+        parameters = inspect.signature(callback).parameters
+        if ("checkpoint_parent_action" not in parameters and not any(
+                item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values())):
+            return callback
 
     @wraps(callback)
     async def invoke(**kwargs: Any) -> Any:
@@ -103,7 +167,7 @@ async def restore_controller_children(action: Any, session: Any, frames: dict[st
                 or type(ordinal) is not int or ordinal <= 0
                 or work.get("pool_attr") != _pool_attr(action)
                 or type(work.get("remaining_passes")) is not int
-                or work["remaining_passes"] < 0
+                or work["remaining_passes"] < -1
                 or type(work.get("reservation")) is not dict):
             raise ValueError("Invalid prepared controller allocation")
         candidates.append((ordinal, frame))
@@ -281,6 +345,13 @@ async def restore_graph_subpass_dossier(
             or context["parent_context_hash"] != action._recursive_attempt_context_hash(
                 session, refresh_quality=False, selected_work_record=selected_work_record)):
         raise ValueError("Graph recursive driver no longer owns its current proof context")
+    from .session import _dispatch_capability_generation_nonce
+    cache_key = (id(getattr(session, "checkpoint_registry", None)),
+                 str(getattr(session, "session_activation_id", "")),
+                 _dispatch_capability_generation_nonce(session.lean))
+    retained = getattr(action, "_suspended_graph_subpass_dossier", None)
+    if retained is not None and retained[0] == cache_key and retained[1] == context:
+        return retained[2]
     from .durable_session_record import _prepare_dossier
 
     verifier_view = SimpleNamespace(
@@ -340,6 +411,7 @@ class PreparedControllerChild:
 async def prepare_controller_child(
     *, parent: Any, child: Any, action: Any, nested_invocation_id: str,
     max_turns: int, deadline_epoch_s: float, graph_subpass_context: Any = None,
+    continuation_lane: str = "",
 ) -> PreparedControllerChild | None:
     registry = getattr(parent, "checkpoint_registry", None)
     if registry is None or action is None:
@@ -365,6 +437,19 @@ async def prepare_controller_child(
         "theorem_name": child.problem.theorem_name, "max_turns": max_turns,
     }
     lane = f"{parent_lane}/controller:{_digest(descriptor)}"
+    if continuation_lane:
+        if (type(continuation_lane) is not str
+                or not continuation_lane.startswith(parent_lane + "/controller:")):
+            raise ValueError("Controller continuation belongs to another parent lane")
+        retained = registry.child_record(continuation_lane)
+        if retained is None:
+            raise ValueError("Controller continuation has no prepared child")
+        stable = {key: value for key, value in descriptor.items()
+                  if key != "parent_record_hash"}
+        if any(retained["descriptor"].get(key) != value for key, value in stable.items()):
+            raise ValueError("Controller continuation identity changed")
+        descriptor["parent_record_hash"] = retained["descriptor"]["parent_record_hash"]
+        lane = continuation_lane
     existing = registry.child_record(lane)
     restored_from_checkpoint = existing is not None
     if existing is None:

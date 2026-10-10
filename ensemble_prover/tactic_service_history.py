@@ -15,7 +15,6 @@ from typing import Any, cast
 _KEY = re.compile(r"[0-9a-f]{16}")
 _PROOF_KEY = re.compile(r"[0-9a-f]{64}")
 _MAX_COUNTER = (1 << 63) - 1
-_MAX_ENTRIES = 16384
 
 
 def validate_service_history(value: Any) -> dict[str, Any]:
@@ -32,7 +31,6 @@ def validate_service_history(value: Any) -> dict[str, Any]:
         type(sequence) is not int
         or not 0 <= sequence <= _MAX_COUNTER
         or not isinstance(entries, Mapping)
-        or len(entries) > _MAX_ENTRIES
     ):
         return {}
     clean = {}
@@ -192,12 +190,14 @@ def renewal_work_available(
     """Read-only eligibility for a funded deferred queue in its current context."""
     checked = validate_service_history(state)
     for key, lane in checked.get("renewal_lanes", {}).items():
+        admitted = set(lane["admitted"])
+        resource_wait = set(lane["resource_wait"])
         waiting = [
             item
             for item in lane["deferred"]
-            if include_admitted or _proof_key(item["proof"]) not in lane["admitted"]
+            if include_admitted or _proof_key(item["proof"]) not in admitted
             if (
-                _proof_key(item["proof"]) not in lane["resource_wait"]
+                _proof_key(item["proof"]) not in resource_wait
                 or _stronger_allowance(allowance_s, checked["entries"]
                                       .get(_proof_key(item["proof"], key), {})
                                       .get("allowance_s", 0.0))
@@ -378,6 +378,46 @@ def retain_acceptance_retry(
     return validate_service_history(checked)
 
 
+def retain_context_retries(
+    state: Mapping[str, Any], attempts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Keep executed candidates whose results belong to a stale context.
+
+    Preserve each target's lane and all service costs. The retained texts are
+    pending checks, with no positive or negative authority in the new context.
+    """
+    checked = validate_service_history(state)
+    lanes = checked.get("renewal_lanes", {})
+    indexes = {}
+    for attempt in attempts:
+        lane_key = str(attempt.get("portfolio_lane_key") or "")
+        lane = lanes.get(lane_key)
+        proof = attempt.get("proof")
+        if lane is None or not isinstance(proof, str) or not proof.strip():
+            continue
+        if lane_key not in indexes:
+            indexes[lane_key] = (
+                {item["proof"] for item in lane["deferred"]}, set(lane["admitted"]),
+                set(lane["resource_wait"]),
+            )
+        deferred, admitted, resource_wait = indexes[lane_key]
+        key = _proof_key(proof)
+        if proof not in deferred:
+            lane["deferred"].append({
+                "proof": proof, "tactic": str(attempt.get("tactic") or "context_retry"),
+                "source": str(attempt.get("source") or "context_retry"),
+                "helper": attempt.get("helper"),
+            })
+            deferred.add(proof)
+        if key not in admitted:
+            lane["admitted"].append(key)
+            admitted.add(key)
+        resource_wait.discard(key)
+    for lane_key, (_deferred, _admitted, resource_wait) in indexes.items():
+        lanes[lane_key]["resource_wait"] = sorted(resource_wait)
+    return validate_service_history(checked)
+
+
 def order_candidates(
     candidates: Sequence[Any],
     state: Mapping[str, Any],
@@ -439,6 +479,9 @@ def record_attempts(
     checked = validate_service_history(state)
     if not checked:
         return {}
+    lane_indexes: dict[str, tuple[
+        dict[str, dict[str, Any]], dict[str, None], dict[str, None],
+    ]] = {}
     for attempt in attempts:
         proof = attempt.get("proof")
         if not isinstance(proof, str) or not proof:
@@ -463,45 +506,38 @@ def record_attempts(
                 # The native checker also applies a 0.1-second minimum to explicit
                 # tiny budgets. Record either allocation without inventing grants.
                 served_allowance_s = float(allocated)
+        inconclusive = str(attempt.get("error_type") or "") in {
+            "timeout", "lean_timeout", "infra_failure", "exception", "cancelled",
+        }
         checked["entries"][_proof_key(proof, lane_key)] = {
             "sequence": checked["sequence"],
             "allowance_s": served_allowance_s,
-            "resource_inconclusive": str(attempt.get("error_type") or "")
-            in {
-                "timeout",
-                "lean_timeout",
-                "infra_failure",
-                "exception",
-                "cancelled",
-            },
+            "resource_inconclusive": inconclusive,
         }
         lane = checked.get("renewal_lanes", {}).get(lane_key)
         if lane and not attempt.get("pending_reference_confirmation"):
+            if lane_key not in lane_indexes:
+                # Ordered dictionaries preserve queue order while each attempt
+                # updates membership without rescanning or rehashing the batch.
+                lane_indexes[lane_key] = (
+                    {item["proof"]: item for item in lane["deferred"]},
+                    dict.fromkeys(lane["admitted"]),
+                    dict.fromkeys(lane["resource_wait"]),
+                )
+            deferred, admitted, resource_wait = lane_indexes[lane_key]
             key = _proof_key(proof)
-            inconclusive = checked["entries"][_proof_key(proof, lane_key)][
-                "resource_inconclusive"
-            ]
             if inconclusive:
-                if key not in lane["resource_wait"] and any(
-                    item["proof"] == proof for item in lane["deferred"]
-                ):
-                    lane["resource_wait"].append(key)
+                if proof in deferred:
+                    resource_wait.setdefault(key, None)
             else:
-                lane["deferred"] = [
-                    item for item in lane["deferred"] if item["proof"] != proof
-                ]
-                lane["resource_wait"] = [
-                    item for item in lane["resource_wait"] if item != key
-                ]
-            lane["admitted"] = [
-                key for key in lane["admitted"] if key != _proof_key(proof)
-            ]
-    if len(checked["entries"]) > _MAX_ENTRIES:
-        checked["entries"] = dict(
-            sorted(
-                checked["entries"].items(),
-                key=lambda item: item[1]["sequence"],
-                reverse=True,
-            )[:_MAX_ENTRIES]
-        )
+                deferred.pop(proof, None)
+                resource_wait.pop(key, None)
+            admitted.pop(key, None)
+    for lane_key, (deferred, admitted, resource_wait) in lane_indexes.items():
+        lane = checked["renewal_lanes"][lane_key]
+        lane["deferred"] = list(deferred.values())
+        lane["admitted"] = list(admitted)
+        lane["resource_wait"] = list(resource_wait)
+    # Prior allowances govern resource retries. Evicting an executed candidate
+    # would make its retained deferred proof look like unserved work again.
     return validate_service_history(checked)

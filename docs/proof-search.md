@@ -47,9 +47,9 @@ truncate the statement or classify the proposed answer as mathematically wrong.
 | Prover conversation | Develop and check a proof using mathematical and Lean feedback | `--max-prove-turns` |
 | Refiner conversation | Continue the transcript after the prover stalls, potentially with a different model | `--refiner`, `--refiner-model`, `--max-refine-turns` |
 | Recursive planning | Propose scoped helper obligations and root assembly routes | `--mini-recursive-*` |
-| Recursive helper proving | Allocate bounded child sessions to selected obligations | `--recursive-helper-*` |
+| Recursive helper proving | Allocate child sessions to selected obligations | `--recursive-helper-*` |
 | Proof-state tactics and declaration application | Try concrete steps on active Lean goals | `--proof-state-child-*`, `--proof-state-decl-application-limit` |
-| Root tactics | Try a bounded deterministic portfolio before broader search | `--root-tactic-prepass`, `--startup-root-fast-lane` |
+| Root tactics | Try deterministic candidates across resumable service slices | `--root-tactic-prepass`, `--startup-root-fast-lane` |
 | Formal-state search | Explore tactic alternatives over multiple resumable quanta | `--formal-state-search-*` |
 | Parallel samples | Run independent proof conversations with shared run limits | `--parallel-samples`, `--parallel-temps` |
 | Research recovery | Investigate mathematical obstacles and return arguments to proof work | `--autonomous-research`, `--frontier-research` |
@@ -59,6 +59,27 @@ Success on a child does not imply success on the root. Parent and child work
 share the governing run limits; recursion does not create additional spending
 authorization. The refiner and planner are model roles, not independent theorem
 verifiers.
+
+New runs impose no cumulative count limit on prover or refiner turns, recursive
+passes, helper claims, claim variants, or recursive helper turns. The count
+options use `-1` for unlimited work; positive values retain the requested limit.
+Zero prover/refiner turns or recursive passes disables that lane. Recursive
+depth and per-node helper attempt limits use zero for unlimited work. Explicit
+cost and elapsed-time budgets still govern the run, and saved checkpoints retain
+their recorded allocations.
+
+Scheduling batches remain finite so pending work can be saved and other work
+can run. Deterministic root, child, and recursive portfolios default to `-1`,
+retaining all generated candidates across service slices; zero disables that
+portfolio, and positive values impose an explicit cap. Child-goal and declaration
+batch widths limit each dispatch while retaining pending work. Typed residual
+batches are checked and admitted atomically without a default goal-count cutoff.
+Recursive children yield only after a settled action and resume the same proof
+state; pending provider work is retained. Repeated identical plans and already
+checked deterministic candidates do not create new work. Accepted helper growth
+does not itself terminate search after a fixed number of turns, and fresh
+mathematical progress can continue a
+repair chain without a default depth cutoff.
 
 Helpers may carry useful automation through attributes and instances as well as
 explicit references. Accepted source must preserve the Lean environment that
@@ -76,6 +97,25 @@ Suppose a checked reduction establishes `A ∧ B → R`. If `B` has already been
 proved, proving `A` can complete that reduction. Proving an unrelated lemma does
 not have the same immediate contribution. Alternative reductions keep their
 own premises; the scheduler cannot mix assumptions from incompatible routes.
+
+Completing a pre-existing obligation counts as progress when current verified
+helper evidence certifies its unchanged target. This includes tighter bounds,
+residual cases, and prerequisites represented explicitly in the graph. Completion
+credit survives restart; renaming or reopening the same proposition cannot earn
+it repeatedly. A claim of usefulness alone does not establish this connection.
+
+The dossier retains the full lemma collection and remaining obligations. When
+the provider can use `read_verified_helpers`, prompts select complete helper
+signatures within a presentation budget. Exact lookup, text filtering, and
+pagination expose the rest in the same validated Lean context. Providers without
+that tool receive the full signature view. Selection never removes dependencies
+from proof replay.
+
+Lemma purpose and compact mathematical failure history remain attached to graph
+records across checkpoints. Failure history records the attempted target and
+context, and guides future search without declaring a target false or forbidding
+another attempt. Restoring accepted helpers independently checks their complete
+ordered declaration batch before restoring proof authority.
 
 There are two different evidence levels:
 
@@ -127,10 +167,13 @@ Formal-state search is **off by default**. Enable it explicitly for a run:
   --formal-state-search
 ```
 
-It maintains a bounded search frontier with tactic candidates, backtracking,
-depth and beam limits, and retirement after repeated quanta without improvement.
-It can request goal-conditioned tactics from the configured model. Lean checks
-the transitions; fewer displayed goals alone is not a root proof.
+It keeps an active beam and a saved reserve of alternative proof states. Depth
+and backtracking windows renew across scheduling quanta; default candidate and
+retry settings impose no lifetime count limit. Explicit positive candidate,
+retry, and non-improvement limits remain available. It can request
+goal-conditioned tactics from the configured model and retains unchecked
+candidates across yields. Lean checks the transitions; fewer displayed goals
+alone is not a root proof.
 
 The total quantum default is 120 seconds. The separate operation timeout defaults
 to zero, meaning no extra formal-search cancellation deadline is imposed on an

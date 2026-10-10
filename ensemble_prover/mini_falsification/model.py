@@ -17,6 +17,9 @@ from ensemble_prover.falsification_cursor_identity import (
 from ensemble_prover.utils import strip_lean_comments_and_string_literals
 
 
+KERNEL_NEGATION_VERIFIER_VERSION = "kernel-not-expr-v3"
+
+
 class TargetKind(str, Enum):
     ROOT = "root"
     HELPER = "helper"
@@ -70,6 +73,7 @@ class LeanCounterexampleCertificate:
     axioms: tuple[str, ...] = ()
     trust: TrustLevel = TrustLevel.HEURISTIC
     environment_hash: str = ""
+    verifier_version: str = ""
 
     @property
     def authoritative(self) -> bool:
@@ -77,6 +81,9 @@ class LeanCounterexampleCertificate:
 
     def to_record(self) -> dict[str, Any]:
         record = asdict(self)
+        if not self.verifier_version:
+            # Preserve old content hashes so their evidence remains replayable.
+            record.pop("verifier_version")
         record["trust"] = self.trust.value
         record["authoritative"] = self.authoritative
         record["certificate_hash"] = content_hash(record)
@@ -255,6 +262,7 @@ def finding_from_record(data: Mapping[str, Any]) -> FalsificationFinding:
                 str(raw_certificate.get("trust") or TrustLevel.HEURISTIC.value)
             ),
             environment_hash=str(raw_certificate.get("environment_hash") or ""),
+            verifier_version=str(raw_certificate.get("verifier_version") or ""),
         )
     candidates = tuple(
         candidate_from_record(item)
@@ -316,6 +324,7 @@ def certificate_record_is_valid(
         and isinstance(concrete_statement, str)
         and isinstance(lean_output, str)
         and isinstance(environment_hash_value, str)
+        and ("verifier_version" not in record or isinstance(record["verifier_version"], str))
         and isinstance(axioms, (list, tuple))
         and all(isinstance(item, str) for item in axioms)
         and isinstance(record.get("trust"), str)

@@ -1,7 +1,7 @@
 """Exclusive durable ownership of one attempt across fresh run generations.
 
-Session records are immutable committed values. A sibling checkpoint never
-walks another live session, whose proof action may still be in flight.
+Session records are immutable committed values. Resource-only receipts can
+settle independently without publishing another session's in-flight proof state.
 """
 from __future__ import annotations
 
@@ -14,12 +14,17 @@ import math
 import time
 import uuid
 import weakref
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ..state_data import clone_json_value
 from ..llm_error_policy import classify_llm_exception, is_resumable_provider_failure
 from ..tactic_attempt_telemetry import MONOTONIC_LEAN_ATTEMPT_METRICS
+
+if TYPE_CHECKING:
+    from .action import ActionBudget
+    from .execution_service import DetachedExecutionSettlement
 
 _MANIFEST = "attempt_checkpoint.json"
 _SCHEMA = 1
@@ -46,7 +51,32 @@ def _write(path: Path, value: dict[str, Any]) -> None:
     write_checkpoint_record(path, value)
 
 
-def expand_completed_children(record: dict[str, Any], registry_root: Path) -> dict[str, Any]:
+def validate_archive_reference_shapes(record: dict[str, Any]) -> None:
+    """Validate archive coordinates for readers that only consume metadata."""
+    from .provider_lane_archives import provider_archive_references
+
+    archived = record.get("archived_children")
+    if type(archived) is not dict:
+        raise ValueError("Invalid checkpoint archive maps")
+    maps: list[dict[str, Any]] = []
+    for field in ("sessions", "children", "planner_receipts"):
+        value = record.get(field)
+        if type(value) is not dict:
+            raise ValueError("Invalid checkpoint archive maps")
+        maps.append(value)
+    for lane, digest in archived.items():
+        if (type(lane) is not str or not lane or type(digest) is not str
+                or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
+                or any(lane in value for value in maps)):
+            raise ValueError("Invalid or conflicting completed child archive reference")
+    for session in record["sessions"].values():
+        for _reference in provider_archive_references(session):
+            pass
+
+
+def expand_completed_children(
+    record: dict[str, Any], registry_root: Path, *, hydrate_provider_lanes: bool = True,
+) -> dict[str, Any]:
     """Read archived child data without acquiring ownership or resuming execution.
 
     The caller must validate the manifest and snapshot identity first. Archive
@@ -56,8 +86,9 @@ def expand_completed_children(record: dict[str, Any], registry_root: Path) -> di
     from ..snapshot_codec import MAX_SNAPSHOT_BYTES, decompress_snapshot, snapshot_bytes
 
     if (type(record) is not dict or type(record.get("schema_version")) is not int
-            or record["schema_version"] != 2):
+            or record["schema_version"] not in {2, 3}):
         return record
+    has_provider_archives = record["schema_version"] == 3
     record = _json(record)
     record["schema_version"] = _SCHEMA
     archived = record.pop("archived_children", None)
@@ -97,6 +128,17 @@ def expand_completed_children(record: dict[str, Any], registry_root: Path) -> di
                 if expanded_size > MAX_SNAPSHOT_BYTES:
                     raise ValueError("expanded checkpoint exceeds snapshot size limit")
                 record[field][lane] = value
+    if has_provider_archives:
+        from .provider_lane_archives import ProviderLaneArchiveStore
+
+        store = ProviderLaneArchiveStore(registry_root)
+        sessions = record.get("sessions")
+        if type(sessions) is not dict:
+            raise ValueError("Invalid provider archive session map")
+        for lane, session in sessions.items():
+            store.validate_session(session)
+            if hydrate_provider_lanes:
+                sessions[lane] = store.hydrate_session(session)
     return record
 
 
@@ -111,6 +153,217 @@ def _validated_execution_audit(value: Any, sessions: dict[str, Any]) -> dict[str
                or type(amount) is not int or amount < 0 for key, amount in metrics.items()):
             raise ValueError("Invalid checkpoint execution audit metric")
     return _json(value)
+
+
+_SERVICE_OBSERVATIONS = frozenset({
+    "service_dispatches", "service_seconds", "elapsed_seconds", "seconds",
+})
+
+
+def _physical_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
+    # A resource record cannot acknowledge an uncommitted mathematical action.
+    return {**_json(receipt), "semantic_attempt_completed": False}
+
+
+def _same_physical_receipt(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left, right = _physical_receipt(left), _physical_receipt(right)
+    left["details"].pop("detached_tail_pending", None)
+    right["details"].pop("detached_tail_pending", None)
+    return left == right
+
+
+def _validated_execution_service(value: Any, sessions: dict[str, Any]) -> dict[str, Any]:
+    from .action import ActionBudget
+
+    if type(value) is not dict:
+        raise ValueError("Invalid checkpoint execution service")
+    for lane, actions in value.items():
+        if type(lane) is not str or lane not in sessions or type(actions) is not dict:
+            raise ValueError("Invalid checkpoint execution service lane")
+        record = sessions[lane]
+        scheduler = record.get("scheduler") if type(record) is dict else None
+        session_state = scheduler.get("session_state") if type(scheduler) is dict else None
+        session_id = session_state.get("execution_session_id") if type(session_state) is dict else None
+        for action_id, state in actions.items():
+            if (type(action_id) is not str or not action_id or type(state) is not dict
+                    or set(state) != {"receipts", "receipt_order", "historical_execution_cost_incomplete", "observations"}
+                    or type(state["receipts"]) is not dict
+                    or type(state["receipt_order"]) is not list
+                    or type(state["historical_execution_cost_incomplete"]) is not bool
+                    or type(state["observations"]) is not dict):
+                raise ValueError("Invalid checkpoint execution service action")
+            receipts = state["receipts"]
+            order = state["receipt_order"]
+            if (any(type(key) is not str for key in order)
+                    or len(order) != len(receipts) or set(order) != set(receipts)):
+                raise ValueError("Invalid checkpoint execution service order")
+            for receipt in receipts.values():
+                if (type(receipt) is not dict or set(receipt) != {
+                    "schema_version", "dispatch_id", "operation_id", "elapsed_seconds",
+                    "nested_seconds", "service_seconds", "productive",
+                    "semantic_attempt_completed", "disposition", "details", "ownership",
+                } or receipt["semantic_attempt_completed"] is not False):
+                    raise ValueError("Execution service cannot commit semantic completion")
+                ownership = receipt["ownership"]
+                if (type(session_id) is not str or not session_id
+                        or type(ownership) is not dict
+                        or set(ownership) != {"session_id", "parent_session_id", "parent_dispatch_id",
+                                              "parent_operation_id", "timing_scope"}
+                        or any(type(item) is not str for item in ownership.values())
+                        or ownership["session_id"] != session_id
+                        or ownership["timing_scope"] != "inclusive_admission_exclusive_wall_service"
+                        or len({bool(ownership[key]) for key in (
+                            "parent_session_id", "parent_dispatch_id", "parent_operation_id",
+                        )}) != 1):
+                    raise ValueError("Execution service receipt does not belong to its checkpoint lane")
+                for key in ("elapsed_seconds", "nested_seconds", "service_seconds"):
+                    if (type(receipt[key]) not in {float, int}
+                            or not math.isfinite(receipt[key]) or receipt[key] < 0):
+                        raise ValueError("Invalid checkpoint execution service duration")
+            elapsed = sum(receipt["elapsed_seconds"] for receipt in receipts.values())
+            ActionBudget(
+                max_invocations=-1, max_total_seconds=0, total_seconds=elapsed,
+                execution_receipts=receipts, execution_elapsed_seconds=elapsed,
+                execution_service_seconds=sum(receipt["service_seconds"] for receipt in receipts.values()),
+            )
+            if any(key not in _SERVICE_OBSERVATIONS or type(amount) not in {float, int}
+                   or not math.isfinite(amount) or amount < 0
+                   for key, amount in state["observations"].items()):
+                raise ValueError("Invalid checkpoint execution service observation")
+    return _json(value)
+
+
+def _pending_execution_service(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    """Keep only physical work absent from the immutable committed session."""
+    pending = {}
+    committed_budgets = record["scheduler"]["budgets"]
+    committed_observations = record["dossier"].get("action_value_observations", {})
+    for action_id, action_state in state.items():
+        budget = committed_budgets.get(action_id, {})
+        committed = budget.get("execution_receipts", {})
+        receipts = {}
+        for key, receipt in action_state["receipts"].items():
+            old = committed.get(key)
+            if old is not None:
+                if not _same_physical_receipt(old, receipt):
+                    raise ValueError("Conflicting execution service receipt")
+                if not (old["details"].get("detached_tail_pending") is True
+                        and receipt["details"].get("detached_tail_pending") is False):
+                    continue
+            receipts[key] = receipt
+        historical = bool(action_state["historical_execution_cost_incomplete"]
+                          and not budget.get("historical_execution_cost_incomplete", False))
+        prior = committed_observations.get(action_id, {})
+        observations = {key: amount for key, amount in action_state["observations"].items()
+                        if amount > prior.get(key, 0)}
+        if receipts or historical or observations:
+            pending[action_id] = {"receipts": receipts,
+                                  "receipt_order": [key for key in action_state["receipt_order"] if key in receipts],
+                                  "historical_execution_cost_incomplete": historical,
+                                  "observations": observations}
+    return pending
+
+
+def _restore_execution_service(session: Any, actions: dict[str, Any]) -> None:
+    from .action import ActionBudget
+
+    for action_id, state in actions.items():
+        budget = session.budgets.get(action_id)
+        if budget is None:
+            action = session.registered_action(action_id)
+            if action is None:
+                raise ValueError("Execution service references an unregistered action")
+            budget = ActionBudget(max_invocations=1, max_total_seconds=0,
+                                  scope=session._declared_action_budget_scope(action))
+            session.budgets[action_id] = budget
+        for key in state["receipt_order"]:
+            receipt = state["receipts"][key]
+            previous = budget.execution_receipts.get(key)
+            if previous is not None:
+                if not _same_physical_receipt(previous, receipt):
+                    raise ValueError("Conflicting restored execution service receipt")
+                if receipt["details"].get("detached_tail_pending") is False:
+                    budget.settle_execution_tail(key)
+                continue
+            budget.record_execution(
+                dispatch_id=receipt["dispatch_id"], operation_id=receipt["operation_id"],
+                elapsed_seconds=receipt["elapsed_seconds"], nested_seconds=receipt["nested_seconds"],
+                productive=receipt["productive"], disposition=receipt["disposition"],
+                details=_json(receipt["details"]), ownership=_json(receipt["ownership"]),
+            )
+        budget.historical_execution_cost_incomplete |= bool(
+            state["historical_execution_cost_incomplete"] or budget._execution_pending_count
+        )
+        observations = session.dossier.action_value_observations.setdefault(action_id, {})
+        # A prepared child can already carry newer dossier observations than
+        # its parent's sealed budget. Floors avoid replaying that service twice.
+        for key, amount in state["observations"].items():
+            observations[key] = max(observations.get(key, 0), amount)
+
+
+def _execution_service_cursors(session: Any) -> dict[str, Any]:
+    return {action_id: budget.execution_cursor()
+            for action_id, budget in getattr(session, "budgets", {}).items()}
+
+
+def _capture_execution_service(session: Any, record: dict[str, Any]) -> dict[str, Any]:
+    actions = {}
+    observations = getattr(session.dossier, "action_value_observations", {})
+    for action_id, budget in getattr(session, "budgets", {}).items():
+        if not budget.execution_receipts:
+            continue
+        actions[action_id] = _capture_execution_budget(budget, observations.get(action_id, {}))
+    return _pending_execution_service(actions, record)
+
+
+def _capture_execution_budget(budget: ActionBudget, observations: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "receipts": {key: _physical_receipt(receipt)
+                     for key, receipt in budget.execution_receipts.items()},
+        "receipt_order": list(budget.execution_receipts),
+        "historical_execution_cost_incomplete": budget.historical_execution_cost_incomplete,
+        "observations": {key: value for key, value in observations.items()
+                         if key in _SERVICE_OBSERVATIONS},
+    }
+
+
+def _merge_execution_service(previous: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    receipts = {**previous["receipts"], **state["receipts"]}
+    for key in previous["receipts"].keys() & state["receipts"].keys():
+        if not _same_physical_receipt(previous["receipts"][key], state["receipts"][key]):
+            raise ValueError("Conflicting execution service receipt update")
+        if previous["receipts"][key]["details"].get("detached_tail_pending") is False:
+            receipts[key]["details"]["detached_tail_pending"] = False
+    return {
+        "receipts": receipts,
+        "receipt_order": [*previous["receipt_order"], *(
+            key for key in state["receipt_order"] if key not in previous["receipts"]
+        )],
+        "historical_execution_cost_incomplete": bool(
+            previous["historical_execution_cost_incomplete"]
+            or state["historical_execution_cost_incomplete"]
+        ),
+        "observations": {key: max(previous["observations"].get(key, 0), state["observations"].get(key, 0))
+                         for key in previous["observations"].keys() | state["observations"].keys()},
+    }
+
+
+@dataclass
+class _ExecutionTailOwner:
+    """Keep a pending resource ledger alive without retaining a MiniSession."""
+
+    budget: ActionBudget
+    observations: dict[str, Any]
+    cursor: dict[str, Any]
+    callbacks: dict[int, weakref.ReferenceType[DetachedExecutionSettlement]] = dataclass_field(default_factory=dict)
+
+    def has_pending_callbacks(self) -> bool:
+        """Discard completed or redirected callbacks without retaining their frames."""
+        for key, reference in list(self.callbacks.items()):
+            settlement = reference()
+            if settlement is None or settlement.budget is not self.budget or not settlement.pending:
+                self.callbacks.pop(key)
+        return bool(self.callbacks)
 
 
 def _worker_clock_receipt(record: dict[str, Any]) -> tuple[float, float, bool]:
@@ -241,12 +494,16 @@ class AttemptCheckpointRegistry:
         self._outer_state: dict[str, Any] = {}
         self._planner_receipts: dict[str, dict[str, Any]] = {}
         self._durable_child_archives: set[str] = set()
+        self._snapshot_provider_archive_refs: dict[Path, set[str]] = {}
         # One process-local owner per lane, held weakly so a finished child
         # that no longer has an external owner does not keep a live capability
         # or stay in every later commit audit for the rest of the attempt.
         self._bound_sessions: dict[str, _LiveLaneOwner] = {}
         self._audit_ready_lanes: set[str] = set()
         self._execution_audit: dict[str, dict[str, int]] = {}
+        self._execution_service: dict[str, dict[str, Any]] = {}
+        self._execution_service_cursors: dict[str, dict[str, Any]] = {}
+        self._execution_tail_owners: dict[tuple[str, str, int], _ExecutionTailOwner] = {}
         self._sequence = 0
         self._closed = False
         self._publication_failed = False
@@ -274,6 +531,11 @@ class AttemptCheckpointRegistry:
             self.attempt_id = uuid.uuid4().hex
             self.registry_root = self.directory.parent / ".mini_attempts" / self.attempt_id
         self.registry_root.mkdir(parents=True, exist_ok=True)
+        from .provider_lane_archives import ProviderLaneArchiveStore
+
+        self._provider_lane_archives = ProviderLaneArchiveStore(
+            self.registry_root, write_record=lambda path, value: _write(path, value),
+        )
         self._lock_fp = (self.registry_root / "writer.lock").open("a+b")
         try:
             try:
@@ -355,7 +617,7 @@ class AttemptCheckpointRegistry:
             self.directory.mkdir(parents=True, exist_ok=True)
             self.generation_id = uuid.uuid4().hex
             self.predecessor = str(predecessor) if predecessor is not None else None
-            self._publish(self._snapshot_payload())
+            self._sessions = self._publish(self._snapshot_payload())
         except BaseException:
             self.close()
             raise
@@ -382,9 +644,13 @@ class AttemptCheckpointRegistry:
 
     def _restore_snapshot(self, record: dict[str, Any], *,
                           expected_identity: dict[str, Any] | None = None) -> None:
+        storage_schema = record.get("schema_version")
         record = self._expand_completed_children(record)
         required = {"schema_version", "attempt_id", "identity", "sessions", "children", "outer_state", "planner_receipts", "cost_ledger", "recorder", "journal_watermark", "predecessor", "worker_active_elapsed_s", "worker_observed_epoch_s", "worker_generation_completed"}
-        if type(record) is not dict or set(record) not in (required, required | {"execution_audit"}) or type(record["schema_version"]) is not int or record["schema_version"] != _SCHEMA:
+        optional = {"execution_audit", "execution_service"}
+        if (type(record) is not dict or not required <= set(record)
+                or set(record) - required - optional
+                or type(record["schema_version"]) is not int or record["schema_version"] != _SCHEMA):
             raise ValueError("Unsupported attempt checkpoint snapshot schema")
         if (record["identity"] != (self.identity if expected_identity is None else expected_identity)
                 or record["attempt_id"] != self.attempt_id):
@@ -393,6 +659,7 @@ class AttemptCheckpointRegistry:
             if type(record[name]) is not dict:
                 raise ValueError("Invalid attempt checkpoint state map")
         execution_audit = _validated_execution_audit(record.get("execution_audit", {}), record["sessions"])
+        execution_service = _validated_execution_service(record.get("execution_service", {}), record["sessions"])
         watermark = record["journal_watermark"]
         if type(watermark) is not int or watermark < 0:
             raise ValueError("Invalid attempt checkpoint journal watermark")
@@ -406,11 +673,21 @@ class AttemptCheckpointRegistry:
             if admitted < committed and not math.isclose(admitted, committed, rel_tol=0.0, abs_tol=1e-9):
                 raise ValueError("Worker lease would erase committed predecessor time")
             self._restored_worker_active_elapsed_s = max(admitted, committed)
+        from .provider_lane_archives import session_has_provider_archives
+
+        if storage_schema != 3 and any(
+            session_has_provider_archives(session)
+            for session in record["sessions"].values()
+        ):
+            raise ValueError("Provider archives require attempt snapshot schema 3")
         self._sessions = _json(record["sessions"])
+        for session in self._sessions.values():
+            self._provider_lane_archives.validate_session(session)
         self._children = _json(record["children"])
         self._outer_state = _json(record["outer_state"])
         self._planner_receipts = _json(record["planner_receipts"])
         self._execution_audit = execution_audit
+        self._execution_service = execution_service
         self._restored_cost_record = _json(record["cost_ledger"])
         self._restored_recorder_record = _json(record["recorder"])
         self._restored_journal_watermark = watermark
@@ -455,7 +732,9 @@ class AttemptCheckpointRegistry:
                 "planner_receipts": receipts, "archived_children": archived}
 
     def _expand_completed_children(self, record: dict[str, Any]) -> dict[str, Any]:
-        return expand_completed_children(record, self.registry_root)
+        return expand_completed_children(
+            record, self.registry_root, hydrate_provider_lanes=False,
+        )
 
     def _snapshot_payload(self) -> dict[str, Any]:
         observed_epoch_s = time.time()
@@ -465,6 +744,7 @@ class AttemptCheckpointRegistry:
             "children": self._children, "outer_state": self._outer_state,
             "planner_receipts": self._planner_receipts,
             "execution_audit": self._execution_audit,
+            "execution_service": self._execution_service,
             "cost_ledger": self._restored_cost_record,
             "recorder": self._restored_recorder_record,
             "journal_watermark": self._restored_journal_watermark,
@@ -484,14 +764,31 @@ class AttemptCheckpointRegistry:
                 "Attempt checkpoint writer failed; close and resume from the validated attempt head"
             )
 
-    def _publish(self, record: dict[str, Any]) -> None:
+    def _publish(self, record: dict[str, Any]) -> dict[str, dict[str, Any]]:
         self._require_writable()
         next_sequence = self._sequence + 1
         snapshot_path = self.directory / "checkpoints" / f"{next_sequence:012d}.json"
         # The shared head prevents a later restart from silently restoring an
         # older generation's cost capacity. Never fall back past this head.
         try:
-            snapshot = self._archive_completed_children(_json(record))
+            from .provider_lane_archives import session_has_provider_archives
+
+            prepared = _json(record)
+            prepared["sessions"] = {
+                lane: self._provider_lane_archives.compact_session(session)
+                for lane, session in prepared["sessions"].items()
+            }
+            has_provider_archives = any(
+                session_has_provider_archives(session)
+                for session in prepared["sessions"].values()
+            )
+            # Archive paid bodies before either whole-attempt size checks or
+            # completed-child compression. Their independent archive/decode
+            # bounds must not become an aggregate limit on retained search.
+            snapshot = self._archive_completed_children(prepared)
+            if has_provider_archives:
+                snapshot = {**snapshot, "schema_version": 3}
+                snapshot.setdefault("archived_children", {})
             head = {"generation_id": self.generation_id, "snapshot_path": str(snapshot_path),
                     "snapshot_hash": _digest(snapshot)}
             manifest = {"schema_version": _SCHEMA, "attempt_id": self.attempt_id,
@@ -508,6 +805,9 @@ class AttemptCheckpointRegistry:
             self._publication_failed = True
             raise
         self._sequence = next_sequence
+        self._snapshot_provider_archive_refs[snapshot_path] = (
+            self._provider_lane_archives.retain_sessions(prepared["sessions"])
+        )
         # Resume reads only the shared head, which now names this snapshot.
         # Each snapshot is a full copy of the attempt state, so keeping every
         # superseded one grows disk use quadratically over a long attempt.
@@ -518,8 +818,20 @@ class AttemptCheckpointRegistry:
         if previous is not None and previous != snapshot_path:
             try:
                 previous.unlink()
+            except FileNotFoundError:
+                self._snapshot_provider_archive_refs.pop(previous, None)
             except OSError:
                 pass
+            else:
+                self._snapshot_provider_archive_refs.pop(previous, None)
+        # The prepared session map includes completed-child provider refs
+        # before child archival. A failed snapshot unlink pins its full set;
+        # no cold body or completed-child file is read for this collection.
+        retained_provider_archives = set().union(
+            *self._snapshot_provider_archive_refs.values(),
+        )
+        self._provider_lane_archives.collect_unreferenced(retained_provider_archives)
+        return prepared["sessions"]
 
     @property
     def is_resume(self) -> bool:
@@ -567,7 +879,9 @@ class AttemptCheckpointRegistry:
                                   publication_guard=publication_guard)
 
     def lane_record(self, lane_key: str) -> dict[str, Any] | None:
-        return _json(self._sessions.get(lane_key))
+        record = self._sessions.get(lane_key)
+        return (self._provider_lane_archives.hydrate_session(record)
+                if record is not None else None)
 
     def child_record(self, child_lane: str) -> dict[str, Any] | None:
         return _json(self._children.get(child_lane))
@@ -615,7 +929,10 @@ class AttemptCheckpointRegistry:
             await asyncio.to_thread(session_checkpoint_identity, session)
             record = self._sessions.get(lane_key)
             if record is not None:
-                await restore_session_record(session, _json(record), expected_identity=record["identity"])
+                await restore_session_record(
+                    session, self._provider_lane_archives.hydrate_session(record),
+                    expected_identity=record["identity"],
+                )
             session.checkpoint_registry = self
             session.checkpoint_lane_key = lane_key
             child_frames = self.child_records_for_parent(lane_key)
@@ -653,6 +970,8 @@ class AttemptCheckpointRegistry:
                 session.dossier.tool_metrics[key] = max(
                     int(session.dossier.tool_metrics.get(key, 0) or 0), floor,
                 )
+            _restore_execution_service(session, self._execution_service.get(lane_key, {}))
+            self._adopt_execution_tails(lane_key, session)
             if record is None:
                 await self.commit_session(lane_key, session)
             self._audit_ready_lanes.add(lane_key)
@@ -680,6 +999,7 @@ class AttemptCheckpointRegistry:
         if binding is None or not binding.owns(session):
             raise ValueError("Checkpoint session does not own its lane")
         record = capture_session_record(session)
+        captured_service_cursor = _execution_service_cursors(session)
         broker = session.planner_job_broker(create=False)
         acknowledged = broker.acknowledged_receipts() if broker is not None else ()
         owner = getattr(session, "_recursive_lane_authority", None) or session
@@ -690,10 +1010,85 @@ class AttemptCheckpointRegistry:
         removals = {broker_lane: [_digest([item.job_id, item.request_fingerprint])
                                  for item in acknowledged]} if acknowledged else {}
         await self._commit_update(session_updates={lane_key: _json(record)},
+                                  execution_service_captured_cursors={lane_key: captured_service_cursor},
                                   planner_receipt_removals=removals,
                                   publication_guard=publication_guard)
         if acknowledged:
             broker.confirm_receipts_committed(acknowledged)
+
+    async def commit_execution_service(self, lane_key: str, session: Any) -> None:
+        """Persist physical work without publishing an unfinished action's state."""
+        binding = self._bound_sessions.get(lane_key)
+        if binding is None or not binding.owns(session) or lane_key not in self._sessions:
+            raise ValueError("Execution service does not own a committed checkpoint lane")
+        actions = _capture_execution_service(session, self._sessions[lane_key])
+        new_tail_owner = any(
+            settlement.pending
+            and (lane_key, settlement.action_id, id(settlement.budget)) not in self._execution_tail_owners
+            for settlement in getattr(session, "_detached_execution_settlements", ())
+        )
+        changed_tail_owner = any(
+            lane == lane_key and owner.cursor != owner.budget.execution_cursor()
+            for (lane, _, _), owner in self._execution_tail_owners.items()
+        )
+        if new_tail_owner or changed_tail_owner or (actions and actions != self._execution_service.get(lane_key, {})):
+            await self._commit_update(execution_service_updates={lane_key: actions})
+
+    def retain_execution_tail(
+        self, lane_key: str, session: Any, settlement: DetachedExecutionSettlement,
+    ) -> None:
+        """Register resource ownership before a detached callback can complete."""
+        binding = self._bound_sessions.get(lane_key)
+        if binding is None or not binding.owns(session) or lane_key not in self._sessions:
+            raise ValueError("Execution tail does not own a committed checkpoint lane")
+        self._retain_execution_tail(lane_key, settlement)
+
+    def _retain_execution_tail(self, lane_key: str, settlement: DetachedExecutionSettlement) -> None:
+        key = (lane_key, settlement.action_id, id(settlement.budget))
+        owner = self._execution_tail_owners.get(key)
+        if owner is None:
+            owner = _ExecutionTailOwner(
+                settlement.budget,
+                settlement.observations if settlement.observations is not None else {},
+                {},
+            )
+            self._execution_tail_owners[key] = owner
+        owner.callbacks[id(settlement)] = weakref.ref(settlement)
+
+    def _adopt_execution_tails(self, lane_key: str, session: Any) -> None:
+        """Transfer in-process resource callbacks to a restored lane's budget.
+
+        Restoring the sealed mathematical record creates a new budget and
+        observation map. Settle any receipts that arrived during that restore,
+        then move pending callbacks before this session can admit fresh work.
+        Both physical history and its observations keep a single live owner.
+        """
+        record = self._sessions.get(lane_key)
+        if record is None:
+            return
+        for (lane, action_id, _), owner in list(self._execution_tail_owners.items()):
+            if lane != lane_key:
+                continue
+            actions = _pending_execution_service({
+                action_id: _capture_execution_budget(
+                    owner.budget, owner.observations.get(action_id, {}),
+                ),
+            }, record)
+            _restore_execution_service(session, actions)
+            for reference in owner.callbacks.values():
+                settlement = reference()
+                if (settlement is None or settlement.budget is not owner.budget
+                        or not settlement.pending):
+                    continue
+                for index, previous in enumerate(settlement.registry):
+                    if previous is settlement:
+                        del settlement.registry[index]
+                        break
+                settlement.budget = session.budgets[action_id]
+                settlement.observations = session.dossier.action_value_observations
+                settlement.registry = session._detached_execution_settlements
+                settlement.registry.append(settlement)
+                self._retain_execution_tail(lane_key, settlement)
 
     async def _commit_update(self, **updates: Any) -> None:
         # Serialize companion snapshots with the manifest transaction. The
@@ -755,6 +1150,10 @@ class AttemptCheckpointRegistry:
             session_updates = updates.pop("session_updates", {})
             snapshot["sessions"] = {**self._sessions, **session_updates}
             execution_audit = _json(self._execution_audit)
+            service_updates = updates.pop("execution_service_updates", {})
+            captured_cursors = updates.pop("execution_service_captured_cursors", {})
+            service_cursors = dict(self._execution_service_cursors)
+            live_budget_ids: set[int] = set()
             for lane, binding in list(self._bound_sessions.items()):
                 session = binding.session()
                 if session is None:
@@ -763,12 +1162,26 @@ class AttemptCheckpointRegistry:
                     if self._bound_sessions.get(lane) is binding:
                         self._bound_sessions.pop(lane, None)
                         self._audit_ready_lanes.discard(lane)
+                        service_cursors.pop(lane, None)
                     continue
                 # bind_session reserves ownership before asynchronous restore;
                 # a pending/failed new bind is not a committed reporting lane.
                 if (lane not in snapshot["sessions"]
                         or (lane not in self._audit_ready_lanes and lane not in session_updates)):
                     continue
+                cursor = _execution_service_cursors(session)
+                previous_cursor = captured_cursors.get(lane, service_cursors.get(lane))
+                if cursor != previous_cursor:
+                    # Late resource-only callbacks can settle after a paused
+                    # scheduler has exited. Observe changed receipt owners,
+                    # without inspecting another lane's mathematical state.
+                    service_updates[lane] = _capture_execution_service(session, snapshot["sessions"][lane])
+                service_cursors[lane] = cursor
+                live_budget_ids.update(id(budget) for budget in getattr(session, "budgets", {}).values())
+                for settlement in getattr(session, "_detached_execution_settlements", ()):
+                    budget = settlement.budget
+                    if budget._execution_pending_count and settlement.pending:
+                        self._retain_execution_tail(lane, settlement)
                 metrics = dict(session.dossier.tool_metrics)
                 floor = execution_audit.setdefault(lane, {})
                 for key in MONOTONIC_LEAN_ATTEMPT_METRICS:
@@ -778,6 +1191,40 @@ class AttemptCheckpointRegistry:
                     if amount:
                         floor[key] = max(floor.get(key, 0), amount)
             snapshot["execution_audit"] = execution_audit
+            tail_cursors = {}
+            for key, owner in self._execution_tail_owners.items():
+                lane, action_id, _ = key
+                cursor = owner.budget.execution_cursor()
+                tail_cursors[key] = cursor
+                if id(owner.budget) in live_budget_ids or cursor == owner.cursor:
+                    continue
+                # Detached callbacks deliberately outlive their MiniSession.
+                # Their narrow budget and observation capabilities must still
+                # settle before this resource owner can be released.
+                pending = _pending_execution_service({
+                    action_id: _capture_execution_budget(owner.budget, owner.observations.get(action_id, {})),
+                }, snapshot["sessions"][lane])
+                destination = service_updates.setdefault(lane, {})
+                for retained_action, state in pending.items():
+                    previous = destination.get(retained_action)
+                    destination[retained_action] = (
+                        _merge_execution_service(previous, state) if previous is not None else state
+                    )
+            execution_service = _json(self._execution_service)
+            for lane, actions in service_updates.items():
+                destination = execution_service.setdefault(lane, {})
+                for action_id, state in actions.items():
+                    previous = destination.get(action_id)
+                    if previous is not None:
+                        state = _merge_execution_service(previous, state)
+                    destination[action_id] = state
+            for lane, actions in list(execution_service.items()):
+                pending = _pending_execution_service(actions, snapshot["sessions"][lane])
+                if pending:
+                    execution_service[lane] = pending
+                else:
+                    execution_service.pop(lane)
+            snapshot["execution_service"] = _validated_execution_service(execution_service, snapshot["sessions"])
             snapshot["children"] = {**self._children, **child_updates}
             snapshot["planner_receipts"] = planner_receipts
             snapshot.update(updates)
@@ -785,12 +1232,19 @@ class AttemptCheckpointRegistry:
                             journal_watermark=watermark)
             if publication_guard is not None and not publication_guard():
                 raise RuntimeError("Planner publication ownership was revoked")
-            self._publish(snapshot)
-            self._sessions = snapshot["sessions"]
+            self._sessions = self._publish(snapshot)
             self._children = snapshot["children"]
             self._outer_state = snapshot["outer_state"]
             self._planner_receipts = planner_receipts
             self._execution_audit = execution_audit
+            self._execution_service = snapshot["execution_service"]
+            self._execution_service_cursors = service_cursors
+            for key, cursor in tail_cursors.items():
+                owner = self._execution_tail_owners[key]
+                if owner.has_pending_callbacks():
+                    owner.cursor = cursor
+                else:
+                    self._execution_tail_owners.pop(key)
             self._restored_cost_record = cost_record
             self._restored_recorder_record = recorder_record
             self._restored_journal_watermark = watermark
@@ -804,6 +1258,7 @@ class AttemptCheckpointRegistry:
                 if binding is not None and binding.strong_only():
                     self._bound_sessions.pop(lane, None)
                     self._audit_ready_lanes.discard(lane)
+                    self._execution_service_cursors.pop(lane, None)
 
     async def prepare_child(
         self, parent_lane: str, descriptor: dict[str, Any],
@@ -846,6 +1301,36 @@ class AttemptCheckpointRegistry:
         await self._commit_update(completed_child_updates={child_lane: result},
                                   publication_guard=publication_guard,
                                   settle_lanes={child_lane})
+
+    async def suspend_session(self, lane_key: str, session: Any, *, publication_guard: Any = None) -> None:
+        """Release a settled runtime owner while retaining its unfinished lane."""
+        await self.commit_session(lane_key, session, publication_guard=publication_guard)
+        binding = self._bound_sessions.get(lane_key)
+        if binding is None or not binding.owns(session):
+            raise ValueError("Suspended session no longer owns its checkpoint lane")
+        self._bound_sessions.pop(lane_key)
+        self._audit_ready_lanes.discard(lane_key)
+        self._execution_service_cursors.pop(lane_key, None)
+        session.checkpoint_registry = None
+        session.checkpoint_lane_key = ""
+
+    async def detach_abandoned_session(self, lane_key: str, session: Any) -> None:
+        """Release a fenced tail without publishing its mutable proof state."""
+        binding = self._bound_sessions.get(lane_key)
+        if (binding is None or not binding.owns(session) or lane_key not in self._sessions
+                or not getattr(getattr(session, "_mini_recursive_hard_timeout_lease", None), "abandoned", False)):
+            raise ValueError("Abandoned session does not own a sealed checkpoint lane")
+        # Financial/execution receipts are independent of mathematical state.
+        # This also retains detached settlement owners for later receipt deltas.
+        await self.commit_execution_service(lane_key, session)
+        binding = self._bound_sessions.get(lane_key)
+        if binding is None or not binding.owns(session):
+            raise ValueError("Abandoned session no longer owns its checkpoint lane")
+        self._bound_sessions.pop(lane_key)
+        self._audit_ready_lanes.discard(lane_key)
+        self._execution_service_cursors.pop(lane_key, None)
+        session.checkpoint_registry = None
+        session.checkpoint_lane_key = ""
 
     async def update_outer_state(self, record: dict[str, Any]) -> None:
         await self._commit_update(outer_state=_json(record))

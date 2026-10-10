@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 import math
+import time
 import uuid
 from typing import Any
 
@@ -94,7 +95,7 @@ def initialize_capacity_reserve(session: Any) -> None:
     # Unlimited counts cannot provide a finite, non-renewing split. Ordinary
     # on-demand research can still borrow under the existing donor policy.
     allocated = min(configured, max(0, available - 1)) if available is not None else 0
-    if hasattr(session, "max_iterations"):
+    if getattr(session, "max_iterations", -1) >= 0:
         allocated = min(allocated, max(0, session.max_iterations - session.iteration - 1))
     state["capacity_reserve"] = {
         "schema": 1, "action_id": donor.action_id if donor else "",
@@ -127,7 +128,7 @@ def capacity_reserve_due(session: Any, action_id: str | None = None) -> bool:
         return False
     held = reserve["allocated"] - reserve["spent"] - reserve["released"]
     remaining = _remaining_turns(budget)
-    if hasattr(session, "max_iterations") and remaining is not None:
+    if getattr(session, "max_iterations", -1) >= 0 and remaining is not None:
         remaining = min(remaining, max(0, session.max_iterations - session.iteration))
     return bool(held and remaining is not None and remaining <= held + 1)
 
@@ -150,7 +151,7 @@ def pending_research_reservation(session: Any, action_id: str) -> tuple[int, flo
     if not isinstance(grant, dict) or not grant.get("background"):
         return 0, 0.0
     requests = max(0, int(grant["requests"]) - int(grant.get("accounted", 0)))
-    seconds = float(grant["seconds"]) if grant["action_id"] == action_id else 0.0
+    seconds = float(grant.get("reserved_seconds", grant["seconds"])) if grant["action_id"] == action_id else 0.0
     if not math.isfinite(seconds) or seconds < 0:
         raise ValueError("invalid pending research time reservation")
     return requests, seconds
@@ -234,19 +235,33 @@ def _share_local_resources(donor: Any, clone: Any) -> Any:
     return clone
 
 
-def _parent_remaining(session: Any) -> float | None:
+def remaining_owner_seconds(session: Any) -> float | None:
+    """Read the earliest current governor or recursive ancestor hard bound."""
     getter = getattr(session, "_run_governor_remaining_s", None)
-    if not callable(getter):
-        return None
-    remaining = getter()
-    if remaining is None:
-        return None
-    if isinstance(remaining, bool):
-        raise ValueError("invalid remaining parent time")
-    seconds = float(remaining)
-    if not math.isfinite(seconds) or seconds <= 0:
+    remaining = getter() if callable(getter) else None
+    limits = []
+    if remaining is not None:
+        if isinstance(remaining, bool):
+            raise ValueError("invalid remaining parent time")
+        seconds = float(remaining)
+        if not math.isfinite(seconds):
+            raise ValueError("invalid remaining parent time")
+        limits.append(max(0.0, seconds))
+    ancestor = getattr(session, "recursive_elapsed_deadline_epoch_s", 0.0)
+    if ancestor is None:
+        ancestor = 0.0
+    if type(ancestor) not in {int, float} or not math.isfinite(ancestor) or ancestor < 0:
+        raise ValueError("invalid recursive ancestor deadline")
+    if ancestor > 0:
+        limits.append(max(0.0, ancestor - time.time()))
+    return min(limits) if limits else None
+
+
+def _parent_remaining(session: Any) -> float | None:
+    remaining = remaining_owner_seconds(session)
+    if remaining is not None and remaining <= 0:
         raise ValueError("remaining parent time is exhausted or invalid")
-    return seconds
+    return remaining
 
 
 def _donor(session: Any, action: Any, parent_seconds: float | None) -> Donor | None:
@@ -319,7 +334,8 @@ def select_donor(session: Any) -> Donor | None:
             if (
                 type(session.max_iterations) is not int
                 or type(getattr(session, "iteration", None)) is not int
-                or session.max_iterations - session.iteration < 2
+                or session.max_iterations < -1
+                or (session.max_iterations >= 0 and session.max_iterations - session.iteration < 2)
             ):
                 return None
         parent_seconds = _parent_remaining(session)
@@ -468,6 +484,69 @@ def restore_elapsed(
         session, action_id, seconds, execution_id=execution_id,
         cumulative_seconds=cumulative_seconds,
     )
+
+
+def reconcile_recovery_elapsed(
+    session: Any, grant: dict[str, Any], saved: dict[str, Any],
+) -> float:
+    """Restore measured replay service inside the grant's existing debit.
+
+    An unfinished interval retains the original conservative reservation.
+    Measured intervals consume that reservation before adding resource time;
+    they remain exact service observations even when earlier cost is unknown.
+    The session's cumulative marker and execution receipts make retries safe.
+    """
+    def seconds(value: Any) -> float:
+        if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+            raise ValueError("invalid native research recovery elapsed time")
+        return float(value)
+
+    intervals = saved.get("recovery_intervals", {})
+    if not isinstance(intervals, dict) or any(
+        not isinstance(key, str) or not key or not isinstance(value, dict)
+        for key, value in intervals.items()
+    ):
+        raise ValueError("invalid native research recovery intervals")
+    measured = []
+    if "elapsed_s" in saved:
+        measured.append((grant["id"], seconds(saved["elapsed_s"])))
+    for key, interval in intervals.items():
+        if "elapsed_s" in interval:
+            measured.append((f"{grant['id']}:recovery:{key}", seconds(interval["elapsed_s"])))
+    incomplete = "elapsed_s" not in saved or any(
+        "elapsed_s" not in interval for interval in intervals.values()
+    )
+    elapsed = seconds(sum(value for _, value in measured))
+    if incomplete:
+        elapsed = max(elapsed, seconds(saved.get(
+            "reserved_seconds", grant.get("reserved_seconds", grant.get("seconds", 0.0)),
+        )))
+    budget = session.budgets[grant["action_id"]]
+    owned_dispatches = {f"research:{execution_id}" for execution_id, _ in measured}
+    recorded = sum(receipt["elapsed_seconds"] for receipt in budget.execution_receipts.values()
+                   if receipt["dispatch_id"] in owned_dispatches)
+    previous = max(seconds(grant.get("elapsed_accounted", 0.0)), recorded)
+    uncharged = max(0.0, elapsed - previous)
+    # Debit the full cumulative obligation before recording observations. A
+    # diagnostic failure after record_execution must not strand an unmarked
+    # debit that the next recovery could charge again.
+    budget.consume_elapsed(uncharged)
+    grant["elapsed_accounted"] = max(previous, elapsed)
+    budget.historical_execution_cost_incomplete |= incomplete
+    for execution_id, measured_seconds in measured:
+        before = budget.total_seconds
+        try:
+            restore_elapsed(
+                session, grant["action_id"], measured_seconds,
+                execution_id=execution_id, cumulative_seconds=measured_seconds,
+            )
+        finally:
+            # Exact service replaces part of the debit above; it is not a
+            # second resource charge, including if an observer raises.
+            credit = budget.total_seconds - before
+            budget.total_seconds -= credit
+            budget.unproductive_seconds -= credit
+    return uncharged
 
 
 def _charge_elapsed_receipt(

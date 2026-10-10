@@ -38,26 +38,21 @@ def _live_event_key(root: Any) -> str:
 
 
 def _merge_retired_support_identities(*records: Any) -> dict[str, list[str]]:
-    """Copy a bounded union of source obligations; these are never admission."""
+    """Copy every retained source obligation; these are never admission."""
     combined: dict[str, set[str]] = {}
-    count = 0
     for record in records:
-        if not isinstance(record, dict) or len(record) > 4096:
+        if not isinstance(record, dict):
             raise ValueError("invalid retired support identities")
         for name, identities in record.items():
             if (
                 not isinstance(name, str) or not name
                 or not isinstance(identities, (list, tuple))
-                or not identities or len(identities) > 4096
+                or not identities
                 or any(not isinstance(identity, str) or not identity for identity in identities)
             ):
                 raise ValueError("invalid retired support identity")
             owners = combined.setdefault(name, set())
-            before = len(owners)
             owners.update(identities)
-            count += len(owners) - before
-            if count > 4096:
-                raise ValueError("retired support identity limit exceeded")
     return {name: sorted(owners) for name, owners in combined.items()}
 
 
@@ -68,13 +63,11 @@ def _retired_support_unknown_names(state: Mapping[str, Any]) -> set[str]:
     unknown = state.get("retired_support_unknown_names", ())
     for values in (retired, unknown):
         if (
-            not isinstance(values, (list, tuple)) or len(values) > 4096
+            not isinstance(values, (list, tuple))
             or any(not isinstance(name, str) or not name for name in values)
         ):
             raise ValueError("invalid retired support names")
     result = set(unknown) | (set(retired) - set(identities))
-    if len(result) > 4096:
-        raise ValueError("retired support name limit exceeded")
     return result
 
 
@@ -778,17 +771,17 @@ class MathematicalMemoryService:
             else ()
         )
         bundles = tuple(getattr(session, "theory_imported_bundle_ids", ()))
-        cap = self.config.cheap_candidate_cap
-        if len(lemmas) > cap or len(records) > cap or len(bundles) > cap:
-            return None
         registry = self.provenance_registry
+        cap = registry.closure_cap if registry is not None else 0
+        if cap > 0 and (len(lemmas) > cap or len(records) > cap or len(bundles) > cap):
+            return None
         identities = [candidate_id] if candidate_id else []
         retired_imports = getattr(session, "mathematical_memory_state", {}).get(
             "retired_import_owners", ()
         )
         if (
             not isinstance(retired_imports, (list, tuple))
-            or len(retired_imports) > cap
+            or (cap > 0 and len(retired_imports) > cap)
             or any(not isinstance(identity, str) for identity in retired_imports)
             or not set(retired_imports).issubset(self._memory_import_owners)
         ):
@@ -846,9 +839,7 @@ class MathematicalMemoryService:
                     return None
             identities.extend(bound or (bundle_id,))
         result = tuple(dict.fromkeys(identities))
-        if len(result) > cap or (
-            registry is not None and len(result) > registry.closure_cap
-        ):
+        if cap > 0 and len(result) > cap:
             return None
         return result
 
@@ -873,10 +864,18 @@ class MathematicalMemoryService:
             )
             if current is not None:
                 return current
+        # Incomplete local history cannot erase a known source denial, missing
+        # original owner, or consumer restriction merely by dropping ancestry.
+        try:
+            locally_admitted = self._sources_admitted(identities)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error):
+            locally_admitted = False
+        local = self.provenance(accepted=accepted)
         return replace(
-            self.provenance(accepted=accepted),
+            local,
             source_record_ids=identities,
             complete=False,
+            scope_id=local.scope_id if locally_admitted else "",
         )
 
     def _sources_admitted(
@@ -908,24 +907,18 @@ class MathematicalMemoryService:
             checked = tuple(dict.fromkeys((*identities, *admission.source_record_ids)))
         else:
             checked = identities
-        unknown = tuple(identity for identity in identities if identity not in known)
+        known_identities = set(known)
+        unknown = tuple(identity for identity in identities if identity not in known_identities)
         if unknown or not identities:
             # Only an unrestricted current-session read may use unregistered
             # source metadata. This fallback never erases a registered denial.
             if not self.policy.permits(self.provenance()):
                 return False
-        cap = (
-            registry.closure_cap
-            if registry is not None
-            else self.config.cheap_candidate_cap
-        )
-        if len(checked) > cap:
+        cap = registry.closure_cap if registry is not None else 0
+        if cap > 0 and len(checked) > cap:
             return False
-        return all(
-            self.catalog.source_eligible(
-                identity, self.policy, deadline_monotonic=deadline
-            )
-            for identity in checked
+        return self.catalog.sources_eligible(
+            checked, self.policy, deadline_monotonic=deadline,
         )
 
     def application_eligible(
@@ -1704,8 +1697,7 @@ class MathematicalMemoryService:
             retired_imports = state.get("retired_import_owners", ())
             if state.get("retired_support_incomplete") is True or any(
                 not isinstance(items, (list, tuple))
-                or len(items) > 4096
-                or any(not isinstance(item, str) for item in items)
+                or any(not isinstance(item, str) or not item for item in items)
                 for items in (retired, retired_bundles, retired_imports)
             ):
                 return False
@@ -1781,6 +1773,11 @@ class MathematicalMemoryService:
                     continue
                 if not self._sources_admitted((identity,)):
                     return False
+            live_identities = (
+                set(self.known_candidate_ids.values())
+                | set(self._memory_support_names.values())
+                | self._memory_import_owners
+            )
             for raw_name in retired:
                 if _observation_proves_unused(
                     raw_name,
@@ -1795,11 +1792,6 @@ class MathematicalMemoryService:
                 # one needs fresh live admission; a replacement with the same
                 # printed name cannot authorize a different original owner.
                 identities = retired_identities.get(raw_name, ())
-                live_identities = (
-                    set(self.known_candidate_ids.values())
-                    | set(self._memory_support_names.values())
-                    | self._memory_import_owners
-                )
                 if raw_name in retired_unknown or not identities or not set(identities).issubset(live_identities):
                     return False
                 if any(not self.application_eligible(identity) for identity in identities):
@@ -2894,8 +2886,7 @@ def finalization_without_memory_eligible(session: Any, candidate: Any) -> bool:
         return False
     if (
         not isinstance(retired, (list, tuple))
-        or len(retired) > 4096
-        or any(not isinstance(name, str) for name in retired)
+        or any(not isinstance(name, str) or not name for name in retired)
     ):
         return False
     retired_names.update(canonical_lean_identifier(name) for name in retired)
@@ -2904,8 +2895,7 @@ def finalization_without_memory_eligible(session: Any, candidate: Any) -> bool:
     bundles = state.get("retired_bundle_obligations", ())
     if (
         not isinstance(bundles, (list, tuple))
-        or len(bundles) > 4096
-        or any(not isinstance(identity, str) for identity in bundles)
+        or any(not isinstance(identity, str) or not identity for identity in bundles)
     ):
         return False
     for node in getattr(getattr(session, "proof_state", None), "nodes", {}).values():
@@ -2965,7 +2955,7 @@ def finalization_without_memory_eligible(session: Any, candidate: Any) -> bool:
 def snapshot_memory_source_obligations(
     service: MathematicalMemoryService,
 ) -> dict[str, Any]:
-    """Retain bounded dependency obligations, never replay authority."""
+    """Retain complete dependency obligations, never replay authority."""
     session = service.session()
     if session is None:
         return {}
@@ -2986,8 +2976,7 @@ def snapshot_memory_source_obligations(
     retired = state.get("retired_support_names", ())
     if (
         not isinstance(retired, (list, tuple))
-        or len(retired) > 4096
-        or any(not isinstance(name, str) for name in retired)
+        or any(not isinstance(name, str) or not name for name in retired)
     ):
         state["retired_support_incomplete"] = True
         retired = ()
@@ -3002,14 +2991,11 @@ def snapshot_memory_source_obligations(
             )
         )
     )
-    state["retired_support_names"] = list(names[:4096])
-    if len(names) > 4096:
-        state["retired_support_incomplete"] = True
+    state["retired_support_names"] = list(names)
     retired_bundles = state.get("retired_bundle_obligations", ())
     if (
         not isinstance(retired_bundles, (list, tuple))
-        or len(retired_bundles) > 4096
-        or any(not isinstance(identity, str) for identity in retired_bundles)
+        or any(not isinstance(identity, str) or not identity for identity in retired_bundles)
     ):
         state["retired_support_incomplete"] = True
         retired_bundles = ()
@@ -3027,21 +3013,16 @@ def snapshot_memory_source_obligations(
             )
             if match:
                 bundles.add(match.group(1))
-    state["retired_bundle_obligations"] = sorted(bundles)[:4096]
-    if len(bundles) > 4096:
-        state["retired_support_incomplete"] = True
+    state["retired_bundle_obligations"] = sorted(bundles)
     retired_imports = state.get("retired_import_owners", ())
     if (
         not isinstance(retired_imports, (list, tuple))
-        or len(retired_imports) > 4096
-        or any(not isinstance(identity, str) for identity in retired_imports)
+        or any(not isinstance(identity, str) or not identity for identity in retired_imports)
     ):
         state["retired_support_incomplete"] = True
         retired_imports = ()
     imports = set(retired_imports) | service._memory_import_owners
-    state["retired_import_owners"] = sorted(imports)[:4096]
-    if len(imports) > 4096:
-        state["retired_support_incomplete"] = True
+    state["retired_import_owners"] = sorted(imports)
     return state
 
 

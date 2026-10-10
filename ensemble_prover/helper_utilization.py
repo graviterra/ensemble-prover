@@ -83,15 +83,16 @@ def parse_helper_usage_observation(
         return None
     for key in ("direct", "reachable", "declarations"):
         value = data.get(key)
-        if not isinstance(value, list) or len(value) > 10000 or any(
+        if not isinstance(value, list) or any(
             not isinstance(name, str) or not name for name in value
         ):
             return None
     if not set(data["direct"]).issubset(data["reachable"]):
         return None
     bindings = data.get("bindings")
-    if not isinstance(bindings, list) or len(bindings) > 10000:
+    if not isinstance(bindings, list):
         return None
+    declarations = set(data["declarations"])
     requested = set()
     pairs = []
     for entry in bindings:
@@ -100,14 +101,14 @@ def parse_helper_usage_observation(
             or not isinstance(entry.get("requested"), str) or not entry["requested"]
             or not isinstance(entry.get("resolved"), str) or not entry["resolved"]
             or entry["requested"] in requested
-            or entry["resolved"] not in data["declarations"]
+            or entry["resolved"] not in declarations
         ):
             return None
         requested.add(entry["requested"])
         pairs.append((entry["requested"], entry["resolved"]))
     return HelperUsageObservation(
         source_digest(statement), source_digest(proof), source_digest(preamble),
-        tuple(lemmas), tuple(sorted(set(data["declarations"]))), tuple(sorted(set(data["direct"]))),
+        tuple(lemmas), tuple(sorted(declarations)), tuple(sorted(set(data["direct"]))),
         tuple(sorted(set(data["reachable"]))), data["complete"], tuple(pairs), _OBSERVED,
     )
 

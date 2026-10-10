@@ -30,9 +30,15 @@ def main (args : List String) : IO UInt32 := do
   let mut target := Lean.Name.anonymous
   for part in parts do
     target := Lean.Name.str target (← IO.ofExcept part.getStr?)
-  unless (env.find? target).isSome do
-    throw <| IO.userError "missing audited declaration"
-  let (_, state) := ((Lean.CollectAxioms.collect target).run env).run {}
+  let some moduleIdx := env.getModuleIdx? (Lean.Name.mkSimple moduleText)
+    | throw <| IO.userError "missing audited module"
+  -- Resolve module-private names only among declarations owned by this file.
+  -- An imported name or multiple matching kernel names cannot select a root.
+  let candidates := env.header.moduleData[moduleIdx]!.constNames.filter fun name =>
+    Lean.privateToUserName name == target && env.getModuleIdxFor? name == some moduleIdx
+  unless candidates.size == 1 do
+    throw <| IO.userError "missing or ambiguous audited declaration"
+  let (_, state) := ((Lean.CollectAxioms.collect candidates[0]!).run env).run {}
   IO.println <| (Lean.toJson (state.axioms.map Lean.Name.toString)).compress
   return 0
 '''

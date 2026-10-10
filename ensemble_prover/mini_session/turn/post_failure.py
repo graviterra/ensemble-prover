@@ -508,7 +508,7 @@ def _record_target_integrity_adjudication(
     route = graph.record_strategy_route(
         name=f"target_integrity_adjudication_{int(turn_index or 0)}",
         description=(
-            "Adjudicate a Lean-rejected target after unverified refutation "
+            "Adjudicate an unresolved target after unverified refutation "
             "commentary or semantic bridge-direction diagnostics."
         ),
         route_key=identity_key,
@@ -529,8 +529,8 @@ def _record_target_integrity_adjudication(
         },
     )
     reason = (
-        "adjudicate target integrity: Lean rejected the proof while the "
-        "attempt contained unverified refutation commentary or an invalid "
+        "adjudicate target integrity: the attempt contained unverified "
+        "refutation commentary or an invalid "
         "bridge-direction calculation; prove the target from accepted "
         "micro-lemmas, replace the bad bridge with a verified smaller lemma, "
         "or Lean-check a counterexample/negation before retiring it"
@@ -694,7 +694,7 @@ async def run_post_failure_cascade(
     repair_retrieval_top_k: int = 6,
     proof_state_child_tactics_enabled: bool = True,
     proof_state_child_tactic_timeout_s: float = DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-    proof_state_child_tactic_max_candidates: int = 32,
+    proof_state_child_tactic_max_candidates: int = -1,
     proof_state_child_goal_limit: int = 3,
     proof_state_decl_application_limit: int = 6,
     proof_state_batch_parallelism: int = 1,
@@ -1954,5 +1954,10 @@ async def run_post_failure_cascade(
         lean_feedback = lean_feedback.rstrip() + "\n\n" + child_note
         if result.giveup_cluster:
             result.feedback_mode = "giveup_helper_decomposition_triaged"
+    from ...helper_salvage import helper_salvage_reuse_feedback
+
+    reuse_feedback = helper_salvage_reuse_feedback(salvage_result)
+    if reuse_feedback:
+        lean_feedback = lean_feedback.rstrip() + "\n\n" + reuse_feedback
     result.feedback_text = lean_feedback
     return result

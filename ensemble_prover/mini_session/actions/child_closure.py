@@ -57,7 +57,7 @@ class ChildClosureAction:
         self,
         *,
         timeout_s: float = DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-        max_candidates: int = 32,
+        max_candidates: int = -1,
         max_nodes: int = 3,
         max_decl_applications: int = 6,
         batch_parallelism: int = 1,
@@ -184,20 +184,61 @@ class ChildClosureAction:
                 for node_id in pending_helper_ids:
                     pending = dict(getattr(nodes[node_id], "pending_helper_acceptance", {}) or {})
                     continuation = dict(pending.get("continuation") or {})
-                    if continuation.get("kind") != "cache_seed_batch":
+                    cache_kind = continuation.get("kind")
+                    if cache_kind not in {"cache_seed_batch", "cache_hit"}:
                         continue
-                    saved_timeout = continuation.get("timeout_s")
-                    try:
-                        saved_timeout_s = 0.0 if isinstance(saved_timeout, bool) else float(saved_timeout)
-                    except (TypeError, ValueError, OverflowError):
-                        continue
-                    if not math.isfinite(saved_timeout_s) or saved_timeout_s <= 0.0:
-                        continue
-                    # The cache verifier resumes its saved allowance. Keep the
-                    # generic follow-on quantum for subsequent assembly work.
+                    if cache_kind == "cache_hit":
+                        # Cache replay preserves the saved verification allowance
+                        # and honors a subsequently increased action allowance.
+                        saved_timeout = continuation.get("timeout_s", operation_timeout_s)
+                        try:
+                            saved_timeout_s = float(saved_timeout)
+                        except (TypeError, ValueError, OverflowError):
+                            saved_timeout_s = float(self.timeout_s)
+                        if not math.isfinite(saved_timeout_s) or saved_timeout_s <= 0.0:
+                            saved_timeout_s = float(self.timeout_s)
+                        saved_timeout_s = max(saved_timeout_s, float(self.timeout_s))
+                    else:
+                        saved_timeout = continuation.get("timeout_s")
+                        try:
+                            saved_timeout_s = 0.0 if isinstance(saved_timeout, bool) else float(saved_timeout)
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                        if not math.isfinite(saved_timeout_s) or saved_timeout_s <= 0.0:
+                            continue
+                        saved_timeout_s = max(saved_timeout_s, float(self.timeout_s))
+                    # Quote the complete atomic acceptance chain. A positive
+                    # proof can still require a source contract observation and
+                    # a target observation; failing to fund those phases would
+                    # repeat the paid proof checks on every resumed turn.
+                    acceptance_operations = 1 + int(answer_safe_recheck)
+                    if cache_kind == "cache_hit" and callable(getattr(getattr(session, "lean", None), "analyze_statement_contracts", None)):
+                        # Cache hits may retry a source observation while
+                        # independently certifying the target.
+                        acceptance_operations += 3
+                    if cache_kind == "cache_seed_batch" and callable(getattr(getattr(session, "lean", None), "analyze_statement_contracts", None)):
+                        # A singleton, excluded head, restart, or stale live
+                        # receipt needs a fully funded source observation.
+                        acceptance_operations += 1
+                    from ensemble_prover.proof_dossier import helper_decl_name
+
+                    helper_name = helper_decl_name(str(pending.get("helper_block") or ""))
+                    dossier = getattr(session, "dossier", None)
+                    has_helper = getattr(dossier, "has_helper", None)
+                    helper_exists = (
+                        bool(has_helper(helper_name)) if callable(has_helper)
+                        else helper_name in (getattr(dossier, "verified_helpers", {}) or {})
+                    )
+                    if helper_exists:
+                        # Replacement first validates its replay prefix and then
+                        # rechecks dependents, each under one aggregate allowance.
+                        # Match acceptance's quoted/root-qualified name resolution.
+                        acceptance_operations += 2
+                    # Preserve the follow-on assembly quantum. These are grant
+                    # requirements; accounting charges only actual elapsed work.
                     cache_acceptance_budget_s = max(
                         cache_acceptance_budget_s,
-                        (1 + int(answer_safe_recheck)) * saved_timeout_s
+                        acceptance_operations * saved_timeout_s
                         + operation_timeout_s,
                     )
         return (
@@ -1066,6 +1107,7 @@ class ChildClosureAction:
                 conv=session.conv,
                 dossier=session.dossier,
                 proof_state=session.proof_state,
+                lean=session.lean,
             )
         except Exception:
             # Execution still retains exact-currentness checks. Reconciliation
@@ -1119,7 +1161,7 @@ class ChildClosureAction:
         # an operation deadline can remove later candidates. This amortizes
         # graph sync/selection/recovery overhead while yielding frequently
         # enough for newly ready proof work and live model continuations.
-        portfolio_bound = max(1, int(self.max_candidates or 1))
+        portfolio_bound = int(self.max_candidates or 0)
         target_scheduler_quanta = max(
             1,
             int(self.ROOT_TACTIC_PORTFOLIO_TARGET_SCHEDULER_QUANTA),
@@ -1128,8 +1170,12 @@ class ChildClosureAction:
             1,
             min(
                 self.ROOT_TACTIC_CANDIDATES_PER_QUANTUM,
-                (portfolio_bound + target_scheduler_quanta - 1)
-                // target_scheduler_quanta,
+                (
+                    self.ROOT_TACTIC_CANDIDATES_PER_QUANTUM
+                    if portfolio_bound < 0 else
+                    (portfolio_bound + target_scheduler_quanta - 1)
+                    // target_scheduler_quanta
+                ),
             ),
         )
         execution_status: dict[str, Any] = {}
@@ -1156,6 +1202,7 @@ class ChildClosureAction:
             candidate_attempt_limit=candidate_attempt_limit,
             service_slice_s=(self.service_slice_s if self.service_slice_s is not None else
                              float(getattr(getattr(session.lean, "cfg", None), "closure_service_slice_s", 30.0))),
+            service_started_monotonic=started,
             status_out=execution_status,
         )
         sync_proof_state_to_graph(
@@ -1185,6 +1232,7 @@ class ChildClosureAction:
             ),
             "root_tactic_candidate_attempt_limit": candidate_attempt_limit,
             "root_tactic_portfolio_max_scheduler_quanta": (
+                -1 if portfolio_bound < 0 else
                 (portfolio_bound + candidate_attempt_limit - 1)
                 // candidate_attempt_limit
             ),
@@ -1205,6 +1253,11 @@ class ChildClosureAction:
             metadata["pending_helper_acceptance_node_ids"] = list(
                 pending_helper_node_ids
             )
+        if execution_status.get("cache_continuation_pending"):
+            # The next source is an unstarted verifier frontier item. Keep it
+            # runnable while charging this quantum's actual elapsed work.
+            metadata["cache_continuation_pending"] = True
+            metadata["preserve_frontier_work"] = True
         root_node = getattr(session.proof_state, "nodes", {}).get(
             getattr(session.proof_state, "root_node_id", "")
         )

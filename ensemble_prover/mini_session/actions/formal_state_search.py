@@ -1647,7 +1647,7 @@ class FormalStateSearchAction:
         # producing a complete candidate. Rank improvement resets this counter;
         # novelty alone does not. Solved candidates exit through acceptance above,
         # so this block accounts for zero-candidate quanta. The tighter stall
-        # window preempts the normal six-quantum window for novelty-only lanes.
+        # window, when configured, preempts the broader no-improvement window.
         # The candidate term also permits future flows where solved quanta reach
         # this block.
         quantum_candidate_found = bool(run.result.solved)

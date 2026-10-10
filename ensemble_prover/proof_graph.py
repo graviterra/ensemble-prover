@@ -16,10 +16,11 @@ import re
 import sys
 import unicodedata
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from threading import Lock, local
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .lean_decl_parser import find_decl_header_end
 from .lean_names import LEAN_NAME_COMPONENT_PATTERN as _SCOPED_OPEN_NAME_COMPONENT_RE
@@ -41,6 +42,7 @@ from .contract_identity import (
     has_lean_contract_identity,
     lean_contract_evidence_receipt_matches,
     make_lean_contract_evidence_receipt,
+    lean_contract_statement_source_key,
     parse_lean_contract_identity,
 )
 from .proof_lineage import ProofLineageEnvelope
@@ -77,7 +79,7 @@ def _lexical_retained_bytes(value: Any) -> int:
 
 
 def _large_lexical_result(key: Tuple[Any, ...], compute: Callable[[], Any]) -> Any:
-    """Reuse exact-source parsing with a shared byte and entry bound.
+    """Reuse exact-source parsing within a shared memory budget.
 
     Large elaborated terms must not make every read rescan their entire source.
     This cache contains immutable syntax projections and pure source-derived
@@ -102,11 +104,10 @@ def _large_lexical_result(key: Tuple[Any, ...], compute: Callable[[], Any]) -> A
             _GRAPH_LARGE_LEXICAL_CACHE_BYTES -= previous[1]
         while _GRAPH_LARGE_LEXICAL_CACHE and (
             _GRAPH_LARGE_LEXICAL_CACHE_BYTES + weight > _GRAPH_LARGE_LEXICAL_CACHE_MAX_BYTES
-            or len(_GRAPH_LARGE_LEXICAL_CACHE) >= _GRAPH_LEXICAL_CACHE_MAX_ENTRIES
         ):
             _, (_, evicted_weight) = _GRAPH_LARGE_LEXICAL_CACHE.popitem(last=False)
             _GRAPH_LARGE_LEXICAL_CACHE_BYTES -= evicted_weight
-        if _GRAPH_LEXICAL_CACHE_MAX_ENTRIES > 0:
+        if _GRAPH_LARGE_LEXICAL_CACHE_MAX_BYTES > 0:
             _GRAPH_LARGE_LEXICAL_CACHE[key] = (result, weight)
             _GRAPH_LARGE_LEXICAL_CACHE_BYTES += weight
     return result
@@ -216,7 +217,7 @@ def bind_graph_contract_identity_metadata(
     """
 
     identity = _graph_metadata_contract_identity(metadata)
-    statement_key = graph_statement_key(statement)
+    statement_key = lean_contract_statement_source_key(statement)
     environment_hash = str(
         metadata.get("statement_environment_hash") or ""
     ).strip()
@@ -261,7 +262,7 @@ def graph_node_bound_contract_identity(node: Any) -> str:
     ).strip()
     if (
         not identity
-        or statement_key != graph_statement_key(getattr(node, "statement", "") or "")
+        or statement_key != lean_contract_statement_source_key(getattr(node, "statement", "") or "")
         or environment_hash
         != str(metadata.get("statement_environment_hash") or "").strip()
         or not lean_contract_evidence_receipt_matches(
@@ -340,7 +341,9 @@ def graph_node_semantic_work_key(
         # hash remains the exact proposition identity across those formats.
         proposition_identity = ("lean_full_expr", parsed_identity[0])
     elif allow_exact_surface_identity:
-        statement_key = graph_statement_key(getattr(node, "statement", "") or "")
+        statement_key = lean_contract_statement_source_key(
+            getattr(node, "statement", "") or "",
+        )
         if not statement_key:
             return None
         proposition_identity = ("exact_surface", statement_key)
@@ -387,7 +390,7 @@ def graph_helper_bound_contract_identity(node: Any) -> str:
     if (
         not has_lean_contract_identity(identity)
         or statement_key
-        != graph_statement_key(getattr(node, "statement", "") or "")
+        != lean_contract_statement_source_key(getattr(node, "statement", "") or "")
         or environment_hash
         != str(metadata.get("verified_helper_environment_hash") or "").strip()
         or not lean_contract_evidence_receipt_matches(
@@ -435,7 +438,7 @@ def stamp_graph_node_environment(
         metadata.pop("contract_identity_environment_hash", None)
         metadata.pop("contract_identity_evidence_receipt", None)
         return
-    statement_key = graph_statement_key(getattr(node, "statement", "") or "")
+    statement_key = lean_contract_statement_source_key(getattr(node, "statement", "") or "")
     metadata["contract_identity_statement_key"] = statement_key
     metadata["contract_identity_environment_hash"] = environment
     metadata["contract_identity_evidence_receipt"] = (
@@ -1008,7 +1011,10 @@ def _helper_source_solution_references(src: str) -> Set[str]:
 
 @lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
 def _cached_helper_source_solution_references(src: str) -> frozenset[str]:
-    return frozenset(_uncached_helper_source_solution_references(src))
+    return _large_lexical_result(
+        ("source_solution_references", src),
+        lambda: frozenset(_uncached_helper_source_solution_references(src)),
+    )
 
 
 def _uncached_helper_source_solution_references(src: str) -> Set[str]:
@@ -1194,7 +1200,10 @@ def _helper_decl_statement_solution_references(src: str) -> Set[str]:
 
 @lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
 def _cached_helper_decl_statement_solution_references(src: str) -> frozenset[str]:
-    return frozenset(_uncached_helper_decl_statement_solution_references(src))
+    return _large_lexical_result(
+        ("statement_solution_references", src),
+        lambda: frozenset(_uncached_helper_decl_statement_solution_references(src)),
+    )
 
 
 def _uncached_helper_decl_statement_solution_references(src: str) -> Set[str]:
@@ -1419,17 +1428,9 @@ def graph_formal_statement_text(
 
 
 def graph_exact_statement_text(text: str) -> str:
-    """Compare Lean surfaces without rewriting literals or layout.
+    """Retain Lean source, including spacing inspected by syntax extensions."""
 
-    Single-line token spacing can be compacted outside lexical atoms. Retain
-    multiline source verbatim because indentation and comment boundaries can
-    affect parsing. This projection grants no elaborated type equivalence.
-    """
-
-    source = str(text or "").strip()
-    if "\n" in source or "\r" in source:
-        return source
-    return _graph_compact_lean_whitespace(source)
+    return str(text or "").strip()
 
 
 def _graph_compact_lean_whitespace(
@@ -1457,8 +1458,11 @@ def _graph_compact_lean_whitespace(
 def _cached_graph_compact_lean_whitespace(
     text: str, preserve_layout: bool, canonicalize_guarded_iff: Optional[bool],
 ) -> str:
-    return _uncached_graph_compact_lean_whitespace(
-        text, preserve_layout, canonicalize_guarded_iff,
+    return _large_lexical_result(
+        ("compact_whitespace", text, preserve_layout, canonicalize_guarded_iff),
+        lambda: _uncached_graph_compact_lean_whitespace(
+            text, preserve_layout, canonicalize_guarded_iff,
+        ),
     )
 
 
@@ -2718,6 +2722,16 @@ def _graph_find_top_level_keyword(text: str, keyword: str, start: int) -> int:
     return -1
 
 
+def _graph_match_separator_index(text: str, start: int) -> int:
+    """Find the match separator after any filtered-operator scrutinee."""
+
+    separator = _graph_find_top_level_keyword(text, "with", start)
+    filtered = _graph_filtered_bigop_with_positions(text)
+    while separator >= 0 and separator in filtered:
+        separator = _graph_find_top_level_keyword(text, "with", separator + len("with"))
+    return separator
+
+
 def _graph_find_top_level_symbol(text: str, symbol: str, start: int) -> int:
     index = max(0, start)
     while index < len(text):
@@ -2751,6 +2765,28 @@ class _GraphSurfaceBudget:
 
 
 _graph_surface_budgets = local()
+
+
+@dataclass
+class _GraphTermScan:
+    """Exact-source syntax results retained only during one synchronous scan."""
+
+    filtered_positions: Dict[Tuple[str, int], frozenset[int]] = field(default_factory=dict)
+    term_results: Dict[Tuple[str, bool, int], bool] = field(default_factory=dict)
+
+
+@contextmanager
+def _graph_term_scan_context() -> Iterator[_GraphTermScan]:
+    scan = getattr(_graph_surface_budgets, "term_scan", None)
+    owner = scan is None
+    if scan is None:
+        scan = _GraphTermScan()
+        _graph_surface_budgets.term_scan = scan
+    try:
+        yield scan
+    finally:
+        if owner:
+            del _graph_surface_budgets.term_scan
 
 
 def _graph_surface_budget() -> _GraphSurfaceBudget:
@@ -2796,7 +2832,7 @@ def _graph_parse_match_term_body(
     if not _graph_keyword_at(text, index, "match"):
         return None
     match_at = index
-    with_at = _graph_find_top_level_keyword(text, "with", index + len("match"))
+    with_at = _graph_match_separator_index(text, index + len("match"))
     if with_at < 0:
         return None
     scrutinee = text[match_at + len("match") : with_at].strip()
@@ -2869,12 +2905,111 @@ def _graph_match_arm_body_end(text: str, start: int) -> int:
     return len(text)
 
 
-def _graph_mask_match_terms(text: str) -> str:
-    """Blank literals and match-separator ``with`` without hiding arm text.
+def _graph_bigop_binder_header_is_plausible(text: str) -> bool:
+    """Recognize the binder portion of the finite sum/product notation."""
 
-    Prose detection must not treat a match separator as English, and it must
-    not treat words inside comments or strings as syntax. Arm bodies stay in
-    the surface so a later check can still reject data, proof, and commands.
+    raw = text.strip()
+    if not raw or not _graph_term_tokens_ok(raw):
+        return False
+    if raw.startswith("("):
+        index = 0
+        while index < len(raw):
+            if raw[index].isspace():
+                index += 1
+                continue
+            if raw[index] != "(":
+                return False
+            end = _graph_matching_group_index(raw, index)
+            if end < 0 or not raw[index + 1:end].strip():
+                return False
+            index = end + 1
+        return True
+    name = _graph_leading_identifier(raw)
+    if not name:
+        return False
+    tail = raw[len(name):].strip()
+    return not tail or (
+        tail[0] in ":∈∉≠<>≤≥" and bool(tail[1:].strip())
+    )
+
+
+def _graph_filtered_bigop_with_positions(text: str) -> frozenset[int]:
+    """Reuse separator scans without retaining source beyond this traversal."""
+
+    if "with" not in text or not any(operator in text for operator in ("∑", "∏")):
+        return frozenset()
+    with _graph_term_scan_context() as scan:
+        budget = _graph_surface_budget()
+        key = (text, budget.match_depth)
+        if not budget.exhausted and key in scan.filtered_positions:
+            return scan.filtered_positions[key]
+        positions = _graph_filtered_bigop_with_positions_uncached(text)
+        if not budget.exhausted:
+            scan.filtered_positions[key] = positions
+        return positions
+
+
+def _graph_filtered_bigop_with_positions_uncached(text: str) -> frozenset[int]:
+    """Locate ``with`` owned by a complete filtered finite-operator header.
+
+    Only the separator is classified here. The binder, predicate, and value
+    stay visible to the ordinary syntax guards, and Lean checks their types.
+    A comma or enclosing closer ends the header; a later prose ``with`` cannot
+    borrow an earlier sum or product as its owner.
+    """
+
+    if "with" not in text or not any(operator in text for operator in ("∑", "∏")):
+        return frozenset()
+    positions: Set[int] = set()
+    index = 0
+    while index < len(text):
+        lexical = _lean_lexical_skip_end(text, index)
+        if lexical is not None:
+            index = lexical
+            continue
+        if text[index] not in {"∑", "∏"}:
+            index += 1
+            continue
+        start = index + 1
+        cursor = start
+        separator = -1
+        while cursor < len(text):
+            skipped = _graph_skip_lexical_or_group(text, cursor)
+            if skipped is not None:
+                cursor = skipped
+                continue
+            if text[cursor] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE.values() or text[cursor] == ";":
+                break
+            if text[cursor] == ",":
+                if separator >= 0:
+                    binder = text[start:separator].strip()
+                    predicate = text[separator + len("with"):cursor].strip()
+                    value = text[cursor + 1:].lstrip()
+                    if (
+                        _graph_bigop_binder_header_is_plausible(binder)
+                        and predicate and not predicate.endswith(":")
+                        and _graph_term_tokens_ok(predicate)
+                        and value and value[0] not in ",;)]}⟩"
+                    ):
+                        positions.add(separator)
+                break
+            if _graph_keyword_at(text, cursor, "with"):
+                if separator >= 0:
+                    break
+                separator = cursor
+                cursor += len("with")
+                continue
+            cursor += 1
+        index += 1
+    return frozenset(positions)
+
+
+def _graph_mask_match_terms(text: str) -> str:
+    """Blank literals and term-separator ``with`` without hiding their terms.
+
+    Prose detection must not treat match or filtered-operator separators as
+    English. Arm bodies and filter terms stay in the surface so later checks
+    can still reject data, proof, and commands.
     """
 
     raw = str(text or "")
@@ -2883,6 +3018,9 @@ def _graph_mask_match_terms(text: str) -> str:
     def blank(start: int, end: int) -> None:
         for offset in range(start, min(end, len(chars))):
             chars[offset] = " "
+
+    for separator in _graph_filtered_bigop_with_positions(raw):
+        blank(separator, separator + len("with"))
 
     index = 0
     while index < len(raw):
@@ -2901,9 +3039,7 @@ def _graph_mask_match_terms(text: str) -> str:
         if _graph_keyword_at(raw, index, "match"):
             parsed = _graph_parse_match_term(raw, index)
             if parsed is not None and parsed[0] > index:
-                with_at = _graph_find_top_level_keyword(
-                    raw, "with", index + len("match")
-                )
+                with_at = _graph_match_separator_index(raw, index + len("match"))
                 if with_at >= 0:
                     blank(with_at, with_at + len("with"))
                 index += len("match")
@@ -2989,6 +3125,20 @@ def _graph_whole_group_inner(text: str) -> str:
 
 
 def _graph_term_tokens_ok(fragment: str, *, tactic: bool = False) -> bool:
+    """Check each exact term once per traversal and match-parse depth."""
+
+    with _graph_term_scan_context() as scan:
+        budget = _graph_surface_budget()
+        key = (fragment, tactic, budget.match_depth)
+        if not budget.exhausted and key in scan.term_results:
+            return scan.term_results[key]
+        result = _graph_term_tokens_ok_uncached(fragment, tactic=tactic)
+        if not budget.exhausted:
+            scan.term_results[key] = result
+        return result
+
+
+def _graph_term_tokens_ok_uncached(fragment: str, *, tactic: bool = False) -> bool:
     """Return whether a term contains no command or stray proof marker.
 
     Parentheses, brackets, and anonymous constructors are entered, so a
@@ -3029,6 +3179,7 @@ def _graph_term_tokens_ok(fragment: str, *, tactic: bool = False) -> bool:
         elif not _graph_let_binding_is_syntactically_complete(binding):
             return False
         return _graph_term_tokens_ok(body)
+    filtered_separators = _graph_filtered_bigop_with_positions(raw)
     index = 0
     while index < len(raw):
         if raw[index].isspace():
@@ -3054,7 +3205,8 @@ def _graph_term_tokens_ok(fragment: str, *, tactic: bool = False) -> bool:
         if any(_graph_keyword_at(raw, index, word) for word in ("sorry", "admit")):
             return False
         if not tactic and (
-            _graph_keyword_at(raw, index, "exact") or _graph_keyword_at(raw, index, "with")
+            _graph_keyword_at(raw, index, "exact")
+            or (_graph_keyword_at(raw, index, "with") and index not in filtered_separators)
         ):
             return False
         if not tactic and _graph_keyword_at(raw, index, "by"):
@@ -5674,6 +5826,7 @@ def _graph_has_top_level_proof_tail(text: str) -> bool:
     stripped = _graph_strip_balanced_outer_parens(raw)
     if stripped != raw and stripped:
         return _graph_has_top_level_proof_tail(stripped)
+    filtered_separators = _graph_filtered_bigop_with_positions(raw)
     index = 0
     while index < len(raw):
         if _graph_keyword_at(raw, index, "match"):
@@ -5698,7 +5851,9 @@ def _graph_has_top_level_proof_tail(text: str) -> bool:
         if ch == ";":
             return True
         for keyword in ("by", "from", "where", "using", "via", "because", "with"):
-            if _graph_keyword_at(raw, index, keyword):
+            if _graph_keyword_at(raw, index, keyword) and not (
+                keyword == "with" and index in filtered_separators
+            ):
                 return True
         index += 1
     return False
@@ -6038,7 +6193,7 @@ def _graph_application_args_are_formal(body: str, head: str) -> bool:
     if re.search(
         r"\b(?:from|by|as|in|inside|context|assumption|helper|goal|claim|"
         r"target|statement|proof|parent|selected|missing|using|via|because|with)\b",
-        tail,
+        _graph_mask_match_terms(tail),
         flags=re.IGNORECASE,
     ):
         return False
@@ -6219,9 +6374,10 @@ def graph_statement_is_executable(text: str, *, binder_context: str = "") -> boo
         if budget.exhausted:
             result = False
         else:
-            result = _graph_statement_is_executable_body(
-                text, binder_context=binder_context
-            )
+            with _graph_term_scan_context():
+                result = _graph_statement_is_executable_body(
+                    text, binder_context=binder_context
+                )
     except RecursionError:
         result = False
     finally:
@@ -6438,6 +6594,8 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
         return _graph_quantified_statement_is_executable(
             compact, outer_binder=binder_context
         )
+    if _graph_filtered_bigop_with_positions(compact) and not _graph_term_tokens_ok(compact):
+        return False
     match_executable = _graph_complete_match_executable(compact, binder_context)
     if match_executable is not None:
         return match_executable
@@ -6666,9 +6824,10 @@ def _rehydrate_graph_node_statement(kind: str, statement: str) -> str:
     kind_text = str(kind or "")
     if (
         kind_text in _GRAPH_FORMAL_STATEMENT_KINDS
+        or kind_text in {"root", "helper"}
         or kind_text.startswith("proof_state_")
     ):
-        return graph_formal_statement_text(statement)
+        return graph_exact_statement_text(statement)
     return graph_identity_text(statement)
 
 
@@ -6689,6 +6848,24 @@ def _replace_outside_lean_quotes(text: str, replacer: Any) -> str:
         out.append(raw[start : end + 1])
         index = end + 1
     return "".join(out)
+
+
+def graph_node_requires_target_integrity_adjudication(node: Any) -> bool:
+    """Keep target adjudication distinct from support-lemma formalization.
+
+    An actual Lean type rejection may explicitly replace the invalid target
+    with a smaller decomposition bridge. A conservative surface-classifier
+    rejection alone cannot change the work's mathematical contract.
+    """
+
+    metadata = dict(getattr(node, "metadata", {}) or {})
+    return bool(
+        metadata.get("target_integrity_adjudication")
+        and not (
+            metadata.get("graph_native_statement_type_rejected")
+            and metadata.get("formalization_bridge_contract") == "strict_decomposition_bridge"
+        )
+    )
 
 
 def graph_node_frontier_quarantined(node: Any) -> bool:
@@ -7041,29 +7218,6 @@ def _sub_outside_lean_literals(
     return "".join(pieces)
 
 
-def _normalize_subset_spacing_outside_lean_literals(text: str) -> str:
-    source = str(text or "")
-    pieces: List[str] = []
-    index = 0
-    while index < len(source):
-        skip_to = _lean_lexical_skip_end(source, index)
-        if skip_to is not None:
-            pieces.append(source[index:skip_to])
-            index = skip_to
-            continue
-        if source.startswith("⊆", index):
-            while pieces and pieces[-1].isspace():
-                pieces.pop()
-            pieces.append("⊆")
-            index += 1
-            while index < len(source) and source[index].isspace():
-                index += 1
-            continue
-        pieces.append(source[index])
-        index += 1
-    return "".join(pieces)
-
-
 def _annotate_inferred_set_univ_type_args(text: str) -> str:
     source = str(text or "")
     binder_types = _binder_type_map_for_statement_key(source)
@@ -7075,35 +7229,35 @@ def _annotate_inferred_set_univ_type_args(text: str) -> str:
         type_arg = binder_types.get(name, "")
         if not type_arg:
             return match.group(0)
-        return f"{name}∈Set.univ[{type_arg}]"
+        return match.group(0).replace("Set.univ", f"Set.univ[{type_arg}]", 1)
 
     def right_equality_replacement(match: re.Match[str]) -> str:
         name = str(match.group("name") or "")
         type_arg = _set_element_type_from_binder_type(binder_types.get(name, ""))
         if not type_arg:
             return match.group(0)
-        return f"{name}=Set.univ[{type_arg}]"
+        return match.group(0).replace("Set.univ", f"Set.univ[{type_arg}]", 1)
 
     def left_equality_replacement(match: re.Match[str]) -> str:
         name = str(match.group("name") or "")
         type_arg = _set_element_type_from_binder_type(binder_types.get(name, ""))
         if not type_arg:
             return match.group(0)
-        return f"Set.univ[{type_arg}]={name}"
+        return match.group(0).replace("Set.univ", f"Set.univ[{type_arg}]", 1)
 
     def right_subset_replacement(match: re.Match[str]) -> str:
         name = str(match.group("name") or "")
         type_arg = _set_element_type_from_binder_type(binder_types.get(name, ""))
         if not type_arg:
             return match.group(0)
-        return f"{name}⊆Set.univ[{type_arg}]"
+        return match.group(0).replace("Set.univ", f"Set.univ[{type_arg}]", 1)
 
     def left_subset_replacement(match: re.Match[str]) -> str:
         name = str(match.group("name") or "")
         type_arg = _set_element_type_from_binder_type(binder_types.get(name, ""))
         if not type_arg:
             return match.group(0)
-        return f"Set.univ[{type_arg}]⊆{name}"
+        return match.group(0).replace("Set.univ", f"Set.univ[{type_arg}]", 1)
 
     source = _sub_outside_lean_literals(
         source,
@@ -7137,6 +7291,66 @@ def _annotate_inferred_set_univ_type_args(text: str) -> str:
 def graph_statement_key(text: str) -> str:
     """Small graph-local equivalence key for matching proved helper statements."""
 
+    return _graph_statement_key(text)
+
+
+def graph_statement_candidate_key(text: str) -> str:
+    """Retrieve possible proofs; this key never certifies a proposition.
+
+    Candidate search may ignore layout and redundant grouping even in custom
+    syntax. Every retrieved proof must be checked against the exact target in
+    its current Lean environment before it can close work.
+    """
+
+    source = str(text or "")
+    return _large_lexical_result(
+        ("statement_candidate", source),
+        lambda: _uncached_graph_statement_candidate_key(source),
+    )
+
+
+def _uncached_graph_statement_candidate_key(text: str) -> str:
+
+    from .proof_state import (
+        _canonicalize_identity_expr,
+        _identity_source_text,
+        _next_free_alpha_index,
+        _replace_outside_lean_quotes_text,
+        _replace_type_symbols_capture_safe,
+    )
+
+    source = _identity_source_text(str(text or ""))
+    source = _replace_outside_lean_quotes_text(
+        source, lambda part: re.sub(r"\s+", " ", part),
+    )
+    source = _replace_type_symbols_capture_safe(source)
+    try:
+        source, _ = _canonicalize_identity_expr(
+            source, replacements={}, next_index=_next_free_alpha_index(source),
+        )
+    except (RecursionError, ValueError):
+        # Opaque/deep syntax remains eligible for exact source retrieval.
+        return graph_statement_key(text)
+    return _graph_statement_key(source, candidate_only=True)
+
+
+def _graph_statement_key(text: str, *, candidate_only: bool = False) -> str:
+
+    from .proof_state import (
+        _identity_requires_exact_source,
+        _identity_source_text,
+        _replace_local_names_tokenwise_text,
+    )
+
+    source = _identity_source_text(str(text or ""))
+    if not candidate_only and _identity_requires_exact_source(source):
+        # The shared parser cannot establish these binding scopes. Graph-local
+        # spelling rewrites must not reintroduce equivalences it rejected, or
+        # collapse executable layout while indexing a checked proposition.
+        # Even whitespace-delimited parentheses may be a custom macro rather
+        # than transparent grouping. Wrapper aliases need semantic evidence.
+        return "\x00exact-source:" + source
+
     normalized = normalize_statement(
         _shield_lean_quotes_for_identity(
             _scoped_statement_identity_text(
@@ -7153,7 +7367,6 @@ def graph_statement_key(text: str) -> str:
     normalized = re.sub(r"(?<![\w'✝])exists(?=\s+)", "∃", normalized)
     normalized = _preserve_explicit_set_univ_type_args(normalized)
     normalized = _annotate_inferred_set_univ_type_args(normalized)
-    normalized = _normalize_subset_spacing_outside_lean_literals(normalized)
 
     def is_nat_binder_type(type_text: str) -> bool:
         clean = " ".join(str(type_text or "").split()).strip()
@@ -7414,107 +7627,25 @@ def graph_statement_key(text: str) -> str:
             for name in re.findall(identifier_pattern, group):
                 if name not in binder_names:
                     binder_names.append(name)
-    for index, name in enumerate(binder_names):
-        normalized = re.sub(
-            rf"(?<![\w'✝]){re.escape(name)}(?![\w'✝])",
-            f"__b{index}",
-            normalized,
-        )
+    literal_alpha_indices = [
+        int(match.group(1))
+        for match in re.finditer(r"(?<![\w'✝])__b(\d+)(?![\w'✝])", normalized)
+    ]
+    first_alpha_index = max(literal_alpha_indices, default=-1) + 1
+    normalized = _replace_local_names_tokenwise_text(
+        normalized,
+        {
+            name: f"__b{first_alpha_index + index}"
+            for index, name in enumerate(binder_names)
+        },
+    )
     normalized = re.sub(
         r"((?:∀|∃|forall|exists)\s+__b\d+\s*:\s*ℕ)\)+\s*,",
         r"\1,",
         normalized,
     )
-    while True:
-        compact_parens = re.sub(r"\(\s+", "(", normalized)
-        compact_parens = re.sub(r"\s+\)", ")", compact_parens)
-        if compact_parens == normalized:
-            break
-        normalized = compact_parens
-
-    def safe_strip_side_parens(side: str) -> str:
-        value = str(side or "").strip()
-        while True:
-            stripped = strip_balanced_outer_parens(value)
-            if stripped == value:
-                return value
-            # Parentheses around propositions/arrows are not presentation-only
-            # in Lean surface syntax.  Keep those intact; this identity pass is
-            # only erasing redundant grouping around expression sides such as
-            # ``(a / b) = c``.
-            if any(token in stripped for token in ("∀", "∃", "→", "↔", "->", "<->")):
-                return value
-            value = stripped
-
-    def split_top_level_identity_operator(
-        value: str,
-    ) -> Optional[Tuple[str, str, str]]:
-        text = str(value or "")
-        open_to_close = {"(": ")", "{": "}", "[": "]"}
-        close_to_open = {close: open_ for open_, close in open_to_close.items()}
-        stack: List[str] = []
-        operators = ("≤", "≥", "≠", "=", "<", ">", "∈", "∉", "∣")
-        index = 0
-        while index < len(text):
-            char = text[index]
-            if char in open_to_close:
-                stack.append(char)
-                index += 1
-                continue
-            if char in close_to_open:
-                if stack and stack[-1] == close_to_open[char]:
-                    stack.pop()
-                index += 1
-                continue
-            if not stack:
-                for operator in operators:
-                    if text.startswith(operator, index):
-                        left = text[:index].strip()
-                        right = text[index + len(operator) :].strip()
-                        if left and right:
-                            return left, operator, right
-            index += 1
-        return None
-
-    def split_leading_quantifier_body(value: str) -> Optional[Tuple[str, str]]:
-        text = str(value or "").strip()
-        if not text.startswith(("∀", "∃")):
-            return None
-        open_to_close = {"(": ")", "{": "}", "[": "]"}
-        close_to_open = {close: open_ for open_, close in open_to_close.items()}
-        stack: List[str] = []
-        for index, char in enumerate(text):
-            if char in open_to_close:
-                stack.append(char)
-                continue
-            if char in close_to_open:
-                if stack and stack[-1] == close_to_open[char]:
-                    stack.pop()
-                continue
-            if char == "," and not stack:
-                prefix = text[: index + 1].strip()
-                body = text[index + 1 :].strip()
-                if prefix and body:
-                    return prefix, body
-        return None
-
-    def normalize_redundant_identity_side_parens(value: str) -> str:
-        text = str(value or "").strip()
-        quantifier_split = split_leading_quantifier_body(text)
-        if quantifier_split is not None:
-            prefix, body = quantifier_split
-            return f"{prefix} {normalize_redundant_identity_side_parens(body)}"
-        identity_split = split_top_level_identity_operator(text)
-        if identity_split is None:
-            return text
-        left, operator, right = identity_split
-        return (
-            f"{safe_strip_side_parens(left)} {operator} "
-            f"{safe_strip_side_parens(right)}"
-        )
-
-    normalized = normalize_redundant_identity_side_parens(normalized)
-    normalized = re.sub(r"\s*([<>=≤≥∣:∈∉])\s*", r"\1", normalized)
+    # User notation can include relation symbols and delimiters in a token.
+    # Retain lexical whitespace boundaries instead of joining them here.
     return " ".join(normalized.split()).strip()
 
 
@@ -8316,13 +8447,22 @@ def _graph_binder_group_is_proof_premise(
     )
 
 
-# These caches contain lexical analyses only, never environment-dependent proof
-# authority. Keep their capacity small: an explicit residual can be very large.
-@lru_cache(maxsize=64)
+# These caches contain immutable lexical analyses, never proof authority. A
+# shared byte budget retains large working collections of short lemmas without
+# retaining an unbounded collection of large residual terms.
 def _graph_leading_binder_analysis(
     statement: str,
     *,
     include_implications: bool = False,
+) -> Tuple[str, Tuple[Tuple[str, Tuple[str, ...], str, bool, bool], ...]]:
+    return _large_lexical_result(
+        ("leading_binders", statement, include_implications),
+        lambda: _uncached_graph_leading_binder_analysis(statement, include_implications=include_implications),
+    )
+
+
+def _uncached_graph_leading_binder_analysis(
+    statement: str, *, include_implications: bool = False,
 ) -> Tuple[str, Tuple[Tuple[str, Tuple[str, ...], str, bool, bool], ...]]:
     """Parse leading binders with local dependent-Prop propagation.
 
@@ -8696,6 +8836,15 @@ def _graph_statement_root_adjacent(
     *,
     conclusion_bound_names: Sequence[str] = (),
 ) -> bool:
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if any(
+        _identity_requires_exact_source(_identity_source_text(source))
+        for source in (conclusion, root_statement)
+    ):
+        return bool(conclusion) and not conclusion_bound_names and (
+            graph_statement_key(conclusion) == graph_statement_key(root_statement)
+        )
     conclusion_norm = _graph_contract_alpha_norm(
         conclusion,
         context_bound_names=conclusion_bound_names,
@@ -8712,8 +8861,45 @@ def _graph_statement_root_adjacent(
     return False
 
 
-@lru_cache(maxsize=64)
+def _graph_may_be_root_adjacent(
+    conclusion: str, root_statement: str, *, conclusion_bound_names: Sequence[str] = (),
+) -> bool:
+    """Coarse safety filter; never a certificate or assembly equivalence."""
+
+    def advisory_key(text: str, names: Sequence[str]) -> str:
+        source, mapping = _graph_contract_alpha_source(text, names)
+        source = _graph_contract_alpha_replace_scoped(
+            _graph_normalize_numeric_casts_for_contract(source), mapping,
+        )
+        pieces: List[str] = []
+        index = 0
+        while index < len(source):
+            lexical_end = _lean_lexical_skip_end(source, index)
+            if lexical_end is not None:
+                pieces.append(source[index:lexical_end])
+                index = lexical_end
+                continue
+            if not source[index].isspace():
+                pieces.append(source[index])
+            index += 1
+        return "".join(pieces)
+
+    key = advisory_key(conclusion, conclusion_bound_names)
+    closed_key = advisory_key(conclusion, ())
+    return bool(key) and any(
+        key == advisory_key(candidate, names)
+        or closed_key == advisory_key(candidate, ())
+        for candidate, names in _graph_root_conclusion_candidates(root_statement)
+    )
+
+
 def _graph_contract_profile(statement: str) -> Tuple[Tuple[str, ...], str]:
+    return _large_lexical_result(
+        ("contract_profile", statement), lambda: _uncached_graph_contract_profile(statement),
+    )
+
+
+def _uncached_graph_contract_profile(statement: str) -> Tuple[Tuple[str, ...], str]:
     premises, conclusion, bound_names = _graph_statement_premises_and_conclusion(
         graph_formal_statement_text(statement)
     )
@@ -9115,6 +9301,7 @@ def _graph_support_contains_contract(
     *, bound_names: Sequence[str] = (),
 ) -> bool:
     from .contract_normalization import numeric_contract_domains_compatible
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
 
     def comparison_context(statement: str, body: str, names: Sequence[str]) -> Tuple[str, ...]:
         # The keyed body erases independent proof names, not data parameters.
@@ -9135,12 +9322,24 @@ def _graph_support_contains_contract(
         if state in seen:
             return False
         seen.add(state)
+        if _identity_requires_exact_source(_identity_source_text(premise)):
+            # Unsupported source cannot be projected or weakened into a
+            # different proposition. Preserve its outer context as well as
+            # its exact source; no scoped alpha comparison is available.
+            exact_key = graph_statement_key(premise)
+            return bool(exact_key) and any(
+                exact_key == graph_statement_key(support)
+                and tuple(bound_names) == tuple(support_names)
+                for support, support_names in supports
+            )
         body, names = graph_statement_keyed_contract(premise)
         context = comparison_context(premise, body, (*bound_names, *names))
         norm = _graph_contract_norm(premise)
         alpha = _graph_contract_alpha_norm(body, context_bound_names=context)
         _alpha_body, premise_mapping = _graph_contract_alpha_source(body, context)
         for support, support_names in supports:
+            if _identity_requires_exact_source(_identity_source_text(support)):
+                continue
             support_body, leading = graph_statement_keyed_contract(support)
             if norm == _graph_contract_norm(support) and numeric_contract_domains_compatible(
                 body, support_body,
@@ -9240,13 +9439,22 @@ def graph_statement_has_circular_premise(statement: str) -> bool:
 
 @lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
 def _cached_graph_statement_has_circular_premise(statement: str) -> bool:
-    return _uncached_graph_statement_has_circular_premise(statement)
+    return _large_lexical_result(
+        ("circular_premise", statement),
+        lambda: _uncached_graph_statement_has_circular_premise(statement),
+    )
 
 
 def _uncached_graph_statement_has_circular_premise(statement: str) -> bool:
     formal_statement = graph_formal_statement_text(statement)
+    # Each source is immutable for this call. The three conservative
+    # comparisons below examine the same telescopes; parse and normalize
+    # each exact telescope once without retaining corpus-sized global state.
+    binder_analysis = lru_cache(maxsize=None)(_graph_leading_binder_analysis)
+
+    @lru_cache(maxsize=None)
     def closed_telescope_key(closed_statement: str) -> str:
-        body, records = _graph_leading_binder_analysis(closed_statement)
+        body, records = binder_analysis(closed_statement)
         if not records:
             return graph_statement_key(closed_statement)
         rendered_groups: List[str] = []
@@ -9264,7 +9472,13 @@ def _uncached_graph_statement_has_circular_premise(statement: str) -> bool:
                     if str(type_text or "").strip()
                     else name
                 )
-                rendered_groups.append(f"{opener}{inner}{closer}")
+                # Bare untyped names are supported telescope syntax.  A
+                # synthetic ``(x)`` could instead be an opaque notation token
+                # and correctly forces exact source in authority keys.
+                rendered_groups.append(
+                    f"{opener}{inner}{closer}"
+                    if str(type_text or "").strip() else name
+                )
         rendered = (
             f"∀ {' '.join(rendered_groups)}, {body}"
             if rendered_groups
@@ -9276,14 +9490,28 @@ def _uncached_graph_statement_has_circular_premise(statement: str) -> bool:
     # into ordered single-binder records.  This equates ``∀ a b : Nat`` with
     # ``∀ a : Nat, ∀ b : Nat`` while preserving binder domains, visibility,
     # arity, and shadowing.
+    closed_premises = tuple(graph_statement_closed_premises(formal_statement))
+    if not closed_premises:
+        # The telescope comparisons below cannot match an absent premise.
+        # Avoid normalizing a potentially enormous elaborated conclusion just
+        # to compare it with an empty sequence. Preserve the final relation-
+        # binder fallback, which uses a separate conservative projection.
+        premises, conclusion, _bound_names = _graph_statement_premises_and_conclusion(
+            formal_statement
+        )
+        return any(
+            lean_relation_binder_equivalent(premise, conclusion)
+            for premise in premises
+        )
     closed_conclusion = graph_statement_closed_conclusion(formal_statement)
     closed_conclusion_key = closed_telescope_key(closed_conclusion)
     if closed_conclusion_key and any(
         closed_telescope_key(premise) == closed_conclusion_key
-        for premise in graph_statement_closed_premises(formal_statement)
+        for premise in closed_premises
     ):
         return True
 
+    @lru_cache(maxsize=None)
     def pattern_lambda_rejection_key(closed_statement: str) -> str:
         key = closed_telescope_key(closed_statement)
         branch_pattern = re.compile(
@@ -9348,14 +9576,14 @@ def _uncached_graph_statement_has_circular_premise(statement: str) -> bool:
     if closed_conclusion_key and any(
         pattern_lambda_rejection_key(premise)
         == pattern_lambda_rejection_key(closed_conclusion)
-        for premise in graph_statement_closed_premises(formal_statement)
+        for premise in closed_premises
     ):
         return True
 
     def inferred_telescope_rejection_key(
         closed_statement: str,
     ) -> Tuple[str, bool]:
-        body, records = _graph_leading_binder_analysis(closed_statement)
+        body, records = binder_analysis(closed_statement)
         if not records:
             return graph_statement_key(closed_statement), False
         rendered: List[str] = []
@@ -9366,17 +9594,17 @@ def _uncached_graph_statement_has_circular_premise(statement: str) -> bool:
             ):
                 return graph_statement_key(closed_statement), False
             missing_type = missing_type or not bool(str(type_text or "").strip())
-            compact_raw = str(raw or "").strip()
-            opener = compact_raw[:1] if compact_raw[:1] in "({[" else "("
-            closer = {"(": ")", "{": "}", "[": "]"}[opener]
-            rendered.extend(f"{opener}{name}{closer}" for name in names)
+            # This comparison only rejects circular progress and intentionally
+            # drops domains when one side needs inference.  Avoid generating
+            # opaque parenthesized atoms while retaining ordered binder arity.
+            rendered.extend(names)
         statement_without_domains = f"∀ {' '.join(rendered)}, {body}"
         return graph_statement_key(statement_without_domains), missing_type
 
     conclusion_inferred_key, conclusion_has_missing_type = (
         inferred_telescope_rejection_key(closed_conclusion)
     )
-    for premise in graph_statement_closed_premises(formal_statement):
+    for premise in closed_premises:
         premise_inferred_key, premise_has_missing_type = (
             inferred_telescope_rejection_key(premise)
         )
@@ -9766,9 +9994,15 @@ def graph_statement_closed_conclusion(statement: str) -> str:
     return f"∀ {binder_prefix}, {conclusion}" if binder_prefix else conclusion
 
 
-@lru_cache(maxsize=64)
 def _graph_nonproof_parameter_profile(statement: str) -> Tuple[str, ...]:
     """Return normalized non-proof binder types in the leading theorem frame."""
+
+    return _large_lexical_result(
+        ("nonproof_parameters", statement), lambda: _uncached_graph_nonproof_parameter_profile(statement),
+    )
+
+
+def _uncached_graph_nonproof_parameter_profile(statement: str) -> Tuple[str, ...]:
 
     _body, binder_records = _graph_leading_binder_analysis(statement)
     context_names: List[str] = []
@@ -9814,6 +10048,16 @@ def graph_statements_contract_equivalent(left: str, right: str) -> bool:
     right_key = graph_statement_key(right)
     if left_key and right_key and left_key == right_key:
         return True
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if any(
+        _identity_requires_exact_source(_identity_source_text(source))
+        for source in (left, right)
+    ):
+        # Projecting an unsupported telescope can erase the token boundary
+        # which made its source opaque. Only the primary exact key above can
+        # establish surface equality for such input.
+        return False
     left_premises, left_conclusion = _graph_contract_profile(left)
     right_premises, right_conclusion = _graph_contract_profile(right)
     left_nonproof_params = _graph_nonproof_parameter_profile(left)
@@ -9993,6 +10237,17 @@ def _uncached_graph_support_candidates(
     include_implication_premises: bool = False,
     premises_are_assumptions: bool = False,
 ) -> List[Tuple[str, Tuple[str, ...]]]:
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    source = str(statement or "").strip()
+    if _identity_requires_exact_source(_identity_source_text(source)):
+        # Do not erase unsupported syntax before the strict support matcher
+        # gets to inspect it. A root's apparent assumptions are not evidence
+        # that its complete opaque goal has already been proved.
+        return [(source, ())] if source and not (
+            include_implication_premises or premises_are_assumptions
+        ) else []
+
     body, base_names, binder_premises = graph_statement_leading_contract(statement)
     candidates: List[Tuple[str, Tuple[str, ...]]] = []
     seen: Set[Tuple[str, Tuple[str, ...]]] = set()
@@ -10182,6 +10437,10 @@ def _graph_strip_leading_forall_binders_with_names(
 
 def _graph_contract_norm(text: str) -> str:
     from .contract_normalization import compact_contract_surface
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if _identity_requires_exact_source(_identity_source_text(text)):
+        return graph_statement_key(text)
 
     stripped, _names = _graph_strip_keeping_premises(text)
     stripped = _graph_normalize_numeric_casts_for_contract(stripped)
@@ -10243,14 +10502,29 @@ def _graph_contract_alpha_norm(
     )
 
 
-@lru_cache(maxsize=64)
 def _cached_graph_contract_alpha_norm(
     text: str,
     *,
     context_bound_names: Tuple[str, ...],
     preserve_type_ascriptions: bool,
 ) -> str:
+    return _large_lexical_result(
+        ("contract_alpha_norm", text, context_bound_names, preserve_type_ascriptions),
+        lambda: _uncached_graph_contract_alpha_norm(
+            text, context_bound_names=context_bound_names,
+            preserve_type_ascriptions=preserve_type_ascriptions,
+        ),
+    )
+
+
+def _uncached_graph_contract_alpha_norm(
+    text: str, *, context_bound_names: Tuple[str, ...], preserve_type_ascriptions: bool,
+) -> str:
     from .contract_normalization import compact_contract_surface
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if _identity_requires_exact_source(_identity_source_text(text)):
+        return graph_statement_key(text)
 
     stripped, mapping = _graph_contract_alpha_source(text, context_bound_names)
     if not preserve_type_ascriptions:
@@ -10377,7 +10651,9 @@ def _helper_decl_header(src: str) -> Optional[Tuple[str, str, str]]:
 
 @lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
 def _cached_helper_decl_header(src: str) -> Optional[Tuple[str, str, str]]:
-    return _uncached_helper_decl_header(src)
+    return _large_lexical_result(
+        ("helper_header", src), lambda: _uncached_helper_decl_header(src),
+    )
 
 
 def _uncached_helper_decl_header(src: str) -> Optional[Tuple[str, str, str]]:
@@ -10448,7 +10724,9 @@ def helper_decl_statement(src: str) -> str:
 
 @lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
 def _cached_helper_decl_statement(src: str) -> str:
-    return _uncached_helper_decl_statement(src)
+    return _large_lexical_result(
+        ("helper_statement", src), lambda: _uncached_helper_decl_statement(src),
+    )
 
 
 def _uncached_helper_decl_statement(src: str) -> str:
@@ -10542,7 +10820,9 @@ def helper_decl_body(src: str) -> str:
 
 @lru_cache(maxsize=_GRAPH_LEXICAL_CACHE_MAX_ENTRIES)
 def _cached_helper_decl_body(src: str) -> str:
-    return _uncached_helper_decl_body(src)
+    return _large_lexical_result(
+        ("helper_body", src), lambda: _uncached_helper_decl_body(src),
+    )
 
 
 def _uncached_helper_decl_body(src: str) -> str:
@@ -11303,6 +11583,262 @@ class ProofGraph:
         return f"replan:{graph_text_hash(graph_identity_text(key))}"
 
     @staticmethod
+    def _source_retaining_proposal_identity(identity: str, statement: str) -> str:
+        """Keep legacy ids for ordinary sources without aliasing altered layouts.
+
+        Persisted edges retain their original ids. New source that legacy
+        formatting would alter receives a stable discriminator before the
+        historical identity formatter runs.
+        """
+        source = graph_exact_statement_text(statement)
+        if source and (
+            source != graph_identity_text(source)
+            or source != graph_formal_statement_text(source)
+        ):
+            return f"{identity}\nexact_source:{lean_contract_statement_source_key(source)}"
+        return identity
+
+    @staticmethod
+    def _proposal_source_frame_key(
+        statement: str, metadata: Mapping[str, Any], *, observed_contract: bool = False,
+    ) -> str:
+        """Bind lifecycle equality to retained source and its observed context."""
+        source_key = lean_contract_statement_source_key(statement)
+        if not source_key:
+            return ""
+        frame = tuple(str(metadata.get(key) or "").strip() for key in (
+            "statement_environment_hash", "helper_context_hash",
+        ))
+        if any(frame):
+            source_key += ":context:" + graph_text_hash(json.dumps(frame))
+        if observed_contract:
+            observed = ProofGraph._proposal_observed_expression(statement, metadata)
+            if observed:
+                source_key += ":expression:" + observed
+        return source_key
+
+    @staticmethod
+    def _proposal_observed_expression(statement: str, metadata: Mapping[str, Any]) -> str:
+        if not metadata.get("contract_identity_evidence_receipt"):
+            return ""
+        identity = graph_node_bound_contract_identity(ProofGraphNode(
+            node_id="", kind="proposed_claim", name="", statement=statement, metadata=dict(metadata),
+        ))
+        parsed = parse_lean_contract_identity(identity)
+        return parsed[0] if parsed is not None else ""
+
+    @classmethod
+    def _proposal_observations_conflict(
+        cls, statement: str, metadata: Mapping[str, Any],
+        other_statement: str, other_metadata: Mapping[str, Any],
+    ) -> bool:
+        observed = cls._proposal_observed_expression(statement, metadata)
+        other = cls._proposal_observed_expression(other_statement, other_metadata)
+        return bool(
+            (observed and other and observed != other)
+            or (not observed and metadata.get("proposal_source_observation_ambiguous") and other)
+            or (not other and other_metadata.get("proposal_source_observation_ambiguous") and observed)
+        )
+
+    def _proposal_source_observations(
+        self, statement: str, metadata: Mapping[str, Any],
+    ) -> Set[str]:
+        """Find checked expressions for this exact source and retained context."""
+        source_frame = self._proposal_source_frame_key(statement, metadata)
+        if not source_frame:
+            return set()
+        return {
+            expression for candidate in self.nodes.values()
+            if candidate.statement == statement
+            and candidate.metadata.get("contract_identity_evidence_receipt")
+            and self._proposal_source_frame_key(candidate.statement, candidate.metadata) == source_frame
+            if (expression := self._proposal_observed_expression(candidate.statement, candidate.metadata))
+        }
+
+    def _retained_proposal_source_identity(
+        self, identity: str, metadata: Dict[str, Any],
+        node_id_for_identity: Callable[[str], str], *, statement: str,
+        source_revision_markers: Sequence[str],
+        source_observations: Optional[Set[str]] = None,
+    ) -> str:
+        """Resolve existing source owners before allocating another revision.
+
+        Source equality only locates existing work. Conflicting checked
+        expressions require an independent unobserved owner until Lean can
+        disambiguate them; no certificate is copied between those owners.
+        """
+        source_frame = self._proposal_source_frame_key(statement, metadata)
+        if not source_frame:
+            return identity
+        incoming_observation = self._proposal_observed_expression(statement, metadata)
+        roots = [identity, *(
+            "\n".join((graph_identity_text(identity), marker, source_frame))
+            for marker in source_revision_markers
+        )]
+        unobserved_identity = identity + "\nunobserved_source:" + source_frame
+        roots.append(unobserved_identity)
+        # A checked incoming expression names its own candidate revisions.
+        # Other observations cannot authorize that owner, so inspecting the
+        # complete graph here only repeats unrelated provenance validation.
+        if incoming_observation:
+            observations = {incoming_observation}
+        elif source_observations is not None:
+            observations = source_observations
+        else:
+            observations = self._proposal_source_observations(statement, metadata)
+        observed_roots = [
+            root + "\nobserved_expression:" + expression
+            for root in roots for expression in sorted(observations)
+        ]
+        candidates = [*roots, *observed_roots]
+        candidates.extend(
+            "\n".join((graph_identity_text(root), marker, source_frame))
+            for root in observed_roots for marker in source_revision_markers
+        )
+        owners: List[Tuple[str, str]] = []
+        unobserved_owner = ""
+        for candidate_identity in candidates:
+            _, active_id = self._active_proposal_identity(
+                candidate_identity, node_id_for_identity=node_id_for_identity,
+                metadata={}, tombstone_metadata_prefix="proposal",
+            )
+            active = self.nodes.get(active_id)
+            if (active is not None
+                    and active.statement == statement
+                    and self._proposal_source_frame_key(active.statement, active.metadata) == source_frame):
+                observed = self._proposal_observed_expression(active.statement, active.metadata)
+                if not observed:
+                    if not incoming_observation and active.metadata.get("proposal_source_observation_ambiguous"):
+                        metadata["proposal_source_observation_ambiguous"] = True
+                    if not unobserved_owner:
+                        unobserved_owner = candidate_identity
+                else:
+                    owners.append((observed, candidate_identity))
+        if incoming_observation:
+            return next((
+                candidate_identity for observed, candidate_identity in owners
+                if observed == incoming_observation
+            ), identity)
+        observation_count = len({observed for observed, _ in owners})
+        if len(observations) > 1:
+            metadata["proposal_source_observation_ambiguous"] = True
+        if unobserved_owner:
+            return unobserved_owner
+        if observation_count == 1 and len(observations) <= 1:
+            return owners[0][1]
+        if owners:
+            return unobserved_identity
+        return identity
+
+    def _context_retaining_proposal_identity(
+        self, identity: str, metadata: Dict[str, Any],
+        node_id_for_identity: Callable[[str], str], *, statement: str,
+        resolve_revivals: bool = False,
+        source_revision_markers: Sequence[str] = (),
+        resolve_observations: bool = False,
+    ) -> str:
+        """Keep a prior context's node intact when its allocation key recurs."""
+        fields = ("statement_environment_hash", "helper_context_hash")
+        incoming = tuple(str(metadata.get(key) or "").strip() for key in fields)
+        source_frame = self._proposal_source_frame_key(statement, metadata)
+        incoming_observation = self._proposal_observed_expression(statement, metadata)
+        source_observations: Optional[Set[str]] = None
+        while True:
+            node = self.nodes.get(node_id_for_identity(identity))
+            if node is None:
+                return identity
+            if (incoming_observation and node.statement == statement
+                    and not self.is_superseded_tombstone(node)
+                    and self._proposal_source_frame_key(node.statement, node.metadata) == source_frame
+                    and self._proposal_observed_expression(node.statement, node.metadata) == incoming_observation):
+                # This exact live owner already carries the supplied checked
+                # expression. No other expression can redirect its work.
+                return identity
+            retained_unobserved_obligation = bool(
+                resolve_observations and not source_revision_markers
+                and not incoming_observation and node.statement == statement
+                and not self.is_superseded_tombstone(node)
+                and self._proposal_source_frame_key(node.statement, node.metadata) == source_frame
+                and not self._proposal_observed_expression(node.statement, node.metadata)
+            )
+            if source_revision_markers or (resolve_observations and not retained_unobserved_obligation):
+                if source_observations is None and not incoming_observation:
+                    # Allocation only reads retained graph evidence. Share the
+                    # fresh census across its identity/revival lookup steps,
+                    # then discard it before the caller can mutate any node.
+                    source_observations = self._proposal_source_observations(statement, metadata)
+                resolved = self._retained_proposal_source_identity(
+                    identity, metadata, node_id_for_identity, statement=statement,
+                    source_revision_markers=source_revision_markers,
+                    source_observations=source_observations,
+                )
+                if resolved != identity:
+                    identity = resolved
+                    continue
+            if source_frame and self._proposal_source_frame_key(node.statement, node.metadata) != source_frame:
+                # A shared proposal key can retain an earlier statement at
+                # its base while this exact source owns a separate revision.
+                # Resolve that owner before generation deduplication can
+                # retire its pending proof or compare against the base Expr.
+                revision_candidates: List[Tuple[Tuple[bool, bool], str]] = []
+                for marker in source_revision_markers:
+                    candidate_identity = "\n".join((graph_identity_text(identity), marker, source_frame))
+                    revision = self.nodes.get(node_id_for_identity(candidate_identity))
+                    if (revision is not None
+                            and self._proposal_source_frame_key(revision.statement, revision.metadata) == source_frame):
+                        _, active_id = self._active_proposal_identity(
+                            candidate_identity, node_id_for_identity=node_id_for_identity,
+                            metadata={}, tombstone_metadata_prefix="proposal",
+                        )
+                        active = self.nodes.get(active_id)
+                        if (active is not None
+                                and self._proposal_source_frame_key(active.statement, active.metadata) == source_frame):
+                            revision = active
+                        revision_candidates.append(((
+                            self._proposal_observations_conflict(statement, metadata, revision.statement, revision.metadata),
+                            self.is_superseded_tombstone(revision),
+                        ), candidate_identity))
+                if revision_candidates:
+                    # Legacy histories can retain both revision spellings.
+                    # Keep the compatible live owner ahead of a retired alias.
+                    identity = min(revision_candidates, key=lambda item: item[0])[1]
+                    continue
+            candidates = [node]
+            if resolve_revivals and self.is_superseded_tombstone(node):
+                # A revision may acquire an observation after its base was
+                # retired. Include every allocated revision so retiring one
+                # cannot change the allocation path for another observation.
+                revival_metadata: Dict[str, Any] = {}
+                self._active_proposal_identity(
+                    identity,
+                    node_id_for_identity=node_id_for_identity,
+                    metadata=revival_metadata,
+                    tombstone_metadata_prefix="proposal",
+                )
+                base_identity = graph_identity_text(identity)
+                for index in range(2, revival_metadata["proposal_revival_index"] + 1):
+                    revived = self.nodes.get(node_id_for_identity(
+                        f"{base_identity}\nproposal_revival:{index}",
+                    ))
+                    if revived is not None:
+                        candidates.append(revived)
+            if any(incoming != tuple(
+                str(candidate.metadata.get(key) or "").strip() for key in fields
+            ) for candidate in candidates):
+                identity += "\nstatement_context:" + graph_text_hash(json.dumps(incoming))
+                continue
+            observation_candidates = [
+                candidate for candidate in candidates
+                if self._proposal_source_frame_key(candidate.statement, candidate.metadata) == source_frame
+            ] or candidates
+            if any(self._proposal_observations_conflict(
+                statement, metadata, candidate.statement, candidate.metadata,
+            ) for candidate in observation_candidates):
+                identity += "\nobserved_expression:" + self._proposal_observed_expression(statement, metadata)
+                continue
+            return identity
+
+    @staticmethod
     def _coerce_float(value: Any, default: float = 0.0) -> float:
         try:
             return float(value)
@@ -11352,7 +11888,7 @@ class ProofGraph:
     ) -> str:
         """Return the stable proposal-generation name used for live dedup."""
 
-        data = dict(metadata or {})
+        data = metadata or {}
         if prefer_variant_name:
             node_label = str(node_name or "").strip()
             variant_name = str(data.get("variant_name") or "").strip()
@@ -11411,8 +11947,8 @@ class ProofGraph:
             or not self.is_superseded_tombstone(base_claim)
         ):
             return
-        claim_key = graph_statement_key(claim.statement)
-        base_key = graph_statement_key(base_claim.statement)
+        claim_key = self._proposal_source_frame_key(claim.statement, claim.metadata)
+        base_key = self._proposal_source_frame_key(base_claim.statement, base_claim.metadata)
         if not claim_key or claim_key != base_key:
             return
         if not str(
@@ -11436,7 +11972,7 @@ class ProofGraph:
                 variant is None
                 or variant.kind != "formal_variant"
                 or self.is_superseded_tombstone(variant)
-                or graph_statement_key(variant.statement) != claim_key
+                or self._proposal_source_frame_key(variant.statement, variant.metadata) != claim_key
             ):
                 continue
             self._reparent_equivalent_child_variant_from_superseded_claim(
@@ -11590,7 +12126,7 @@ class ProofGraph:
             metadata=incoming_metadata,
             prefer_variant_name=False,
         )
-        formal_statement = graph_formal_statement_text(statement)
+        formal_statement = graph_exact_statement_text(statement)
         bind_graph_contract_identity_metadata(
             formal_statement,
             incoming_metadata,
@@ -11605,8 +12141,20 @@ class ProofGraph:
         )
         if not identity:
             raise ValueError("proposed claim requires a name or statement")
+        identity = self._source_retaining_proposal_identity(identity, formal_statement)
+        identity = self._context_retaining_proposal_identity(
+            identity, incoming_metadata, self.claim_node_id, statement=formal_statement,
+            resolve_revivals=True,
+            source_revision_markers=("statement_revision", "rejected_after_proved_claim"),
+        )
         base_node_id = self.claim_node_id(identity)
-        new_statement_key = graph_statement_key(formal_statement or informal)
+        _, current_node_id = self._active_proposal_identity(
+            identity,
+            node_id_for_identity=self.claim_node_id,
+            metadata={},
+            tombstone_metadata_prefix="claim",
+        )
+        new_statement_key = self._proposal_source_frame_key(formal_statement or informal, incoming_metadata)
         superseded_prior_statement_ids: List[str] = []
         for prior in self.nodes_by_kind("proposed_claim"):
             prior_name = self._proposal_generation_name(
@@ -11617,16 +12165,19 @@ class ProofGraph:
             if (
                 claim_generation_name
                 and prior_name == claim_generation_name
-                and prior.node_id != base_node_id
+                and prior.node_id not in {base_node_id, current_node_id}
                 and not self.is_superseded_tombstone(prior)
                 and (
                     prior.status != "proved"
-                    or not graph_statement_key(prior.statement)
+                    or not self._proposal_source_frame_key(prior.statement, prior.metadata)
                 )
                 and new_statement_key
+                and not self._proposal_observations_conflict(
+                    prior.statement, prior.metadata, formal_statement, incoming_metadata,
+                )
                 and (
-                    not graph_statement_key(prior.statement)
-                    or graph_statement_key(prior.statement) == new_statement_key
+                    not self._proposal_source_frame_key(prior.statement, prior.metadata)
+                    or self._proposal_source_frame_key(prior.statement, prior.metadata) == new_statement_key
                 )
             ):
                 self._mark_node_superseded_by_source(prior)
@@ -11637,17 +12188,17 @@ class ProofGraph:
             and existing.kind == "proposed_claim"
             and not self.is_superseded_tombstone(existing)
             and existing.status != "proved"
-            and graph_statement_key(existing.statement)
-            and graph_statement_key(formal_statement or informal)
-            and graph_statement_key(existing.statement)
-            != graph_statement_key(formal_statement or informal)
+            and self._proposal_source_frame_key(existing.statement, existing.metadata)
+            and self._proposal_source_frame_key(formal_statement or informal, incoming_metadata)
+            and self._proposal_source_frame_key(existing.statement, existing.metadata)
+            != self._proposal_source_frame_key(formal_statement or informal, incoming_metadata)
         ):
             self._mark_node_superseded_by_source(existing)
             identity = "\n".join(
                 [
                     graph_identity_text(identity),
                     "statement_revision",
-                    graph_statement_key(formal_statement or informal)
+                    self._proposal_source_frame_key(formal_statement or informal, incoming_metadata)
                     or graph_text_hash(formal_statement or informal),
                 ]
             )
@@ -11666,9 +12217,9 @@ class ProofGraph:
             and active_node.kind == "proposed_claim"
             and active_node.status == "proved"
             and not self.is_superseded_tombstone(active_node)
-            and graph_statement_key(active_node.statement)
+            and self._proposal_source_frame_key(active_node.statement, active_node.metadata)
             and new_statement_key
-            and graph_statement_key(active_node.statement) != new_statement_key
+            and self._proposal_source_frame_key(active_node.statement, active_node.metadata) != new_statement_key
         ):
             identity = "\n".join(
                 [
@@ -11691,10 +12242,10 @@ class ProofGraph:
                 and active_node.kind == "proposed_claim"
                 and not self.is_superseded_tombstone(active_node)
                 and active_node.status != "proved"
-                and graph_statement_key(active_node.statement)
-                and graph_statement_key(formal_statement or informal)
-                and graph_statement_key(active_node.statement)
-                != graph_statement_key(formal_statement or informal)
+                and self._proposal_source_frame_key(active_node.statement, active_node.metadata)
+                and self._proposal_source_frame_key(formal_statement or informal, incoming_metadata)
+                and self._proposal_source_frame_key(active_node.statement, active_node.metadata)
+                != self._proposal_source_frame_key(formal_statement or informal, incoming_metadata)
             ):
                 break
             self._mark_node_superseded_by_source(active_node)
@@ -11801,7 +12352,7 @@ class ProofGraph:
                 source_hash=helper.source_hash,
                 proof_hash=helper.proof_hash or helper.source_hash,
             )
-        if claim_generation_name and not graph_statement_key(node.statement):
+        if claim_generation_name and not self._proposal_source_frame_key(node.statement, node.metadata):
             for prior in self.nodes_by_kind("proposed_claim"):
                 if prior.node_id == node.node_id:
                     continue
@@ -11814,7 +12365,7 @@ class ProofGraph:
                 )
                 if (
                     prior_name == claim_generation_name
-                    and graph_statement_key(prior.statement)
+                    and self._proposal_source_frame_key(prior.statement, prior.metadata)
                 ):
                     self._mark_node_superseded_by_source(
                         node,
@@ -11839,7 +12390,10 @@ class ProofGraph:
                 )
                 if (
                     prior_name == claim_generation_name
-                    and graph_statement_key(prior.statement)
+                    and self._proposal_source_frame_key(prior.statement, prior.metadata) == new_statement_key
+                    and not self._proposal_observations_conflict(
+                        prior.statement, prior.metadata, node.statement, node.metadata,
+                    )
                 ):
                     self._mark_node_superseded_by_source(
                         node,
@@ -11847,6 +12401,8 @@ class ProofGraph:
                     )
                     self.enforce_superseded_tombstones()
                     break
+        if node.status == "proved" and not self._proved_node_has_durable_certificate(node):
+            self._reopen_uncertified_graph_native_node(node, reason="updated_target_missing_certificate")
         return node
 
     def record_formal_variant(
@@ -11870,7 +12426,7 @@ class ProofGraph:
     ) -> ProofGraphNode:
         """Record one formalization candidate for an informal/proposed claim."""
 
-        formal_statement = graph_formal_statement_text(statement)
+        formal_statement = graph_exact_statement_text(statement)
         if not formal_statement:
             raise ValueError("formal variant requires a statement")
         non_theorem_reason = graph_statement_non_theorem_reason(formal_statement)
@@ -11897,7 +12453,7 @@ class ProofGraph:
         parent_claim = self.nodes.get(claim_id)
         parent_superseded = self.is_superseded_tombstone(parent_claim)
         parent_statement_key = (
-            graph_statement_key(parent_claim.statement)
+            self._proposal_source_frame_key(parent_claim.statement, parent_claim.metadata)
             if parent_claim is not None
             else ""
         )
@@ -11949,11 +12505,31 @@ class ProofGraph:
             and parent_claim.kind == "proposed_claim"
             and parent_claim.status == "proved"
             and bool(parent_statement_key)
-            and parent_statement_key != graph_statement_key(formal_statement)
+            and (
+                parent_statement_key != self._proposal_source_frame_key(formal_statement, incoming_metadata)
+                or self._proposal_observations_conflict(
+                    parent_claim.statement, parent_claim.metadata, formal_statement, incoming_metadata,
+                )
+            )
         )
-        variant_identity = graph_identity_text(variant_key) or formal_statement
+        variant_identity = self._source_retaining_proposal_identity(
+            graph_identity_text(variant_key) or formal_statement, formal_statement,
+        )
+        variant_identity = self._context_retaining_proposal_identity(
+            variant_identity, incoming_metadata,
+            lambda key: self.formal_variant_node_id(claim_id, key),
+            statement=formal_statement,
+            resolve_revivals=True,
+            source_revision_markers=("statement_revision", "rejected_after_proved_variant"),
+        )
         base_variant_id = self.formal_variant_node_id(claim_id, variant_identity)
-        new_variant_statement_key = graph_statement_key(formal_statement)
+        _, current_variant_id = self._active_proposal_identity(
+            variant_identity,
+            node_id_for_identity=lambda key: self.formal_variant_node_id(claim_id, key),
+            metadata={},
+            tombstone_metadata_prefix="variant",
+        )
+        new_variant_statement_key = self._proposal_source_frame_key(formal_statement, incoming_metadata)
         variant_label = self._proposal_generation_name(
             node_name=str(variant_name or claim_name or "").strip(),
             metadata=incoming_metadata,
@@ -11969,17 +12545,20 @@ class ProofGraph:
             if (
                 variant_label
                 and prior_name == variant_label
-                and prior.node_id != base_variant_id
+                and prior.node_id not in {base_variant_id, current_variant_id}
                 and not parent_superseded
                 and not parent_proved_mismatch
                 and not self.is_superseded_tombstone(prior)
                 and (
                     prior.status != "proved"
-                    or not graph_statement_key(prior.statement)
+                    or not self._proposal_source_frame_key(prior.statement, prior.metadata)
                 )
-                and graph_statement_key(prior.statement)
+                and self._proposal_source_frame_key(prior.statement, prior.metadata)
                 and new_variant_statement_key
-                and graph_statement_key(prior.statement)
+                and not self._proposal_observations_conflict(
+                    prior.statement, prior.metadata, formal_statement, incoming_metadata,
+                )
+                and self._proposal_source_frame_key(prior.statement, prior.metadata)
                 == new_variant_statement_key
             ):
                 self._mark_node_superseded_by_source(prior, source_node_id=claim_id)
@@ -12029,7 +12608,7 @@ class ProofGraph:
                 [
                     graph_identity_text(variant_identity),
                     "rejected_child_revision",
-                    graph_statement_key(formal_statement)
+                    self._proposal_source_frame_key(formal_statement, incoming_metadata)
                     or graph_text_hash(formal_statement),
                 ]
             )
@@ -12054,9 +12633,9 @@ class ProofGraph:
             and active_existing.kind == "formal_variant"
             and active_existing.status == "proved"
             and not self.is_superseded_tombstone(active_existing)
-            and graph_statement_key(active_existing.statement)
+            and self._proposal_source_frame_key(active_existing.statement, active_existing.metadata)
             and new_variant_statement_key
-            and graph_statement_key(active_existing.statement)
+            and self._proposal_source_frame_key(active_existing.statement, active_existing.metadata)
             != new_variant_statement_key
         ):
             variant_identity = "\n".join(
@@ -12089,10 +12668,10 @@ class ProofGraph:
             and not incoming_invalid
             and not self.is_superseded_tombstone(existing_variant)
             and existing_variant.status != "proved"
-            and graph_statement_key(existing_variant.statement)
-            and graph_statement_key(formal_statement)
-            and graph_statement_key(existing_variant.statement)
-            != graph_statement_key(formal_statement)
+            and self._proposal_source_frame_key(existing_variant.statement, existing_variant.metadata)
+            and self._proposal_source_frame_key(formal_statement, incoming_metadata)
+            and self._proposal_source_frame_key(existing_variant.statement, existing_variant.metadata)
+            != self._proposal_source_frame_key(formal_statement, incoming_metadata)
         ):
             self._mark_node_superseded_by_source(
                 existing_variant,
@@ -12102,7 +12681,7 @@ class ProofGraph:
                 [
                     graph_identity_text(variant_identity),
                     "statement_revision",
-                    graph_statement_key(formal_statement)
+                    self._proposal_source_frame_key(formal_statement, incoming_metadata)
                     or graph_text_hash(formal_statement),
                 ]
             )
@@ -12130,10 +12709,10 @@ class ProofGraph:
                 and not incoming_invalid
                 and not self.is_superseded_tombstone(active_variant)
                 and active_variant.status != "proved"
-                and graph_statement_key(active_variant.statement)
-                and graph_statement_key(formal_statement)
-                and graph_statement_key(active_variant.statement)
-                != graph_statement_key(formal_statement)
+                and self._proposal_source_frame_key(active_variant.statement, active_variant.metadata)
+                and self._proposal_source_frame_key(formal_statement, incoming_metadata)
+                and self._proposal_source_frame_key(active_variant.statement, active_variant.metadata)
+                != self._proposal_source_frame_key(formal_statement, incoming_metadata)
             ):
                 break
             self._mark_node_superseded_by_source(
@@ -12279,9 +12858,12 @@ class ProofGraph:
                 )
                 if (
                     prior_name == variant_label
-                    and graph_statement_key(prior.statement)
-                    and graph_statement_key(prior.statement)
+                    and self._proposal_source_frame_key(prior.statement, prior.metadata)
+                    and self._proposal_source_frame_key(prior.statement, prior.metadata)
                     == new_variant_statement_key
+                    and not self._proposal_observations_conflict(
+                        prior.statement, prior.metadata, node.statement, node.metadata,
+                    )
                 ):
                     self._mark_node_superseded_by_source(
                         node,
@@ -12306,6 +12888,8 @@ class ProofGraph:
                 source_hash=helper.source_hash,
                 proof_hash=helper.proof_hash or helper.source_hash,
             )
+        if node.status == "proved" and not self._proved_node_has_durable_certificate(node):
+            self._reopen_uncertified_graph_native_node(node, reason="updated_target_missing_certificate")
         return node
 
     def record_strategy_route(
@@ -12770,7 +13354,7 @@ class ProofGraph:
             bound_root_identity = bool(
                 has_lean_contract_identity(root_contract_identity)
                 and root_statement_key
-                and root_statement_key == expected_target_key
+                and root_statement_key == lean_contract_statement_source_key(expected_target)
                 and lean_contract_evidence_receipt_matches(
                     root_evidence_receipt,
                     identity=root_contract_identity,
@@ -12824,7 +13408,7 @@ class ProofGraph:
                 if (
                     has_lean_contract_identity(anchor_identity)
                     and anchor_statement_key
-                    == self._route_target_statement_key(
+                    == lean_contract_statement_source_key(
                         str(anchor.get("statement") or "").strip()
                     )
                     and anchor_environment_hash == root_environment_hash
@@ -12836,7 +13420,7 @@ class ProofGraph:
                     )
                 ):
                     route_anchor_identities.add(anchor_identity)
-                    route_anchor_statement_keys.add(anchor_statement_key)
+                    route_anchor_statement_keys.add(self._route_target_statement_key(str(anchor.get("statement") or "")))
                 else:
                     invalid_route_anchor = True
             if invalid_route_anchor:
@@ -12897,7 +13481,7 @@ class ProofGraph:
                     not bound_root_identity
                     or not has_lean_contract_identity(claim_identity)
                     or claim_statement_key
-                    != self._route_target_statement_key(
+                    != lean_contract_statement_source_key(
                         str(item.get("statement") or "").strip()
                     )
                     or kind not in {"exact", "profile"}
@@ -12968,7 +13552,7 @@ class ProofGraph:
                 bound_claim_identity = bool(
                     has_lean_contract_identity(claim_identity)
                     and claim_statement_key
-                    == self._route_target_statement_key(statement)
+                    == lean_contract_statement_source_key(statement)
                     and claim_environment_hash == root_environment_hash
                     and lean_contract_evidence_receipt_matches(
                         str(
@@ -14142,6 +14726,8 @@ class ProofGraph:
         old_signature = str(
             metadata.get("route_missing_assembly_bridge_signature_hash") or ""
         ).strip()
+        if metadata.get("schedulable") is False and not metadata.get("route_missing_assembly_bridge_rescue_stale"):
+            metadata["route_missing_assembly_bridge_rescue_quarantined"] = True
         metadata["route_missing_assembly_bridge_rescue_stale"] = True
         metadata["route_missing_assembly_bridge_rescue_stale_signature_hash"] = (
             old_signature
@@ -14154,6 +14740,8 @@ class ProofGraph:
                 dict(contract_status)
             )
         metadata["schedulable"] = False
+        if node.status in {"failed", "rejected"}:
+            metadata["route_missing_assembly_bridge_rescue_terminal_status"] = node.status
         if node.status != "proved":
             node.status = "obsolete"
         route_id = str(metadata.get("route_id") or "").strip()
@@ -14248,7 +14836,7 @@ class ProofGraph:
         # does not mean its causal blockers or terminal attempt state vanished.
         # Only an actual stale-signature retirement performed above owns an
         # automatic revival transition, and that retirement uses ``obsolete``.
-        if stale_marker_present and node.status == "obsolete":
+        if node.status != "proved":
             unresolved_blocker = any(
                 edge.source == node.node_id
                 and edge.kind == "blocked_by"
@@ -14259,9 +14847,8 @@ class ProofGraph:
             )
             terminal_generation_memory = bool(
                 metadata.get("retired_by_repeated_repair_failure")
-                or metadata.get(
-                    "formalization_repeated_unrelated_bridge_suppressed"
-                )
+                or metadata.get("route_missing_assembly_bridge_rescue_terminal_status")
+                or metadata.get("route_missing_assembly_bridge_rescue_quarantined")
                 or metadata.get("proposal_invalidated")
                 or graph_node_frontier_quarantined(node)
                 or graph_node_frontier_promoted_to_proof_state(node)
@@ -14271,12 +14858,12 @@ class ProofGraph:
                 # a semantically deduplicated rescue. Do not publish an OPEN
                 # frontier item that session liveness will immediately reject.
                 node.status = "obsolete"
-            elif unresolved_blocker:
+            elif unresolved_blocker and node.status in {"open", "blocked", "obsolete"}:
                 # Spawned-claim blockers belong to the mathematical rescue,
                 # not merely its exact certificate signature. Preserve their
                 # causal conjunction across signature generations.
                 node.status = "blocked"
-            else:
+            elif stale_marker_present and node.status == "obsolete":
                 node.status = "open"
 
     def _route_missing_assembly_bridge_rescue_current(
@@ -14673,17 +15260,69 @@ class ProofGraph:
             ).strip()
         except Exception:
             semantic_signature = ""
+        semantic_signature_available = bool(semantic_signature)
         if not semantic_signature:
-            semantic_signature = graph_text_hash(
-                json.dumps(
-                    {
-                        "route_id": clean_route_id,
-                        "target_statement_key": graph_statement_key(target_statement),
-                        "contract_verdict": str(status.get("verdict") or ""),
-                    },
-                    sort_keys=True,
-                )
-            )
+            # Deduplication is optional; an incomplete semantic projection
+            # cannot suppress changed dependency work.
+            semantic_signature = clean_signature
+        legacy_candidates = [
+            candidate for candidate in self.nodes.values()
+            if semantic_signature_available and candidate.kind == "missing_obligation"
+            and not self.is_superseded_tombstone(candidate)
+            and (candidate.metadata or {}).get("route_missing_assembly_bridge_rescue")
+            and str((candidate.metadata or {}).get("route_id") or "").strip() == clean_route_id
+            and str((candidate.metadata or {}).get("route_missing_assembly_bridge_semantic_signature_hash") or "").strip() == semantic_signature
+            and str((candidate.metadata or {}).get("parent_repair_target_statement") or "").strip() == target_statement
+            and bool((candidate.metadata or {}).get("route_root_tactic_failure_rescue")) == bool(allow_deterministic_ready)
+        ]
+        existing_id = str((route.metadata or {}).get("route_missing_assembly_bridge_rescue_obligation_id") or "").strip()
+        existing = next((candidate for candidate in legacy_candidates if candidate.node_id == existing_id), None)
+        if existing is None and legacy_candidates:
+            existing = min(legacy_candidates, key=lambda candidate: candidate.node_id)
+        if existing is not None:
+            legacy_ids = {candidate.node_id for candidate in legacy_candidates}
+            legacy_replans = [
+                candidate for candidate in self.nodes.values()
+                if candidate.kind == "replan_queue_item"
+                and (candidate.metadata or {}).get("route_id") == clean_route_id
+                and (candidate.metadata or {}).get("obligation_id") in legacy_ids
+                and (candidate.metadata or {}).get("route_missing_assembly_bridge_rescue")
+            ]
+            existing.attempt_ids = list(dict.fromkeys(
+                attempt_id for candidate in legacy_candidates for attempt_id in candidate.attempt_ids
+            ))
+            for edge in tuple(self.edges):
+                if edge.source in legacy_ids and edge.kind == "blocked_by":
+                    self.add_edge(existing.node_id, edge.target, "blocked_by")
+            for candidate in legacy_candidates:
+                metadata = candidate.metadata or {}
+                if metadata.get("schedulable") is False and not metadata.get("route_missing_assembly_bridge_rescue_stale"):
+                    existing.metadata["route_missing_assembly_bridge_rescue_quarantined"] = True
+                if candidate.status in {"failed", "rejected"} or metadata.get("route_missing_assembly_bridge_rescue_terminal_status"):
+                    existing.metadata["route_missing_assembly_bridge_rescue_terminal_status"] = (
+                        metadata.get("route_missing_assembly_bridge_rescue_terminal_status") or candidate.status
+                    )
+                for key in ("retired_by_repeated_repair_failure", "proposal_invalidated",
+                            "route_missing_assembly_bridge_rescue_quarantined"):
+                    if metadata.get(key):
+                        existing.metadata[key] = True
+                for key in (
+                            "residual_goal_quarantined", "failed_proof_residual_quarantined",
+                            "route_retired", "route_dependency_contradicted", "root_equivalent_work_suppressed",
+                            "promoted_to_proof_state"):
+                    if metadata.get(key) is True:
+                        existing.metadata[key] = True
+                for key in ("proof_state_child_node_id", "proof_state_child_graph_node_id"):
+                    if str(metadata.get(key) or "").strip():
+                        existing.metadata[key] = metadata[key]
+                if metadata.get("obligation_trust") == "untrusted_failed_proof_residual":
+                    existing.metadata["obligation_trust"] = "untrusted_failed_proof_residual"
+            for candidate in legacy_replans:
+                metadata = candidate.metadata or {}
+                if (metadata.get("closed_by_obligation_id") in legacy_ids
+                        and metadata.get("closed_by_obligation_status") in {"failed", "rejected"}
+                        and metadata.get("closed_reason") == "linked_obligation_terminal"):
+                    existing.metadata["route_missing_assembly_bridge_rescue_terminal_status"] = metadata["closed_by_obligation_status"]
         self._retire_stale_route_missing_assembly_bridge_rescues(
             clean_route_id,
             current_signature_hash=clean_signature,
@@ -14696,36 +15335,77 @@ class ProofGraph:
                 if allow_deterministic_ready
                 else "route_missing_assembly_bridge:"
             )
-            + f"{clean_route_id}:{clean_signature}"
+            + f"{clean_route_id}:{semantic_signature}:{hashlib.sha256(target_statement.encode('utf-8')).hexdigest()}"
         )
-        existing_id = str(
-            (route.metadata or {}).get(
-                "route_missing_assembly_bridge_rescue_obligation_id"
-            )
-            or ""
-        ).strip()
-        existing = self.nodes.get(existing_id) if existing_id else None
         if (
             existing is not None
             and existing.kind == "missing_obligation"
             and not self.is_superseded_tombstone(existing)
-            and str((existing.metadata or {}).get("identity_key") or "").strip()
-            == identity_key
         ):
             self._mark_route_missing_assembly_bridge_rescue_current(
                 existing,
                 signature_hash=clean_signature,
                 contract_status=status,
             )
+            route.metadata["route_missing_assembly_bridge_rescue_obligation_id"] = existing.node_id
+            for candidate in self.nodes.values():
+                metadata = candidate.metadata or {}
+                if (candidate.kind == "replan_queue_item"
+                        and metadata.get("obligation_id") == existing.node_id
+                        and metadata.get("route_id") == clean_route_id
+                        and metadata.get("route_missing_assembly_bridge_rescue")
+                        and not self.is_superseded_tombstone(candidate)):
+                    if existing.metadata.get("route_missing_assembly_bridge_rescue_terminal_status"):
+                        metadata["route_missing_assembly_bridge_rescue_terminal_status"] = existing.metadata["route_missing_assembly_bridge_rescue_terminal_status"]
+                    candidate.attempt_ids = list(dict.fromkeys(
+                        attempt_id for queue in legacy_replans for attempt_id in queue.attempt_ids
+                    ))
+                    legacy_replan_ids = {queue.node_id for queue in legacy_replans}
+                    for edge in tuple(self.edges):
+                        if edge.source in legacy_replan_ids and edge.kind == "blocked_by":
+                            self.add_edge(candidate.node_id, edge.target, "blocked_by")
+                    for queue in legacy_replans:
+                        queue_metadata = queue.metadata or {}
+                        terminal_status = queue_metadata.get("route_missing_assembly_bridge_rescue_terminal_status")
+                        if queue.status in {"failed", "rejected"}:
+                            terminal_status = queue.status
+                        if terminal_status:
+                            metadata["route_missing_assembly_bridge_rescue_terminal_status"] = terminal_status
+                        if queue_metadata.get("route_missing_assembly_bridge_rescue_quarantined"):
+                            metadata["route_missing_assembly_bridge_rescue_quarantined"] = True
+                        for key in ("retired_by_repeated_repair_failure", "proposal_invalidated"):
+                            if queue_metadata.get(key):
+                                metadata[key] = True
+                        for key in ("residual_goal_quarantined", "failed_proof_residual_quarantined",
+                                    "route_retired", "route_dependency_contradicted", "root_equivalent_work_suppressed",
+                                    "promoted_to_proof_state"):
+                            if queue_metadata.get(key) is True:
+                                metadata[key] = True
+                        for key in ("proof_state_child_node_id", "proof_state_child_graph_node_id"):
+                            if str(queue_metadata.get(key) or "").strip():
+                                metadata[key] = queue_metadata[key]
+                        if queue_metadata.get("obligation_trust") == "untrusted_failed_proof_residual":
+                            metadata["obligation_trust"] = "untrusted_failed_proof_residual"
+                    self._mark_route_missing_assembly_bridge_rescue_current(
+                        candidate, signature_hash=clean_signature, contract_status=status,
+                    )
+                    route.metadata["route_missing_assembly_bridge_rescue_replan_id"] = candidate.node_id
+            route.metadata[
+                "route_root_tactic_failure_rescue_signature_hash" if allow_deterministic_ready
+                else "route_missing_assembly_bridge_rescue_signature_hash"
+            ] = clean_signature
             return existing
         reason = (
             "Create a replayable Lean bridge for a ready route whose proved "
             "dependencies do not yet determine an assembly proof."
         )
         statement = (
-            "Build a replayable assembly bridge for route "
+            ("Build a replayable root tactic bridge for route " if allow_deterministic_ready
+             else "Build a replayable assembly bridge for route ")
+            +
             f"{graph_text_hash(clean_route_id)} with dependency signature "
-            f"{clean_signature}."
+            f"{semantic_signature} and target scope "
+            f"{hashlib.sha256(target_statement.encode('utf-8')).hexdigest()}."
         )
         shared_metadata = {
             "source": "route_missing_assembly_bridge",
@@ -14873,11 +15553,7 @@ class ProofGraph:
         incoming_metadata = dict(metadata or {})
         raw_statement = str(statement or "").strip()
         statement_is_executable = graph_statement_is_executable(raw_statement)
-        obligation_statement = (
-            graph_formal_statement_text(raw_statement)
-            if statement_is_executable
-            else graph_identity_text(raw_statement)
-        )
+        obligation_statement = graph_exact_statement_text(raw_statement)
         reason_text = graph_identity_text(reason)
         source_id = str(source_node_id or "").strip()
         route = str(route_id or "").strip()
@@ -14896,6 +15572,11 @@ class ProofGraph:
         )
         if not identity:
             raise ValueError("missing obligation requires a statement or reason")
+        identity = self._source_retaining_proposal_identity(identity, obligation_statement)
+        identity = self._context_retaining_proposal_identity(
+            identity, incoming_metadata, self.missing_obligation_node_id, statement=obligation_statement,
+            resolve_observations=True,
+        )
         node_id = self.missing_obligation_node_id(identity)
         # This classifies the incoming source before lifecycle reconciliation.
         # A retired route may still own this node until the live route below
@@ -15029,7 +15710,22 @@ class ProofGraph:
         node_metadata = self._normalize_missing_obligation_metadata(node_metadata)
         duplicate_reused = False
         node = self.nodes.get(node_id)
-        if formalization_obligation_key:
+        incoming_observation = self._proposal_observed_expression(node_statement, node_metadata)
+        retained_owner = bool(
+            node is not None
+            and node.statement == node_statement
+            and node.metadata.get("formalization_obligation_key") == formalization_obligation_key
+            and self._proposal_source_frame_key(node.statement, node.metadata)
+            == self._proposal_source_frame_key(node_statement, node_metadata)
+            and self._proposal_observed_expression(node.statement, node.metadata) == incoming_observation
+        )
+        # Retaining one's exact observed or unobserved owner does not borrow a
+        # different expression. Source-only helper closure still performs its
+        # fresh ambiguity census, including before a checkpoint refresh.
+        if formalization_obligation_key and not retained_owner:
+            matching_candidates: List[ProofGraphNode] = []
+            observed_candidates: Dict[str, str] = {}
+            source_frames: Set[str] = set()
             for candidate in self.nodes.values():
                 if candidate.kind != "missing_obligation":
                     continue
@@ -15039,9 +15735,44 @@ class ProofGraph:
                 ).strip()
                 if candidate_key != formalization_obligation_key:
                     continue
-                node = candidate
-                duplicate_reused = candidate.node_id != node_id
-                break
+                if node_statement and candidate.statement != node_statement:
+                    continue
+                # A sparse metadata refresh does not propose a replacement
+                # source. Resolve it only when this formalization key has one
+                # candidate in the same context; otherwise retain independent
+                # work instead of choosing between distinct propositions.
+                comparison_statement = node_statement or candidate.statement
+                if self._proposal_source_frame_key(candidate.statement, candidate.metadata) != (
+                    self._proposal_source_frame_key(comparison_statement, node_metadata)
+                ) or self._proposal_observations_conflict(
+                    candidate.statement, candidate.metadata, comparison_statement, node_metadata,
+                ):
+                    continue
+                matching_candidates.append(candidate)
+                source_frames.add(self._proposal_source_frame_key(candidate.statement, candidate.metadata))
+                observed_candidates[candidate.node_id] = self._proposal_observed_expression(
+                    candidate.statement, candidate.metadata,
+                )
+            observations = {value for value in observed_candidates.values() if value}
+            if not incoming_observation and len(observations) > 1:
+                node_metadata["proposal_source_observation_ambiguous"] = True
+            # An advisory formalization key cannot select an expression.
+            # Preserve an existing unobserved owner ahead of observed aliases,
+            # or select the owner's checked expression when one is supplied.
+            eligible_candidates = [
+                candidate for candidate in matching_candidates
+                if (
+                    not observed_candidates[candidate.node_id]
+                    or incoming_observation
+                    or len(observations) <= 1
+                )
+            ] if len(source_frames) == 1 else []
+            if eligible_candidates:
+                node = min(eligible_candidates, key=lambda candidate: (
+                    observed_candidates[candidate.node_id] != incoming_observation,
+                    candidate.node_id != node_id,
+                ))
+                duplicate_reused = node.node_id != node_id
         existing_node_reused = node is not None
         poisoned_duplicate_reuse = existing_node_reused and route_poisoned
         metadata_to_merge = node_metadata
@@ -15166,6 +15897,8 @@ class ProofGraph:
                 source_hash=helper.source_hash,
                 proof_hash=helper.proof_hash or helper.source_hash,
             )
+        if node.status == "proved" and not self._proved_node_has_durable_certificate(node):
+            self._reopen_uncertified_graph_native_node(node, reason="updated_target_missing_certificate")
         return node
 
     @staticmethod
@@ -15439,9 +16172,24 @@ class ProofGraph:
         require_replayable_source: bool = False,
         consumer_node: Optional[ProofGraphNode] = None,
     ) -> Optional[ProofGraphNode]:
+        """Select a helper, checking live authority when a consumer is supplied."""
+
         statement_key = graph_statement_key(statement)
         if not statement_key:
             return None
+        # This lookup is synchronous: share a fresh census only within this
+        # nomination. The later proof transition independently checks authority.
+        observed_expressions: Optional[Set[str]] = None
+
+        def source_observations() -> Set[str]:
+            nonlocal observed_expressions
+            if observed_expressions is None:
+                assert consumer_node is not None
+                observed_expressions = self._proposal_source_observations(
+                    consumer_node.statement, consumer_node.metadata or {},
+                )
+            return observed_expressions
+
         for node in self.nodes_by_kind("helper"):
             if node.status != "proved":
                 continue
@@ -15483,6 +16231,10 @@ class ProofGraph:
                         exact_statement_key=statement_key,
                     ):
                         continue
+                if consumer_node is not None and not self._helper_certifies_node(
+                    node, consumer_node, _source_observations=source_observations,
+                ):
+                    continue
                 return node
         return None
 
@@ -16115,6 +16867,8 @@ class ProofGraph:
         self,
         helper: Optional[ProofGraphNode],
         node: Optional[ProofGraphNode],
+        *,
+        _source_observations: Optional[Callable[[], Set[str]]] = None,
     ) -> bool:
         if (
             helper is None
@@ -16184,6 +16938,39 @@ class ProofGraph:
             )
             if structural_conflict:
                 return False
+            if not (
+                structural_match
+                or (helper_key and node_key and helper_key == node_key)
+            ):
+                return False
+            if (
+                helper_metadata.get("verified_helper_contract_observation_required")
+                or node_metadata.get("proposal_source_observation_ambiguous")
+                or "\n" in str(helper.statement or "")
+                or "\r" in str(helper.statement or "")
+            ) and not structural_match:
+                # Qualified declarations and scoped notation can elaborate
+                # the same printed binder type differently from this target.
+                # Observing the helper alone cannot certify an unelaborated
+                # target through the surface-matching fallback.
+                return False
+            if not structural_match:
+                observed_expressions = (
+                    _source_observations() if _source_observations is not None
+                    else self._proposal_source_observations(node.statement, node_metadata)
+                )
+                if (
+                    len(observed_expressions) > 1
+                    or (
+                        helper_parsed_identity is not None
+                        and observed_expressions
+                        and helper_parsed_identity[0] not in observed_expressions
+                    )
+                ):
+                    # Restored owners may predate allocation's ambiguity
+                    # marker. Inspect retained evidence before source-only
+                    # helper closure can run during checkpoint restoration.
+                    return False
             # Unbound format-valid litter is not authority, but it is still a
             # conflict signal against a helper's bound identity. Bind strips
             # every alias key, so legacy reinject may land on any of them.
@@ -16198,9 +16985,10 @@ class ProofGraph:
                 and not structural_match
             ):
                 return False
-            if not (
-                structural_match
-                or (helper_key and node_key and helper_key == node_key)
+            if (
+                not structural_match
+                and str(helper.statement or "").strip() != str(node.statement or "").strip()
+                and helper_metadata.get("verified_helper_plain_syntax") is not True
             ):
                 return False
         metadata = dict(helper.metadata or {})
@@ -18526,7 +19314,7 @@ class ProofGraph:
         premises, conclusion, bound_names = _graph_statement_premises_and_conclusion(
             statement
         )
-        if not premises or not _graph_statement_root_adjacent(
+        if not premises or not _graph_may_be_root_adjacent(
             conclusion,
             root.statement,
             conclusion_bound_names=bound_names,
@@ -18579,10 +19367,20 @@ class ProofGraph:
 
         if node is None or node.status != "proved" or self.is_superseded_tombstone(node):
             return False
-        if node.kind in _GRAPH_FORMAL_STATEMENT_KINDS and graph_statement_non_theorem_reason(
-            node.statement
-        ):
-            return False
+        if node.kind in _GRAPH_FORMAL_STATEMENT_KINDS:
+            # Classification depends only on exact syntax. Mutable proof,
+            # source, environment and dependency authority is checked below
+            # on every call. Dynamic attributes are absent from disk records.
+            lexical_key = (node.statement, graph_statement_non_theorem_reason)
+            cached = getattr(node, "_lexical_target_classification", None)
+            if cached is not None and cached[0] == lexical_key:
+                reason = cached[1]
+            else:
+                reason = graph_statement_non_theorem_reason(node.statement)
+                if reason != "parse_bound":
+                    node._lexical_target_classification = (lexical_key, reason)
+            if reason:
+                return False
         if self._graph_native_source_is_superseded(node):
             return False
         if self._node_open_root_reducer_premises(node):
@@ -19462,9 +20260,11 @@ class ProofGraph:
             or self.is_superseded_tombstone(source)
         ):
             return False
-        source_key = graph_statement_key(source.statement)
-        node_key = graph_statement_key(node.statement)
-        if not source_key or source_key != node_key:
+        source_key = self._proposal_source_frame_key(source.statement, source.metadata)
+        node_key = self._proposal_source_frame_key(node.statement, node.metadata)
+        if not source_key or source_key != node_key or self._proposal_observations_conflict(
+            source.statement, source.metadata, node.statement, node.metadata,
+        ):
             return False
         node_revision = self._effective_proposal_revision(node)
         source_revision = self._effective_proposal_revision(source)
@@ -19539,12 +20339,19 @@ class ProofGraph:
             or self.is_superseded_tombstone(source)
         ):
             return False
-        source_key = graph_statement_key(source.statement)
-        variant_key = graph_statement_key(variant.statement)
+        old_parent_key = self._proposal_source_frame_key(old_parent.statement, old_parent.metadata)
+        source_key = self._proposal_source_frame_key(source.statement, source.metadata)
+        variant_key = self._proposal_source_frame_key(variant.statement, variant.metadata)
         if (
             not source_key
             or source_key != old_parent_key
             or source_key != variant_key
+            or self._proposal_observations_conflict(
+                source.statement, source.metadata, old_parent.statement, old_parent.metadata,
+            )
+            or self._proposal_observations_conflict(
+                source.statement, source.metadata, variant.statement, variant.metadata,
+            )
         ):
             return False
         old_revision = self._proposal_revision(old_parent)
@@ -20019,7 +20826,7 @@ class ProofGraph:
             ready_count, open_count = direct_proved_route_dependency_counts(node)
             if node.kind != "proposed_claim":
                 return (ready_count, open_count)
-            claim_statement_key = graph_statement_key(node.statement)
+            claim_statement_key = self._proposal_source_frame_key(node.statement, node.metadata)
             if not claim_statement_key:
                 return (ready_count, open_count)
             variant_ids = {
@@ -20038,7 +20845,7 @@ class ProofGraph:
                     variant is None
                     or variant.kind != "formal_variant"
                     or self.is_superseded_tombstone(variant)
-                    or graph_statement_key(variant.statement) != claim_statement_key
+                    or self._proposal_source_frame_key(variant.statement, variant.metadata) != claim_statement_key
                 ):
                     continue
                 child_ready, child_open = direct_proved_route_dependency_counts(variant)
@@ -20053,7 +20860,7 @@ class ProofGraph:
             ready_route_count, open_route_count = proved_route_dependency_counts(node)
             proved_with_certificate = self._proved_node_has_durable_certificate(node)
             return (
-                1 if graph_statement_key(node.statement) else 0,
+                1 if self._proposal_source_frame_key(node.statement, node.metadata) else 0,
                 0 if self._formal_variant_crosses_parent_revision(node) else 1,
                 1 if proved_with_certificate else 0,
                 proposal_revision,
@@ -20071,14 +20878,16 @@ class ProofGraph:
                 name = proposal_name(node)
                 if not name:
                     continue
-                groups.setdefault((name, graph_statement_key(node.statement)), []).append(
+                groups.setdefault((name, self._proposal_source_frame_key(
+                    node.statement, node.metadata, observed_contract=True,
+                )), []).append(
                     node
                 )
             for nodes in groups.values():
                 if len(nodes) <= 1:
                     continue
                 active = max(nodes, key=proposal_score)
-                active_statement_key = graph_statement_key(active.statement)
+                active_statement_key = self._proposal_source_frame_key(active.statement, active.metadata)
                 for node in nodes:
                     if (
                         node.node_id == active.node_id
@@ -20938,7 +21747,10 @@ class ProofGraph:
                     metadata.get("formalization_obligation_key") or ""
                 ).strip()
                 if formalization_key:
-                    dedupe_sid = f"formalization:{formalization_key}"
+                    source_key = self._proposal_source_frame_key(
+                        graph_node.statement, metadata, observed_contract=True,
+                    )
+                    dedupe_sid = f"formalization:{formalization_key}:{source_key}"
             key = (dedupe_sid, wtype, assembly_id if wtype == "assembly" else "")
             if key in seen:
                 return
@@ -21671,10 +22483,7 @@ class ProofGraph:
                     continue
                 statement = str(graph_node.statement or "").strip()
                 statement_executable = self.statement_is_executable(statement, node_id=graph_node.node_id)
-                if (
-                    metadata.get("target_integrity_adjudication")
-                    and statement_executable
-                ):
+                if graph_node_requires_target_integrity_adjudication(graph_node):
                     add_graph_native(graph_node, "target_integrity_adjudication")
                 elif metadata.get("formalization_required"):
                     if statement_executable:
@@ -22330,6 +23139,8 @@ class ProofGraph:
         self.attempts.append(attempt)
         self._attempt_ids.add(attempt.attempt_id)
         self.nodes[node_id].attempt_ids.append(attempt.attempt_id)
+        if self._is_mathematical_attempt_failure(verdict, error_type):
+            self._remember_mathematical_failure(node, attempt)
         self._update_status_from_verdict(
             node_id,
             attempt.verdict,
@@ -22348,6 +23159,64 @@ class ProofGraph:
                     self._add_edge(helper_id, self.root_node_id, "supports_root")
         self._compact_attempt_history()
         return attempt
+
+    def _remember_mathematical_failure(
+        self, node: ProofGraphNode, attempt: ProofGraphAttempt,
+    ) -> None:
+        """Keep compact advisory failure history with the exact target version.
+
+        Detailed recent diagnostics may be evicted. Distinct mathematical
+        failures stay attached to their obligation, and repeated observations
+        share one entry. These records never reject work or establish a fact.
+        """
+        helper_versions = []
+        for name in attempt.helper_names:
+            helper = self.nodes.get(self.helper_name_to_node_id.get(name, ""))
+            helper_versions.append((name, helper.source_hash if helper else ""))
+        context = {
+            "helpers": helper_versions,
+            "context": str(attempt.metadata.get("helper_context_hash") or node.metadata.get("helper_context_hash") or ""),
+        }
+        rejected_statement = str(attempt.metadata.get("attempted_statement") or node.statement)
+        if attempt.verdict == "graph_native_statement_type_rejected":
+            rejected_statement = str(attempt.metadata.get("graph_native_goal_statement") or node.statement)
+        entry = {
+            "target_statement_hash": graph_text_hash(rejected_statement),
+            "target_source_hash": node.source_hash,
+            "environment_hash": str(attempt.metadata.get("statement_environment_hash") or node.metadata.get("statement_environment_hash") or ""),
+            "helper_context_hash": graph_text_hash(json.dumps(context, sort_keys=True)),
+            "proof_hash": attempt.proof_hash,
+            "verdict": attempt.verdict,
+            "error_type": attempt.error_type,
+        }
+        identity = graph_text_hash(json.dumps(entry, sort_keys=True))
+        history = node.metadata.get("failure_memory")
+        if not isinstance(history, list):
+            history = []
+            node.metadata["failure_memory"] = history
+        for previous in history:
+            if isinstance(previous, dict) and previous.get("identity") == identity:
+                count = previous.get("count", 0)
+                previous["count"] = (count if type(count) is int and count >= 0 else 0) + 1
+                previous["last_turn_index"] = attempt.turn_index
+                return
+        history.append({
+            "identity": identity, **entry, "phase": attempt.phase,
+            "first_turn_index": attempt.turn_index,
+            "last_turn_index": attempt.turn_index, "count": 1,
+        })
+
+    @classmethod
+    def _is_mathematical_attempt_failure(cls, verdict: str, error_type: str) -> bool:
+        """Retain actual proof rejection, not successful or deferred work."""
+        return (
+            str(verdict or "").strip().lower() in {
+                "lean_rejected", "tactic_rejected", "scratch_rejected",
+                "variant_falsified_by_sample", "variant_type_rejected",
+                "graph_native_statement_type_rejected",
+            }
+            and not cls._is_operational_attempt_failure(verdict, error_type)
+        )
 
     @staticmethod
     def _is_operational_attempt_failure(verdict: str, error_type: str) -> bool:
@@ -23160,6 +24029,69 @@ class ProofGraph:
                         "formalization_bridge_rehydrate_reclassified"
                     ] = True
 
+    def _restore_legacy_formalization_limit(self) -> None:
+        """Remove an identified historical attempt-count scheduling veto.
+
+        Candidate failures remain available for planning. Only an open or
+        explicitly dependency-blocked obligation carrying complete old veto
+        provenance is eligible; blocking edges and status are preserved, and
+        independent quarantine, delegation, and terminal state remain intact.
+        """
+
+        reasons = {
+            "auxiliary_bridge_statement_unrelated_to_parent",
+            "auxiliary_bridge_support_lacks_mathematical_relation",
+            "formalization_bridge_required",
+            "bridge_assumes_own_conclusion",
+            "bridge_assumes_parent_target",
+            "bridge_contract_ambiguous_proof_binder",
+        }
+        blocked_sources: Optional[Set[str]] = None
+        for node in self.nodes.values():
+            metadata = node.metadata
+            if (
+                node.kind != "missing_obligation" or node.status not in {"open", "blocked"}
+                or metadata.get("formalization_repeated_unrelated_bridge_suppressed") is not True
+                or metadata.get("schedulable") is not False
+                or metadata.get("formalization_repeated_unrelated_bridge_reason") not in reasons
+            ):
+                continue
+            count = metadata.get("formalization_repeated_unrelated_bridge_count")
+            history = metadata.get("rejected_formalization_candidates")
+            if (
+                not isinstance(count, int) or isinstance(count, bool) or count < 3
+                or not isinstance(history, list)
+                or sum(
+                    isinstance(candidate, dict) and candidate.get("reason") in reasons
+                    for candidate in history
+                ) < 3
+            ):
+                continue
+            if node.status == "blocked":
+                if blocked_sources is None:
+                    blocked_sources = {
+                        edge.source for edge in self.edges if edge.kind == "blocked_by"
+                    }
+                if node.node_id not in blocked_sources:
+                    continue
+            view = copy.copy(node)
+            view.metadata = dict(metadata)
+            view.metadata.pop("schedulable", None)
+            if (
+                graph_node_frontier_quarantined(view)
+                or graph_node_frontier_promoted_to_proof_state(view)
+                or self.is_superseded_tombstone(view)
+                or any(metadata.get(key) for key in (
+                    "retired_by_repeated_repair_failure", "proposal_invalidated",
+                    "graph_statement_non_theorem", "rejection_reason",
+                    "route_missing_assembly_bridge_rescue_stale",
+                    "prop_admission_rejection_preserved",
+                ))
+            ):
+                continue
+            metadata.pop("schedulable", None)
+            metadata["formalization_repeated_unrelated_bridge_suppressed"] = False
+
     def to_record(self) -> Dict[str, Any]:
         self.prune_scratch_nodes()
         self.refresh_route_branch_frames()
@@ -23423,6 +24355,7 @@ class ProofGraph:
         if resolve_helper_matches:
             graph.resolve_existing_proved_helper_matches()
         graph._repair_uncertified_graph_native_proved_nodes()
+        graph._restore_legacy_formalization_limit()
         graph.refresh_route_branch_frames()
         graph.prune_scratch_nodes()
         graph._next_attempt_index = max(

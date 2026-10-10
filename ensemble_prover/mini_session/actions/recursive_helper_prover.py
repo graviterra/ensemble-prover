@@ -803,10 +803,10 @@ class RecursiveHelperProverAction:
     def __init__(
         self,
         *,
-        max_attempts_per_node: int = 2,
-        helper_turns: int = 5,
+        max_attempts_per_node: int = 0,
+        helper_turns: int = -1,
         refine_enabled: bool = False,
-        max_giveups_per_cluster_per_node: int = 2,
+        max_giveups_per_cluster_per_node: int = 0,
         max_elapsed_s: float = 0.0,
     ) -> None:
         self.max_attempts_per_node = int(max_attempts_per_node or 0)
@@ -817,6 +817,9 @@ class RecursiveHelperProverAction:
         )
         self.max_elapsed_s = max(0.0, float(max_elapsed_s or 0.0))
         self._nested_execution_frame: dict[str, Any] = {}
+        # In-process continuation only; when configured, the prepared child
+        # lane also owns durable recovery. No live capability enters snapshots.
+        self._suspended_child_session: Any = None
 
     def on_outcome_applied(self, session: Any, outcome: MiniOutcome) -> None:
         del session
@@ -828,6 +831,7 @@ class RecursiveHelperProverAction:
         outcome_metadata = getattr(outcome, "metadata", None) or {}
         if bool(
             outcome_metadata.get("parent_recheck_pending")
+            or outcome_metadata.get("child_service_yielded")
             or outcome_metadata.get("recursive_helper_cleanup_retry_pending")
             or outcome_metadata.get(
                 "recursive_helper_zero_provider_retry_pending"
@@ -835,6 +839,12 @@ class RecursiveHelperProverAction:
         ):
             return
         self._nested_execution_frame = {}
+        self._suspended_child_session = None
+
+    def should_yield_static_dispatch(self, session: Any) -> bool:
+        """Offer one parent competitor service before resuming the same child."""
+        del session
+        return bool(self._nested_execution_frame.pop("yield_to_parent", False))
 
     @staticmethod
     def _cleanup_retry_frame_identity(frame: Mapping[str, Any]) -> str:
@@ -1304,8 +1314,8 @@ class RecursiveHelperProverAction:
         # normal-protocol framing of the give-up nudge.
         depth = int(getattr(session, "recursion_depth", 0) or 0)
         # Read directly without ``or 3`` fallback to preserve 0 → uncapped.
-        raw_cap = getattr(session, "max_recursion_depth", 3)
-        cap = int(raw_cap if raw_cap is not None else 3)
+        raw_cap = getattr(session, "max_recursion_depth", 0)
+        cap = int(raw_cap if raw_cap is not None else 0)
         if cap <= 0:
             return True  # uncapped
         return depth < cap
@@ -1379,6 +1389,7 @@ class RecursiveHelperProverAction:
             _try_proof_state_child_falsification_preflight,
             retain_pending_helper_acceptance_retry,
             stage_pending_helper_acceptance,
+            helper_acceptance_settlement_current,
         )
 
         started = time.monotonic()
@@ -2224,6 +2235,7 @@ class RecursiveHelperProverAction:
                 max_elapsed_s=self.max_elapsed_s,
                 action_deadline_epoch_s=deadline_epoch_s,
                 checkpoint_child_lane=str(descriptor.get("child_lane") or ""),
+                continuation_owner=self,
                 advisory_refutation_candidates=(
                     advisory_refutation_candidates
                 ),
@@ -2235,6 +2247,37 @@ class RecursiveHelperProverAction:
             require_current_action_dispatch(session, dispatch_id)
 
         telemetry = dict(telemetry or {})
+        if telemetry.get("child_service_yielded"):
+            self._nested_execution_frame["yield_to_parent"] = True
+            self._nested_execution_frame["child_reason"] = "settled_service_yield"
+            self._nested_execution_frame["child_service_retention"] = str(
+                telemetry.get("child_service_retention") or "checkpoint"
+            )
+            self._nested_execution_frame["child_exposure_reported"] = list(
+                telemetry["child_exposure_total"]
+            )
+            seeded = set(telemetry.get("child_seeded_helpers") or ()) | set(
+                telemetry.get("child_seeded_proposed_helpers") or ()
+            )
+            helpers = tuple(
+                name for name in (telemetry.get("child_helpers_added") or ())
+                if name not in seeded and name in getattr(session.dossier, "verified_helpers", {})
+            )
+            return MiniOutcome(
+                action_id=self.id, solved=False, proof=None, helpers_added=helpers,
+                progress=bool(helpers), cost_seconds=time.monotonic() - started,
+                metadata={
+                    "verdict": "recursive_helper_service_yield",
+                    "node_id": getattr(node, "node_id", ""),
+                    "child_service_yielded": True, "child_telemetry": telemetry,
+                    "provider_calls_completed": _nonnegative_counter(telemetry.get("provider_calls_completed")),
+                    "provider_dispatches_started": _nonnegative_counter(telemetry.get("provider_dispatches_started")),
+                    "preserve_action_budget": True, "preserve_frontier_work": True,
+                    "preserve_selected_frontier_action": True, "iteration_neutral": True,
+                    "scheduler_neutral": True, "stagnation_neutral": True,
+                    "hard_pivot_neutral": True,
+                },
+            )
         if str(telemetry.get("verdict") or "") == "selected_proof_idea_context_invalidated":
             if attempt_snapshot:
                 node.recursive_attempts = int(attempt_snapshot["attempts"])
@@ -2526,6 +2569,7 @@ class RecursiveHelperProverAction:
                             timeout_s=parent_recheck_timeout_s,
                             proof_cache=session.proof_cache,
                             proof_state=getattr(session, "proof_state", None),
+                            target_node_id=node.node_id if node is not None else "",
                             target_statement=target_statement,
                             status_out=acceptance_status,
                             verified_helper_accept_callback=getattr(
@@ -2559,6 +2603,9 @@ class RecursiveHelperProverAction:
                             post_child_elapsed_budget_exhausted = True
                             parent_recheck_timeout_exception = True
 
+                accepted = helper_acceptance_settlement_current(
+                    session.proof_state, node, acceptance_status,
+                ) and accepted
                 if accepted:
                     node.pending_helper_acceptance = {}
                     landed_name = str(

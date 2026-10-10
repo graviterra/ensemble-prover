@@ -23,10 +23,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-_LOGGER = logging.getLogger(__name__)
-
 from ..config import LeanConfig, RetrievalConfig, RoleConfig  # noqa: F401  (parity with mini_prover imports)
 from ..lean_runner import LeanRunner
+from ..search_limits import add_count_limits
 from ..llm_error_policy import (
     ProviderAccountUnavailable,
     is_terminal_llm_failure_reason,
@@ -139,6 +138,9 @@ from .turn.tool_loop import (
     _client_hard_provider_operation_budget_s,
     _client_hard_turn_elapsed_budget_s,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 _RECURSIVE_PAID_NO_ARTIFACT_KINDS = frozenset(
@@ -423,7 +425,7 @@ def _recursive_conversation_lane_key(
             ),
         },
         "max_tool_calls_per_turn": max(0, int(max_tool_calls_per_turn or 0)),
-        "max_turns": max(1, int(max_turns or 1)),
+        "max_turns": int(max_turns),
         "temperature_override": temperature_override,
         "mini_phase_temperatures": mini_phase_temperatures,
         "recursive_max_elapsed_s": max(
@@ -513,7 +515,6 @@ def _recursive_proof_cache_served_frontier(
             frontier_config(
                 sorted(statements),
                 preamble=preamble,
-                max_hits=3,
             )
             or {}
         )
@@ -1263,13 +1264,13 @@ def _mini_recursive_config_from_params(
         planner_deliberation_enabled=(production_planner_deliberation_default()),
         **_mini_recursive_planner_deadline_kwargs(planner_client),
         planner_sanity_contract_required=True,
-        passes=int(mini_recursive_passes or 1),
-        max_claims=int(mini_recursive_max_claims or 1),
-        turns_per_claim=int(mini_recursive_turns_per_claim or 1),
+        passes=int(mini_recursive_passes),
+        max_claims=int(mini_recursive_max_claims),
+        turns_per_claim=int(mini_recursive_turns_per_claim),
         recursive_child_max_elapsed_s=_mini_recursive_child_elapsed_budget_s(
             planner_client,
             refiner_client,
-            turns_per_claim=int(mini_recursive_turns_per_claim or 1),
+            turns_per_claim=int(mini_recursive_turns_per_claim),
             tactic_timeout_s=float(mini_recursive_tactic_timeout_s or 0.0),
         ),
         tactic_timeout_s=float(mini_recursive_tactic_timeout_s or 0.0),
@@ -1462,6 +1463,9 @@ def _clone_dossier_for_session(supplied: ProofDossier) -> ProofDossier:
         ),
         current_lean_environment_hash=str(
             getattr(supplied, "current_lean_environment_hash", "") or ""
+        ),
+        lean_environment_plain_syntax=copy.deepcopy(
+            getattr(supplied, "lean_environment_plain_syntax", {}) or {}
         ),
         lean_environment_ancestor_hashes=copy.deepcopy(
             getattr(supplied, "lean_environment_ancestor_hashes", {}) or {}
@@ -1895,17 +1899,14 @@ def _mini_recursive_child_elapsed_budget_s(
     turns_per_claim: int,
     tactic_timeout_s: float,
 ) -> float:
-    """Derive one finite, fair whole-subtree lease from its admitted work.
+    """Derive a subtree lease only when a finite production cap is configured.
 
-    A recursive claim may consume at most ``turns_per_claim`` conversation
-    turns across its prover/refiner handoff. Each turn also receives one
-    bounded tactic allowance. Size every turn for the slowest admitted lane:
-    hard conversations need their settlement-aware outer envelope, while soft
-    lanes retain the finite planner-operation fallback used before this bound.
-    Cap the whole subtree independently of helper progress and turn limits so
-    descendants cannot monopolize the parent frontier for hours. The inherited
-    absolute deadline already survives child replans and checkpoint recovery.
+    Parent and operator deadlines are enforced independently. Renewable child
+    scheduling slices preserve fairness without discarding unfinished work.
     """
+
+    if PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S <= 0.0:
+        return 0.0
 
     provider_turn_s = 0.0
     for client in clients:
@@ -2059,7 +2060,7 @@ def build_session_for_prove_problem(
     proof_state_engine_enabled: bool = True,
     proof_state_child_tactics_enabled: bool = True,
     proof_state_child_tactic_timeout_s: float = DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-    proof_state_child_tactic_max_candidates: int = 32,
+    proof_state_child_tactic_max_candidates: int = -1,
     proof_state_child_goal_limit: int = 3,
     proof_state_decl_application_limit: int = 6,
     proof_state_batch_parallelism: int = 1,
@@ -2077,13 +2078,13 @@ def build_session_for_prove_problem(
     formal_state_search_provider_reasoning_effort: str = (
         DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT
     ),
-    formal_state_search_provider_max_attempts: int = 2,
+    formal_state_search_provider_max_attempts: int = 0,
     formal_state_search_provider_retry_backoff_s: float = 5.0,
     formal_state_search_beam_width: int = 4,
     formal_state_search_max_steps: int = 8,
-    formal_state_search_max_candidates: int = 6,
+    formal_state_search_max_candidates: int = 0,
     formal_state_search_backtrack_limit: int = 8,
-    formal_state_search_max_no_improvement_quanta: int = 6,
+    formal_state_search_max_no_improvement_quanta: int = 0,
     falsification_enabled: bool = True,
     falsification_max_checks: int = 32,
     falsification_operation_timeout_s: float = (
@@ -2094,14 +2095,14 @@ def build_session_for_prove_problem(
     proof_state_cache_path: Optional[Path] = None,
     root_tactic_prepass_enabled: bool = False,
     root_tactic_timeout_s: float = 40.0,
-    root_tactic_max_candidates: int = 64,
+    root_tactic_max_candidates: int = -1,
     mini_recursive_enabled: bool = False,
     adaptive_recursive_on_stall: bool = False,
-    mini_recursive_passes: int = 1,
+    mini_recursive_passes: int = -1,
     mini_recursive_max_claims: int = PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
-    mini_recursive_turns_per_claim: int = 3,
+    mini_recursive_turns_per_claim: int = -1,
     mini_recursive_tactic_timeout_s: float = 20.0,
-    mini_recursive_tactic_max_candidates: int = 48,
+    mini_recursive_tactic_max_candidates: int = -1,
     recursive_pass_budget_override: Optional[int] = None,
     adaptive_recursive_pass_budget_override: Optional[int] = None,
     llm_preamble_override: Optional[str] = None,
@@ -2120,10 +2121,10 @@ def build_session_for_prove_problem(
     session_scope: str = "problem",
     # recursive helper prover.
     recursive_helper_prover_enabled: bool = False,
-    recursive_helper_budget: int = 0,
-    recursive_helper_max_depth: int = 3,
-    recursive_helper_max_attempts_per_node: int = 2,
-    recursive_helper_turns: int = 5,
+    recursive_helper_budget: int = -1,
+    recursive_helper_max_depth: int = 0,
+    recursive_helper_max_attempts_per_node: int = 0,
+    recursive_helper_turns: int = -1,
     recursive_helper_refine: bool = False,
     # strict-progress accounting feature flag.
     # When True, ``outcome.metadata["strong_progress"]`` is required for a
@@ -2133,7 +2134,7 @@ def build_session_for_prove_problem(
     # contradiction-route helpers kept resetting stagnation.
     strict_progress_accounting: bool = False,
     soft_progress_streak_cap: int = 4,
-    max_helper_only_provider_quanta: int = 24,
+    max_helper_only_provider_quanta: int = 0,
     run_wall_clock_budget_s: float = 0.0,
     no_strong_progress_budget_s: float = 0.0,
     theory_library: Optional[Any] = None,
@@ -2301,10 +2302,10 @@ def build_session_for_prove_problem(
     # Recursive budget pools. Prepass and adaptive fallback are separate:
     # the fallback is a last-resort action and must not vanish simply because
     # an upfront recursive prepass spent its own allocation.
-    configured_recursive_budget = max(0, int(mini_recursive_passes or 0))
+    configured_recursive_budget = int(mini_recursive_passes)
     recursive_budget = (
         (
-            max(0, int(recursive_pass_budget_override))
+            int(recursive_pass_budget_override)
             if recursive_pass_budget_override is not None
             else configured_recursive_budget
         )
@@ -2313,7 +2314,7 @@ def build_session_for_prove_problem(
     )
     adaptive_recursive_budget = (
         (
-            max(0, int(adaptive_recursive_pass_budget_override))
+            int(adaptive_recursive_pass_budget_override)
             if adaptive_recursive_pass_budget_override is not None
             else configured_recursive_budget
         )
@@ -2323,24 +2324,18 @@ def build_session_for_prove_problem(
     recursive_helper_invocation_budget = (
         (
             int(recursive_helper_budget)
-            if int(recursive_helper_budget or 0) > 0
-            else max(1, int(max_prove_turns or 1) * 2)
+            if int(recursive_helper_budget or 0) != 0
+            else (-1 if max_prove_turns < 0 else max(1, int(max_prove_turns or 1) * 2))
         )
         if recursive_helper_prover_enabled
         else 0
     )
 
-    # Bound max_iterations by the configured action budgets plus headroom for
-    # inter-turn assembly.
-    max_iterations = (
-        2  # premise retrieval + root tactic prepass
-        + max(0, int(mini_recursive_passes or 0))
-        + adaptive_recursive_budget
-        + recursive_helper_invocation_budget
-        + max(0, int(max_prove_turns or 0))
-        + max(0, int(max_refine_turns or 0))
-        + (1 if adaptive_recursive_on_stall else 0)
-        + 5  # safety headroom
+    # The scheduler inherits an unlimited lane; finite callers retain their
+    # supplied allocations plus assembly headroom.
+    max_iterations = add_count_limits(
+        7, recursive_budget, adaptive_recursive_budget,
+        recursive_helper_invocation_budget, max_prove_turns, max_refine_turns,
     )
 
     # Build the prove-role Conversation up front. The session uses one conversation
@@ -2651,10 +2646,7 @@ def build_session_for_prove_problem(
     set_active_bundle_ids = getattr(searcher, "set_active_bundle_ids", None)
     if callable(set_active_bundle_ids):
         set_active_bundle_ids(session.theory_imported_bundle_ids)
-    total_llm_turn_budget = max(0, int(max_prove_turns or 0)) + max(
-        0,
-        int(max_refine_turns or 0),
-    )
+    total_llm_turn_budget = add_count_limits(max_prove_turns, max_refine_turns)
     session.configure_no_applicable_recovery(total_llm_turn_budget)
     effective_compute_examples_tool_enabled = _effective_compute_examples_tool_enabled(
         compute_examples_tool_enabled,
@@ -2728,7 +2720,7 @@ def build_session_for_prove_problem(
         session.set_budget(
             "domain_theory",
             ActionBudget(
-                max_invocations=max(1, min(4, int(max_prove_turns or 1))),
+                max_invocations=(-1 if max_prove_turns < 0 else max(1, min(4, int(max_prove_turns or 1)))),
                 max_total_seconds=0.0,
             ),
         )
@@ -2751,7 +2743,7 @@ def build_session_for_prove_problem(
             session.set_budget(
                 "domain_theory_build",
                 ActionBudget(
-                    max_invocations=max(2, min(8, int(max_prove_turns or 1) * 2)),
+                    max_invocations=(-1 if max_prove_turns < 0 else max(2, min(8, int(max_prove_turns or 1) * 2))),
                     max_total_seconds=0.0,
                 ),
             )
@@ -2759,26 +2751,26 @@ def build_session_for_prove_problem(
     session.register(
         CastNormalizationAction(
             timeout_s=max(1.0, min(12.0, float(root_tactic_timeout_s or 12.0))),
-            max_candidates=max(8, min(24, int(root_tactic_max_candidates or 16))),
+            max_candidates=int(root_tactic_max_candidates or 0),
         )
     )
     session.set_budget(
         "cast_normalization",
         ActionBudget(
-            max_invocations=max(1, int(max_prove_turns or 1)),
+            max_invocations=(-1 if max_prove_turns < 0 else max(1, int(max_prove_turns or 1))),
             max_total_seconds=0.0,
         ),
     )
     session.register(
         FinsetReindexingAction(
             timeout_s=max(1.0, min(12.0, float(root_tactic_timeout_s or 12.0))),
-            max_candidates=max(8, min(24, int(root_tactic_max_candidates or 18))),
+            max_candidates=int(root_tactic_max_candidates or 0),
         )
     )
     session.set_budget(
         "finset_reindexing",
         ActionBudget(
-            max_invocations=max(1, int(max_prove_turns or 1)),
+            max_invocations=(-1 if max_prove_turns < 0 else max(1, int(max_prove_turns or 1))),
             max_total_seconds=0.0,
         ),
     )
@@ -2796,14 +2788,14 @@ def build_session_for_prove_problem(
             or DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT
         ),
         provider_max_attempts=max(
-            1, int(formal_state_search_provider_max_attempts or 1)
+            0, int(formal_state_search_provider_max_attempts or 0)
         ),
         provider_retry_backoff_s=max(
             0.0, float(formal_state_search_provider_retry_backoff_s or 0.0)
         ),
         beam_width=max(1, int(formal_state_search_beam_width or 1)),
         max_steps=max(1, int(formal_state_search_max_steps or 1)),
-        max_candidates_per_state=max(1, int(formal_state_search_max_candidates or 1)),
+        max_candidates_per_state=max(0, int(formal_state_search_max_candidates or 0)),
         backtrack_limit=max(0, int(formal_state_search_backtrack_limit or 0)),
         max_no_improvement_quanta=max(
             0, int(formal_state_search_max_no_improvement_quanta or 0)
@@ -2823,11 +2815,11 @@ def build_session_for_prove_problem(
         session.set_budget(
             "tactic_close",
             ActionBudget(
-                max_invocations=max(
+                max_invocations=(-1 if max_prove_turns < 0 or max_refine_turns < 0 else max(
                     2,
                     int(max_prove_turns or 0) + int(max_refine_turns or 0),
-                ),
-                max_total_seconds=60.0,
+                )),
+                max_total_seconds=0.0,
             ),
         )
     if proof_state_engine_enabled and formal_search_config.normalized().enabled:
@@ -2868,7 +2860,7 @@ def build_session_for_prove_problem(
             or DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT
         ),
         "formal_state_search_provider_max_attempts": max(
-            1, int(formal_state_search_provider_max_attempts or 1)
+            0, int(formal_state_search_provider_max_attempts or 0)
         ),
         "formal_state_search_provider_retry_backoff_s": max(
             0.0, float(formal_state_search_provider_retry_backoff_s or 0.0)
@@ -2876,7 +2868,7 @@ def build_session_for_prove_problem(
         "formal_state_search_beam_width": int(formal_state_search_beam_width or 1),
         "formal_state_search_max_steps": int(formal_state_search_max_steps or 1),
         "formal_state_search_max_candidates": int(
-            formal_state_search_max_candidates or 1
+            formal_state_search_max_candidates or 0
         ),
         "formal_state_search_backtrack_limit": int(
             formal_state_search_backtrack_limit or 0
@@ -2887,9 +2879,9 @@ def build_session_for_prove_problem(
     }
     graph_recursive_cfg = (
         _mini_recursive_config_from_params(
-            mini_recursive_passes=int(mini_recursive_passes or 1),
-            mini_recursive_max_claims=int(mini_recursive_max_claims or 1),
-            mini_recursive_turns_per_claim=int(mini_recursive_turns_per_claim or 1),
+            mini_recursive_passes=int(mini_recursive_passes),
+            mini_recursive_max_claims=int(mini_recursive_max_claims),
+            mini_recursive_turns_per_claim=int(mini_recursive_turns_per_claim),
             mini_recursive_tactic_timeout_s=float(
                 mini_recursive_tactic_timeout_s or 0.0
             ),
@@ -2905,16 +2897,16 @@ def build_session_for_prove_problem(
             planner_client=prover_client,
             refiner_client=refiner_client,
         )
-        if configured_recursive_budget > 0
+        if configured_recursive_budget != 0
         else None
     )
     recursive_cfg = (
         graph_recursive_cfg
-        if mini_recursive_enabled and recursive_prepass_budget > 0
+        if mini_recursive_enabled and recursive_prepass_budget != 0
         else None
     )
 
-    if recursive_cfg is not None and recursive_prepass_budget > 0:
+    if recursive_cfg is not None and recursive_prepass_budget != 0:
         session.register(
             RecursiveControllerAction(
                 phase_label="[mini-recursive prepass]",
@@ -2972,6 +2964,7 @@ def build_session_for_prove_problem(
         session.register(
             GraphRecursiveDecomposeAction(
                 config=graph_recursive_cfg,
+                max_invocations=configured_recursive_budget,
                 run_conversation_fn=_bind_theory_parent_callback(
                     session, **formal_callback_kwargs
                 ),
@@ -3004,7 +2997,7 @@ def build_session_for_prove_problem(
         session.set_budget(
             "graph_recursive_decompose",
             ActionBudget(
-                max_invocations=GraphRecursiveDecomposeAction.DEFAULT_MAX_INVOCATIONS,
+                max_invocations=configured_recursive_budget,
                 # This action runs bounded mini-recursive sub-passes. Its own
                 # invocation/depth/internal-turn caps are the contract; a
                 # session-level wall-clock cap exhausted the structural path
@@ -3028,7 +3021,7 @@ def build_session_for_prove_problem(
     if not proof_state_child_tactics_enabled and (
         recursive_cfg is not None
         or graph_recursive_cfg is not None
-        or (adaptive_recursive_on_stall and adaptive_recursive_budget > 0)
+        or (adaptive_recursive_on_stall and adaptive_recursive_budget != 0)
     ):
         session.register(
             GraphRouteAssemblyAction(
@@ -3040,24 +3033,21 @@ def build_session_for_prove_problem(
         session.set_budget(
             "graph_route_assembly",
             ActionBudget(
-                max_invocations=10,
-                max_total_seconds=_route_assembly_budget_seconds(
-                    timeout_s=float(root_tactic_timeout_s or 0.0),
-                    max_invocations=10,
-                ),
+                max_invocations=-1,
+                max_total_seconds=0.0,
             ),
         )
         session.register(GraphNativeShortcutAction())
         session.set_budget(
             "graph_native_shortcut",
-            ActionBudget(max_invocations=20, max_total_seconds=30.0),
+            ActionBudget(max_invocations=-1, max_total_seconds=0.0),
         )
 
-    if adaptive_recursive_on_stall and adaptive_recursive_budget > 0:
+    if adaptive_recursive_on_stall and adaptive_recursive_budget != 0:
         fallback_cfg = _mini_recursive_config_from_params(
-            mini_recursive_passes=int(mini_recursive_passes or 1),
-            mini_recursive_max_claims=int(mini_recursive_max_claims or 1),
-            mini_recursive_turns_per_claim=int(mini_recursive_turns_per_claim or 1),
+            mini_recursive_passes=int(mini_recursive_passes),
+            mini_recursive_max_claims=int(mini_recursive_max_claims),
+            mini_recursive_turns_per_claim=int(mini_recursive_turns_per_claim),
             mini_recursive_tactic_timeout_s=float(
                 mini_recursive_tactic_timeout_s or 0.0
             ),
@@ -3142,7 +3132,7 @@ def build_session_for_prove_problem(
         )
         session.set_budget(
             "inter_turn_assembly",
-            ActionBudget(max_invocations=10, max_total_seconds=90.0),
+            ActionBudget(max_invocations=-1, max_total_seconds=0.0),
         )
         session.register(
             GraphRouteAssemblyAction(
@@ -3154,17 +3144,14 @@ def build_session_for_prove_problem(
         session.set_budget(
             "graph_route_assembly",
             ActionBudget(
-                max_invocations=10,
-                max_total_seconds=_route_assembly_budget_seconds(
-                    timeout_s=float(root_tactic_timeout_s or 0.0),
-                    max_invocations=10,
-                ),
+                max_invocations=-1,
+                max_total_seconds=0.0,
             ),
         )
         session.register(GraphNativeShortcutAction())
         session.set_budget(
             "graph_native_shortcut",
-            ActionBudget(max_invocations=20, max_total_seconds=30.0),
+            ActionBudget(max_invocations=-1, max_total_seconds=0.0),
         )
         session.register(
             HelperOnlySalvageAction(
@@ -3176,17 +3163,17 @@ def build_session_for_prove_problem(
         session.set_budget(
             "helper_only_salvage",
             ActionBudget(
-                max_invocations=max(1, int(max_prove_turns or 1)),
-                max_total_seconds=120.0,
+                max_invocations=(-1 if max_prove_turns < 0 else max(1, int(max_prove_turns or 1))),
+                max_total_seconds=0.0,
             ),
         )
         session.set_budget(
             "post_lean_failure",
             ActionBudget(
-                max_invocations=max(
+                max_invocations=(-1 if max_prove_turns < 0 or max_refine_turns < 0 else max(
                     1, int(max_prove_turns or 1) + int(max_refine_turns or 0)
-                ),
-                max_total_seconds=300.0,
+                )),
+                max_total_seconds=0.0,
             ),
         )
         # Frontier-mappable workhorses also registered for the outer
@@ -3212,8 +3199,8 @@ def build_session_for_prove_problem(
             session.set_budget(
                 "proof_state_retrieval",
                 ActionBudget(
-                    max_invocations=max(1, int(max_prove_turns or 1)),
-                    max_total_seconds=60.0,
+                    max_invocations=(-1 if max_prove_turns < 0 else max(1, int(max_prove_turns or 1))),
+                    max_total_seconds=0.0,
                 ),
             )
         child_closure_action = ChildClosureAction(
@@ -3228,10 +3215,10 @@ def build_session_for_prove_problem(
         session.set_budget(
             "child_closure",
             ActionBudget(
-                max_invocations=max(
+                max_invocations=(-1 if max_prove_turns < 0 else max(
                     child_closure_action.minimum_invocation_budget(),
                     int(max_prove_turns or 1),
-                ),
+                )),
                 # Invocation/iteration bounds govern this lane. A cumulative
                 # wall-clock cap can strand a paid parent stub when its typed
                 # residual replay legitimately needs the verifier's 300s
@@ -3242,7 +3229,7 @@ def build_session_for_prove_problem(
         session.register(
             LemmaDagDecomposeAction(
                 timeout_s=float(proof_state_child_tactic_timeout_s or 0.0),
-                max_parent_stub_goals=int(proof_state_child_goal_limit or 0),
+                max_parent_stub_goals=-1,
                 root_tactic_max_candidates=int(
                     proof_state_child_tactic_max_candidates or 0
                 ),
@@ -3251,7 +3238,7 @@ def build_session_for_prove_problem(
         session.set_budget(
             "lemma_dag_decompose",
             ActionBudget(
-                max_invocations=max(1, int(max_prove_turns or 1)),
+                max_invocations=(-1 if max_prove_turns < 0 else max(1, int(max_prove_turns or 1))),
                 # Parent-stub decomposition can hand off to the 300-second typed
                 # residual verifier. Bound this lane by invocation count while letting
                 # verifier operations retain their own recoverable deadlines.
@@ -3291,7 +3278,7 @@ def build_session_for_prove_problem(
         raw_max_depth = recursive_helper_max_depth
         session.max_recursion_depth = max(
             0,
-            int(raw_max_depth if raw_max_depth is not None else 3),
+            int(raw_max_depth if raw_max_depth is not None else 0),
         )
 
     # Conversation prove — the workhorse.
@@ -3329,7 +3316,7 @@ def build_session_for_prove_problem(
                 proof_state_decl_application_limit or 0
             ),
             proof_state_batch_parallelism=int(proof_state_batch_parallelism or 1),
-            max_turns_for_budget=max(1, int(max_prove_turns or 1)),
+            max_turns_for_budget=int(max_prove_turns),
             llm_turn_elapsed_s=_client_llm_turn_elapsed_budget_s(prover_client),
             formalization_llm_turn_elapsed_s=_client_llm_turn_elapsed_budget_s(
                 prover_client
@@ -3339,7 +3326,7 @@ def build_session_for_prove_problem(
     session.set_budget(
         "conversation_turn_prove",
         ActionBudget(
-            max_invocations=max(0, int(max_prove_turns or 0)),
+            max_invocations=(-1 if max_prove_turns < 0 else max(0, int(max_prove_turns or 0))),
             # Conversation turn budgets are count-based CLI contracts.
             # A slow model call should consume one turn, not silently burn
             # several turns' worth of aggregate wall-clock budget. Per-call
@@ -3348,7 +3335,7 @@ def build_session_for_prove_problem(
         ),
     )
 
-    if refiner_client is not None and int(max_refine_turns or 0) > 0:
+    if refiner_client is not None and int(max_refine_turns or 0) != 0:
         session.register(
             ConversationTurnAction(
                 role="refine",
@@ -3378,7 +3365,7 @@ def build_session_for_prove_problem(
                     proof_state_decl_application_limit or 0
                 ),
                 proof_state_batch_parallelism=int(proof_state_batch_parallelism or 1),
-                max_turns_for_budget=max(1, int(max_refine_turns or 1)),
+                max_turns_for_budget=int(max_refine_turns),
                 llm_turn_elapsed_s=_client_llm_turn_elapsed_budget_s(refiner_client),
                 formalization_llm_turn_elapsed_s=_client_llm_turn_elapsed_budget_s(
                     refiner_client
@@ -3390,7 +3377,7 @@ def build_session_for_prove_problem(
         session.set_budget(
             "conversation_turn_refine",
             ActionBudget(
-                max_invocations=int(max_refine_turns or 0),
+                max_invocations=(-1 if max_refine_turns < 0 else int(max_refine_turns or 0)),
                 # Same count-based contract as prove turns; see above.
                 max_total_seconds=0.0,
             ),
@@ -3674,15 +3661,12 @@ async def prove_problem_via_session(
             "stage_process_cpu_s": round(cache_cpu_elapsed, 6),
         })
     recursive_pass_budget_remaining = (
-        max(
-            0,
-            int(kwargs.get("mini_recursive_passes", 1) or 0),
-        )
+        int(kwargs.get("mini_recursive_passes", -1) or 0)
         if bool(kwargs.get("mini_recursive_enabled", False))
         else 0
     )
     adaptive_recursive_pass_budget_remaining = (
-        max(0, int(kwargs.get("mini_recursive_passes", 1) or 0))
+        int(kwargs.get("mini_recursive_passes", -1) or 0)
         if bool(kwargs.get("adaptive_recursive_on_stall", False))
         else 0
     )
@@ -4231,7 +4215,7 @@ async def prove_problem_via_session(
                 if adaptive_fallback
                 else recursive_pass_budget_remaining
             )
-            if remaining <= 0:
+            if remaining == 0:
                 _trace(
                     trace_prefix,
                     f"=== mini recursive skipped {phase_label}: "
@@ -4255,11 +4239,13 @@ async def prove_problem_via_session(
                     )
                 return False, None
 
-            passes_for_run = min(
-                max(1, int(kwargs.get("mini_recursive_passes", 1) or 1)),
-                remaining,
+            passes_for_run = (
+                -1 if remaining < 0 else min(
+                    max(1, int(kwargs.get("mini_recursive_passes", 1) or 1)),
+                    remaining,
+                )
             )
-            remaining = max(0, remaining - passes_for_run)
+            remaining = -1 if remaining < 0 else max(0, remaining - passes_for_run)
             if adaptive_fallback:
                 adaptive_recursive_pass_budget_remaining = remaining
             else:
@@ -4442,6 +4428,9 @@ async def prove_problem_via_session(
                         "dossier_current_lean_environment_hash": str(
                             attempt_dossier.current_lean_environment_hash or ""
                         ),
+                        "dossier_lean_environment_plain_syntax": copy.deepcopy(
+                            attempt_dossier.lean_environment_plain_syntax
+                        ),
                         "dossier_lean_environment_ancestor_hashes": copy.deepcopy(
                             attempt_dossier.lean_environment_ancestor_hashes
                         ),
@@ -4476,6 +4465,9 @@ async def prove_problem_via_session(
                     )
                     attempt_dossier.current_lean_environment_hash = str(
                         state.get("dossier_current_lean_environment_hash") or ""
+                    )
+                    attempt_dossier.lean_environment_plain_syntax = copy.deepcopy(
+                        state.get("dossier_lean_environment_plain_syntax") or {}
                     )
                     attempt_dossier.lean_environment_ancestor_hashes = copy.deepcopy(
                         state.get("dossier_lean_environment_ancestor_hashes") or {}
@@ -4530,7 +4522,7 @@ async def prove_problem_via_session(
                 )
                 conv_kwargs.setdefault(
                     "proof_state_child_tactic_max_candidates",
-                    kwargs.get("proof_state_child_tactic_max_candidates", 32),
+                    kwargs.get("proof_state_child_tactic_max_candidates", -1),
                 )
                 conv_kwargs.setdefault(
                     "proof_state_child_goal_limit",
@@ -4562,13 +4554,13 @@ async def prove_problem_via_session(
                         "formal_state_search_provider_reasoning_effort",
                         DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT,
                     ),
-                    ("formal_state_search_provider_max_attempts", 2),
+                    ("formal_state_search_provider_max_attempts", 0),
                     ("formal_state_search_provider_retry_backoff_s", 5.0),
                     ("formal_state_search_beam_width", 4),
                     ("formal_state_search_max_steps", 8),
-                    ("formal_state_search_max_candidates", 6),
+                    ("formal_state_search_max_candidates", 0),
                     ("formal_state_search_backtrack_limit", 8),
-                    ("formal_state_search_max_no_improvement_quanta", 6),
+                    ("formal_state_search_max_no_improvement_quanta", 0),
                 ):
                     conv_kwargs.setdefault(
                         formal_key,
@@ -4640,13 +4632,13 @@ async def prove_problem_via_session(
                     or 0.0
                 ),
                 proof_state_child_tactic_max_candidates=int(
-                    kwargs.get("proof_state_child_tactic_max_candidates", 32) or 0
+                    kwargs.get("proof_state_child_tactic_max_candidates", -1) or 0
                 ),
                 root_tactic_timeout_s=float(
                     kwargs.get("root_tactic_timeout_s", 40.0) or 0.0
                 ),
                 root_tactic_max_candidates=int(
-                    kwargs.get("root_tactic_max_candidates", 64) or 0
+                    kwargs.get("root_tactic_max_candidates", -1) or 0
                 ),
                 proof_state_child_goal_limit=int(
                     kwargs.get("proof_state_child_goal_limit", 3) or 0
@@ -4689,33 +4681,24 @@ async def prove_problem_via_session(
                     **_mini_recursive_planner_deadline_kwargs(prover_client),
                     planner_sanity_contract_required=True,
                     passes=passes_for_run,
-                    max_claims=max(
-                        1,
-                        int(
+                    max_claims=int(
                             kwargs.get(
                                 "mini_recursive_max_claims",
                                 PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS,
                             )
                             or 1
                         ),
-                    ),
-                    turns_per_claim=max(
-                        1,
-                        int(kwargs.get("mini_recursive_turns_per_claim", 3) or 1),
-                    ),
+                    turns_per_claim=int(kwargs.get("mini_recursive_turns_per_claim", -1)),
                     recursive_child_max_elapsed_s=(
                         _mini_recursive_child_elapsed_budget_s(
                             prover_client,
                             kwargs.get("refiner_client"),
-                            turns_per_claim=max(
-                                1,
-                                int(
+                            turns_per_claim=int(
                                     kwargs.get(
-                                        "mini_recursive_turns_per_claim", 3
+                                        "mini_recursive_turns_per_claim", -1
                                     )
                                     or 1
                                 ),
-                            ),
                             tactic_timeout_s=max(
                                 1.0,
                                 float(
@@ -4733,12 +4716,9 @@ async def prove_problem_via_session(
                             kwargs.get("mini_recursive_tactic_timeout_s", 20.0) or 1.0
                         ),
                     ),
-                    tactic_max_candidates=max(
-                        1,
-                        int(
-                            kwargs.get("mini_recursive_tactic_max_candidates", 48) or 1
+                    tactic_max_candidates=int(
+                            kwargs.get("mini_recursive_tactic_max_candidates", -1) or 0
                         ),
-                    ),
                     progress_continuation_passes=1,
                     mini_phase_temperatures=kwargs.get("mini_phase_temperatures"),
                     sample_temperature=kwargs.get("sample_temperature"),
@@ -4796,7 +4776,7 @@ async def prove_problem_via_session(
                 recorder=recorder,
                 trace_prefix=trace_prefix,
                 timeout_s=float(kwargs.get("root_tactic_timeout_s", 40.0) or 0.0),
-                max_candidates=int(kwargs.get("root_tactic_max_candidates", 64) or 0),
+                max_candidates=int(kwargs.get("root_tactic_max_candidates", -1) or 0),
             )
             if not result[0]:
                 await _commit_outer_phase(phase_key, True)
@@ -5107,12 +5087,12 @@ async def prove_problem_via_session(
             sample_recursive_prepass_enabled = (
                 sample_count == 1
                 and bool(kwargs.get("mini_recursive_enabled", False))
-                and recursive_pass_budget_remaining > 0
+                and recursive_pass_budget_remaining != 0
             )
             sample_adaptive_recursive_enabled = (
                 bool(kwargs.get("adaptive_recursive_on_stall", False))
                 and sample_count == 1
-                and adaptive_recursive_pass_budget_remaining > 0
+                and adaptive_recursive_pass_budget_remaining != 0
             )
             sample_label = (
                 f"[s{sample_index + 1}/{sample_count}"
@@ -5327,23 +5307,17 @@ async def prove_problem_via_session(
                         pass
             sample_recursive_remaining: Optional[int] = None
             if sample_recursive_prepass_enabled:
-                sample_recursive_remaining = max(
-                    0,
-                    int(getattr(session, "recursive_pass_budget_remaining", 0) or 0),
-                )
+                sample_recursive_remaining = int(getattr(session, "recursive_pass_budget_remaining", 0) or 0)
             sample_adaptive_recursive_remaining: Optional[int] = None
             if bool(session_kwargs.get("adaptive_recursive_on_stall", False)):
-                sample_adaptive_recursive_remaining = max(
-                    0,
-                    int(
+                sample_adaptive_recursive_remaining = int(
                         getattr(
                             session,
                             "adaptive_recursive_pass_budget_remaining",
                             0,
                         )
                         or 0
-                    ),
-                )
+                    )
             failure_reason = str(getattr(session, "last_failure_reason", "") or "")
             if is_terminal_llm_failure_reason(failure_reason):
                 _remember_terminal_llm_failure(
@@ -6314,11 +6288,11 @@ async def prove_problem_via_session(
                 return True, proof
         post_fanin_primary_recursive_enabled = bool(
             bool(kwargs.get("mini_recursive_enabled", False))
-            and recursive_pass_budget_remaining > 0
+            and recursive_pass_budget_remaining != 0
         )
         post_fanin_adaptive_recursive_enabled = bool(
             bool(kwargs.get("adaptive_recursive_on_stall", False))
-            and adaptive_recursive_pass_budget_remaining > 0
+            and adaptive_recursive_pass_budget_remaining != 0
         )
         post_fanin_recursive_enabled = bool(
             post_fanin_primary_recursive_enabled
@@ -6392,18 +6366,18 @@ def _register_child_session_tactic_actions(
         or 0.0
     )
     max_nodes = int(kwargs.get("proof_state_child_goal_limit", 3) or 0)
-    max_candidates = int(kwargs.get("proof_state_child_tactic_max_candidates", 32) or 0)
+    max_candidates = int(kwargs.get("proof_state_child_tactic_max_candidates", -1) or 0)
     max_decl_applications = int(
         kwargs.get("proof_state_decl_application_limit", 6) or 0
     )
     batch_parallelism = int(kwargs.get("proof_state_batch_parallelism", 1) or 1)
     repair_top_k = int(kwargs.get("repair_retrieval_top_k", 6) or 0)
-    budget_turns = max(1, int(max_turns or 1))
+    budget_turns = int(max_turns)
 
     session.register(
         CastNormalizationAction(
             timeout_s=max(1.0, min(12.0, timeout_s or 12.0)),
-            max_candidates=max(8, min(24, max_candidates or 16)),
+            max_candidates=max_candidates,
         )
     )
     session.set_budget(
@@ -6413,7 +6387,7 @@ def _register_child_session_tactic_actions(
     session.register(
         FinsetReindexingAction(
             timeout_s=max(1.0, min(12.0, timeout_s or 12.0)),
-            max_candidates=max(8, min(24, max_candidates or 18)),
+            max_candidates=max_candidates,
         )
     )
     session.set_budget(
@@ -6444,14 +6418,14 @@ def _register_child_session_tactic_actions(
         session.set_budget(
             "tactic_close",
             ActionBudget(
-                max_invocations=max(2, budget_turns * 2),
-                max_total_seconds=60.0,
+                max_invocations=(-1 if budget_turns < 0 else max(2, budget_turns * 2)),
+                max_total_seconds=0.0,
             ),
         )
     session.register(InterTurnAssemblyAction(timeout_s=timeout_s, max_nodes=max_nodes))
     session.set_budget(
         "inter_turn_assembly",
-        ActionBudget(max_invocations=max(2, budget_turns * 2), max_total_seconds=90.0),
+        ActionBudget(max_invocations=(-1 if budget_turns < 0 else max(2, budget_turns * 2)), max_total_seconds=0.0),
     )
     session.register(
         GraphRouteAssemblyAction(
@@ -6467,17 +6441,14 @@ def _register_child_session_tactic_actions(
     session.set_budget(
         "graph_route_assembly",
         ActionBudget(
-            max_invocations=max(2, budget_turns * 2),
-            max_total_seconds=_route_assembly_budget_seconds(
-                timeout_s=float(kwargs.get("root_tactic_timeout_s", timeout_s) or 0.0),
-                max_invocations=max(2, budget_turns * 2),
-            ),
+            max_invocations=(-1 if budget_turns < 0 else max(2, budget_turns * 2)),
+            max_total_seconds=0.0,
         ),
     )
     session.register(GraphNativeShortcutAction())
     session.set_budget(
         "graph_native_shortcut",
-        ActionBudget(max_invocations=max(2, budget_turns * 2), max_total_seconds=30.0),
+        ActionBudget(max_invocations=(-1 if budget_turns < 0 else max(2, budget_turns * 2)), max_total_seconds=0.0),
     )
     session.register(
         HelperOnlySalvageAction(
@@ -6488,13 +6459,13 @@ def _register_child_session_tactic_actions(
     )
     session.set_budget(
         "helper_only_salvage",
-        ActionBudget(max_invocations=budget_turns, max_total_seconds=120.0),
+        ActionBudget(max_invocations=budget_turns, max_total_seconds=0.0),
     )
     # Post-failure cascade is owned by ConversationTurnAction. Child sessions
     # keep the budget bucket because the inline cascade charges it directly.
     session.set_budget(
         "post_lean_failure",
-        ActionBudget(max_invocations=budget_turns, max_total_seconds=300.0),
+        ActionBudget(max_invocations=budget_turns, max_total_seconds=0.0),
     )
     if (
         bool(kwargs.get("proof_state_retrieval_enabled", False))
@@ -6509,7 +6480,7 @@ def _register_child_session_tactic_actions(
         )
         session.set_budget(
             "proof_state_retrieval",
-            ActionBudget(max_invocations=budget_turns, max_total_seconds=60.0),
+            ActionBudget(max_invocations=budget_turns, max_total_seconds=0.0),
         )
     from ensemble_prover.mini_formal_state_search import FormalStateSearchConfig
 
@@ -6554,8 +6525,8 @@ def _register_child_session_tactic_actions(
             or DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT
         ),
         provider_max_attempts=max(
-            1,
-            int(kwargs.get("formal_state_search_provider_max_attempts", 2) or 1),
+            0,
+            int(kwargs.get("formal_state_search_provider_max_attempts", 0) or 0),
         ),
         provider_retry_backoff_s=max(
             0.0,
@@ -6566,14 +6537,14 @@ def _register_child_session_tactic_actions(
         beam_width=max(1, int(kwargs.get("formal_state_search_beam_width", 4) or 1)),
         max_steps=max(1, int(kwargs.get("formal_state_search_max_steps", 8) or 1)),
         max_candidates_per_state=max(
-            1, int(kwargs.get("formal_state_search_max_candidates", 6) or 1)
+            0, int(kwargs.get("formal_state_search_max_candidates", 0) or 0)
         ),
         backtrack_limit=max(
             0, int(kwargs.get("formal_state_search_backtrack_limit", 8) or 0)
         ),
         max_no_improvement_quanta=max(
             0,
-            int(kwargs.get("formal_state_search_max_no_improvement_quanta", 6) or 0),
+            int(kwargs.get("formal_state_search_max_no_improvement_quanta", 0) or 0),
         ),
     )
 
@@ -6589,10 +6560,10 @@ def _register_child_session_tactic_actions(
     session.set_budget(
         "child_closure",
         ActionBudget(
-            max_invocations=max(
+            max_invocations=(-1 if budget_turns < 0 else max(
                 child_closure_action.minimum_invocation_budget(),
                 budget_turns,
-            ),
+            )),
             max_total_seconds=0.0,
         ),
     )
@@ -6642,15 +6613,9 @@ def _register_child_graph_recursive_decompose_action(
     remaining_depth = (
         max(1, max_recursion_depth - current_depth)
         if max_recursion_depth > 0
-        else GraphRecursiveDecomposeAction.DEFAULT_MAX_INVOCATIONS
+        else 0
     )
-    max_invocations = max(
-        1,
-        min(
-            GraphRecursiveDecomposeAction.DEFAULT_MAX_INVOCATIONS,
-            max(1, int(max_turns or 1)),
-        ),
-    )
+    max_invocations = int(max_turns)
     session.register(
         GraphRecursiveDecomposeAction(
             config=cfg,
@@ -6698,9 +6663,9 @@ def _register_child_graph_recursive_decompose_action(
                     or DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT
                 ),
                 formal_state_search_provider_max_attempts=max(
-                    1,
+                    0,
                     int(
-                        kwargs.get("formal_state_search_provider_max_attempts", 2) or 1
+                        kwargs.get("formal_state_search_provider_max_attempts", 0) or 0
                     ),
                 ),
                 formal_state_search_provider_retry_backoff_s=max(
@@ -6720,7 +6685,7 @@ def _register_child_graph_recursive_decompose_action(
                     kwargs.get("formal_state_search_max_steps", 8) or 1
                 ),
                 formal_state_search_max_candidates=int(
-                    kwargs.get("formal_state_search_max_candidates", 6) or 1
+                    kwargs.get("formal_state_search_max_candidates", 0) or 0
                 ),
                 formal_state_search_backtrack_limit=int(
                     kwargs.get("formal_state_search_backtrack_limit", 8) or 0
@@ -6728,7 +6693,7 @@ def _register_child_graph_recursive_decompose_action(
                 formal_state_search_max_no_improvement_quanta=max(
                     0,
                     int(
-                        kwargs.get("formal_state_search_max_no_improvement_quanta", 6)
+                        kwargs.get("formal_state_search_max_no_improvement_quanta", 0)
                         or 0
                     ),
                 ),
@@ -6754,13 +6719,13 @@ def _register_child_graph_recursive_decompose_action(
                 or 0.0
             ),
             proof_state_child_tactic_max_candidates=int(
-                kwargs.get("proof_state_child_tactic_max_candidates", 32) or 0
+                kwargs.get("proof_state_child_tactic_max_candidates", -1) or 0
             ),
             root_tactic_timeout_s=float(
                 kwargs.get("root_tactic_timeout_s", 40.0) or 0.0
             ),
             root_tactic_max_candidates=int(
-                kwargs.get("root_tactic_max_candidates", 64) or 0
+                kwargs.get("root_tactic_max_candidates", -1) or 0
             ),
             proof_state_child_goal_limit=int(
                 kwargs.get("proof_state_child_goal_limit", 3) or 0
@@ -6881,6 +6846,14 @@ class _DeferredTheoryPromotion:
                 "dossier_current_lean_environment_hash": str(
                     getattr(dossier, "current_lean_environment_hash", "") or ""
                 ),
+                "dossier_lean_environment_plain_syntax": copy.deepcopy(
+                    getattr(
+                        dossier,
+                        "lean_environment_plain_syntax",
+                        {},
+                    )
+                    or {}
+                ),
                 "dossier_lean_environment_ancestor_hashes": copy.deepcopy(
                     getattr(
                         dossier,
@@ -6922,6 +6895,9 @@ class _DeferredTheoryPromotion:
         if dossier is not None:
             dossier.current_lean_environment_hash = str(
                 state.get("dossier_current_lean_environment_hash") or ""
+            )
+            dossier.lean_environment_plain_syntax = copy.deepcopy(
+                state.get("dossier_lean_environment_plain_syntax") or {}
             )
             dossier.lean_environment_ancestor_hashes = copy.deepcopy(
                 state.get("dossier_lean_environment_ancestor_hashes") or {}
@@ -7097,8 +7073,6 @@ def _inherit_child_memory_source_obligations(session: Any, *, parent: Any = None
         state["retired_support_incomplete"] = True
     try:
         unknown = _retired_support_unknown_names(state) | _retired_support_unknown_names(inherited)
-        if len(unknown) > 4096:
-            raise ValueError("retired support name limit exceeded")
         state["retired_support_unknown_names"] = sorted(unknown)
         state["retired_support_identities"] = _merge_retired_support_identities(
             state.get("retired_support_identities", {}),
@@ -7113,16 +7087,13 @@ def _inherit_child_memory_source_obligations(session: Any, *, parent: Any = None
         for values in (state.get(key, ()), inherited.get(key, ())):
             if (
                 not isinstance(values, (list, tuple))
-                or len(values) > 4096
-                or any(not isinstance(value, str) for value in values)
+                or any(not isinstance(value, str) or not value for value in values)
             ):
                 state["retired_support_incomplete"] = True
                 continue
             combined.update(values)
-        if len(combined) > 4096:
-            state["retired_support_incomplete"] = True
         if combined:
-            state[key] = sorted(combined)[:4096]
+            state[key] = sorted(combined)
 
 
 def _install_child_mathematical_memory(session: Any, config: Any, allocation: Any,
@@ -7177,6 +7148,15 @@ async def _mini_session_run_conversation_callback(
         return False, None
     theory_parent_session = kwargs.get("theory_parent_session")
     checkpoint_parent_action = kwargs.get("checkpoint_parent_action")
+    child_execution_state = kwargs.get("child_execution_state")
+    child_continuation = dict(kwargs.get("child_continuation") or {})
+    service_enabled = bool(isinstance(child_execution_state, dict)
+                           and int(kwargs.get("max_turns", -1)) < 0)
+    service_retention_enabled = bool(
+        service_enabled and checkpoint_parent_action is not None and theory_parent_session is not None
+    )
+    if isinstance(child_execution_state, dict):
+        child_execution_state.clear()
     checkpoint_child_enabled = bool(
         checkpoint_parent_action is not None
         and getattr(theory_parent_session, "checkpoint_registry", None) is not None
@@ -7195,7 +7175,7 @@ async def _mini_session_run_conversation_callback(
         ),
     )
 
-    max_turns = max(1, int(kwargs.get("max_turns", 1) or 1))
+    max_turns = int(kwargs.get("max_turns", -1))
     recursive_max_elapsed_s = max(
         0.0,
         float(kwargs.get("recursive_conversation_max_elapsed_s", 0.0) or 0.0),
@@ -7231,10 +7211,10 @@ async def _mini_session_run_conversation_callback(
         str(getattr(dossier, "theorem_name", "") or "").strip()
         or f"mini_recursive_{role}"
     )
-    raw_max_recursion_depth = kwargs.get("recursive_helper_max_depth", 3)
+    raw_max_recursion_depth = kwargs.get("recursive_helper_max_depth", 0)
     max_recursion_depth = max(
         0,
-        int(raw_max_recursion_depth if raw_max_recursion_depth is not None else 3),
+        int(raw_max_recursion_depth if raw_max_recursion_depth is not None else 0),
     )
     problem = SimpleNamespace(
         theorem_name=theorem_name,
@@ -7259,7 +7239,7 @@ async def _mini_session_run_conversation_callback(
         recorder=kwargs.get("recorder"),
         cost_controller=kwargs.get("cost_controller"),
         trace_prefix=str(kwargs.get("trace_prefix") or ""),
-        max_iterations=max(4, max_turns * 6 + 4),
+        max_iterations=(-1 if max_turns < 0 else max(4, max_turns * 6 + 4)),
         recursive_pass_budget_remaining=0,
         recursion_depth=max(0, int(kwargs.get("recursion_depth", 0) or 0)),
         max_recursion_depth=max_recursion_depth,
@@ -7284,7 +7264,7 @@ async def _mini_session_run_conversation_callback(
             int(
                 kwargs.get(
                     "max_helper_only_provider_quanta",
-                    getattr(theory_parent_session, "max_helper_only_provider_quanta", 24),
+                    getattr(theory_parent_session, "max_helper_only_provider_quanta", 0),
                 )
                 or 0
             ),
@@ -7472,7 +7452,7 @@ async def _mini_session_run_conversation_callback(
                     or 0.0
                 ),
                 "proof_state_child_tactic_max_candidates": int(
-                    kwargs.get("proof_state_child_tactic_max_candidates", 32) or 0
+                    kwargs.get("proof_state_child_tactic_max_candidates", -1) or 0
                 ),
                 "proof_state_child_goal_limit": int(
                     kwargs.get("proof_state_child_goal_limit", 3) or 0
@@ -7501,7 +7481,7 @@ async def _mini_session_run_conversation_callback(
                         "root_tactic_max_candidates",
                         kwargs.get(
                             "proof_state_child_tactic_max_candidates",
-                            32,
+                            -1,
                         ),
                     )
                     or 0
@@ -7554,11 +7534,11 @@ async def _mini_session_run_conversation_callback(
                     or DEFAULT_FORMAL_STATE_SEARCH_PROVIDER_REASONING_EFFORT
                 ),
                 "formal_state_search_provider_max_attempts": max(
-                    1,
+                    0,
                     int(
                         kwargs.get(
                             "formal_state_search_provider_max_attempts",
-                            2,
+                            0,
                         )
                         or 1
                     ),
@@ -7582,8 +7562,8 @@ async def _mini_session_run_conversation_callback(
                     int(kwargs.get("formal_state_search_max_steps", 8) or 1),
                 ),
                 "formal_state_search_max_candidates": max(
-                    1,
-                    int(kwargs.get("formal_state_search_max_candidates", 6) or 1),
+                    0,
+                    int(kwargs.get("formal_state_search_max_candidates", 0) or 0),
                 ),
                 "formal_state_search_backtrack_limit": max(
                     0,
@@ -7594,7 +7574,7 @@ async def _mini_session_run_conversation_callback(
                     int(
                         kwargs.get(
                             "formal_state_search_max_no_improvement_quanta",
-                            6,
+                            0,
                         )
                         or 0
                     ),
@@ -7607,8 +7587,8 @@ async def _mini_session_run_conversation_callback(
                 ),
                 "recursive_helper_max_depth": max_recursion_depth,
                 "recursive_helper_max_attempts_per_node": int(
-                    kwargs.get("recursive_helper_max_attempts_per_node", 2)
-                    if kwargs.get("recursive_helper_max_attempts_per_node", 2)
+                    kwargs.get("recursive_helper_max_attempts_per_node", 0)
+                    if kwargs.get("recursive_helper_max_attempts_per_node", 0)
                     is not None
                     else 2
                 ),
@@ -7816,7 +7796,7 @@ async def _mini_session_run_conversation_callback(
                     root_tactic_max_candidates=int(
                         kwargs.get(
                             "root_tactic_max_candidates",
-                            kwargs.get("proof_state_child_tactic_max_candidates", 32),
+                            kwargs.get("proof_state_child_tactic_max_candidates", -1),
                         )
                         or 0
                     ),
@@ -7825,28 +7805,16 @@ async def _mini_session_run_conversation_callback(
             session.set_budget(
                 "graph_route_assembly",
                 ActionBudget(
-                    max_invocations=max(1, max_turns),
-                    max_total_seconds=_route_assembly_budget_seconds(
-                        timeout_s=float(
-                            kwargs.get(
-                                "root_tactic_timeout_s",
-                                kwargs.get(
-                                    "proof_state_child_tactic_timeout_s",
-                                    DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-                                ),
-                            )
-                            or 0.0
-                        ),
-                        max_invocations=max(1, max_turns),
-                    ),
+                    max_invocations=(-1 if max_turns < 0 else max(1, max_turns)),
+                    max_total_seconds=0.0,
                 ),
             )
             session.register(GraphNativeShortcutAction())
             session.set_budget(
                 "graph_native_shortcut",
                 ActionBudget(
-                    max_invocations=max(1, max_turns * 2),
-                    max_total_seconds=30.0,
+                    max_invocations=(-1 if max_turns < 0 else max(1, max_turns * 2)),
+                    max_total_seconds=0.0,
                 ),
             )
 
@@ -7872,13 +7840,13 @@ async def _mini_session_run_conversation_callback(
             and session.proof_state is not None
             and recursive_helper_depth_allowed
         ):
-            raw_helper_budget = int(kwargs.get("recursive_helper_budget", 0) or 0)
-            helper_budget = raw_helper_budget if raw_helper_budget > 0 else max_turns
+            raw_helper_budget = int(kwargs.get("recursive_helper_budget", -1))
+            helper_budget = raw_helper_budget if raw_helper_budget != 0 else max_turns
             session.register(
                 RecursiveHelperProverAction(
                     max_attempts_per_node=int(
-                        kwargs.get("recursive_helper_max_attempts_per_node", 2)
-                        if kwargs.get("recursive_helper_max_attempts_per_node", 2)
+                        kwargs.get("recursive_helper_max_attempts_per_node", 0)
+                        if kwargs.get("recursive_helper_max_attempts_per_node", 0)
                         is not None
                         else 2
                     ),
@@ -7892,7 +7860,7 @@ async def _mini_session_run_conversation_callback(
             session.set_budget(
                 "recursive_helper_prover",
                 ActionBudget(
-                    max_invocations=max(1, int(helper_budget or 1)),
+                    max_invocations=(-1 if helper_budget < 0 else max(1, int(helper_budget or 1))),
                     max_total_seconds=0.0,
                 ),
             )
@@ -7926,7 +7894,7 @@ async def _mini_session_run_conversation_callback(
                     or 0.0
                 ),
                 proof_state_child_tactic_max_candidates=int(
-                    kwargs.get("proof_state_child_tactic_max_candidates", 32) or 0
+                    kwargs.get("proof_state_child_tactic_max_candidates", -1) or 0
                 ),
                 proof_state_child_goal_limit=int(
                     kwargs.get("proof_state_child_goal_limit", 3) or 0
@@ -8006,6 +7974,85 @@ async def _mini_session_run_conversation_callback(
             conv._unverified_root_candidate_replay = copy.deepcopy(candidate_replay)
             conv._provider_call_quantum_state = replay_state(candidate_replay, conv)
         checkpoint_child = None
+        continuation_key = None
+        cached_promotion_registration = None
+        cached_promotion_registered = False
+        if service_retention_enabled:
+            from .session import _dispatch_capability_generation_nonce
+            from .durable_recursive_child import (
+                RecursiveChildLimits, capture_retained_child_helper_authority,
+                refresh_retained_child_helpers,
+            )
+            admitted_limits = RecursiveChildLimits.capture(session)
+            admitted_dossier = session.dossier
+            from ensemble_prover.proof_dossier import propagate_invalidated_statements
+            if getattr(theory_parent_session, "dossier", None) is not None:
+                propagate_invalidated_statements(
+                    admitted_dossier, theory_parent_session.dossier, record_graph=False,
+                )
+            admitted_helper_authority = capture_retained_child_helper_authority(admitted_dossier)
+            continuation_lane = str(child_continuation.get("lane") or "")
+            if not checkpoint_child_enabled:
+                continuation_lane = "runtime-controller:" + str(kwargs.get("nested_invocation_id") or "")
+            continuation_key = (
+                id(getattr(theory_parent_session, "checkpoint_registry", None)), continuation_lane,
+                str(getattr(theory_parent_session, "session_activation_id", "")),
+                str(getattr(theory_parent_session.conv, "lean_preamble", "") or ""),
+                str(getattr(theory_parent_session.conv, "preamble", "") or ""),
+                session.problem.theorem_name, session.problem.statement_type, role, max_turns,
+                *(_dispatch_capability_generation_nonce(getattr(theory_parent_session, name, None))
+                  for name in ("lean", "prover_client", "refiner_client", "theory_library")),
+            )
+            cached = getattr(checkpoint_parent_action, "_suspended_controller_child_session", None)
+            if (cached is not None and cached[0] == continuation_key
+                    and getattr(cached[1], "_scheduler_service_yielded", False)
+                    and not getattr(getattr(cached[1], "_mini_recursive_hard_timeout_lease", None), "abandoned", False)):
+                session = cached[1]
+                session.parent = theory_parent_session
+                conv, dossier = session.conv, session.dossier
+                cached_promotion_registration = _child_theory_promotion_registration(session, theory_parent_session)
+            elif cached is not None:
+                previous = cached[1]
+                if not checkpoint_child_enabled and cached[0][1] != continuation_key[1]:
+                    raise ValueError("Retained recursive controller belongs to another invocation")
+                abandoned = bool(getattr(getattr(previous, "_mini_recursive_hard_timeout_lease", None), "abandoned", False))
+                from ..mini_research import current_native_research
+                research_owner = current_native_research()
+                if research_owner is not None:
+                    await research_owner.settle_session_before_rebind(previous, abandoned=abandoned)
+                previous_registry = getattr(previous, "checkpoint_registry", None)
+                previous_lane = getattr(previous, "checkpoint_lane_key", "")
+                if previous_registry is not None and previous_lane:
+                    if abandoned:
+                        await previous_registry.detach_abandoned_session(previous_lane, previous)
+                        child_continuation["lane"] = previous_lane
+                    else:
+                        await previous_registry.suspend_session(previous_lane, previous)
+                if abandoned and not checkpoint_child_enabled:
+                    # No safe value cutpoint exists for this runtime attempt.
+                    # Retire it as an unsuccessful attempt, so ordinary parent
+                    # attempt/turn policy governs any fresh retry.
+                    checkpoint_parent_action._suspended_controller_child_session = None
+                    conv._last_run_turns_used = max(0, *(
+                        int((getattr(previous, field, {}) or {}).get(role, 0) or 0)
+                        for field in ("_conversation_role_turn_counts", "_conversation_role_turn_exposure_counts")
+                    ))
+                    return False, None
+                if not checkpoint_child_enabled:
+                    from .durable_session_record import capture_session_record, restore_session_record
+                    # A runtime-only child has no disk lane to restore. Keep
+                    # the same verified restore boundary when a capability
+                    # generation changes, instead of silently restarting it.
+                    retained_record = capture_session_record(previous)
+                    await restore_session_record(
+                        session, retained_record, expected_identity=retained_record["identity"],
+                    )
+                    conv, dossier = session.conv, session.dossier
+                checkpoint_parent_action._suspended_controller_child_session = None
+            elif child_continuation and not checkpoint_child_enabled:
+                raise ValueError("Runtime recursive continuation lost its live child")
+            admitted_limits.intersect_restored(session, theory_parent_session)
+            deadline_epoch_s = session.recursive_elapsed_deadline_epoch_s
         if checkpoint_child_enabled:
             from .durable_recursive_child import prepare_controller_child
 
@@ -8014,8 +8061,15 @@ async def _mini_session_run_conversation_callback(
                 nested_invocation_id=str(kwargs.get("nested_invocation_id") or ""),
                 max_turns=max_turns, deadline_epoch_s=deadline_epoch_s,
                 graph_subpass_context=kwargs.get("checkpoint_graph_subpass_context"),
+                continuation_lane=str(child_continuation.get("lane") or ""),
             )
             deadline_epoch_s = session.recursive_elapsed_deadline_epoch_s
+            if service_retention_enabled:
+                continuation_key = (continuation_key[0], checkpoint_child.lane, *continuation_key[2:])
+        if service_retention_enabled:
+            refresh_retained_child_helpers(session.dossier, admitted_helper_authority)
+            session.scheduler_service_slice_s = max(0.001, float(
+                kwargs.get("recursive_child_service_slice_s", 30.0)))
         if isinstance(inherited_escalation_state, dict):
             merge_planner_escalation_failure_state(inherited_escalation_state, session.planner_escalation_failure_state)
             session.planner_escalation_failure_state = inherited_escalation_state
@@ -8060,8 +8114,17 @@ async def _mini_session_run_conversation_callback(
             for key in _RECURSIVE_CHILD_REPORTING_METRICS
         }
         try:
+            if cached_promotion_registration is not None:
+                cached_promotion_registration.__enter__()
+                cached_promotion_registered = True
             from .recursive_helper_prover import _run_child_with_elapsed_budget
 
+            if service_retention_enabled and checkpoint_result is None:
+                # Cancellation may arrive after settled paid work but before
+                # a normal service return publishes its continuation. Keep the
+                # owner now; cancelled capabilities take the fresh verified
+                # restore path on resume, never direct live reuse.
+                checkpoint_parent_action._suspended_controller_child_session = (continuation_key, session)
             if checkpoint_result is not None:
                 ok, proof, timed_out = checkpoint_result
             elif (
@@ -8154,7 +8217,8 @@ async def _mini_session_run_conversation_callback(
                     charged_attempts = 0
                 lane_ledger.settle(
                     lane_token,
-                    charge_count=charged_attempts,
+                    charge_count=max(0, charged_attempts - int(
+                        child_continuation.get("paid_failures_reported", 0))),
                 )
             if child_promotion_registered:
                 try:
@@ -8162,6 +8226,8 @@ async def _mini_session_run_conversation_callback(
                 except Exception:
                     pass
             _snapshot_session_state_for_caller(session)
+            if cached_promotion_registered:
+                cached_promotion_registration.__exit__(None, None, None)
             if (
                 not completed_normally and checkpoint_child is not None
                 and getattr(session.conv, "_unverified_root_candidate", None)
@@ -8220,7 +8286,8 @@ async def _mini_session_run_conversation_callback(
     setattr(
         conv,
         "_last_run_turns_used",
-        min(max_turns, max(durable_turns, exposed_turns)),
+        (max(durable_turns, exposed_turns) if max_turns < 0
+         else min(max_turns, max(durable_turns, exposed_turns))),
     )
     if completed_normally:
         child_theory_bundle_ids = tuple(
@@ -8267,6 +8334,25 @@ async def _mini_session_run_conversation_callback(
                 setattr(conv, "_last_no_proof_llm_response", latest)
         except Exception:
             pass
+    service_yielded = bool(
+        service_retention_enabled
+        and getattr(session, "_scheduler_service_yielded", False) and not ok and not timed_out
+    )
+    if isinstance(child_execution_state, dict):
+        child_execution_state.update(session=session, yielded=service_yielded)
+    if service_yielded:
+        if checkpoint_child is not None:
+            checkpoint_child.publication_allowed()
+        checkpoint_parent_action._suspended_controller_child_session = (continuation_key, session)
+        child_execution_state["continuation"] = {
+            "lane": continuation_key[1],
+            "nested_invocation_id": str(kwargs.get("nested_invocation_id") or ""),
+            "role": role,
+            "paid_failures_reported": _recursive_conversation_lane_paid_failure_count(session),
+        }
+        return False, None
+    if checkpoint_parent_action is not None:
+        checkpoint_parent_action._suspended_controller_child_session = None
     if checkpoint_child is not None:
         await checkpoint_child.complete(ok=ok, proof=proof, timed_out=timed_out)
     if timed_out and candidate_replay is None and speculative_operational_probe:

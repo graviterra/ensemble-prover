@@ -2326,6 +2326,16 @@ async def _call_llm_with_tools_one_round_impl(
 
     primitives = _legacy_imports()
     explicit_helper_scope = helper_context_override is not None
+    from ...helper_inventory import READ_VERIFIED_HELPERS_TOOL, run_read_verified_helpers_tool
+
+    helper_lookup_enabled = bool(
+        use_tools and callable(getattr(dossier, "validate_helper_context", None))
+    )
+    if helper_lookup_enabled:
+        tools_list = list(tools_list)
+        if not any((item.get("function") or {}).get("name") == "read_verified_helpers"
+                   for item in tools_list):
+            tools_list.append(READ_VERIFIED_HELPERS_TOOL)
 
     def validate_tool_scope(blocks: Sequence[str]) -> tuple[str, ...]:
         validator = getattr(dossier, "validate_helper_context", None)
@@ -3794,6 +3804,13 @@ async def _call_llm_with_tools_one_round_impl(
                     preamble=str(getattr(conv, "preamble", "") or ""),
                     context_lemmas=context_lemmas,
                     session_scope=session_scope,
+                    **({"helper_lookup_available": bool(
+                            helper_lookup_enabled
+                            and use_tools
+                            and tool_calls_used < max_tool_calls_per_turn
+                            and not force_finalize_without_tools
+                            and not force_proof_submission
+                        )} if _callable_accepts_keyword(renderer, "helper_lookup_available") else {}),
                     **helper_context_kwargs(),
                 )
                 or []
@@ -5628,6 +5645,10 @@ async def _call_llm_with_tools_one_round_impl(
                         from ...mini_research import native_research_tool
 
                         result_text = json.dumps(native_research_tool(name, args, conv), ensure_ascii=False)
+                    elif name == "read_verified_helpers" and helper_lookup_enabled:
+                        result_text = run_read_verified_helpers_tool(
+                            dossier, tool_helper_blocks(), args,
+                        )
                     elif name == "read_strategy_artifact" and strategy_runtime is not None:
                         result_text = json.dumps(strategy_runtime.read_artifact(args), ensure_ascii=False)
                     elif name == "request_strategy_review" and strategy_runtime is not None:
@@ -5903,6 +5924,7 @@ async def _call_llm_with_tools_one_round_impl(
                             else []
                         )
                         accepted_code_out: dict[str, str] = {}
+                        checked_declaration_out = []
                         result_text = await await_with_elapsed_budget(
                             invoke_formal_runner(
                                 primitives["run_try_lean_tool"],
@@ -5927,6 +5949,7 @@ async def _call_llm_with_tools_one_round_impl(
                                     else None
                                 ),
                                 accepted_code_out=accepted_code_out,
+                                checked_declaration_out=checked_declaration_out,
                             )
                         )
                         if result_text.startswith("try_lean accepted."):
@@ -5997,7 +6020,7 @@ async def _call_llm_with_tools_one_round_impl(
                             if accepted_try_lean_code and not scratch_has_local_scope:
                                 try:
                                     from ensemble_prover.mini_recursive import (
-                                        _accepted_try_lean_negates_statement,
+                                        _try_lean_negation_candidate,
                                         _iter_checked_lean_target_headers,
                                     )
 
@@ -6008,7 +6031,7 @@ async def _call_llm_with_tools_one_round_impl(
                                     )
                                     accepted_target_negation = bool(
                                         bridge_source
-                                        and _accepted_try_lean_negates_statement(
+                                        and _try_lean_negation_candidate(
                                             accepted_try_lean_code,
                                             tool_goal_statement,
                                         )
@@ -6065,34 +6088,50 @@ async def _call_llm_with_tools_one_round_impl(
                                 and context_name in helper_registry
                             ]
                             if bridge_source and callable(recorder):
-                                bridge_validation = await await_with_elapsed_budget(
-                                    primitives["run_try_lean_tool"](
-                                        lean,
-                                        goal_statement=tool_goal_statement,
-                                        preamble=conv.preamble,
-                                        args={
-                                            "code": bridge_source,
-                                            "purpose": (
-                                                "revalidate named durable bridge"
-                                            ),
-                                        },
-                                        context_lemmas=context_lemmas,
-                                        dossier=dossier,
-                                        turn_index=turn,
-                                        tool_call_index=tool_calls_used + 1,
-                                        redact_solution_refs=(
-                                            redact_solution_refs
-                                        ),
-                                        allow_declarations=True,
-                                        require_declaration=True,
-                                        accepted_code_out={},
-                                        deadline_exhausted=(
-                                            elapsed_budget_exhausted
-                                            if max_turn_elapsed_f > 0.0
-                                            else None
-                                        ),
+                                from ...try_lean_tool import CheckedDeclarationReceipt
+
+                                unchanged_checked_declaration = (
+                                    context_lemmas == tool_helper_blocks()
+                                    and any(
+                                        isinstance(receipt, CheckedDeclarationReceipt)
+                                        and receipt.matches(
+                                            source=bridge_source, preamble=conv.preamble,
+                                            context=context_lemmas, lean=lean,
+                                        )
+                                        for receipt in checked_declaration_out
                                     )
                                 )
+                                if unchanged_checked_declaration:
+                                    bridge_validation = result_text
+                                else:
+                                    bridge_validation = await await_with_elapsed_budget(
+                                        primitives["run_try_lean_tool"](
+                                            lean,
+                                            goal_statement=tool_goal_statement,
+                                            preamble=conv.preamble,
+                                            args={
+                                                "code": bridge_source,
+                                                "purpose": (
+                                                    "revalidate named durable bridge"
+                                                ),
+                                            },
+                                            context_lemmas=context_lemmas,
+                                            dossier=dossier,
+                                            turn_index=turn,
+                                            tool_call_index=tool_calls_used + 1,
+                                            redact_solution_refs=(
+                                                redact_solution_refs
+                                            ),
+                                            allow_declarations=True,
+                                            require_declaration=True,
+                                            accepted_code_out={},
+                                            deadline_exhausted=(
+                                                elapsed_budget_exhausted
+                                                if max_turn_elapsed_f > 0.0
+                                                else None
+                                            ),
+                                        )
+                                    )
                             if (
                                 bridge_source
                                 and callable(recorder)
@@ -6101,18 +6140,19 @@ async def _call_llm_with_tools_one_round_impl(
                                 )
                             ):
                                 from ...verified_helper_contract import (
-                                    analyze_verified_helper_contract,
+                                    analyze_verified_helper_source_contract,
+                                    helper_contract_context_is_plain,
+                                    helper_source_contract_is_context_sensitive,
                                 )
-                                from ...proof_graph import helper_decl_statement
 
                                 contract_preamble = str(conv.preamble or "")
                                 contract_environment = str(
                                     getattr(dossier, "current_lean_environment_hash", "") or ""
                                 )
                                 contract_remaining = elapsed_budget_remaining_s()
-                                contract_fields = await analyze_verified_helper_contract(
+                                contract_fields = await analyze_verified_helper_source_contract(
                                         lean,
-                                        helper_decl_statement(bridge_source),
+                                        bridge_source,
                                         preamble=contract_preamble,
                                         context=context_lemmas,
                                         environment_hash=contract_environment,
@@ -6137,6 +6177,11 @@ async def _call_llm_with_tools_one_round_impl(
                                     ),
                                     provenance_tags=(
                                         "try_lean_accepted_example",
+                                    ),
+                                    contract_observation_required=helper_source_contract_is_context_sensitive(
+                                        bridge_source, context_is_plain=helper_contract_context_is_plain(
+                                            lean, preamble=contract_preamble, context=context_lemmas,
+                                        ),
                                     ),
                                     **contract_fields,
                                 )
@@ -6225,13 +6270,7 @@ async def _call_llm_with_tools_one_round_impl(
                                             **helper_context_kwargs(),
                                             turn_index=turn,
                                             tool_call_index=tool_calls_used + 1,
-                                            max_residual_goals=max(
-                                                0,
-                                                int(
-                                                    proof_state_child_goal_limit
-                                                    or 0
-                                                ),
-                                            ),
+                                            max_residual_goals=-1,
                                             redact_solution_refs=(
                                                 redact_solution_refs
                                             ),
@@ -6393,10 +6432,7 @@ async def _call_llm_with_tools_one_round_impl(
                                 **helper_context_kwargs(),
                                 turn_index=turn,
                                 tool_call_index=tool_calls_used + 1,
-                                max_residual_goals=max(
-                                    0,
-                                    int(proof_state_child_goal_limit or 0),
-                                ),
+                                max_residual_goals=-1,
                                 redact_solution_refs=redact_solution_refs,
                                 deadline_exhausted=(
                                     elapsed_budget_exhausted
@@ -6431,10 +6467,7 @@ async def _call_llm_with_tools_one_round_impl(
                                 proof_cache=proof_cache,
                                 turn_index=turn,
                                 tool_call_index=tool_calls_used + 1,
-                                max_residual_goals=max(
-                                    0,
-                                    int(proof_state_child_goal_limit or 0),
-                                ),
+                                max_residual_goals=-1,
                                 goal_statement_override=tool_goal_statement,
                                 redact_solution_refs=redact_solution_refs,
                                 deadline_exhausted=(

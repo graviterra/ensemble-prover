@@ -37,6 +37,7 @@ from .contract_identity import (
     has_lean_contract_identity,
     lean_contract_evidence_receipt_matches,
     make_lean_contract_evidence_receipt,
+    lean_contract_statement_source_key,
     parse_lean_contract_identity,
 )
 from .helper_quality import verified_helper_admission_quality
@@ -1756,7 +1757,7 @@ def _bound_mini_recursive_event_contract_identity(
         or (
             source_statement
             and statement_key
-            != _mini_recursive_contract_statement_key(source_statement)
+            != lean_contract_statement_source_key(source_statement)
         )
         or not lean_contract_evidence_receipt_matches(
             receipt,
@@ -2491,6 +2492,10 @@ def _dossier_split_top_level_conjunctions(text: str) -> List[str]:
 
 def _dossier_contract_norm(text: str) -> str:
     from .contract_normalization import compact_contract_surface
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if _identity_requires_exact_source(_identity_source_text(text)):
+        return canonical_dossier_statement_key(text)
 
     stripped = _dossier_strip_leading_forall_binders(text)
     stripped = _dossier_normalize_numeric_casts_for_contract(stripped)
@@ -2583,6 +2588,10 @@ def _cached_dossier_contract_alpha_norm(
     context_bound_names: Tuple[str, ...],
 ) -> str:
     from .contract_normalization import compact_contract_surface
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if _identity_requires_exact_source(_identity_source_text(text)):
+        return canonical_dossier_statement_key(text)
 
     stripped, leading_names = _dossier_strip_leading_forall_binders_with_names(text)
     bound_names = tuple(
@@ -2739,8 +2748,13 @@ def _cached_dossier_statements_root_adjacent(
     root_statement: str,
     conclusion_bound_names: Tuple[str, ...],
 ) -> bool:
-    return _uncached_dossier_statements_root_adjacent(
-        conclusion, root_statement, conclusion_bound_names=conclusion_bound_names,
+    from .proof_graph import _large_lexical_result
+
+    return _large_lexical_result(
+        ("dossier_root_adjacency", conclusion, root_statement, conclusion_bound_names),
+        lambda: _uncached_dossier_statements_root_adjacent(
+            conclusion, root_statement, conclusion_bound_names=conclusion_bound_names,
+        ),
     )
 
 
@@ -2751,6 +2765,16 @@ def _uncached_dossier_statements_root_adjacent(
     conclusion_bound_names: Sequence[str] = (),
 ) -> bool:
     from .mini_falsification.generators import _right_pi_term_mentions_dependency
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if any(
+        _identity_requires_exact_source(_identity_source_text(source))
+        for source in (conclusion, root_statement)
+    ):
+        return bool(conclusion) and not conclusion_bound_names and (
+            canonical_dossier_statement_key(conclusion)
+            == canonical_dossier_statement_key(root_statement)
+        )
 
     # Unused outer binders must not shift the indices assigned to inner
     # quantifiers: `(h : P) : ∃ n, Q n` and `∃ n, Q n` have the same
@@ -2793,6 +2817,17 @@ def _dossier_statement_is_negative_evidence(statement: str) -> bool:
         or compact.startswith("False ")
         or compact.startswith("¬")
         or compact.startswith("Not ")
+    )
+
+
+def _dossier_may_be_root_adjacent(
+    conclusion: str, root_statement: str, *, conclusion_bound_names: Sequence[str] = (),
+) -> bool:
+    """Advisory resemblance may deny usefulness but never prove a target."""
+    from .proof_graph import _graph_may_be_root_adjacent
+
+    return _graph_may_be_root_adjacent(
+        conclusion, root_statement, conclusion_bound_names=conclusion_bound_names,
     )
 
 
@@ -2867,7 +2902,7 @@ def _dossier_is_conditional_negative_auxiliary(
         return _dossier_strip_balanced_outer_parens(inner)
 
     positive_conclusion = negated_body(conclusion)
-    if not positive_conclusion or not any(negated_body(p) for p in premises):
+    if not positive_conclusion or not premises:
         return False
     if _dossier_statement_root_equivalent(
         positive_conclusion,
@@ -2890,6 +2925,23 @@ def _dossier_is_conditional_negative_auxiliary(
         _graph_type_returns_prop,
     )
 
+    if not any(negated_body(p) for p in premises):
+        # Positive hypotheses can prove useful negative facts too, such as
+        # a small divisor's exclusion by a lower bound on the least factor.
+        # Require an actual data parameter in the conclusion; an unrelated
+        # closed negation is still advisory. The target-family checks below
+        # also apply to these lemmas and retain refutation isolation.
+        from .mini_falsification.generators import _right_pi_term_mentions_dependency
+
+        _tail, auxiliary_binders = _graph_leading_binder_analysis(helper_statement)
+        if not any(
+            _right_pi_term_mentions_dependency(positive_conclusion, name)
+            for _raw, names, type_text, is_proof, ambiguous in auxiliary_binders
+            if not is_proof and not ambiguous and not _graph_type_returns_prop(type_text)
+            for name in names
+        ):
+            return False
+
     operator_heads = {
         "Eq": "=", "Ne": "≠", "LE.le": "≤", "LT.lt": "<",
         "Membership.mem": "∈", "Dvd.dvd": "∣", "Set.Subset": "⊆",
@@ -2906,6 +2958,17 @@ def _dossier_is_conditional_negative_auxiliary(
             return ""
         raw = match.group(1)
         return canonical_lean_identifier(raw).removeprefix("_root_.") if canonical else raw
+
+    def group_lambda_argument(text: str) -> str:
+        # Lean's pretty printer omits parentheses in `Summable fun a => ...`.
+        # That lambda owns the entire remaining expression; its arrow and
+        # body operators are not relations asserted by the outer predicate.
+        match = identifier_pattern.match(text)
+        if match is not None:
+            argument = text[match.end():].strip()
+            if re.match(r"fun\s", argument):
+                return text[:match.end()] + " (" + argument + ")"
+        return text
 
     def rejection_tokens(text: str) -> Set[str]:
         tokens = set(_graph_bridge_variant_rejection_tokens(text))
@@ -3209,6 +3272,7 @@ def _dossier_is_conditional_negative_auxiliary(
                     binders, target_bound_names | scope_names,
                 ),
             )
+        body = group_lambda_argument(body)
         implications = _dossier_split_top_level_implications(body)
         if len(implications) > 1:
             return proposition_atoms(
@@ -3280,7 +3344,7 @@ def _dossier_is_conditional_negative_auxiliary(
         """Recognize a property of witnesses or a genuinely varying function."""
         from .mini_falsification.generators import _right_pi_term_mentions_dependency
 
-        body = _dossier_strip_balanced_outer_parens(text)
+        body = group_lambda_argument(_dossier_strip_balanced_outer_parens(text))
         prefix = _dossier_top_level_quantifier_token_len(body, 0)
         if prefix:
             separators = _top_level_token_positions(body, (",",))
@@ -3458,7 +3522,7 @@ def _dossier_is_conditional_negative_auxiliary(
             ):
                 return False
     return not scope_exhausted and not any(
-        _dossier_statements_root_adjacent(
+        _dossier_may_be_root_adjacent(
             positive_conclusion,
             target,
             conclusion_bound_names=bound_names,
@@ -3643,6 +3707,17 @@ def _dossier_support_candidates(
     include_implication_premises: bool = False,
     premises_are_assumptions: bool = False,
 ) -> List[Tuple[str, Tuple[str, ...]]]:
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    source = str(statement or "").strip()
+    if _identity_requires_exact_source(_identity_source_text(source)):
+        # A checked opaque proposition remains usable as a whole. Its source
+        # does not establish that apparent binders or connectives can be
+        # projected into reusable assumptions or conclusions.
+        return [(source, ())] if source and not (
+            include_implication_premises or premises_are_assumptions
+        ) else []
+
     candidates: List[Tuple[str, Tuple[str, ...]]] = []
     seen: Set[Tuple[str, Tuple[str, ...]]] = set()
 
@@ -7562,6 +7637,9 @@ class VerifiedHelper:
     render_policy: str = ""
     verification_environment_hash: str = ""
     contract_identity: str = ""
+    # Source scope can change familiar binder spellings; retain this requirement
+    # until a complete declaration observation supplies their actual sorts.
+    contract_observation_required: bool = False
     contract_identity_statement_key: str = ""
     contract_identity_environment_hash: str = ""
     contract_identity_evidence_receipt: str = ""
@@ -7664,7 +7742,7 @@ def verified_helper_bound_contract_identity(helper: Any) -> str:
     receipt = str(
         getattr(helper, "contract_identity_evidence_receipt", "") or ""
     ).strip()
-    source_statement_key = canonical_dossier_statement_key(
+    source_statement_key = lean_contract_statement_source_key(
         helper_decl_statement(str(getattr(helper, "source", "") or ""))
     )
     verification_environment_hash = str(
@@ -7694,6 +7772,7 @@ def verified_helper_has_typed_binder_evidence(helper: Any) -> bool:
         str(getattr(helper, "contract_identity_environment_hash", "") or ""),
         tuple(getattr(helper, "contract_binder_sorts", ()) or ()),
         tuple(getattr(helper, "contract_proof_binder_types", ()) or ()),
+        allow_empty_binders=True,
     )
     return bool(expected and expected == getattr(helper, "contract_binder_evidence_receipt", ""))
 
@@ -8195,6 +8274,7 @@ class ProofDossier:
     graph_execution_projection_mode: str = "shadow"
     graph_execution_project_environment_hash: str = ""
     current_lean_environment_hash: str = ""
+    lean_environment_plain_syntax: Dict[str, bool] = field(default_factory=dict)
     # child environment hash -> transitive hashes whose declarations remain
     # available in that child.  Direction matters: a fact checked in an
     # ancestor is valid after a monotone extension, but not conversely.
@@ -8538,6 +8618,12 @@ class ProofDossier:
         child = str(environment_hash or "").strip()
         parent = str(extends_environment_hash or "").strip()
         previous = str(self.current_lean_environment_hash or "").strip()
+        if child and str(environment_source_text or "").strip():
+            from .verified_helper_contract import helper_contract_context_is_plain
+
+            self.lean_environment_plain_syntax[child] = helper_contract_context_is_plain(
+                None, preamble=environment_source_text, context=(),
+            )
         if child and str(environment_source_text or "").strip():
             # Record before adjudicating the edge so the check can see this
             # environment's own declarations.
@@ -12429,6 +12515,43 @@ class ProofDossier:
         )
         projected_fact_ids_by_node: Dict[str, str] = {}
         projected_fact_order_by_node: Dict[str, int] = {}
+        target_kinds = {
+            "proposed_claim", "formal_variant", "missing_obligation",
+            "proof_state_root", "proof_state_child_goal",
+        }
+        # Index candidate locations once, not authority. This synchronous pass
+        # changes certification/status, never a target's statement or bound
+        # contract. Include proved/tombstoned nodes because variant completion
+        # can also certify its parent. Every selected node is checked afresh
+        # below, and a later reconciliation rebuilds these local indexes.
+        target_order: Dict[str, int] = {}
+        surface_targets: Dict[Tuple[str, str], Set[str]] = {}
+        structural_targets: Dict[Tuple[str, str], Set[str]] = {}
+        certified_targets: Dict[str, Set[str]] = {}
+        for node in (graph.nodes.values() if self.verified_helpers else ()):
+            if node.kind not in target_kinds:
+                continue
+            target_order[node.node_id] = len(target_order)
+            environment_hash = str(
+                node.metadata.get("statement_environment_hash") or ""
+            ).strip()
+            statement_key = canonical_dossier_statement_key(node.statement)
+            if statement_key:
+                surface_targets.setdefault(
+                    (environment_hash, statement_key), set(),
+                ).add(node.node_id)
+            parsed_identity = parse_lean_contract_identity(
+                self._graph_node_contract_identity(node)
+            )
+            if parsed_identity is not None:
+                structural_targets.setdefault(
+                    (environment_hash, parsed_identity[0]), set(),
+                ).add(node.node_id)
+            helper_node_id = str(
+                node.metadata.get("verified_by_helper_node_id") or ""
+            ).strip()
+            if helper_node_id:
+                certified_targets.setdefault(helper_node_id, set()).add(node.node_id)
         for helper_order, helper in enumerate(self.verified_helpers.values()):
             if not self._verified_helper_context_visible(helper):
                 continue
@@ -12461,15 +12584,20 @@ class ProofDossier:
             fact_id = self._verified_fact_identity(helper)
             if not fact_id:
                 continue
+            helper_parsed_identity = parse_lean_contract_identity(
+                helper_contract_identity
+            )
+            candidate_node_ids = set(surface_targets.get(
+                (helper_environment_hash, helper_statement_key), (),
+            ))
+            if helper_parsed_identity is not None:
+                candidate_node_ids.update(structural_targets.get(
+                    (helper_environment_hash, helper_parsed_identity[0]), (),
+                ))
             newly_resolved: List[str] = []
-            for node in list(graph.nodes.values()):
-                if node.kind not in {
-                    "proposed_claim",
-                    "formal_variant",
-                    "missing_obligation",
-                    "proof_state_root",
-                    "proof_state_child_goal",
-                }:
+            for node_id in sorted(candidate_node_ids, key=target_order.__getitem__):
+                node = graph.nodes.get(node_id)
+                if node is None or node.kind not in target_kinds:
                     continue
                 if graph.is_superseded_tombstone(node) or node.status == "proved":
                     continue
@@ -12576,17 +12704,14 @@ class ProofDossier:
             # certifications from graph provenance so the durable fact
             # receipt is complete even when ``newly_resolved`` is empty.
             certified_node_ids = list(newly_resolved)
-            for node in list(graph.nodes.values()):
+            recovery_node_ids = candidate_node_ids | certified_targets.get(helper_node_id, set())
+            for node_id in sorted(recovery_node_ids, key=target_order.__getitem__):
+                node = graph.nodes.get(node_id)
+                if node is None:
+                    continue
                 metadata = dict(getattr(node, "metadata", {}) or {})
                 if (
-                    node.kind
-                    in {
-                        "proposed_claim",
-                        "formal_variant",
-                        "missing_obligation",
-                        "proof_state_root",
-                        "proof_state_child_goal",
-                    }
+                    node.kind in target_kinds
                     and node.status == "proved"
                     and str(
                         metadata.get("verified_by_helper_node_id") or ""
@@ -12830,6 +12955,9 @@ class ProofDossier:
 
     @staticmethod
     def _verified_helper_context_visible(helper: VerifiedHelper) -> bool:
+        if (getattr(helper, "contract_observation_required", False)
+                and not verified_helper_has_typed_binder_evidence(helper)):
+            return False
         return str(getattr(helper, "render_policy", "") or "") in {
             "",
             "root_authoritative",
@@ -12922,6 +13050,12 @@ class ProofDossier:
         metadata = {
             "verified_helper_answer_safety_policy": admission_policy,
         }
+        if helper.name in getattr(self, "_checkpoint_pending_answer_receipts", ()):
+            # Private restore staging has retained an exact source whose old
+            # parser receipt no longer identifies today's statement key.
+            # Only the fresh full replay may release its current receipt.
+            metadata["verified_helper_answer_safety_receipt"] = ""
+            return metadata
         receipt = graph_helper_answer_safety_receipt(
             source_hash=source_hash,
             source_digest=hashlib.sha256(
@@ -13059,8 +13193,33 @@ class ProofDossier:
                 framed.append(dict(raw))
         return framed
 
-    def _classify_verified_helper_quality(self, helper: VerifiedHelper) -> None:
+    def _classify_verified_helper_quality(
+        self,
+        helper: VerifiedHelper,
+        *,
+        _context_sources_are_plain: Optional[bool] = None,
+    ) -> None:
         statement = helper_decl_statement(helper.source)
+        from .verified_helper_contract import (
+            helper_contract_context_is_plain, helper_source_contract_is_context_sensitive,
+        )
+
+        if _context_sources_are_plain is None:
+            _context_sources_are_plain = helper_contract_context_is_plain(
+                None, preamble="",
+                context=tuple(item.source for item in self.verified_helpers.values() if item is not helper),
+            )
+        context_is_plain = _context_sources_are_plain and (
+            not helper.verification_environment_hash
+            or self.lean_environment_plain_syntax.get(helper.verification_environment_hash) is True
+        )
+        # Multiline extraction introduces a positioned wrapper for display.
+        # Environment macros can give that wrapper different semantics from
+        # the declaration's checked type, so text cannot certify a target.
+        helper.contract_observation_required = bool(
+            helper.contract_observation_required or "\n" in statement or "\r" in statement
+            or helper_source_contract_is_context_sensitive(helper.source, context_is_plain=context_is_plain)
+        )
         admission_quality = verified_helper_admission_quality(helper)
         premises, conclusion, bound_names = _dossier_statement_premises_and_conclusion(
             statement
@@ -13068,6 +13227,9 @@ class ProofDossier:
         # An Expr identity alone does not describe its proof binders. Older
         # support refreshes attached identities without any binder analysis.
         has_lean_contract_evidence = verified_helper_has_typed_binder_evidence(helper)
+        observation_unavailable = bool(
+            helper.contract_observation_required and not has_lean_contract_evidence
+        )
         if has_lean_contract_evidence:
             premises = tuple(
                 str(item or "")
@@ -13154,7 +13316,7 @@ class ProofDossier:
                 for tag in provenance_tags
             )
         )
-        root_adjacent = _dossier_statements_root_adjacent(
+        root_adjacent = _dossier_may_be_root_adjacent(
             conclusion,
             self.root_statement,
             conclusion_bound_names=bound_names,
@@ -13190,7 +13352,7 @@ class ProofDossier:
                     closed_open_statements.append(ambiguous_type)
             if not root_authoritative:
                 render_policy = "advisory_requires_unproved_premise"
-        if (premises or data_requirements) and _dossier_statements_root_adjacent(
+        if (premises or data_requirements) and _dossier_may_be_root_adjacent(
             conclusion,
             self.root_statement,
             conclusion_bound_names=bound_names,
@@ -13276,6 +13438,12 @@ class ProofDossier:
             render_policy = "advisory_negative_evidence"
         if not render_policy and visibility_policy:
             render_policy = visibility_policy
+        if observation_unavailable:
+            # The declaration's body is checked, but local name resolution can
+            # hide proof binders behind familiar data-type spellings. Retain
+            # exact source for replay without publishing guessed global facts.
+            tags.append("unresolved_binder_contract")
+            render_policy = "advisory_requires_unproved_premise"
         for tag in provenance_tags:
             if tag not in tags:
                 tags.append(tag)
@@ -13287,9 +13455,29 @@ class ProofDossier:
         helper.render_policy = render_policy
 
     def _refresh_verified_helper_quality(self) -> None:
-        for helper in list(self.verified_helpers.values()):
+        from .verified_helper_contract import helper_source_contract_is_context_sensitive
+
+        helpers = list(self.verified_helpers.values())
+        # Classify each retained source once, then exclude the helper whose
+        # contract is being classified. Rebuild this census on every refresh:
+        # replacement, removal, restore and environment changes cannot leave a
+        # cached context classification behind. Environment evidence remains
+        # specific to each declaration and is checked by the classifier.
+        sensitive_source_ids = {
+            id(helper)
+            for helper in helpers
+            if helper_source_contract_is_context_sensitive(
+                helper.source, context_is_plain=True,
+            )
+        }
+        for helper in helpers:
             old_policy = str(getattr(helper, "render_policy", "") or "")
-            self._classify_verified_helper_quality(helper)
+            self._classify_verified_helper_quality(
+                helper,
+                _context_sources_are_plain=(
+                    not sensitive_source_ids or sensitive_source_ids == {id(helper)}
+                ),
+            )
             if not verified_helper_admission_quality(helper).generic_novelty:
                 stale_delta = _coerce_verified_helper_progress_delta(
                     self.verified_helper_progress_deltas.get(helper.name)
@@ -13314,6 +13502,13 @@ class ProofDossier:
                         helper.quality_tags
                     )
                     node.metadata["verified_helper_render_policy"] = helper.render_policy
+                    node.metadata["verified_helper_contract_observation_required"] = (
+                        helper.contract_observation_required
+                    )
+                    node.metadata["verified_helper_plain_syntax"] = bool(
+                        not helper.contract_observation_required
+                        and (not helper.verification_environment_hash or self.lean_environment_plain_syntax.get(helper.verification_environment_hash) is True)
+                    )
                     node.metadata.update(
                         self._verified_helper_answer_safety_metadata(helper)
                     )
@@ -13503,7 +13698,7 @@ class ProofDossier:
         """Persist Lean-derived root goals after answer-placeholder simplification."""
 
         cleaned: List[Dict[str, Any]] = []
-        seen: Set[str] = set()
+        seen: Set[Tuple[str, ...]] = set()
         for item in list(targets or ()):
             if not isinstance(item, dict):
                 continue
@@ -13540,18 +13735,6 @@ class ProofDossier:
                 if value:
                     record[key] = value
             closed_targets = active_root_equivalence_statements([record])
-            closed_target_key = (
-                graph_statement_key(closed_targets[0])
-                if len(closed_targets) == 1
-                else ""
-            )
-            # Two proof states may have the same displayed target while their
-            # local telescopes differ.  Bare-target dedup silently discarded
-            # one such root obligation; deduplicate the closed proposition.
-            dedup_key = closed_target_key or graph_statement_key(target)
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
             # Lean-derived structural identity is useful only while it remains
             # bound to this exact closed active target and environment.  Keep
             # the evidence quartet atomically; copying individual fields would
@@ -13567,7 +13750,7 @@ class ProofDossier:
                 item.get("contract_identity_evidence_receipt") or ""
             ).strip()
             closed_statement_key = (
-                closed_target_key
+                lean_contract_statement_source_key(closed_targets[0]) if len(closed_targets) == 1 else ""
             )
             if (
                 identity
@@ -13588,6 +13771,20 @@ class ProofDossier:
                         "contract_identity_evidence_receipt": evidence_receipt,
                     }
                 )
+            # Search normalization is not equality: syntax extensions may
+            # distinguish even alpha-renamed binders. Preserve exact closed
+            # source and its observation frame, including local hypotheses.
+            # Check the receipt before using any supplied semantic metadata.
+            dedup_key = (
+                closed_statement_key or lean_contract_statement_source_key(target),
+                *(str(record.get(key) or "") for key in (
+                    "root_statement_key", "preamble_hash", "helper_context_hash",
+                    "contract_identity_environment_hash", "contract_identity",
+                )),
+            )
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
             cleaned.append(record)
         self.active_root_targets = cleaned
         if self.proof_graph is not None:
@@ -13760,6 +13957,8 @@ class ProofDossier:
                     "verified_helper_visibility_policy": helper.visibility_policy,
                     "verified_helper_quality_tags": list(helper.quality_tags),
                     "verified_helper_render_policy": helper.render_policy,
+                    "verified_helper_contract_observation_required": helper.contract_observation_required,
+                    "verified_helper_plain_syntax": (not helper.contract_observation_required and (not helper.verification_environment_hash or self.lean_environment_plain_syntax.get(helper.verification_environment_hash) is True)),
                     "verified_helper_open_premise_statement_keys": list(
                         helper.open_premise_statement_keys
                     ),
@@ -14096,6 +14295,7 @@ class ProofDossier:
         helper_names: Optional[Iterable[str]] = None,
         dependency_helper_names: Optional[Iterable[str]] = None,
         refresh_quality: bool = True,
+        require_current_environment: bool = False,
     ) -> Dict[str, Any]:
         """Return whether replay helpers still match current support hashes."""
 
@@ -14194,6 +14394,7 @@ class ProofDossier:
         stale_edges: List[Dict[str, str]] = []
         replay_mismatches: List[Dict[str, str]] = []
         visited: Set[str] = set()
+        pending_names = list(reversed(seed_names))
 
         def helper_support_names(helper: VerifiedHelper) -> List[str]:
             names: List[str] = []
@@ -14229,7 +14430,7 @@ class ProofDossier:
                     names.append(name)
             return names
 
-        def visit(raw_name: str) -> None:
+        def inspect_helper(raw_name: str) -> None:
             key = str(raw_name or "").strip()
             if not key:
                 return
@@ -14250,7 +14451,7 @@ class ProofDossier:
                         explicit_source,
                         skip=helper_decl_name(explicit_source) or explicit_name,
                     ):
-                        visit(support_name)
+                        pending_names.append(support_name)
                     return
                 stale_edges.append(
                     {
@@ -14269,6 +14470,28 @@ class ProofDossier:
             visited.add(clean_name)
             explicit_hash = explicit_hash_by_name.get(clean_name)
             helper_hash = str(getattr(helper, "source_hash", "") or "").strip()
+            current_source = str(getattr(helper, "source", "") or "")
+            declared_name = str(helper_decl_name(current_source) or "")
+            current_environment = str(self.current_lean_environment_hash or "")
+            stored_environment = str(getattr(helper, "verification_environment_hash", "") or "")
+            authority_reason = ""
+            if not current_source or not helper_hash or text_hash(current_source) != helper_hash:
+                authority_reason = "helper_source_hash_mismatch"
+            elif (
+                self._equivalent_helper_registry_name(self.verified_helpers, declared_name) != clean_name
+                or self._equivalent_helper_registry_name(self.verified_helpers, str(helper.name or "")) != clean_name
+            ):
+                authority_reason = "helper_source_name_mismatch"
+            elif require_current_environment and current_environment and not self.lean_environment_is_compatible(stored_environment, current_environment):
+                authority_reason = "helper_environment_mismatch"
+            if authority_reason:
+                replay_mismatches.append({
+                    "helper_name": clean_name,
+                    "current_source_hash": text_hash(current_source),
+                    "recorded_source_hash": helper_hash,
+                    "replay_source_hash": explicit_hash or "",
+                    "reason": authority_reason,
+                })
             helper_artifact_source = sanitize_lean_artifact_text(
                 getattr(helper, "source", "") or ""
             )
@@ -14335,10 +14558,10 @@ class ProofDossier:
                     )
                 if stale_hashes:
                     continue
-                visit(support_key or support_name)
+                pending_names.append(support_key or support_name)
 
-        for name in seed_names:
-            visit(name)
+        while pending_names:
+            inspect_helper(pending_names.pop())
 
         if replay_mismatches or stale_edges:
             return {
@@ -14360,6 +14583,7 @@ class ProofDossier:
         replay_helpers: Optional[Iterable[str]] = None,
         support_helper_names: Optional[Iterable[str]] = None,
         refresh_quality: bool = True,
+        require_current_environment: bool = False,
     ) -> List[str]:
         """Return a self-contained helper prefix for replaying the root proof."""
 
@@ -14393,63 +14617,78 @@ class ProofDossier:
             if str(name or "")
         }
         renderable_names = self._verified_helper_renderable_names(all_by_name)
-
-        def visit(name: str) -> bool:
-            key = str(name or "").strip()
-            clean_name = self._equivalent_helper_registry_name(self.verified_helpers, key) or key
-            if not clean_name:
-                return False
-            if clean_name in emitted:
-                return True
-            if clean_name in visiting:
-                return False
-            helper = all_by_name.get(clean_name)
-            if (
-                helper is None
-                or clean_name not in renderable_names
-                or (
-                    not self._verified_helper_context_visible(helper)
-                    and clean_name not in route_local_helper_names
-                )
-            ):
-                return False
-            integrity_status = self.root_replay_integrity_status(
-                helper_names=[clean_name],
-                refresh_quality=refresh_quality,
-            )
-            if not bool(integrity_status.get("ready")):
-                return False
-            visiting.add(clean_name)
-            support_names = self._canonical_support_names(
+        # Validate the reachable source receipts once. Rechecking each suffix
+        # of a long proof chain repeatedly traversed the same dependencies and
+        # rebuilt the complete helper inventory for every lemma.
+        integrity_status = self.root_replay_integrity_status(
+            helper_names=seed_names, refresh_quality=refresh_quality,
+            require_current_environment=require_current_environment,
+        )
+        invalid_names = {
+            str(edge.get("helper_name") or "")
+            for field_name in ("stale_support_edges", "replay_helper_source_mismatches")
+            for edge in integrity_status.get(field_name, [])
+        }
+        dependency_names: Dict[str, List[str]] = {}
+        consumers: Dict[str, List[str]] = {}
+        for name in integrity_status.get("checked_helper_names", []):
+            helper = all_by_name.get(name)
+            if helper is None:
+                continue
+            supports = self._canonical_support_names(
                 list(getattr(helper, "support_names", []) or [])
                 + list(getattr(helper, "replay_context_names", []) or [])
                 + list(dict(getattr(helper, "support_source_hashes", {}) or {}))
                 + list(dict(getattr(helper, "replay_context_source_hashes", {}) or {}))
-                + self._referenced_verified_helper_names(
-                    getattr(helper, "source", ""),
-                    skip=clean_name,
-                )
+                + self._referenced_verified_helper_names(helper.source, skip=name)
             )
-            if not self._verified_helper_context_visible(helper):
-                route_local_helper_names.update(
-                    str(support or "").strip()
-                    for support in support_names
-                    if str(support or "").strip()
-                )
-            for support in support_names:
-                if not visit(str(support or "").strip()):
+            dependency_names[name] = supports
+            for support in supports:
+                consumers.setdefault(support, []).append(name)
+        if not integrity_status.get("ready") and not invalid_names:
+            invalid_names.update(seed_names)
+        invalid_pending = list(invalid_names)
+        while invalid_pending:
+            for consumer in consumers.get(invalid_pending.pop(), []):
+                if consumer not in invalid_names:
+                    invalid_names.add(consumer)
+                    invalid_pending.append(consumer)
+        for seed in seed_names:
+            pending_names: List[Tuple[str, bool]] = [(seed, False)]
+            while pending_names:
+                name, completed = pending_names.pop()
+                key = str(name or "").strip()
+                clean_name = self._equivalent_helper_registry_name(self.verified_helpers, key) or key
+                if not clean_name or clean_name in emitted:
+                    continue
+                helper = all_by_name.get(clean_name)
+                if completed:
                     visiting.discard(clean_name)
-                    return False
-            visiting.discard(clean_name)
-            source = str(getattr(helper, "source", "") or "").strip()
-            if source:
-                closed_blocks.append(source)
-                emitted.add(clean_name)
-                return True
-            return False
-
-        for name in seed_names:
-            visit(name)
+                    if not all(support in emitted for support in dependency_names[clean_name]):
+                        continue
+                    source = str(getattr(helper, "source", "") or "").strip()
+                    if source:
+                        closed_blocks.append(source)
+                        emitted.add(clean_name)
+                    continue
+                if (
+                    clean_name in visiting
+                    or clean_name in invalid_names
+                    or helper is None
+                    or clean_name not in renderable_names
+                    or (
+                        not self._verified_helper_context_visible(helper)
+                        and clean_name not in route_local_helper_names
+                    )
+                ):
+                    continue
+                support_names = dependency_names.get(clean_name, [])
+                dependency_names[clean_name] = support_names
+                if not self._verified_helper_context_visible(helper):
+                    route_local_helper_names.update(support_names)
+                visiting.add(clean_name)
+                pending_names.append((clean_name, True))
+                pending_names.extend((support, False) for support in reversed(support_names))
 
         explicit_names = {
             helper_decl_name(block) or ""
@@ -14461,6 +14700,7 @@ class ProofDossier:
                 replay_helpers=explicit_blocks,
                 helper_names=explicit_names,
                 refresh_quality=refresh_quality,
+                require_current_environment=require_current_environment,
             ).get("ready")
         )
         explicit_candidates: List[Tuple[str, str, List[str]]] = []
@@ -14736,16 +14976,19 @@ class ProofDossier:
             return ""
         if clean in registry:
             return clean
-        canonical = canonical_lean_identifier(clean)
-        return next(
-            (
-                str(candidate or "").strip()
-                for candidate in registry
-                if canonical_lean_identifier(str(candidate or "").strip())
-                == canonical
-            ),
-            "",
-        )
+        # Strip only the literal leading resolution qualifier, before quoted
+        # components are normalized. A namespace named «_root_» is a real
+        # component, as is an inner namespace with the same spelling.
+        canonical = canonical_lean_identifier(clean.removeprefix("_root_."))
+        match = ""
+        for candidate in registry:
+            candidate_name = str(candidate or "").strip()
+            if canonical_lean_identifier(candidate_name.removeprefix("_root_.")) != canonical:
+                continue
+            if match:
+                return ""
+            match = candidate_name
+        return match
 
     def _canonical_support_names(self, names: Iterable[str]) -> List[str]:
         out: List[str] = []
@@ -14888,6 +15131,7 @@ class ProofDossier:
     ) -> List[str]:
         helper_name = str(getattr(helper, "name", "") or "").strip()
         deps: List[str] = []
+        seen: Set[str] = set()
         # Hash receipts retain dependency authority even when a legacy record
         # omitted the parallel names list. Rendering and execution scopes must
         # follow the same evidence edges as root_replay_integrity_status.
@@ -14902,9 +15146,10 @@ class ProofDossier:
             if (
                 root
                 and root != helper_name
-                and root not in deps
+                and root not in seen
             ):
                 deps.append(root)
+                seen.add(root)
         for raw_name in (
             list(getattr(helper, "replay_context_names", []) or [])
             + list(dict(getattr(helper, "replay_context_source_hashes", {}) or {}))
@@ -14914,16 +15159,18 @@ class ProofDossier:
             if (
                 root
                 and root != helper_name
-                and root not in deps
+                and root not in seen
             ):
                 deps.append(root)
+                seen.add(root)
         for raw_name in self._referenced_generated_helper_names(
             getattr(helper, "source", ""),
             skip=helper_name,
         ):
             root = self._verified_helper_reference_root(raw_name)
-            if root and root != helper_name and root not in deps:
+            if root and root != helper_name and root not in seen:
                 deps.append(root)
+                seen.add(root)
         return deps
 
     def _verified_helper_renderable_names(
@@ -16455,6 +16702,7 @@ class ProofDossier:
             ],
             provenance_tags=provenance_tags,
             visibility_policy=import_visibility,
+            contract_observation_required=bool(getattr(helper, "contract_observation_required", False)),
             contract_identity=contract_identity,
             contract_display_statement=(
                 str(getattr(helper, "contract_display_statement", "") or "")
@@ -16481,6 +16729,7 @@ class ProofDossier:
             _contract_identity_statement=(
                 helper_decl_statement(source) if contract_identity else ""
             ),
+            _contract_binder_observation_complete=verified_helper_has_typed_binder_evidence(helper),
             _verification_environment_hash=evidence_environment_hash,
             _progress_anchor_from=helper,
         )
@@ -16758,6 +17007,9 @@ class ProofDossier:
         merged_replay_hashes.update(incoming_replay_hashes)
 
         changed = False
+        if incoming.contract_observation_required and not existing.contract_observation_required:
+            existing.contract_observation_required = True
+            changed = True
         for receipt in incoming.replay_context_repair_receipts:
             if receipt not in existing.replay_context_repair_receipts:
                 existing.replay_context_repair_receipts.append(copy.deepcopy(receipt))
@@ -16884,6 +17136,8 @@ class ProofDossier:
                             existing.quality_tags
                         ),
                         "verified_helper_render_policy": existing.render_policy,
+                        "verified_helper_contract_observation_required": existing.contract_observation_required,
+                    "verified_helper_plain_syntax": (not existing.contract_observation_required and (not existing.verification_environment_hash or self.lean_environment_plain_syntax.get(existing.verification_environment_hash) is True)),
                         **self._verified_helper_answer_safety_metadata(existing),
                         "verified_helper_open_premise_statement_keys": list(
                             existing.open_premise_statement_keys
@@ -16930,10 +17184,12 @@ class ProofDossier:
         provenance_tags: Optional[Iterable[str]] = None,
         visibility_policy: str = "",
         contract_identity: str = "",
+        contract_observation_required: bool = False,
         contract_display_statement: str = "",
         contract_binder_sorts: Optional[Iterable[str]] = None,
         contract_proof_binder_types: Optional[Iterable[str]] = None,
         _contract_identity_statement: str = "",
+        _contract_binder_observation_complete: bool = False,
         _verification_environment_hash: Optional[str] = None,
         _progress_anchor_from: Optional[VerifiedHelper] = None,
         replace_existing_same_name: bool = False,
@@ -16952,6 +17208,21 @@ class ProofDossier:
         src = str(source or "").strip()
         if not src:
             return None
+        from .verified_helper_contract import (
+            helper_contract_context_is_plain, helper_source_contract_is_context_sensitive,
+        )
+
+        context_is_plain = helper_contract_context_is_plain(
+            None, preamble="",
+            context=tuple(item.source for item in self.verified_helpers.values()),
+        ) and (
+            not self.current_lean_environment_hash
+            or self.lean_environment_plain_syntax.get(self.current_lean_environment_hash) is True
+        )
+        contract_observation_required = bool(
+            contract_observation_required
+            or helper_source_contract_is_context_sensitive(src, context_is_plain=context_is_plain)
+        )
         ready_route_ids_before_accept = self._ready_route_ids()
         if is_answer_unsafe_helper_source(src, **self._answer_safety_kwargs()):
             return None
@@ -17036,13 +17307,13 @@ class ProofDossier:
             or ""
         )
         incoming_contract_identity = str(contract_identity or "").strip()
-        evidence_statement_key = canonical_dossier_statement_key(
+        evidence_statement_key = lean_contract_statement_source_key(
             _contract_identity_statement
         )
         contract_evidence_valid = bool(
             has_lean_contract_identity(incoming_contract_identity)
             and evidence_statement_key
-            and evidence_statement_key == incoming_statement_key
+            and evidence_statement_key == lean_contract_statement_source_key(incoming_statement)
         )
         if incoming_contract_identity and not contract_evidence_valid:
             self.increment_tool_metric(
@@ -17079,6 +17350,15 @@ class ProofDossier:
             visibility_policy=str(visibility_policy or "").strip(),
             verification_environment_hash=verification_environment_hash,
             contract_identity=bound_contract_identity,
+            contract_observation_required=bool(
+                contract_observation_required
+                or (
+                    equivalent_existing is not None
+                    and equivalent_existing.source == src
+                    and equivalent_existing.verification_environment_hash == verification_environment_hash
+                    and equivalent_existing.contract_observation_required
+                )
+            ),
             contract_identity_statement_key=(
                 evidence_statement_key if bound_contract_identity else ""
             ),
@@ -17106,6 +17386,7 @@ class ProofDossier:
             verification_environment_hash,
             tuple(item.contract_binder_sorts),
             tuple(item.contract_proof_binder_types),
+            allow_empty_binders=_contract_binder_observation_complete,
         )
         if (
             _progress_anchor_from is not None
@@ -17134,6 +17415,18 @@ class ProofDossier:
             item.replay_context_repair_receipts = copy.deepcopy(
                 existing.replay_context_repair_receipts
             )
+        same_source_contract_upgrade = bool(
+            existing is not None
+            and existing.source == item.source
+            and existing.source_hash == item.source_hash
+            and existing.verification_environment_hash == item.verification_environment_hash
+            and list(existing.support_names) == list(item.support_names)
+            and dict(existing.support_source_hashes) == dict(item.support_source_hashes)
+            and self._verified_helper_replay_scope_key(existing)
+            == self._verified_helper_replay_scope_key(item)
+            and not verified_helper_bound_contract_identity(existing)
+            and verified_helper_bound_contract_identity(item)
+        )
         if (
             existing is not None
             and not verified_helper_surface_statement_changed(existing, item)
@@ -17148,6 +17441,7 @@ class ProofDossier:
         if (
             existing is not None
             and verified_helper_semantic_statement_changed(existing, item)
+            and not same_source_contract_upgrade
             and not replace_existing_same_name
         ):
             alternative_name = fresh_lean_alternative_identifier(
@@ -17287,6 +17581,8 @@ class ProofDossier:
                     "verified_helper_visibility_policy": item.visibility_policy,
                     "verified_helper_quality_tags": list(item.quality_tags),
                     "verified_helper_render_policy": item.render_policy,
+                    "verified_helper_contract_observation_required": item.contract_observation_required,
+                    "verified_helper_plain_syntax": (not item.contract_observation_required and (not item.verification_environment_hash or self.lean_environment_plain_syntax.get(item.verification_environment_hash) is True)),
                     "verified_helper_open_premise_statement_keys": list(
                         item.open_premise_statement_keys
                     ),
@@ -17930,6 +18226,11 @@ class ProofDossier:
             replay_helpers=replay_helper_list,
             support_helper_names=support_names,
         )
+        if set(raw_replay_closure) == set(replay_helper_list):
+            # An already closed replay prefix retains its checked ordering.
+            # Independent declarations can still have ordered elaboration
+            # effects, so a dependency traversal must not permute them.
+            raw_replay_closure = list(replay_helper_list)
         replay_closure = list(sanitize_lean_artifact_texts(raw_replay_closure))
         certificate_metadata = dict(root_certificate_metadata or {})
         certificate_metadata.setdefault(
@@ -18297,6 +18598,7 @@ class ProofDossier:
                 verdict=verdict,
                 error_type=error_type,
                 metadata={
+                    "attempted_statement": str(record.get("statement") or ""),
                     "pass_index": record.get("pass_index"),
                     "claim_index": record.get("claim_index"),
                     "variant_index": record.get("variant_index"),
@@ -18413,7 +18715,7 @@ class ProofDossier:
             return {}
         if root_contract_identity and str(
             record.get("root_contract_identity_statement_key") or ""
-        ).strip() != graph_statement_key(self.root_statement):
+        ).strip() != lean_contract_statement_source_key(self.root_statement):
             self.increment_tool_metric(
                 "mini_recursive_route_contracts_invalid_root_identity_rejected",
                 1,
@@ -20785,13 +21087,15 @@ class ProofDossier:
         current_preamble: str = "",
         current_context_lemmas: Iterable[str] = (),
         helper_context_override: Optional[Sequence[str]] = None,
+        helper_lookup_available: bool = False,
     ) -> str:
         """Render a compact model-facing state update.
 
         Verified helper bodies are never rendered, only their signatures.  The
-        production default is deliberately lossless: every named fact exposed
-        to the model must carry its proposition in the same snapshot.  Callers
-        doing diagnostics may still request an explicit recency cap.
+        Every named fact exposes its complete proposition. When exact helper
+        lookup is callable, the initial display selects a compact local view;
+        the tool retains access to the entire authorized inventory. Callers
+        without lookup receive every signature in the snapshot.
         """
         self._refresh_verified_helper_quality()
         answer_safety_kwargs = self._answer_safety_kwargs()
@@ -20845,7 +21149,9 @@ class ProofDossier:
         if active_strategy_context:
             lines.append(active_strategy_context)
         lines.append(
-            "- Named-fact boundary: only verified helpers listed below may be "
+            ("- Named-fact boundary: only verified helpers listed below or returned "
+             "by read_verified_helpers may be " if helper_lookup_available else
+             "- Named-fact boundary: only verified helpers listed below may be ") +
             "cited as already-proved named facts. Do not cite hidden benchmark, "
             "parent-root, or closed-form evaluation lemmas unless their exact "
             "names are listed. This boundary is not the whole mathematical "
@@ -20884,9 +21190,22 @@ class ProofDossier:
             if helper_limit is None
             else (all_helpers[-helper_limit:] if helper_limit else [])
         )
+        if helper_lookup_available and helper_limit is None:
+            from .helper_inventory import select_prompt_helpers
+
+            helpers = select_prompt_helpers(
+                all_helpers, target=current_goal_statement or self.root_statement,
+            )
         if all_helpers:
             lines.append("- verified helper lemmas supplied as named facts:")
-            if len(all_helpers) > len(helpers):
+            if helper_lookup_available:
+                lines.append(
+                    f"  - displaying {len(helpers)} of {len(all_helpers)} available helpers; "
+                    "read_verified_helpers reads any exact name or pages through the complete "
+                    "inventory, including full signatures and advisory history. All available "
+                    "helpers remain in the Lean replay context."
+                )
+            elif len(all_helpers) > len(helpers):
                 all_names = ", ".join(
                     f"`{_prompt_safe_helper_name(helper.name, redact_solution_refs=redact_solution_refs)}`"
                     for helper in all_helpers
@@ -21551,6 +21870,7 @@ class ProofDossier:
             "current_lean_environment_hash": str(
                 self.current_lean_environment_hash or ""
             ),
+            "lean_environment_plain_syntax": dict(self.lean_environment_plain_syntax),
             "lean_environment_ancestor_hashes": clone_json_value(
                 self.lean_environment_ancestor_hashes,
                 label="dossier Lean environment ancestry",
@@ -21807,6 +22127,7 @@ class ProofDossier:
         restored_contract_evidence_rejected = 0
         restored_verified_helper_integrity_rejected = 0
         rejected_verified_helper_names: Set[str] = set()
+        pending_answer_receipts: Set[str] = set()
         for raw in list(data.get("verified_helpers") or []):
             if not isinstance(raw, dict):
                 continue
@@ -21878,6 +22199,7 @@ class ProofDossier:
                 ],
                 render_policy=str(raw.get("render_policy") or ""),
                 contract_identity=str(raw.get("contract_identity") or ""),
+                contract_observation_required=bool(raw.get("contract_observation_required", False)),
                 progress_statement=str(raw.get("progress_statement") or ""),
                 progress_statement_identity=str(raw.get("progress_statement_identity") or ""),
                 progress_discriminator=str(raw.get("progress_discriminator") or ""),
@@ -21950,7 +22272,7 @@ class ProofDossier:
                 visibility_policy=str(item.visibility_policy or "").strip(),
                 admission_policy=admission_policy,
             )
-            item_has_graph_verification_receipt = bool(
+            item_has_graph_source_provenance = bool(
                 helper_graph_node is not None
                 and str(getattr(helper_graph_node, "kind", "") or "")
                 == "helper"
@@ -21975,13 +22297,17 @@ class ProofDossier:
                     or ""
                 ).strip()
                 == str(item.verification_environment_hash or "").strip()
-                and str(
-                    helper_graph_metadata.get(
-                        "verified_helper_answer_safety_receipt"
-                    )
-                    or ""
-                )
-                == expected_answer_safety_receipt
+            )
+            saved_answer_receipt = str(
+                helper_graph_metadata.get("verified_helper_answer_safety_receipt") or ""
+            )
+            pending_answer_receipt = bool(
+                reverify_complete_helpers and item_has_graph_source_provenance
+                and saved_answer_receipt and saved_answer_receipt != expected_answer_safety_receipt
+            )
+            item_has_graph_verification_receipt = bool(
+                item_has_graph_source_provenance
+                and (saved_answer_receipt == expected_answer_safety_receipt or pending_answer_receipt)
             )
             # Private execution checkpoints are a lossless inverse of a live
             # dossier whose helpers already crossed the Lean acceptance
@@ -22047,6 +22373,8 @@ class ProofDossier:
                     # validation and are never overwritten during restore.
                     _bind_verified_helper_progress_anchor(item, verified_helpers.values())
                 verified_helpers[item.name] = item
+                if pending_answer_receipt:
+                    pending_answer_receipts.add(item.name)
             else:
                 rejected_name = str(raw.get("name") or "").strip()
                 if rejected_name:
@@ -22225,6 +22553,10 @@ class ProofDossier:
             current_lean_environment_hash=str(
                 data.get("current_lean_environment_hash") or ""
             ),
+            lean_environment_plain_syntax={
+                str(key): value is True
+                for key, value in dict(data.get("lean_environment_plain_syntax") or {}).items()
+            },
             lean_environment_ancestor_hashes={
                 str(child or "").strip(): [
                     str(ancestor or "").strip()
@@ -22259,6 +22591,8 @@ class ProofDossier:
             },
         )
         from .closure_feedback import bounded_receipts
+        if pending_answer_receipts:
+            dossier._checkpoint_pending_answer_receipts = pending_answer_receipts
         dossier.checked_failure_feedback = bounded_receipts(data.get("checked_failure_feedback"))
         # A fact ID is shared by equivalent helper aliases, so retaining a
         # whole persisted receipt merely because one alias survived source
@@ -22686,13 +23020,28 @@ class ProofDossier:
             and re.fullmatch(r"[0-9a-f]{64}", item)
             and item in ledger_certificate_hashes
         }
-        restored_conflict_hashes = set(
+        from .mini_falsification.model import KERNEL_NEGATION_VERIFIER_VERSION
+
+        current_verifier_certificate_hashes = {
+            str(certificate.get("certificate_hash") or "")
+            for report in dossier.mini_falsification_ledger
+            for finding in report.get("findings") or ()
+            if isinstance(finding, dict)
+            for certificate in [finding.get("certificate")]
+            if isinstance(certificate, dict)
+            and authoritative_certificate_record_is_valid(certificate)
+            and certificate.get("verifier_version") == KERNEL_NEGATION_VERIFIER_VERSION
+        }
+        restored_conflict_hashes = (
             dossier.mini_falsification_trust_boundary_conflict_certificate_hashes
+            & current_verifier_certificate_hashes
         )
         # A public/report round-trip is not an authority boundary: a caller
         # can edit a valid ledger, metric, and denormalized hash set together.
         # Only authenticated execution checkpoints restore the process-local
-        # receipts minted while both mathematical sides were live.
+        # receipts minted while both mathematical sides were live under the
+        # current kernel-negation verifier. Older conflicts remain evidence
+        # pending fresh replay, not terminal authority after an upgrade.
         setattr(
             dossier,
             "_mini_falsification_trust_boundary_conflict_certificate_hashes",

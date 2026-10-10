@@ -120,6 +120,9 @@ def _seed_proposed_helpers(dst: ProofDossier, src: ProofDossier) -> None:
     dst.current_lean_environment_hash = str(
         getattr(src, "current_lean_environment_hash", "") or ""
     )
+    dst.lean_environment_plain_syntax = copy.deepcopy(
+        getattr(src, "lean_environment_plain_syntax", {}) or {}
+    )
     dst.lean_environment_ancestor_hashes = copy.deepcopy(
         getattr(src, "lean_environment_ancestor_hashes", {}) or {}
     )
@@ -180,6 +183,9 @@ def _copy_dossier_contents(dst: ProofDossier, src: ProofDossier) -> None:
     # a valid certificate is quarantined against the destination's stale hash.
     dst.current_lean_environment_hash = str(
         getattr(src, "current_lean_environment_hash", "") or ""
+    )
+    dst.lean_environment_plain_syntax = copy.deepcopy(
+        getattr(src, "lean_environment_plain_syntax", {}) or {}
     )
     dst.lean_environment_ancestor_hashes = copy.deepcopy(
         getattr(src, "lean_environment_ancestor_hashes", {}) or {}
@@ -1171,6 +1177,18 @@ def merge_lean_environment_ancestry(dst: ProofDossier, src: ProofDossier) -> boo
     """
 
     changed = False
+    for environment, plain in dict(
+        getattr(src, "lean_environment_plain_syntax", {}) or {}
+    ).items():
+        environment_hash = str(environment or "").strip()
+        if not environment_hash:
+            continue
+        previous = dst.lean_environment_plain_syntax.get(environment_hash)
+        # A conflicting classification must retain the stricter context.
+        merged = plain is True and previous is not False
+        if previous is not merged:
+            dst.lean_environment_plain_syntax[environment_hash] = merged
+            changed = True
     # Merge recorded environment content BEFORE any edge is considered: the
     # monotonicity check below can only refuse an inverted edge for an
     # environment whose declarations it knows.  Hash -> digest is functionally

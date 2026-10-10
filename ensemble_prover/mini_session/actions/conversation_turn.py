@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import math
 import re
@@ -71,6 +72,7 @@ from ensemble_prover.proof_dossier import (
     helper_decl_name,
     helper_progress_metadata_for_accepted_helpers,
     is_answer_unsafe_statement_text,
+    selected_work_mapping_layers,
     selected_work_has_explicit_cognition,
     text_hash,
     verified_helper_semantic_statement_changed,
@@ -86,9 +88,12 @@ from ensemble_prover.provider_tool_protocol import (
     mini_request_envelope_policy,
 )
 from ensemble_prover.proof_graph import (
+    _graph_split_top_level_relation,
+    _graph_strip_balanced_outer_parens,
     graph_exact_statement_text,
     graph_negated_statement_key,
     graph_node_frontier_quarantined,
+    graph_node_requires_target_integrity_adjudication,
     graph_statement_closed_premises,
     graph_statement_contract_ambiguities,
     graph_statement_contract_profile,
@@ -135,6 +140,11 @@ from ..action import MiniOutcome, RepairTicket, require_current_action_dispatch
 from ..graph_sync import sync_proof_state_to_graph
 from ..process_watchdog import begin_process_deadline
 from ..state_codec import StateSnapshotCompatibilityError
+from ..provider_lane_bank import (
+    ProviderLaneBankMixin, capture_provider_prompt_scope, copy_provider_envelope,
+    authenticated_provider_lane_header, decode_provider_lane, encode_provider_lane,
+    provider_context_identity, restore_provider_prompt_scope,
+)
 
 
 _GENERATED_SOLUTION_REF_ALIAS_RE = re.compile(
@@ -151,6 +161,8 @@ _PROVIDER_BLOCKED_REASON_BY_KIND = {
 def _provider_repair_cycle_identity(
     session: Any,
     selected_work: Mapping[str, Any],
+    *,
+    formal_evidence_hash: Optional[str] = None,
 ) -> str:
     """Return immutable scheduler authority for one provider repair lane."""
 
@@ -159,23 +171,24 @@ def _provider_repair_cycle_identity(
         getattr(session, "_repair_ticket_selected_id", "") or ""
     ).strip()
     ticket_id = str(getattr(ticket, "ticket_id", "") or "").strip()
-    ticket_active = bool(ticket_id and ticket_id == selected_ticket_id)
     record = dict(selected_work or {})
+    scope_key = _graph_selected_work_scope_key(session, record, _provider_cycle_compat=True)
+    record_ticket_ids = {
+        str(layer.get("repair_ticket_id") or "").strip()
+        for layer in selected_work_mapping_layers(record)
+        if str(layer.get("repair_ticket_id") or "").strip()
+    }
+    ticket_active = bool(
+        ticket_id and ticket_id == selected_ticket_id
+        and record_ticket_ids == {ticket_id}
+    )
     # The graph scope below binds the exact execution target, environment,
     # contract, and cognition consumer.  Do not add the projected-context
     # digest here: it includes append-only observations produced by this very
     # tool round.  Exact prompt validation still checks that digest directly
     # before every provider dispatch.
-    durable_evidence_fn = getattr(
-        session,
-        "_durable_formal_progress_evidence",
-        None,
-    )
-    durable_evidence = (
-        tuple(str(item or "") for item in durable_evidence_fn())
-        if callable(durable_evidence_fn)
-        else ()
-    )
+    if formal_evidence_hash is None:
+        formal_evidence_hash = _provider_formal_evidence_hash(session)
     payload = {
         "work_type": str(record.get("work_type") or "").strip(),
         "node_id": str(
@@ -187,19 +200,11 @@ def _provider_repair_cycle_identity(
         "route_id": str(record.get("route_id") or "").strip(),
         "obligation_id": str(record.get("obligation_id") or "").strip(),
         "target_hash": str(record.get("target_hash") or "").strip(),
-        "graph_scope_key": str(
-            _graph_selected_work_scope_key(session, record) or ""
-        ),
+        "graph_scope_key": scope_key,
         # An exhausted wall lease owns only the exact formal environment that
         # consumed it. Newly verified helpers/proved nodes must open a fresh
         # provider lane, while observation-only scheduler churn must not.
-        "durable_formal_evidence_hash": hashlib.sha256(
-            json.dumps(
-                sorted(durable_evidence),
-                ensure_ascii=True,
-                separators=(",", ":"),
-            ).encode("utf-8", errors="replace")
-        ).hexdigest(),
+        "durable_formal_evidence_hash": formal_evidence_hash,
         "repair_ticket_id": ticket_id if ticket_active else "",
         "proof_candidate_id": (
             str(getattr(ticket, "proof_candidate_id", "") or "").strip()
@@ -219,6 +224,13 @@ def _provider_repair_cycle_identity(
         ensure_ascii=True,
     ).encode("utf-8", errors="replace")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _provider_formal_evidence_hash(session: Any) -> str:
+    evidence_fn = getattr(session, "_durable_formal_progress_evidence", None)
+    evidence = tuple(str(item or "") for item in evidence_fn()) if callable(evidence_fn) else ()
+    encoded = json.dumps(sorted(evidence), ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()
 
 
 def _provider_lane_identity_for_session(
@@ -1249,7 +1261,7 @@ def _repair_ticket_from_lean_rejection(
         getattr(
             parent_ticket,
             "max_chain_depth",
-            getattr(session, "max_repair_ticket_chain_depth", 3),
+            getattr(session, "max_repair_ticket_chain_depth", -1),
         )
         or 3
     )
@@ -1258,7 +1270,7 @@ def _repair_ticket_from_lean_rejection(
         if parent_is_selected
         else 0
     )
-    if repair_depth >= max(1, max_chain_depth):
+    if max_chain_depth >= 0 and repair_depth >= max(1, max_chain_depth):
         recorder = getattr(session, "_record_event", None)
         if callable(recorder):
             recorder({
@@ -1592,7 +1604,7 @@ def _repair_ticket_from_lean_rejection(
         max_policy_attempts=2 if unknown_identifier_repair else 1,
         root_ticket_id=root_ticket_id,
         repair_depth=repair_depth,
-        max_chain_depth=max(1, max_chain_depth),
+        max_chain_depth=max_chain_depth,
         metadata=ticket_metadata,
     )
 
@@ -2133,6 +2145,9 @@ async def _run_policy_helper_quarantine(
                 ),
                 current_lean_environment_hash=str(
                     getattr(dossier, "current_lean_environment_hash", "") or ""
+                ),
+                lean_environment_plain_syntax=copy.deepcopy(
+                    getattr(dossier, "lean_environment_plain_syntax", {}) or {}
                 ),
             )
             candidate_result = await salvager.salvage(
@@ -2804,7 +2819,7 @@ def _format_graph_native_selected_work_prompt(
 
     if work_type == "target_integrity_adjudication":
         instruction = (
-            "Adjudicate this Lean-rejected target from clean state. Do not "
+            "Adjudicate this unresolved target from clean state. Do not "
             "repeat unverified prose refutations as a reason to abandon it. "
             "Either prove the selected target, replace the bad bridge with a "
             "verified smaller lemma, or provide a Lean-checked counterexample "
@@ -2938,6 +2953,8 @@ _GRAPH_REVISION_DERIVED_SCOPE_KEYS = frozenset(
 def _graph_selected_work_scope_key(
     session: Any,
     selected_work: Optional[Mapping[str, Any]] = None,
+    *,
+    _provider_cycle_compat: bool = False,
 ) -> str:
     """Stable identity for both execution and cognition shown to the model.
 
@@ -2955,19 +2972,6 @@ def _graph_selected_work_scope_key(
         if selected_work is not None
         else (getattr(session, "selected_work_item_record", {}) or {})
     )
-    statement = str(
-        record.get("exact_target_statement")
-        or record.get("target_statement")
-        or ""
-    ).strip()
-    execution_scope = record.get("execution_scope")
-    primary_cognition = (
-        record.get("primary_cognition_scope")
-        or record.get("primary_consumer_binding")
-        or {}
-    )
-    consumer_bindings = record.get("consumer_bindings") or []
-
     def stable_record(value: Any) -> str:
         if not value:
             return ""
@@ -2996,7 +3000,26 @@ def _graph_selected_work_scope_key(
         except (TypeError, ValueError):
             return str(normalized)
 
-    parts = (
+    coordinate_keys = (
+        "node_id", "graph_node_id", "target_id", "claim_id", "variant_id",
+        "obligation_id", "replan_id", "route_id", "work_type", "target_hash",
+        "execution_scope_id", "execution_target_sha256", "execution_environment_hash",
+        "execution_contract_identity", "exact_target_statement", "target_statement",
+        "statement_identity", "proof_idea_id", "strategy_lineage_id", "branch_id",
+        "proof_candidate_id", "lean_residual_id", "repair_ticket_id", "proof_attempt_id",
+        "assembly_id", "execution_target_graph_node_id", "execution_proposition_identity",
+        "execution_helper_context_hash", "primary_consumer_binding_id", "consumer_binding_id",
+        "occurrence_key", "selected_work_item_id", "work_item_id", "selected_target_statement",
+        "parent_lineage_id", "accepted_fact_id", "environment_hash", "statement_environment_hash",
+        "lean_environment_hash", "helper_context_hash",
+    )
+    scope_keys = (
+        "execution_scope", "primary_cognition_scope", "primary_consumer_binding",
+        "consumer_bindings", "proof_lineage", "graph_node_ids",
+    )
+    # Preserve existing exact-lane wall/tool receipts where the original scope
+    # and outer repair-cycle fields already represented every authority value.
+    legacy_parts = (
         str(record.get("node_id") or record.get("graph_node_id") or "").strip(),
         str(record.get("work_type") or "").strip(),
         str(record.get("target_hash") or "").strip(),
@@ -3004,15 +3027,88 @@ def _graph_selected_work_scope_key(
         str(record.get("execution_target_sha256") or "").strip(),
         str(record.get("execution_environment_hash") or "").strip(),
         str(record.get("execution_contract_identity") or "").strip(),
-        stable_record(execution_scope),
-        stable_record(primary_cognition),
-        stable_record(consumer_bindings),
-        statement,
+        stable_record(record.get("execution_scope")),
+        stable_record(record.get("primary_cognition_scope") or record.get("primary_consumer_binding")),
+        stable_record(record.get("consumer_bindings")),
+        str(record.get("exact_target_statement") or record.get("target_statement") or "").strip(),
     )
-    if not any(parts):
-        return ""
+    legacy_scope = (
+        hashlib.sha256("\n".join(legacy_parts).encode("utf-8", errors="replace")).hexdigest()[:24]
+        if any(legacy_parts) else ""
+    )
+    covered_top_keys = {
+        "node_id", "work_type", "target_hash", "execution_scope_id", "execution_target_sha256",
+        "execution_environment_hash", "execution_contract_identity", "exact_target_statement",
+        "variant_id", "route_id", "obligation_id", "execution_scope", "primary_cognition_scope",
+        "consumer_bindings",
+    }
+    if not record.get("node_id") or record.get("graph_node_id") == record.get("node_id"):
+        covered_top_keys.add("graph_node_id")
+    if not record.get("exact_target_statement") or record.get("target_statement") == record.get("exact_target_statement"):
+        covered_top_keys.add("target_statement")
+    if not record.get("primary_cognition_scope") or record.get("primary_consumer_binding") == record.get("primary_cognition_scope"):
+        covered_top_keys.add("primary_consumer_binding")
+    bound_target_ids = {
+        str(record.get(key) or "").strip()
+        for key in ("node_id", "graph_node_id", "obligation_id", "variant_id")
+        if record.get(key)
+    }
+    if bound_target_ids == {str(record.get("execution_target_graph_node_id") or "").strip()}:
+        covered_top_keys.add("execution_target_graph_node_id")
+    execution_scope = record.get("execution_scope")
+    if isinstance(execution_scope, Mapping):
+        for key, scope_key in (("execution_proposition_identity", "proposition_identity"),
+                               ("execution_helper_context_hash", "helper_context_hash")):
+            if record.get(key) == execution_scope.get(scope_key):
+                covered_top_keys.add(key)
+    ticket = getattr(session, "pending_repair_ticket", None)
+    ticket_id = str(getattr(ticket, "ticket_id", "") or "")
+    if ticket_id and ticket_id == getattr(session, "_repair_ticket_selected_id", ""):
+        for key in ("repair_ticket_id", "proof_candidate_id", "lean_residual_id"):
+            expected = ticket_id if key == "repair_ticket_id" else getattr(ticket, key, "")
+            if record.get(key) == expected:
+                covered_top_keys.add(key)
+    # These wrappers also control graph liveness and target resolution. Keep
+    # their coordinates separate so one live route cannot authenticate another
+    # route merely because the outer scheduler record names the same target.
+    pending: List[Tuple[Tuple[str, ...], Mapping[str, Any], FrozenSet[int]]] = [
+        ((), record, frozenset({id(record)})),
+    ]
+    layer_count = 0
+    scopes: List[Tuple[Tuple[str, ...], Dict[str, str]]] = []
+    while pending:
+        path, layer, ancestors = pending.pop(0)
+        layer_count += 1
+        if layer_count > ConversationTurnAction._PROVIDER_QUANTUM_SELECTED_WORK_MAX_LAYERS:
+            raise StateSnapshotCompatibilityError("selected provider work scope is too deeply nested")
+        coordinates = {
+            key: str(layer.get(key) or "").strip()
+            for key in coordinate_keys if layer.get(key)
+        }
+        for key in scope_keys:
+            value = stable_record(layer.get(key))
+            if value not in {"", "{}", "[]"}:
+                coordinates[key] = value
+        if _provider_cycle_compat and not path:
+            coordinates = {
+                key: value for key, value in coordinates.items()
+                if key not in covered_top_keys
+                or (key not in {"target_statement", "exact_target_statement"}
+                    and ("\n" in value or "\r" in value))
+            }
+        if coordinates:
+            scopes.append((path, coordinates))
+        for key in ConversationTurnAction._PROVIDER_QUANTUM_SELECTED_WORK_WRAPPER_KEYS:
+            child = layer.get(key)
+            if isinstance(child, Mapping):
+                if id(child) in ancestors:
+                    raise StateSnapshotCompatibilityError("selected provider work scope is cyclic")
+                pending.append(((*path, key), child, ancestors | {id(child)}))
+    if not scopes:
+        return legacy_scope if _provider_cycle_compat else ""
     return hashlib.sha256(
-        "\n".join(parts).encode("utf-8", errors="replace")
+        json.dumps([legacy_scope if _provider_cycle_compat else "", scopes], sort_keys=True,
+                   separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     ).hexdigest()[:24]
 
 
@@ -3692,21 +3788,13 @@ def _selected_graph_native_proof_target(
         return graph_node_frontier_quarantined(node)
 
     def target_integrity_root_equivalent_allowed(
-        record: Dict[str, Any],
+        _record: Dict[str, Any],
         node: Any = None,
     ) -> bool:
         node_metadata = dict(getattr(node, "metadata", {}) or {}) if node else {}
         return bool(
-            (
-                record.get("target_integrity_adjudication")
-                or node_metadata.get("target_integrity_adjudication")
-            )
-            and (
-                record.get("allow_root_equivalent_target_integrity_adjudication")
-                or node_metadata.get(
-                    "allow_root_equivalent_target_integrity_adjudication"
-                )
-            )
+            node_metadata.get("target_integrity_adjudication")
+            and node_metadata.get("allow_root_equivalent_target_integrity_adjudication")
         )
 
     def materialization_root_equivalent_allowed(node: Any = None) -> bool:
@@ -3715,6 +3803,36 @@ def _selected_graph_native_proof_target(
             work_type == "materialize_replay_source"
             and node_metadata.get("needs_replay_materialization")
         )
+
+    if work_type == "target_integrity_adjudication":
+        resolver = getattr(session, "_selected_target_integrity_adjudication_nodes", None)
+        if not callable(resolver):
+            return {}
+        targets = resolver(merged)
+        if len(targets) != 1:
+            return {}
+        guard = getattr(session, "_selected_work_record_dispatch_block_reason", None)
+        if callable(guard):
+            reason = guard(merged, "conversation_turn")
+            if reason and not (for_prop_check and reason == "target_integrity_nonexecutable"):
+                return {}
+        node = targets[0]
+        statement = str(getattr(node, "statement", "") or "").strip()
+        node_id = str(getattr(node, "node_id", "") or "")
+        if (
+            graph_node_is_quarantined(node)
+            or not statement_allowed_for_execution(statement)
+            or not statement_admitted(statement, node_id)
+            or (root_equivalent(statement)
+                and not target_integrity_root_equivalent_allowed(merged, node))
+        ):
+            return {}
+        return {
+            "work_type": work_type,
+            "node_id": node_id,
+            "statement": statement,
+            "name": str(getattr(node, "name", "") or ""),
+        }
 
     field_order_by_work_type = {
         "formalize_claim": ("claim_id", "graph_node_id", "node_id"),
@@ -3996,6 +4114,10 @@ def _selected_formalization_helper_contract(
     nodes = getattr(graph, "nodes", {}) if graph is not None else {}
     node = nodes.get(node_id) if isinstance(nodes, dict) and node_id else None
     node_metadata = dict(getattr(node, "metadata", {}) or {}) if node is not None else {}
+    if graph_node_requires_target_integrity_adjudication(node):
+        # A restored generic selection cannot replace adjudication of an exact
+        # target with permission to formalize an arbitrary supporting lemma.
+        return {}
     if node is not None and graph_node_frontier_quarantined(node):
         return {}
     selected_graph_work = {**node_metadata, **merged}
@@ -4652,23 +4774,31 @@ async def _check_graph_native_formalization_replay(
     usage_sources: Sequence[str] = (),
 ) -> Any:
     from ...helper_utilization import declaration_usage_kwargs
+    from ...verified_helper_contract import helper_contract_context_guard
 
+    preamble = str(getattr(conv, "preamble", "") or "")
+    checked_helpers = tuple(replay_helpers)
+    runner_is_current = helper_contract_context_guard(lean)
     try:
-        return await lean.check(
+        result = await lean.check(
             "True",
             "by\n  trivial",
-            list(replay_helpers),
-            preamble_override=str(getattr(conv, "preamble", "") or ""),
+            list(checked_helpers),
+            preamble_override=preamble,
             check_kind="graph_native_formalization_helper",
             **declaration_usage_kwargs(lean, usage_sources),
         )
     except TypeError:
-        return await lean.check(
+        result = await lean.check(
             "True",
             "by\n  trivial",
-            list(replay_helpers),
-            preamble_override=str(getattr(conv, "preamble", "") or ""),
+            list(checked_helpers),
+            preamble_override=preamble,
         )
+    if (not runner_is_current() or tuple(replay_helpers) != checked_helpers
+            or str(getattr(conv, "preamble", "") or "") != preamble):
+        raise ValueError("checked Lean context changed during formalization replay")
+    return result
 
 
 def _formalization_parent_target_statement(contract: Dict[str, Any]) -> str:
@@ -5711,7 +5841,30 @@ def _auxiliary_bridge_typed_surface_key(statement: str) -> str:
             index = close_index
         return "".join(out)
 
-    return graph_statement_key(normalize_segment(raw))
+    normalized = normalize_segment(raw).strip()
+    relation_parts = _graph_split_top_level_relation(normalized)
+    if len(relation_parts) == 2:
+        left, right = relation_parts
+        operator = normalized[len(left):len(normalized) - len(right)].strip()
+        arithmetic_operands = all(
+            re.fullmatch(r"[\w\s'+*/^().:\[\]{}-]+", part)
+            and not re.search(
+                r"\b(?:if|then|else|match|with|let|in|fun|forall|exists|by|do)\b",
+                part,
+            )
+            and "/-" not in part and "--" not in part
+            for part in relation_parts
+        )
+        if operator == "=" and arithmetic_operands:
+            # Keep operands separate: reconstructing unparenthesized Lean
+            # could change binder, logical, or conditional scope. This key is
+            # only for arithmetic equality support, never proof authority.
+            return json.dumps([
+                "arithmetic_equality",
+                graph_statement_key(_graph_strip_balanced_outer_parens(left)),
+                graph_statement_key(_graph_strip_balanced_outer_parens(right)),
+            ])
+    return graph_statement_key(normalized)
 
 
 def _auxiliary_bridge_relevance_status(
@@ -6369,6 +6522,109 @@ def _mark_graph_native_goal_statement_type_rejected(
             pass
 
 
+async def _analyze_graph_native_statement_contract(
+    lean: Any, *, statement: str, preamble: str,
+    replay_helpers: Sequence[str], declaration_source: str = "",
+) -> Any:
+    """Observe a checked declaration, or a target in its ordered Lean context."""
+    analyzer = getattr(lean, "analyze_statement_contracts", None)
+    if not callable(analyzer) or not str(statement or "").strip():
+        return None
+    from ...verified_helper_contract import helper_contract_context_guard
+
+    runner_is_current = helper_contract_context_guard(lean)
+    try:
+        parameters = inspect.signature(analyzer).parameters
+        required = {"declaration_context"}
+        if declaration_source:
+            required.update(("declaration_names", "declaration_sources"))
+        if not required <= parameters.keys():
+            return None
+        options: Dict[str, Any] = {
+            "preamble_override": preamble,
+            "declaration_context": tuple(replay_helpers),
+        }
+        if declaration_source:
+            name = helper_decl_name(declaration_source)
+            if not name:
+                return None
+            options.update(
+                declaration_names=(name,),
+                declaration_sources=(declaration_source,),
+            )
+        analyses, _output, returncode = await analyzer([statement], **options)
+    except Exception as exc:
+        if not runner_is_current():
+            raise ValueError("checked Lean context changed during formalization contract observation") from exc
+        return None
+    if not runner_is_current():
+        raise ValueError("checked Lean context changed during formalization contract observation")
+    if returncode != 0 or not isinstance(analyses, (list, tuple)) or len(analyses) != 1:
+        return None
+    analysis = analyses[0]
+    if not has_lean_contract_identity(str(getattr(analysis, "structural_identity", "") or "")):
+        return None
+    return analysis
+
+
+async def _analyze_graph_native_declaration_contracts(
+    lean: Any, *, sources: Sequence[str], preamble: str,
+    replay_helpers: Sequence[str],
+) -> Dict[str, Any]:
+    """Observe a checked declaration group in one source-position-bound batch."""
+    analyzer = getattr(lean, "analyze_statement_contracts", None)
+    if not callable(analyzer) or not sources:
+        return {}
+    from ...verified_helper_contract import helper_contract_context_guard
+
+    runner_is_current = helper_contract_context_guard(lean)
+    try:
+        required = {"declaration_context", "declaration_names", "declaration_sources"}
+        if not required <= inspect.signature(analyzer).parameters.keys():
+            return {}
+        names = tuple(helper_decl_name(source) for source in sources)
+        if not all(names):
+            return {}
+        analyses, _output, returncode = await analyzer(
+            tuple(helper_decl_statement(source) for source in sources),
+            preamble_override=preamble, declaration_context=tuple(replay_helpers),
+            declaration_names=names, declaration_sources=tuple(sources),
+        )
+    except Exception as exc:
+        if not runner_is_current():
+            raise ValueError("checked Lean context changed during formalization contract observation") from exc
+        return {}
+    if not runner_is_current():
+        raise ValueError("checked Lean context changed during formalization contract observation")
+    if returncode != 0 or not isinstance(analyses, (tuple, list)) or len(analyses) != len(sources):
+        return {}
+    return {
+        source: analysis for source, analysis in zip(sources, analyses)
+        if has_lean_contract_identity(str(getattr(analysis, "structural_identity", "") or ""))
+    }
+
+
+def _bind_checked_graph_native_contract(node: Any, analysis: Any, environment_hash: str) -> None:
+    """Bind a freshly observed target type to its current graph statement."""
+    from ensemble_prover.contract_identity import (
+        lean_contract_statement_source_key,
+        make_lean_contract_evidence_receipt,
+    )
+
+    identity = str(getattr(analysis, "structural_identity", "") or "")
+    if node is None or not has_lean_contract_identity(identity):
+        return
+    key = lean_contract_statement_source_key(str(node.statement or ""))
+    node.metadata.update({
+        "contract_identity": identity,
+        "contract_identity_statement_key": key,
+        "contract_identity_environment_hash": environment_hash,
+        "contract_identity_evidence_receipt": make_lean_contract_evidence_receipt(
+            identity, key, environment_hash,
+        ),
+    })
+
+
 async def _run_graph_native_formalization_helper_contract(
     *,
     session: Any,
@@ -6431,6 +6687,18 @@ async def _run_graph_native_formalization_helper_contract(
     graph = getattr(dossier, "proof_graph", None)
     node_id = str(contract.get("node_id") or "").strip()
     node = getattr(graph, "nodes", {}).get(node_id) if graph is not None else None
+    initial_node_id, initial_node = node_id, node
+    initial_statement = str(getattr(node, "statement", "") or "")
+    dispatch_publication_guard = publication_guard
+
+    def publication_guard() -> None:
+        dispatch_publication_guard()
+        if initial_node is not None and (
+            getattr(graph, "nodes", {}).get(initial_node_id) is not initial_node
+            or str(initial_node.statement or "") != initial_statement
+        ):
+            raise ValueError("formalization target changed during verification")
+
     candidates = _formalization_helper_candidates(
         helpers,
         lemma_dag_candidates,
@@ -6500,6 +6768,7 @@ async def _run_graph_native_formalization_helper_contract(
     last_bridge_status: Dict[str, Any] = {}
     last_rejected_statement = ""
     banked_rejected_candidate_names: List[str] = []
+    last_declaration_lean_ok: Optional[bool] = None
 
     async def authoritative_exact_negation_outcome(
         *,
@@ -6739,38 +7008,19 @@ async def _run_graph_native_formalization_helper_contract(
     async def analyze_verified_statement_contract(
         statement: str,
         replay_helpers: Sequence[str],
+        *, declaration_source: str = "",
     ) -> Any:
-        analyzer = getattr(lean, "analyze_statement_contracts", None)
-        if not callable(analyzer) or not str(statement or "").strip():
-            return None
-        try:
-            analyses, _output, returncode = await analyzer(
-                [statement],
-                preamble_override="\n\n".join(
-                    part
-                    for part in (
-                        str(getattr(conv, "preamble", "") or "").strip(),
-                        *(
-                            str(block or "").strip()
-                            for block in replay_helpers
-                        ),
-                    )
-                    if part
-                ),
-            )
-        except Exception:
-            return None
-        if returncode != 0 or not isinstance(analyses, (list, tuple)) or len(analyses) != 1:
-            return None
-        analysis = analyses[0]
-        if not has_lean_contract_identity(
-            str(getattr(analysis, "structural_identity", "") or "")
-        ):
-            return None
-        return analysis
+        return await _analyze_graph_native_statement_contract(
+            lean, statement=statement,
+            preamble=str(getattr(conv, "preamble", "") or ""),
+            replay_helpers=replay_helpers, declaration_source=declaration_source,
+        )
 
     for candidate in candidates:
         formal_statement = helper_decl_statement(candidate)
+        last_rejected_statement = formal_statement
+        last_bridge_status = {}
+        last_declaration_lean_ok = None
         same_turn_dependency_analysis_prefix_blocks: List[str] = [
             *same_turn_prefix_blocks,
             *replay_only_prefix_blocks,
@@ -6813,6 +7063,7 @@ async def _run_graph_native_formalization_helper_contract(
             replay_helpers=candidate_replay_helpers,
             usage_sources=[*pre_replay_dependency_blocks, candidate],
         )
+        last_declaration_lean_ok = bool(getattr(result, "ok", False))
         if not bool(getattr(result, "ok", False)):
             replay_only_prefix_names = _replay_only_prefix_names(
                 same_turn_dependency_analysis_prefix_blocks
@@ -6869,10 +7120,35 @@ async def _run_graph_native_formalization_helper_contract(
                 if name not in banked_rejected_candidate_names:
                     banked_rejected_candidate_names.append(name)
             continue
-        contract_analysis = await analyze_verified_statement_contract(
-            formal_statement,
-            candidate_replay_helpers,
+        from ...verified_helper_contract import (
+            helper_contract_context_is_plain,
+            helper_source_contract_is_context_sensitive,
+            helper_source_requires_contract_analysis,
+            verified_helper_contract_fields,
         )
+
+        contract_context_is_plain = helper_contract_context_is_plain(
+            lean, preamble=str(getattr(conv, "preamble", "") or ""),
+            context=context_helpers,
+        )
+        candidate_context_is_plain = contract_context_is_plain and helper_contract_context_is_plain(
+            lean, preamble=str(getattr(conv, "preamble", "") or ""),
+            context=pre_replay_dependency_blocks,
+        )
+        scoped_candidate = helper_source_contract_is_context_sensitive(
+            candidate, context_is_plain=candidate_context_is_plain,
+        )
+        observation_sources = tuple(dict.fromkeys([
+            *(block for block in pre_replay_dependency_blocks
+              if helper_source_requires_contract_analysis(block, context_is_plain=candidate_context_is_plain)),
+            candidate,
+        ]))
+        declaration_analyses = await _analyze_graph_native_declaration_contracts(
+            lean, sources=observation_sources,
+            preamble=str(getattr(conv, "preamble", "") or ""),
+            replay_helpers=candidate_replay_helpers,
+        )
+        contract_analysis = declaration_analyses.get(candidate)
         bridge_status = _formalization_bridge_status(
             contract,
             formal_statement,
@@ -6881,6 +7157,38 @@ async def _run_graph_native_formalization_helper_contract(
                 getattr(contract_analysis, "structural_identity", "") or ""
             ),
         )
+        checked_target_analysis = None
+        if scoped_candidate and bridge_status.get("reason") in {
+            "exact_executable_target", "formalization_statement_mismatches_executable_target",
+        }:
+            if node is not None and graph_exact_statement_text(initial_statement) != graph_exact_statement_text(
+                str(contract.get("target_statement") or "")
+            ):
+                raise ValueError("formalization target changed before contract observation")
+            # The helper's namespace and new same-turn declarations cannot
+            # determine what the already selected target meant.
+            checked_target_analysis = await analyze_verified_statement_contract(
+                str(contract.get("target_statement") or ""), context_helpers,
+            )
+            from ensemble_prover.contract_identity import parse_lean_contract_identity
+
+            helper_identity = parse_lean_contract_identity(str(
+                getattr(contract_analysis, "structural_identity", "") or ""
+            ))
+            target_identity = parse_lean_contract_identity(str(
+                getattr(checked_target_analysis, "structural_identity", "") or ""
+            ))
+            if not helper_identity or not target_identity or helper_identity[0] != target_identity[0]:
+                checked_target_analysis = None
+                bridge_status = {
+                    "accepted": False, "closes_target": False,
+                    "reason": "formalization_helper_target_contract_mismatch",
+                }
+            else:
+                bridge_status = {
+                    "accepted": True, "closes_target": True,
+                    "reason": "exact_typed_executable_target",
+                }
         parent_closure_checked = False
         checked_parent_statement = ""
         parent_obligation_id = ""
@@ -7008,54 +7316,6 @@ async def _run_graph_native_formalization_helper_contract(
                 )
                 node_metadata["rejected_formalization_candidates"] = rejected[-5:]
                 node_metadata["formalization_bridge_required"] = True
-                same_rejections = [
-                    item
-                    for item in rejected
-                    if str(item.get("statement") or "") == formal_statement
-                    and str(item.get("reason") or "") == last_failure
-                ]
-                same_reason_rejections = [
-                    item
-                    for item in rejected
-                    if str(item.get("reason") or "") == last_failure
-                ]
-                nonprogress_bridge_rejection_reasons = {
-                    "auxiliary_bridge_statement_unrelated_to_parent",
-                    "auxiliary_bridge_support_lacks_mathematical_relation",
-                    "formalization_bridge_required",
-                    "bridge_assumes_own_conclusion",
-                    "bridge_assumes_parent_target",
-                    "bridge_contract_ambiguous_proof_binder",
-                }
-                repeated_relevance_count = sum(
-                    1
-                    for item in rejected
-                    if str(item.get("reason") or "")
-                    in nonprogress_bridge_rejection_reasons
-                )
-                repeated_bridge_count = max(
-                    len(same_rejections),
-                    repeated_relevance_count,
-                )
-                suppress_repeated_bridge = (
-                    repeated_bridge_count >= 3
-                    and not bool(
-                        node_metadata.get(
-                            "formalization_repeated_unrelated_bridge_suppressed"
-                        )
-                    )
-                )
-                if suppress_repeated_bridge:
-                    node_metadata["schedulable"] = False
-                    node_metadata[
-                        "formalization_repeated_unrelated_bridge_suppressed"
-                    ] = True
-                    node_metadata[
-                        "formalization_repeated_unrelated_bridge_reason"
-                    ] = last_failure
-                    node_metadata[
-                        "formalization_repeated_unrelated_bridge_count"
-                    ] = repeated_bridge_count
             increment = getattr(session, "_increment_dossier_metric", None)
             if callable(increment):
                 increment("mini_session_graph_formalization_bridge_rejected", 1)
@@ -7067,11 +7327,6 @@ async def _run_graph_native_formalization_helper_contract(
                 }:
                     increment(
                         "mini_session_graph_formalization_negative_bridge_support_rejected",
-                        1,
-                    )
-                if node is not None and suppress_repeated_bridge:
-                    increment(
-                        "mini_session_graph_formalization_repeated_bridge_suppressed",
                         1,
                     )
             _emit_record(session, {
@@ -7087,17 +7342,6 @@ async def _run_graph_native_formalization_helper_contract(
                 ),
                 "verdict": "graph_native_formalization_bridge_rejected",
             })
-            if node is not None and suppress_repeated_bridge:
-                _emit_record(session, {
-                    **common_payload,
-                    "helper_statement": formal_statement,
-                    "graph_native_formalization_contract": dict(contract),
-                    "rejection_reason": last_failure,
-                    "repeat_count": repeated_bridge_count,
-                    "same_statement_repeat_count": len(same_rejections),
-                    "same_reason_repeat_count": len(same_reason_rejections),
-                    "verdict": "graph_native_formalization_repeated_bridge_suppressed",
-                })
             if helper_decl_name(candidate):
                 same_turn_prefix_blocks.append(candidate)
             continue
@@ -7195,6 +7439,14 @@ async def _run_graph_native_formalization_helper_contract(
                     ["route_support_only_dependency"] if route_support_only else []
                 ),
                 visibility_policy=route_support_visibility,
+                contract_observation_required=helper_source_contract_is_context_sensitive(
+                    dependency_block, context_is_plain=candidate_context_is_plain,
+                ),
+                **verified_helper_contract_fields(
+                    declaration_analyses.get(dependency_block),
+                    statement=helper_decl_statement(dependency_block),
+                    environment_hash=str(dossier.current_lean_environment_hash or ""),
+                ),
             )
             if dependency_record is None:
                 dependency_banking_failed = True
@@ -7241,6 +7493,7 @@ async def _run_graph_native_formalization_helper_contract(
                 replay_helpers=candidate_standalone_replay_helpers,
                 usage_sources=[candidate],
             )
+            last_declaration_lean_ok = bool(getattr(candidate_standalone, "ok", False))
             if not bool(getattr(candidate_standalone, "ok", False)):
                 last_failure = (
                     "same-turn helper dependency requires replay-only prefix"
@@ -7273,19 +7526,11 @@ async def _run_graph_native_formalization_helper_contract(
             ],
             provenance_tags=route_support_provenance,
             visibility_policy=route_support_visibility,
-            contract_identity=str(
-                getattr(contract_analysis, "structural_identity", "") or ""
+            contract_observation_required=scoped_candidate,
+            **verified_helper_contract_fields(
+                contract_analysis, statement=formal_statement,
+                environment_hash=str(dossier.current_lean_environment_hash or ""),
             ),
-            contract_display_statement=str(
-                getattr(contract_analysis, "display_type", "") or ""
-            ),
-            contract_binder_sorts=tuple(
-                getattr(contract_analysis, "binder_sorts", ()) or ()
-            ),
-            contract_proof_binder_types=tuple(
-                getattr(contract_analysis, "proof_binder_types", ()) or ()
-            ),
-            _contract_identity_statement=formal_statement,
         )
         if helper_record is None:
             last_failure = "verified helper policy rejected the declaration"
@@ -7756,16 +8001,21 @@ async def _run_graph_native_formalization_helper_contract(
                         "pre_formalization_statement",
                         old_statement,
                     )
-                node.statement = formal_statement
+                node.statement = old_statement if checked_target_analysis is not None else formal_statement
                 node.metadata["formalization_required"] = False
                 node.metadata["formalized_by_helper_name"] = helper_name
-                node.metadata["formalized_statement"] = formal_statement
+                node.metadata["formalized_statement"] = node.statement
                 # The placeholder may predate the current Lean environment or
                 # carry no environment stamp at all.  This exact declaration
                 # was just replay-checked in the dossier's current context;
                 # bind the now-executable node to that same context before the
                 # helper-certification gate compares their receipts.
                 node.metadata.update(dossier.statement_environment_metadata())
+                if scoped_candidate:
+                    _bind_checked_graph_native_contract(
+                        node, checked_target_analysis or contract_analysis,
+                        str(dossier.current_lean_environment_hash or ""),
+                    )
                 helper_node_id = graph.helper_name_to_node_id.get(helper_name, "")
                 graph.mark_obligation_proved_by_helper(
                     node.node_id,
@@ -7805,6 +8055,11 @@ async def _run_graph_native_formalization_helper_contract(
                         parent_obligation.metadata[
                             "formalized_statement"
                         ] = formal_statement
+                        if scoped_candidate:
+                            _bind_checked_graph_native_contract(
+                                parent_obligation, contract_analysis,
+                                str(dossier.current_lean_environment_hash or ""),
+                            )
                         graph.mark_obligation_proved_by_helper(
                             parent_obligation.node_id,
                             helper_node_id,
@@ -7849,6 +8104,10 @@ async def _run_graph_native_formalization_helper_contract(
                         ),
                     }
             elif node_kind == "proposed_claim":
+                if checked_target_analysis is not None:
+                    _bind_checked_graph_native_contract(
+                        node, checked_target_analysis, str(dossier.current_lean_environment_hash or ""),
+                    )
                 variant = graph.record_formal_variant(
                     claim_node_id=node.node_id,
                     claim_name=str(getattr(node, "name", "") or ""),
@@ -7869,6 +8128,11 @@ async def _run_graph_native_formalization_helper_contract(
                 )
                 variant_node_id = variant.node_id
                 target_node_id = variant.node_id
+                if scoped_candidate:
+                    _bind_checked_graph_native_contract(
+                        variant, checked_target_analysis or contract_analysis,
+                        str(dossier.current_lean_environment_hash or ""),
+                    )
                 helper_node_id = graph.helper_name_to_node_id.get(helper_name, "")
                 graph.mark_variant_proved_by_helper(
                     variant.node_id,
@@ -7878,6 +8142,11 @@ async def _run_graph_native_formalization_helper_contract(
                     support_names=candidate_support_names,
                 )
             elif node_kind == "formal_variant":
+                if scoped_candidate:
+                    _bind_checked_graph_native_contract(
+                        node, checked_target_analysis or contract_analysis,
+                        str(dossier.current_lean_environment_hash or ""),
+                    )
                 helper_node_id = graph.helper_name_to_node_id.get(helper_name, "")
                 graph.mark_variant_proved_by_helper(
                     node.node_id,
@@ -7966,10 +8235,38 @@ async def _run_graph_native_formalization_helper_contract(
         bridge_status=last_bridge_status,
         rejected_statement=last_rejected_statement,
     )
+    if last_declaration_lean_ok is True:
+        feedback = (
+            "Lean accepted the declaration. Its relationship to the selected "
+            "graph task was not accepted; this is not a Lean proof error. "
+            "Do not repeat the same declaration without addressing the graph "
+            "contract below.\n\n" + feedback
+        )
+        rejected_key = graph_statement_key(last_rejected_statement)
+        retained_names = [
+            name
+            for block in context_helpers
+            if (name := helper_decl_name(block))
+            and graph_statement_key(helper_decl_statement(block))
+            == rejected_key
+        ]
+        if retained_names:
+            feedback += (
+                "\nThe replay context already contains this helper statement as "
+                + ", ".join(f"`{name}`" for name in retained_names)
+                + ". Use that retained result to address the remaining obligation; "
+                "reproving the helper alone does not discharge that obligation. "
+                "This statement match is a retrieval hint, not a target-closure certificate."
+            )
     try:
         conv.append_user(feedback)
     except Exception:
         pass
+    rejection_stage = (
+        "graph_contract" if last_declaration_lean_ok is True
+        else "lean" if last_declaration_lean_ok is False
+        else "dependency"
+    )
     _emit_record(session, {
         **common_payload,
         "rejection_reason": "formalization_helper_declaration_rejected",
@@ -7977,11 +8274,16 @@ async def _run_graph_native_formalization_helper_contract(
         "graph_native_formalization_contract": dict(contract),
         "formalization_bridge_status": dict(last_bridge_status),
         "lean_output": last_failure,
+        "lean_ok": last_declaration_lean_ok,
+        "verification_stage": rejection_stage,
         "banked_proposed_helpers": list(banked_rejected_candidate_names),
         "formalization_rejected_helpers_banked_proposed": list(
             banked_rejected_candidate_names
         ),
-        "verdict": "lean_rejected",
+        "verdict": (
+            "lean_rejected" if last_declaration_lean_ok is False
+            else "proof_policy_rejected"
+        ),
     })
     return MiniOutcome(
         action_id=action_id,
@@ -7997,6 +8299,8 @@ async def _run_graph_native_formalization_helper_contract(
             "conv_turn_index_phase": phase_turn,
             **_turn_budget_metadata(common_payload),
             "lean_verdict": "formalization_helper_declaration_rejected",
+            "lean_ok": last_declaration_lean_ok,
+            "verification_stage": rejection_stage,
             "lean_error": last_failure,
             "graph_native_formalization_contract": dict(contract),
             "formalization_bridge_status": dict(last_bridge_status),
@@ -8477,7 +8781,7 @@ def _should_defer_post_failure_search(
     expensive_budget_enabled = (
         float(proof_state_child_tactic_timeout_s or 0.0) > 0.0
         and (
-            int(proof_state_child_tactic_max_candidates or 0) > 0
+            int(proof_state_child_tactic_max_candidates or 0) != 0
             or int(proof_state_decl_application_limit or 0) > 0
         )
     )
@@ -8524,7 +8828,7 @@ def _lean_failure_wall_signature(failure_analysis: Dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
-class ConversationTurnAction:
+class ConversationTurnAction(ProviderLaneBankMixin):
     id: str = "conversation_turn"
     priority: int = 50
     cost_estimate_s: float = 30.0
@@ -8855,7 +9159,7 @@ class ConversationTurnAction:
         repair_retrieval_top_k: int = 6,
         proof_state_child_tactics_enabled: bool = True,
         proof_state_child_tactic_timeout_s: float = DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-        proof_state_child_tactic_max_candidates: int = 32,
+        proof_state_child_tactic_max_candidates: int = -1,
         proof_state_child_goal_limit: int = 3,
         proof_state_decl_application_limit: int = 6,
         proof_state_batch_parallelism: int = 1,
@@ -8910,6 +9214,11 @@ class ConversationTurnAction:
         self._provider_quantum_yield_generation: int = 0
         self._provider_quantum_yield_consumed_generation: int = 0
         self._provider_quantum_checkpoint: Dict[str, Any] = {}
+        self._provider_quantum_parked: Dict[str, Dict[str, Any]] = {}
+        self._provider_quantum_active_context_identity = ""
+        self._provider_quantum_active_prompt_scope: Dict[str, Any] = {}
+        self._provider_quantum_bank_return_scope: Dict[str, Any] = {}
+        self._provider_quantum_active_digest = ""
         self._provider_quantum_runtime_loaded: bool = False
         # max_turns_for_budget represents the OUTER-
         # loop iteration count for the budget footer, NOT the always-1
@@ -10258,6 +10567,13 @@ class ConversationTurnAction:
             if str(identity or "").strip()
         }
         states: List[Dict[str, Any]] = []
+        parked_to_renew = {}
+        for identity, envelope in self._provider_quantum_parked.items():
+            if retired_lane_identities is not None and identity not in retired:
+                continue
+            body = decode_provider_lane(identity, envelope, self._validated_provider_quantum_checkpoint)
+            parked_to_renew[identity] = body
+            states.append(body["checkpoint"]["state"])
         checkpoint = getattr(self, "_provider_quantum_checkpoint", None)
         if isinstance(checkpoint, dict) and isinstance(
             checkpoint.get("state"), dict
@@ -10297,7 +10613,41 @@ class ConversationTurnAction:
             state.pop("provider_turn_lane_retired", None)
             state.update(dict(self._PROVIDER_LANE_LEASE_STATE_RESET))
             renewed = True
+        for identity, body in parked_to_renew.items():
+            self._provider_quantum_parked[identity] = encode_provider_lane(
+                body["checkpoint"], body["prompt_scope"], body["context_identity"],
+            )
+        if renewed:
+            self._refresh_active_provider_digest()
         return renewed
+
+    @staticmethod
+    def _provider_paid_round_retained(
+        owned_history: List[Dict[str, Any]],
+        live_history: List[Dict[str, Any]],
+        state: Mapping[str, Any],
+    ) -> bool:
+        """Require the original assistant arguments and every tool receipt."""
+
+        pending_ids = {call.get("id") for call in state.get("pending_tool_replay", ())}
+        if not pending_ids or None in pending_ids:
+            return False
+        for index in range(len(owned_history) - 1, -1, -1):
+            message = owned_history[index]
+            calls = message.get("tool_calls", ())
+            if message.get("role") != "assistant" or not calls:
+                continue
+            if not pending_ids.issubset({call.get("id") for call in calls}):
+                continue
+            end = index + 1
+            while end < len(owned_history) and owned_history[end].get("role") == "tool":
+                end += 1
+            paid_round = owned_history[index:end]
+            return any(
+                live_history[start:start + len(paid_round)] == paid_round
+                for start in range(len(live_history) - len(paid_round) + 1)
+            )
+        return False
 
     @classmethod
     def _provider_quantum_timing_only_state(
@@ -10370,15 +10720,17 @@ class ConversationTurnAction:
             # parked wall/tool receipt; it will be validated against the live
             # target and repair cycle when that action is selected again.
             return
+        if self._prepare_provider_lane_parking(session):
+            return
         if not isinstance(raw_state, Mapping) or not raw_state:
-            self._provider_quantum_checkpoint = {}
+            self._clear_active_provider_lane()
             return
         if str(raw_state.get("pending_tool_replay_disposition") or "").strip() == (
             "durable_progress_cutpoint"
         ):
             # This narrower paid continuation has its own authenticated
             # session-level checkpoint owner.
-            self._provider_quantum_checkpoint = {}
+            self._clear_active_provider_lane()
             return
         retained_binding: Dict[str, Any] = {}
         retained_state = self._provider_quantum_checkpoint.get("state")
@@ -10431,7 +10783,7 @@ class ConversationTurnAction:
                 # and wall lease are authenticated to the prior environment;
                 # discard them rather than serializing a snapshot that cannot
                 # replay or rebinding paid state to the new environment.
-                self._provider_quantum_checkpoint = {}
+                self._clear_active_provider_lane()
                 if hasattr(conv, "_provider_call_quantum_state"):
                     delattr(conv, "_provider_call_quantum_state")
                 self._provider_quantum_yield_consumed_generation = int(
@@ -10478,6 +10830,11 @@ class ConversationTurnAction:
                 expected_repair_cycle=live_repair_cycle,
             )
         )
+        self._provider_quantum_active_context_identity = provider_context_identity(session)
+        self._provider_quantum_active_prompt_scope = capture_provider_prompt_scope(
+            session, self._provider_quantum_checkpoint["history"],
+        )
+        self._refresh_active_provider_digest()
 
     def _activate_provider_quantum_checkpoint(self, session: Any) -> bool:
         """Reactivate this role's exact in-memory provider continuation.
@@ -10508,7 +10865,7 @@ class ConversationTurnAction:
                     conv=conv,
                 )
             except StateSnapshotCompatibilityError:
-                self._provider_quantum_checkpoint = {}
+                self._clear_active_provider_lane()
                 return False
             parked_lane_identity = str(
                 parked_checkpoint["state"].get("provider_turn_lane_identity")
@@ -10530,7 +10887,7 @@ class ConversationTurnAction:
                 # action checkpoint is subordinate to the session's durable
                 # spent-lane ledger and cannot restore either selection or
                 # provider state after frontier fairness clears them.
-                self._provider_quantum_checkpoint = {}
+                self._clear_active_provider_lane()
                 return False
             current_selected_record = getattr(
                 session,
@@ -10584,7 +10941,7 @@ class ConversationTurnAction:
                         "mini_session_retired_graph_target_provider_quantum_suppressed"
                     ),
                 ):
-                    self._provider_quantum_checkpoint = {}
+                    self._clear_active_provider_lane()
                     return False
             live_target, live_repair_cycle = self._provider_quantum_live_binding(
                 session
@@ -10597,12 +10954,13 @@ class ConversationTurnAction:
                     expected_repair_cycle=live_repair_cycle,
                 )
             except StateSnapshotCompatibilityError:
-                self._provider_quantum_checkpoint = {}
+                self._clear_active_provider_lane()
                 return False
 
             state = dict(checkpoint["state"])
             checkpoint_history = copy.deepcopy(list(checkpoint["history"]))
             live_history = copy.deepcopy(list(getattr(conv, "history", []) or []))
+            bank_return_scope = self._provider_quantum_bank_return_scope
             checkpoint_is_live_prefix = bool(
                 len(checkpoint_history) <= len(live_history)
                 and live_history[: len(checkpoint_history)] == checkpoint_history
@@ -10611,12 +10969,28 @@ class ConversationTurnAction:
                 len(live_history) <= len(checkpoint_history)
                 and checkpoint_history[: len(live_history)] == live_history
             )
-            if checkpoint_is_live_prefix:
+            if bank_return_scope:
+                # This exact authenticated lane owns its protocol transcript.
+                # Another graph target's local history belongs to its banked lane.
+                merged_history = checkpoint_history
+                transcript_disposition = "owned_lane_transcript_restored"
+            elif checkpoint_is_live_prefix:
                 merged_history = live_history
                 transcript_disposition = "live_transcript_retained"
             elif live_is_checkpoint_prefix:
                 merged_history = checkpoint_history
                 transcript_disposition = "checkpoint_transcript_restored"
+            elif state.get("pending_tool_replay") and self._live_provider_quantum_owns_checkpoint(session):
+                # Local compaction may annotate an intact paid protocol round.
+                # A same-lane mirror alone cannot authenticate altered arguments
+                # or tool receipts: recover the original owned transcript then.
+                if self._provider_paid_round_retained(checkpoint_history, live_history, state):
+                    merged_history = live_history
+                    transcript_disposition = "owned_paid_tool_transcript_retained"
+                else:
+                    merged_history = checkpoint_history
+                    bank_return_scope = self._provider_quantum_active_prompt_scope
+                    transcript_disposition = "owned_paid_tool_transcript_restored"
             else:
                 # Sibling roles can append mutually divergent transcripts.
                 # Preserve the live mathematical evidence and the exact
@@ -10636,12 +11010,23 @@ class ConversationTurnAction:
                     expected_repair_cycle=live_repair_cycle,
                 )
 
+            checkpoint = self._validated_provider_quantum_checkpoint(
+                {"state": state, "history": merged_history, "binding": checkpoint["binding"]},
+                conv=conv, expected_target=live_target,
+                expected_repair_cycle=live_repair_cycle,
+            )
+
             conv._provider_turn_repair_cycle_identity = str(
                 live_repair_cycle or ""
             )
             conv._provider_call_quantum_state = copy.deepcopy(state)
             conv.history = merged_history
+            if bank_return_scope:
+                restore_provider_prompt_scope(session, bank_return_scope)
+                self._provider_quantum_active_prompt_scope = bank_return_scope
+                self._provider_quantum_bank_return_scope = {}
             self._provider_quantum_checkpoint = copy.deepcopy(checkpoint)
+            self._refresh_active_provider_digest()
             # The provider state, transcript, action checkpoint, and role now
             # form one coherent ownership transfer. Observational telemetry
             # must not make a late external stop roll back only the role.
@@ -10712,8 +11097,23 @@ class ConversationTurnAction:
                 parked,
                 require_exact_verification_state=True,
             )
-        return {
-            "schema_version": schema_version,
+        state = {
+            "schema_version": 7,
+            "verifier_schema_version": schema_version,
+            "provider_quantum_parked": {
+                lane_id: copy_provider_envelope(envelope)
+                for lane_id, envelope in self._provider_quantum_parked.items()
+            },
+            "provider_quantum_active_context_identity": (
+                self._provider_quantum_active_context_identity if self._provider_quantum_checkpoint else ""
+            ),
+            "provider_quantum_active_prompt_scope": copy.deepcopy(
+                (self._provider_quantum_bank_return_scope or self._provider_quantum_active_prompt_scope)
+                if self._provider_quantum_checkpoint else {}
+            ),
+            "provider_quantum_activation_pending": bool(
+                self._provider_quantum_checkpoint and self._provider_quantum_bank_return_scope
+            ),
             "answer_safe_recheck_pending": pending,
             "answer_safe_recheck_parked": parked,
             "answer_safe_recheck_parked_order": list(
@@ -10736,6 +11136,22 @@ class ConversationTurnAction:
                 self._provider_quantum_yield_consumed_generation
             ),
         }
+        if self._provider_quantum_checkpoint and not (
+            self._provider_quantum_active_context_identity
+            and state["provider_quantum_active_prompt_scope"]
+        ):
+            # Legacy active owners become context-bound only at live session
+            # synchronization. Keep apply/export portable before that boundary.
+            if self._provider_quantum_parked:
+                raise StateSnapshotCompatibilityError("provider bank has an unbound legacy active owner")
+            for key in (
+                "verifier_schema_version", "provider_quantum_parked",
+                "provider_quantum_active_context_identity", "provider_quantum_active_prompt_scope",
+                "provider_quantum_activation_pending",
+            ):
+                state.pop(key)
+            state["schema_version"] = schema_version
+        return state
 
     def apply_scheduler_runtime_state(self, state: Any) -> None:
         """Restore a schema-validated verifier-only continuation."""
@@ -10745,6 +11161,40 @@ class ConversationTurnAction:
                 "conversation runtime state is malformed"
             )
         schema_version = state.get("schema_version")
+        if type(schema_version) is not int:
+            raise StateSnapshotCompatibilityError("conversation runtime version is malformed")
+        bank_schema = schema_version == 7
+        provider_parked = {}
+        active_context = ""
+        active_prompt_scope = {}
+        activation_pending = False
+        if schema_version == 7:
+            extra_keys = {
+                "verifier_schema_version", "provider_quantum_parked",
+                "provider_quantum_active_context_identity", "provider_quantum_active_prompt_scope",
+                "provider_quantum_activation_pending",
+            }
+            if (not extra_keys <= state.keys()
+                    or type(state["verifier_schema_version"]) is not int
+                    or state["verifier_schema_version"] not in {5, 6}):
+                raise StateSnapshotCompatibilityError("conversation runtime verifier format is malformed")
+            raw_parked = state["provider_quantum_parked"]
+            if type(raw_parked) is not dict:
+                raise StateSnapshotCompatibilityError("conversation provider lane bank is malformed")
+            for lane_id, envelope in raw_parked.items():
+                body = decode_provider_lane(lane_id, envelope, self._validated_provider_quantum_checkpoint)
+                upgraded = copy_provider_envelope(envelope)
+                upgraded["header"] = authenticated_provider_lane_header(body)
+                provider_parked[lane_id] = upgraded
+            active_context = state["provider_quantum_active_context_identity"]
+            active_prompt_scope = copy.deepcopy(state["provider_quantum_active_prompt_scope"])
+            activation_pending = state["provider_quantum_activation_pending"]
+            if (type(active_context) is not str or (active_context and len(active_context) != 64)
+                    or type(active_prompt_scope) is not dict or type(activation_pending) is not bool):
+                raise StateSnapshotCompatibilityError("conversation provider active context is malformed")
+            verifier_schema_version = state["verifier_schema_version"]
+            state = {key: value for key, value in state.items() if key not in extra_keys}
+            schema_version = state["schema_version"] = verifier_schema_version
         if schema_version == 1:
             expected_keys = {"schema_version", "answer_safe_recheck_pending"}
         elif schema_version == 2:
@@ -10886,10 +11336,25 @@ class ConversationTurnAction:
                 raise StateSnapshotCompatibilityError(
                     "conversation verifier binding has duplicate ownership"
                 )
+        active_lane = provider_quantum_checkpoint.get("state", {}).get("provider_turn_lane_identity")
+        if active_lane in provider_parked:
+            raise StateSnapshotCompatibilityError("conversation provider lane has duplicate ownership")
+        if bank_schema and bool(provider_quantum_checkpoint) != bool(active_context and active_prompt_scope):
+            raise StateSnapshotCompatibilityError("conversation provider active authority is missing")
+        if not provider_quantum_checkpoint and (active_context or active_prompt_scope or activation_pending):
+            raise StateSnapshotCompatibilityError("conversation provider inactive authority is malformed")
+        if active_prompt_scope:
+            from ..provider_lane_bank import validate_provider_prompt_scope
+            validate_provider_prompt_scope(active_prompt_scope, provider_quantum_checkpoint.get("history", []))
+        self._provider_quantum_parked = provider_parked
+        self._provider_quantum_active_context_identity = active_context
+        self._provider_quantum_active_prompt_scope = active_prompt_scope
+        self._provider_quantum_bank_return_scope = active_prompt_scope if activation_pending else {}
         self._answer_safe_recheck_pending = pending
         self._answer_safe_recheck_parked = parked
         self._answer_safe_recheck_held_terminal_provider_failure = held_terminal
         self._provider_quantum_checkpoint = provider_quantum_checkpoint
+        self._refresh_active_provider_digest()
         self._provider_quantum_runtime_loaded = bool(
             schema_version
             in {5, self._ANSWER_SAFE_RECHECK_RUNTIME_SCHEMA_VERSION}
@@ -10919,6 +11384,26 @@ class ConversationTurnAction:
             )
         if not self._provider_quantum_runtime_loaded:
             return
+        self._prune_parked_provider_lanes(session)
+        if self._provider_quantum_checkpoint:
+            conv = getattr(session, "conv", None)
+            if str(getattr(conv, "role", "") or "").strip() == self.role:
+                self._validated_provider_quantum_checkpoint(self._provider_quantum_checkpoint, conv=conv)
+            current_context = provider_context_identity(session)
+            if (self._provider_quantum_active_context_identity
+                    and self._provider_quantum_active_context_identity != current_context):
+                raise StateSnapshotCompatibilityError("conversation provider active context changed")
+            if not self._provider_quantum_active_context_identity:
+                self._provider_quantum_active_context_identity = current_context
+            if self._prepare_provider_lane_parking(session):
+                if not self._provider_quantum_bank_return_scope:
+                    session._clear_selected_work_item()
+                return
+        elif self._provider_quantum_parked:
+            raw = getattr(session.conv, "_provider_call_quantum_state", None)
+            if isinstance(raw, Mapping) and raw.get("provider_turn_lane_identity") in self._provider_quantum_parked:
+                delattr(session.conv, "_provider_call_quantum_state")
+            return
         parked_lane_identity = str(
             self._provider_quantum_checkpoint.get("state", {}).get(
                 "provider_turn_lane_identity"
@@ -10933,7 +11418,7 @@ class ConversationTurnAction:
             )
             or set()
         ):
-            self._provider_quantum_checkpoint = {}
+            self._clear_active_provider_lane()
             return
         conv = getattr(session, "conv", None)
         if conv is None:
@@ -11021,6 +11506,8 @@ class ConversationTurnAction:
         )
         conv._provider_call_quantum_state = copy.deepcopy(checkpoint["state"])
         conv.history = copy.deepcopy(checkpoint["history"])
+        if self._provider_quantum_active_prompt_scope:
+            restore_provider_prompt_scope(session, self._provider_quantum_active_prompt_scope)
         if selected_work_record:
             checkpoint["binding"]["selected_work_record"] = (
                 self._compact_provider_quantum_selected_work_record(
@@ -11030,6 +11517,9 @@ class ConversationTurnAction:
             )
             self._provider_quantum_checkpoint = copy.deepcopy(checkpoint)
             session._provider_quantum_selected_work_restored = True
+        if not self._provider_quantum_active_prompt_scope:
+            self._provider_quantum_active_prompt_scope = capture_provider_prompt_scope(session, checkpoint["history"])
+        self._refresh_active_provider_digest()
 
     def has_answer_safe_recheck_work(
         self,
@@ -11160,6 +11650,54 @@ class ConversationTurnAction:
             ) == clean_identity:
                 return True
         return False
+
+    @staticmethod
+    def _current_answer_safe_execution_binding(
+        session: Any, *, graph_native_target: Optional[Mapping[str, Any]] = None,
+        active_root_targets: Optional[Sequence[Any]] = None,
+    ) -> Dict[str, Any]:
+        conv, dossier = session.conv, session.dossier
+        selected_record = dict(getattr(session, "selected_work_item_record", {}) or {})
+        if graph_native_target is None:
+            graph_native_target = _selected_graph_native_proof_target(session, for_prop_check=True)
+        initial_framed_active_root_targets = (
+            active_root_targets if active_root_targets is not None else
+            _framed_active_root_targets_for_turn(dossier=dossier, conv=conv)
+        )
+        return {
+            "graph_node_id": str(graph_native_target.get("node_id") or ""),
+            "graph_work_type": str(graph_native_target.get("work_type") or ""),
+            "graph_statement": str(graph_native_target.get("statement") or "").strip(),
+            "graph_scope_key": str(_graph_selected_work_scope_key(session) or ""),
+            "selected_node_id": str(selected_record.get("node_id") or ""),
+            "selected_variant_id": str(selected_record.get("variant_id") or ""),
+            "selected_work_type": str(selected_record.get("work_type") or "").strip(),
+            "selected_mapped_action": str(selected_record.get("mapped_action_id") or "").strip(),
+            "selected_context_digest": str(
+                (getattr(session, "_selected_proof_idea_context_digest", "") or "") if selected_record else ""
+            ),
+            "root_statement": str(
+                getattr(dossier, "root_statement", "") or ""
+            ),
+            "conversation_goal_statement": str(
+                getattr(conv, "goal_statement", "") or ""
+            ),
+            "lean_preamble": str(getattr(conv, "lean_preamble", "") or ""),
+            "prompt_preamble": str(getattr(conv, "preamble", "") or ""),
+            "active_root_targets": copy.deepcopy(
+                list(initial_framed_active_root_targets or [])
+            ),
+        }
+
+    def _has_current_answer_safe_recheck_work(self, session: Any) -> bool:
+        if not self._answer_safe_recheck_pending and not self._answer_safe_recheck_parked:
+            return False
+        expected = self._current_answer_safe_execution_binding(session)
+        candidates = (
+            self._validated_answer_safe_recheck_pending_state(self._answer_safe_recheck_pending),
+            *self._validated_answer_safe_recheck_parked_state(self._answer_safe_recheck_parked).values(),
+        )
+        return any(candidate and candidate["execution_binding"] == expected for candidate in candidates)
 
     def rebind_legacy_answer_safe_recheck(
         self,
@@ -11547,8 +12085,9 @@ class ConversationTurnAction:
                 pass
             self._provider_quantum_yield_generation += 1
         else:
-            if not self._live_provider_quantum_owns_checkpoint(_session):
-                self._provider_quantum_checkpoint = {}
+            if (not self._provider_quantum_bank_return_scope
+                    and not self._live_provider_quantum_owns_checkpoint(_session)):
+                self._drop_active_provider_lane(_session)
             self._provider_quantum_yield_consumed_generation = int(
                 self._provider_quantum_yield_generation
             )
@@ -11830,9 +12369,9 @@ class ConversationTurnAction:
         except StateSnapshotCompatibilityError:
             return False
 
-    def is_applicable(self, session: Any) -> bool:
-        if session.conv is None or session.lean is None:
-            return False
+    def _future_provider_exposure_blocked(self, session: Any) -> bool:
+        """Whether new provider work must wait for existing reservations."""
+
         from ...mini_research_budget import pending_research_reservation
 
         reserved_dispatches, reserved_seconds = pending_research_reservation(session, self.id)
@@ -11843,7 +12382,7 @@ class ConversationTurnAction:
             or (budget.max_aggregate_seconds > 0
                 and budget.unproductive_seconds + reserved_seconds >= budget.max_aggregate_seconds)
         ):
-            return False
+            return True
         if (
             self.provider_dispatch_limit > 0
             and reserved_dispatches + max(
@@ -11869,17 +12408,21 @@ class ConversationTurnAction:
             )
             >= self.provider_dispatch_limit
         ):
-            return False
+            return True
         if self.speculative_followthrough_only and max(
             int(getattr(session, "provider_dispatches_started_total", 0) or 0),
             int(getattr(session, "provider_calls_completed_total", 0) or 0),
         ) >= 1 and not self._speculative_followthrough_ready(session):
+            return True
+        return False
+
+    def is_applicable(self, session: Any) -> bool:
+        if session.conv is None or session.lean is None:
             return False
-        if (
-            self.has_answer_safe_terminal_provider_failure()
-            and not self.has_answer_safe_recheck_work()
-        ):
-            return False
+        current_verifier_work = self._has_current_answer_safe_recheck_work(session)
+        if ((self._provider_quantum_checkpoint or self._provider_quantum_parked)
+                and current_verifier_work):
+            return True
         durable_continuation = dict(
             getattr(session, "durable_progress_tool_continuation", {}) or {}
         )
@@ -11890,26 +12433,30 @@ class ConversationTurnAction:
                 session,
             )
         )
+        future_exposure_blocked = self._future_provider_exposure_blocked(session)
+        current_paid_work = (
+            current_verifier_work
+            or durable_continuation_current
+            or self._has_current_paid_provider_lane(session, local_replay_only=future_exposure_blocked)
+        )
+        # Reservations govern future exposure. Already paid tools and verifier
+        # work retain their current owners; the run's transport fence still
+        # enforces the remaining provider-dispatch allowance.
+        if future_exposure_blocked and not current_paid_work:
+            return False
+        if (
+            self.has_answer_safe_terminal_provider_failure()
+            and not self.has_answer_safe_recheck_work()
+        ):
+            return False
+        if not durable_continuation_current and not self._provider_lane_dispatch_available(session):
+            return False
         from ...mini_research_budget import capacity_reserve_due
 
         if capacity_reserve_due(session, self.id) and not durable_continuation_current:
             # A held future invocation cannot interrupt already paid response
             # processing, tool replay, or independent verifier acceptance.
-            has_paid_work = self.has_answer_safe_recheck_work()
-            if not has_paid_work and self._provider_quantum_checkpoint:
-                try:
-                    checkpoint = self._validated_provider_quantum_checkpoint(
-                        self._provider_quantum_checkpoint, conv=session.conv,
-                    )
-                    quantum = checkpoint.get("state", {})
-                    has_paid_work = bool(
-                        quantum.get("pending_tool_replay")
-                        or quantum.get("provider_calls_completed", 0)
-                        or quantum.get("provider_turn_lane_identity")
-                    )
-                except StateSnapshotCompatibilityError:
-                    has_paid_work = False
-            if not has_paid_work:
+            if not current_paid_work:
                 return False
         retired_provider_lanes = getattr(
             session,
@@ -12094,7 +12641,41 @@ class ConversationTurnAction:
         # PostLeanFailureAction) does not act on stale data from a prior
         # turn. Wrapping the body in try/finally is the only way to
         # guarantee this across the many early returns in the pipeline.
+        verifier_priority = bool(
+            (self._provider_quantum_checkpoint or self._provider_quantum_parked)
+            and self._has_current_answer_safe_recheck_work(session)
+        )
+        durable_continuation = dict(getattr(session, "durable_progress_tool_continuation", {}) or {})
+        durable_priority = bool(
+            str(durable_continuation.get("action_id") or "").strip() == self.id
+            and self.owns_durable_progress_tool_continuation(
+                str(durable_continuation.get("identity") or ""), session,
+            )
+        )
+        independent_paid_work = verifier_priority or durable_priority
         try:
+            if independent_paid_work:
+                self._park_active_provider_lane(session)
+            elif not self._select_provider_lane(
+                session, local_replay_only=bool(
+                    (self._provider_quantum_checkpoint or self._provider_quantum_parked)
+                    and self._future_provider_exposure_blocked(session)
+                ),
+            ):
+                session.last_turn_extraction = None
+                session.last_lean_verdict = None
+                session.last_llm_content = ""
+                return MiniOutcome(
+                    action_id=self.id, solved=False, proof=None, progress=False,
+                    cost_seconds=0.0, metadata={
+                        "verdict": "provider_checkpoint_waiting_for_dependencies",
+                        "provider_checkpoint_waiting_for_dependencies": True,
+                        "provider_attempts": [], "preserve_action_budget": True,
+                        "preserve_frontier_work": True, "defer_selected_frontier_action": True,
+                        "scheduler_neutral": True, "stagnation_neutral": True,
+                        "hard_pivot_neutral": True, "iteration_neutral": True,
+                    },
+                )
             local_preflight = await self._preflight_pending_graph_statement(session)
         except BaseException:
             session.last_turn_extraction = None
@@ -12105,10 +12686,13 @@ class ConversationTurnAction:
             session.last_turn_extraction = None
             session.last_lean_verdict = None
             session.last_llm_content = ""
+            if verifier_priority and self._answer_safe_recheck_pending:
+                local_preflight.metadata["answer_safe_recheck_pending"] = True
             return local_preflight
-        self._activate_provider_quantum_checkpoint(session)
-        authenticated_provider_resume = self._authenticated_live_provider_resume(
-            session
+        if not independent_paid_work:
+            self._activate_provider_quantum_checkpoint(session)
+        authenticated_provider_resume = bool(
+            not verifier_priority and self._authenticated_live_provider_resume(session)
         )
         self._authenticated_provider_resume_for_run = bool(
             authenticated_provider_resume
@@ -12234,9 +12818,14 @@ class ConversationTurnAction:
             self._answer_safe_replay_content = ""
 
         try:
-            outcome = await self._run_impl(session)
+            outcome = (
+                await self._run_impl(session, provider_bank_verifier_only=True)
+                if verifier_priority else await self._run_impl(session)
+            )
             merge_verifier_replay_into_live_history()
             metadata = dict(getattr(outcome, "metadata", {}) or {})
+            if verifier_priority and self._answer_safe_recheck_pending:
+                metadata["answer_safe_recheck_pending"] = True
             metadata["conversation_turn_newly_charged"] = bool(
                 not authenticated_provider_resume
             )
@@ -12403,7 +12992,9 @@ class ConversationTurnAction:
             session.last_lean_verdict = None
             session.last_llm_content = ""
 
-    async def _run_impl(self, session: Any) -> MiniOutcome:  # noqa: C901, PLR0912, PLR0915
+    async def _run_impl(
+        self, session: Any, *, provider_bank_verifier_only: bool = False,
+    ) -> MiniOutcome:  # noqa: C901, PLR0912, PLR0915
         from ensemble_prover.helper_salvage import (
             merge_context_helpers,
             merge_helpers_for_correction_recheck,
@@ -12478,6 +13069,27 @@ class ConversationTurnAction:
             and str(answer_safe_pending.get("content") or "").strip()
             and isinstance(answer_safe_pending.get("turn_entry"), dict)
         )
+        dispatch_guard = getattr(
+            session, "_selected_work_record_dispatch_block_reason", None
+        )
+        if callable(dispatch_guard):
+            dispatch_reason = dispatch_guard(
+                dict(getattr(session, "selected_work_item_record", {}) or {}),
+                self.id,
+            )
+            if str(dispatch_reason).startswith("target_integrity_"):
+                return MiniOutcome(
+                    action_id=self.id,
+                    solved=False,
+                    proof=None,
+                    progress=False,
+                    cost_seconds=time.monotonic() - started,
+                    metadata={
+                        "rejection_reason": dispatch_reason,
+                        "verification_stage": "graph_contract",
+                        "selected_work_dispatch_blocked": True,
+                    },
+                )
         graph_native_target = _selected_graph_native_proof_target(session)
         graph_native_goal_statement = str(
             graph_native_target.get("statement") or ""
@@ -12561,30 +13173,10 @@ class ConversationTurnAction:
                         "strong_progress": False,
                     },
                 )
-        current_answer_safe_execution_binding = {
-            "graph_node_id": str(graph_native_target.get("node_id") or ""),
-            "graph_work_type": str(graph_native_target.get("work_type") or ""),
-            "graph_statement": graph_native_goal_statement,
-            "graph_scope_key": str(_graph_selected_work_scope_key(session) or ""),
-            "selected_node_id": str(selected_record.get("node_id") or ""),
-            "selected_variant_id": str(selected_record.get("variant_id") or ""),
-            "selected_work_type": selected_work_type,
-            "selected_mapped_action": selected_mapped_action,
-            "selected_context_digest": str(
-                getattr(session, "_selected_proof_idea_context_digest", "") or ""
-            ),
-            "root_statement": str(
-                getattr(dossier, "root_statement", "") or ""
-            ),
-            "conversation_goal_statement": str(
-                getattr(conv, "goal_statement", "") or ""
-            ),
-            "lean_preamble": str(getattr(conv, "lean_preamble", "") or ""),
-            "prompt_preamble": str(getattr(conv, "preamble", "") or ""),
-            "active_root_targets": copy.deepcopy(
-                list(initial_framed_active_root_targets or [])
-            ),
-        }
+        current_answer_safe_execution_binding = self._current_answer_safe_execution_binding(
+            session, graph_native_target=graph_native_target,
+            active_root_targets=initial_framed_active_root_targets,
+        )
         current_binding_identity = self._answer_safe_recheck_binding_identity(
             current_answer_safe_execution_binding
         )
@@ -12607,6 +13199,18 @@ class ConversationTurnAction:
             answer_safe_pending_replay = True
             self._answer_safe_recheck_pending = copy.deepcopy(
                 answer_safe_pending
+            )
+        if provider_bank_verifier_only and not answer_safe_pending_replay:
+            # A paid verifier selection never grants permission to replace a
+            # blocked provider lane with a fresh root/provider invocation.
+            return MiniOutcome(
+                action_id=self.id, solved=False, proof=None, progress=False,
+                cost_seconds=time.monotonic() - started, metadata={
+                    "verdict": "answer_safe_recheck_binding_not_current",
+                    "provider_attempts": [], "preserve_action_budget": True,
+                    "preserve_frontier_work": True, "scheduler_neutral": True,
+                    "stagnation_neutral": True, "iteration_neutral": True,
+                },
             )
         setattr(
             session,
@@ -12779,8 +13383,10 @@ class ConversationTurnAction:
                         "preserving its required declaration or proof-body shape."
                     )
                     conv.append_user(
-                        f"Refiner phase begins. You have {conv.turn_budget} refiner "
-                        "turn(s). Recover the blocked local proof obligation from "
+                        "Refiner phase begins. "
+                        + (f"You have {conv.turn_budget} refiner turn(s). "
+                           if int(conv.turn_budget or 0) > 0 else "No fixed turn count is imposed. ")
+                        + "Recover the blocked local proof obligation from "
                         "the problem and transcript, manufacture needed bridge "
                         "facts as local `have`/`suffices` steps or exact helper "
                         "statements. " + local_progress_instruction + " "
@@ -13519,6 +14125,10 @@ class ConversationTurnAction:
 
         speculative_submission_only = bool(
             self.speculative_followthrough_only
+            and not (
+                authenticated_provider_resume
+                and getattr(conv, "_provider_call_quantum_state", {}).get("pending_tool_replay")
+            )
             and max(
                 int(getattr(session, "provider_dispatches_started_total", 0) or 0),
                 int(getattr(session, "provider_calls_completed_total", 0) or 0),
@@ -13607,6 +14217,11 @@ class ConversationTurnAction:
             ),
         )
         temperature_metadata = temperature_decision.metadata(client=client)
+        future_provider_exposure_blocked = self._future_provider_exposure_blocked(session)
+        if future_provider_exposure_blocked:
+            # A paid eligibility exception authorizes local replay only, never
+            # another request using capacity held by research or a fresh probe.
+            temperature_metadata["provider_dispatches_remaining"] = 0
         if self.provider_dispatch_limit > 0:
             from ...mini_research_budget import pending_research_reservation
 
@@ -13633,6 +14248,8 @@ class ConversationTurnAction:
                 0,
                 self.provider_dispatch_limit - provider_dispatches_used - reserved_dispatches,
             )
+            if future_provider_exposure_blocked:
+                remaining_provider_dispatches = 0
             # Unlike retry-policy zero (unlimited), this is a finite allowance
             # for the entire invocation, including finalizers and repairs.
             temperature_metadata["provider_dispatches_remaining"] = remaining_provider_dispatches
@@ -14522,7 +15139,7 @@ class ConversationTurnAction:
             # Keep the live state fail-closed. A direct scheduler snapshot
             # will expose the incompatibility instead of silently rebinding
             # provider work to a different target.
-            self._provider_quantum_checkpoint = {}
+            self._clear_active_provider_lane()
         if (
             bool(getattr(loop_result, "proof_disproof_conflict", False))
             and not reported_elapsed_budget_exhaustion
@@ -16094,6 +16711,7 @@ class ConversationTurnAction:
                 and llm_failure_kind not in permanent_nonretryable_kinds
                 and not nonretryable_http_failure
                 and not cooperative_provider_yield
+                and not getattr(conv, "_provider_call_quantum_state", {}).get("pending_tool_replay")
             )
             if compact_retry_history:
                 compaction_kwargs: Dict[str, Any] = {
@@ -17707,22 +18325,19 @@ class ConversationTurnAction:
                     continuation_counts.get(format_policy_redirect_key, 0) or 0
                 )
                 format_policy_redirect_count = prior
-                global_limit = max(
-                    0,
-                    int(
+                global_limit = int(
                         getattr(
                             session,
                             "policy_repair_redirect_global_limit",
-                            4,
+                            -1,
                         )
                         or 0
-                    ),
-                )
+                    )
                 global_used = int(
                     getattr(session, "_policy_repair_redirect_total_count", 0)
                     or 0
                 )
-                format_policy_redirect = prior < 1 and global_used < global_limit
+                format_policy_redirect = prior < 1 and (global_limit < 0 or global_used < global_limit)
                 if format_policy_redirect:
                     format_policy_redirect_count = prior + 1
                     continuation_counts[format_policy_redirect_key] = (
@@ -18451,17 +19066,14 @@ class ConversationTurnAction:
                 0,
                 int(getattr(session, "policy_repair_redirect_limit", 2) or 0),
             )
-            redirect_global_limit = max(
-                0,
-                int(
+            redirect_global_limit = int(
                     getattr(
                         session,
                         "policy_repair_redirect_global_limit",
-                        4,
+                        -1,
                     )
                     or 0
-                ),
-            )
+                )
             redirect_total_count = int(
                 getattr(session, "_policy_repair_redirect_total_count", 0) or 0
             )
@@ -18490,7 +19102,7 @@ class ConversationTurnAction:
                 redirect_count = int(counts.get(redirect_key, 0) or 0)
                 policy_repair_redirect = (
                     redirect_count < redirect_limit
-                    and redirect_total_count < redirect_global_limit
+                    and (redirect_global_limit < 0 or redirect_total_count < redirect_global_limit)
                 )
                 if policy_repair_redirect:
                     redirect_count += 1
@@ -20137,6 +20749,44 @@ class ConversationTurnAction:
                 helper_decl_name(b) or "" for b in check_lemmas if helper_decl_name(b)
             ]
             if dossier is not None:
+                from ensemble_prover.verified_helper_contract import analyze_verified_helper_context
+                from ensemble_prover.proof_state_executor import _proof_state_check_preamble
+                from ensemble_prover.mini_recursive import _recursive_contract_operation_timeout_s
+
+                checked_contract_sources = tuple(check_lemmas)
+                checked_contract_preamble = _proof_state_check_preamble(conv)
+                checked_contract_environment = str(dossier.current_lean_environment_hash or "")
+                checked_contract_target = str(selected_goal_statement_override or conv.goal_statement)
+                generated_graph_helper = ""
+                if graph_native_goal_statement and graph_native_target:
+                    generated_graph_helper = _graph_native_helper_source(
+                        helper_name=_graph_native_helper_name(
+                            theorem_name=str(theorem_name or ""),
+                            node_id=str(graph_native_target.get("node_id") or "").strip(),
+                            node_name=str(graph_native_target.get("name") or ""),
+                            work_type=str(graph_native_target.get("work_type") or ""),
+                        ),
+                        statement=graph_native_goal_statement, proof=proof,
+                    )
+
+                def checked_contract_context_is_current() -> bool:
+                    return bool(
+                        tuple(check_lemmas) == checked_contract_sources
+                        and _proof_state_check_preamble(conv) == checked_contract_preamble
+                        and str(dossier.current_lean_environment_hash or "") == checked_contract_environment
+                        and str(selected_goal_statement_override or conv.goal_statement) == checked_contract_target
+                    )
+
+                checked_contract_fields = await analyze_verified_helper_context(
+                    session.lean,
+                    (*checked_contract_sources, *((generated_graph_helper,) if generated_graph_helper else ())),
+                    preamble=checked_contract_preamble, environment_hash=checked_contract_environment,
+                    timeout_s=_recursive_contract_operation_timeout_s(session.lean, 0.0),
+                    context_is_current=checked_contract_context_is_current,
+                )
+                publication_guard()
+                if not checked_contract_context_is_current():
+                    raise ValueError("accepted helper context changed during contract observation")
                 checked_helper_sources = set(check_lemmas)
                 semantic_replacement_names: List[str] = []
                 for helper in helpers:
@@ -20160,6 +20810,7 @@ class ConversationTurnAction:
                         # instead of silently keeping an older same-name
                         # helper from a prior turn.
                         replace_existing_same_name=True,
+                        **checked_contract_fields.get(helper, {}),
                     )
                     if helper_record is None:
                         continue
@@ -20257,6 +20908,7 @@ class ConversationTurnAction:
                         phase=f"{conv.role}_graph_native",
                         turn_index=phase_turn,
                         replay_context_names=graph_native_replay_context_names,
+                        **checked_contract_fields.get(helper_source, {}),
                     )
                     graph_native_verdict = "proved"
                     graph_native_error_type = ""
@@ -21255,7 +21907,29 @@ async def _run_helpers_only_cascade(
     accepted_helper_names = list(
         dict.fromkeys([*lemma_dag_helpers, *salvage_result.accepted])
     )
+    reused_helper_aliases = dict(getattr(salvage_result, "reused", {}) or {})
+    if reused_helper_aliases:
+        from ...helper_salvage import helper_salvage_reuse_feedback
+
+        conv.append_user(helper_salvage_reuse_feedback(salvage_result))
     if not accepted_helper_names:
+        if reused_helper_aliases:
+            return MiniOutcome(
+                action_id=action.id,
+                solved=False,
+                proof=None,
+                progress=False,
+                cost_seconds=time.monotonic() - started,
+                metadata={
+                    "role": action.role,
+                    "conv_turn_index_offset": conv_turn_offset,
+                    "conv_turn_index_absolute": absolute_turn,
+                    "conv_turn_index_phase": phase_turn,
+                    **_turn_budget_metadata(common_payload),
+                    "salvage_reused": reused_helper_aliases,
+                    "strong_progress": False,
+                },
+            )
         return None
     visible_accepted_helper_names = (
         dossier.visible_accepted_helper_names(accepted_helper_names)
@@ -21493,7 +22167,7 @@ async def _run_helpers_only_cascade(
     # Child closure can consume a root portfolio quantum and preserve its
     # cursor. A fresh fallback would restart the same candidates here.
     if (
-        max_candidates > 0
+        max_candidates != 0
         and inline_timeout_s > 0.0
         and not child_closure_status.get("root_tactic_candidate_quantum_exhausted")
     ):
@@ -21511,7 +22185,7 @@ async def _run_helpers_only_cascade(
             ),
             active_root_frame_helper_blocks=dossier.verified_helper_blocks(),
             timeout_s=inline_timeout_s,
-            max_candidates=max(1, max_candidates),
+            max_candidates=max_candidates,
             suppress_solution_placeholders=bool(
                 getattr(conv, "suppress_solution_placeholders", True)
             ),
@@ -21700,7 +22374,7 @@ async def _run_helpers_only_cascade(
     # when the inline tactic-close was skipped because the
     # helper_only_salvage budget exhausted, surface a record so RCA can
     # see the cascade WAS attempted, just bounded out.
-    if max_candidates > 0 and inline_timeout_s <= 0.0:
+    if max_candidates != 0 and inline_timeout_s <= 0.0:
         _emit_record(session, {
             **common_payload,
             "phase": "helper_only_salvage_root_tactic",
@@ -22442,7 +23116,7 @@ async def _run_post_failure_cascade_inline(
         and cascade.salvaged_helper_names
         and cascade.helper_salvage_root_tactic_record is not None
         and not cascade.solved
-        and int(action.proof_state_child_tactic_max_candidates or 0) > 0
+        and int(action.proof_state_child_tactic_max_candidates or 0) != 0
     ):
         try:
             dossier.record_attempt(

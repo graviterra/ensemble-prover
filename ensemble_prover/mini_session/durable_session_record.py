@@ -8,26 +8,32 @@ serialized proof certificate is treated as a live verifier capability.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import copy
 from dataclasses import fields
 import hashlib
+import inspect
 import json
 import math
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Callable
+import uuid
 
 from ensemble_prover.proof_dossier import (
-    ProofDossier, helper_decl_name, helper_decl_statement, text_hash,
-    verified_helper_has_typed_binder_evidence,
+    ProofDossier, helper_decl_name, text_hash,
 )
 from ensemble_prover.verified_helper_contract import (
-    analyze_verified_helper_contract, refresh_verified_helper_contract,
+    analyze_verified_helper_source_contract, analyze_verified_helper_declarations,
+    helper_contract_context_is_plain, helper_source_contract_is_context_sensitive,
+    helper_source_requires_contract_analysis,
+    refresh_verified_helper_contract,
 )
 from ensemble_prover.proof_state import ProofSearchState, ProofStateWorkItem
 from ensemble_prover.root_finalization import RootFinalizationCandidate
 from ensemble_prover.state_data import clone_json_value
 from ensemble_prover.mini_theory.model import TheoryNeed
+from ensemble_prover.formalization.environment import runtime_selector_snapshot
 
 from .action import ActionBudget, MiniOutcome, RepairTicket
 from .capability_policy import field_is_runtime_capability
@@ -49,6 +55,7 @@ _RUNTIME_FIELDS = frozenset({
     "_quarantined_lean_runners",
     "_latest_pre_select_snapshot", "_dispatch_generation_resume_snapshot",
     "_dispatch_generation_late_rollback_snapshot", "_run_governor_last_tick_monotonic",
+    "_native_research_governor_clock",
     "_applying_action_dispatch_ids", "_duplicate_action_dispatch_events_in_progress",
     "_inflight_action_dispatch_id", "_apply_transition_active",
     "_inflight_provider_exposure_tracker",
@@ -148,6 +155,36 @@ def _decode(value: Any) -> Any:
 def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
                                      allow_nan=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def _checkpoint_import_config(lean: Any) -> dict[str, Any]:
+    config = getattr(lean, "cfg", None)
+    return {
+        name: clone_json_value(getattr(config, name, default))
+        for name, default in (
+            ("project_imports", []), ("project_import_sources", {}),
+            ("support_project_builds", {}), ("extra_imports", []),
+            ("module_search_paths", []), ("preamble_import", ""),
+            ("preamble_tactics", ""),
+        )
+    }
+
+
+def _checkpoint_runner_context(lean: Any, preamble: str = "") -> tuple[Any, ...]:
+    """Track mutable verifier inputs without rescanning its imported files."""
+    from ensemble_prover.lean_runner import LeanREPL
+
+    project = getattr(lean, "project_dir", None)
+    project_key = str(Path(project).resolve()) if project is not None else ""
+    import_config = _checkpoint_import_config(lean)
+    return (
+        id(lean), project_key, _digest(import_config),
+        getattr(lean, "_execution_environment_generation", 0),
+        LeanREPL._GLOBAL_ENV_EPOCH.get(project_key, 0),
+        runtime_selector_snapshot(),
+        (material_environment_hash(lean, Path(project_key), import_config, preamble)
+         if project is not None else ""),
+    )
 
 
 def initialize_theory_checkpoint_context(session: Any) -> None:
@@ -264,16 +301,7 @@ def session_checkpoint_identity(session: Any) -> dict[str, Any]:
             if path.is_file():
                 project_files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
         project_files["project_dir"] = str(directory)
-        config = getattr(session.lean, "cfg", None)
-        import_config = {
-            name: clone_json_value(getattr(config, name, default))
-            for name, default in (
-                ("project_imports", []), ("project_import_sources", {}),
-                ("support_project_builds", {}), ("extra_imports", []),
-                ("module_search_paths", []), ("preamble_import", ""),
-                ("preamble_tactics", ""),
-            )
-        }
+        import_config = _checkpoint_import_config(session.lean)
         project_files["import_config"] = _digest(import_config)
         sources = dict(import_config["project_import_sources"])
         for module in import_config["project_imports"]:
@@ -311,6 +339,35 @@ def _require_settled(session: Any) -> None:
         raise ValueError("checkpoint requires settled provider exposure")
 
 
+def _validated_research_governor_coverage(value: Any, elapsed: float) -> dict[str, Any]:
+    """Validate historical overlap ceilings before publishing restored state."""
+    if (type(value) is not dict or set(value) != {"by_clock", "legacy_elapsed_s"}
+            or type(value["by_clock"]) is not dict
+            or any(type(key) is not str or not key for key in value["by_clock"])):
+        raise ValueError("invalid native research governor coverage")
+    for covered in [value["legacy_elapsed_s"], *value["by_clock"].values()]:
+        if (type(covered) not in {int, float} or not math.isfinite(covered)
+                or not 0 <= covered <= elapsed):
+            raise ValueError("invalid native research governor coverage")
+    return {"by_clock": dict(value["by_clock"]), "legacy_elapsed_s": value["legacy_elapsed_s"]}
+
+
+def _capture_research_governor_coverage(session: Any) -> dict[str, Any]:
+    """Attribute this snapshot's observation only to its live governor clock."""
+    elapsed = float(session.run_governor_elapsed_s or 0.0)
+    clock = getattr(session, "_native_research_governor_clock", None)
+    by_clock = dict(clock.get("coverage_by_clock", {})) if clock is not None else {}
+    legacy = clock.get("restored_elapsed_s") if clock is not None else None
+    if clock is not None:
+        by_clock[clock["identity"]] = elapsed
+    # Before the first restore, this process owns any legacy observations.
+    # Thereafter their original ceiling stays fixed across later checkpoints.
+    return _validated_research_governor_coverage({
+        "by_clock": by_clock,
+        "legacy_elapsed_s": elapsed if legacy is None else legacy,
+    }, elapsed)
+
+
 def capture_session_record(session: Any) -> dict[str, Any]:
     """Capture only this settled session; never traverse shared live services."""
     _require_settled(session)
@@ -328,6 +385,7 @@ def capture_session_record(session: Any) -> dict[str, Any]:
     record = {
         "schema_version": SCHEMA_VERSION,
         "clock": {"epoch_s": time.time(), "monotonic_s": time.monotonic()},
+        "native_research_governor_coverage": _capture_research_governor_coverage(session),
         "identity": session_checkpoint_identity(session),
         "conversation": _encode({
             key: value for key, value in vars(session.conv).items()
@@ -342,14 +400,78 @@ def capture_session_record(session: Any) -> dict[str, Any]:
     return clone_json_value(record, label="durable session record")
 
 
+def _fresh_check_options(lean: Any, preamble: str) -> dict[str, Any]:
+    # A restart establishes new authority; a completed execution cache entry
+    # must not substitute for the independent reference check.
+    options: dict[str, Any] = {"preamble_override": preamble}
+    try:
+        parameters = inspect.signature(lean.check).parameters
+        if "force_reference" in parameters or any(
+            item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+        ):
+            options["force_reference"] = True
+    except (TypeError, ValueError):
+        pass
+    return options
+
+
 async def _verify(lean: Any, *, statement: str, proof: str, helpers: list[str], preamble: str) -> None:
-    result = await lean.check(statement, proof, helpers, preamble_override=preamble)
+    result = await lean.check(statement, proof, helpers, **_fresh_check_options(lean, preamble))
     if not getattr(result, "ok", False) or getattr(result, "axiom_audit_ok", None) is False:
         raise ValueError("saved proof failed fresh Lean checkpoint verification")
 
 
+def _checkpoint_helper_order(helpers: dict[str, Any]) -> list[Any]:
+    """Order the complete declared replay DAG without Python recursion."""
+    remaining = {}
+    consumers: dict[str, list[str]] = {}
+    for name, helper in helpers.items():
+        dependencies = set(helper.support_names or ()) | set(helper.replay_context_names or ())
+        if not dependencies <= helpers.keys():
+            raise ValueError("checkpoint helper dependency cycle or missing support")
+        remaining[name] = len(dependencies)
+        for dependency in dependencies:
+            consumers.setdefault(dependency, []).append(name)
+    ready = deque(name for name in helpers if not remaining[name])
+    ordered = []
+    while ready:
+        name = ready.popleft()
+        ordered.append(helpers[name])
+        for consumer in consumers.get(name, ()):
+            remaining[consumer] -= 1
+            if remaining[consumer] == 0:
+                ready.append(consumer)
+    if len(ordered) != len(helpers):
+        raise ValueError("checkpoint helper dependency cycle or missing support")
+    return ordered
+
+
+def _clear_saved_helper_contract(dossier: ProofDossier, helper: Any) -> bool:
+    """Discard serialized type observations before obtaining fresh evidence."""
+    fields = (
+        "contract_identity", "contract_identity_statement_key",
+        "contract_identity_environment_hash", "contract_identity_evidence_receipt",
+        "contract_display_statement", "contract_binder_evidence_receipt",
+        "contract_binder_sorts", "contract_proof_binder_types",
+    )
+    had_evidence = any(getattr(helper, name) for name in fields)
+    for name in fields:
+        setattr(helper, name, [] if name in {
+            "contract_binder_sorts", "contract_proof_binder_types",
+        } else "")
+    node_id = dossier.proof_graph.helper_name_to_node_id.get(helper.name)
+    node = dossier.proof_graph.nodes.get(node_id)
+    if node is not None:
+        for name in fields:
+            key = "verified_helper_" + name
+            if key in node.metadata:
+                node.metadata[key] = copy.deepcopy(getattr(helper, name))
+    return had_evidence
+
+
 async def _prepare_dossier(
     session: Any, data: dict[str, Any], *, staged_dossier: ProofDossier | None = None,
+    context_is_current: Callable[[], bool] | None = None,
 ) -> ProofDossier:
     """Freshly verify an imported private dossier before publishing authority.
 
@@ -365,51 +487,112 @@ async def _prepare_dossier(
     expected = {item["name"]: item for item in originals}
     if len(expected) != len(originals) or set(expected) != set(dossier.verified_helpers):
         raise ValueError("checkpoint helper admission rejected saved source")
-    pending = dict(dossier.verified_helpers)
+    ordered = _checkpoint_helper_order(dossier.verified_helpers)
+    for helper in ordered:
+        saved = expected[helper.name]
+        if helper.source != saved.get("source") or text_hash(helper.source) != saved.get("source_hash"):
+            raise ValueError("checkpoint helper source hash mismatch")
+    environment = str(dossier.current_lean_environment_hash or "")
+    preamble = str(session.conv.lean_preamble or "")
+    target = str(getattr(session.conv, "goal_statement", dossier.root_statement) or "")
+    runner_context = _checkpoint_runner_context(session.lean, preamble)
+    if target != str(dossier.root_statement or ""):
+        raise ValueError("checkpoint dossier target identity mismatch")
+
+    def current_context() -> bool:
+        return (
+            preamble == str(session.conv.lean_preamble or "")
+            and environment == str(dossier.current_lean_environment_hash or "")
+            and target == str(getattr(session.conv, "goal_statement", dossier.root_statement) or "")
+            and target == str(dossier.root_statement or "")
+            and runner_context == _checkpoint_runner_context(session.lean, preamble)
+            and (context_is_current is None or context_is_current())
+        )
+    if not current_context():
+        raise ValueError("checkpoint verification context changed before replay")
+    # The checker audits every local declaration, including unused helpers.
+    # Publish no restored authority until this whole fresh replay succeeds.
+    if ordered:
+        await _verify(session.lean, statement="True", proof="by trivial",
+                      helpers=[helper.source for helper in ordered], preamble=preamble)
+    if not current_context():
+        raise ValueError("checkpoint verification context changed during replay")
+    refresh_answer_receipts = bool(getattr(dossier, "_checkpoint_pending_answer_receipts", ()))
+    saved_contracts = {helper.name: copy.deepcopy(helper) for helper in ordered}
+    cleared_contracts = {
+        helper.name: _clear_saved_helper_contract(dossier, helper) for helper in ordered
+    }
+    observed = await analyze_verified_helper_declarations(
+        session.lean, [helper.source for helper in ordered], preamble=preamble,
+        environment_hash=environment, timeout_s=30.0, context_is_current=current_context,
+    )
+    if not current_context():
+        raise ValueError("checkpoint verification context changed during contract analysis")
     checked: list[str] = []
-    checked_names: set[str] = set()
-    while pending:
-        ready = [helper for helper in pending.values()
-                 if set(helper.support_names or ()) <= checked_names]
-        if not ready:
-            raise ValueError("checkpoint helper dependency cycle or missing support")
-        for helper in ready:
-            saved = expected[helper.name]
-            if helper.source != saved.get("source") or text_hash(helper.source) != saved.get("source_hash"):
-                raise ValueError("checkpoint helper source hash mismatch")
-            await _verify(session.lean, statement="True", proof="by trivial",
-                          helpers=[*checked, helper.source], preamble=session.conv.lean_preamble)
-            environment = str(dossier.current_lean_environment_hash or "")
-            checked_in_new_environment = helper.verification_environment_hash != environment
-            if checked_in_new_environment or not verified_helper_has_typed_binder_evidence(helper):
-                preamble = str(session.conv.lean_preamble or "")
-                contract_fields = await analyze_verified_helper_contract(
-                    session.lean, helper_decl_statement(helper.source),
-                    preamble=preamble, context=checked,
-                    environment_hash=environment, timeout_s=30.0,
-                    context_is_current=lambda: (
-                        preamble == str(session.conv.lean_preamble or "")
-                        and environment == str(dossier.current_lean_environment_hash or "")
-                    ),
-                )
-                if checked_in_new_environment and contract_fields:
-                    # Only the fresh body replay above authorizes rebinding an
-                    # ancestor-verified declaration to the checked environment.
-                    # Ordinary same-source imports still reject this change.
-                    dossier.record_verified_helper(
-                        helper.source, phase=helper.phase, turn_index=helper.turn_index,
-                        support_names=helper.support_names,
-                        replay_context_names=helper.replay_context_names,
-                        provenance_tags=helper.provenance_tags,
-                        visibility_policy=helper.visibility_policy,
-                        replace_existing_same_name=True,
-                        **contract_fields,
-                    )
-                else:
-                    refresh_verified_helper_contract(dossier, helper, contract_fields)
-            checked.append(helper.source)
-            checked_names.add(helper.name)
-            pending.pop(helper.name)
+    prefix_is_plain = helper_contract_context_is_plain(session.lean, preamble=preamble, context=())
+    for helper in ordered:
+        checked_in_new_environment = helper.verification_environment_hash != environment
+        observation_required = helper_source_contract_is_context_sensitive(
+            helper.source, context_is_plain=prefix_is_plain,
+        )
+        analysis_required = helper_source_requires_contract_analysis(
+            helper.source, context_is_plain=prefix_is_plain,
+        )
+        observation_requirement_changed = (
+            bool(getattr(helper, "contract_observation_required", False)) != observation_required
+        )
+        # This staging object has no authority yet. A saved marker cannot
+        # replace classification of the context just checked by this runner.
+        helper.contract_observation_required = observation_required
+        contract_fields = observed.get(helper.source) or (
+            await analyze_verified_helper_source_contract(
+                session.lean, helper.source,
+                preamble=preamble, context=checked,
+                environment_hash=environment, timeout_s=30.0,
+                context_is_current=current_context,
+            ) if analysis_required else {}
+        )
+        if not current_context():
+            raise ValueError("checkpoint verification context changed during contract analysis")
+        if checked_in_new_environment or cleared_contracts[helper.name] or observation_requirement_changed:
+            # Only the fresh body replay above authorizes rebinding an
+            # ancestor-verified declaration to the checked environment.
+            # Ordinary same-source imports still reject this change.
+            # Saved type receipts establish internal consistency only. An
+            # unavailable fresh observation leaves this checked source with
+            # conservative metadata, including in an unchanged environment.
+            rebound_fields = dict(contract_fields)
+            rebound_fields["_verification_environment_hash"] = environment
+            rebound = dossier.record_verified_helper(
+                helper.source, phase=helper.phase, turn_index=helper.turn_index,
+                support_names=helper.support_names,
+                replay_context_names=helper.replay_context_names,
+                provenance_tags=helper.provenance_tags,
+                visibility_policy=helper.visibility_policy,
+                contract_observation_required=observation_required,
+                replace_existing_same_name=True,
+                _progress_anchor_from=saved_contracts[helper.name],
+                **rebound_fields,
+            )
+            if rebound is None:
+                raise ValueError("checkpoint helper environment rebinding rejected")
+            # Rebinding the environment does not replace historical source
+            # obligations with hashes read from today's helper registry.
+            rebound.support_source_hashes = copy.deepcopy(helper.support_source_hashes)
+            rebound.replay_context_source_hashes = copy.deepcopy(helper.replay_context_source_hashes)
+        else:
+            refresh_verified_helper_contract(dossier, helper, contract_fields)
+        checked.append(helper.source)
+        prefix_is_plain = prefix_is_plain and helper_contract_context_is_plain(
+            session.lean, preamble="", context=(helper.source,),
+        )
+    if refresh_answer_receipts:
+        # The exact whole source context passed fresh independent Lean checking.
+        # Rebuild current parser receipts only after serialized type authority
+        # is replaced by fresh observations or conservative missing-type policy.
+        del dossier._checkpoint_pending_answer_receipts
+        dossier._sync_legacy_helpers_to_graph()
+        dossier.reconcile_verified_facts(trigger="checkpoint_fresh_helper_replay")
     if dossier.final_proof:
         if text_hash(dossier.final_proof) != data.get("final_proof_hash"):
             raise ValueError("checkpoint root proof hash mismatch")
@@ -438,9 +621,11 @@ async def _prepare_dossier(
             for key, value in artifact_fields.items()
         ):
             raise ValueError("checkpoint root certificate artifact mismatch")
-        await _verify(session.lean, statement=session.conv.goal_statement,
+        await _verify(session.lean, statement=target,
                       proof=dossier.final_proof, helpers=replay_helpers,
-                      preamble=session.conv.lean_preamble)
+                      preamble=preamble)
+        if not current_context():
+            raise ValueError("checkpoint verification context changed during root replay")
         # Fresh checking above, not the JSON hash, establishes this receipt.
         dossier.record_root_proof_finalization_receipt()
     return dossier
@@ -475,6 +660,40 @@ def _prepare_bound_publication(session: Any, staged: Any) -> tuple[Any, ...]:
     )
 
 
+def _release_obsolete_negation_conflict(session: Any) -> None:
+    """Let saved conflicts from older negation verifiers reach fresh replay."""
+    from ..mini_falsification.model import KERNEL_NEGATION_VERIFIER_VERSION
+
+    dossier = session.dossier
+    conflicts = dossier.mini_falsification_trust_boundary_conflict_certificate_hashes
+    legacy_hashes = {
+        str(certificate.get("certificate_hash") or "")
+        for report in dossier.mini_falsification_ledger
+        for finding in report.get("findings") or ()
+        if isinstance(finding, dict)
+        for certificate in [finding.get("certificate")]
+        if isinstance(certificate, dict)
+        and certificate.get("verifier_version") != KERNEL_NEGATION_VERIFIER_VERSION
+    }
+    if (not conflicts or not conflicts <= legacy_hashes
+            or bool(getattr(dossier, "_mini_falsification_trust_boundary_conflict_certificate_hashes", set()))):
+        return
+    # The public conflict history remains intact. Release only the terminal
+    # latch attributable entirely to those obsolete certificates; unrelated
+    # failures and current-verifier conflicts keep their existing treatment.
+    reason = "falsification_trust_boundary_conflict"
+    for owner, reason_field, kind_field in (
+        (session, "terminal_failure_reason", "terminal_failure_kind"),
+        (session.conv, "_last_llm_failure_reason", "_last_llm_failure_kind"),
+        (dossier, "session_failure_reason", "session_failure_kind"),
+    ):
+        if getattr(owner, reason_field, "") == reason:
+            setattr(owner, reason_field, "")
+            setattr(owner, kind_field, "")
+    if getattr(session, "last_failure_reason", "") == reason:
+        session.last_failure_reason = ""
+
+
 async def restore_session_record(session: Any, record: dict[str, Any], *, expected_identity: dict[str, Any]) -> None:
     """Validate in isolation, recheck proofs, then install into bound objects."""
     _require_settled(session)
@@ -482,6 +701,15 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
         # Capture can preserve an incomplete tail, but replacing a live owner
         # would strand its callback on the old budget and observation map.
         raise ValueError("checkpoint restore requires settled detached execution resources")
+    live_context = tuple(getattr(session.conv, key, None) for key in _IDENTITY_CONV_FIELDS)
+    live_runner_context = _checkpoint_runner_context(session.lean, str(session.conv.lean_preamble or ""))
+
+    def live_context_is_current() -> bool:
+        return (
+            live_context == tuple(getattr(session.conv, key, None) for key in _IDENTITY_CONV_FIELDS)
+            and live_runner_context == _checkpoint_runner_context(session.lean, str(session.conv.lean_preamble or ""))
+        )
+
     data = clone_json_value(record, label="durable session restore")
     if type(data) is not dict or type(data.get("schema_version")) is not int or data["schema_version"] != SCHEMA_VERSION:
         raise ValueError("unsupported durable session checkpoint schema")
@@ -500,16 +728,33 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
     if values.get("_inflight_provider_exposure_tracker") is None:
         values.pop("_inflight_provider_exposure_tracker", None)
     verifier_view = await _prepare_theory_checkpoint_context(session, data, values)
+    if not live_context_is_current():
+        raise ValueError("checkpoint verification context changed during theory preparation")
     if expected_identity != session_checkpoint_identity(verifier_view):
         raise ValueError("checkpoint identity differs from the fresh target, environment or policy")
+    verifier_context = tuple(getattr(verifier_view.conv, key, None) for key in _IDENTITY_CONV_FIELDS)
+    verifier_runner_context = _checkpoint_runner_context(verifier_view.lean, str(verifier_view.conv.lean_preamble or ""))
+
+    def verification_context_is_current() -> bool:
+        return (
+            live_context_is_current()
+            and verifier_context == tuple(
+                getattr(verifier_view.conv, key, None) for key in _IDENTITY_CONV_FIELDS
+            )
+            and verifier_runner_context == _checkpoint_runner_context(verifier_view.lean, str(verifier_view.conv.lean_preamble or ""))
+        )
+
+    verifier_preamble = str(verifier_view.conv.lean_preamble or "")
     # The identity above includes fresh source/compiled inputs for the complete
     # import closure. Re-establish each declaration admission independently,
     # before publishing any context or retrieval availability to the session.
     for receipt in values.get("_checked_source_imports", ()):
         admitted = await verifier_view.lean.check(
             receipt["statement"], f"by exact @{receipt['declaration']}", [],
-            preamble_override=verifier_view.conv.lean_preamble,
+            **_fresh_check_options(verifier_view.lean, verifier_preamble),
         )
+        if not verification_context_is_current():
+            raise ValueError("checkpoint verification context changed during source admission")
         if not getattr(admitted, "ok", False) or getattr(admitted, "axiom_audit_ok", None) is not True:
             raise ValueError("saved source import failed fresh Lean admission")
     clock = data.get("clock")
@@ -583,12 +828,20 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
         staged.actions.append(cloned_action)
     staged.recorder = staged.on_event = staged.checkpoint_registry = None
     apply_scheduler_snapshot(staged, data["scheduler"], allow_local_execution_cursors=False)
+    research_governor_coverage = _validated_research_governor_coverage(
+        data.get("native_research_governor_coverage", {
+            "by_clock": {}, "legacy_elapsed_s": staged.run_governor_elapsed_s,
+        }),
+        float(staged.run_governor_elapsed_s or 0.0),
+    )
     # Enrich the same private dossier/graph that owns the validated cursors.
     # Preparing a second dossier and copying only root receipts would discard
     # fresh typed helper evidence and its corresponding visibility metadata.
     await _prepare_dossier(
         verifier_view, data["dossier"], staged_dossier=staged.dossier,
+        context_is_current=verification_context_is_current,
     )
+    _release_obsolete_negation_conflict(staged)
     from ensemble_prover.mini_accepted_progress import validate_restored_acceptance_records
 
     validate_restored_acceptance_records(staged, checkpoint_monotonic=clock["monotonic_s"])
@@ -657,3 +910,8 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
         session.theory_context_pair = verifier_view.theory_context_pair
         session.theory_snapshot = verifier_view.theory_snapshot
     session._run_governor_last_tick_monotonic = time.monotonic()
+    session._native_research_governor_clock = {
+        "identity": uuid.uuid4().hex,
+        "restored_elapsed_s": research_governor_coverage["legacy_elapsed_s"],
+        "coverage_by_clock": research_governor_coverage["by_clock"],
+    }

@@ -90,17 +90,14 @@ class LemmaDagDecomposeAction:
         timeout_s: float = DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
         helpers_override: Sequence[str] = (),
         backtracking_enabled: bool = True,
-        max_parent_stub_goals: int = 8,
-        root_tactic_max_candidates: int = 32,
+        max_parent_stub_goals: int = -1,
+        root_tactic_max_candidates: int = -1,
     ) -> None:
         self.timeout_s = float(timeout_s or 0.0)
         self._helpers_override = tuple(helpers_override)
         self.backtracking_enabled = bool(backtracking_enabled)
-        self.max_parent_stub_goals = max(0, int(max_parent_stub_goals or 0))
-        self.root_tactic_max_candidates = max(
-            0,
-            int(root_tactic_max_candidates or 0),
-        )
+        self.max_parent_stub_goals = int(max_parent_stub_goals or 0)
+        self.root_tactic_max_candidates = int(root_tactic_max_candidates or 0)
 
 
     def _helpers_for(self, session: Any) -> Sequence[str]:
@@ -469,7 +466,7 @@ class LemmaDagDecomposeAction:
                             )
                     except Exception:
                         pass
-                elif self.root_tactic_max_candidates > 0:
+                elif self.root_tactic_max_candidates != 0:
                     tactic_ok, tactic_proof, tactic_helpers, tactic_records = (
                         await _try_proof_state_root_tactic_assembly(
                             conv=session.conv,

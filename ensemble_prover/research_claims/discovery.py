@@ -34,6 +34,7 @@ from .store import RevisionConflict
 from .strategy_discovery import ACTION_FIELDS as STRATEGY_ACTION_FIELDS
 from .strategy_discovery import SYSTEM as STRATEGY_SYSTEM
 from .strategy import StrategyYield
+from .native_deadline import native_admission_deadline_only, paid_work_deadline, paid_response_deadline
 from .literature import FIELDS as LITERATURE_FIELDS, INSTRUCTIONS as LITERATURE_INSTRUCTIONS, LiteratureTools, source_context
 
 
@@ -660,6 +661,7 @@ class DiscoveryLoop:
                     tool_result=None,
                     last_error_details=None,
                 )
+                job.pop("native_response_attempt_id", None)
                 self.store.save_job(job)
 
             requested_job = dict(job)
@@ -701,6 +703,11 @@ class DiscoveryLoop:
             timeout = min(
                 run["request_timeout_s"], max(0, run["deadline"] - time.time())
             )
+            if self.native_mode and native_admission_deadline_only(run):
+                # The borrowed client retains its own request watchdog. The
+                # allocation deadline controls admission, not this paid reply.
+                hard_deadline = paid_work_deadline(run)
+                timeout = None if hard_deadline is None else max(0.0, hard_deadline - time.time())
             try:
                 # Native owners and cost metering already carry their own
                 # operation observer. Run admission must compose with that
@@ -868,11 +875,19 @@ class DiscoveryLoop:
                         controller.settle(dispatch_attempts[-1], outcome="completed")
                         if current_response:
                             job["frontier_response_attempt_id"] = dispatch_attempts[-1]
+                    elif self.native_mode:
+                        settle_dispatches("completed")
                     if current_response:
                         job.update(
                             status="responded", response=response_artifact,
                             incomplete=bool(_completion_error(response) or getattr(client, "last_truncated", False)),
                         )
+                        if self.native_mode and self.strategy is not None and dispatch_attempts:
+                            if self.strategy.controller.bind_native_response(
+                                dispatch_attempts[-1], job_id=job["job_id"],
+                                turn=job["turn"], artifact_id=response_artifact,
+                            ):
+                                job["native_response_attempt_id"] = dispatch_attempts[-1]
                         # A timeout retains pending images; only the matching
                         # completed turn may mark them as presented.
                         job["source_images_presented"] = sorted(
@@ -922,7 +937,7 @@ class DiscoveryLoop:
                     elif exc.reason in {
                         "fairness", "suspended", "frontier_permit_required", "paused_operational",
                         "stale_permit_basis", "stale_frontier_scope", "formal_authority_revoked",
-                        "permit_expired", "claim_expired", "retry_exhausted",
+                        "permit_expired", "claim_expired", "retry_exhausted", "retry_deadline",
                     }:
                         from .frontier.hooks import mode_of
 
@@ -970,9 +985,10 @@ class DiscoveryLoop:
                 ):
                     reason = "context_overflow"
                 elif isinstance(exc, asyncio.TimeoutError):
+                    failure_deadline = paid_work_deadline(run) if self.native_mode else run["deadline"]
                     reason = (
                         "deadline_exhausted"
-                        if time.time() >= run["deadline"]
+                        if failure_deadline is not None and time.time() >= failure_deadline
                         else "provider_timeout"
                     )
                 else:
@@ -2108,6 +2124,34 @@ class DiscoveryLoop:
                 self.store.save_run(run)
             self._notify(job["parent_job"], {"verified_late_proof": result, "program_id": job_id}, requires_response=True)
 
+    def _tool_deadline(self, job: dict[str, Any]) -> float | None:
+        run = self.store.run_record()
+        if not self.native_mode:
+            return run["deadline"]
+        attempt_id = job.get("native_response_attempt_id")
+        attempts = self.strategy.controller.snapshot()["attempts"] if self.strategy is not None else {}
+        if attempt_id is not None:
+            if self.strategy is None:
+                raise ValueError("native paid response has no owning strategy ledger")
+            receipt = attempts.get(attempt_id)
+            if receipt is None or receipt.get("native_paid_settlement") is not True:
+                raise ValueError("native paid response has no admitted dispatch receipt")
+            return paid_response_deadline(run, job, receipt)
+        # Legacy responses have no native response pointer. Recover only the
+        # original consumer turn's receipts, preserving every retry's bound.
+        # Without archived response hashes, the exact emitting retry cannot be
+        # reconstructed; their intersection preserves the original allowance.
+        # The current run deadline belongs to a possibly renewed grant.
+        receipts = [receipt for receipt in attempts.values()
+                    if receipt.get("consumer_id") == job["job_id"]
+                    and receipt.get("consumer_turn") == job["turn"]
+                    and (not receipt.get("artifacts") or job.get("response") in receipt["artifacts"])]
+        if not receipts:
+            return paid_response_deadline(run, job, None)
+        deadlines = [paid_response_deadline(run, job, receipt) for receipt in receipts]
+        finite = [deadline for deadline in deadlines if deadline is not None]
+        return min(finite) if finite else None
+
     async def _advance(self, job: dict[str, Any]) -> None:
         if job["role"] == "formalization":
             await self._advance_formalization(job)
@@ -2156,7 +2200,11 @@ class DiscoveryLoop:
                 job["status"] = "tool_running"
                 self.store.save_job(job)
             attempted = job
-            result = await self.literature.run(action, remaining_s=self.store.run_record()["deadline"] - time.time()) if self.strategy is not None else {"status": "unavailable", "coverage": "none", "reason": "strategy research disabled", "kernel_verified": False}
+            tool_deadline = self._tool_deadline(job)
+            # Literature tools keep their existing local 30-second timeout;
+            # a renewable admission slice does not erase this paid tool call.
+            tool_remaining = 30.0 if tool_deadline is None else tool_deadline - time.time()
+            result = await self.literature.run(action, remaining_s=tool_remaining) if self.strategy is not None else {"status": "unavailable", "coverage": "none", "reason": "strategy research disabled", "kernel_verified": False}
             with self.store.atomic():
                 job = self.store.job(job["job_id"])
                 artifact = self._blob(result, "literature-result.json")
@@ -2209,8 +2257,9 @@ class DiscoveryLoop:
                     "reason": "supply complete code and finite scope",
                 }
             else:
+                tool_deadline = self._tool_deadline(job)
                 result = await self.sandbox.run(
-                    code, remaining_s=run["deadline"] - time.time()
+                    code, remaining_s=None if tool_deadline is None else tool_deadline - time.time()
                 )
             with self.store.atomic():
                 job = self.store.job(job["job_id"])
@@ -2265,7 +2314,9 @@ class DiscoveryLoop:
         This never starts/extends a run, closes borrowed clients, executes a
         formalization campaign, or grants mathematical acceptance. Admission
         guards propagate into client retries and remain closed in retired
-        transport tasks after this method returns.
+        transport tasks after this method returns. A native admission-only
+        grant lets dispatched work settle past its slice; explicit owner hard
+        bounds and the provider's own request watchdog still apply.
         """
         from ..llm_usage import provider_dispatch_guard
 
@@ -2285,21 +2336,40 @@ class DiscoveryLoop:
                 or run["deadline"] is None):
             raise ValueError("native owner must authorize the existing run first")
         deadline = asyncio.get_running_loop().time() + timeout_s
-        admitted = 0
+        admission_only = native_admission_deadline_only(run)
+        hard_deadline = paid_work_deadline(run) if admission_only or max_requests == 0 else None
+        execution_deadline = deadline
+        if admission_only or max_requests == 0:
+            # Recovery must also preserve a paid tool beyond the admission
+            # slice. Each tool retains its local watchdog and the intersection
+            # of its original receipt and current owner's hard deadline.
+            execution_deadline = None
+            if hard_deadline is not None:
+                hard_remaining = max(0.0, hard_deadline - time.time())
+                if max_requests > 0 or hard_remaining > 0:
+                    execution_deadline = asyncio.get_running_loop().time() + hard_remaining
+                # With an already expired owner, zero-admission recovery only
+                # settles saved output; the tool gate refuses new execution.
+        initial_requests = run["requests_used"]
         transitions = 0
         admission_open = True
         reason = "no_ready_work"
+        renewed_grant_can_resume = False
         current_job: str | None = None
         last_provider_error: dict[str, Any] | None = None
         transition_limit = 32 + 4 * min(max_requests, 32)
         initial_handoffs = set(self.store.run_record()["handoffs"])
 
+        def admitted_requests() -> int:
+            # Earlier guards can accept an intent that a later guard refuses.
+            # The durable ledger records committed admissions, including
+            # uncertain transport exposure, rather than local refusals.
+            return self.store.run_record(scheduling=True)["requests_used"] - initial_requests
+
         def authorize(details: Any = None) -> None:
-            nonlocal admitted
-            if (not admission_open or admitted >= max_requests
+            if (not admission_open or admitted_requests() >= max_requests
                     or asyncio.get_running_loop().time() >= deadline):
                 raise StrategyYield("native_quantum_exhausted")
-            admitted += 1
 
         self._native_advancing = True
         self._native_target_claim_id = target_claim_id
@@ -2316,12 +2386,20 @@ class DiscoveryLoop:
                             self._recover_native_job(job)
                     self._native_recovered = True
                 try:
-                    async with asyncio.timeout(timeout_s):
+                    async with asyncio.timeout_at(execution_deadline):
                         while transitions < transition_limit:
+                            # Yield even when ledger/response settlement is all
+                            # synchronous, so hard cancellation is observable.
+                            await asyncio.sleep(0)
                             if self.strategy is not None:
                                 self.strategy.synchronize()
                             run = self.store.run_record(scheduling=True)
+                            admitted = run["requests_used"] - initial_requests
                             stop = self.store.stop_reason(run)
+                            if admission_only and stop == "deadline_exhausted":
+                                stop = "quantum_exhausted"
+                            if not stop and asyncio.get_running_loop().time() >= deadline:
+                                stop = "quantum_exhausted"
                             if stop == "target_changed":
                                 reason = stop
                                 break
@@ -2355,17 +2433,28 @@ class DiscoveryLoop:
                                 if stop or admitted >= max_requests:
                                     reason = stop or "quantum_exhausted"
                                     break
-                                if any(job["status"] == "waiting"
-                                       and (job.get("research_control", {}).get("budget_deferred")
-                                            or job.get("research_control", {}).get("phase_deferred"))
-                                       and (target_claim_id is None or self.native_job_target(job, jobs_by_id) == target_claim_id)
-                                       for job in jobs):
-                                    reason = "research_allocation_deferred"
-                                    break
-                                if (target_claim_id is None and self.strategy is not None
+                                # A phase-deferred investigator can make its
+                                # reconciliation reviewer eligible. Service
+                                # that existing work before declaring idle.
+                                if ((target_claim_id is None or adaptive) and self.strategy is not None
                                         and self.strategy.ensure_work()):
                                     transitions += 1
                                     continue
+                                deferred = [job for job in jobs
+                                            if job["status"] == "waiting"
+                                            and (job.get("research_control", {}).get("budget_deferred")
+                                                 or job.get("research_control", {}).get("phase_deferred"))
+                                            and (target_claim_id is None or self.native_job_target(job, jobs_by_id) == target_claim_id)
+                                            and (not adaptive or native_job_context(
+                                                job, jobs_by_id, recorded_contexts=run.get("native_job_contexts", {}))
+                                                 == run.get("native_active_target_context_binding"))]
+                                if deferred:
+                                    reason = "research_allocation_deferred"
+                                    renewed_grant_can_resume = any(
+                                        job.get("research_control", {}).get("budget_deferred")
+                                        for job in deferred
+                                    )
+                                    break
                                 if last_provider_error is not None:
                                     reason = last_provider_error["kind"]
                                 break
@@ -2382,7 +2471,7 @@ class DiscoveryLoop:
                         else:
                             reason = "transition_limit"
                 except TimeoutError:
-                    reason = "quantum_timeout"
+                    reason = "parent_deadline_exhausted" if admission_only else "quantum_timeout"
                 finally:
                     admission_open = False
                     if current_job is not None:
@@ -2397,7 +2486,8 @@ class DiscoveryLoop:
                 self._native_target_claim_id = None
         return {
             "reason": reason,
-            "paid_dispatches": admitted,
+            "renewed_grant_can_resume": renewed_grant_can_resume,
+            "paid_dispatches": admitted_requests(),
             "transitions": transitions,
             "requests_used": self.store.run_record()["requests_used"],
             "last_provider_error": last_provider_error,

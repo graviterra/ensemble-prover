@@ -67,7 +67,16 @@ def dispatch_binding(store: Any, state: dict[str, Any], job: dict[str, Any]) -> 
 
 def begin_tool(loop: Any, job: dict[str, Any], action: dict[str, Any]) -> dict[str, Any] | None:
     """Persist intent or return a bounded refusal/cached result before execution."""
-    if action["action"] not in TOOLS or not _enabled(loop):
+    if action["action"] not in TOOLS:
+        return None
+    if not _enabled(loop):
+        if loop.native_mode:
+            deadline = loop._tool_deadline(job)
+            if deadline is not None:
+                import time
+
+                if time.time() >= deadline:
+                    return {"status": "unavailable", "reason": "deadline", "kernel_verified": False}
         return None
     controller = loop.strategy.controller
     with controller._edit() as (state, run):
@@ -98,10 +107,14 @@ def begin_tool(loop: Any, job: dict[str, Any], action: dict[str, Any]) -> dict[s
         control = (job["role"] == "review" and authorization is not None
                    and job.get("frontier_review_authorization") == authorization["authorization_id"]
                    and authorization["status"] == "open")
+        # Saved paid work keeps its original lifetime, intersected with the
+        # current owner's hard bound. This also covers synchronous reads during
+        # zero-admission recovery, outside the enclosing paid-request timeout.
+        tool_deadline = loop._tool_deadline(job) if loop.native_mode else run["deadline"]
         reason = None
         if (approach is None and not control) or receipt is None:
             reason = "tool_requires_bound_paid_response"
-        elif controller.clock() >= run["deadline"]:
+        elif tool_deadline is not None and controller.clock() >= tool_deadline:
             reason = "deadline"
         elif run["status"] not in {"running", "budget_exhausted"}:
             reason = "run_stopped"

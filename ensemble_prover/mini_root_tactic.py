@@ -1423,8 +1423,8 @@ async def try_root_tactic_close(
     """Run the deterministic root closer and persist the result."""
 
     timeout = max(0.0, float(timeout_s or 0.0))
-    max_cands = max(0, int(max_candidates or 0))
-    if timeout <= 0.0 or max_cands <= 0:
+    max_cands = int(max_candidates or 0)
+    if timeout <= 0.0 or max_cands == 0:
         return False, None
 
     close_with_tactics = tactic_closer or try_close_with_tactics

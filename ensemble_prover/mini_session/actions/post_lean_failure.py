@@ -46,7 +46,7 @@ class PostLeanFailureAction:
         *,
         timeout_s: float = 30.0,
         max_nodes: int = 3,
-        max_candidates: int = 32,
+        max_candidates: int = -1,
         max_decl_applications: int = 6,
         batch_parallelism: int = 1,
         repair_retrieval_top_k: int = 6,

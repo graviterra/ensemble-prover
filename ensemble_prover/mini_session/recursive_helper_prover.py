@@ -425,6 +425,8 @@ async def _run_child_with_elapsed_budget(
     result-only tail; the scheduler receives a retryable infrastructure yield.
     """
 
+    resumed_service_slice = bool(getattr(child_session, "_scheduler_service_yielded", False))
+    child_session._scheduler_service_yielded = False
     elapsed_budget = max(0.0, float(max_elapsed_s or 0.0))
     durable_deadline = max(0.0, float(deadline_epoch_s or 0.0))
     if elapsed_budget > 0.0:
@@ -482,11 +484,17 @@ async def _run_child_with_elapsed_budget(
 
     child_context = contextvars.copy_context()
     child_context.run(_OPERATION_CHILD_TASK_TRACKER.set, None)
-    mutation_lease = HardTimeoutLease(
-        timeout_s=(0.0 if remaining_s is None else max(0.0, remaining_s)),
-        cancel_grace_s=cleanup_allowance_s,
+    mutation_lease = getattr(child_session, "_mini_recursive_hard_timeout_lease", None)
+    reuse_settled_lease = bool(
+        resumed_service_slice
+        and mutation_lease is not None and not mutation_lease.abandoned
     )
-    _install_recursive_helper_capability_fence(child_session, mutation_lease)
+    if not reuse_settled_lease:
+        mutation_lease = HardTimeoutLease(
+            timeout_s=(0.0 if remaining_s is None else max(0.0, remaining_s)),
+            cancel_grace_s=cleanup_allowance_s,
+        )
+        _install_recursive_helper_capability_fence(child_session, mutation_lease)
     child_context.run(_CURRENT_HARD_TIMEOUT_LEASE.set, mutation_lease)
     setattr(child_session, "_mini_recursive_hard_timeout_lease", mutation_lease)
     cancelled_candidate: dict[str, Any] = {}
@@ -773,7 +781,7 @@ async def prove_helper_in_subsession(
     parent_session: Any,
     helper_name: str,
     target_statement: str,
-    max_turns: int = 5,
+    max_turns: int = -1,
     refine_enabled: bool = False,
     trace_label: str = "",
     nested_node_id: str = "",
@@ -781,6 +789,7 @@ async def prove_helper_in_subsession(
     max_elapsed_s: float = 0.0,
     action_deadline_epoch_s: float = 0.0,
     checkpoint_child_lane: str = "",
+    continuation_owner: Any = None,
     advisory_refutation_candidates: Sequence[Mapping[str, Any]] = (),
     publication_guard: Optional[Callable[[], None]] = None,
 ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
@@ -803,6 +812,9 @@ async def prove_helper_in_subsession(
         action_deadline_epoch_s: durable absolute deadline owned by the
             parent action. A restored child reuses it instead of receiving a
             fresh elapsed-time allowance.
+        continuation_owner: action retaining the child between settled service
+            slices. Without a checkpoint lane, retention lasts only for this
+            process; its live state cannot be recovered from a parent snapshot.
         advisory_refutation_candidates: bounded Lean-checked counterexample
             hints that lack a full-negation certificate. They steer the child
             prompt but never carry falsification authority.
@@ -842,6 +854,7 @@ async def prove_helper_in_subsession(
     from ensemble_prover.proof_dossier import (
         ProofDossier,
         canonical_dossier_statement_key,
+        text_hash,
     )
     from ensemble_prover.proof_state import ProofSearchState, lean_referenced_helper_names
     from .actions.child_closure import ChildClosureAction
@@ -873,8 +886,8 @@ async def prove_helper_in_subsession(
     # Aligned with action's _depth_under_cap and nudge convention:
     # ``max_recursion_depth=0`` means "uncapped". Read directly (no
     # ``or 3`` fallback) so 0 stays 0.
-    raw_max = getattr(parent_session, "max_recursion_depth", 3)
-    max_recursion_depth = int(raw_max if raw_max is not None else 3)
+    raw_max = getattr(parent_session, "max_recursion_depth", 0)
+    max_recursion_depth = int(raw_max if raw_max is not None else 0)
     new_depth = parent_recursion_depth + 1
 
     target_statement = str(target_statement or "").strip()
@@ -1181,6 +1194,9 @@ async def prove_helper_in_subsession(
         current_lean_environment_hash=str(
             getattr(parent_dossier, "current_lean_environment_hash", "") or ""
         ),
+        lean_environment_plain_syntax=copy.deepcopy(
+            getattr(parent_dossier, "lean_environment_plain_syntax", {}) or {}
+        ),
         lean_environment_ancestor_hashes=copy.deepcopy(
             getattr(parent_dossier, "lean_environment_ancestor_hashes", {}) or {}
         ),
@@ -1367,15 +1383,16 @@ async def prove_helper_in_subsession(
     )
     # Helper sub-prover targets ONLY the helper statement. Force answer-related
     # state empty/disabled so stale parent records cannot affect verification.
-    total_turn_budget = max(1, int(max_turns or 1))
+    total_turn_budget = -1 if int(max_turns) < 0 else max(1, int(max_turns or 1))
+    unlimited_turns = total_turn_budget < 0
     refine_turn_budget = (
-        1
+        (-1 if unlimited_turns else 1)
         if bool(refine_enabled)
         and parent_session.refiner_client is not None
-        and total_turn_budget > 1
+        and (unlimited_turns or total_turn_budget > 1)
         else 0
     )
-    prove_turn_budget = max(1, total_turn_budget - refine_turn_budget)
+    prove_turn_budget = -1 if unlimited_turns else max(1, total_turn_budget - refine_turn_budget)
 
     lean_signature = (
         f"theorem {helper_name} : {target_statement} := by\n  -- prove this helper"
@@ -1524,7 +1541,7 @@ async def prove_helper_in_subsession(
         recursion_depth=new_depth,
         max_recursion_depth=max_recursion_depth,
         # Tight iteration cap: 1 LLM turn + cascade overhead per helper turn.
-        max_iterations=int(max_turns or 1) + 5,
+        max_iterations=(-1 if unlimited_turns else int(max_turns or 1) + 5),
         scope="subgoal",
         parent=parent_session,
         strict_progress_accounting=parent_session.strict_progress_accounting,
@@ -1556,9 +1573,9 @@ async def prove_helper_in_subsession(
     # putnam_2025_b1's outer child expired at t~=1284 while an inner helper
     # had incorrectly reset itself to t~=1857, converting ordinary nested
     # timeout composition into external cancellation and a hard watchdog kill.
-    child_session.recursive_elapsed_deadline_epoch_s = max(
-        0.0,
-        float(action_deadline_epoch_s or 0.0),
+    child_session.recursive_elapsed_deadline_epoch_s = _bounded_nested_elapsed_deadline_epoch_s(
+        max_elapsed_s=max_elapsed_s,
+        ancestor_deadline_epoch_s=action_deadline_epoch_s,
     )
     parent_memory = getattr(parent_session, "mathematical_memory", None)
     if parent_memory is not None:
@@ -1618,7 +1635,7 @@ async def prove_helper_in_subsession(
     )
     child_max_nodes = int(getattr(parent_child_closure, "max_nodes", 3) or 3)
     child_max_candidates = int(
-        getattr(parent_child_closure, "max_candidates", 32) or 32
+        getattr(parent_child_closure, "max_candidates", -1) or 0
     )
     child_max_decl_apps = int(
         getattr(parent_child_closure, "max_decl_applications", 6) or 6
@@ -1628,7 +1645,7 @@ async def prove_helper_in_subsession(
         getattr(parent_route_assembly, "root_tactic_timeout_s", 40.0) or 0.0
     )
     route_root_tactic_max_candidates = int(
-        getattr(parent_route_assembly, "root_tactic_max_candidates", 64) or 0
+        getattr(parent_route_assembly, "root_tactic_max_candidates", -1) or 0
     )
     # ``or 6`` on a missing parent action made this unconditionally truthy, so
     # the child registered proof_state_retrieval even when the parent had none.
@@ -1788,7 +1805,7 @@ async def prove_helper_in_subsession(
 
     # Graph route/native closers are structural graph consumers, not tactic
     # swarms. Keep them available even when child tactics are disabled.
-    route_budget_invocations = max(1, total_turn_budget + 2)
+    route_budget_invocations = -1 if unlimited_turns else max(1, total_turn_budget + 2)
     child_session.register(
         GraphRouteAssemblyAction(
             max_routes=child_max_nodes,
@@ -1800,7 +1817,7 @@ async def prove_helper_in_subsession(
         "graph_route_assembly",
         ActionBudget(
             max_invocations=route_budget_invocations,
-            max_total_seconds=max(
+            max_total_seconds=0.0 if unlimited_turns else max(
                 30.0,
                 float(route_budget_invocations)
                 * max(1.0, route_root_tactic_timeout_s)
@@ -1811,7 +1828,7 @@ async def prove_helper_in_subsession(
     child_session.register(GraphNativeShortcutAction())
     child_session.set_budget(
         "graph_native_shortcut",
-        ActionBudget(max_invocations=max(1, total_turn_budget + 2), max_total_seconds=30.0),
+        ActionBudget(max_invocations=(-1 if unlimited_turns else max(1, total_turn_budget + 2)), max_total_seconds=(0.0 if unlimited_turns else 30.0)),
     )
 
     if child_tactics_enabled:
@@ -1832,8 +1849,8 @@ async def prove_helper_in_subsession(
         child_session.set_budget(
             "inter_turn_assembly",
             ActionBudget(
-                max_invocations=max(1, total_turn_budget + 2),
-                max_total_seconds=90.0,
+                max_invocations=(-1 if unlimited_turns else max(1, total_turn_budget + 2)),
+                max_total_seconds=0.0,
             ),
         )
         # The deterministic root closer is gated on the parent's OWN root
@@ -1863,8 +1880,8 @@ async def prove_helper_in_subsession(
             child_session.set_budget(
                 "tactic_close",
                 ActionBudget(
-                    max_invocations=max(2, total_turn_budget * 2),
-                    max_total_seconds=60.0,
+                    max_invocations=(-1 if unlimited_turns else max(2, total_turn_budget * 2)),
+                    max_total_seconds=(0.0 if unlimited_turns else 60.0),
                 ),
             )
             child_session.register(
@@ -1915,15 +1932,15 @@ async def prove_helper_in_subsession(
         child_session.set_budget(
             "helper_only_salvage",
             ActionBudget(
-                max_invocations=max(1, total_turn_budget),
-                max_total_seconds=120.0,
+                max_invocations=(-1 if unlimited_turns else max(1, total_turn_budget)),
+                max_total_seconds=0.0,
             ),
         )
         child_session.set_budget(
             "post_lean_failure",
             ActionBudget(
-                max_invocations=max(1, total_turn_budget),
-                max_total_seconds=180.0,
+                max_invocations=(-1 if unlimited_turns else max(1, total_turn_budget)),
+                max_total_seconds=0.0,
             ),
         )
     if (
@@ -1939,7 +1956,7 @@ async def prove_helper_in_subsession(
         )
         child_session.set_budget(
             "proof_state_retrieval",
-            ActionBudget(max_invocations=max(1, total_turn_budget), max_total_seconds=60.0),
+            ActionBudget(max_invocations=(-1 if unlimited_turns else max(1, total_turn_budget)), max_total_seconds=(0.0 if unlimited_turns else 60.0)),
         )
     if child_tactics_enabled:
         child_closure_action = ChildClosureAction(
@@ -1958,7 +1975,7 @@ async def prove_helper_in_subsession(
         child_session.set_budget(
             "child_closure",
             ActionBudget(
-                max_invocations=max(2, total_turn_budget),
+                max_invocations=(-1 if unlimited_turns else max(2, total_turn_budget)),
                 max_total_seconds=0.0,
             ),
         )
@@ -1967,7 +1984,7 @@ async def prove_helper_in_subsession(
         child_session.set_budget(
             "lemma_dag_decompose",
             ActionBudget(
-                max_invocations=max(1, total_turn_budget),
+                max_invocations=(-1 if unlimited_turns else max(1, total_turn_budget)),
                 max_total_seconds=0.0,
             ),
         )
@@ -1977,18 +1994,18 @@ async def prove_helper_in_subsession(
         child_session.register(
             RecursiveHelperProverAction(
                 max_attempts_per_node=int(
-                    getattr(parent_recursive, "max_attempts_per_node", 2)
-                    if getattr(parent_recursive, "max_attempts_per_node", 2)
+                    getattr(parent_recursive, "max_attempts_per_node", 0)
+                    if getattr(parent_recursive, "max_attempts_per_node", 0)
                     is not None
-                    else 2
+                    else 0
                 ),
                 max_giveups_per_cluster_per_node=int(
                     getattr(
                         parent_recursive,
                         "max_giveups_per_cluster_per_node",
-                        2,
+                        0,
                     )
-                    or 2
+                    or 0
                 ),
                 helper_turns=int(getattr(parent_recursive, "helper_turns", max_turns) or max_turns),
                 refine_enabled=bool(getattr(parent_recursive, "refine_enabled", False)),
@@ -2001,8 +2018,8 @@ async def prove_helper_in_subsession(
         child_session.set_budget(
             "recursive_helper_prover",
             ActionBudget(
-                max_invocations=max(1, total_turn_budget),
-                max_total_seconds=300.0,
+                max_invocations=(-1 if unlimited_turns else max(1, total_turn_budget)),
+                max_total_seconds=0.0,
             ),
         )
 
@@ -2028,7 +2045,7 @@ async def prove_helper_in_subsession(
     if (
         bool(refine_enabled)
         and parent_session.refiner_client is not None
-        and refine_turn_budget > 0
+        and refine_turn_budget != 0
     ):
         # Register refine before the first child run. Otherwise the prove
         # phase uses "no applicable action" as an implicit phase boundary,
@@ -2054,18 +2071,115 @@ async def prove_helper_in_subsession(
     child_session.expand_max_iterations_to_action_budgets(headroom=5)
 
     checkpoint_registry = getattr(parent_session, "checkpoint_registry", None)
+    checkpoint_child_enabled = bool(checkpoint_registry is not None and checkpoint_child_lane)
+    service_retention_enabled = continuation_owner is not None
     completed_checkpoint_result = None
-    if checkpoint_registry is not None and checkpoint_child_lane:
-        from .durable_recursive_child import RecursiveChildLimits
+    continuation_key = None
+    child_exposure_before = (0, 0)
+    if checkpoint_child_enabled or service_retention_enabled:
+        from .durable_recursive_child import (
+            RecursiveChildLimits, capture_retained_child_helper_authority,
+            refresh_retained_child_helpers,
+        )
+        from .session import _dispatch_capability_generation_nonce
 
-        child_record = checkpoint_registry.child_record(checkpoint_child_lane)
-        if child_record is None:
-            raise ValueError("Recursive child has no durable reservation")
+        child_record = None
+        if checkpoint_child_enabled:
+            child_record = checkpoint_registry.child_record(checkpoint_child_lane)
+            if child_record is None:
+                raise ValueError("Recursive child has no durable reservation")
         admitted_limits = RecursiveChildLimits.capture(child_session)
-        await checkpoint_registry.bind_session(checkpoint_child_lane, child_session)
+        admitted_dossier = capture_retained_child_helper_authority(child_dossier)
+        invocation_identity = (
+            id(parent_session), id(continuation_owner),
+            str(getattr(continuation_owner, "id", "")),
+            str(checkpoint_child_lane), helper_name, target_statement,
+            str(nested_node_id), int(nested_attempt_number), int(max_turns), bool(refine_enabled),
+        )
+        continuation_key = (
+            id(checkpoint_registry), invocation_identity,
+            str(getattr(parent_session, "session_activation_id", "")),
+            text_hash(str(getattr(parent_conv, "lean_preamble", "") or "")),
+            text_hash(str(getattr(parent_conv, "preamble", "") or "")),
+            *(_dispatch_capability_generation_nonce(getattr(parent_session, name, None))
+              for name in ("lean", "prover_client", "refiner_client", "theory_library")),
+        )
+        frame = dict(getattr(continuation_owner, "_nested_execution_frame", {}) or {})
+        cached = getattr(continuation_owner, "_suspended_child_session", None)
+        refresh_admitted_helpers = bool(cached is not None or (
+            checkpoint_child_enabled and checkpoint_registry.lane_record(checkpoint_child_lane) is not None
+        ))
+        if (cached is not None and cached[0] == continuation_key
+                and getattr(cached[1], "_scheduler_service_yielded", False)
+                and not getattr(getattr(cached[1], "_mini_recursive_hard_timeout_lease", None), "abandoned", False)):
+            child_session = cached[1]
+        else:
+            if cached is not None:
+                if cached[0][1] != invocation_identity:
+                    raise ValueError("Retained recursive helper belongs to another invocation")
+                previous = cached[1]
+                abandoned = bool(getattr(getattr(previous, "_mini_recursive_hard_timeout_lease", None), "abandoned", False))
+                from ..mini_research import current_native_research
+                research_owner = current_native_research()
+                if research_owner is not None:
+                    await research_owner.settle_session_before_rebind(previous, abandoned=abandoned)
+                previous_registry = getattr(previous, "checkpoint_registry", None)
+                previous_lane = getattr(previous, "checkpoint_lane_key", "")
+                if previous_registry is not None and previous_lane:
+                    if abandoned:
+                        await previous_registry.detach_abandoned_session(previous_lane, previous)
+                    else:
+                        await previous_registry.suspend_session(previous_lane, previous)
+                if abandoned and not checkpoint_child_enabled:
+                    continuation_owner._suspended_child_session = None
+                    continuation_owner._nested_execution_frame.pop("child_service_retention", None)
+                    reported = frame.get("child_exposure_reported", [0, 0])
+                    exposure = _child_provider_exposure(previous, include_inflight=True)
+                    if (not isinstance(reported, (list, tuple)) or len(reported) != 2
+                            or any(type(value) is not int or value < 0 for value in reported)):
+                        raise ValueError("Invalid reported recursive child provider exposure")
+                    continuation_owner._nested_execution_frame.pop("child_exposure_reported", None)
+                    return False, None, {
+                        "verdict": "recursive_helper_abandoned_runtime_retired",
+                        "child_runtime_retired": True,
+                        "provider_calls_completed": max(0, exposure[0] - reported[0]),
+                        "provider_dispatches_started": max(0, exposure[1] - reported[1]),
+                        "child_helpers_added": [],
+                    }
+                if not checkpoint_child_enabled:
+                    from .durable_session_record import capture_session_record, restore_session_record
+
+                    # A runtime continuation has no disk receipt. Preserve its
+                    # settled work and freshly verify it when rebinding services.
+                    retained_record = capture_session_record(previous)
+                    await restore_session_record(
+                        child_session, retained_record, expected_identity=retained_record["identity"],
+                    )
+                continuation_owner._suspended_child_session = None
+            elif not checkpoint_child_enabled and frame.get("child_service_retention") == "runtime":
+                raise ValueError("Runtime recursive helper continuation lost its live child")
+            if checkpoint_child_enabled:
+                await checkpoint_registry.bind_session(checkpoint_child_lane, child_session)
+        child_session.parent = parent_session
+        child_conv = child_session.conv
+        child_dossier = child_session.dossier
+        if refresh_admitted_helpers:
+            refresh_retained_child_helpers(child_dossier, admitted_dossier)
+        prove_action = child_session.registered_action("conversation_turn_prove")
+        refine_action = child_session.registered_action("conversation_turn_refine")
+        refine_registered = refine_action is not None
         admitted_limits.intersect_restored(child_session, parent_session)
         action_deadline_epoch_s = child_session.recursive_elapsed_deadline_epoch_s
-        completed_checkpoint_result = child_record.get("result")
+        reported = frame.get("child_exposure_reported", [0, 0])
+        if (not isinstance(reported, (list, tuple)) or len(reported) != 2
+                or any(type(value) is not int or value < 0 for value in reported)):
+            raise ValueError("Invalid reported recursive child provider exposure")
+        if any(prior > current for prior, current in zip(reported, _child_provider_exposure(child_session))):
+            raise ValueError("Reported recursive child exposure exceeds its retained execution")
+        child_exposure_before = tuple(reported)
+        if service_retention_enabled:
+            child_session.scheduler_service_slice_s = 30.0
+        completed_checkpoint_result = child_record.get("result") if child_record is not None else None
         if completed_checkpoint_result is not None:
             result = completed_checkpoint_result
             if (type(result) is not dict
@@ -2187,6 +2301,11 @@ async def prove_helper_in_subsession(
             True, child_session.final_proof, False,
         )
     else:
+        if service_retention_enabled:
+            # Retain ownership before entering provider work too. A settled
+            # cancellation can then recover its paid input through the same
+            # independently verified restore path on the next dispatch.
+            continuation_owner._suspended_child_session = (continuation_key, child_session)
         ok, proof_text, action_elapsed_budget_exhausted = (
             await _run_child_with_elapsed_budget(
                 child_session,
@@ -2214,11 +2333,34 @@ async def prove_helper_in_subsession(
             include_inflight=action_elapsed_budget_exhausted,
         )
     )
+    child_exposure_total = (child_provider_calls_completed, child_provider_dispatches_started)
+    child_provider_calls_completed = max(0, child_provider_calls_completed - child_exposure_before[0])
+    child_provider_dispatches_started = max(0, child_provider_dispatches_started - child_exposure_before[1])
     child_llm_failure_kind = str(
         last_action_metadata.get("llm_failure_kind") or ""
     ).strip()
     child_llm_error = str(last_action_metadata.get("llm_error") or "").strip()
     child_llm_retryable = bool(last_action_metadata.get("llm_retryable"))
+
+    if getattr(child_session, "_scheduler_service_yielded", False) and not ok:
+        if continuation_owner is None or continuation_key is None:
+            raise ValueError("A suspended helper child requires a continuation owner")
+        if publication_guard is not None:
+            publication_guard()
+        merge_child_theory_context(parent_session, child_session)
+        merge_eligible_child_verified_helpers()
+        continuation_owner._suspended_child_session = (continuation_key, child_session)
+        return False, None, {
+            "verdict": "recursive_helper_service_yield",
+            "child_service_yielded": True,
+            "child_service_retention": "checkpoint" if checkpoint_child_enabled else "runtime",
+            "child_helpers_added": list(child_dossier.verified_helpers),
+            "child_seeded_helpers": child_seeded_helpers,
+            "child_seeded_proposed_helpers": child_seeded_proposed_helpers,
+            "provider_calls_completed": child_provider_calls_completed,
+            "provider_dispatches_started": child_provider_dispatches_started,
+            "child_exposure_total": list(child_exposure_total),
+        }
 
     if action_elapsed_budget_exhausted:
         cleanup_infrastructure_yield = bool(cleanup_infrastructure_outcome)
@@ -2361,7 +2503,7 @@ async def prove_helper_in_subsession(
     if bool(refine_enabled) and parent_session.refiner_client is None:
         refine_skipped = True
         refine_skip_reason = "missing_refiner_client"
-    elif bool(refine_enabled) and refine_turn_budget <= 0:
+    elif bool(refine_enabled) and refine_turn_budget == 0:
         refine_skipped = True
         refine_skip_reason = "turn_budget_exhausted"
 
@@ -2370,7 +2512,7 @@ async def prove_helper_in_subsession(
         not ok
         and bool(refine_enabled)
         and parent_session.refiner_client is not None
-        and refine_turn_budget > 0
+        and refine_turn_budget != 0
         and not refine_registered
     ):
         refine_attempted = True
@@ -2390,7 +2532,7 @@ async def prove_helper_in_subsession(
                 max_total_seconds=0.0,
             ),
         )
-        child_session.max_iterations = max(
+        child_session.max_iterations = -1 if unlimited_turns else max(
             int(getattr(child_session, "max_iterations", 0) or 0),
             int(getattr(child_session, "iteration", 0) or 0)
             + refine_turn_budget
@@ -2418,6 +2560,8 @@ async def prove_helper_in_subsession(
     child_provider_calls_completed, child_provider_dispatches_started = (
         _child_provider_exposure(child_session)
     )
+    child_provider_calls_completed = max(0, child_provider_calls_completed - child_exposure_before[0])
+    child_provider_dispatches_started = max(0, child_provider_dispatches_started - child_exposure_before[1])
     child_llm_failure_kind = str(
         last_action_metadata.get("llm_failure_kind") or ""
     ).strip()

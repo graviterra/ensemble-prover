@@ -56,6 +56,15 @@ _RUNTIME_SELECTORS = (
     "LEAN_SRC_PATH",
 )
 
+
+def runtime_selector_snapshot() -> tuple[tuple[str, str | None], ...]:
+    """Read process selectors without rescanning toolchains or import files.
+
+    HOME also selects Elan's default directory and expands a configured tilde.
+    Preserve absent versus empty values because subprocess lookup differs.
+    """
+    return tuple((name, os.environ.get(name)) for name in (*_RUNTIME_SELECTORS, "HOME"))
+
 # Optional caller-owned cancellation for background identity capture. Ordinary
 # campaign/checkpoint capture has no callback and retains its existing policy.
 _CAPTURE_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(

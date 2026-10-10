@@ -1142,12 +1142,12 @@ def _export_root_replay_witness(
     witness = f"miniExportRootReplay_{digest}"
     while witness in material:
         witness += "_"
-    root_components = ", ".join(json.dumps(part, ensure_ascii=False) for part in root_parts)
     allowed_axioms = ", ".join(json.dumps(name) for name in sorted(_ALLOWED_EXPORT_AXIOMS))
     guard = f'''run_cmd Lean.Elab.Command.liftTermElabM do
-  let rootName := ([{root_components}] : List String).foldl Lean.Name.str Lean.Name.anonymous
+  let rootName := ``_root_.{theorem_name.removeprefix('_root_.')}
+  let replayName := ``_root_.{witness}
   let rootInfo ← Lean.getConstInfo rootName
-  let replayInfo ← Lean.getConstInfo (Lean.Name.mkSimple "{witness}")
+  let replayInfo ← Lean.getConstInfo replayName
   let rootParams := (Lean.collectLevelParams {{}} rootInfo.type).params.toList
   let replayParams := (Lean.collectLevelParams {{}} replayInfo.type).params.toList
   unless rootParams.length == replayParams.length do
@@ -1158,7 +1158,7 @@ def _export_root_replay_witness(
   unless ← Lean.Meta.isDefEq rootType replayType do
     Lean.throwError "export root type is not definitionally equal to the original target"
   let allowedAxioms := ([{allowed_axioms}] : List String)
-  for name in [rootName, Lean.Name.mkSimple "{witness}"] do
+  for name in [rootName, replayName] do
     for axiomName in (← Lean.collectAxioms name) do
       unless allowedAxioms.contains axiomName.toString do
         Lean.throwError "export root replay uses an unsupported axiom"
@@ -1229,15 +1229,22 @@ def _with_export_heartbeats(content: str, max_heartbeats: int) -> str:
 def _export_target_witness(
     statement: str, *, scoped_prefix: str = "", omit_variables: Sequence[str] = (),
 ) -> tuple[str, str]:
-    from .lean_runner import _type_identity_probe_command, _check_target_identity_guard_definition
+    from .lean_runner import (
+        _check_target_identity_probe_command,
+        _check_target_identity_guard_definition,
+    )
 
     name = "miniExportExpected_" + hashlib.sha256(statement.encode()).hexdigest()[:20]
-    command = "set_option autoImplicit true in\npublic " + _type_identity_probe_command(f"_root_.{name}", statement)
+    command = "set_option autoImplicit true in\n" + _check_target_identity_probe_command(
+        f"_root_.{name}", statement, require_proposition=True,
+    )
     if omit_variables:
         command = f"omit {' '.join(omit_variables)} in\n{command}"
     if scoped_prefix:
         command = f"{scoped_prefix}\n{command}"
-    return name, command + "\n" + _check_target_identity_guard_definition(name)
+    return name, command + "\n" + _check_target_identity_guard_definition(
+        name, require_proposition=True,
+    )
 
 
 @dataclass(frozen=True)

@@ -4328,6 +4328,13 @@ def rename_lean_identifier(
         return raw
     old_segments = _lean_qualified_identifier_segments(old)
     new_segments = _lean_qualified_identifier_segments(new)
+    if old_segments[:1] == ("_root_",):
+        old_segments = old_segments[1:]
+    new_is_rooted = new_segments[:1] == ("_root_",)
+    if new_is_rooted:
+        new_segments = new_segments[1:]
+    if not old_segments or not new_segments:
+        return raw
     old_short = old_segments[-1] if old_segments else old
     new_short = new_segments[-1] if new_segments else new
     allow_short_reference = len(old_segments) > 1
@@ -4346,33 +4353,97 @@ def rename_lean_identifier(
         }
     )
 
-    identifier_pattern = r"(?:«[^»]+»|[A-Za-z_][A-Za-z0-9_']*)"
-    declaration_match = re.search(
+    identifier_pattern = r"(?:«[^»]+»|(?:[^\W\d]|_)[\w']*)"
+    declaration_pattern = re.compile(
         rf"\b(?:theorem|lemma|def|abbrev|opaque|instance)\s+"
         rf"(?P<name>{identifier_pattern}(?:\.{identifier_pattern})*)",
-        raw,
     )
+    declaration_match = None
+    scan_index = 0
+    while scan_index < len(raw):
+        skipped = _lean_lexical_skip_end(raw, scan_index)
+        if skipped is not None:
+            scan_index = skipped
+            continue
+        declaration_match = declaration_pattern.match(raw, scan_index)
+        if declaration_match is not None:
+            break
+        scan_index += 1
     declaration_name_span: tuple[int, int] | None = None
     declaration_parameter_names: set[str] = set()
+    header_local_scopes: list[tuple[int, int, set[str]]] = []
+    proof_local_names: set[str] = set()
+    header_end = len(raw)
     if declaration_match is not None:
         declaration_name_span = declaration_match.span("name")
-        header_end = raw.find(":=", declaration_match.end("name"))
-        if header_end < 0:
-            header_end = len(raw)
+        proof_start = find_decl_header_end(raw, 0)
+        header_end = proof_start - 2 if proof_start is not None else len(raw)
         header = raw[declaration_match.end("name") : header_end]
-        for binder in re.finditer(r"[({\[]([^(){}\[\]]+)[)}\]]", header):
-            binder_body = str(binder.group(1) or "")
-            if ":" not in binder_body:
-                continue
-            lhs = binder_body.split(":", 1)[0]
-            for parameter_name in re.findall(identifier_pattern, lhs):
-                canonical = canonical_lean_identifier(parameter_name)
-                if canonical and canonical != "_":
-                    declaration_parameter_names.add(canonical)
-    old_short_is_shadowed = (
-        len(old_segments) == 1
-        and canonical_lean_identifier(old_short) in declaration_parameter_names
-    )
+        scope_names = {
+            canonical_lean_identifier(name)
+            for name in (old_short, new_short, old_segments[0], new_segments[0])
+        }
+        colon = _first_top_level_colon(header) if any(name in header for name in scope_names) else -1
+        parameter_text = header[:colon] if colon >= 0 else header
+        if colon >= 0:
+            parameter_segments = _split_binder_segments([parameter_text])
+            declaration_parameter_names.update(_declared_names_from_binder_segments(
+                parameter_segments,
+            ))
+            def remember_header_scope(text: str, start: int, end: int) -> None:
+                local_names: set[str] = set()
+
+                def observe_scope(_text: str, bound: set[str]) -> set[str]:
+                    local_names.update(bound)
+                    return set()
+
+                bound, _free = _scoped_identifier_uses(
+                    text, free_identifier_collector=observe_scope,
+                )
+                local_names.update(bound)
+                if local_names:
+                    header_local_scopes.append((start, end, local_names))
+
+            # A quantifier inside a parameter's type does not bind names in
+            # later parameters, the result type, or the proof. Only declaration
+            # parameters themselves have that wider scope.
+            parameter_offset = 0
+            header_start = declaration_match.end("name")
+            for segment in parameter_segments:
+                # Walk the same lexical separators as the binder splitter.
+                # Searching by text could attach this scope to an identical
+                # binder quoted inside a preceding comment instead.
+                while parameter_offset < len(parameter_text):
+                    if parameter_text[parameter_offset].isspace():
+                        parameter_offset += 1
+                    elif parameter_text.startswith(("/-", "--"), parameter_offset):
+                        parameter_offset = _lean_lexical_skip_end(parameter_text, parameter_offset) or len(parameter_text)
+                    else:
+                        break
+                position = parameter_offset
+                parameter_offset = position + len(segment)
+                remember_header_scope(
+                    f"∀ {segment}, True",
+                    header_start + position, header_start + parameter_offset,
+                )
+            remember_header_scope(
+                header[colon + 1:], header_start + colon + 1, header_end,
+            )
+        # This lexical renamer does not elaborate tactic scopes. Preserve short
+        # spellings introduced inside a proof instead of risking capture; exact
+        # qualified global references remain renameable across those scopes.
+        body = raw[header_end:]
+        body = strip_lean_comments_and_string_literals(body) if any(name in body for name in scope_names) else ""
+        for binding in re.finditer(
+            r"\b(?:intro|intros|rintro|rename_i)\s+([^\n;|]+)"
+            r"|\b(?:let|have|obtain)\s+([^\n:=]+)"
+            r"|(?:\bfun|λ)\s+([^=↦]+)(?:=>|↦)"
+            r"|\|\s*([^=\n]+)=>"
+            r"|\b(?:cases|rcases|induction)\s+[^\n]*?\bwith\s+([^\n]+)", body,
+        ):
+            for group in binding.groups():
+                if group:
+                    proof_local_names.update(_binder_identifier_tokens(group))
 
     def identifier_end(start: int) -> Optional[int]:
         def segment_end(index: int) -> Optional[int]:
@@ -4410,58 +4481,122 @@ def rename_lean_identifier(
         rooted = bool(token_keys and token_keys[0] == "_root_")
         comparison_keys = token_keys[1:] if rooted else token_keys
         comparison_segments = token_segments[1:] if rooted else token_segments
+        if not (
+            comparison_keys[:len(old_keys)] == old_keys
+            or (allow_short_reference and not rooted and comparison_keys[:1] == (short_key,))
+        ):
+            return token
         is_declaration_name = bool(
             declaration_name_span is not None
             and token_start == declaration_name_span[0]
             and token_start + len(token) == declaration_name_span[1]
         )
+        if not is_declaration_name:
+            following = token_start + len(token)
+            while following < len(raw):
+                if raw[following].isspace():
+                    following += 1
+                    continue
+                if raw.startswith(("/-", "--"), following):
+                    following = _lean_lexical_skip_end(raw, following) or following
+                    continue
+                break
+            if (raw.startswith(":=", following) and following != header_end) or (
+                previous_code_token in {"{", ",", "with"}
+                and raw[following:following + 1] in {",", "}"}
+            ) or previous_code_token == ".":
+                # Named arguments, structure fields, and local definition
+                # labels are interfaces, not references to the global helper.
+                # A structure pun and anonymous `.constructor` spelling also
+                # carry a field/constructor identity that must be retained.
+                return token
+        local_names = declaration_parameter_names
+        if token_start >= header_end:
+            local_names = local_names | proof_local_names
+        else:
+            for scope_start, scope_end, scoped_names in header_local_scopes:
+                if scope_start <= token_start < scope_end:
+                    local_names = local_names | scoped_names
+                    break
+        old_short_is_shadowed = canonical_lean_identifier(old_short) in local_names
+        new_short_is_shadowed = canonical_lean_identifier(new_short) in local_names
+        old_head_is_shadowed = canonical_lean_identifier(old_segments[0]) in local_names
+        new_head_is_shadowed = canonical_lean_identifier(new_segments[0]) in local_names
 
         def replacement(
             prefix_length: int,
             replacement_segments: tuple[str, ...],
         ) -> str:
-            prefix = ("_root_",) if rooted else ()
+            replacement_is_rooted = replacement_segments[:1] == ("_root_",)
+            if replacement_is_rooted:
+                replacement_segments = replacement_segments[1:]
+            prefix = ("_root_",) if rooted or new_is_rooted or replacement_is_rooted else ()
             suffix = comparison_segments[prefix_length:]
             return ".".join((*prefix, *replacement_segments, *suffix))
 
         if comparison_keys == old_keys:
-            if old_short_is_shadowed and not is_declaration_name:
+            if not rooted and old_head_is_shadowed and not is_declaration_name:
                 return token
-            return replacement(len(old_keys), new_segments)
+            destination = (
+                ("_root_", *new_segments)
+                if not rooted and not is_declaration_name and new_head_is_shadowed
+                else new_segments
+            )
+            return replacement(len(old_keys), destination)
         if comparison_keys[: len(old_keys)] == old_keys and len(
             comparison_keys
         ) > len(old_keys):
+            if not rooted and old_head_is_shadowed:
+                return token
             suffix = comparison_keys[len(old_keys)]
             if (
                 len(old_segments) > 1
                 or allow_arbitrary_dot_suffixes
                 or suffix in projection_suffixes
             ):
-                return replacement(len(old_keys), new_segments)
-        if allow_short_reference:
+                destination = (
+                    ("_root_", *new_segments)
+                    if not rooted and new_head_is_shadowed else new_segments
+                )
+                return replacement(len(old_keys), destination)
+        if allow_short_reference and not rooted and not old_short_is_shadowed:
+            # An explicitly rooted short name is not this qualified helper.
+            # A new short spelling that is locally bound must stay qualified.
+            short_replacement = (
+                ("_root_", *new_segments)
+                if (new_short_is_shadowed or new_is_rooted
+                    or old_segments[:-1] != new_segments[:-1])
+                else (new_short,)
+            )
             if comparison_keys == (short_key,):
-                return replacement(1, (new_short,))
+                return replacement(1, short_replacement)
             if comparison_keys[:1] == (short_key,) and len(comparison_keys) > 1:
                 suffix = comparison_keys[1]
                 if allow_arbitrary_dot_suffixes or suffix in projection_suffixes:
-                    return replacement(1, (new_short,))
+                    return replacement(1, short_replacement)
         return token
 
     out: List[str] = []
     index = 0
+    previous_code_token = ""
     while index < len(raw):
         skip_to = _lean_lexical_skip_end(raw, index)
         if skip_to is not None and not raw.startswith("«", index):
             out.append(raw[index:skip_to])
+            if not raw.startswith(("/-", "--"), index):
+                previous_code_token = "<literal>"
             index = skip_to
             continue
         end = identifier_end(index)
         if end is not None:
             token = raw[index:end]
             out.append(renamed_token(token, index))
+            previous_code_token = token
             index = end
             continue
         out.append(raw[index])
+        if not raw[index].isspace():
+            previous_code_token = raw[index]
         index += 1
     return "".join(out)
 
@@ -6734,7 +6869,7 @@ def merge_contextual_binders(
     stmt: str,
     binders: Sequence[str],
     *,
-    max_prefix_chars: int = 600,
+    max_prefix_chars: int = 0,
 ) -> Optional[str]:
     """Merge selected context binders into a statement's leading `∀` chain."""
     raw_stmt = str(stmt or "").strip()
@@ -6839,7 +6974,7 @@ def merge_contextual_binders(
 def build_forall_prefix_from_binders(
     binders: list[str] | tuple[str, ...],
     *,
-    max_prefix_chars: int = 600,
+    max_prefix_chars: int = 0,
 ) -> Optional[str]:
     """Build a syntactically valid `∀` binder prefix from extracted segments."""
     # Lean accepts bare binders like `∀ n, ...` and bare groups like `∀ a b, ...`.
@@ -6876,7 +7011,7 @@ def contextualize_subgoal_with_binders(
     stmt: str,
     root_statement: str,
     *,
-    max_prefix_chars: int = 600,
+    max_prefix_chars: int = 0,
 ) -> Optional[str]:
     """Prefix a subgoal with leading binders from the root statement.
 

@@ -303,8 +303,9 @@ def counterexample_negation_proof_from_declaration(
 ) -> str:
     """Lift one checked counterexample declaration into ``¬statement``.
 
-    The surface matcher is deliberately the same conservative relation used
-    by recursive invalidity detection.  The declaration itself is embedded as
+    Direct negations use advisory spelling matches so ordinary grouping and
+    packed syntax can reach the certifier. Counterexample synthesis uses the
+    conservative relation matcher. The declaration itself is embedded as
     a local ``have`` and the original universal claim is introduced before
     ``aesop`` performs only the implication/conjunction/quantifier plumbing.
     This synthesized proof still has to pass fresh Lean replay and the axiom
@@ -987,57 +988,14 @@ async def record_authoritative_negation_from_transcript(
     if not statement or conv is None:
         return False, "", ()
     try:
-        # Lazy imports keep the child-session module dependency one-way at
-        # import time; mini_recursive transitively imports this subsystem.
-        from ensemble_prover.mini_lean_extract import _split_top_level_chunks
+        # Keep the runtime dependency one-way during module initialization.
         from ensemble_prover.mini_recursive import (
-            _accepted_try_lean_negates_statement,
-            _checked_evidence_result_has_proof_placeholder_warning,
-            _iter_recursive_child_tool_evidence,
+            _recursive_claim_negation_candidates_with_context,
         )
-        from ensemble_prover.utils import strip_lean_comments
 
-        transcript_candidates: list[tuple[str, tuple[str, ...]]] = []
-        for name, args, result_text in _iter_recursive_child_tool_evidence(conv):
-            code = str(args.get("code") or "").strip()
-            if name not in {"try_lean", "certify_counterexample"} or not code:
-                continue
-            accepted_prefix = (
-                "try_lean accepted."
-                if name == "try_lean"
-                else "certify_counterexample accepted."
-            )
-            if not str(result_text or "").lstrip().startswith(accepted_prefix):
-                continue
-            if _checked_evidence_result_has_proof_placeholder_warning(result_text):
-                continue
-            cleaned = strip_lean_comments(code).strip()
-            if name == "certify_counterexample" and cleaned.lstrip().startswith(
-                "by"
-            ):
-                # The dedicated tool binds a bare body to ``¬active_target``;
-                # unlike try_lean it never checks that body as the positive
-                # target. Replay it once more below before using authority.
-                transcript_candidates.append((cleaned, ()))
-                continue
-            if not _accepted_try_lean_negates_statement(code, statement):
-                continue
-            _leading, chunks = _split_top_level_chunks(cleaned)
-            for index, declaration in enumerate(chunks):
-                proof = counterexample_negation_proof_from_declaration(
-                    declaration,
-                    statement,
-                )
-                if not proof:
-                    continue
-                # Tactics such as aesop, simp, and typeclass search can consume
-                # a predecessor without spelling its name in the proof body.
-                # The whole try_lean block was already accepted, so replay all
-                # safe declarations that precede this exact-negation theorem.
-                # Later declarations remain out of scope by construction.
-                dependencies = tuple(safe_helper_sources(chunks[:index]))
-                transcript_candidates.append((proof, dependencies))
-        transcript_candidates = list(dict.fromkeys(transcript_candidates))
+        transcript_candidates = _recursive_claim_negation_candidates_with_context(
+            conv, statement,
+        )
     except Exception:
         return False, "", ()
     declarations = tuple(
@@ -1215,18 +1173,6 @@ async def maybe_falsify_child_goal_from_child_transcript(
         return False, ""
 
     try:
-        # Lazy import: mini_recursive imports this subsystem transitively, so
-        # keep the dependency edge one-directional at module load time.
-        from ensemble_prover.mini_recursive import (
-            _recursive_claim_negation_proof_candidates,
-        )
-
-        negation_candidates = _recursive_claim_negation_proof_candidates(
-            child_conv, statement
-        )
-        if not negation_candidates:
-            return False, ""
-
         base_helpers = tuple(
             dossier.verified_helper_blocks()
             if callable(getattr(dossier, "verified_helper_blocks", None))
@@ -1241,11 +1187,11 @@ async def maybe_falsify_child_goal_from_child_transcript(
         )
 
         authoritative, certificate_hash, terminalized = (
-            await record_authoritative_negation_artifact(
+            await record_authoritative_negation_from_transcript(
                 parent_session=parent_session,
                 dossier=dossier,
                 target_statement=statement,
-                negation_proofs=negation_candidates,
+                conv=child_conv,
                 preamble=str(preamble or ""),
                 helper_blocks=base_helpers,
                 feedback_preamble=feedback_preamble,

@@ -57,6 +57,7 @@ from .contract_identity import (
     lean_contract_evidence_receipt_matches,
     lean_contract_telescope_evidence_receipt_matches,
     make_lean_contract_evidence_receipt,
+    lean_contract_statement_source_key,
     make_lean_contract_telescope_evidence_receipt,
     parse_lean_contract_identity,
 )
@@ -282,11 +283,12 @@ FinalizeClaimEnvironmentFn = Callable[..., Any]
 # or an operational outcome when no completed proof attempt is available.
 @dataclass(frozen=True)
 class RootCloseOperationalFailure:
-    """A root-close attempt ended without a mathematical verdict."""
+    """A root-close operation has no terminal mathematical verdict."""
 
     reason: str
     kind: str = ""
     expired_before_provider_dispatch: bool = False
+    child_continuation: Optional[dict[str, Any]] = None
 
 
 class _RootCloseProof(str):
@@ -605,12 +607,10 @@ def _theory_promotion_rollback_error(
     return error
 
 
-# Production claim capacity across durable planner tranches. One tranche is
-# planner_claim_tranche_size (6). 20 leaves room for a later root_assembly
-# after several helper-only slices instead of filling a 4- or 6-claim cap
-# and spending the clock proving a ladder with no terminal route.
-PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS = 20
-PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S = 1800.0
+# Negative search counts leave the campaign open; each planner response and
+# scheduler dispatch remains a finite, durably resumable quantum.
+PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS = -1
+PRODUCTION_RECURSIVE_SUBTREE_MAX_ELAPSED_S = 0.0
 
 
 @dataclass(frozen=True)
@@ -618,18 +618,16 @@ class MiniRecursiveConfig:
     # Mathematical ancestry must survive config replacement and durable child
     # reconstruction, not just the lifetime of the parent's Python object.
     graph_recursive_ancestor_keys: tuple[str, ...] = ()
-    passes: int = 1
+    passes: int = -1
     # 0 runs the complete recursive frontier in one invocation. A positive
     # value yields a durable partial result after this many committed passes,
     # allowing MiniSession to interleave formal-state search, retrieval, and
     # assembly before resuming the exact recursive driver state.
     pass_quantum: int = 0
-    # Compatibility default for raw MiniRecursiveConfig() in tests. Production
-    # factories and the CLI use PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS so one
-    # helper tranche cannot fill the campaign and force helper-only proving.
-    max_claims: int = 4
-    max_variants_per_claim: int = 2
-    turns_per_claim: int = 3
+    # A negative count is unlimited; positive counts retain explicit policy.
+    max_claims: int = PRODUCTION_MINI_RECURSIVE_MAX_CLAIMS
+    max_variants_per_claim: int = -1
+    turns_per_claim: int = -1
     # Zero leaves recursive claims unbounded by default.  A positive explicit
     # value is a recoverable action-scheduling boundary shared by prove/refine
     # and preserved across nested-session resume; it must not terminate the
@@ -639,14 +637,14 @@ class MiniRecursiveConfig:
     # A single recursive claim must not inherit that multiplicatively.
     recursive_child_max_tool_calls_per_turn: int = 10
     tactic_timeout_s: float = 20.0
-    tactic_max_candidates: int = 48
+    tactic_max_candidates: int = -1
     tactic_source_suppression_records: tuple[Mapping[str, Any], ...] = ()
     planner_temperature: float = 0.1
     # After a degenerate (empty/unparseable) planning response, the NEXT
     # planner call may escalate to a stronger model (the driver's
-    # ``planner_escalation_client``). Bounded per driver invocation so a
-    # degenerate strong model cannot burn unbounded premium spend.
-    planner_escalation_max_calls: int = 3
+    # ``planner_escalation_client``). Negative leaves logical calls subject to
+    # the shared run policy; explicit nonnegative values bound this lane.
+    planner_escalation_max_calls: int = -1
     # Bound premium planning by both concrete dispatch count and elapsed
     # time. Its allowance is tighter than the ordinary composite pass.
     planner_escalation_provider_max_attempts: int = 2
@@ -668,7 +666,7 @@ class MiniRecursiveConfig:
     # mini_prover/factory enables it. Disable with
     # --no-mini-planner-deliberation.
     planner_deliberation_enabled: bool = False
-    planner_deliberation_max_calls: int = 3
+    planner_deliberation_max_calls: int = -1
     # Visible JSON floor for planner request kinds. Hidden-reasoning models
     # receive the provider envelope (GPT 32_768 / DeepSeek 96_000), not this
     # integer as a total cap. Kept for compatibility and telemetry labels.
@@ -694,14 +692,14 @@ class MiniRecursiveConfig:
     progress_continuation_passes: int = 0
     # A failed child route may be revisited only when it leaves behind a new
     # durable formal helper or a new bounded diagnostic-progress signature.
-    # This is a retry ceiling per structural claim identity, not a blind fixed
-    # prove/refine schedule: repeated signatures terminate immediately.
-    claim_progress_retry_limit: int = 2
+    # Negative permits every fresh evidence signature; explicit nonnegative
+    # values cap retries. Repeated signatures do not earn another attempt.
+    claim_progress_retry_limit: int = -1
     mini_phase_temperatures: Any = None
     sample_temperature: Optional[float] = None
-    # Max conversational root-close turns per recursive run (honest root
-    # bridge from verified helpers). 0 disables the short-circuit.
-    llm_root_close_max_attempts: int = 2
+    # Logical root-close attempts across a recursive campaign. Negative is
+    # unlimited, zero disables the lane, positive counts remain explicit caps.
+    llm_root_close_max_attempts: int = -1
     # Route-incomplete post-helper root synthesis is a probe, not a nested
     # proof campaign. The production callback combines this strict total wall
     # with a two-response lane for inspection or concrete Lean repair.
@@ -1169,6 +1167,9 @@ class ClaimProofResult:
     diagnostic_progress: bool = False
     progress_signature: str = ""
     controller_projection_invalidated: bool = False
+    # A settled scheduling yield keeps the exact child pending; it is not a proof receipt.
+    child_service_yielded: bool = False
+    child_continuation: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -1931,6 +1932,10 @@ def seed_verified_helpers(
         dst.current_lean_environment_hash = str(
             getattr(src, "current_lean_environment_hash", "") or ""
         )
+    if hasattr(dst, "lean_environment_plain_syntax"):
+        dst.lean_environment_plain_syntax = copy.deepcopy(
+            getattr(src, "lean_environment_plain_syntax", {}) or {}
+        )
     if hasattr(dst, "lean_environment_ancestor_hashes"):
         dst.lean_environment_ancestor_hashes = copy.deepcopy(
             getattr(src, "lean_environment_ancestor_hashes", {}) or {}
@@ -2357,7 +2362,9 @@ def _merge_new_verified_helpers(
 
 
 def unique_dossier_helper_name(dossier: Any, suggested: str) -> str:
-    base = re.sub(r"[^A-Za-z0-9_'.]", "_", str(suggested or "mini_helper"))
+    # A generated declaration must stay in the scope where its proposition
+    # was checked. Dots would introduce a namespace during elaboration.
+    base = re.sub(r"[^A-Za-z0-9_']", "_", str(suggested or "mini_helper"))
     base = re.sub(r"_+", "_", base).strip("_") or "mini_helper"
     base = re.sub(r"_solution", "_target", base, flags=re.IGNORECASE)
     if base[0].isdigit():
@@ -2816,7 +2823,7 @@ def _rendered_helper_bound_identities(
     for helper_record in helper_records or ():
         helper_source = str(getattr(helper_record, "source", "") or helper_record or "")
         helper_name = helper_decl_name(helper_source)
-        helper_statement_key = canonical_dossier_statement_key(
+        helper_statement_key = lean_contract_statement_source_key(
             helper_decl_statement(helper_source)
         )
         helper_identity = verified_helper_bound_contract_identity(helper_record)
@@ -2826,7 +2833,7 @@ def _rendered_helper_bound_identities(
         identity_by_surface.get(
             (
                 helper_decl_name(block),
-                canonical_dossier_statement_key(helper_decl_statement(block)),
+                lean_contract_statement_source_key(helper_decl_statement(block)),
             ),
             "",
         )
@@ -2841,19 +2848,21 @@ def _refresh_verified_helper_contract_evidence_from_support_analysis(
     rendered_helper_blocks: Sequence[str],
     support_statements: Sequence[str],
     coverage: _ContractIdentityCoverage,
+    context_is_plain: bool = False,
 ) -> int:
     """Bind fresh same-batch Lean identities to replay-verified helpers.
 
     Proof-cache imports are replay checked in the destination environment but
     can legitimately arrive without historical contract-identity receipts.
-    Recursive planning already elaborates every rendered helper statement in
-    that same environment.  Preserve that evidence on the durable helper
-    record so the receipt-bound reuse gate can recognize the helper instead of
+    In a plain context, recursive planning already elaborates every rendered
+    helper statement in that same environment. Preserve that evidence on the
+    durable helper record so the receipt-bound reuse gate can recognize the helper instead of
     proving a same-statement alias.  Ambiguous statement-to-identity mappings
     and helpers not verified in the current environment fail closed.
     """
 
     refresh = getattr(dossier, "refresh_imported_verified_helper_evidence", None)
+    from .verified_helper_contract import helper_source_contract_is_context_sensitive
     environment_hash = str(
         getattr(dossier, "current_lean_environment_hash", "") or ""
     ).strip()
@@ -2863,11 +2872,11 @@ def _refresh_verified_helper_contract_evidence_from_support_analysis(
     rendered_helper_surfaces = {
         (
             str(helper_decl_name(block) or "").strip(),
-            canonical_dossier_statement_key(helper_decl_statement(block)),
+            lean_contract_statement_source_key(helper_decl_statement(block)),
         )
         for block in rendered_helper_blocks or ()
         if str(helper_decl_name(block) or "").strip()
-        and canonical_dossier_statement_key(helper_decl_statement(block))
+        and lean_contract_statement_source_key(helper_decl_statement(block))
     }
 
     identities_by_statement_key: dict[str, set[str]] = {}
@@ -2875,7 +2884,7 @@ def _refresh_verified_helper_contract_evidence_from_support_analysis(
         support_statements or (),
         coverage.support_structural_identities or (),
     ):
-        statement_key = canonical_dossier_statement_key(statement)
+        statement_key = lean_contract_statement_source_key(statement)
         structural_identity = str(identity or "").strip()
         if statement_key and has_lean_contract_identity(structural_identity):
             identities_by_statement_key.setdefault(statement_key, set()).add(
@@ -2890,10 +2899,17 @@ def _refresh_verified_helper_contract_evidence_from_support_analysis(
         ):
             continue
         source = str(getattr(helper, "source", "") or "")
+        if (
+            getattr(helper, "contract_observation_required", False)
+            or helper_source_contract_is_context_sensitive(source, context_is_plain=context_is_plain)
+        ):
+            # Re-elaborating extracted text in the ambient scope does not
+            # observe a qualified/private declaration's actual kernel type.
+            continue
         name = str(
             getattr(helper, "name", "") or helper_decl_name(source) or ""
         ).strip()
-        statement_key = canonical_dossier_statement_key(helper_decl_statement(source))
+        statement_key = lean_contract_statement_source_key(helper_decl_statement(source))
         if (name, statement_key) not in rendered_helper_surfaces:
             continue
         identities = identities_by_statement_key.get(statement_key, set())
@@ -2904,12 +2920,12 @@ def _refresh_verified_helper_contract_evidence_from_support_analysis(
             continue
         incoming = clone_verified_helper(helper)
         incoming.contract_identity = identity
-        incoming.contract_identity_statement_key = statement_key
+        incoming.contract_identity_statement_key = lean_contract_statement_source_key(helper_decl_statement(source))
         incoming.contract_identity_environment_hash = environment_hash
         incoming.contract_identity_evidence_receipt = (
             make_lean_contract_evidence_receipt(
                 identity,
-                statement_key,
+                incoming.contract_identity_statement_key,
                 environment_hash,
             )
         )
@@ -3543,11 +3559,19 @@ def _iter_recursive_child_tool_evidence(conv: Any) -> list[tuple[str, dict, str]
 
 
 def _accepted_try_lean_negates_statement(code: Any, statement: str) -> bool:
+    """Recognize source refutations under an independently trusted plain context.
+
+    An accepted check alone cannot authenticate this grammar when the existing
+    environment defines custom syntax. Runtime evidence consumers enforce that
+    context boundary before using this source-only fallback.
+    """
     code_text = str(code or "")
     statement_text = str(statement or "").strip()
     if not code_text.strip() or not statement_text:
         return False
-    cleaned_code = strip_lean_comments(code_text)
+    # The lexical extractors skip comments without changing token boundaries
+    # or indentation in the accepted target source.
+    cleaned_code = code_text
     if _checked_evidence_code_has_ambient_context(cleaned_code):
         return False
     if _checked_evidence_code_has_proof_placeholder(cleaned_code):
@@ -3569,6 +3593,47 @@ def _accepted_try_lean_negates_statement(code: Any, statement: str) -> bool:
         )
         for target in _iter_checked_lean_target_headers(cleaned_code)
     )
+
+
+def _try_lean_negation_candidate(code: Any, statement: str) -> bool:
+    """Select scratch proofs for independent exact-target replay, never authority.
+
+    Ordinary packed negation and grouping may also be custom syntax. They can
+    nominate a proof body, but only the certifier may establish its meaning in
+    the current Lean environment.
+    """
+    source = str(code or "")
+    statement_text = str(statement or "").strip()
+    if not source.strip() or not statement_text:
+        return False
+    if (
+        _checked_evidence_code_has_ambient_context(source)
+        or _checked_evidence_code_has_proof_placeholder(source)
+    ):
+        return False
+    statement_key = _lean_compact_key(statement_text)
+    return any(
+        _checked_evidence_target_refutes_statement(target, statement_text, statement_key)
+        or _lean_target_negation_candidate(target, statement_text)
+        for target in _iter_checked_lean_target_headers(source)
+    )
+
+
+def _lean_target_negation_candidate(target: Any, statement: str) -> bool:
+    """Advisory direct-negation matching before fresh kernel certification."""
+    source = _strip_balanced_outer_parens(str(target or "").strip())
+    if source.startswith("¬"):
+        inner = source[1:].strip()
+    elif re.match(r"^Not(?:\s|\()", source):
+        inner = source[3:].strip()
+    else:
+        return False
+    inner = _strip_balanced_outer_parens(inner)
+    expected = _strip_balanced_outer_parens(str(statement or "").strip())
+    return bool(inner and expected and (
+        _contract_alpha_matches(inner, expected)
+        or _lean_compact_key(inner) == _lean_compact_key(expected)
+    ))
 
 
 def _checked_evidence_target_refutes_statement(
@@ -3690,18 +3755,11 @@ def _lean_target_negates_statement(
     statement_key: str,
     statement_text: str = "",
 ) -> bool:
-    target_text = _strip_balanced_outer_parens(str(target or ""))
-    target_key = _lean_compact_key(target_text)
-    if not target_key or not statement_key:
+    # The legacy compact key is advisory text, never negation authority:
+    # environment-defined tokens can distinguish ``f=2`` from ``f =2``.
+    if not str(target or "").strip() or not statement_text:
         return False
-    if (
-        target_key == f"¬({statement_key})"
-        or target_key == f"¬{statement_key}"
-        or target_key == f"Not({statement_key})"
-        or target_key == f"Not{statement_key}"
-    ):
-        return True
-    negated_inner = _top_level_negated_inner(target_text)
+    negated_inner = _top_level_negated_inner(str(target or ""))
     return bool(
         negated_inner
         and statement_text
@@ -3709,11 +3767,42 @@ def _lean_target_negates_statement(
     )
 
 
+def _refutation_source_has_separate_connectives(text: str) -> bool:
+    """Do not infer Boolean semantics from an environment-defined packed token."""
+    raw = str(text or "")
+    index = 0
+    while index < len(raw):
+        lexical_end = _lean_surface_lexical_skip_end(raw, index)
+        if lexical_end is not None:
+            index = lexical_end
+            continue
+        operator = next((token for token in ("<->", "->", "↔", "→", "∧", "∨", "¬")
+                         if raw.startswith(token, index)), "")
+        if operator:
+            end = index + len(operator)
+            if not (
+                (index == 0 or raw[index - 1].isspace())
+                and end < len(raw) and raw[end].isspace()
+            ):
+                return False
+            index = end
+        else:
+            index += 1
+    return True
+
+
 def _lean_target_implication_to_false_refutes_statement(
     target: Any,
     statement_text: str,
 ) -> bool:
-    target_text = _strip_balanced_outer_parens(str(target or ""))
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    target_text = str(target or "").strip()
+    if (
+        _identity_requires_exact_source(_identity_source_text(target_text))
+        or not _refutation_source_has_separate_connectives(target_text)
+    ):
+        return False
     parts = _split_top_level_implications(target_text)
     if len(parts) != 2:
         return False
@@ -3847,22 +3936,22 @@ def _strip_leading_exists_binders_with_names(text: str) -> tuple[str, tuple[str,
 def _strip_leading_lean_negation(text: str) -> str:
     """Return the inner of a top-level ``¬``/``Not`` negation, else ``""``.
 
-    Handles ``¬P``, ``Not P`` and ``Not(P)`` uniformly — the ``Not`` keyword
-    followed by ``(`` or whitespace, not a longer identifier like ``Nothing``.
+    Requires a whitespace boundary after the negation token. Packed syntax
+    needs checked semantic evidence rather than inferred source semantics.
     """
 
     compact = str(text or "").strip()
-    if compact.startswith("¬"):
+    # A source-only refutation may assign semantics only to a separate token.
+    # Packed spellings such as ``¬P`` or ``Not(P)`` may be custom notation.
+    if compact.startswith("¬") and compact[1:2].isspace():
         return compact[1:].strip()
-    if compact.startswith("Not"):
-        rest = compact[3:]
-        if not rest or not (rest[0].isalnum() or rest[0] in "_'"):
-            return rest.strip()
+    if compact.startswith("Not") and compact[3:4].isspace():
+        return compact[3:].strip()
     return ""
 
 
 def _top_level_negated_inner(text: str) -> str:
-    compact = _strip_balanced_outer_parens(str(text or "").strip())
+    compact = str(text or "").strip()
     inner = _strip_leading_lean_negation(compact)
     if not inner:
         return ""
@@ -3870,7 +3959,9 @@ def _top_level_negated_inner(text: str) -> str:
     if raw_inner.startswith("("):
         group_end = _matching_surface_group_index(raw_inner, 0)
         if group_end == len(raw_inner) - 1:
-            return _strip_balanced_outer_parens(raw_inner)
+            # Grouping can be environment-defined syntax even with separate
+            # delimiter tokens. Retain it as part of the checked proposition.
+            return raw_inner
     # Lean negation binds more tightly than these connectives. Thus `¬ P ∨ Q`
     # negates only P, while `¬ (P ∨ Q)` (handled above) negates the group.
     # Do not widen an ungrouped prefix negation to the remaining formula.
@@ -3881,7 +3972,7 @@ def _top_level_negated_inner(text: str) -> str:
         or len(_split_top_level_iffs(raw_inner)) > 1
     ):
         return ""
-    return _strip_balanced_outer_parens(raw_inner)
+    return raw_inner
 
 
 def _split_top_level_relation(
@@ -3902,7 +3993,11 @@ def _split_top_level_relation(
         ">",
     ),
 ) -> tuple[str, str, str]:
-    raw = _strip_balanced_outer_parens(str(text or "").strip())
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    raw = str(text or "").strip()
+    if _identity_requires_exact_source(_identity_source_text(raw)):
+        return "", "", ""
     depth = 0
     index = 0
     ordered_operators = tuple(sorted(operators, key=len, reverse=True))
@@ -3919,6 +4014,14 @@ def _split_top_level_relation(
         elif depth == 0:
             for operator in ordered_operators:
                 if not raw.startswith(operator, index):
+                    continue
+                after_operator = index + len(operator)
+                if not (
+                    index > 0 and raw[index - 1].isspace()
+                    and after_operator < len(raw) and raw[after_operator].isspace()
+                ):
+                    # Splitting a joined token invents relation semantics for
+                    # arbitrary notation such as ``f=2`` or ``f≠2``.
                     continue
                 if operator == "=" and index > 0 and raw[index - 1] in "!<>:":
                     continue
@@ -4309,7 +4412,9 @@ def _counterexample_body_refutes_statement(
     return True
 
 
-def _canonical_nonproof_parameter_profile(statement: str) -> tuple[str, ...]:
+def _canonical_nonproof_parameter_profile(
+    statement: str, *, advisory_only: bool = False,
+) -> tuple[str, ...]:
     """Return a surface parameter profile with standard Lean aliases unified."""
 
     from .mini_lean_extract import (
@@ -4335,11 +4440,17 @@ def _canonical_nonproof_parameter_profile(statement: str) -> tuple[str, ...]:
     statement = _strip_lean_comments(statement)
 
     def canonicalize(marker: str) -> str:
+        if advisory_only and marker.startswith("\x00exact-source:"):
+            marker = marker[len("\x00exact-source:"):]
         sort = re.fullmatch(r"(Type|Sort)(?:\s+(.+)|\((.+)\))", marker)
         if sort is None:
             return marker
         head = sort.group(1)
         level = _strip_balanced_outer_parens(sort.group(2) or sort.group(3))
+        if advisory_only:
+            # Universe resemblance only selects additional drift rejections.
+            # It must not weaken strict parameter checks for proof authority.
+            level = re.sub(r"\s+", "", level)
         if head == "Sort":
             if level.isdecimal():
                 if int(level) == 0:
@@ -4363,6 +4474,16 @@ def _lean_counterexample_target_refutes_statement(
     *,
     allow_inferred_relation_binders: bool = False,
 ) -> bool:
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if any(
+        _identity_requires_exact_source(_identity_source_text(str(source or "")))
+        or not _refutation_source_has_separate_connectives(str(source or ""))
+        for source in (target, statement)
+    ):
+        # Do not recover an ordinary telescope by projecting opaque notation.
+        # Such counterexamples require a receipt bound to the actual target.
+        return False
     premises, conclusion, statement_bound_names = _statement_premises_and_conclusion(
         str(statement or "")
     )
@@ -4542,8 +4663,13 @@ def _recursive_claim_invalidity_has_checked_evidence(
     statement: str,
     *,
     dossier: Any = None,
+    context_is_plain: bool = True,
 ) -> bool:
-    """Accept child invalidation only with an accepted Lean negation check."""
+    """Check certificates, or source refutations in a trusted standard context.
+
+    Runtime callers must establish the plain-context assumption independently.
+    Custom syntax can override even an otherwise supported binder grammar.
+    """
 
     for name, args, result_text in _iter_recursive_child_tool_evidence(conv):
         if name not in {"try_lean", "certify_counterexample"}:
@@ -4585,7 +4711,7 @@ def _recursive_claim_invalidity_has_checked_evidence(
             ):
                 return True
             continue
-        if _accepted_try_lean_negates_statement(args.get("code", ""), statement):
+        if context_is_plain and _accepted_try_lean_negates_statement(args.get("code", ""), statement):
             return True
     return False
 
@@ -4597,6 +4723,9 @@ def _negation_proof_body_for_statement(
 ) -> str:
     """Return the proof body of the declaration whose target directly negates
     the statement, bounded to that single declaration.
+
+    This is candidate extraction, not a statement-equivalence certificate; every
+    caller must replay the body as the exact target's negation and audit axioms.
 
     A multi-declaration block (e.g. a helper ``lemma h : … := …`` followed by
     ``example : ¬goal := …``) must NOT read the negation body from the first
@@ -4626,7 +4755,7 @@ def _negation_proof_body_for_statement(
         if colon < 0 or _lean_declaration_prefix_has_parameters(header[:colon]):
             continue
         target = header[colon + 1 :].strip()
-        if not _lean_target_negates_statement(target, statement_key, statement_text):
+        if not _lean_target_negation_candidate(target, statement_text):
             continue
         body = decl[header_end + 2 :].strip()
         if body:
@@ -4634,13 +4763,23 @@ def _negation_proof_body_for_statement(
     return ""
 
 
-def _recursive_claim_negation_proof_candidates(
+def _recursive_claim_negation_candidates_with_context(
     conv: Any,
     statement: str,
-) -> tuple[str, ...]:
-    """Extract closed direct-negation proof bodies from accepted child checks."""
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Retain candidate bodies and their accepted preceding declarations.
 
-    proofs: list[str] = []
+    Every result needs fresh target-bound replay and axiom certification. A
+    predecessor may be consumed implicitly by tactics, so retain the complete
+    safe declaration prefix rather than guessing dependencies from names.
+    """
+    from .mini_falsification.lean_check import safe_helper_sources
+    from .mini_lean_extract import _split_top_level_chunks
+    from .mini_session.child_goal_falsification import (
+        counterexample_negation_proof_from_declaration,
+    )
+
+    candidates: list[tuple[str, tuple[str, ...]]] = []
     statement_text = str(statement or "").strip()
     for name, args, result_text in _iter_recursive_child_tool_evidence(conv):
         code = str(args.get("code") or "").strip()
@@ -4653,23 +4792,32 @@ def _recursive_claim_negation_proof_candidates(
         )
         if not str(result_text or "").lstrip().startswith(accepted_prefix):
             continue
+        if _checked_evidence_result_has_proof_placeholder_warning(result_text):
+            continue
         cleaned = strip_lean_comments(code).strip()
         if name == "certify_counterexample" and cleaned.lstrip().startswith("by"):
-            proofs.append(cleaned)
+            candidates.append((cleaned, ()))
             continue
-        if not _accepted_try_lean_negates_statement(code, statement):
+        if not _try_lean_negation_candidate(code, statement):
             continue
-        from ensemble_prover.mini_session.child_goal_falsification import (
-            counterexample_negation_proof_from_declaration,
-        )
+        _leading, chunks = _split_top_level_chunks(cleaned)
+        for index, declaration in enumerate(chunks):
+            body = counterexample_negation_proof_from_declaration(
+                declaration, statement_text,
+            )
+            if body:
+                candidates.append((body, tuple(safe_helper_sources(chunks[:index]))))
+    return tuple(dict.fromkeys(candidates))
 
-        body = counterexample_negation_proof_from_declaration(
-            cleaned,
-            statement_text,
-        )
-        if body:
-            proofs.append(body)
-    return tuple(dict.fromkeys(proofs))
+
+def _recursive_claim_negation_proof_candidates(
+    conv: Any,
+    statement: str,
+) -> tuple[str, ...]:
+    """Return advisory bodies; replay callers must also retain their contexts."""
+    return tuple(dict.fromkeys(
+        body for body, _context in _recursive_claim_negation_candidates_with_context(conv, statement)
+    ))
 
 
 def _render_recursive_child_obligation_contract(
@@ -5198,6 +5346,7 @@ def _detect_recursive_claim_invalidity(
     *,
     require_checked_evidence: bool = False,
     dossier: Any = None,
+    context_is_plain: bool = True,
 ) -> str:
     """Detect when a child prover invalidates the planned helper itself.
 
@@ -5213,6 +5362,7 @@ def _detect_recursive_claim_invalidity(
             conv,
             statement,
             dossier=dossier,
+            context_is_plain=context_is_plain,
         )
         if require_checked_evidence
         else True
@@ -6606,7 +6756,7 @@ def _active_root_target_contract_identities(
         ):
             continue
         receipt = str(item.get("contract_identity_evidence_receipt") or "").strip()
-        if statement_key != graph_statement_key(statements[0]):
+        if statement_key != lean_contract_statement_source_key(statements[0]):
             continue
         if not lean_contract_evidence_receipt_matches(
             receipt,
@@ -6637,7 +6787,7 @@ def _active_root_target_contract_identity_map(
         )
         if not statements or not identities:
             continue
-        key = graph_statement_key(statements[0])
+        key = lean_contract_statement_source_key(statements[0])
         if key:
             result[key] = identities[0]
     return result
@@ -7323,7 +7473,7 @@ def _merge_positional_active_target_contract_identities(
             if has_lean_contract_identity(fresh)
             else str(
                 prior_identities_by_statement_key.get(
-                    graph_statement_key(statement),
+                    lean_contract_statement_source_key(statement),
                     "",
                 )
                 or ""
@@ -9203,38 +9353,9 @@ def _strip_contract_comments(text: str) -> str:
 
 
 def _contract_compact_surface(text: str) -> str:
-    raw = str(text or "")
-    out: list[str] = []
-    index = 0
-    while index < len(raw):
-        skip_to = _lean_surface_lexical_skip_end(raw, index)
-        if skip_to is not None:
-            if not raw.startswith(("/-", "--"), index):
-                out.append(raw[index:skip_to])
-            index = skip_to
-            continue
-        ch = raw[index]
-        if not ch.isspace():
-            out.append(ch)
-            index += 1
-            continue
-        next_index = index + 1
-        while next_index < len(raw) and raw[next_index].isspace():
-            next_index += 1
-        # Whitespace is insignificant around punctuation, but it is the token
-        # boundary in applications such as ``P Set.Icc``.  Erasing it entirely
-        # creates the synthetic identifier ``PSet.Icc`` and makes namespace
-        # alias comparison (and ordinary contract identity) dependent on
-        # surrounding punctuation.
-        if (
-            out
-            and next_index < len(raw)
-            and _lean_ident_char(out[-1])
-            and _lean_ident_char(raw[next_index])
-        ):
-            out.append(" ")
-        index = next_index
-    return "".join(out)
+    from .contract_normalization import compact_contract_surface
+
+    return compact_contract_surface(str(text or ""))
 
 
 _CONTRACT_NORMALIZATION_CACHE_SIZE = 2048
@@ -9252,6 +9373,11 @@ def _contract_norm(text: str) -> str:
 
 @lru_cache(maxsize=_CONTRACT_NORMALIZATION_CACHE_SIZE)
 def _cached_contract_norm(text: str) -> str:
+    from .proof_graph import graph_statement_key
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if _identity_requires_exact_source(_identity_source_text(text)):
+        return graph_statement_key(text)
     stripped, _names = _strip_leading_forall_keeping_premises(
         _strip_contract_comments(text)
     )
@@ -9271,6 +9397,8 @@ def _contract_identity_matches(left: str, right: str) -> bool:
         return False
     if left == right:
         return True
+    if left.startswith("\x00exact-source:") or right.startswith("\x00exact-source:"):
+        return False
     # Surface fallback may erase an explicit numeral cast only when the two
     # surfaces do not assert conflicting numeric types. This preserves legacy
     # matching of `7 / 4` against `(7 / 4 : ℚ)` while preventing Nat evidence
@@ -9671,8 +9799,13 @@ def _invalidated_statement_reason_for_statement(
 
 
 def _root_conclusion_candidates(
-    root_statement: str,
+    root_statement: str, *, advisory_only: bool = False,
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    raw = str(root_statement or "").strip()
+    if not advisory_only and _identity_requires_exact_source(_identity_source_text(raw)):
+        return ((raw, ()),) if raw else ()
     candidates: list[tuple[str, tuple[str, ...]]] = []
     seen: set[str] = set()
 
@@ -9714,14 +9847,28 @@ def _statements_root_adjacent(
     root_statement: str,
     *,
     conclusion_bound_names: Sequence[str] = (),
+    advisory_only: bool = False,
 ) -> bool:
+    from .proof_graph import graph_statement_key
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if not advisory_only and any(
+        _identity_requires_exact_source(_identity_source_text(text))
+        for text in (conclusion, root_statement)
+    ):
+        return bool(conclusion) and (
+            graph_statement_key(conclusion) == graph_statement_key(root_statement)
+            and not conclusion_bound_names
+        )
     conclusion_norm = _contract_alpha_norm(
         conclusion,
         context_bound_names=conclusion_bound_names,
     )
     if not conclusion_norm:
         return False
-    for candidate, root_bound_names in _root_conclusion_candidates(root_statement):
+    for candidate, root_bound_names in _root_conclusion_candidates(
+        root_statement, advisory_only=advisory_only,
+    ):
         root_norm = _contract_alpha_norm(
             candidate,
             context_bound_names=root_bound_names,
@@ -9773,6 +9920,11 @@ def _contract_alpha_norm(
 def _cached_contract_alpha_norm(
     text: str, context_bound_names: tuple[str, ...],
 ) -> str:
+    from .proof_graph import graph_statement_key
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if _identity_requires_exact_source(_identity_source_text(text)):
+        return graph_statement_key(text)
     stripped, mapping = _contract_alpha_source(text, context_bound_names)
     normalized = _contract_alpha_replace_scoped(stripped, mapping)
     return _normalize_not_mem_contract_surface(_contract_compact_surface(normalized))
@@ -9890,6 +10042,13 @@ def _support_contract_candidates(
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
     """Return top-level formulas that can actually supply a planner premise."""
     from .proof_graph import graph_contract_with_data_domains
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    raw = str(statement or "").strip()
+    if _identity_requires_exact_source(_identity_source_text(raw)):
+        # A proved opaque theorem is available as a whole. Its apparent
+        # telescope/conjuncts cannot supply inferred facts or root assumptions.
+        return () if premises_are_assumptions or include_implication_premises else ((raw, ()),)
 
     candidates: list[tuple[str, tuple[str, ...]]] = []
     seen: set[tuple[str, tuple[str, ...]]] = set()
@@ -9991,7 +10150,9 @@ def _support_contains_contract(
         graph_contract_domains_compatible,
         graph_contract_weakening_bound_names,
         graph_contract_weakening_tail,
+        graph_statement_key,
     )
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
 
     seen: set[tuple[str, tuple[str, ...]]] = set()
     while True:
@@ -9999,6 +10160,15 @@ def _support_contains_contract(
         if state in seen:
             return False
         seen.add(state)
+        if _identity_requires_exact_source(_identity_source_text(premise)):
+            # Recursive dependency authority must retain the original source
+            # before telescope projection, cast rewriting, or weakening.
+            key = graph_statement_key(premise)
+            return bool(key) and any(
+                key == graph_statement_key(support)
+                and tuple(premise_bound_names) == tuple(support_bound_names)
+                for support, support_bound_names in support_candidates
+            )
         premise_norm = _contract_norm(premise)
         if not premise_norm:
             return True
@@ -10008,6 +10178,8 @@ def _support_contains_contract(
         )
         _alpha_body, premise_mapping = _contract_alpha_source(premise, premise_bound_names)
         for support, support_bound_names in support_candidates:
+            if _identity_requires_exact_source(_identity_source_text(support)):
+                continue
             support_norm = _contract_norm(support)
             # Preserve the exact surface fast path, but defer namespace aliasing to
             # the alpha-normalized comparison below. Otherwise an unqualified
@@ -10054,6 +10226,11 @@ class _SupportContractSequent:
 
 def _support_contract_sequent(statement: str) -> _SupportContractSequent:
     from .proof_graph import graph_contract_with_data_domains
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    raw = str(statement or "").strip()
+    if _identity_requires_exact_source(_identity_source_text(raw)):
+        return _SupportContractSequent(assumptions=(), conclusion=raw)
 
     premises, conclusion, bound_names = _statement_premises_and_conclusion(
         str(statement or "")
@@ -10167,6 +10344,13 @@ def _contract_alpha_matches(
     left_bound_names: Sequence[str] = (),
     right_bound_names: Sequence[str] = (),
 ) -> bool:
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if any(_identity_requires_exact_source(_identity_source_text(text)) for text in (left, right)):
+        return bool(left) and (
+            _contract_norm(left) == _contract_norm(right)
+            and tuple(left_bound_names) == tuple(right_bound_names)
+        )
     left_key = _contract_alpha_norm(left, context_bound_names=left_bound_names)
     right_key = _contract_alpha_norm(right, context_bound_names=right_bound_names)
     return _contract_identity_matches(left_key, right_key)
@@ -10215,11 +10399,17 @@ def _branch_case_support_kind(
     leaving unsupported bridge premises rejected as before.
     """
 
+    from .proof_state import _identity_requires_exact_source, _identity_source_text
+
+    if _identity_requires_exact_source(_identity_source_text(premise)):
+        return ""
     premise_text, premise_names = _strip_leading_forall_keeping_premises(premise)
     premise_names = tuple(dict.fromkeys(tuple(premise_bound_names) + premise_names))
     if not premise_text:
         return False
     for support, support_bound_names in support_candidates:
+        if _identity_requires_exact_source(_identity_source_text(support)):
+            continue
         support_body, support_names = _strip_leading_forall_keeping_premises(support)
         disjuncts = _split_top_level_disjunctions(support_body)
         if len(disjuncts) < 2:
@@ -10292,10 +10482,15 @@ def _is_assembly_like_claim(claim: MiniSubgoalClaim, *, root_statement: str) -> 
     )
     if not premises:
         return False
+    # This classification only prioritizes root work and imposes stronger
+    # dependency checks. It never certifies a root route or supplies a premise.
+    from .proof_graph import _graph_may_be_root_adjacent
+
     return _statements_root_adjacent(
-        conclusion,
-        root_statement,
-        conclusion_bound_names=bound_names,
+        conclusion, root_statement, conclusion_bound_names=bound_names,
+        advisory_only=True,
+    ) or _graph_may_be_root_adjacent(
+        conclusion, root_statement, conclusion_bound_names=bound_names,
     )
 
 
@@ -10414,7 +10609,7 @@ def _claim_contract_source_matches(claim: MiniSubgoalClaim, source: str) -> bool
     """Bind new receipts to exact source; old checkpoints keep their old fence."""
 
     source = str(source or "").strip()
-    if not source or graph_statement_key(source) != claim.contract_identity_statement_key:
+    if not source or lean_contract_statement_source_key(source) != claim.contract_identity_statement_key:
         return False
     digest = str(claim.contract_source_sha256 or "")
     return not digest or bool(
@@ -10497,7 +10692,7 @@ def _bound_statement_contract_identity(
         )
     ):
         return ""
-    if statement_key != graph_statement_key(
+    if statement_key != lean_contract_statement_source_key(
         statement
     ) or not lean_contract_evidence_receipt_matches(
         item.contract_identity_evidence_receipt,
@@ -10807,7 +11002,7 @@ def _bound_root_contract_identity(plan: MiniSubgoalPlan) -> str:
     identity = str(plan.root_contract_identity or "").strip()
     statement_key = str(plan.root_contract_identity_statement_key or "").strip()
     environment_hash = str(plan.root_contract_identity_environment_hash or "").strip()
-    if statement_key != graph_statement_key(
+    if statement_key != lean_contract_statement_source_key(
         plan.root_statement
     ) or not lean_contract_evidence_receipt_matches(
         plan.root_contract_identity_evidence_receipt,
@@ -10854,6 +11049,7 @@ def _plan_root_assembly_claim_names(
     active_target_contract_identities: Sequence[str] = (),
     require_dependency_closure: bool = True,
     allow_surface_heuristics: bool = True,
+    include_advisory_candidates: bool = False,
 ) -> tuple[str, ...]:
     """Return claims that explicitly connect the plan back to its root.
 
@@ -11067,8 +11263,14 @@ def _plan_root_assembly_claim_names(
                 or lean_route_relation_match
             )
         else:
+            from .proof_graph import _graph_may_be_root_adjacent
+
             root_connected = bool(
                 active_target_match
+                or (
+                    include_advisory_candidates
+                    and _graph_may_be_root_adjacent(statement, root_statement)
+                )
                 or (
                     allow_surface_heuristics
                     and (
@@ -11403,10 +11605,10 @@ def _claim_dependency_contract_reasons(
         # premises from a checkpoint.
         premises = tuple(claim.contract_proof_binder_types)
     claim_parameter_profile = _canonical_nonproof_parameter_profile(
-        analysis_claim.statement
+        analysis_claim.statement, advisory_only=True,
     )
     root_parameter_profile = _canonical_nonproof_parameter_profile(
-        root_contract_statement
+        root_contract_statement, advisory_only=True,
     )
     parameter_profile_is_known = "__untyped_binder__" not in {
         *claim_parameter_profile,
@@ -11516,7 +11718,7 @@ def _claim_dependency_contract_reasons(
             continue
         branch_kind = (
             _branch_case_support_kind(
-                premise_text,
+                premise,
                 support_candidates,
                 premise_bound_names=premise_bound_names,
                 root_statement=str(plan.root_statement or ""),
@@ -12037,7 +12239,7 @@ def _verified_helper_dependency_identities(
         if not for_progress and not structural_identity and statement:
             structural_identity = str(
                 (structural_identities_by_statement_key or {}).get(
-                    canonical_dossier_statement_key(statement),
+                    lean_contract_statement_source_key(statement),
                     "",
                 )
                 or ""
@@ -12688,17 +12890,6 @@ def _record_suspended_dependency_claim(
             claim.dependency_semantic_identities or ()
         ),
     )
-    # Checkpoints must remain bounded. Prefer the newest observations while
-    # retaining deterministic ordering for replay and tests.
-    while len(suspended_claims) > 256:
-        oldest_key = min(
-            suspended_claims,
-            key=lambda item_key: (
-                suspended_claims[item_key].pass_index,
-                item_key,
-            ),
-        )
-        suspended_claims.pop(oldest_key, None)
     return was_new
 
 
@@ -12740,7 +12931,7 @@ def _ready_suspended_dependency_claims(
             allow_official_answer_visibility=allow_official_answer_visibility,
         )
     )
-    cap = max(1, int(max_claims or 1))
+    cap = len(suspended_claims) if max_claims < 0 else max(1, int(max_claims or 1))
     prioritized = frozenset(prioritized_claim_keys)
     suspended_items = list(suspended_claims.items())
     if prioritized:
@@ -13736,7 +13927,14 @@ async def _canonicalize_dependency_contract_inputs(
     analyzer = getattr(lean, "analyze_statement_contracts", None)
     canonicalizer = getattr(lean, "canonicalize_statement_types", None)
     use_structural_analysis = callable(analyzer)
-    if not use_structural_analysis and not callable(canonicalizer):
+    identity_operation = analyzer if use_structural_analysis else canonicalizer
+    supports_context = True
+    if declaration_context:
+        try:
+            supports_context = "declaration_context" in inspect.signature(identity_operation).parameters
+        except (TypeError, ValueError):
+            supports_context = False
+    if not callable(identity_operation) or not supports_context:
         _record(
             record_event,
             {
@@ -13820,18 +14018,12 @@ async def _canonicalize_dependency_contract_inputs(
             self.cause = cause
 
     try:
-        identity_operation = analyzer if use_structural_analysis else canonicalizer
         identity_kwargs: dict[str, Any] = {
-            "preamble_override": "\n\n".join(
-                part
-                for part in (
-                    str(preamble or "").strip(),
-                    *(str(block or "").strip() for block in declaration_context),
-                )
-                if part
-            ),
+            "preamble_override": str(preamble or "").strip(),
             "timeout_s": operation_timeout_s,
         }
+        if declaration_context:
+            identity_kwargs["declaration_context"] = tuple(declaration_context)
         if (
             use_structural_analysis
             and _callable_accepts_keyword(
@@ -14250,7 +14442,7 @@ async def _canonicalize_dependency_contract_inputs(
     for index, claim in enumerate(plan.claims, start=1):
         identity = str(structural_identities[index] or "").strip()
         analyzed_statement = claim_analysis_statements[index - 1]
-        statement_key = graph_statement_key(analyzed_statement) if identity else ""
+        statement_key = lean_contract_statement_source_key(analyzed_statement) if identity else ""
         evidence_environment_hash = str(environment_hash or "").strip()
         canonical_claims.append(
             dataclass_replace(
@@ -14306,7 +14498,7 @@ async def _canonicalize_dependency_contract_inputs(
     )
     root_identity = str(structural_identities[0] or "").strip()
     root_statement_key = (
-        graph_statement_key(plan.root_statement) if root_identity else ""
+        lean_contract_statement_source_key(plan.root_statement) if root_identity else ""
     )
     evidence_environment_hash = str(environment_hash or "").strip()
     canonical_plan = dataclass_replace(
@@ -14686,7 +14878,7 @@ def _claim_with_recompiled_statement(
             build_subgoal_variants(
                 source,
                 root_statement=root_statement,
-                max_variants=4,
+                max_variants=-1,
             )
         ),
         contract_identity="",
@@ -14727,6 +14919,17 @@ def _contract_statement_repair_content(raw: Any) -> str:
     return content[:4000].strip()
 
 
+def _replan_contract_repair_identity(plan: MiniSubgoalPlan) -> str:
+    """Bind repair accounting to the original replan through source repairs."""
+    return text_hash(json.dumps({
+        "root_statement": plan.root_statement,
+        "raw_response": plan.raw_response,
+        "origin_plan_fingerprints": sorted({
+            str(claim.origin_plan_fingerprint or "") for claim in plan.claims
+        }),
+    }, sort_keys=True, ensure_ascii=True))
+
+
 async def _repair_contract_identity_statements(
     *,
     plan: MiniSubgoalPlan,
@@ -14737,8 +14940,8 @@ async def _repair_contract_identity_statements(
     stats: MiniRecursiveStats,
     record_event: Optional[RecordEvent],
     operation_timeout_s: Optional[float] = None,
-    max_repairs: int = 4,
-    max_empty_retries: int = 2,
+    max_repairs: int = -1,
+    max_empty_retries: int = -1,
     replay_only: bool = False,
     answer_safe_preamble: str = "",
     suppress_solution_placeholders: Optional[bool] = None,
@@ -14755,14 +14958,18 @@ async def _repair_contract_identity_statements(
         ]
     ] = None,
 ) -> MiniSubgoalPlan:
-    """Make bounded repairs; durable reservations prevent paid replay on resume.
+    """Repair pending statements; durable reservations prevent paid replay.
 
     Completed indices include dispatched calls whose outcome is unavailable.
-    Only an explicitly funded empty-response retry reopens an obligation.
+    Completed empty responses reopen an obligation within any explicit limit.
+    Negative one leaves counts unlimited; zero disables the corresponding lane.
     Without an explicit operation bound, the provider's configured LLM deadline
     policy applies; a Lean tactic timeout is not a model generation deadline.
     """
 
+    for label, limit in (("max_repairs", max_repairs), ("max_empty_retries", max_empty_retries)):
+        if type(limit) is not int or limit < -1:
+            raise ValueError(f"{label} must be -1 or a nonnegative integer")
     if replay_only:
         return plan
     repaired_claims = list(plan.claims)
@@ -14778,13 +14985,12 @@ async def _repair_contract_identity_statements(
         and index not in completed_indices
         and index < len(repaired_claims)
     ]
-    aggregate_repair_budget = max(0, int(max_repairs or 0))
-    empty_retry_budget = max(0, int(max_empty_retries or 0))
+    aggregate_repair_budget = max_repairs
+    empty_retry_budget = max_empty_retries
     # A reasoning model can successfully consume a response budget while
     # returning no visible proposition. Keep those claims in a FIFO retry lane
-    # behind all as-yet-unattempted failed claims. The aggregate cap remains
-    # authoritative: large bad plans must not turn contract repair into 20
-    # sequential provider calls.
+    # behind all as-yet-unattempted failed claims. Explicit aggregate limits
+    # remain authoritative across restoration of the pending plan.
     root_route_names = set(
         _root_route_dependency_names(
             plan.claims,
@@ -14864,7 +15070,7 @@ async def _repair_contract_identity_statements(
         allow_official_answer_visibility=allow_official_answer_visibility,
         official_answer_payload_present=official_answer_payload_present,
     )
-    while pending_indices and attempts < aggregate_repair_budget:
+    while pending_indices and (aggregate_repair_budget < 0 or attempts < aggregate_repair_budget):
         index, empty_retry = pending_indices.pop(0)
         if empty_retry:
             empty_retries_used += 1
@@ -15018,8 +15224,8 @@ async def _repair_contract_identity_statements(
             }
             repair_key = repair_key_by_index[index]
             retry_available = bool(
-                retry_counts.get(repair_key, 0) < empty_retry_budget
-                and attempts < aggregate_repair_budget
+                (empty_retry_budget < 0 or retry_counts.get(repair_key, 0) < empty_retry_budget)
+                and (aggregate_repair_budget < 0 or attempts < aggregate_repair_budget)
             )
             if retry_available:
                 completed_indices.discard(index)
@@ -18407,7 +18613,7 @@ async def run_mini_recursive_attempt(
     repair_retrieval_top_k: int = 6,
     proof_state_child_tactics_enabled: bool = True,
     proof_state_child_tactic_timeout_s: float = DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-    proof_state_child_tactic_max_candidates: int = 32,
+    proof_state_child_tactic_max_candidates: int = -1,
     root_tactic_timeout_s: Optional[float] = None,
     root_tactic_max_candidates: Optional[int] = None,
     proof_state_child_goal_limit: int = 3,
@@ -18429,9 +18635,9 @@ async def run_mini_recursive_attempt(
     selected_parent_proof_idea_context: str = "",
     suppress_root_solved: bool = False,
     recursive_helper_prover_enabled: bool = False,
-    recursive_helper_max_depth: int = 3,
-    recursive_helper_max_attempts_per_node: int = 2,
-    recursive_helper_turns: int = 5,
+    recursive_helper_max_depth: int = 0,
+    recursive_helper_max_attempts_per_node: int = 0,
+    recursive_helper_turns: int = -1,
     recursive_helper_refine: bool = False,
     recursive_helper_budget: int = 0,
     recursion_depth: int = 0,
@@ -18493,9 +18699,9 @@ async def run_mini_recursive_attempt(
         else max(0.0, float(root_tactic_timeout_s))
     )
     nested_root_tactic_max_candidates = (
-        64
+        -1
         if root_tactic_max_candidates is None
-        else max(0, int(root_tactic_max_candidates))
+        else int(root_tactic_max_candidates)
     )
     recursive_attempt_activation_id = secrets.token_hex(16)
     suppress_solution_placeholders = effective_solution_placeholder_suppression(
@@ -18614,6 +18820,7 @@ async def run_mini_recursive_attempt(
         contract_display_statement: str = "",
         contract_binder_sorts: Sequence[str] = (),
         contract_proof_binder_types: Sequence[str] = (),
+        contract_binder_observation_complete: bool = False,
     ) -> Optional[str]:
         def notify_promotable_accept(item: Any) -> None:
             callback = verified_helper_accept_callback
@@ -18635,6 +18842,16 @@ async def run_mini_recursive_attempt(
 
         actual_name = unique_dossier_helper_name(attempt_dossier, suggested_name)
         helper_src = helper_decl_from_proof(actual_name, statement, proof_text)
+        from .verified_helper_contract import (
+            helper_contract_context_is_plain, helper_source_contract_is_context_sensitive,
+        )
+        observation_required = helper_source_contract_is_context_sensitive(
+            helper_src,
+            context_is_plain=helper_contract_context_is_plain(
+                lean, preamble=lean_check_preamble,
+                context=attempt_dossier.execution_helper_blocks(),
+            ),
+        )
         exact_recursive_root = bool(
             str(statement or "").strip()
             and str(statement or "").strip() == str(root_statement or "").strip()
@@ -18652,10 +18869,12 @@ async def run_mini_recursive_attempt(
             ),
             visibility_policy=("root_authoritative" if exact_recursive_root else ""),
             contract_identity=contract_identity,
+            contract_observation_required=observation_required,
             contract_display_statement=contract_display_statement,
             contract_binder_sorts=contract_binder_sorts,
             contract_proof_binder_types=contract_proof_binder_types,
             _contract_identity_statement=(statement if contract_identity else ""),
+            _contract_binder_observation_complete=contract_binder_observation_complete,
         )
         if item is None:
             return None
@@ -18684,7 +18903,10 @@ async def run_mini_recursive_attempt(
         }
         render_policy = str(getattr(item, "render_policy", "") or "").strip()
         if render_policy:
-            if _recursive_helper_item_passes_quality_gate(item, statement):
+            if exact_recursive_root or _recursive_helper_item_passes_quality_gate(item, statement):
+                # Auxiliary visibility is advisory to the separately checked
+                # root proof. An unavailable binder observation cannot discard
+                # the exact root candidate before its final replay.
                 record_event(
                     {
                         "phase": "mini_recursive_helper_accept",
@@ -18757,6 +18979,67 @@ async def run_mini_recursive_attempt(
         route_local_replay_blocks = tuple(ProofDossier._merge_replay_helper_blocks(
             inherited_replay_blocks, blocks,
         ))
+        # Proposition admission resolves the owning dossier's live execution
+        # context. Keep it aligned with this route's replay-verified scope for
+        # the duration of the driver, without changing helper visibility.
+        attempt_dossier.forced_context_helper_blocks = route_local_replay_blocks
+
+    async def publish_settled_child_helpers(child_conv: Any, child_dossier: Any) -> None:
+        """Publish reusable settled facts without claiming the child's target."""
+        from .helper_salvage import stale_helper_dependent_names
+
+        propagate_invalidated_statements(attempt_dossier, child_dossier, record_graph=False)
+        child_helpers = dict(getattr(child_dossier, "verified_helpers", {}) or {})
+        blocked = {str(getattr(child_dossier, "theorem_name", "") or "")}
+        for name, helper in child_helpers.items():
+            quality_probe = clone_verified_helper(helper)
+            classifier = getattr(attempt_dossier, "_classify_verified_helper_quality", None)
+            if callable(classifier):
+                classifier(quality_probe)
+            # Pending target/certificate exceptions apply only to terminal
+            # proof adoption, never to free-standing progress at a yield.
+            if not _recursive_helper_item_passes_quality_gate(quality_probe, ""):
+                blocked.add(name)
+        blocked.update(stale_helper_dependent_names(child_dossier, tuple(blocked)))
+        admitted = {name: helper for name, helper in child_helpers.items() if name not in blocked}
+        if not any(attempt_dossier.verified_helpers.get(name) != helper
+                   for name, helper in admitted.items()):
+            return
+        projection = SimpleNamespace(verified_helpers=admitted)
+        child_llm_preamble = str(getattr(child_conv, "preamble", "") or answer_safe_preamble)
+        child_lean_preamble = str(getattr(child_conv, "lean_preamble", "") or lean_check_preamble)
+        child_theory_hash = str(getattr(child_conv, "mini_theory_context_hash", "") or "")
+        needs_promotion = bool(
+            child_llm_preamble != answer_safe_preamble or child_lean_preamble != lean_check_preamble
+            or (child_theory_hash and child_theory_hash != str(
+                getattr(attempt_dossier, "mini_theory_context_hash", "") or ""))
+        )
+        if not needs_promotion:
+            _merge_new_verified_helpers(attempt_dossier, projection)
+        else:
+            replay_helpers = tuple(str(helper.source) for _, helper in
+                                   dependency_ordered_verified_helper_items(list(admitted.items())))
+            def merge_settled_helpers() -> bool:
+                _merge_new_verified_helpers(attempt_dossier, projection)
+                return True
+            # The closed check audits only independently reusable declarations.
+            # Existing promotion owns the rollbackable helper/environment commit;
+            # this is never submitted as a proof of the pending mathematical goal.
+            replay_statement, replay_proof = "True", "by trivial"
+            promoted = await promote_claim_environment(
+                claim_proof_result=ClaimProofResult(
+                    child_llm_preamble=child_llm_preamble, child_lean_preamble=child_lean_preamble,
+                    theory_imported_bundle_ids=tuple(getattr(child_conv, "mini_theory_imported_bundle_ids", ()) or ()),
+                    theory_snapshot=getattr(child_conv, "mini_theory_snapshot", None),
+                    theory_context_hash=child_theory_hash,
+                    child_verified_helper_blocks=replay_helpers, child_replay_helpers=replay_helpers,
+                    theory_promotion_commit=getattr(child_conv, "mini_theory_commit_promotion", None),
+                    child_helper_merge_commit=merge_settled_helpers,
+                ),
+                statement=replay_statement, proof=replay_proof, helpers=(),
+            )
+            if promoted:
+                finalize_claim_environment(statement=replay_statement, proof=replay_proof)
 
     async def prove_claim(
         claim: MiniSubgoalClaim,
@@ -18767,6 +19050,7 @@ async def run_mini_recursive_attempt(
         variant_index: int,
         *,
         planner_handoff: Optional[Mapping[str, Any]] = None,
+        child_continuation: Optional[Mapping[str, Any]] = None,
     ) -> ClaimProofResult:
         nonlocal lean
         child_recursion_depth = max(0, int(recursion_depth or 0)) + 1
@@ -18986,6 +19270,32 @@ async def run_mini_recursive_attempt(
             ).strip(),
         )
         label = f"[mini-recursive p{pass_index} c{claim_index} v{variant_index}]"
+        child_execution_state: dict[str, Any] = {}
+        service_kwargs: dict[str, Any] = {}
+        if _callable_accepts_keyword(run_conversation_fn, "child_execution_state"):
+            service_kwargs["child_execution_state"] = child_execution_state
+            service_kwargs["child_continuation"] = dict(child_continuation or {})
+        initial_child_phase = str((child_continuation or {}).get("role") or "prove")
+        if initial_child_phase not in {"prove", "refine"}:
+            raise ValueError("Unsupported recursive child continuation role")
+        if initial_child_phase == "refine":
+            if refiner_client is None:
+                raise ValueError("Recursive refiner continuation lost its provider")
+            subgoal_conv.role = "refine"
+
+        async def take_child_service_result() -> Optional[ClaimProofResult]:
+            nonlocal subgoal_conv, subgoal_dossier, subgoal_proof_state
+            child = child_execution_state.get("session")
+            if child is not None:
+                subgoal_conv, subgoal_dossier = child.conv, child.dossier
+                subgoal_proof_state = child.proof_state
+            if child_execution_state.get("yielded"):
+                await publish_settled_child_helpers(subgoal_conv, subgoal_dossier)
+                return ClaimProofResult(
+                    child_service_yielded=True,
+                    child_continuation=dict(child_execution_state["continuation"]),
+                )
+            return None
 
         required_child_helper_hashes: dict[str, str] = {}
 
@@ -19362,6 +19672,9 @@ async def run_mini_recursive_attempt(
 
         def successful_child_result(proof: str) -> ClaimProofResult:
             """Return a proof together with its exact child theory context."""
+            from .verified_helper_contract import (
+                helper_contract_context_is_plain, helper_source_contract_is_context_sensitive,
+            )
 
             parent_helper_sources = {
                 helper_decl_name(block): str(block or "").strip()
@@ -19372,6 +19685,12 @@ async def run_mini_recursive_attempt(
             }
             accepted_replay_helpers = _accepted_child_replay_helpers(
                 subgoal_dossier, proof,
+            )
+            child_context_is_plain = helper_contract_context_is_plain(
+                lean,
+                preamble=str(getattr(subgoal_conv, "lean_preamble", "")
+                             or getattr(subgoal_conv, "preamble", "") or ""),
+                context=accepted_replay_helpers,
             )
             child_delta_blocks = tuple(
                 str(block or "").strip()
@@ -19430,6 +19749,14 @@ async def run_mini_recursive_attempt(
                     if current is None:
                         current = attempt_dossier.record_verified_helper(
                             block, phase="mini_recursive_child_replay", turn_index=0,
+                            contract_observation_required=helper_source_contract_is_context_sensitive(
+                                block,
+                                context_is_plain=child_context_is_plain and helper_contract_context_is_plain(
+                                    lean,
+                                    preamble=lean_check_preamble,
+                                    context=attempt_dossier.execution_helper_blocks(),
+                                ),
+                            ),
                         )
                         if current is None:
                             return False
@@ -19534,13 +19861,31 @@ async def run_mini_recursive_attempt(
                         invalid_certificate=copy.deepcopy(dict(certificate)),
                     )
 
+            from .proof_state_executor import (
+                _proof_state_acceptance_preamble, _proof_state_check_preamble,
+            )
+            from .verified_helper_contract import helper_contract_context_is_plain
+
             invalid_reason = _detect_recursive_claim_invalidity(
                 subgoal_conv,
                 variant.statement,
                 require_checked_evidence=True,
                 dossier=subgoal_dossier,
+                context_is_plain=all(
+                    helper_contract_context_is_plain(
+                        lean, preamble=preamble,
+                        context=subgoal_dossier.verified_helper_blocks(),
+                    )
+                    for preamble in (
+                        _proof_state_check_preamble(subgoal_conv),
+                        _proof_state_acceptance_preamble(subgoal_conv),
+                    )
+                ),
             )
-            if invalid_reason:
+            negation_candidates = _recursive_claim_negation_candidates_with_context(
+                subgoal_conv, variant.statement,
+            )
+            if invalid_reason or negation_candidates:
                 from ensemble_prover.proof_state_executor import (
                     _proof_state_acceptance_preamble,
                 )
@@ -19562,18 +19907,18 @@ async def run_mini_recursive_attempt(
                     operation_timeout_s=cfg.falsification_operation_timeout_s,
                     engine_timeout_s=cfg.falsification_engine_timeout_s,
                 )
-                certificate_environment_hash = falsification_environment_hash(
-                    preamble=certification_preamble,
-                    helpers=attempt_dossier.verified_helper_blocks(),
-                    policy=policy,
-                    lean=lean,
-                )
-                for negation_proof in _recursive_claim_negation_proof_candidates(
-                    subgoal_conv,
-                    variant.statement,
-                ):
+                for negation_proof, local_dependencies in negation_candidates:
                     if not environment_is_bound:
                         break
+                    certification_helpers = tuple(dict.fromkeys((
+                        *attempt_dossier.verified_helper_blocks(), *local_dependencies,
+                    )))
+                    certificate_environment_hash = falsification_environment_hash(
+                        preamble=certification_preamble,
+                        helpers=certification_helpers,
+                        policy=policy,
+                        lean=lean,
+                    )
                     candidate = CounterexampleCandidate(
                         engine="child_try_lean",
                         explanation="child supplied a closed direct-negation proof",
@@ -19584,7 +19929,7 @@ async def run_mini_recursive_attempt(
                         proof=negation_proof,
                         candidate=candidate,
                         preamble=certification_preamble,
-                        helpers=attempt_dossier.verified_helper_blocks(),
+                        helpers=certification_helpers,
                         policy=policy,
                         environment_hash=certificate_environment_hash,
                     )
@@ -19610,7 +19955,7 @@ async def run_mini_recursive_attempt(
                             FalsificationFinding(
                                 engine="child_try_lean",
                                 outcome=FalsificationOutcome.REFUTED,
-                                reason=invalid_reason,
+                                reason=invalid_reason or "independently certified target negation",
                                 candidates=(candidate,),
                                 certificate=certificate,
                                 checks_run=1,
@@ -19626,7 +19971,7 @@ async def run_mini_recursive_attempt(
                         continue
                     return ClaimProofResult(
                         proof=None,
-                        invalid_reason=invalid_reason,
+                        invalid_reason=invalid_reason or "independently certified target negation",
                         invalid_certificate=certificate.to_record(),
                     )
                 # Checked evidence (an ACCEPTED try_lean counterexample / negation)
@@ -19637,11 +19982,12 @@ async def run_mini_recursive_attempt(
                 # materially different from having NO checked evidence, so surface
                 # it distinctly: the planner must be told a valid counterexample
                 # exists (not that none was found) and must not re-plan the claim.
-                return ClaimProofResult(
-                    proof=None,
-                    giveup_cluster="checked_counterexample_without_full_negation",
-                    giveup_match=invalid_reason,
-                )
+                if invalid_reason:
+                    return ClaimProofResult(
+                        proof=None,
+                        giveup_cluster="checked_counterexample_without_full_negation",
+                        giveup_match=invalid_reason,
+                    )
             unchecked_invalidity = _detect_recursive_claim_invalidity(
                 subgoal_conv,
                 variant.statement,
@@ -19718,7 +20064,7 @@ async def run_mini_recursive_attempt(
 
         ok, proof_text = await run_conversation_fn(
             conv=subgoal_conv,
-            client=prover_client,
+            client=(refiner_client if initial_child_phase == "refine" else prover_client),
             lean=lean,
             max_turns=cfg.turns_per_claim,
             trace_prefix=trace_prefix + f"  {label} ",
@@ -19757,10 +20103,15 @@ async def run_mini_recursive_attempt(
             cost_controller=cost_controller,
             strict_progress_accounting=strict_progress_accounting,
             soft_progress_streak_cap=soft_progress_streak_cap,
-            nested_invocation_id=child_nested_invocation_id("prove"),
+            nested_invocation_id=(str((child_continuation or {}).get("nested_invocation_id") or "")
+                                  or child_nested_invocation_id(initial_child_phase)),
             session_scope="subgoal",
             **child_planner_kwargs,
+            **service_kwargs,
         )
+        service_result = await take_child_service_result()
+        if service_result is not None:
+            return service_result
         expose_child_elapsed_deadline_failure()
         raw_prover_turns_used = getattr(
             subgoal_conv,
@@ -19769,16 +20120,19 @@ async def run_mini_recursive_attempt(
         )
         try:
             prover_turns_used = int(raw_prover_turns_used)
-            if not 0 <= prover_turns_used <= int(cfg.turns_per_claim):
+            if prover_turns_used < 0 or (
+                int(cfg.turns_per_claim) >= 0
+                and prover_turns_used > int(cfg.turns_per_claim)
+            ):
                 raise ValueError("recursive turn receipt is out of range")
         except (TypeError, ValueError, OverflowError):
             # Custom/legacy callbacks without a trustworthy receipt cannot
             # mint a second full refiner tranche.  The production callback
             # explicitly publishes zero when it performed no child work.
-            prover_turns_used = int(cfg.turns_per_claim)
-        remaining_claim_turns = max(
-            0,
-            int(cfg.turns_per_claim) - prover_turns_used,
+            prover_turns_used = max(0, int(cfg.turns_per_claim))
+        remaining_claim_turns = (
+            -1 if int(cfg.turns_per_claim) < 0
+            else max(0, int(cfg.turns_per_claim) - prover_turns_used)
         )
         expired_before_child_work = bool(
             getattr(
@@ -19937,9 +20291,11 @@ async def run_mini_recursive_attempt(
                 nested_invocation_id=child_nested_invocation_id(handoff_kind),
                 session_scope="subgoal",
                 **child_planner_kwargs,
+                **({"child_execution_state": child_execution_state}
+                   if "child_execution_state" in service_kwargs else {}),
             )
 
-        if not ok and refiner_client is not None and remaining_claim_turns > 0:
+        if not ok and initial_child_phase == "prove" and refiner_client is not None and remaining_claim_turns != 0:
             provider_handoff = _retire_ordinary_provider_state_for_role_handoff(
                 subgoal_conv
             )
@@ -20116,7 +20472,12 @@ async def run_mini_recursive_attempt(
                 ),
                 session_scope="subgoal",
                 **child_planner_kwargs,
+                **({"child_execution_state": child_execution_state}
+                   if "child_execution_state" in service_kwargs else {}),
             )
+            service_result = await take_child_service_result()
+            if service_result is not None:
+                return service_result
             expose_child_elapsed_deadline_failure()
             if owned_provider_continuation and not ok:
                 raw_owned_turns_used = getattr(
@@ -20126,15 +20487,18 @@ async def run_mini_recursive_attempt(
                 )
                 try:
                     owned_turns_used = int(raw_owned_turns_used)
-                    if not 0 <= owned_turns_used <= remaining_claim_turns:
+                    if owned_turns_used < 0 or (
+                        remaining_claim_turns >= 0
+                        and owned_turns_used > remaining_claim_turns
+                    ):
                         raise ValueError("owned continuation turn receipt is invalid")
                 except (TypeError, ValueError, OverflowError):
                     # An unauthenticated callback receipt cannot mint a
                     # refiner tranche after the prover-owned continuation.
-                    owned_turns_used = remaining_claim_turns
-                remaining_claim_turns = max(
-                    0,
-                    remaining_claim_turns - owned_turns_used,
+                    owned_turns_used = max(0, remaining_claim_turns)
+                remaining_claim_turns = (
+                    -1 if remaining_claim_turns < 0
+                    else max(0, remaining_claim_turns - owned_turns_used)
                 )
                 handoff_failure = await failed_child_handoff_result()
                 if handoff_failure is not None:
@@ -20163,7 +20527,7 @@ async def run_mini_recursive_attempt(
                     },
                 )
                 if (
-                    remaining_claim_turns > 0
+                    remaining_claim_turns != 0
                     and not post_drain_handoff.get("protected")
                 ):
                     subgoal_conv.role = "refine"
@@ -20214,6 +20578,9 @@ async def run_mini_recursive_attempt(
                         handoff_turns=remaining_claim_turns,
                         handoff_kind="refine_after_owned_drain",
                     )
+                    service_result = await take_child_service_result()
+                    if service_result is not None:
+                        return service_result
                     expose_child_elapsed_deadline_failure()
         elif not ok and refiner_client is not None:
             _record(
@@ -20305,6 +20672,7 @@ async def run_mini_recursive_attempt(
         speculative_operational_probe: bool = False,
         max_elapsed_s: Optional[float] = None,
         setup_retry_generation: int = 0,
+        child_continuation: Optional[Mapping[str, Any]] = None,
     ) -> Optional[str] | RootCloseOperationalFailure:
         """Honest root close: run a conversational proof attempt against the
         canonical root with a route-local verified helper context. The model
@@ -20377,14 +20745,13 @@ async def run_mini_recursive_attempt(
                     recorded = None
                 if recorded:
                     existing_names.add(str(recorded))
-        close_turn_limit = max(
-            1,
-            int(
-                max_conversation_turns
-                if max_conversation_turns is not None
-                else cfg.turns_per_claim
-            ),
+        close_turn_limit = int(
+            max_conversation_turns
+            if max_conversation_turns is not None
+            else cfg.turns_per_claim
         )
+        if close_turn_limit == 0:
+            close_turn_limit = 1
         close_conv = conversation_cls(
             role="prove",
             goal_statement=root_statement,
@@ -20452,6 +20819,12 @@ async def run_mini_recursive_attempt(
         )
         label = f"[mini-recursive p{pass_index} root-close after {after_helper}]"
         root_close_governor_kwargs: dict[str, Any] = {}
+        close_execution_state: dict[str, Any] = {}
+        if _callable_accepts_keyword(run_conversation_fn, "child_execution_state"):
+            root_close_governor_kwargs.update(
+                child_execution_state=close_execution_state,
+                child_continuation=dict(child_continuation or {}),
+            )
         if close_deadline_epoch_s > 0.0 and _callable_accepts_keyword(
             run_conversation_fn, "action_deadline_epoch_s",
         ):
@@ -20516,6 +20889,7 @@ async def run_mini_recursive_attempt(
             cost_controller=cost_controller,
             **root_close_governor_kwargs,
             nested_invocation_id=(
+                str((child_continuation or {}).get("nested_invocation_id") or "") or
                 f"root-close:{pass_index}:"
                 + text_hash(
                     json.dumps(
@@ -20558,6 +20932,16 @@ async def run_mini_recursive_attempt(
             ),
             session_scope="problem",
         )
+        retained_child = close_execution_state.get("session")
+        if retained_child is not None:
+            close_conv, close_dossier = retained_child.conv, retained_child.dossier
+            close_proof_state = retained_child.proof_state
+        if close_execution_state.get("yielded"):
+            await publish_settled_child_helpers(close_conv, close_dossier)
+            return RootCloseOperationalFailure(
+                reason="recursive_child_service_yield",
+                child_continuation=dict(close_execution_state["continuation"]),
+            )
         if ok and proof_text:
             proof = str(proof_text)
             parent_helper_sources = {
@@ -20752,7 +21136,7 @@ async def run_mini_recursive_attempt(
 
     llm_root_close_enabled = (
         not suppress_root_solved
-        and int(getattr(cfg, "llm_root_close_max_attempts", 0) or 0) > 0
+        and int(getattr(cfg, "llm_root_close_max_attempts", -1)) != 0
     )
 
     # Failed-route memory must also reopen when non-dossier proof evidence
@@ -21013,6 +21397,7 @@ async def run_mini_recursive_attempt(
             "current_lean_environment_hash",
             "lean_environment_ancestor_hashes",
             "lean_environment_content_digests",
+            "lean_environment_plain_syntax",
             "proof_lineage_events",
             "proof_lineage_event_ids",
             "proof_ideas",
@@ -21543,6 +21928,8 @@ async def run_mini_recursive_attempt(
         if rollback_failures:
             raise driver_error from rollback_failures[0]
         raise
+    finally:
+        attempt_dossier.forced_context_helper_blocks = inherited_replay_blocks
     final_result = result
     checked_environment_hash = text_hash(lean_check_preamble)
     stored_replay_helpers = tuple(attempt_dossier.final_replay_helpers)
@@ -22069,7 +22456,8 @@ def _recursive_controller_accounting_frame(
     if (
         frame.get("schema_version") != 1
         or not 1 <= cursor <= ceiling + 1
-        or not 1 <= ceiling <= configured_passes
+        or ceiling < 1
+        or (configured_passes >= 0 and ceiling > configured_passes)
         or grants >= ceiling
         or accounting_stats["passes_completed"] > accounting_stats["passes_started"]
         or accounting_stats["passes_completed"] >= cursor
@@ -22154,6 +22542,14 @@ async def run_mini_recursive_driver(
     """
 
     stats = MiniRecursiveStats(campaign_id=secrets.token_hex(16))
+    if int(config.passes) == 0 or int(config.max_claims) == 0:
+        return MiniRecursiveResult(
+            ok=False, proof=None, stats=stats,
+            failure_reason=(
+                "recursive_passes_exhausted" if int(config.passes) == 0
+                else "recursive_claims_exhausted"
+            ),
+        )
     if record_event is not None:
         campaign_record_event = record_event
 
@@ -22211,13 +22607,10 @@ async def run_mini_recursive_driver(
             else root_tactic_timeout_s
         ),
     )
-    effective_root_tactic_max_candidates = max(
-        0,
-        int(
-            config.tactic_max_candidates
-            if root_tactic_max_candidates is None
-            else root_tactic_max_candidates
-        ),
+    effective_root_tactic_max_candidates = int(
+        config.tactic_max_candidates
+        if root_tactic_max_candidates is None
+        else root_tactic_max_candidates
     )
 
     def current_answer_safe_preamble() -> str:
@@ -22403,6 +22796,7 @@ async def run_mini_recursive_driver(
     # a ProofDossier (which would change root-finalization semantics).
     falsification_runtime_owner = dossier if dossier is not None else SimpleNamespace()
     summaries: list[str] = []
+    unlimited_passes = int(config.passes) < 0
     passes = max(1, int(config.passes or 1))
     # This is an enable/disable policy, not another fixed mathematical budget.
     # Once the configured exploratory passes are spent, every pass that banks a
@@ -22415,7 +22809,7 @@ async def run_mini_recursive_driver(
     )
     pass_quantum = max(0, int(getattr(config, "pass_quantum", 0) or 0))
     invocation_passes_completed = 0
-    max_claims = max(1, int(config.max_claims or 1))
+    max_claims = int(config.max_claims)
     planner_feedback: list[str] = []
 
     # Bind every durable recursive claim fact to the complete static proof
@@ -22475,7 +22869,7 @@ async def run_mini_recursive_driver(
     if isinstance(continuation_state, Mapping):
         candidate_resume_frame = dict(continuation_state)
         controller_accounting_frame = _recursive_controller_accounting_frame(
-            candidate_resume_frame, configured_passes=passes
+            candidate_resume_frame, configured_passes=(-1 if unlimited_passes else passes)
         )
         current_cognition_hash = current_proof_idea_cognition_hash()
         saved_route_lifecycle = candidate_resume_frame.get("route_identity_lifecycle_context")
@@ -22696,6 +23090,10 @@ async def run_mini_recursive_driver(
         0,
         int(resume_frame.get("planner_tranche_claims_emitted", 0) or 0),
     )
+    planner_tranche_claim_keys = {
+        str(key) for key in resume_frame.get("planner_tranche_claim_keys", ())
+        if isinstance(key, str) and key
+    }
     planner_tranche_accounting_version = max(
         0,
         int(resume_frame.get("planner_tranche_accounting_version", 0) or 0),
@@ -22733,6 +23131,7 @@ async def run_mini_recursive_driver(
         for item in list(resume_frame.get("llm_root_close_attempted_keys") or [])
         if isinstance(item, (list, tuple, set, frozenset))
     }
+    root_child_continuations = copy.deepcopy(dict(resume_frame.get("root_child_continuations") or {}))
     llm_root_close_pending_keys: set[frozenset[str]] = {
         frozenset(str(part or "") for part in item if str(part or ""))
         for item in list(resume_frame.get("llm_root_close_pending_keys") or [])
@@ -22789,16 +23188,14 @@ async def run_mini_recursive_driver(
     if isinstance(raw_portfolio_phases, Mapping):
         root_tactic_portfolio_phases = {
             str(key): str(phase)
-            for key, phase in list(raw_portfolio_phases.items())[:256]
+            for key, phase in raw_portfolio_phases.items()
             if len(str(key)) == 64 and isinstance(phase, str) and phase in {"direct", "active", "lift", "fallback"}
         }
     raw_root_tactic_portfolio_continuations = root_portfolio_frame.get(
         "root_tactic_portfolio_continuations"
     )
     if isinstance(raw_root_tactic_portfolio_continuations, Mapping):
-        for raw_key, raw_offset in list(
-            raw_root_tactic_portfolio_continuations.items()
-        )[:256]:
+        for raw_key, raw_offset in raw_root_tactic_portfolio_continuations.items():
             key = str(raw_key or "").strip()
             if len(key) != 64 or isinstance(raw_offset, bool):
                 continue
@@ -22806,7 +23203,7 @@ async def run_mini_recursive_driver(
                 offset = int(raw_offset)
             except (TypeError, ValueError, OverflowError):
                 continue
-            if 0 < offset <= 4096 or (offset == 0 and key in root_tactic_portfolio_phases):
+            if offset > 0 or (offset == 0 and key in root_tactic_portfolio_phases):
                 root_tactic_portfolio_continuations[key] = offset
     root_tactic_portfolio_phases = {
         key: phase for key, phase in root_tactic_portfolio_phases.items()
@@ -22817,7 +23214,7 @@ async def run_mini_recursive_driver(
         for item in list(
             root_portfolio_frame.get("root_tactic_direct_portfolio_exhausted_execution_keys")
             or ()
-        )[:256]
+        )
         if len(str(item or "").strip()) == 64
     }
     unmet_assembly_bridge_recovery_pass_granted = bool(
@@ -23259,6 +23656,11 @@ async def run_mini_recursive_driver(
             progress_accepts_state = True
             progress_accepts_state_none = False
 
+    # The first plan and its in-pass replan own separate paid repair ledgers.
+    # Keep this ledger through local replan filtering/infrastructure yields;
+    # discard it once the selected executable plan owns the continuation.
+    replan_contract_repair_progress: dict[str, Any] = {}
+
     async def publish_driver_state(
         reason: str,
         *,
@@ -23274,6 +23676,7 @@ async def run_mini_recursive_driver(
         next_claim_index: int = 0,
         next_variant_index: int = 0,
         child_receipt: Optional[ClaimProofResult] = None,
+        child_continuation: Optional[Mapping[str, Any]] = None,
         completed_claim_keys: Sequence[str] = (),
         accepted_helper_name: str = "",
         accepted_helper_statement: str = "",
@@ -23290,12 +23693,39 @@ async def run_mini_recursive_driver(
         planner_job_identity: Optional[Mapping[str, Any]] = None,
         pass_outcome_kind: str = "",
     ) -> None:
+        if (
+            phase == "plan_compiled"
+            and resuming_this_pass
+            and int(resume_frame.get("pass_index", 0) or 0) == pass_index
+            and plan is not None
+            and plan.raw_response == dict(resume_frame.get("plan") or {}).get("raw_response", "")
+        ):
+            # Earlier filter retries must preserve the deepest admitted paid
+            # receipt. The original context-bound frame already passed resume
+            # validation; its sources still traverse the current gates again.
+            if resumed_replan_plan is not None:
+                phase = "replan_compiled"
+                replan_plan = resumed_replan_plan
+            elif resume_contract_replan_pending:
+                phase = "planner_job_pending"
+                planner_job_identity = asdict(resumed_planner_job_identity)
+            elif resumed_contract_repair_plan is not None:
+                phase = "contract_repair_progress"
+            if phase != "plan_compiled" and contract_repair_plan is None:
+                contract_repair_plan = resumed_contract_repair_plan
+                contract_repair_completed_indices = tuple(resumed_contract_repair_indices)
+                contract_repair_attempts_used = resumed_contract_repair_attempts
+                contract_repair_retry_counts = resumed_contract_repair_retry_counts
         checkpoint_live_claims = [
             claim
             for candidate_plan in (plan, replan_plan, contract_repair_plan)
             if candidate_plan is not None
             for claim in candidate_plan.claims
         ]
+        if phase == "replan_compiled" and replan_contract_repair_progress:
+            checkpoint_live_claims.extend(_recursive_plan_from_state_record(
+                replan_contract_repair_progress["plan"],
+            ).claims)
         checkpoint_live_claims.extend(
             item.claim for item in suspended_dependency_claims.values()
         )
@@ -23340,6 +23770,10 @@ async def run_mini_recursive_driver(
                 _recursive_plan_state_record(replan_plan)
                 if replan_plan is not None
                 else {}
+            ),
+            "replan_contract_repair_progress": (
+                copy.deepcopy(replan_contract_repair_progress)
+                if phase == "replan_compiled" else {}
             ),
             "contract_repair_plan": (
                 _recursive_plan_state_record(contract_repair_plan)
@@ -23390,6 +23824,7 @@ async def run_mini_recursive_driver(
                 else max(0.0, float(planner_fallback_remaining))
             ),
             "planner_tranche_claims_emitted": int(planner_tranche_claims_emitted),
+            "planner_tranche_claim_keys": sorted(planner_tranche_claim_keys),
             # v2 commits the current provider receipt only after post-filter
             # completion adjudication. Missing/legacy versions counted it in
             # the earlier ``plan_compiled`` checkpoint.
@@ -23423,6 +23858,8 @@ async def run_mini_recursive_driver(
                 if child_receipt is not None
                 else None
             ),
+            "child_continuation": dict(child_continuation or {}),
+            "root_child_continuations": copy.deepcopy(root_child_continuations),
             "completed_claim_keys": sorted(
                 str(item or "") for item in completed_claim_keys if str(item or "")
             ),
@@ -23465,6 +23902,7 @@ async def run_mini_recursive_driver(
                 if str(item or "")
             ),
             "pass_helpers_accepted_before": int(pass_helpers_accepted_before or 0),
+            "pass_claims_attempted_before": int(pass_claims_attempted_before),
             "exhausted_claim_keys": sorted(exhausted_claim_keys),
             "suspended_dependency_claims": {
                 key: {
@@ -23481,7 +23919,7 @@ async def run_mini_recursive_driver(
                 for key, item in sorted(
                     suspended_dependency_claims.items(),
                     key=lambda pair: (-pair[1].pass_index, pair[0]),
-                )[:256]
+                )
             },
             "deferred_priority_claims": {
                 key: asdict(claim) for key, claim in deferred_priority_claims.items()
@@ -23528,22 +23966,20 @@ async def run_mini_recursive_driver(
             "root_tactic_service_history": copy.deepcopy(root_tactic_service_history),
             "root_tactic_portfolio_continuations": {
                 key: int(offset)
-                for key, offset in sorted(root_tactic_portfolio_continuations.items())[
-                    :256
-                ]
+                for key, offset in sorted(root_tactic_portfolio_continuations.items())
                 if len(str(key or "")) == 64 and (
-                    0 < int(offset or 0) <= 4096
+                    int(offset or 0) > 0
                     or (int(offset or 0) == 0 and key in root_tactic_portfolio_phases)
                 )
             },
             "root_tactic_portfolio_phases": {
                 key: root_tactic_portfolio_phases[key]
-                for key in sorted(root_tactic_portfolio_continuations)[:256]
+                for key in sorted(root_tactic_portfolio_continuations)
                 if key in root_tactic_portfolio_phases
             },
             "root_tactic_direct_portfolio_exhausted_execution_keys": sorted(
                 root_tactic_direct_portfolio_exhausted_execution_keys
-            )[:256],
+            ),
             "unmet_assembly_bridge_recovery_pass_granted": bool(
                 unmet_assembly_bridge_recovery_pass_granted
             ),
@@ -23886,6 +24322,7 @@ async def run_mini_recursive_driver(
         contract_display_statement: str = "",
         contract_binder_sorts: Sequence[str] = (),
         contract_proof_binder_types: Sequence[str] = (),
+        contract_binder_observation_complete: bool = False,
     ) -> Optional[str]:
         try:
             parameters_by_name = inspect.signature(accept_helper).parameters
@@ -23917,12 +24354,18 @@ async def run_mini_recursive_driver(
                 replay_context_names,
             )
             if accepts_contract_evidence:
+                completeness = (
+                    {"contract_binder_observation_complete": contract_binder_observation_complete}
+                    if _callable_accepts_keyword(accept_helper, "contract_binder_observation_complete")
+                    else {}
+                )
                 return accept_helper(
                     *positional,
                     contract_identity=contract_identity,
                     contract_display_statement=contract_display_statement,
                     contract_binder_sorts=contract_binder_sorts,
                     contract_proof_binder_types=contract_proof_binder_types,
+                    **completeness,
                 )
             return accept_helper(*positional)
         return accept_helper(  # type: ignore[call-arg]
@@ -23947,24 +24390,49 @@ async def run_mini_recursive_driver(
                 "contract_display_statement": evidence.contract_display_statement,
                 "contract_binder_sorts": evidence.contract_binder_sorts,
                 "contract_proof_binder_types": evidence.contract_proof_binder_types,
+                "contract_binder_observation_complete": lean_contract_telescope_evidence_receipt_matches(
+                    evidence.contract_telescope_evidence_receipt,
+                    identity=evidence.contract_identity,
+                    statement_key=evidence.contract_identity_statement_key,
+                    environment_hash=evidence.contract_identity_environment_hash,
+                    proof_binder_structural_hashes=tuple(evidence.contract_proof_binder_structural_hashes),
+                    conclusion_structural_hash=evidence.contract_conclusion_structural_hash,
+                    binder_sorts=tuple(evidence.contract_binder_sorts),
+                    proof_binder_types=tuple(evidence.contract_proof_binder_types),
+                ),
             }
         analyzer = getattr(lean, "analyze_statement_contracts", None)
         if not callable(analyzer):
             return {}
+        from .verified_helper_contract import helper_contract_context_guard
+
+        runner_is_current = helper_contract_context_guard(lean)
+        checked_preamble = current_lean_check_preamble().strip()
+        checked_helpers = tuple(replay_helpers)
+        checked_environment = current_contract_evidence_environment_hash()
+
+        def context_is_current() -> bool:
+            return bool(runner_is_current()
+                        and current_lean_check_preamble().strip() == checked_preamble
+                        and tuple(replay_helpers) == checked_helpers
+                        and current_contract_evidence_environment_hash() == checked_environment)
+
         try:
-            analyses, _output, _returncode = await analyzer(
+            if replay_helpers and "declaration_context" not in inspect.signature(analyzer).parameters:
+                return {}
+            analyses, _output, returncode = await analyzer(
                 [variant.statement],
-                preamble_override="\n\n".join(
-                    part
-                    for part in (
-                        current_lean_check_preamble().strip(),
-                        *(str(block or "").strip() for block in replay_helpers),
-                    )
-                    if part
-                ),
+                preamble_override=checked_preamble,
                 timeout_s=_recursive_contract_operation_timeout_s(lean, config.tactic_timeout_s),
+                **({"declaration_context": checked_helpers} if checked_helpers else {}),
             )
         except Exception:
+            if not context_is_current():
+                raise ValueError("recursive accepted helper context changed during contract observation")
+            return {}
+        if not context_is_current():
+            raise ValueError("recursive accepted helper context changed during contract observation")
+        if returncode != 0 or not isinstance(analyses, (list, tuple)) or len(analyses) != 1:
             return {}
         analysis = next(iter(analyses or ()), None)
         identity = str(getattr(analysis, "structural_identity", "") or "").strip()
@@ -23979,6 +24447,7 @@ async def run_mini_recursive_driver(
             "contract_proof_binder_types": tuple(
                 getattr(analysis, "proof_binder_types", ()) or ()
             ),
+            "contract_binder_observation_complete": bool(getattr(analysis, "profile_complete", False)),
         }
 
     async def rollback_claim_environment_if_needed(
@@ -24848,7 +25317,7 @@ async def run_mini_recursive_driver(
     async def finish_standalone_root_drain(result: MiniRecursiveResult) -> MiniRecursiveResult:
         """Drain finite root work under one existing elapsed allowance."""
         if (progress_callback is not None or result.ok or result.disproved
-                or effective_root_tactic_timeout_s <= 0 or effective_root_tactic_max_candidates <= 0):
+                or effective_root_tactic_timeout_s <= 0 or effective_root_tactic_max_candidates == 0):
             return result
 
         def pending_context() -> tuple[str, list[str], bool]:
@@ -25120,9 +25589,7 @@ async def run_mini_recursive_driver(
         if prove_root_close is None or dossier is None:
             _record_llm_root_close_skip("callback_or_dossier_missing")
             return None
-        max_attempts = max(
-            0, int(getattr(config, "llm_root_close_max_attempts", 0) or 0)
-        )
+        max_attempts = int(getattr(config, "llm_root_close_max_attempts", -1))
         authoritative_attempts = max(
             0,
             int(stats.llm_root_close_attempts or 0)
@@ -25133,7 +25600,7 @@ async def run_mini_recursive_driver(
             if speculative_assembly
             else authoritative_attempts
         )
-        if capped_attempts >= max_attempts:
+        if max_attempts >= 0 and capped_attempts >= max_attempts:
             _record_llm_root_close_skip("attempts_exhausted")
             return None
         if not certificate_names and not assembly_helper_names:
@@ -25269,12 +25736,19 @@ async def run_mini_recursive_driver(
                 ),
             )
         )
+        for retained in root_child_continuations.values():
+            if (retained.get("root_pass_index") == pass_index
+                    and retained.get("root_after_helper") == after_helper
+                    and retained.get("root_attempt_key")):
+                attempt_key = frozenset(retained["root_attempt_key"])
+                break
         if attempt_key in llm_root_close_attempted_keys:
             _record_llm_root_close_skip("root_close_context_already_attempted")
             return None
         if attempt_key in llm_root_close_setup_exhausted_keys:
             _record_llm_root_close_skip("root_close_setup_retry_exhausted")
             return None
+        continuation_key = text_hash(json.dumps(sorted(attempt_key)))
         setup_retry_generation = int(attempt_key in llm_root_close_setup_retry_keys)
         llm_root_close_pending_keys.add(attempt_key)
         _record(
@@ -25344,6 +25818,13 @@ async def run_mini_recursive_driver(
                 "pass_index": pass_index,
                 "after_helper": after_helper,
             }
+            if _callable_accepts_keyword(prove_root_close, "child_continuation"):
+                retained = root_child_continuations.get(continuation_key)
+                root_close_kwargs["child_continuation"] = (
+                    {key: value for key, value in retained.items() if key not in {
+                        "root_pass_index", "root_after_helper", "root_attempt_key",
+                    }} if retained else None
+                )
             if setup_retry_generation and _callable_accepts_keyword(
                 prove_root_close, "setup_retry_generation",
             ):
@@ -25423,6 +25904,30 @@ async def run_mini_recursive_driver(
                 },
             )
             return None
+        if (isinstance(proof_text, RootCloseOperationalFailure)
+                and proof_text.reason == "recursive_child_service_yield"):
+            if not proof_text.child_continuation:
+                raise ValueError("Root child service yield lost its continuation")
+            root_child_continuations[continuation_key] = {
+                **dict(proof_text.child_continuation), "root_pass_index": pass_index,
+                "root_after_helper": after_helper, "root_attempt_key": sorted(attempt_key),
+            }
+            stats.llm_root_close_attempts -= 1
+            if root_close_mode == "helper_set_assembly":
+                stats.llm_root_assembly_attempts -= 1
+            if speculative_assembly:
+                stats.llm_root_speculative_assembly_attempts -= 1
+            if publish_attempt_intent is not None:
+                await publish_attempt_intent()
+            else:
+                await publish_driver_state(
+                    "recursive_root_child_service", phase="root_close_intent",
+                    pass_index=pass_index,
+                    pass_helper_fingerprints_before=verified_helper_fingerprints_before,
+                    pass_helpers_accepted_before=pass_helpers_before,
+                )
+            return proof_text
+        root_child_continuations.pop(continuation_key, None)
         if (
             isinstance(proof_text, RootCloseOperationalFailure)
             and proof_text.expired_before_provider_dispatch is True
@@ -25549,7 +26054,7 @@ async def run_mini_recursive_driver(
         skip_keys: Sequence[str] = (),
         skip_statement_keys: Sequence[str] = (),
     ) -> list[MiniSubgoalClaim]:
-        if int(max_new_claims or 0) <= 0:
+        if int(max_new_claims or 0) == 0:
             return []
         for key, item in list(suspended_dependency_claims.items()):
             claim = item.claim
@@ -25905,6 +26410,13 @@ async def run_mini_recursive_driver(
                 "recursive_helper_only_fixed_point",
             }:
                 failure_reason = ""
+        if not failure_reason and unlimited_passes and pass_index >= passes:
+            if (fresh_verified_helper_count > 0
+                    or int(stats.claims_attempted or 0) > pass_claims_attempted_before):
+                passes += 1
+                pass_extension_grants += 1
+            else:
+                failure_reason = "recursive_progress_fixed_point"
         if not failure_reason and pass_index < passes:
             return None
         if not failure_reason:
@@ -26071,6 +26583,7 @@ async def run_mini_recursive_driver(
     # the next planner call ever read it — the trigger would be inert in
     # exactly the deployment that produced the motivating failure.
     last_pass_lacked_root_route = resumed_last_pass_lacked_root_route
+    pass_claims_attempted_before = int(stats.claims_attempted or 0)
     while pass_index <= passes:
         # Sibling planners can refresh a shared lease while this driver is
         # doing mathematical work. Observe that newer refusal before reopening.
@@ -26101,6 +26614,15 @@ async def run_mini_recursive_driver(
                 and bool(resume_frame.get("replan_plan"))
             )
             else None
+        )
+        replan_contract_repair_progress = (
+            copy.deepcopy(dict(resume_frame["replan_contract_repair_progress"]))
+            if resumed_replan_plan is not None
+            and isinstance(resume_frame.get("replan_contract_repair_progress"), Mapping)
+            and resume_frame["replan_contract_repair_progress"].get("identity")
+            == _replan_contract_repair_identity(resumed_replan_plan)
+            and isinstance(resume_frame["replan_contract_repair_progress"].get("plan"), Mapping)
+            else {}
         )
         resumed_contract_repair_plan = (
             _recursive_plan_from_state_record(
@@ -26191,6 +26713,10 @@ async def run_mini_recursive_driver(
         # never earn that credit twice.
         resume_records_pass_baseline = (
             "pass_helpers_accepted_before" in pass_evidence_frame
+        )
+        pass_claims_attempted_before = (
+            int(resume_frame.get("pass_claims_attempted_before", stats.claims_attempted) or 0)
+            if resuming_this_pass else int(stats.claims_attempted or 0)
         )
         pass_helpers_before = (
             int(pass_evidence_frame.get("pass_helpers_accepted_before", 0) or 0)
@@ -26381,6 +26907,11 @@ async def run_mini_recursive_driver(
             )
             else None
         )
+        if isinstance(llm_root_proof, RootCloseOperationalFailure):
+            return MiniRecursiveResult(
+                ok=False, proof=None, stats=stats, plan_summaries=tuple(summaries),
+                failure_reason=llm_root_proof.reason,
+            )
         if llm_root_proof:
             stats.passes_completed += 1
             pass_finished = True
@@ -26502,6 +27033,7 @@ async def run_mini_recursive_driver(
             provider_plan_requested = True
             if not planner_tranche_continuation_pending:
                 planner_tranche_claims_emitted = 0
+                planner_tranche_claim_keys.clear()
                 incomplete_root_route_filtered = False
             planner_claim_limit = max(
                 1,
@@ -26517,7 +27049,8 @@ async def run_mini_recursive_driver(
                             or 1
                         ),
                     ),
-                    max_claims - planner_tranche_claims_emitted,
+                    (max_claims - planner_tranche_claims_emitted)
+                    if max_claims >= 0 else max(1, int(config.planner_claim_tranche_size)),
                 ),
             )
             pass_active_root_targets = _current_active_root_targets()
@@ -26724,10 +27257,7 @@ async def run_mini_recursive_driver(
             # cannot leave premium planning permanently latched.
             previous_pass_outcome_kind = ""
 
-            premium_call_limit = max(
-                0,
-                int(getattr(config, "planner_escalation_max_calls", 3) or 0),
-            )
+            premium_call_limit = int(getattr(config, "planner_escalation_max_calls", -1))
 
             async def _authorize_premium_planner_call(call_kind: str) -> bool:
                 """Reserve one premium logical call before provider dispatch.
@@ -26746,6 +27276,7 @@ async def run_mini_recursive_driver(
                 routine_call_limit = max(0, premium_call_limit - 1)
                 if (
                     routine_deliberation
+                    and premium_call_limit >= 0
                     and int(stats.planner_escalations or 0) >= routine_call_limit
                 ):
                     _record(
@@ -26765,7 +27296,7 @@ async def run_mini_recursive_driver(
                         },
                     )
                     return False
-                if int(stats.planner_escalations or 0) >= premium_call_limit:
+                if premium_call_limit >= 0 and int(stats.planner_escalations or 0) >= premium_call_limit:
                     _record(
                         record_event,
                         {
@@ -27377,7 +27908,8 @@ async def run_mini_recursive_driver(
                     len(plan.claims),
                     max(
                         0,
-                        max_claims - planner_tranche_claims_emitted,
+                        (max_claims - planner_tranche_claims_emitted)
+                        if max_claims >= 0 else len(plan.claims),
                     ),
                 )
             )
@@ -27637,6 +28169,9 @@ async def run_mini_recursive_driver(
             satisfied_dependency_obligation_origins=proved_claim_obligation_origins,
             satisfied_dependency_helpers=get_helpers(),
             satisfied_dependency_names=(root_route_satisfied_dependency_names()),
+            # Preserve candidates only for the following Lean adjudication.
+            # Every post-elaboration route recognition remains strict.
+            include_advisory_candidates=True,
         )
         # Filled after Lean canonicalization. Comparing this raw surface plan
         # to the receipt-bound filtered plan makes an unchanged claim appear
@@ -27683,13 +28218,26 @@ async def run_mini_recursive_driver(
         def refresh_helper_contract_evidence(
             identity_coverage: _ContractIdentityCoverage,
         ) -> None:
+            from .verified_helper_contract import helper_contract_context_is_plain
+
+            declaration_blocks = _verified_helper_declaration_blocks(
+                contract_helpers,
+                suppress_solution_placeholders=suppress_solution_placeholders,
+                opaque_mode=opaque_mode,
+                allow_official_answer_visibility=allow_official_answer_visibility,
+                official_answer_payload_present=official_answer_payload_present,
+            )
             refreshed = (
                 _refresh_verified_helper_contract_evidence_from_support_analysis(
                     dossier=dossier,
                     helper_records=current_helper_evidence_records(),
-                    rendered_helper_blocks=contract_helpers,
+                    rendered_helper_blocks=declaration_blocks,
                     support_statements=original_support_statements,
                     coverage=identity_coverage,
+                    context_is_plain=helper_contract_context_is_plain(
+                        lean, preamble=current_lean_check_preamble(),
+                        context=declaration_blocks,
+                    ),
                 )
             )
             if refreshed:
@@ -27713,6 +28261,13 @@ async def run_mini_recursive_driver(
 
             nonlocal identity_service_exhausted_yields
             identity_service_exhausted_yields += 1
+            if (
+                cursor_phase == "plan_compiled"
+                and contract_repair_progress_plan is not None
+                and not replaying_contract_replan_filters
+            ):
+                cursor_phase = "contract_repair_progress"
+                cursor_plan = compiled_plan_receipt
             await publish_driver_state(
                 "recursive_contract_identity_infrastructure_unknown:"
                 f"{pass_index}:{cursor_phase}",
@@ -27720,6 +28275,10 @@ async def run_mini_recursive_driver(
                 pass_index=pass_index,
                 plan=cursor_plan,
                 replan_plan=cursor_replan,
+                contract_repair_plan=contract_repair_progress_plan,
+                contract_repair_completed_indices=tuple(sorted(contract_repair_progress_indices)),
+                contract_repair_attempts_used=contract_repair_progress_attempts,
+                contract_repair_retry_counts=contract_repair_progress_retry_counts,
                 pass_helper_fingerprints_before=(verified_helper_fingerprints_before),
                 pass_helpers_accepted_before=pass_helpers_before,
             )
@@ -27774,7 +28333,7 @@ async def run_mini_recursive_driver(
                     cursor_plan=compiled_plan_receipt,
                 )
             support_identity_by_statement_key = {
-                canonical_dossier_statement_key(statement): identity
+                lean_contract_statement_source_key(statement): identity
                 for statement, identity in zip(
                     original_support_statements,
                     coverage.support_structural_identities,
@@ -27790,7 +28349,7 @@ async def run_mini_recursive_driver(
             )
             if coverage.analysis_structural_identities:
                 identity_by_statement_key = {
-                    graph_statement_key(statement): identity
+                    lean_contract_statement_source_key(statement): identity
                     for statement, identity in zip(
                         plan_active_target_statements,
                         coverage.analysis_structural_identities,
@@ -27802,7 +28361,7 @@ async def run_mini_recursive_driver(
                     statements = active_root_equivalence_statements([item])
                     if not statements:
                         continue
-                    statement_key = graph_statement_key(statements[0])
+                    statement_key = lean_contract_statement_source_key(statements[0])
                     identity = identity_by_statement_key.get(statement_key, "")
                     prior_identity_is_current = bool(
                         evidence_environment_hash
@@ -27821,14 +28380,14 @@ async def run_mini_recursive_driver(
                             item.pop(evidence_key, None)
                     if identity:
                         item["contract_identity"] = identity
-                        item["contract_identity_statement_key"] = statement_key
+                        item["contract_identity_statement_key"] = lean_contract_statement_source_key(statements[0])
                         item["contract_identity_environment_hash"] = (
                             evidence_environment_hash
                         )
                         item["contract_identity_evidence_receipt"] = (
                             make_lean_contract_evidence_receipt(
                                 identity,
-                                statement_key,
+                                item["contract_identity_statement_key"],
                                 evidence_environment_hash,
                             )
                         )
@@ -29211,9 +29770,14 @@ async def run_mini_recursive_driver(
                     if replan is not None
                     else ()
                 )
+                replan_repair_input = (
+                    _recursive_plan_from_state_record(replan_contract_repair_progress["plan"])
+                    if replan is not None and replan_contract_repair_progress
+                    else replan
+                )
                 replan_filtered = (
                     apply_surface_plan_filters(
-                        replan,
+                        replan_repair_input,
                         filter_stats=stats,
                         filter_event_sink=record_event,
                     )
@@ -29277,6 +29841,44 @@ async def run_mini_recursive_driver(
                     if replan_coverage.usable and any(
                         not ok for ok in replan_coverage.claim_elaborated
                     ):
+
+                        async def publish_replan_repair_progress(
+                            repaired_plan: MiniSubgoalPlan,
+                            completed_indices: Sequence[int],
+                            attempts_used: int,
+                            retry_counts: Mapping[str, int],
+                        ) -> None:
+                            nonlocal replan_contract_repair_progress
+                            replan_contract_repair_progress = {
+                                "identity": _replan_contract_repair_identity(replan),
+                                "plan": _recursive_plan_state_record(repaired_plan),
+                                "completed_obligation_ids": sorted(
+                                    repaired_plan.claims[index].obligation_id
+                                    for index in completed_indices
+                                    if 0 <= index < len(repaired_plan.claims)
+                                ),
+                                "attempts_used": int(attempts_used),
+                                "retry_counts": dict(retry_counts),
+                            }
+                            await publish_driver_state(
+                                f"recursive_replan_contract_repair_progress:{pass_index}",
+                                phase="replan_compiled",
+                                pass_index=pass_index,
+                                plan=compiled_plan_receipt,
+                                replan_plan=replan,
+                                contract_repair_plan=contract_repair_progress_plan,
+                                contract_repair_completed_indices=tuple(
+                                    sorted(contract_repair_progress_indices)
+                                ),
+                                contract_repair_attempts_used=contract_repair_progress_attempts,
+                                contract_repair_retry_counts=contract_repair_progress_retry_counts,
+                                pass_helper_fingerprints_before=verified_helper_fingerprints_before,
+                                pass_helpers_accepted_before=pass_helpers_before,
+                            )
+
+                        replan_completed_ids = set(
+                            replan_contract_repair_progress.get("completed_obligation_ids") or ()
+                        )
                         repaired_replan = await _repair_contract_identity_statements(
                             plan=replan_original,
                             coverage=replan_coverage,
@@ -29296,6 +29898,17 @@ async def run_mini_recursive_driver(
                             official_answer_payload_present=(
                                 official_answer_payload_present
                             ),
+                            completed_repair_indices=frozenset(
+                                index for index, claim in enumerate(replan_original.claims)
+                                if claim.obligation_id in replan_completed_ids
+                            ),
+                            completed_repair_attempts=int(
+                                replan_contract_repair_progress.get("attempts_used") or 0
+                            ),
+                            repair_retry_counts=dict(
+                                replan_contract_repair_progress.get("retry_counts") or {}
+                            ),
+                            progress_callback=publish_replan_repair_progress,
                         )
                         if repaired_replan != replan_original:
                             # replan repairs get the same gates.
@@ -29935,7 +30548,7 @@ async def run_mini_recursive_driver(
                             _verified_helper_dependency_identities(
                                 contract_helpers,
                                 structural_identities_by_statement_key={
-                                    canonical_dossier_statement_key(statement): identity
+                                    lean_contract_statement_source_key(statement): identity
                                     for statement, identity in zip(
                                         original_support_statements,
                                         replan_coverage.support_structural_identities,
@@ -30193,8 +30806,24 @@ async def run_mini_recursive_driver(
                     and not executable_root_route_surviving
                 )
             )
+            # A duplicate incomplete response grants no new planning work.
+            # Retain its executable queue and let it run instead of depending
+            # on a total claim cap to end a repeated-tranche loop.
+            tranche_claim_keys = {
+                text_hash(json.dumps([
+                    _claim_semantic_statement_identity(claim),
+                    sorted(canonical_dossier_statement_key(v.statement) for v in claim.variants),
+                    str(claim.role or "helper"),
+                    sorted(str(name) for name in claim.dependencies),
+                ], sort_keys=True))
+                for claim in plan.claims
+            }
+            tranche_has_new_claims = bool(tranche_claim_keys - planner_tranche_claim_keys)
+            planner_tranche_claim_keys.update(tranche_claim_keys)
             planner_tranche_continuation_pending = bool(
-                continuation_needed and planner_tranche_claims_emitted < max_claims
+                continuation_needed
+                and (max_claims >= 0 or tranche_has_new_claims)
+                and (max_claims < 0 or planner_tranche_claims_emitted < max_claims)
             )
             tranche_record = {
                 "phase": "mini_recursive_plan_tranche",
@@ -30203,6 +30832,7 @@ async def run_mini_recursive_driver(
                 "claims_emitted_total": planner_tranche_claims_emitted,
                 "claims_surviving_filters": len(plan.claims),
                 "claim_total_capacity": max_claims,
+                "tranche_has_new_claims": tranche_has_new_claims,
                 "raw_root_route_declared": provider_raw_root_route_declared,
                 "executable_root_route_names": list(executable_root_route_names),
                 "executable_root_route_surviving": (executable_root_route_surviving),
@@ -30232,9 +30862,10 @@ async def run_mini_recursive_driver(
                     planner_feedback,
                     (
                         "Continue the same decomposition in the next durable "
-                        f"tranche. {planner_tranche_claims_emitted} of the "
-                        f"configured {max_claims}-claim total capacity has "
-                        "been received." + feedback_suffix
+                        f"tranche. {planner_tranche_claims_emitted} claims have "
+                        "been received."
+                        + (f" The configured capacity is {max_claims} claims." if max_claims >= 0 else " There is no total claim-count limit.")
+                        + feedback_suffix
                     ),
                 )
                 if pass_index >= passes:
@@ -30650,7 +31281,7 @@ async def run_mini_recursive_driver(
                     for dependency in deferred_claim.dependencies
                 ):
                     reason = "dependency_not_selected"
-                elif selected_helper_count >= max_claims:
+                elif max_claims >= 0 and selected_helper_count >= max_claims:
                     reason = "claim_cap"
                 else:
                     reason = "dependency_ordering"
@@ -31027,7 +31658,7 @@ async def run_mini_recursive_driver(
                         {
                             "statement": statement,
                             "contract_identity": identity,
-                            "contract_identity_statement_key": graph_statement_key(
+                            "contract_identity_statement_key": lean_contract_statement_source_key(
                                 statement
                             ),
                             "contract_identity_environment_hash": (
@@ -31036,7 +31667,7 @@ async def run_mini_recursive_driver(
                             "contract_identity_evidence_receipt": (
                                 make_lean_contract_evidence_receipt(
                                     identity,
-                                    graph_statement_key(statement),
+                                    lean_contract_statement_source_key(statement),
                                     current_contract_evidence_environment_hash(),
                                 )
                             ),
@@ -31264,7 +31895,7 @@ async def run_mini_recursive_driver(
             claims = []
         if not restored_selected_plan and tuple(
             claim.name for claim in claims
-        ) != tuple(claim.name for claim in claim_candidates[:max_claims]):
+        ) != tuple(claim.name for claim in (claim_candidates[:max_claims] if max_claims >= 0 else claim_candidates)):
             _record(
                 record_event,
                 {
@@ -31433,7 +32064,7 @@ async def run_mini_recursive_driver(
                 and _dependency_contract_suspension_key(item)
                 not in completed_claim_keys
             )
-            slots = max_claims - open_claim_count
+            slots = (max_claims - open_claim_count) if max_claims >= 0 else len(suspended_dependency_claims)
             if slots <= 0:
                 return []
             ready_claims = await _rehydrate_ready_dependency_claims(
@@ -31542,8 +32173,13 @@ async def run_mini_recursive_driver(
             }
             accepted_item_root_authoritative = bool(
                 accepted_item is not None
-                and str(getattr(accepted_item, "render_policy", "") or "").strip()
-                == "root_authoritative"
+                # Advisory binder observations may withhold global helper
+                # visibility. The original exact-root acceptance still offers
+                # its source-bound proof for independent root finalization.
+                and "root_authoritative" in {
+                    str(getattr(accepted_item, "render_policy", "") or "").strip(),
+                    str(getattr(accepted_item, "visibility_policy", "") or "").strip(),
+                }
                 and accepted_item_tags
                 & {
                     "root_authoritative_helper",
@@ -31807,6 +32443,11 @@ async def run_mini_recursive_driver(
                 accepted,
                 publish_attempt_intent=checkpoint_helper_root_close_intent,
             )
+            if isinstance(llm_root_result, RootCloseOperationalFailure):
+                return MiniRecursiveResult(
+                    ok=False, proof=None, stats=stats, plan_summaries=tuple(summaries),
+                    failure_reason=llm_root_result.reason,
+                )
             if llm_root_result:
                 stats.passes_completed += 1
                 return MiniRecursiveResult(
@@ -31989,10 +32630,7 @@ async def run_mini_recursive_driver(
                 durable_variants, _skipped = _select_claim_variants(
                     selected_claim,
                     root_statement=root_statement,
-                    max_variants=max(
-                        1,
-                        int(config.max_variants_per_claim or 1),
-                    ),
+                    max_variants=int(config.max_variants_per_claim),
                     active_target_statements=active_targets,
                     allowed_anchor_identities=allowed_execution_anchor_identities,
                     expected_environment_hash=current_contract_evidence_environment_hash(),
@@ -32076,7 +32714,7 @@ async def run_mini_recursive_driver(
                 variants, skipped_variants = _select_claim_variants(
                     claim,
                     root_statement=root_statement,
-                    max_variants=max(1, int(config.max_variants_per_claim or 1)),
+                    max_variants=int(config.max_variants_per_claim),
                     active_target_statements=claim_active_target_statements,
                     allowed_anchor_identities=allowed_execution_anchor_identities,
                     expected_environment_hash=current_contract_evidence_environment_hash(),
@@ -33057,6 +33695,11 @@ async def run_mini_recursive_driver(
                                     active_plan,
                                 )
                             )
+                        if _callable_accepts_keyword(prove_claim, "child_continuation"):
+                            planner_handoff_kwargs["child_continuation"] = (
+                                dict(resume_frame.get("child_continuation") or {})
+                                if resume_same_variant else {}
+                            )
                         claim_proof_result = _normalize_claim_proof_result(
                             await prove_claim(
                                 claim,
@@ -33086,6 +33729,26 @@ async def run_mini_recursive_driver(
                                 "refresh_attempt": projection_refresh_attempt,
                                 "verdict": "same_variant_projection_refreshed",
                             },
+                        )
+                    if claim_proof_result.child_service_yielded:
+                        if not claim_proof_result.child_continuation:
+                            raise ValueError("Recursive child service yield lost its continuation")
+                        await publish_driver_state(
+                            f"recursive_child_service:{claim.name}:{variant_index}",
+                            phase="child_pending", pass_index=pass_index, plan=active_plan,
+                            next_claim_index=claim_index - 1, next_variant_index=variant_index,
+                            child_continuation=claim_proof_result.child_continuation,
+                            completed_claim_keys=completed_claim_keys,
+                            active_variant_statement=variant.statement,
+                            active_variant_mode=variant.mode,
+                            selected_variant_key=_recursive_variant_key(selected_variant),
+                            selected_variant_keys=tuple(_recursive_variant_key(item) for item in variants),
+                            pass_helper_fingerprints_before=verified_helper_fingerprints_before,
+                            pass_helpers_accepted_before=pass_helpers_before,
+                        )
+                        return MiniRecursiveResult(
+                            ok=False, proof=None, stats=stats, plan_summaries=tuple(summaries),
+                            failure_reason="recursive_child_service_yield",
                         )
                     if (provider_account_pause_enabled
                             and is_resumable_provider_failure(claim_proof_result.terminal_failure_reason)):
@@ -33753,12 +34416,10 @@ async def run_mini_recursive_driver(
                 retry_count = int(
                     claim_progress_retry_counts.get(claim_progress_key, 0) or 0
                 )
-                retry_limit = max(
-                    0,
-                    int(getattr(config, "claim_progress_retry_limit", 0) or 0),
-                )
+                retry_limit = int(getattr(config, "claim_progress_retry_limit", -1))
                 continuation_available = bool(
-                    pass_index < passes
+                    unlimited_passes
+                    or pass_index < passes
                     or (
                         progress_continuation_enabled
                         and bool(fresh_claim_helper_fingerprints)
@@ -33768,7 +34429,7 @@ async def run_mini_recursive_driver(
                     progress_seen.add(progress_signature)
                 if (
                     progress_is_fresh
-                    and retry_count < retry_limit
+                    and (retry_limit < 0 or retry_count < retry_limit)
                     and continuation_available
                 ):
                     claim_progress_retry_counts[claim_progress_key] = retry_count + 1
@@ -35452,8 +36113,8 @@ def _planner_deliberation_trigger(
 
     if not bool(getattr(config, "planner_deliberation_enabled", False)):
         return ""
-    budget = max(0, int(getattr(config, "planner_deliberation_max_calls", 0) or 0))
-    if int(getattr(stats, "planner_deliberations", 0) or 0) >= budget:
+    budget = int(getattr(config, "planner_deliberation_max_calls", -1))
+    if budget >= 0 and int(getattr(stats, "planner_deliberations", 0) or 0) >= budget:
         return ""
     # Signal-driven only (ledger: "re-deliberate only after meaningful
     # formal-state progress, a newly exposed bottleneck, or stagnation") —
@@ -35587,10 +36248,7 @@ async def _request_planner_deliberation(
         # handles.  Rebuild a public, authoritative continuation request; an
         # in-process ready receipt is consumed without dispatching this copy.
         request_messages = [*base_messages, continuation_instruction]
-    max_rounds = max(
-        1,
-        int(getattr(config, "planner_deliberation_max_calls", 0) or 0),
-    )
+    max_rounds = int(getattr(config, "planner_deliberation_max_calls", -1))
     while True:
         deliberation_material_fingerprint = _planner_deliberation_material_fingerprint(
             planner_prompt=planner_prompt,
@@ -35933,7 +36591,7 @@ async def _request_planner_deliberation(
         )
         if not incomplete:
             return artifact
-        if stats.planner_deliberations >= max_rounds:
+        if max_rounds >= 0 and stats.planner_deliberations >= max_rounds:
             return pending_artifact
         round_index += 1
         if provider_output_items:
@@ -36312,7 +36970,7 @@ async def _request_plan_parse_repair(
                         build_subgoal_variants(
                             route,
                             root_statement=root_statement,
-                            max_variants=4,
+                            max_variants=-1,
                         )
                     ),
                     source_index=len(clean_claims) + len(synthesized) + 1,
@@ -36667,7 +37325,7 @@ async def _request_plan(
         claim_limit = max(
             1,
             min(
-                max(1, int(config.max_claims or 1)),
+                (int(config.max_claims) if int(config.max_claims) > 0 else max(1, int(config.planner_claim_tranche_size))),
                 int(
                     planner_claim_limit
                     if planner_claim_limit is not None
@@ -36679,8 +37337,8 @@ async def _request_plan(
             "DURABLE PLANNER TRANCHE\n"
             f"Return at most {claim_limit} claim objects total in this "
             "response, including root_assembly. This is a bounded tranche "
-            f"of the configured {max(1, int(config.max_claims or 1))}-claim "
-            "capacity. Set the top-level `plan_complete` boolean to false "
+            + (f"of the configured {int(config.max_claims)}-claim capacity. " if int(config.max_claims) > 0 else "with no total claim-count limit. ")
+            + "Set the top-level `plan_complete` boolean to false "
             "whenever another tranche is needed, including when a provisional "
             "root_assembly is present; set it to true only for a complete "
             "dependency-closed root route. An incomplete executable frontier "
@@ -36908,7 +37566,7 @@ async def _request_plan(
                 cost_controller=cost_controller,
                 root_statement=root_statement,
                 authoritative_root_statements=authoritative_repair_routes,
-                max_claims=max(1, int(config.max_claims or 1)),
+                max_claims=claim_limit,
                 temperature_decision=MiniTemperatureDecision(
                     value=0.0,
                     phase_key="planner_repair",
@@ -38413,7 +39071,7 @@ async def _request_plan(
                     cost_controller=cost_controller,
                     root_statement=root_statement,
                     authoritative_root_statements=authoritative_repair_routes,
-                    max_claims=max(1, int(config.max_claims or 1)),
+                    max_claims=claim_limit,
                     temperature_decision=temperature_decision,
                     operation_timeout_s=planner_operation_timeout_s,
                     operation_deadline_monotonic=(
@@ -38570,6 +39228,7 @@ async def _request_plan(
         plan,
         active_target_statements=active_plan_targets,
         satisfied_dependency_names=frozenset(_verified_helper_names(helpers)),
+        include_advisory_candidates=True,
     )
     declared_root_assembly_names = tuple(
         claim.name
@@ -39187,7 +39846,7 @@ def _root_tactic_context_fingerprint(
         # restart candidate one indefinitely.
         "tactic_budget": {
             "timeout_s": round(max(0.0, float(tactic_timeout_s or 0.0)), 6),
-            "max_candidates": max(0, int(tactic_max_candidates or 0)),
+            "max_candidates": int(tactic_max_candidates or 0),
         },
         "proof_environment_fingerprint": str(proof_environment_fingerprint or ""),
         "answer_policy": {
@@ -39248,7 +39907,7 @@ def _root_tactic_portfolio_execution_key(
         ],
         "active_root_targets": active_items,
         "tactic_timeout_s": round(max(0.0, float(tactic_timeout_s or 0.0)), 6),
-        "tactic_max_candidates": max(0, int(tactic_max_candidates or 0)),
+        "tactic_max_candidates": int(tactic_max_candidates or 0),
         "proof_environment_fingerprint": str(proof_environment_fingerprint or ""),
         "suppress_solution_placeholders": bool(suppress_solution_placeholders),
         "opaque_mode": bool(opaque_mode),
@@ -40201,13 +40860,10 @@ async def _try_root_close(
             else root_tactic_timeout_s
         ),
     )
-    direct_max_candidates = max(
-        0,
-        int(
-            config.tactic_max_candidates
-            if root_tactic_max_candidates is None
-            else root_tactic_max_candidates
-        ),
+    direct_max_candidates = int(
+        config.tactic_max_candidates
+        if root_tactic_max_candidates is None
+        else root_tactic_max_candidates
     )
     stats.root_tactic_attempts += 1
     if root_tactic_timeout_s is not None and direct_timeout_s <= 0.0:
@@ -41395,7 +42051,7 @@ def _select_priority_root(
 ) -> tuple[Optional[MiniSubgoalClaim], frozenset[str]]:
     """Share the exact root-route gate across cap and readiness selection."""
     items = list(claims or ())
-    cap = max(1, int(max_claims or 1))
+    cap = len(items) if max_claims < 0 else max(1, int(max_claims or 1))
     provisional_roots = set(provisional_root_claim_keys or ())
     name_to_index = {str(claim.name or ""): idx for idx, claim in enumerate(items)}
     root_items = [
@@ -41472,7 +42128,7 @@ def _prioritize_claims(
     bypass this function, so resumption cannot replace an admitted prerequisite.
     """
     items = list(claims or ())
-    cap = max(1, int(max_claims or 1))
+    cap = len(items) if max_claims < 0 else max(1, int(max_claims or 1))
     deprioritized = {
         str(key or "").strip()
         for key in list(deprioritized_claim_keys or ())
@@ -41621,7 +42277,7 @@ def _select_claim_variants(
     )
     if bound_key:
         variants.sort(key=lambda variant: not _claim_contract_source_matches(claim, variant.statement))
-    cap = max(1, int(max_variants or 1))
+    cap = len(variants) if max_variants < 0 else max(1, int(max_variants or 1))
     context_names = _root_context_names(root_statement)
     selected: list[SubgoalVariant] = []
     skipped: list[SubgoalVariant] = []
@@ -41687,7 +42343,7 @@ def _suggest_helper_name(
         )
         if str(part or "").strip("_")
     )
-    safe = "".join(ch if (ch.isalnum() or ch in "_.") else "_" for ch in base)
+    safe = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in base)
     while "__" in safe:
         safe = safe.replace("__", "_")
     if not safe or safe[0].isdigit():

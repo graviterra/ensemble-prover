@@ -41,7 +41,7 @@ class HelperOnlySalvageAction:
         timeout_s: float = DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
         max_nodes: int = 3,
         run_assembly_after_salvage: bool = True,
-        max_candidates: int = 32,
+        max_candidates: int = -1,
         max_decl_applications: int = 6,
         batch_parallelism: int = 1,
     ) -> None:
@@ -99,7 +99,7 @@ class HelperOnlySalvageAction:
         return True
 
     async def run(self, session: Any) -> MiniOutcome:
-        from ensemble_prover.helper_salvage import HelperSalvager
+        from ensemble_prover.helper_salvage import HelperSalvager, helper_salvage_reuse_feedback
         from ensemble_prover.mini_root_tactic import (
             root_tactic_success_contract_status,
             try_close_root_with_active_lift,
@@ -131,6 +131,7 @@ class HelperOnlySalvageAction:
         lemma_dag_linked_child_node_ids: List[str] = []
         proof_state_helpers: List[str] = []
         rejected_or_skipped: Tuple[List[str], List[str]] = ([], [])
+        reused: Dict[str, str] = {}
         solved = False
         proof: Optional[str] = None
         solved_via: str = ""
@@ -441,6 +442,9 @@ class HelperOnlySalvageAction:
                 except Exception:
                     pass
             accepted = list(salvage_result.accepted)
+            reused = dict(getattr(salvage_result, "reused", {}) or {})
+            if reused:
+                conv.append_user(helper_salvage_reuse_feedback(salvage_result))
             rejected_or_skipped = (
                 list(salvage_result.rejected),
                 list(salvage_result.skipped),
@@ -598,7 +602,7 @@ class HelperOnlySalvageAction:
             if (
                 not solved
                 and accepted
-                and self.max_candidates > 0
+                and self.max_candidates != 0
                 and dossier is not None
                 and not child_closure_status.get("root_tactic_candidate_quantum_exhausted")
             ):
@@ -616,7 +620,7 @@ class HelperOnlySalvageAction:
                         ),
                         active_root_frame_helper_blocks=dossier.verified_helper_blocks(),
                         timeout_s=self.timeout_s,
-                        max_candidates=max(1, self.max_candidates),
+                        max_candidates=self.max_candidates,
                         suppress_solution_placeholders=bool(
                             getattr(conv, "suppress_solution_placeholders", True)
                         ),
@@ -784,6 +788,7 @@ class HelperOnlySalvageAction:
                     defer_fresh_children_to_llm
                 ),
                 "salvage_accepted": list(accepted),
+                "salvage_reused": reused,
                 "salvage_rejected": rejected_or_skipped[0],
                 "salvage_skipped": rejected_or_skipped[1],
                 "proof_state_helpers": list(proof_state_helpers),

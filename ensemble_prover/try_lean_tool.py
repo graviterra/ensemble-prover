@@ -1071,12 +1071,57 @@ async def _run_try_lean_tool_impl(
     )
 
 
+@dataclass(frozen=True)
+class CheckedDeclarationReceipt:
+    """Call-local evidence for retaining an unchanged, fully checked declaration.
+
+    This object is never serialized or supplied by a provider. Renaming an
+    example, changing its context, or recycling Lean requires another check.
+    It does not certify the active target or replace the final root check.
+    """
+
+    source: str
+    preamble: str
+    context: tuple[str, ...]
+    lean: Any = field(repr=False, compare=False)
+    is_current: Callable[[], bool] = field(repr=False, compare=False)
+
+    def matches(self, *, source: str, preamble: str, context: Sequence[str], lean: Any) -> bool:
+        return bool(
+            source == self.source and preamble == self.preamble
+            and tuple(context) == self.context and lean is self.lean
+            and self.is_current()
+        )
+
+
 async def run_try_lean_tool(*args: Any, **kwargs: Any) -> str:
     """Run scratch validation without allowing a late dossier commit."""
 
     caller_accepted_code_out = kwargs.pop("accepted_code_out", None)
+    checked_declaration_out = kwargs.pop("checked_declaration_out", None)
     accepted_code_receipt: Dict[str, str] = {}
     kwargs["accepted_code_out"] = accepted_code_receipt
+    receipt_inputs = None
+    if isinstance(checked_declaration_out, list) and not kwargs.get("feedback_context"):
+        from .mini_recursive import _live_lean_capability_for_new_work
+        from .verified_helper_contract import helper_contract_context_guard
+
+        lean = args[0] if args else kwargs.get("lean")
+        dossier = kwargs.get("dossier")
+        environment = getattr(dossier, "current_lean_environment_hash", "")
+        context = tuple(kwargs.get("context_lemmas") or ())
+        capability = _live_lean_capability_for_new_work(lean)
+        runner_is_current = helper_contract_context_guard(capability)
+
+        def receipt_is_current() -> bool:
+            return bool(
+                _live_lean_capability_for_new_work(lean) is capability
+                and runner_is_current()
+                and getattr(dossier, "current_lean_environment_hash", "") == environment
+                and tuple(kwargs.get("context_lemmas") or ()) == context
+            )
+
+        receipt_inputs = (lean, str(kwargs.get("preamble") or ""), context, receipt_is_current)
 
     transaction = DeadlineMutationTransaction(
         deadline_exhausted=kwargs.get("deadline_exhausted"),
@@ -1112,4 +1157,16 @@ async def run_try_lean_tool(*args: Any, **kwargs: Any) -> str:
         caller_accepted_code_out["code"] = accepted_code_receipt["code"]
         if accepted_code_receipt.get("target_conversion") == "checked":
             caller_accepted_code_out["target_conversion"] = "checked"
+    if receipt_inputs is not None:
+        lean, preamble, context, is_current = receipt_inputs
+        source = accepted_code_receipt.get("code", "")
+        if (
+            result.startswith("try_lean accepted.")
+            and helper_decl_kind(source) in {"theorem", "lemma"}
+            and is_current()
+        ):
+            checked_declaration_out.append(CheckedDeclarationReceipt(
+                source=source, preamble=preamble, context=context,
+                lean=lean, is_current=is_current,
+            ))
     return result

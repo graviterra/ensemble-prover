@@ -12,9 +12,11 @@ import textwrap
 import time
 import weakref
 from dataclasses import dataclass, replace
+from contextlib import contextmanager
 from functools import wraps
+from itertools import count
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .helper_salvage import (
     HelperSalvager,
@@ -80,7 +82,6 @@ from .proof_dossier import (
     text_hash,
 )
 from .proof_graph import (
-    graph_statement_contract_ambiguities,
     helper_decl_body,
     helper_decl_statement,
 )
@@ -206,6 +207,14 @@ def _fully_funded_operation_timeout(
     return requested if remaining >= requested else 0.0
 
 
+def _durable_count_limit(value: Any) -> int:
+    """Retain an explicit unlimited/disabled count in a producer frame."""
+
+    if type(value) is int and value >= -1:
+        return value
+    return 1
+
+
 def _durable_nonnegative_int(value: Any) -> int:
     """Decode an advisory durable counter without trusting checkpoint shape."""
 
@@ -223,6 +232,22 @@ class _LeanOperationDeadline(asyncio.TimeoutError):
 
 class _LeanAdmissionDeferred(_LeanOperationDeadline):
     """Lock admission expired before this operation launched any Lean work."""
+
+
+class _CacheTargetContextChanged(RuntimeError):
+    """A cache candidate still needs verification in its current owner frame."""
+
+
+class _CacheSeedContextChanged(RuntimeError):
+    """A seed verdict no longer belongs to its checked runtime and prefix."""
+
+
+class _HelperReplacementContextChanged(RuntimeError):
+    """A replacement verdict no longer describes its checked declarations."""
+
+
+class _HelperAcceptanceRuntimeChanged(RuntimeError):
+    """A helper verdict no longer belongs to its admitted runtime owner."""
 
 
 _LEAN_LOCK_ADMISSION_TIMEOUT_S = 1.0
@@ -982,6 +1007,38 @@ def _helper_names_from_blocks(blocks: Sequence[str]) -> List[str]:
     return names
 
 
+def _helper_acceptance_runner_policy_hash(lean: Any) -> str:
+    """Freeze verifier policy without rejecting authenticated lazy resolution."""
+    cfg = getattr(lean, "cfg", None)
+    policy = dict(vars(cfg)) if hasattr(cfg, "__dict__") else {}
+    # Output destinations do not change a mathematical verdict. Fresh worker
+    # scratch roots must not restart a deadline-bounded prefix after resume.
+    for field_name in (
+        "resolved_lean_path", "resolved_lean_executable", "resolved_lean_environment_epoch",
+        "scratch_dir", "solved_dir",
+    ):
+        policy.pop(field_name, None)
+    # The CLI installs this effort limit on the runner rather than LeanConfig.
+    # Changing it renews failed attempts and invalidates work already queued.
+    policy["runtime_default_max_heartbeats"] = getattr(lean, "default_max_heartbeats", None)
+    return text_hash(json.dumps(policy, sort_keys=True, separators=(",", ":"), default=str))
+
+
+def _helper_replay_inventory(dossier: ProofDossier, names: Sequence[str]) -> Tuple[Any, ...]:
+    """Snapshot only declarations and dependency records actually checked."""
+    return tuple(_helper_replay_record_identity(name, dossier.verified_helpers.get(name))
+                 for name in names)
+
+
+def _helper_replay_record_identity(name: str, helper: Any) -> Tuple[Any, ...]:
+    return (
+        name, helper.source, helper.source_hash, helper.verification_environment_hash,
+        helper.visibility_policy, helper.render_policy,
+        tuple(helper.support_names), tuple(sorted(helper.support_source_hashes.items())),
+        tuple(helper.replay_context_names), tuple(sorted(helper.replay_context_source_hashes.items())),
+    ) if helper is not None else (name, None)
+
+
 def _helper_blocks_for_names(
     blocks: Sequence[str],
     names: Sequence[str],
@@ -1084,7 +1141,7 @@ def _root_tactic_context_key(
         "helpers": helper_payload,
         "active_root_targets": active_target_payload,
         "timeout_s": round(max(0.0, float(timeout_s or 0.0)), 3),
-        "max_candidates": max(0, int(max_candidates or 0)),
+        "max_candidates": int(max_candidates or 0),
     }
     if answer_policy is not None:
         payload["answer_policy"] = dict(answer_policy)
@@ -1314,7 +1371,7 @@ def _has_untried_proof_state_root_tactic_context(
 ) -> bool:
     if conv is None or dossier is None or proof_state is None:
         return False
-    if max(0, int(max_candidates or 0)) <= 0 or float(timeout_s or 0.0) <= 0:
+    if int(max_candidates or 0) == 0 or float(timeout_s or 0.0) <= 0:
         return False
     helpers = _proof_state_root_tactic_helper_blocks(conv=conv, dossier=dossier)
     if not helpers:
@@ -1659,7 +1716,7 @@ def stage_closed_typed_residual_acceptance(
         source=exact_source,
         preamble=preamble,
         lemmas=lemmas,
-        max_goals=max(1, int(max_goals or 0)),
+        max_goals=int(max_goals or 0),
     )
     next_action_metadata = dict(action_metadata or {})
     next_action_metadata["typed_residual_closed_pending_acceptance"] = True
@@ -1674,7 +1731,7 @@ def stage_closed_typed_residual_acceptance(
         parent_node_id=parent_node.node_id,
         source=exact_source,
         parent_proof_stub=exact_stub,
-        max_goals=max(1, int(max_goals or 0)),
+        max_goals=int(max_goals or 0),
         request_context_hash=request_hash,
         elaboration_context_hash=context_hash,
         origin_metadata=dict(origin_metadata or {}),
@@ -1682,9 +1739,6 @@ def stage_closed_typed_residual_acceptance(
         retry_count=0,
         verifier_retry_key=retry_key,
     )
-
-
-_TYPED_RESIDUAL_REATTESTATION_MAX_GOALS = 256
 
 
 def _typed_residual_route_goal_cap(
@@ -1698,8 +1752,8 @@ def _typed_residual_route_goal_cap(
 
     New routes persist ``residual_goal_slot_count`` on the assembly group.
     Legacy routes can recover it from any surviving exact child receipt. If a
-    damaged legacy graph lost every child projection, use the Lean receipt
-    schema's bounded maximum: verifier replay remains the authority and this
+    damaged legacy graph lost every child projection, accept the complete
+    fresh Lean receipt: verifier replay remains the authority and this
     avoids discarding a paid parent proof solely because public topology was
     incomplete.
     """
@@ -1736,8 +1790,8 @@ def _typed_residual_route_goal_cap(
                 continue
             expected = max(expected, int(slot_count))
     if expected <= 0:
-        expected = _TYPED_RESIDUAL_REATTESTATION_MAX_GOALS
-    return min(_TYPED_RESIDUAL_REATTESTATION_MAX_GOALS, expected)
+        return -1
+    return expected
 
 
 def _typed_residual_request_hashes(
@@ -1775,7 +1829,7 @@ def _typed_residual_request_hashes(
                     str(parent_proof_stub or "").encode("utf-8")
                 ).hexdigest(),
                 "elaboration_context_hash": context_hash,
-                "max_goals": max(0, int(max_goals or 0)),
+                "max_goals": int(max_goals or 0),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1889,6 +1943,25 @@ def _helper_acceptance_request_hashes(
     return request_hash, exact_context_hash, retry_key
 
 
+_PENDING_HELPER_ACCEPTANCE_LIFETIMES = count(1)
+
+
+class _PendingHelperAcceptanceLifetime:
+    """Process-local scheduling identity; copying retains work, not ownership."""
+
+    def __init__(self) -> None:
+        self.generation = next(_PENDING_HELPER_ACCEPTANCE_LIFETIMES)
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "_PendingHelperAcceptanceLifetime":
+        copied = type(self)()
+        memo[id(self)] = copied
+        return copied
+
+
+def _renew_pending_helper_acceptance_lifetime(node: ProofStateNode) -> None:
+    setattr(node, "_helper_acceptance_lifetime", _PendingHelperAcceptanceLifetime())
+
+
 def stage_pending_helper_acceptance(
     *,
     conv: Any,
@@ -1968,6 +2041,7 @@ def stage_pending_helper_acceptance(
         "attempt_count": "0",
         "continuation": exact_continuation,
     }
+    _renew_pending_helper_acceptance_lifetime(node)
     return True
 
 
@@ -1977,17 +2051,23 @@ def ensure_current_helper_acceptance_retries(
     dossier: ProofDossier,
     proof_state: Optional[ProofSearchState],
     verified_helpers: Optional[Sequence[str]] = None,
+    lean: Any = None,
 ) -> List[str]:
     """Rearm exact pending helpers whose acceptance environment changed.
 
     The scheduler may safely hide cooling work only after this reconciliation:
     a preamble/helper/policy change creates a new verifier identity and must be
-    immediately executable, while mere session recreation must retain the old
-    cooldown.
+    immediately executable. Seed scheduling also renews when its actual runner
+    or checking policy changes; its process-local authority cannot transfer to
+    a replacement runner.
     """
 
     if proof_state is None:
         return []
+    if lean is None:
+        reference = _VERIFIED_HELPER_ACCEPT_SESSIONS.get(id(dossier))
+        session = reference() if reference is not None else None
+        lean = getattr(session, "lean", None)
     rearmed: List[str] = []
     for node in proof_state.nodes.values():
         if node.status != "open":
@@ -2009,6 +2089,8 @@ def ensure_current_helper_acceptance_retries(
             if "caller_context_hash" in pending
             else pending.get("context_hash") or ""
         )
+        if lean is not None and (pending.get("continuation") or {}).get("kind") == "cache_seed_batch":
+            caller_context_hash = _cache_seed_pending_runtime_hash(lean)
         request_hash, exact_context_hash, retry_key = (
             _helper_acceptance_request_hashes(
                 conv=conv,
@@ -2030,10 +2112,76 @@ def ensure_current_helper_acceptance_retries(
         pending["verifier_retry_key"] = retry_key
         pending.pop("verifier_failure", None)
         node.pending_helper_acceptance = pending
+        _renew_pending_helper_acceptance_lifetime(node)
         if prior_retry_key and prior_retry_key != retry_key:
             proof_state.clear_verifier_retry_state(node, prior_retry_key)
         rearmed.append(node.node_id)
     return rearmed
+
+
+def _claim_pending_helper_acceptance_attempt(
+    proof_state: ProofSearchState, node: ProofStateNode, helper_block: str,
+) -> Dict[str, Any]:
+    """Bind one verifier attempt to the exact live paid request and lifetime."""
+    pending = node.pending_helper_acceptance or {}
+    if (proof_state.nodes.get(node.node_id) is not node
+            or not pending.get("acceptance_request_hash")
+            or str(pending.get("helper_block") or "").strip() != helper_block.strip()):
+        return {"pending_acceptance_request_hash": "", "pending_acceptance_attempt": None}
+    lifetime = getattr(node, "_helper_acceptance_lifetime", None)
+    if not isinstance(lifetime, _PendingHelperAcceptanceLifetime):
+        _renew_pending_helper_acceptance_lifetime(node)
+        lifetime = getattr(node, "_helper_acceptance_lifetime")
+    attempt = int(getattr(node, "_helper_acceptance_retry_attempt", 0)) + 1
+    # Checkpoints retain paid work but cannot recreate an in-flight owner.
+    setattr(node, "_helper_acceptance_retry_attempt", attempt)
+    return {"pending_acceptance_request_hash": pending["acceptance_request_hash"],
+            "pending_acceptance_attempt": attempt,
+            "pending_acceptance_lifetime": lifetime.generation,
+            "pending_acceptance_state": id(proof_state),
+            "pending_acceptance_node": id(node)}
+
+
+def _pending_helper_acceptance_claim_is_current(
+    proof_state: ProofSearchState, node: ProofStateNode, status: Mapping[str, Any],
+    *, released: bool = False,
+) -> bool:
+    """Check scheduling ownership without scanning proof or continuation data."""
+    if proof_state.nodes.get(node.node_id) is not node:
+        return False
+    lifetime = getattr(node, "_helper_acceptance_lifetime", None)
+    if (status.get("pending_acceptance_state") != id(proof_state)
+            or status.get("pending_acceptance_node") != id(node)
+            or not isinstance(lifetime, _PendingHelperAcceptanceLifetime)
+            or status.get("pending_acceptance_lifetime") != lifetime.generation
+            or status.get("pending_acceptance_attempt") != getattr(node, "_helper_acceptance_retry_attempt", None)):
+        return False
+    pending = node.pending_helper_acceptance or {}
+    if released:
+        return not pending
+    return bool(pending and status.get("pending_acceptance_request_hash")
+                == pending.get("acceptance_request_hash"))
+
+
+def helper_acceptance_settlement_current(
+    proof_state: Optional[ProofSearchState], node: Optional[ProofStateNode],
+    status: Dict[str, Any],
+) -> bool:
+    """Recheck the paid owner immediately before consuming an acceptance result.
+
+    A superseded invocation may have published useful checked evidence. It
+    cannot reject, cool, clear, or dispatch another invocation's paid work.
+    Standalone admissions without a paid claim retain their ordinary verdict.
+    """
+    if not status.get("pending_acceptance_request_hash"):
+        return not status.get("pending_acceptance_superseded", False)
+    if (proof_state is not None and node is not None
+            and _pending_helper_acceptance_claim_is_current(proof_state, node, status)):
+        return True
+    if status.get("status") not in {"retryable_error", "cancelled"} or not status.get("error_kind"):
+        status.update(status="retryable_error", error_kind="helper_acceptance_superseded", error="")
+    status["pending_acceptance_superseded"] = True
+    return False
 
 
 def retain_pending_helper_acceptance_retry(
@@ -2041,10 +2189,34 @@ def retain_pending_helper_acceptance_retry(
     proof_state: ProofSearchState,
     node: ProofStateNode,
     status: Mapping[str, Any],
+    expected_pending: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Advance retry frequency for a staged helper without losing it."""
 
+    if (status.get("pending_acceptance_superseded")
+            or ("pending_acceptance_lifetime" in status
+                and not _pending_helper_acceptance_claim_is_current(proof_state, node, status))):
+        return {}
     pending = dict(node.pending_helper_acceptance or {})
+    if (proof_state.nodes.get(node.node_id) is not node or not pending.get("helper_block")
+            or not pending.get("acceptance_request_hash")
+            or pending.get("target_hash") != text_hash(node.target)):
+        return {}
+    if ("pending_acceptance_request_hash" in status
+            and pending["acceptance_request_hash"] != status["pending_acceptance_request_hash"]):
+        return {}
+    if ("pending_acceptance_attempt" in status
+            and status["pending_acceptance_attempt"] != getattr(node, "_helper_acceptance_retry_attempt", None)):
+        return {}
+    if expected_pending is not None and (
+        node.status in {"proved", "obsolete"}
+        or any(pending.get(key) != expected_pending.get(key) for key in (
+            "helper_block", "target_hash", "acceptance_request_hash",
+        ))
+    ):
+        # A later checked consumer can complete or replace this slot while
+        # the old verifier awaits. Its retry cannot recreate or cool that work.
+        return {}
     retry_key = str(pending.get("verifier_retry_key") or "").strip()
     request_hash = str(
         pending.get("acceptance_request_hash") or ""
@@ -2062,7 +2234,15 @@ def retain_pending_helper_acceptance_retry(
         ).encode("utf-8")
     ).hexdigest()
     retry_record = {}
-    if attempted and retry_key and request_hash:
+    context_changed = error_kind in {
+        "cache_target_context_changed", "cache_seed_context_changed",
+        "helper_replacement_context_changed", "helper_acceptance_runtime_changed",
+    }
+    if context_changed and retry_key:
+        # A verdict from a revoked context cannot cool the current verifier,
+        # even when a replacement runner has identical configuration.
+        proof_state.clear_verifier_retry_state(node, retry_key)
+    if attempted and not context_changed and retry_key and request_hash:
         retry_record = proof_state.record_verifier_retry_failure(
             node,
             retry_key=retry_key,
@@ -2619,8 +2799,8 @@ async def _extract_and_spawn_typed_residual_goals(
         proof_state.clear_verifier_retry_state(parent_node, retry_key)
         clear_pending()
         return [], 0, "residual_attestation_closed_goal"
-    goal_limit = max(0, int(max_goals or 0))
-    if goal_count > goal_limit:
+    goal_limit = int(max_goals or 0)
+    if goal_limit >= 0 and goal_count > goal_limit:
         proof_state.clear_verifier_retry_state(parent_node, retry_key)
         clear_pending()
         return [], goal_count, "residual_attestation_goal_cap_exceeded"
@@ -2643,6 +2823,7 @@ async def _extract_and_spawn_typed_residual_goals(
         target_key = proof_state._target_environment_index_key(  # noqa: SLF001
             signature.normalized_statement_hash,
             proof_state.statement_environment_hash,
+            statement_source=statement,
         )
         existing_id = proof_state._node_by_target.get(target_key)  # noqa: SLF001
         existing = proof_state.nodes.get(existing_id) if existing_id else None
@@ -2905,12 +3086,7 @@ async def _retry_pending_typed_residual_extractions(
                         _typed_residual_operation_timeout(lean, 0.0),
                         deadline_monotonic,
                     ),
-                    max_goals=max(
-                        1,
-                        _durable_nonnegative_int(
-                            continuation.get("max_parent_stub_goals")
-                        ),
-                    ),
+                    max_goals=_durable_count_limit(continuation.get("max_parent_stub_goals")),
                     deadline_monotonic=deadline_monotonic,
                     producer_continuation=retry_continuation,
                     validation_variants=remaining_validation_variants,
@@ -3059,12 +3235,7 @@ async def _retry_pending_typed_residual_extractions(
             deadline_monotonic=deadline_monotonic,
             proof_cache=proof_cache,
             target_task_id=task_id,
-            max_parent_stub_goals=max(
-                1,
-                _durable_nonnegative_int(
-                    continuation.get("max_parent_stub_goals")
-                ),
-            ),
+            max_parent_stub_goals=_durable_count_limit(continuation.get("max_parent_stub_goals")),
             initial_proposed_count=proposed_count,
             initial_accepted_count=accepted_count,
             initial_candidate_node_ids=candidate_node_ids,
@@ -3351,10 +3522,12 @@ async def _retry_pending_typed_residual_extractions(
                         turn_index=turn,
                         timeout_s=operation_timeout,
                         proof_state=proof_state,
+                        target_node_id=node.node_id,
                         status_out=acceptance_status,
                         target_statement=node.target,
                         deadline_monotonic=deadline_monotonic,
                     )
+                    accepted = helper_acceptance_settlement_current(proof_state, node, acceptance_status) and accepted
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -3399,6 +3572,9 @@ async def _retry_pending_typed_residual_extractions(
                         attempt_count=0,
                         exit_reason="closed_residual_stub_accepted",
                         helper_name=accepted_helper_name,
+                    )
+                    _supersede_checked_helper_close(
+                        proof_state, node_id=node.node_id, helper_name=accepted_helper_name,
                     )
                 continuation_helpers = (
                     await resume_lemma_dag_parent_stub_batch(
@@ -4044,7 +4220,7 @@ async def _validate_proof_state_tactic_residual_stub(
     claimed = [goal for goal in list(claimed_goals or []) if isinstance(goal, dict)]
     if not claimed:
         return False, [], "missing_claimed_goals"
-    if len(claimed) > max(0, int(max_goals or 0)):
+    if int(max_goals or 0) >= 0 and len(claimed) > int(max_goals or 0):
         return False, [], "too_many_residual_goals"
     timeout = _fully_funded_operation_timeout(timeout_s, deadline_monotonic)
     if timeout <= 0.0:
@@ -4292,27 +4468,72 @@ def _close_lemma_dag_task_with_parent_helper(
 
 def _cache_seed_helper_registry_identity(
     dossier: ProofDossier,
-) -> Tuple[Tuple[str, str], ...]:
+) -> Optional[Tuple[Tuple[str, str], ...]]:
     """Bind exact authoritative helper names and sources, independent of rendering."""
 
-    return tuple(
-        sorted(
-            (
-                str(name or "").strip(),
-                str(getattr(helper, "source_hash", "") or "").strip(),
-            )
-            for name, helper in dict(
-                getattr(dossier, "verified_helpers", {}) or {}
-            ).items()
-            if str(name or "").strip()
+    from .utils import canonical_lean_identifier
+
+    def name_key(name: str) -> str:
+        # Strip only the literal resolution qualifier; «_root_» is a real
+        # namespace, and a quoted dotted atom is not a qualified declaration.
+        return canonical_lean_identifier(name.removeprefix("_root_."))
+
+    identities = []
+    for name, helper in dict(getattr(dossier, "verified_helpers", {}) or {}).items():
+        name = str(name or "").strip()
+        source = str(getattr(helper, "source", "") or "")
+        source_hash = str(getattr(helper, "source_hash", "") or "").strip()
+        declared_name = str(helper_decl_name(source) or "").strip()
+        if (
+            not name or not declared_name or not source_hash
+            or text_hash(source) != source_hash
+            or name_key(declared_name) != name_key(name)
+            or name_key(str(getattr(helper, "name", "") or "")) != name_key(name)
+        ):
+            # An already malformed baseline must not mint a receipt that
+            # makes the same malformed registry compare equal on reuse.
+            return None
+        identities.append((name, source_hash))
+    return tuple(sorted(identities))
+
+
+def _cache_seed_context_dependencies_valid(
+    dossier: ProofDossier, context: Sequence[str],
+) -> bool:
+    current_hashes = {
+        name: str(getattr(helper, "source_hash", "") or "").strip()
+        for name, helper in dossier.verified_helpers.items()
+    }
+    resolved_names: Dict[str, str] = {}
+    for block in context:
+        helper_name = dossier._equivalent_helper_registry_name(
+            dossier.verified_helpers, str(helper_decl_name(block) or ""),
         )
-    )
+        helper = dossier.verified_helpers.get(helper_name)
+        if helper is None:
+            return False
+        for field in ("support_source_hashes", "replay_context_source_hashes"):
+            receipts = getattr(helper, field, {})
+            if not isinstance(receipts, Mapping):
+                return False
+            for dependency, expected_hash in receipts.items():
+                dependency = str(dependency or "").strip()
+                resolved = dependency if dependency in current_hashes else resolved_names.get(dependency)
+                if resolved is None:
+                    resolved = dossier._equivalent_helper_registry_name(
+                        dossier.verified_helpers, dependency,
+                    )
+                    resolved_names[dependency] = resolved
+                if not resolved or current_hashes.get(resolved) != str(expected_hash or "").strip():
+                    return False
+    return True
 
 
 def _cache_seed_visible_base_identity(
     dossier: ProofDossier,
     *,
     excluded_helper_names: Iterable[str] = (),
+    visible_context: Optional[Sequence[str]] = None,
 ) -> Tuple[Tuple[str, str], ...]:
     """Normalize raw/alias rendering while retaining visibility changes."""
 
@@ -4323,9 +4544,9 @@ def _cache_seed_visible_base_identity(
     }
     identity: List[Tuple[str, str]] = []
     verified_helpers = dict(getattr(dossier, "verified_helpers", {}) or {})
-    for block in _proof_state_verified_helper_blocks(
-        dossier,
-        refresh_quality=False,
+    for block in (
+        _proof_state_verified_helper_blocks(dossier, refresh_quality=False)
+        if visible_context is None else visible_context
     ):
         name = str(helper_decl_name(block) or "").strip()
         helper = verified_helpers.get(name)
@@ -4353,6 +4574,390 @@ def _cache_seed_visible_base_identity(
     return tuple(identity)
 
 
+def _helper_acceptance_owner_guard(lean: Any, dossier: Optional[ProofDossier]) -> Callable[[], bool]:
+    """Retain exact registration ownership without keeping the owner alive."""
+
+    if dossier is None:
+        return lambda: True
+    dossier_id = id(dossier)
+    reference = _VERIFIED_HELPER_ACCEPT_SESSIONS.get(dossier_id)
+
+    def current() -> bool:
+        if _VERIFIED_HELPER_ACCEPT_SESSIONS.get(dossier_id) is not reference:
+            return False
+        if reference is None:
+            return True
+        session = reference()
+        # Callback-only facades need no runner attribute, but still own the
+        # exact live registration. Cleanup cannot turn them into standalone
+        # callers after verification has begun.
+        return session is not None and getattr(session, "lean", lean) is lean
+
+    return current
+
+
+def _helper_acceptance_runtime_guard(
+    lean: Any, *, dossier: Optional[ProofDossier] = None,
+    owner_current: Optional[Callable[[], bool]] = None,
+) -> Callable[[], bool]:
+    """Bind a helper check to authenticated runtime, policy and live owner."""
+    from .verified_helper_contract import helper_contract_context_guard
+
+    owner_current = owner_current or _helper_acceptance_owner_guard(lean, dossier)
+    runner_current = helper_contract_context_guard(lean)
+    policy = _helper_acceptance_runner_policy_hash(lean)
+
+    def current() -> bool:
+        return bool(
+            owner_current()
+            and runner_current()
+            and _helper_acceptance_runner_policy_hash(lean) == policy
+        )
+
+    return current
+
+
+_cache_seed_runtime_guard = _helper_acceptance_runtime_guard
+
+
+class _HelperCacheClosureHandoff:
+    """Retain effects of a callback's cache closure until its owner hands off.
+
+    Capture only operations actually reached by record_cache_hit. Callback
+    observation is synchronous; no temporary method binding crosses an await.
+    Publication reconciliation precedes these receipts and remains durable.
+    """
+
+    _CLOSE_FIELDS = (
+        "status", "action", "proved_helper_name", "successful_family", "priority", "blocker",
+        "pending_helper_acceptance", "pending_residual_goal_extraction", "cache_lookup_progress",
+        "verifier_retry_states", "child_tactic_portfolio_continuation", "cache_hits",
+        "failure_transitions", "typed_transitions",
+    )
+    _OBSERVATION_FIELDS = (
+        "contract_identity", "contract_identity_statement_key",
+        "contract_identity_environment_hash", "contract_identity_evidence_receipt",
+    )
+
+    def __init__(self, state: ProofSearchState, target: ProofStateNode) -> None:
+        self.state = state
+        self.target = target
+        self.active_closure = False
+        self.changes: Dict[Tuple[int, str], Tuple[ProofStateNode, Any, str, Any, Any]] = {}
+        self.superseded = False
+        self.pending_retry_owner: Dict[str, Any] = {}
+        self.scheduling_lifetimes: Dict[Tuple[int, str], Any] = {}
+        self.target_observation: Optional[Tuple[ProofDossier, str, Dict[str, Any], Callable[[], bool]]] = None
+
+    def register(self) -> None:
+        receipts = getattr(self.target, "_helper_cache_closure_handoffs", None)
+        if receipts is None:
+            receipts = weakref.WeakSet()
+            setattr(self.target, "_helper_cache_closure_handoffs", receipts)
+        receipts.add(self)
+
+    def stage_target_observation(
+        self, dossier: ProofDossier, helper_name: str, metadata: Dict[str, Any],
+        current: Callable[[], bool],
+    ) -> None:
+        # Completion callbacks and their graph copies must never see a new
+        # executable observation before this operation hands off authority.
+        self.target_observation = (dossier, helper_name, metadata, current)
+        self.register()
+
+    def commit_target_observation(self, *, accepted: bool) -> bool:
+        observation = self.target_observation
+        self.target_observation = None
+        if observation is None:
+            return True
+        dossier, helper_name, metadata, current = observation
+        if self.superseded or not current():
+            return False
+        if accepted and not self.state._verified_helper_certifies_state_node(
+            dossier, self.target, helper_name, target_observation=metadata,
+        ):
+            return False
+        _publish_cache_target_observation(dossier, self.state, self.target, metadata)
+        return True
+
+    def recover_callback_pending_owner(self) -> None:
+        """Recover this attempt's journaled slot for normal checked settlement."""
+        owner = self.pending_retry_owner
+        change = self.changes.get((id(self.target), "pending_helper_acceptance"))
+        if (self.superseded or change is None
+                or not _pending_helper_acceptance_claim_is_current(self.state, self.target, owner, released=True)
+                or change[3].get("acceptance_request_hash") != owner.get("pending_acceptance_request_hash")
+                or self.target.pending_helper_acceptance != change[4]):
+            return
+        # A raw callback close is provisional until the checked consumer
+        # commits. Its exact slot can be settled without granting ownership
+        # from an empty slot or reopening independently completed work.
+        for field in ("pending_helper_acceptance", "verifier_retry_states"):
+            change = self.changes.get((id(self.target), field))
+            if change is not None and getattr(self.target, field) == change[4]:
+                setattr(self.target, field, change[3])
+
+    def node_fields(self, node_id: str, fields: Sequence[str]) -> List[Tuple[ProofStateNode, Any, str, Any]]:
+        node = self.state.nodes.get(node_id)
+        return [(node, node, field, copy.deepcopy(getattr(node, field))) for field in fields] if node else []
+
+    def remember(self, before: Sequence[Tuple[ProofStateNode, Any, str, Any]]) -> None:
+        for node, subject, field, previous in before:
+            key = (id(subject), field)
+            following = copy.deepcopy(getattr(subject, field))
+            if previous == following:
+                continue
+            original = self.changes[key][3] if key in self.changes else previous
+            if field in {"pending_helper_acceptance", "verifier_retry_states"}:
+                lifetime = (getattr(node, "_helper_acceptance_lifetime", None),
+                            getattr(node, "_helper_acceptance_retry_attempt", None))
+                if self.scheduling_lifetimes.get(key) != lifetime:
+                    # A callback can release and stage paid work between two
+                    # provisional closes. Recover the slot actually retired
+                    # by the later close, not an earlier continuation.
+                    original = previous
+                self.scheduling_lifetimes[key] = lifetime
+            self.changes[key] = (node, subject, field, original, following)
+
+    def cancellation_fields(self, parent_id: str) -> List[Tuple[ProofStateNode, Any, str, Any]]:
+        parent = self.state.nodes.get(parent_id)
+        if parent is None:
+            return []
+        before: List[Tuple[ProofStateNode, Any, str, Any]] = []
+        children: Set[str] = set()
+        for group in parent.assembly_attempt_groups:
+            if group.status in {"open", "failed"}:
+                before.append((parent, group, "status", group.status))
+                children.update(group.child_node_ids)
+        for child_id in children:
+            before.extend(self.node_fields(child_id, ("status", "priority")))
+        return before
+
+    def priority_fields(self, node_id: str) -> List[Tuple[ProofStateNode, Any, str, Any]]:
+        neighbors: Set[str] = set()
+        for parent_id, assembly_id in self.state.parent_groups_for_child(node_id):
+            parent = self.state.nodes[parent_id]
+            neighbors.add(parent_id)
+            for group in parent.assembly_attempt_groups:
+                if group.assembly_id == assembly_id:
+                    neighbors.update(group.child_node_ids)
+                    break
+        node = self.state.nodes.get(node_id)
+        if node is not None:
+            neighbors.update(node.child_node_ids)
+            for group in node.assembly_attempt_groups:
+                neighbors.update(group.child_node_ids)
+        return [frame for neighbor in neighbors for frame in self.node_fields(neighbor, ("priority",))]
+
+    def parent_fields(self, child_id: str) -> List[Tuple[ProofStateNode, Any, str, Any]]:
+        child = self.state.nodes.get(child_id)
+        if child is None:
+            return []
+        # This matches the parent reconciliation operation's explicit DAG
+        # links, which may exist without assembly-index entries. It runs only
+        # when that operation is actually invoked by a callback closure.
+        parents = [node.node_id for node in self.state.nodes.values()
+                   if node.kind == "decomposition_task"
+                   and (node.node_id == child.parent_node_id or child_id in node.child_node_ids)]
+        return [frame for parent in parents for frame in self.node_fields(parent, self._CLOSE_FIELDS)]
+
+    @contextmanager
+    def observe(self) -> Iterator[None]:
+        state = self.state
+        methods = {name: getattr(state, name) for name in (
+            "record_cache_hit", "_cancel_obsolete_or_siblings",
+            "_refresh_priorities_for_neighbors", "_reconcile_unverified_lemma_dag_parent_for_child",
+        )}
+
+        def close(*, node_id: str, helper_name: str) -> Any:
+            node = state.nodes.get(node_id)
+            if node is None or node.status == "obsolete" or node.falsified:
+                return methods["record_cache_hit"](node_id=node_id, helper_name=helper_name)
+            if node is not self.target:
+                return methods["record_cache_hit"](node_id=node_id, helper_name=helper_name)
+            if self.superseded:
+                self.changes.clear()
+                self.superseded = False
+            self.register()
+            before = self.node_fields(node_id, self._CLOSE_FIELDS)
+            previous_active = self.active_closure
+            # A synchronous callback stays in this handoff even if it changes
+            # the runtime before closing work. A runtime swap is not a proof.
+            self.active_closure = True
+            try:
+                return methods["record_cache_hit"](node_id=node_id, helper_name=helper_name)
+            finally:
+                self.remember(before)
+                self.active_closure = previous_active
+
+        def operation(method: str, capture: Callable[[str], Any], node_id: str, **options: Any) -> Any:
+            if not self.active_closure:
+                return methods[method](node_id, **options)
+            before = capture(node_id)
+            try:
+                return methods[method](node_id, **options)
+            finally:
+                self.remember(before)
+
+        bindings = {
+            "record_cache_hit": close,
+            "_cancel_obsolete_or_siblings": lambda parent_id, **kw: operation(
+                "_cancel_obsolete_or_siblings", self.cancellation_fields, parent_id, **kw),
+            "_refresh_priorities_for_neighbors": lambda node_id: operation(
+                "_refresh_priorities_for_neighbors", self.priority_fields, node_id),
+            "_reconcile_unverified_lemma_dag_parent_for_child": lambda child_node_id, **kw: operation(
+                "_reconcile_unverified_lemma_dag_parent_for_child", self.parent_fields, child_node_id, **kw),
+        }
+        previous = {name: (name in state.__dict__, state.__dict__.get(name)) for name in bindings}
+        for name, binding in bindings.items():
+            setattr(state, name, binding)
+        try:
+            yield
+        finally:
+            for name, binding in bindings.items():
+                if state.__dict__.get(name) is not binding:
+                    continue
+                had_value, value = previous[name]
+                if had_value:
+                    setattr(state, name, value)
+                else:
+                    delattr(state, name)
+
+    def restore(self, *, revoke_observation: bool = False) -> bool:
+        if revoke_observation:
+            self.target_observation = None
+        if self.superseded:
+            return False
+        restored = False
+        for node, subject, field, previous, following in self.changes.values():
+            if self.state.nodes.get(node.node_id) is not node:
+                continue
+            if subject is not node and not any(group is subject for group in node.assembly_attempt_groups):
+                continue
+            if (field in {"pending_helper_acceptance", "verifier_retry_states"}
+                    and self.scheduling_lifetimes.get((id(subject), field)) != (
+                        getattr(node, "_helper_acceptance_lifetime", None),
+                        getattr(node, "_helper_acceptance_retry_attempt", None),
+                    )):
+                # Matching empty values do not authorize recovery across a
+                # newer attempt or independently completed paid lifecycle.
+                continue
+            if getattr(subject, field) == following:
+                setattr(subject, field, copy.deepcopy(previous))
+                restored = True
+        return restored
+
+
+def _record_accepted_cache_hit(
+    proof_state: ProofSearchState, *, node_id: str, helper_name: str,
+) -> None:
+    """Commit a checked cache close and supersede older provisional effects.
+
+    Call only after current helper/target acceptance, in its synchronous
+    consumption step. Raw advisory callbacks cannot grant this handoff.
+    Weak receipts retain no proof authority and never enter checkpoints.
+    """
+    proof_state.record_cache_hit(node_id=node_id, helper_name=helper_name)
+    _supersede_checked_helper_close(proof_state, node_id=node_id, helper_name=helper_name)
+
+
+def _supersede_checked_helper_close(
+    proof_state: ProofSearchState, *, node_id: str, helper_name: str,
+) -> None:
+    """Retire provisional effects after a verified consumer commits its close."""
+    node = proof_state.nodes.get(node_id)
+    if helper_name and node is not None and node.status == "proved" and node.proved_helper_name == helper_name:
+        for receipt in tuple(getattr(node, "_helper_cache_closure_handoffs", ())):
+            if receipt.state is proof_state and receipt.target is node:
+                receipt.superseded = True
+
+
+def _with_helper_cache_closure_handoff(operation: Callable[..., Any]) -> Callable[..., Any]:
+    """Recover provisional callback closes whenever acceptance does not finish.
+
+    Cleanup belongs to the complete operation, including cancellation, and
+    does not depend on optional attempt notifications. Checked successor
+    commits supersede only their exact live state and target receipts.
+    """
+    @wraps(operation)
+    async def guarded(*args: Any, **kwargs: Any) -> bool:
+        proof_state = kwargs.get("proof_state")
+        node = proof_state.nodes.get(kwargs.get("target_node_id", "")) \
+            if proof_state is not None else None
+        receipt = _HelperCacheClosureHandoff(proof_state, node) \
+            if proof_state is not None and node is not None else None
+        kwargs["_closure_handoff"] = receipt
+        producer_owner = kwargs.pop("_pending_acceptance_owner", None)
+        if receipt is not None:
+            receipt.pending_retry_owner = dict(producer_owner) if producer_owner is not None else _claim_pending_helper_acceptance_attempt(
+                receipt.state, receipt.target, str(kwargs.get("helper_block") or ""),
+            )
+            if producer_owner is not None and not _pending_helper_acceptance_claim_is_current(
+                receipt.state, receipt.target, producer_owner,
+            ):
+                status = kwargs.get("status_out")
+                if status is not None:
+                    status.clear()
+                    status.update(producer_owner)
+                    status.update(status="retryable_error", error_kind="helper_acceptance_superseded",
+                                  error="", lean_attempted=False, pending_acceptance_superseded=True)
+                return False
+        accepted = False
+        completed = False
+        try:
+            accepted = await operation(*args, **kwargs)
+            completed = True
+            return accepted
+        finally:
+            if not accepted and receipt is not None and receipt.restore(revoke_observation=not completed):
+                receipt.state.sync_to_graph(
+                    kwargs["dossier"], phase=kwargs["phase"], turn_index=kwargs["turn_index"],
+                )
+    return guarded
+
+
+async def _prepare_cache_seed_runtime(lean: Any, timeout_s: float) -> None:
+    """Authenticate cold direct-Lake coordinates without compiling a theorem.
+
+    Direct Lake checks can resolve their coordinates without publishing the
+    shared resolver receipt. Seed guards need that authenticated bootstrap,
+    just as env-cached checks do. Reuse the existing environment-only resolver
+    under the admitted operation's lease; subsequent checks reuse the binding.
+    """
+    from .lean_runner import LeanREPL
+    from .verified_helper_contract import helper_contract_runner_context
+
+    if not isinstance(lean, LeanRunner) or lean._configured_backend_mode() != "lake":
+        return
+    expected = helper_contract_runner_context(lean)
+    if expected[-1] != ("", "", None):
+        return
+    resolver = LeanREPL(lean.project_dir, timeout_s=timeout_s)
+    try:
+        if not await resolver.start():
+            raise _LeanOperationDeadline("cache seed environment bootstrap unavailable")
+        if helper_contract_runner_context(lean) != expected:
+            raise _CacheSeedContextChanged("cache seed runtime changed during bootstrap")
+        coordinates = LeanREPL._get_global_env_cache(expected[1])
+        if coordinates is None or not lean.bind_resolved_lean_environment(
+            *coordinates, expected_epoch=expected[3],
+        ):
+            raise _CacheSeedContextChanged("cache seed bootstrap lost its environment epoch")
+    finally:
+        resolver.close()
+
+
+def _cache_seed_pending_runtime_hash(lean: Any) -> str:
+    """Renew advisory seed retry scheduling when the actual runner changes."""
+    from .verified_helper_contract import helper_contract_runner_context
+
+    return text_hash(json.dumps({
+        "runner": id(lean),
+        "context": helper_contract_runner_context(lean),
+        "policy": _helper_acceptance_runner_policy_hash(lean),
+    }, sort_keys=True, separators=(",", ":"), default=str))
+
+
 @dataclass(frozen=True)
 class _CacheSeedBatchReceipt:
     """Exact Lean certificate for ordered same-problem cache prefixes."""
@@ -4365,6 +4970,14 @@ class _CacheSeedBatchReceipt:
     baseline_visible_context_identity: Tuple[Tuple[str, str], ...]
     candidate_identities: Tuple[Tuple[str, str], ...]
     verification_environment_hash: str
+    contract_observations: Tuple[Tuple[str, Tuple[Tuple[str, Any], ...]], ...] = ()
+    runtime_owner: Any = None
+    runtime_current: Optional[Callable[[], bool]] = None
+
+    def runtime_is_current(self, lean: Any) -> bool:
+        # A closure over an old runner cannot grant a new runner authority.
+        return bool(lean is self.runtime_owner and self.runtime_current is not None
+                    and self.runtime_current())
 
     def _preambles_match(self, conv: Any) -> bool:
         if self.primary_preamble != _proof_state_check_preamble(conv):
@@ -4379,12 +4992,14 @@ class _CacheSeedBatchReceipt:
         self,
         *,
         conv: Any,
+        lean: Any,
         helper_block: str,
         certified_context: Sequence[str],
     ) -> bool:
         exact_context = tuple(certified_context)
         return bool(
             exact_context
+            and self.runtime_is_current(lean)
             and self._preambles_match(conv)
             and any(
                 certified_helper == helper_block
@@ -4398,9 +5013,11 @@ class _CacheSeedBatchReceipt:
         *,
         conv: Any,
         dossier: ProofDossier,
+        lean: Any,
         helper_block: str,
+        _defer_validation: bool = False,
     ) -> Optional["_CacheSeedBatchAdmission"]:
-        if not self._preambles_match(conv):
+        if not self.runtime_is_current(lean) or not self._preambles_match(conv):
             return None
         helper_name = str(helper_decl_name(helper_block) or "").strip()
         helper_identity = (helper_name, text_hash(helper_block))
@@ -4426,7 +5043,7 @@ class _CacheSeedBatchReceipt:
                 )
                 return (
                     admission
-                    if self.authorizes(dossier=dossier, admission=admission)
+                    if _defer_validation or self.authorizes(lean=lean, dossier=dossier, admission=admission)
                     else None
                 )
         return None
@@ -4435,11 +5052,14 @@ class _CacheSeedBatchReceipt:
         self,
         *,
         dossier: ProofDossier,
+        lean: Any,
         admission: "_CacheSeedBatchAdmission",
+        published: bool = False,
     ) -> bool:
         index = int(admission.candidate_index)
         if (
-            index < 0
+            not self.runtime_is_current(lean)
+            or index < 0
             or index >= len(self.candidate_identities)
             or index >= len(self.covered_contexts)
         ):
@@ -4474,7 +5094,7 @@ class _CacheSeedBatchReceipt:
             sorted(
                 [
                     *self.baseline_helper_identities,
-                    *self.candidate_identities[:index],
+                    *self.candidate_identities[:index + int(published)],
                 ]
             )
         )
@@ -4484,12 +5104,26 @@ class _CacheSeedBatchReceipt:
             and dossier._verified_helper_context_visible(helper)  # noqa: SLF001
             for name, _source_hash in self.candidate_identities[:index]
         )
+        if not visible_prefix or _cache_seed_helper_registry_identity(dossier) != expected_registry:
+            return False
+        try:
+            visible_context = tuple(_proof_state_verified_helper_blocks(
+                dossier, refresh_quality=False,
+            ))
+            if published:
+                # The checked declaration may be advisory and absent from the
+                # global renderer. Compare the unchanged original replay frame.
+                visible_context = tuple(block for block in visible_context
+                                        if helper_decl_name(block) != expected_helper_identity[0])
+        except (ValueError, TypeError):
+            return False
         return bool(
-            visible_prefix
-            and _cache_seed_helper_registry_identity(dossier) == expected_registry
+            visible_context == admission.context
+            and _cache_seed_context_dependencies_valid(dossier, visible_context)
             and _cache_seed_visible_base_identity(
                 dossier,
                 excluded_helper_names=candidate_names,
+                visible_context=visible_context,
             )
             == self.baseline_visible_context_identity
         )
@@ -4552,6 +5186,7 @@ def _cache_seed_batch_receipt_key(receipt: _CacheSeedBatchReceipt) -> str:
 
     payload = {
         "schema_version": 1,
+        "runtime_capability": id(receipt.runtime_current),
         "primary_preamble_hash": text_hash(receipt.primary_preamble),
         "answer_safe_preamble_hash": (
             text_hash(receipt.answer_safe_preamble)
@@ -4624,6 +5259,7 @@ def _cached_seed_batch_receipt(
     return receipt if isinstance(receipt, _CacheSeedBatchReceipt) else None
 
 
+@_with_helper_cache_closure_handoff
 async def _accept_proof_state_helper(
     *,
     lean: LeanRunner,
@@ -4638,6 +5274,8 @@ async def _accept_proof_state_helper(
     proof_state: Optional[ProofSearchState] = None,
     status_out: Optional[Dict[str, Any]] = None,
     target_statement: str = "",
+    require_target_application: bool = False,
+    target_node_id: str = "",
     require_relevance_gate: bool = False,
     deadline_exhausted: Optional[Callable[[], bool]] = None,
     deadline_monotonic: float = 0.0,
@@ -4648,6 +5286,9 @@ async def _accept_proof_state_helper(
     cache_seed_batch_admission: Optional["_CacheSeedBatchAdmission"] = None,
     defer_cache_seed_derived_refresh: bool = False,
     cache_seed_derived_refresh: Optional["_CacheSeedDerivedRefresh"] = None,
+    require_cache_seed_observation: bool = False,
+    _closure_handoff: Optional[_HelperCacheClosureHandoff] = None,
+    _pending_acceptance_owner: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Verify and record a proof-state helper in the authoritative context.
 
@@ -4661,9 +5302,181 @@ async def _accept_proof_state_helper(
     ):
         raise ValueError("remaining-budget admission requires a finite owner deadline")
 
+    existing = None
     observer_started = False
     observer_finished = False
     lean_attempted = False
+    cache_context_current: Optional[Callable[[], bool]] = None
+    replacement_context_current: Optional[Callable[[], bool]] = None
+    seed_context_current: Optional[Callable[[], bool]] = None
+    batch_context_current: Optional[Callable[[], bool]] = None
+    ordinary_context_current: Optional[Callable[[], bool]] = None
+    batch_authority_valid = False
+    acceptance_await_depth = 0
+    seed_admission = phase == "proof_state_cache_seed" or require_cache_seed_observation
+    owner_current = _helper_acceptance_owner_guard(lean, dossier)
+    runtime_current = _helper_acceptance_runtime_guard(
+        lean, dossier=dossier, owner_current=owner_current,
+    )
+    closure_handoff = _closure_handoff
+    admission_node = proof_state.nodes.get(target_node_id) if proof_state is not None and target_node_id else None
+    admission_target = getattr(admission_node, "target", "")
+    admission_node_environment = getattr(admission_node, "statement_environment_hash", "")
+    admission_root_node_id = proof_state.root_node_id if proof_state is not None else ""
+    admission_preamble = _proof_state_check_preamble(conv)
+    admission_feedback = str(getattr(conv, "preamble", "") or "")
+    admission_policy = copy.deepcopy(_root_tactic_answer_policy(conv=conv, dossier=dossier))
+    admission_environment = dossier.current_lean_environment_hash
+    published_context_current: Optional[Callable[..., bool]] = None
+    advance_published_context: Optional[Callable[[], None]] = None
+    advance_published_contract: Optional[Callable[[], None]] = None
+    completion_certificate_dirty = False
+    published_name = ""
+    published_source_hash = ""
+
+    def fixed_frame_current() -> bool:
+        return bool(
+            (not target_node_id or proof_state is None or (
+                admission_node is not None
+                and proof_state.nodes.get(target_node_id) is admission_node
+                and admission_node.target == admission_target
+                and admission_node.statement_environment_hash == admission_node_environment
+            ))
+            and _proof_state_check_preamble(conv) == admission_preamble
+            and str(getattr(conv, "preamble", "") or "") == admission_feedback
+            and _root_tactic_answer_policy(conv=conv, dossier=dossier) == admission_policy
+            and dossier.current_lean_environment_hash == admission_environment
+            and (proof_state is None or proof_state.root_node_id == admission_root_node_id)
+        )
+
+    def restore_changed_owner_handoff() -> None:
+        # A committed body remains useful input. Its old owner's callbacks or
+        # target observations cannot close executable work or retire its WAL.
+        # Initial node snapshots cannot attribute a close: another runner may
+        # have independently verified this target while this operation awaited.
+        if closure_handoff is not None and closure_handoff.restore(revoke_observation=True) and proof_state is not None:
+            proof_state.sync_to_graph(dossier, phase=phase, turn_index=turn_index)
+
+    def notify_acceptance_observer(event: str, metadata: Dict[str, Any]) -> None:
+        nonlocal completion_certificate_dirty
+        if callable(lean_attempt_observer):
+            completion_certificate_dirty = True
+        if callable(lean_attempt_observer) and closure_handoff is not None:
+            try:
+                with closure_handoff.observe():
+                    notify_lean_attempt_observer(lean_attempt_observer, event, metadata)
+            except BaseException:
+                restore_changed_owner_handoff()
+                raise
+        else:
+            notify_lean_attempt_observer(lean_attempt_observer, event, metadata)
+
+    def runtime_context_error() -> RuntimeError:
+        if seed_admission:
+            return _CacheSeedContextChanged()
+        if require_target_application:
+            return _CacheTargetContextChanged()
+        if existing is not None:
+            return _HelperReplacementContextChanged()
+        return _HelperAcceptanceRuntimeChanged()
+
+    def require_acceptance_context() -> None:
+        # A receipt already owns its runtime snapshot. Its live-prefix guard
+        # also checks this admission's exact owner without a second policy scan.
+        if batch_context_current is not None:
+            if not batch_context_current():
+                raise _CacheSeedContextChanged
+        elif not runtime_current():
+            raise runtime_context_error()
+        if not fixed_frame_current():
+            raise runtime_context_error()
+        if seed_context_current is not None and not seed_context_current():
+            raise _CacheSeedContextChanged
+        if cache_context_current is not None and not cache_context_current():
+            raise _CacheTargetContextChanged
+        if replacement_context_current is not None and not replacement_context_current():
+            raise _HelperReplacementContextChanged
+        if ordinary_context_current is not None and not ordinary_context_current():
+            raise _HelperAcceptanceRuntimeChanged
+
+    def acceptance_context_is_current() -> bool:
+        try:
+            require_acceptance_context()
+        except (_CacheTargetContextChanged, _CacheSeedContextChanged,
+                _HelperReplacementContextChanged, _HelperAcceptanceRuntimeChanged):
+            return False
+        return True
+
+    def bind_published_context(item: Any, context: Sequence[str]) -> None:
+        nonlocal published_context_current, advance_published_context, advance_published_contract
+        nonlocal published_name, published_source_hash
+        # Registration may return an equivalent name or an alternative. Bind
+        # the actual returned source before any advisory code can change it.
+        identity = (item.name, item.source, item.source_hash)
+        published_name, published_source_hash = identity[0], identity[2]
+        context_names = tuple(key for key in _helper_names_from_blocks(context) if key != identity[0])
+        observe_replay = bool(
+            callable(lean_attempt_observer) or callable(verified_helper_accept_callback)
+            or callable(_registered_verified_helper_accept_callback(dossier))
+            or deadline_exhausted is not None or require_target_application
+        )
+        inventory: Tuple[Any, ...] = ()
+        graph_evidence: Tuple[Any, ...] = ()
+        candidate_evidence: Tuple[Any, ...] = ()
+        published_batch = bool(batch_prevalidated and batch_admission is not None
+                               and identity[0] == name and identity[1] == helper_block)
+
+        def helper_graph_evidence() -> Tuple[Any, ...]:
+            graph = dossier.proof_graph
+            helper = graph.nodes.get(graph.helper_name_to_node_id.get(identity[0], ""))
+            if helper is None:
+                return ()
+            from .proof_graph import _GRAPH_CONTRACT_IDENTITY_KEYS
+
+            return (
+                helper.kind, helper.name, helper.statement, helper.status,
+                helper.source_hash, helper.proof_hash,
+                graph.is_superseded_tombstone(helper),
+                tuple(sorted((key, copy.deepcopy(value)) for key, value in helper.metadata.items()
+                             if key.startswith("verified_helper_")
+                             or key in _GRAPH_CONTRACT_IDENTITY_KEYS)),
+            )
+
+        def advance(*, replay: bool = True) -> None:
+            nonlocal inventory, graph_evidence, candidate_evidence
+            # Only synchronous, internal registration/reconciliation or a
+            # source-contract upgrade may advance this expected transition.
+            if replay and observe_replay and not published_batch:
+                inventory = _helper_replay_inventory(dossier, context_names)
+            graph_evidence = helper_graph_evidence()
+            candidate_evidence = _helper_replay_record_identity(identity[0], dossier.verified_helpers.get(identity[0]))
+
+        def current(*, check_replay: bool = True) -> bool:
+            retained = dossier.verified_helpers.get(identity[0])
+            if not (
+                retained is not None
+                and (retained.name, retained.source, retained.source_hash) == identity
+                and _helper_replay_record_identity(identity[0], retained) == candidate_evidence
+                and helper_graph_evidence() == graph_evidence
+            ):
+                return False
+            if not check_replay:
+                return True
+            if published_batch:
+                if not completion_certificate_dirty and deadline_exhausted is None:
+                    return True
+                return bool(cache_seed_batch_receipt is not None and batch_admission is not None
+                            and cache_seed_batch_receipt.authorizes(
+                                lean=lean, dossier=dossier, admission=batch_admission, published=True,
+                            ))
+            return not observe_replay or inventory == _helper_replay_inventory(dossier, context_names)
+
+        def advance_contract() -> None:
+            advance(replay=False)
+
+        advance()
+        published_context_current, advance_published_context = current, advance
+        advance_published_contract = advance_contract
 
     def _status(
         status: str,
@@ -4672,34 +5485,32 @@ async def _accept_proof_state_helper(
         error: str = "",
         accepted_name: str = "",
         accepted_source_hash: str = "",
-    ) -> None:
+    ) -> bool:
         nonlocal observer_finished
-        if status_out is None:
-            pass
-        else:
-            status_out.clear()
-            status_out.update(
-                {
-                    "status": str(status or ""),
-                    "error_kind": str(error_kind or ""),
-                    "error": str(error or "")[:240],
-                    "lean_attempted": bool(lean_attempted),
-                    "accepted_helper_name": str(accepted_name or ""),
-                    "accepted_source_hash": str(accepted_source_hash or ""),
-                }
-            )
+
+        def refresh_callback_verdict() -> None:
+            nonlocal status, error_kind, error
+            if not runtime_current() or not fixed_frame_current():
+                status = "retryable_error"
+                error_kind = acceptance_error_kind(runtime_context_error())
+                error = ""
+                restore_changed_owner_handoff()
+
         if observer_started and not observer_finished:
             observer_finished = True
+            if callable(lean_attempt_observer):
+                refresh_callback_verdict()
             clean_status = str(status or "")
-            clean_error = str(error_kind or "")
             if clean_status == "accepted":
-                notify_lean_attempt_observer(
-                    lean_attempt_observer,
+                notify_acceptance_observer(
                     "certificate_accepted",
                     {"helper_name": name, "phase": phase},
                 )
-            notify_lean_attempt_observer(
-                lean_attempt_observer,
+                if callable(lean_attempt_observer):
+                    refresh_callback_verdict()
+            clean_status = str(status or "")
+            clean_error = str(error_kind or "")
+            notify_acceptance_observer(
                 "finished",
                 {
                     "ok": clean_status == "accepted",
@@ -4715,6 +5526,66 @@ async def _accept_proof_state_helper(
                     "cancelled": clean_status == "cancelled",
                 },
             )
+            if callable(lean_attempt_observer):
+                refresh_callback_verdict()
+        if not fixed_frame_current() or (
+            published_context_current is not None and not published_context_current()
+        ) or (
+            published_context_current is None and completion_certificate_dirty
+            and status in {"accepted", "rejected"}
+            and not acceptance_context_is_current()
+        ):
+            status = "retryable_error"
+            error_kind = acceptance_error_kind(runtime_context_error())
+            error = ""
+            restore_changed_owner_handoff()
+        if (status == "accepted" and completion_certificate_dirty
+                and require_target_application and proof_state is not None
+                and admission_node is not None
+                and admission_node.node_id != proof_state.root_node_id
+                and not (closure_handoff is not None and closure_handoff.target_observation is not None)
+                and not proof_state._verified_helper_certifies_state_node(dossier, admission_node, accepted_name)):
+            status = "retryable_error"
+            error_kind = "cache_target_context_changed"
+            error = ""
+            restore_changed_owner_handoff()
+        if closure_handoff is not None and status in {"accepted", "rejected"}:
+            closure_handoff.recover_callback_pending_owner()
+        if closure_handoff is not None:
+            settlement_status = {
+                **closure_handoff.pending_retry_owner,
+                "status": status, "error_kind": error_kind, "error": error,
+            }
+            if not helper_acceptance_settlement_current(
+                closure_handoff.state, closure_handoff.target, settlement_status,
+            ):
+                status = settlement_status["status"]
+                error_kind = settlement_status["error_kind"]
+                error = settlement_status["error"]
+                closure_handoff.pending_retry_owner["pending_acceptance_superseded"] = True
+                restore_changed_owner_handoff()
+        if (closure_handoff is not None and closure_handoff.target_observation is not None
+                and status in {"accepted", "rejected"}):
+            if not closure_handoff.commit_target_observation(accepted=status == "accepted"):
+                status = "retryable_error"
+                error_kind = "cache_target_context_changed"
+                error = ""
+                restore_changed_owner_handoff()
+        if status_out is not None:
+            status_out.clear()
+            status_out.update(
+                {
+                    "status": str(status or ""),
+                    "error_kind": str(error_kind or ""),
+                    "error": str(error or "")[:240],
+                    "lean_attempted": bool(lean_attempted),
+                    "accepted_helper_name": str(accepted_name or ""),
+                    "accepted_source_hash": str(accepted_source_hash or ""),
+                }
+            )
+            if closure_handoff is not None:
+                status_out.update(closure_handoff.pending_retry_owner)
+        return status == "accepted"
 
     def deadline_elapsed() -> bool:
         try:
@@ -4744,6 +5615,14 @@ async def _accept_proof_state_helper(
         return _fully_funded_operation_timeout(timeout, deadline_monotonic)
 
     def acceptance_error_kind(exc: BaseException) -> str:
+        if isinstance(exc, _HelperAcceptanceRuntimeChanged):
+            return "helper_acceptance_runtime_changed"
+        if isinstance(exc, _CacheTargetContextChanged):
+            return "cache_target_context_changed"
+        if isinstance(exc, _CacheSeedContextChanged):
+            return "cache_seed_context_changed"
+        if isinstance(exc, _HelperReplacementContextChanged):
+            return "helper_replacement_context_changed"
         if isinstance(exc, _LeanOperationDeadline) or (
             deadline_elapsed() and isinstance(exc, asyncio.TimeoutError)
         ):
@@ -4754,34 +5633,71 @@ async def _accept_proof_state_helper(
         operation_factory: Callable[[float], Any],
         operation_timeout: float,
     ) -> Any:
+        nonlocal batch_authority_valid, acceptance_await_depth
         # Create the checker operation after admission. Aggregate owners spend
         # lock waiting as well as earlier checks, so adapters must receive the
         # live remaining allowance instead of a pre-admission timeout.
         async def operation() -> Any:
-            nonlocal lean_attempted
-            if deadline_elapsed():
-                raise _LeanOperationDeadline(
-                    "proof-state helper acceptance deadline elapsed"
+            nonlocal lean_attempted, batch_authority_valid, acceptance_await_depth
+            # A cancellation-resistant adapter can outlive the outer deadline
+            # waiter. Its callbacks still cross awaits until this body exits.
+            acceptance_await_depth += 1
+            batch_authority_valid = False
+            try:
+                require_acceptance_context()
+                if deadline_elapsed():
+                    raise _LeanOperationDeadline(
+                        "proof-state helper acceptance deadline elapsed"
+                    )
+                dispatch_timeout = (
+                    min(operation_timeout, remaining_timeout())
+                    if timeout_is_remaining_budget else operation_timeout
                 )
-            dispatch_timeout = (
-                min(operation_timeout, remaining_timeout())
-                if timeout_is_remaining_budget else operation_timeout
-            )
-            if dispatch_timeout <= 0.0:
-                raise _LeanOperationDeadline("proof-state helper allocation exhausted")
-            lean_attempted = True
-            return await operation_factory(dispatch_timeout)
+                if dispatch_timeout <= 0.0:
+                    raise _LeanOperationDeadline("proof-state helper allocation exhausted")
+                if seed_admission or (
+                    isinstance(lean, LeanRunner)
+                    and getattr(lean.cfg, "module_search_paths", None)
+                ):
+                    # Direct module-path checks resolve coordinates themselves;
+                    # publish the authenticated binding before their verdict
+                    # rather than repeating a successful cold check on resume.
+                    await _prepare_cache_seed_runtime(lean, dispatch_timeout)
+                    require_acceptance_context()
+                lean_attempted = True
+                return await operation_factory(dispatch_timeout)
+            finally:
+                acceptance_await_depth -= 1
+                batch_authority_valid = False
 
-        return await _await_serialized_lean_operation(
-            lean,
-            operation,
-            timeout_s=operation_timeout,
-            deadline_monotonic=deadline_monotonic,
-            operation_label="proof_state_helper_acceptance",
-            deadline_elapsed=deadline_elapsed,
-            release_unrecyclable_tail=False,
-            timeout_is_remaining_budget=timeout_is_remaining_budget,
-        )
+        batch_authority_valid = False
+        acceptance_await_depth += 1
+        try:
+            try:
+                result = await _await_serialized_lean_operation(
+                    lean,
+                    operation,
+                    timeout_s=operation_timeout,
+                    deadline_monotonic=deadline_monotonic,
+                    operation_label="proof_state_helper_acceptance",
+                    deadline_elapsed=deadline_elapsed,
+                    release_unrecyclable_tail=False,
+                    timeout_is_remaining_budget=timeout_is_remaining_budget,
+                )
+            finally:
+                acceptance_await_depth -= 1
+                batch_authority_valid = False
+        except Exception as exc:
+            try:
+                require_acceptance_context()
+            except (_CacheTargetContextChanged, _HelperReplacementContextChanged,
+                    _CacheSeedContextChanged, _HelperAcceptanceRuntimeChanged) as changed:
+                raise changed from exc
+            raise
+        # A negative result is also authority: it can delete the only saved
+        # candidate on resume. Check ownership before either verdict is used.
+        require_acceptance_context()
+        return result
 
     if deadline_elapsed():
         _status("retryable_error", error_kind="llm_turn_elapsed_budget_exhausted")
@@ -4791,11 +5707,18 @@ async def _accept_proof_state_helper(
     if not name:
         _status("rejected", error_kind="invalid_helper_name")
         return False
-    existing_name = (
-        dossier.resolve_verified_helper_name(name)
-        if dossier.has_helper(name)
-        else name
-    )
+    if seed_admission:
+        # Statement aliases can name distinct declarations. Only equivalent
+        # Lean name spellings identify the declaration being replaced.
+        existing_name = dossier._equivalent_helper_registry_name(
+            dossier.verified_helpers, name,
+        ) or name
+    else:
+        existing_name = (
+            dossier.resolve_verified_helper_name(name)
+            if dossier.has_helper(name)
+            else name
+        )
     existing = dossier.verified_helpers.get(existing_name)
     helper_statement = helper_decl_statement(helper_block)
     existing_statement = (
@@ -4823,19 +5746,74 @@ async def _accept_proof_state_helper(
             existing = None
             existing_statement = ""
             existing_key = ""
+        elif seed_admission and name != existing_name:
+            # Record an alias spelling through its authoritative registry name.
+            # Otherwise dossier alias de-duplication can return an older,
+            # still-invisible helper without installing the fresh observation.
+            # Rename before checking so the recorded source is exactly audited.
+            from .proof_graph import _helper_decl_header
+
+            header = _helper_decl_header(helper_block)
+            name_end = len(helper_block.rstrip()) - len(header[2]) if header is not None else 0
+            name_start = name_end - len(name)
+            if helper_block[name_start:name_end] != name:
+                _status("retryable_error", error_kind="cache_seed_alias_context_changed")
+                return False
+            helper_block = helper_block[:name_start] + existing_name + helper_block[name_end:]
+            name = existing_name
+            helper_statement = helper_decl_statement(helper_block)
         # Same-statement crash replay deliberately falls through the complete
         # current policy, primary, answer-safe, relevance, and replacement
         # checks. Proposition equality alone is not a current-context receipt.
     if _proof_state_helper_policy_rejection(helper_block):
         _status("rejected", error_kind="proof_state_helper_policy_rejection")
         return False
+    if require_target_application and not str(target_statement or "").strip():
+        _status("rejected", error_kind="missing_cache_target")
+        return False
+    # A cache key selects candidates, including alternate surface spellings.
+    # Checking the declaration alone proves its own type, not the scheduled
+    # target. Replay the exact target during the same primary audited check.
+    checked_statement = target_statement if require_target_application else "True"
+    checked_proof = (
+        f"by\n  exact @_root_.{name}"
+        if require_target_application else "by\n  trivial"
+    )
+    if require_target_application:
+        cache_admission_node = (
+            proof_state.nodes.get(target_node_id) if proof_state is not None else None
+        )
+        if proof_state is not None and (
+            cache_admission_node is None or cache_admission_node.target != target_statement
+        ):
+            _status("retryable_error", error_kind="cache_target_context_changed")
+            return False
+        cache_initial_context = list(_proof_state_verified_helper_blocks(dossier))
+        cache_context_names = tuple(_helper_names_from_blocks(cache_initial_context))
+        cache_admission_inventory = _helper_replay_inventory(dossier, cache_context_names)
+        cache_candidate_inventory = _helper_replay_inventory(dossier, (name,))
+
+        def cache_context_current() -> bool:
+            return bool(
+                _helper_replay_inventory(dossier, cache_context_names) == cache_admission_inventory
+                and _helper_replay_inventory(dossier, (name,)) == cache_candidate_inventory
+            )
+    if existing is not None:
+        replacement_candidate_inventory = _helper_replay_inventory(dossier, (name,))
+        replacement_context_names: Tuple[str, ...] = ()
+        replacement_inventory: Tuple[Any, ...] = ()
+
+        def replacement_context_current() -> bool:
+            return bool(
+                _helper_replay_inventory(dossier, (name,)) == replacement_candidate_inventory
+                and _helper_replay_inventory(dossier, replacement_context_names) == replacement_inventory
+            )
     timeout = float(timeout_s or 0.0)
     if timeout <= 0.0:
         _status("retryable_error", error_kind="nonpositive_timeout_deferred")
         return False
     observer_started = True
-    notify_lean_attempt_observer(
-        lean_attempt_observer,
+    notify_acceptance_observer(
         "started",
         {
             "helper_name": name,
@@ -4856,24 +5834,31 @@ async def _accept_proof_state_helper(
         else ()
     )
     batch_admission_authorized = bool(
-        existing is None
+        not require_target_application
+        and existing is None
         and cache_seed_batch_receipt is not None
         and batch_admission is not None
         and batch_admission.receipt is cache_seed_batch_receipt
         and batch_admission.helper_block == helper_block
         and batch_admission.certified_context == recomputed_certified_context
         and cache_seed_batch_receipt.authorizes(
-            dossier=dossier,
+            lean=lean, dossier=dossier,
             admission=batch_admission,
         )
         and cache_seed_batch_receipt.certifies_exact_context(
-            conv=conv,
+            lean=lean, conv=conv,
             helper_block=helper_block,
             certified_context=batch_admission.certified_context,
         )
     )
     try:
         if existing is not None:
+            replacement_initial_context = (
+                cache_initial_context if require_target_application
+                else list(_proof_state_verified_helper_blocks(dossier))
+            )
+            replacement_context_names = tuple(_helper_names_from_blocks(replacement_initial_context))
+            replacement_inventory = _helper_replay_inventory(dossier, replacement_context_names)
             operation_timeout = remaining_timeout()
             if operation_timeout <= 0.0:
                 _status(
@@ -4884,7 +5869,7 @@ async def _accept_proof_state_helper(
             context, _ = await await_acceptance_operation(
                 lambda dispatch_timeout: lean_valid_helper_context_excluding_name(
                     lean,
-                    list(_proof_state_verified_helper_blocks(dossier)),
+                    replacement_initial_context,
                     name,
                     preamble=_proof_state_check_preamble(conv),
                     timeout_s=dispatch_timeout,
@@ -4900,7 +5885,8 @@ async def _accept_proof_state_helper(
         elif batch_admission_authorized and cache_seed_batch_context is not None:
             context = list(cache_seed_batch_context)
         else:
-            context = list(_proof_state_verified_helper_blocks(dossier))
+            context = (cache_initial_context if require_target_application
+                       else list(_proof_state_verified_helper_blocks(dossier)))
     except asyncio.CancelledError:
         _status("cancelled", error_kind="cancelled")
         raise
@@ -4920,12 +5906,72 @@ async def _accept_proof_state_helper(
             for block in context
             if str(helper_decl_name(block) or "").strip() != name
         ]
+    if require_target_application:
+        if any(
+            str(getattr(dossier.verified_helpers.get(helper_decl_name(block) or ""), "source", "")) != block
+            for block in context
+        ):
+            _status("retryable_error", error_kind="cache_target_context_changed")
+            return False
+        cache_context_names = tuple(_helper_names_from_blocks(context))
+        cache_admission_inventory = _helper_replay_inventory(dossier, cache_context_names)
     batch_prevalidated = bool(
         batch_admission_authorized
         and batch_admission is not None
         and batch_admission.context == tuple(context)
     )
+    if seed_admission:
+        # A current batch receipt already owns the full prefix inventory.
+        # Singleton and replacement admission still need their own snapshot.
+        seed_context_names = () if batch_prevalidated else tuple(_helper_names_from_blocks(context))
+        seed_inventory = () if batch_prevalidated else _helper_replay_inventory(dossier, seed_context_names)
+
+        def seed_context_current() -> bool:
+            return bool(batch_prevalidated or
+                        _helper_replay_inventory(dossier, seed_context_names) == seed_inventory)
+    if existing is not None:
+        replacement_context_names = tuple(_helper_names_from_blocks(context))
+        replacement_inventory = _helper_replay_inventory(dossier, replacement_context_names)
+    if batch_prevalidated:
+        assert cache_seed_batch_receipt is not None
+        # The admission above already audited this exact prefix. Reuse that
+        # census only until control can leave this synchronous segment.
+        batch_authority_valid = True
+
+        def batch_context_current() -> bool:
+            nonlocal batch_authority_valid
+            if not (
+                owner_current()
+                and cache_seed_batch_receipt.runtime_is_current(lean)
+                and cache_seed_batch_receipt._preambles_match(conv)
+                and dossier.current_lean_environment_hash
+                == cache_seed_batch_receipt.verification_environment_hash
+            ):
+                batch_authority_valid = False
+                return False
+            if batch_authority_valid and acceptance_await_depth == 0:
+                return True
+            current = bool(
+                cache_seed_batch_receipt.authorizes(
+                    lean=lean, dossier=dossier, admission=batch_admission,
+                )
+                and cache_seed_batch_receipt.certifies_exact_context(
+                    lean=lean, conv=conv, helper_block=helper_block,
+                    certified_context=batch_admission.certified_context,
+                )
+            )
+            # An observer may call this guard on either side of its own
+            # internal await. Keep reuse disabled throughout the callee.
+            batch_authority_valid = current and acceptance_await_depth == 0
+            return current
     if not batch_prevalidated:
+        if not seed_admission and not require_target_application and existing is None:
+            ordinary_names = tuple(_helper_names_from_blocks(context))
+            ordinary_inventory = _helper_replay_inventory(dossier, (*ordinary_names, name))
+
+            def ordinary_context_current() -> bool:
+                return _helper_replay_inventory(dossier, (*ordinary_names, name)) == ordinary_inventory
+
         try:
             operation_timeout = remaining_timeout()
             if operation_timeout <= 0.0:
@@ -4938,12 +5984,13 @@ async def _accept_proof_state_helper(
                 from .helper_utilization import declaration_usage_kwargs
                 result = await await_acceptance_operation(
                     lambda dispatch_timeout: lean.check(
-                        "True",
-                        "by\n  trivial",
+                        checked_statement,
+                        checked_proof,
                         merge_context_helpers(context, [helper_block]),
                         preamble_override=_proof_state_check_preamble(conv),
                         timeout_s=dispatch_timeout,
                         check_kind="proof_state_helper",
+                        **({"force_reference": True} if require_target_application else {}),
                         **declaration_usage_kwargs(lean, (helper_block,)),
                     ),
                     operation_timeout,
@@ -4952,8 +5999,8 @@ async def _accept_proof_state_helper(
                 try:
                     result = await await_acceptance_operation(
                         lambda dispatch_timeout: lean.check(
-                            "True",
-                            "by\n  trivial",
+                            checked_statement,
+                            checked_proof,
                             merge_context_helpers(context, [helper_block]),
                             preamble_override=_proof_state_check_preamble(conv),
                             timeout_s=dispatch_timeout,
@@ -4963,8 +6010,8 @@ async def _accept_proof_state_helper(
                 except TypeError:
                     result = await await_acceptance_operation(
                         lambda dispatch_timeout: lean.check(
-                            "True",
-                            "by\n  trivial",
+                            checked_statement,
+                            checked_proof,
                             merge_context_helpers(context, [helper_block]),
                             preamble_override=_proof_state_check_preamble(conv),
                         ),
@@ -5002,12 +6049,13 @@ async def _accept_proof_state_helper(
         try:
             safe_result = await await_acceptance_operation(
                 lambda dispatch_timeout: lean.check(
-                    "True",
-                    "by\n  trivial",
+                    checked_statement,
+                    checked_proof,
                     merge_context_helpers(context, [helper_block]),
                     preamble_override=str(getattr(conv, "preamble", "") or ""),
                     timeout_s=dispatch_timeout,
                     check_kind="proof_state_helper_answer_safe",
+                    **({"force_reference": True} if require_target_application else {}),
                 ),
                 operation_timeout,
             )
@@ -5015,8 +6063,8 @@ async def _accept_proof_state_helper(
             try:
                 safe_result = await await_acceptance_operation(
                     lambda dispatch_timeout: lean.check(
-                        "True",
-                        "by\n  trivial",
+                        checked_statement,
+                        checked_proof,
                         merge_context_helpers(context, [helper_block]),
                         preamble_override=str(getattr(conv, "preamble", "") or ""),
                         timeout_s=dispatch_timeout,
@@ -5027,8 +6075,8 @@ async def _accept_proof_state_helper(
                 try:
                     safe_result = await await_acceptance_operation(
                         lambda dispatch_timeout: lean.check(
-                            "True",
-                            "by\n  trivial",
+                            checked_statement,
+                            checked_proof,
                             merge_context_helpers(context, [helper_block]),
                             preamble_override=str(getattr(conv, "preamble", "") or ""),
                         ),
@@ -5123,10 +6171,19 @@ async def _accept_proof_state_helper(
             )
             return False
         try:
+            require_acceptance_context()
+            # The invalidation sweep checks declarations excluded from the
+            # primary replay prefix as well. Bind that exact census before
+            # waiting for admission; a verdict cannot evict a newer source.
+            replacement_scan_context = list(_proof_state_verified_helper_blocks(dossier))
+            replacement_context_names = tuple(_helper_names_from_blocks(
+                merge_context_helpers(context, replacement_scan_context),
+            ))
+            replacement_inventory = _helper_replay_inventory(dossier, replacement_context_names)
             stale_dependents = await await_acceptance_operation(
                 lambda dispatch_timeout: lean_invalid_helpers_after_replacement(
                     lean,
-                    list(_proof_state_verified_helper_blocks(dossier)),
+                    replacement_scan_context,
                     name,
                     helper_block,
                     context,
@@ -5160,18 +6217,70 @@ async def _accept_proof_state_helper(
     # Obtain fresh typed evidence only where that ambiguity would hide the
     # accepted theorem. Cache metadata is never authority for these fields.
     contract_fields: Dict[str, Any] = {}
+    from .verified_helper_contract import (
+        helper_contract_context_is_plain, helper_source_requires_contract_analysis,
+        helper_source_contract_is_context_sensitive,
+    )
+
+    contract_context_is_plain = helper_contract_context_is_plain(
+        lean, preamble=_proof_state_check_preamble(conv), context=context,
+    )
+    contract_observation_required = helper_source_contract_is_context_sensitive(
+        helper_block, context_is_plain=contract_context_is_plain,
+    )
+    contract_analysis_required = helper_source_requires_contract_analysis(
+        helper_block, context_is_plain=contract_context_is_plain,
+    )
+    from .proof_dossier import verified_helper_bound_contract_identity
+    retained_contract_requires_refresh = bool(
+        existing is not None and verified_helper_bound_contract_identity(existing)
+    )
+    # Rechecking a durable body under a new owner must also refresh any typed
+    # evidence already attached to it. Publishing an unobserved replacement
+    # would downgrade that evidence and reject the paid retry.
+    contract_analysis_required = contract_analysis_required or retained_contract_requires_refresh
+    if batch_prevalidated and batch_admission is not None:
+        contract_fields = dict(next((
+            fields for source, fields in batch_admission.receipt.contract_observations
+            if source == helper_block
+        ), ()))
     analyzer = getattr(lean, "analyze_statement_contracts", None)
-    if callable(analyzer) and graph_statement_contract_ambiguities(helper_statement):
+    if not contract_fields and callable(analyzer) and contract_analysis_required:
         operation_timeout = remaining_timeout()
         if operation_timeout > 0.0:
             contract_preamble = _proof_state_check_preamble(conv)
             contract_environment = str(dossier.current_lean_environment_hash or "")
-            from .verified_helper_contract import analyze_verified_helper_contract
+            from .verified_helper_contract import analyze_verified_helper_source_contract
 
             async def analyze_contract(dispatch_timeout: float) -> Mapping[str, Any]:
-                return await analyze_verified_helper_contract(
+                if retained_contract_requires_refresh:
+                    # Surface-simple declarations can acquire typed evidence
+                    # during target handoff. Refresh that evidence explicitly;
+                    # the optional ambiguity observer otherwise skips them.
+                    try:
+                        supported = {"declaration_sources", "declaration_context"} <= set(
+                            inspect.signature(analyzer).parameters,
+                        )
+                    except (TypeError, ValueError):
+                        supported = False
+                    if not supported:
+                        return {}
+                    try:
+                        analyses, _output, returncode = await analyzer(
+                            (helper_decl_statement(helper_block),), declaration_names=(name,),
+                            declaration_sources=(helper_block,), declaration_context=(*context, helper_block),
+                            preamble_override=contract_preamble, timeout_s=dispatch_timeout,
+                        )
+                    except Exception:
+                        return {}
+                    from .verified_helper_contract import verified_helper_contract_fields
+                    return verified_helper_contract_fields(
+                        analyses[0], statement=helper_decl_statement(helper_block),
+                        environment_hash=contract_environment,
+                    ) if returncode == 0 and len(analyses) == 1 else {}
+                return await analyze_verified_helper_source_contract(
                     lean,
-                    helper_statement,
+                    helper_block,
                     preamble=contract_preamble,
                     context=context,
                     environment_hash=contract_environment,
@@ -5180,30 +6289,78 @@ async def _accept_proof_state_helper(
                         contract_preamble == _proof_state_check_preamble(conv)
                         and contract_environment
                         == str(dossier.current_lean_environment_hash or "")
+                        and acceptance_context_is_current()
                     ),
                 )
 
-            if timeout_is_remaining_budget:
-                try:
-                    contract_fields = dict(await await_acceptance_operation(
-                        analyze_contract, operation_timeout,
-                    ))
-                except asyncio.CancelledError:
-                    _status("cancelled", error_kind="cancelled")
-                    raise
-                except _LeanOperationDeadline as exc:
-                    _status("retryable_error", error_kind=acceptance_error_kind(exc))
-                    return False
-            else:
-                contract_fields = dict(await analyze_contract(operation_timeout))
+            try:
+                contract_fields = dict(await await_acceptance_operation(
+                    analyze_contract, operation_timeout,
+                ))
+            except asyncio.CancelledError:
+                _status("cancelled", error_kind="cancelled")
+                raise
+            except (_LeanOperationDeadline, _CacheTargetContextChanged,
+                    _HelperReplacementContextChanged, _CacheSeedContextChanged,
+                    _HelperAcceptanceRuntimeChanged) as exc:
+                _status("retryable_error", error_kind=acceptance_error_kind(exc))
+                return False
             if not contract_fields:
                 dossier.increment_tool_metric("mini_helper_contract_analysis_unavailable", 1)
+    if retained_contract_requires_refresh and not contract_fields:
+        _status("retryable_error", error_kind="helper_contract_observation_pending")
+        return False
     # The monotonic deadline is an admission boundary between atomic checks.
     # Once every required check was fully admitted and completed, publication
     # must not discard that valid certificate merely because the clock crossed
     # during the operation. An explicit cancellation callback remains
     # authoritative and keeps teardown transactional.
-    combined_deadline_exhausted = deadline_exhausted
+    batch_needs_publication_census = batch_prevalidated and not (
+        callable(lean_attempt_observer) or callable(verified_helper_accept_callback)
+        or callable(_registered_verified_helper_accept_callback(dossier))
+        or deadline_exhausted is not None
+    )
+    try:
+        # Callback-free publication needs its second census only here. With
+        # advisory code, spend that same census at the final handoff instead.
+        if batch_needs_publication_census and (
+            cache_seed_batch_receipt is None or batch_admission is None
+            or not cache_seed_batch_receipt.authorizes(
+                lean=lean, dossier=dossier, admission=batch_admission,
+            )
+        ):
+            raise _CacheSeedContextChanged
+        require_acceptance_context()
+    except (_CacheTargetContextChanged, _HelperReplacementContextChanged,
+            _CacheSeedContextChanged, _HelperAcceptanceRuntimeChanged) as exc:
+        _status("retryable_error", error_kind=acceptance_error_kind(exc))
+        return False
+    publication_context_error = ""
+
+    def publication_cancelled() -> bool:
+        nonlocal publication_context_error, batch_authority_valid
+        cancelled = bool(deadline_exhausted and deadline_exhausted())
+        # Cancellation callbacks may replace or release the owner while a
+        # reversible publication is in progress. Check after the callback so
+        # its false return cannot authorize a verdict from the old runtime.
+        # Publication changes the candidate registry intentionally; its
+        # pre-publication declaration inventory cannot be compared afterward.
+        if published_context_current is None:
+            # Arbitrary deadline code ends the synchronous receipt segment.
+            # Before registration, retain the original checked replay frame.
+            batch_authority_valid = False
+            current = acceptance_context_is_current()
+        else:
+            current = bool(runtime_current() and fixed_frame_current()
+                           and published_context_current())
+        if not current:
+            publication_context_error = acceptance_error_kind(runtime_context_error())
+            return True
+        return cancelled
+
+    combined_deadline_exhausted = (
+        publication_cancelled if deadline_exhausted is not None else None
+    )
     transaction = DeadlineMutationTransaction(
         deadline_exhausted=combined_deadline_exhausted,
         dossier=dossier,
@@ -5214,7 +6371,7 @@ async def _accept_proof_state_helper(
         if not transaction.can_mutate():
             _status(
                 "retryable_error",
-                error_kind="llm_turn_elapsed_budget_exhausted",
+                error_kind=publication_context_error or "llm_turn_elapsed_budget_exhausted",
             )
             return False
         for dependent_name in sorted(stale_dependents):
@@ -5233,6 +6390,7 @@ async def _accept_proof_state_helper(
                     if helper_decl_name(block)
                 ],
                 _defer_global_derived_refresh=defer_derived_refresh,
+                contract_observation_required=contract_observation_required,
                 **contract_fields,
             )
         finally:
@@ -5245,9 +6403,11 @@ async def _accept_proof_state_helper(
         if item is None:
             _status("rejected", error_kind="record_verified_helper_rejected")
             return False
+        bind_published_context(item, context)
         from .helper_utilization import record_runner_declaration_utilization
         record_runner_declaration_utilization(
-            lean, dossier, source=helper_block, statement="True", proof="by\n  trivial",
+            lean, dossier, source=helper_block,
+            statement=checked_statement, proof=checked_proof,
             preamble=_proof_state_check_preamble(conv),
             lemmas=(batch_admission.receipt.covered_contexts[-1][1]
                     if batch_prevalidated else merge_context_helpers(context, [helper_block])),
@@ -5266,6 +6426,8 @@ async def _accept_proof_state_helper(
                 turn_index=turn_index,
                 conservative=True,
             )
+        if advance_published_context is not None:
+            advance_published_context()
         if proof_cache is not None and transaction.enabled:
             publication = stage_verified_helper_for_dossier(
                 proof_cache,
@@ -5280,13 +6442,13 @@ async def _accept_proof_state_helper(
         if not transaction.can_mutate():
             _status(
                 "retryable_error",
-                error_kind="llm_turn_elapsed_budget_exhausted",
+                error_kind=publication_context_error or "llm_turn_elapsed_budget_exhausted",
             )
             return False
     if transaction.enabled and not transaction.committed:
         _status(
             "retryable_error",
-            error_kind=(
+            error_kind=publication_context_error or (
                 "llm_turn_elapsed_budget_exhausted"
                 if transaction.deadline_won
                 else "deadline_mutation_commit_failed"
@@ -5305,20 +6467,84 @@ async def _accept_proof_state_helper(
     if not callable(callback):
         callback = _registered_verified_helper_accept_callback(dossier)
     if callable(callback):
+        completion_certificate_dirty = True
         try:
-            callback(item, dossier)
+            if closure_handoff is not None:
+                with closure_handoff.observe():
+                    callback(item, dossier)
+            else:
+                callback(item, dossier)
         except Exception:
             # Durable theory staging is advisory and must never roll back a
             # helper whose verification transaction already committed.
             pass
-    _status(
+        except BaseException:
+            restore_changed_owner_handoff()
+            raise
+        if not runtime_current() or not fixed_frame_current() or (
+            published_context_current is not None and not published_context_current(check_replay=False)
+        ):
+            restore_changed_owner_handoff()
+            _status("retryable_error", error_kind=acceptance_error_kind(runtime_context_error()),
+                    accepted_name=published_name, accepted_source_hash=published_source_hash)
+            return False
+    if seed_admission and contract_analysis_required and not contract_fields:
+        # Keep the successfully checked body conservatively recorded, but the
+        # seed owner must retain its WAL until current source evidence exists.
+        _status("retryable_error", error_kind="cache_seed_contract_observation_pending",
+                accepted_name=published_name, accepted_source_hash=published_source_hash)
+        return False
+    if require_target_application and proof_state is not None:
+        if published_context_current is not None and not published_context_current():
+            restore_changed_owner_handoff()
+            return _status("retryable_error", error_kind="cache_target_context_changed",
+                           accepted_name=published_name, accepted_source_hash=published_source_hash)
+        # The certifier sees all preceding advisory effects. Only subsequent
+        # completion callbacks require another graph certificate census.
+        completion_certificate_dirty = False
+        target_node = proof_state.nodes.get(target_node_id)
+        target_observation_status: Dict[str, Any] = {}
+        target_certified = bool(
+            target_node is not None
+            and target_node.target == target_statement
+            and (
+                # Root closure has its own final proof/certificate boundary.
+                # A root-equivalent helper may intentionally be advisory to
+                # child work while remaining eligible for that final replay.
+                target_node.node_id == proof_state.root_node_id
+                or await _certify_cache_target_observation(
+                    lean=lean, conv=conv, dossier=dossier, proof_state=proof_state,
+                    node=target_node, helper_name=published_name,
+                    target_context=context,
+                    timeout_s=remaining_timeout(), deadline_monotonic=deadline_monotonic,
+                    status_out=target_observation_status,
+                    runtime_current=runtime_current,
+                    observation_handoff=closure_handoff,
+                    source_contract_refreshed=advance_published_contract,
+                )
+            )
+        )
+        if not target_certified:
+            # The helper body remains a durable win. A successful application
+            # alone is not a portable graph Expr certificate; retain the fact
+            # while the target awaits a current, source-bound observation.
+            _status(
+                str(target_observation_status.get("status") or "retryable_error"),
+                error_kind=str(target_observation_status.get("error_kind") or "cache_target_context_changed"),
+                error=str(target_observation_status.get("error") or ""),
+                accepted_name=published_name, accepted_source_hash=published_source_hash,
+            )
+            return False
+    if not runtime_current():
+        restore_changed_owner_handoff()
+        _status("retryable_error", error_kind=acceptance_error_kind(runtime_context_error()),
+                accepted_name=published_name, accepted_source_hash=published_source_hash)
+        return False
+    return _status(
         "accepted",
-        accepted_name=str(getattr(item, "name", "") or name),
-        accepted_source_hash=str(
-            getattr(item, "source_hash", "") or text_hash(helper_block)
-        ),
+        accepted_name=published_name,
+        accepted_source_hash=published_source_hash,
     )
-    return True
 
 
 class _MalformedCacheSeedDependencyReceipts(ValueError):
@@ -5601,6 +6827,26 @@ async def _validate_same_problem_cache_batch(
     if _fully_funded_operation_timeout(batch_timeout_s, deadline_monotonic) <= 0.0:
         telemetry["batch_validation_verdict"] = "batch_validation_deadline_deferred"
         return None, telemetry
+    runtime_current = _cache_seed_runtime_guard(lean, dossier=dossier)
+    baseline_helper_identities = _cache_seed_helper_registry_identity(dossier)
+    baseline_visible_context_identity = _cache_seed_visible_base_identity(dossier)
+    baseline_context_inventory = _helper_replay_inventory(dossier, tuple(_helper_names_from_blocks(base_context)))
+    verification_environment = str(dossier.current_lean_environment_hash or "")
+    primary_preamble = _proof_state_check_preamble(conv)
+    answer_safe_preamble = str(getattr(conv, "preamble", "") or "") if _needs_answer_safe_feedback_check(conv) else ""
+
+    def require_batch_context() -> None:
+        if not (
+            runtime_current()
+            and verification_environment == str(dossier.current_lean_environment_hash or "")
+            and primary_preamble == _proof_state_check_preamble(conv)
+            and answer_safe_preamble == (str(getattr(conv, "preamble", "") or "") if _needs_answer_safe_feedback_check(conv) else "")
+            and baseline_helper_identities == _cache_seed_helper_registry_identity(dossier)
+            and baseline_visible_context_identity == _cache_seed_visible_base_identity(dossier)
+            and baseline_context_inventory == _helper_replay_inventory(dossier, tuple(_helper_names_from_blocks(base_context)))
+        ):
+            raise _CacheSeedContextChanged("cache seed runtime or prefix changed")
+
     telemetry["batch_validation_attempted"] = True
     started = time.monotonic()
 
@@ -5651,6 +6897,9 @@ async def _validate_same_problem_cache_batch(
         lemmas: Sequence[str],
     ) -> Any:
         async def operation() -> Any:
+            require_batch_context()
+            await _prepare_cache_seed_runtime(lean, batch_timeout_s)
+            require_batch_context()
             if _fully_funded_operation_timeout(
                 batch_timeout_s, deadline_monotonic,
             ) <= 0.0:
@@ -5691,27 +6940,77 @@ async def _validate_same_problem_cache_batch(
                     preamble_override=preamble,
                 )
 
-        return await _await_serialized_lean_operation(
-            lean,
-            operation,
-            timeout_s=batch_timeout_s,
-            deadline_monotonic=deadline_monotonic,
-            operation_label=check_kind,
-        )
+        try:
+            result = await _await_serialized_lean_operation(
+                lean,
+                operation,
+                timeout_s=batch_timeout_s,
+                deadline_monotonic=deadline_monotonic,
+                operation_label=check_kind,
+            )
+        except Exception:
+            require_batch_context()
+            raise
+        require_batch_context()
+        return result
 
-    primary_preamble = _proof_state_check_preamble(conv)
-    answer_safe_preamble = (
-        str(getattr(conv, "preamble", "") or "")
-        if _needs_answer_safe_feedback_check(conv)
-        else ""
-    )
+    if baseline_helper_identities is None or not _cache_seed_context_dependencies_valid(dossier, base_context):
+        telemetry["batch_validation_verdict"] = "batch_validation_registry_changed"
+        return None, telemetry
+    excluded_diagnostic_sources: Set[str] = set()
+
+    def isolate_failed_helpers(result: Any, checked_lemmas: Sequence[str]) -> bool:
+        """Use diagnostics only to choose a new batch, never to reject a row.
+
+        A stale proof near the start of a cache closure used to poison both
+        the full batch and its half-prefix. Preserve every original row for
+        ordinary admission, but let unrelated declarations share a new check.
+        Only a successful kernel check mints the replacement receipt.
+        """
+        nonlocal helper_blocks, base_context, covered_contexts
+        spans = tuple(getattr(result, "generated_lemma_line_spans", ()) or ())
+        if len(spans) != len(checked_lemmas):
+            return False
+        candidate_sources = set(helper_blocks)
+        failed_sources: Set[str] = set()
+        result_path = str(getattr(result, "file_path", "") or "")
+        for diagnostic in getattr(getattr(result, "parsed", None), "diagnostics", ()) or ():
+            if str(getattr(diagnostic, "severity", "")).lower() != "error":
+                continue
+            diagnostic_path = str(getattr(diagnostic, "file", "") or "")
+            if result_path and diagnostic_path and result_path != diagnostic_path:
+                continue
+            line = getattr(diagnostic, "line", None)
+            if not isinstance(line, int) or isinstance(line, bool):
+                continue
+            for block, span in zip(checked_lemmas, spans):
+                if (
+                    block in candidate_sources
+                    and isinstance(span, (tuple, list)) and len(span) == 2
+                    and all(isinstance(value, int) and not isinstance(value, bool) for value in span)
+                    and span[0] <= line <= span[1]
+                ):
+                    failed_sources.add(block)
+        failed_sources.difference_update(excluded_diagnostic_sources)
+        if not failed_sources:
+            return False
+        excluded_diagnostic_sources.update(failed_sources)
+        helper_blocks, base_context, covered_contexts = _cache_seed_batch_validation_input(
+            [record for record in records
+             if str(record.get("source") or "").strip() not in excluded_diagnostic_sources],
+            dossier=dossier,
+        )
+        telemetry["batch_validation_diagnostic_isolated_count"] = len(excluded_diagnostic_sources)
+        return bool(helper_blocks)
+
     candidate_sizes = [len(helper_blocks)]
     if len(helper_blocks) >= 4:
         candidate_sizes.append(len(helper_blocks) // 2)
     last_failure_kind = ""
     batch_exception = False
     try:
-        for candidate_size in candidate_sizes:
+        while candidate_sizes:
+            candidate_size = candidate_sizes.pop(0)
             candidate_contexts = covered_contexts[:candidate_size]
             lemmas = candidate_contexts[-1][1]
             telemetry["batch_validation_check_count"] = int(
@@ -5733,6 +7032,12 @@ async def _validate_same_problem_cache_batch(
                     or "proof_state_cache_seed_batch_check_failed"
                 )
                 if _decl_application_failure_is_retryable(last_failure_kind):
+                    break
+                if isolate_failed_helpers(primary_result, lemmas):
+                    candidate_sizes = [len(helper_blocks)]
+                    if len(helper_blocks) >= 4:
+                        candidate_sizes.append(len(helper_blocks) // 2)
+                elif not helper_blocks:
                     break
                 continue
             if answer_safe_preamble:
@@ -5758,18 +7063,87 @@ async def _validate_same_problem_cache_batch(
                     )
                     if _decl_application_failure_is_retryable(last_failure_kind):
                         break
+                    if isolate_failed_helpers(answer_safe_result, lemmas):
+                        candidate_sizes = [len(helper_blocks)]
+                        if len(helper_blocks) >= 4:
+                            candidate_sizes.append(len(helper_blocks) // 2)
+                    elif not helper_blocks:
+                        break
                     continue
+            contract_observations: Tuple[Tuple[str, Tuple[Tuple[str, Any], ...]], ...] = ()
+            analyzer = getattr(lean, "analyze_statement_contracts", None)
+            from .verified_helper_contract import helper_contract_context_is_plain, helper_source_requires_contract_analysis
+
+            contract_context_is_plain = helper_contract_context_is_plain(
+                lean, preamble=primary_preamble, context=lemmas,
+            )
+            ambiguous_sources = tuple(
+                block for block in helper_blocks[:candidate_size]
+                if helper_source_requires_contract_analysis(block, context_is_plain=contract_context_is_plain)
+            )
+            try:
+                supports_declarations = callable(analyzer) and {
+                    "declaration_names", "declaration_context",
+                } <= set(inspect.signature(analyzer).parameters)
+            except (TypeError, ValueError):
+                supports_declarations = False
+            if ambiguous_sources and supports_declarations and _fully_funded_operation_timeout(
+                batch_timeout_s, deadline_monotonic,
+            ) > 0.0:
+                # Observe types of the actual checked constants. Re-elaborating
+                # their statement text after later declarations could resolve
+                # names differently from the original declaration prefix.
+                from .verified_helper_contract import verified_helper_contract_fields
+                analysis_started = time.monotonic()
+                telemetry["batch_contract_analysis_attempted"] = True
+                environment = verification_environment
+
+                async def observe_contracts() -> Any:
+                    require_batch_context()
+                    if _fully_funded_operation_timeout(batch_timeout_s, deadline_monotonic) <= 0.0:
+                        raise _LeanOperationDeadline("cache contract observation deadline deferred")
+                    return await analyzer(
+                        tuple(helper_decl_statement(block) for block in ambiguous_sources),
+                        declaration_names=tuple(helper_decl_name(block) for block in ambiguous_sources),
+                        preamble_override=primary_preamble,
+                        declaration_context=tuple(lemmas),
+                        timeout_s=batch_timeout_s,
+                    )
+
+                try:
+                    analyses, _output, returncode = await _await_serialized_lean_operation(
+                        lean, observe_contracts, timeout_s=batch_timeout_s,
+                        deadline_monotonic=deadline_monotonic,
+                        operation_label="proof_state_cache_seed_contract_batch",
+                    )
+                    require_batch_context()
+                    if (
+                        returncode == 0 and len(analyses) == len(ambiguous_sources)
+                        and environment == str(getattr(dossier, "current_lean_environment_hash", "") or "")
+                    ):
+                        contract_observations = tuple(
+                            (block, tuple(fields.items()))
+                            for block, analysis in zip(ambiguous_sources, analyses)
+                            if (fields := verified_helper_contract_fields(
+                                analysis, statement=helper_decl_statement(block),
+                                environment_hash=environment,
+                            ))
+                        )
+                except (asyncio.CancelledError, _CacheSeedContextChanged):
+                    raise
+                except Exception as exc:
+                    require_batch_context()
+                    telemetry["batch_contract_analysis_failure_kind"] = type(exc).__name__
+                telemetry["batch_contract_analysis_elapsed_s"] = round(time.monotonic() - analysis_started, 6)
+                telemetry["batch_contract_analysis_certified_count"] = len(contract_observations)
+            require_batch_context()
             receipt = _CacheSeedBatchReceipt(
                 primary_preamble=primary_preamble,
                 answer_safe_preamble=answer_safe_preamble,
                 base_context=base_context,
                 covered_contexts=candidate_contexts,
-                baseline_helper_identities=(
-                    _cache_seed_helper_registry_identity(dossier)
-                ),
-                baseline_visible_context_identity=(
-                    _cache_seed_visible_base_identity(dossier)
-                ),
+                baseline_helper_identities=baseline_helper_identities,
+                baseline_visible_context_identity=baseline_visible_context_identity,
                 candidate_identities=tuple(
                     (
                         str(helper_decl_name(block) or "").strip(),
@@ -5777,9 +7151,9 @@ async def _validate_same_problem_cache_batch(
                     )
                     for block in helper_blocks[:candidate_size]
                 ),
-                verification_environment_hash=str(
-                    getattr(dossier, "current_lean_environment_hash", "") or ""
-                ),
+                verification_environment_hash=verification_environment,
+                contract_observations=contract_observations,
+                runtime_owner=lean, runtime_current=runtime_current,
             )
             telemetry.update(
                 {
@@ -5796,6 +7170,10 @@ async def _validate_same_problem_cache_batch(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        if isinstance(exc, _CacheSeedContextChanged) or not runtime_current():
+            telemetry["batch_validation_context_changed"] = True
+            telemetry["batch_validation_verdict"] = "batch_validation_context_changed"
+            return None, telemetry
         batch_exception = True
         record_failure(
             SimpleNamespace(output=str(exc), returncode=None),
@@ -5828,8 +7206,8 @@ async def seed_verified_helpers_from_same_problem_cache(
     theorem_name: str,
     timeout_s: Optional[float] = None,
     deadline_monotonic: float = 0.0,
-    max_helpers: int = 64,
-    max_passes: int = 3,
+    max_helpers: int = -1,
+    max_passes: int = -1,
     _candidate_records: Optional[Sequence[Mapping[str, Any]]] = None,
     _batch_receipt_key: str = "",
 ) -> Dict[str, Any]:
@@ -5879,8 +7257,8 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
     theorem_name: str,
     timeout_s: float = 12.0,
     deadline_monotonic: float = 0.0,
-    max_helpers: int = 64,
-    max_passes: int = 3,
+    max_helpers: int = -1,
+    max_passes: int = -1,
     _candidate_records: Optional[Sequence[Mapping[str, Any]]] = None,
     _batch_receipt_key: str = "",
     _derived_refresh: _CacheSeedDerivedRefresh,
@@ -5914,7 +7292,8 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
         or dossier is None
         or not summary["theorem_name"]
         or float(timeout_s or 0.0) <= 0.0
-        or int(max_helpers or 0) <= 0
+        or int(max_helpers or 0) == 0
+        or int(max_passes or 0) == 0
     ):
         return summary
 
@@ -5928,7 +7307,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
             candidates = list(
                 records_for_theorem(
                     summary["theorem_name"],
-                    max_records=max(0, int(max_helpers or 0)),
+                    max_records=int(max_helpers or 0),
                     preamble=_proof_state_check_preamble(conv),
                 )
                 or []
@@ -5965,6 +7344,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
         else None
     )
     initial_batch_pending: Optional[Dict[str, Any]] = None
+    initial_batch_owner: Dict[str, Any] = {}
     batch_receipt = _cached_seed_batch_receipt(
         proof_state,
         _batch_receipt_key,
@@ -5974,7 +7354,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
         if (
             not first_helper_block
             or batch_receipt.admission(
-                conv=conv,
+                lean=lean, conv=conv,
                 dossier=dossier,
                 helper_block=first_helper_block,
             )
@@ -5987,8 +7367,8 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
             batch_receipt = None
 
     def stage_batch_inputs() -> bool:
-        nonlocal initial_batch_pending
-        if root_node is not None:
+        nonlocal initial_batch_pending, initial_batch_owner
+        if root_node is not None and proof_state is not None:
             # The first await may be a long cold batch compile. Persist its
             # inputs before launch: attempted=True alone cannot resume after
             # interruption, and a cache entry is never a proof certificate.
@@ -6015,6 +7395,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 node=root_node,
                 helper_block=first_source,
                 source=f"cache_seed:{text_hash(first_source)}",
+                context_hash=_cache_seed_pending_runtime_hash(lean),
                 continuation={
                     "kind": "cache_seed_batch",
                     "theorem_name": summary["theorem_name"],
@@ -6030,6 +7411,9 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
             ):
                 return False
             initial_batch_pending = root_node.pending_helper_acceptance
+            initial_batch_owner = _claim_pending_helper_acceptance_attempt(
+                proof_state, root_node, first_source,
+            )
         return True
 
     if batch_receipt is None:
@@ -6065,6 +7449,23 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
         summary["retryable_error_count"] = 1
         summary["verdict"] = "cache_seed_pending_owner_busy"
         return summary
+    if batch_validation_telemetry.get("batch_validation_context_changed"):
+        summary["retryable_error_count"] = 1
+        summary["verdict"] = "cache_seed_context_deferred"
+        summary["pending_cache_records"] = [dict(record) for record in pending]
+        if root_node is not None and proof_state is not None:
+            retain_pending_helper_acceptance_retry(
+                proof_state=proof_state, node=root_node,
+                status={"status": "retryable_error", "lean_attempted": True,
+                        "error_kind": "cache_seed_context_changed", **initial_batch_owner},
+                expected_pending=initial_batch_pending,
+            )
+        return summary
+    if (initial_batch_pending is not None and proof_state is not None and root_node is not None
+            and not _pending_helper_acceptance_claim_is_current(proof_state, root_node, initial_batch_owner)):
+        summary["retryable_error_count"] = 1
+        summary["verdict"] = "cache_seed_pending_owner_superseded"
+        return summary
     batch_validation_attempted = bool(
         batch_validation_telemetry.get("batch_validation_attempted")
     )
@@ -6094,10 +7495,11 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
     accepted_sources: Set[str] = set()
     terminal_source_hashes: Set[str] = set()
     deferred_provenance_records: List[Dict[str, Any]] = []
-    passes = max(1, int(max_passes or 1))
+    passes = int(max_passes)
     unresolved_rejection = "cache_seed_passes_exhausted"
 
-    for pass_index in range(passes):
+    pass_index = 0
+    while passes < 0 or pass_index < passes:
         if not pending:
             break
         progressed = False
@@ -6210,9 +7612,9 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
             batch_admission: Optional[_CacheSeedBatchAdmission] = None
             if batch_receipt is not None and existing is None:
                 batch_admission = batch_receipt.admission(
-                    conv=conv,
+                    lean=lean, conv=conv,
                     dossier=dossier,
-                    helper_block=helper_block,
+                    helper_block=helper_block, _defer_validation=True,
                 )
                 if batch_admission is not None:
                     batch_context = list(batch_admission.context)
@@ -6222,9 +7624,9 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 _derived_refresh.flush()
                 if batch_receipt is not None and existing is None:
                     batch_admission = batch_receipt.admission(
-                        conv=conv,
+                        lean=lean, conv=conv,
                         dossier=dossier,
-                        helper_block=helper_block,
+                        helper_block=helper_block, _defer_validation=True,
                     )
                     if batch_admission is not None:
                         batch_context = list(batch_admission.context)
@@ -6247,6 +7649,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                     and str(item.get("source") or "").strip() in accepted_sources
                 )
             ]
+            candidate_owner: Dict[str, Any] = {}
             if root_node is not None:
                 if (
                     initial_batch_pending is not None
@@ -6270,6 +7673,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                         batch_receipt_key
                     )
                     staged = True
+                    candidate_owner = initial_batch_owner
                     initial_batch_pending = None
                 else:
                     staged = stage_pending_helper_acceptance(
@@ -6278,6 +7682,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                         node=root_node,
                         helper_block=helper_block,
                         source=f"cache_seed:{source_hash}",
+                        context_hash=_cache_seed_pending_runtime_hash(lean),
                         continuation={
                             "kind": "cache_seed_batch",
                             "theorem_name": summary["theorem_name"],
@@ -6288,6 +7693,8 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                         },
                         refresh_quality=batch_admission is None,
                     )
+                if staged and not candidate_owner and proof_state is not None:
+                    candidate_owner = _claim_pending_helper_acceptance_attempt(proof_state, root_node, helper_block)
                 if not staged:
                     summary["retryable_error_count"] = (
                         int(summary["retryable_error_count"]) + 1
@@ -6313,6 +7720,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 deadline_monotonic=deadline_monotonic,
                 proof_cache=None,
                 proof_state=proof_state,
+                target_node_id=root_node.node_id if root_node is not None else "",
                 status_out=status,
                 target_statement="",
                 require_relevance_gate=False,
@@ -6323,7 +7731,9 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 cache_seed_batch_admission=batch_admission,
                 defer_cache_seed_derived_refresh=batch_admission is not None,
                 cache_seed_derived_refresh=_derived_refresh,
+                _pending_acceptance_owner=candidate_owner if root_node is not None else None,
             )
+            accepted = helper_acceptance_settlement_current(proof_state, root_node, status) and accepted
             record_summary["accepted"] = bool(accepted)
             if accepted:
                 if root_node is not None:
@@ -6336,8 +7746,9 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 ]
                 progressed = True
                 summary["accepted_count"] = int(summary["accepted_count"]) + 1
-                if helper_name not in summary["accepted_helper_names"]:
-                    summary["accepted_helper_names"].append(helper_name)
+                accepted_helper_name = str(status.get("accepted_helper_name") or helper_name)
+                if accepted_helper_name not in summary["accepted_helper_names"]:
+                    summary["accepted_helper_names"].append(accepted_helper_name)
                 if reused_existing_helper:
                     record_summary["reused_existing_helper"] = True
                     summary["duplicate_count"] = (
@@ -6361,6 +7772,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                     )
                 summary["records"].append(record_summary)
                 summary["verdict"] = "cache_seed_acceptance_deferred"
+                summary["pending_cache_records"] = [dict(record), *remaining_cache_records]
                 # The current candidate and its ordered, already-paid suffix
                 # now live in the root helper-acceptance WAL. Never translate
                 # verifier unavailability into cache rejection.
@@ -6375,6 +7787,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
             unresolved_rejection = "cache_seed_retryable_not_resolved"
             break
         pending = next_pending
+        pass_index += 1
 
     # Missing provenance can block an entire dependency chain. Preserve that
     # chain in the continuation so recovering its head can resume every body.
@@ -6476,6 +7889,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
         if root_node is not None and proof_state is not None and stage_pending_helper_acceptance(
             conv=conv, dossier=dossier, node=root_node,
             helper_block=first_source, source=f"cache_seed:{text_hash(first_source)}",
+            context_hash=_cache_seed_pending_runtime_hash(lean),
             continuation={
                 "kind": "cache_seed_batch",
                 "theorem_name": summary["theorem_name"],
@@ -6590,7 +8004,7 @@ async def _try_proof_state_decl_closure(
     turn: int,
     timeout_s: float,
     max_decls: int,
-    max_residual_goals: int = 4,
+    max_residual_goals: int = -1,
     proof_cache: Optional[MiniVerifiedLemmaCache] = None,
     deadline_monotonic: float = 0.0,
 ) -> Tuple[str, List[Dict[str, Any]]]:
@@ -6653,7 +8067,7 @@ async def _try_proof_state_decl_closure(
     timeout = float(timeout_s or 0.0)
     if timeout <= 0.0:
         return "", []
-    residual_goal_limit = max(0, int(max_residual_goals or 0))
+    residual_goal_limit = int(max_residual_goals or 0)
     full_decl_application_signature = text_hash(
         "\n".join(
             [
@@ -7142,7 +8556,7 @@ async def _try_proof_state_decl_closure(
             attempts.append(attempt_record)
             continue
         if applicable and proof_stub and remaining_goals:
-            residual_goal_limit = max(0, int(max_residual_goals or 0))
+            residual_goal_limit = int(max_residual_goals or 0)
             residual_source = f"decl_application:{decl_name}"
             spawned, residual_goal_count, receipt_status = (
                 await _extract_and_spawn_typed_residual_goals(
@@ -7325,10 +8739,12 @@ async def _try_proof_state_decl_closure(
             timeout_s=acceptance_timeout,
             proof_cache=proof_cache,
             proof_state=proof_state,
+            target_node_id=node.node_id,
             status_out=accept_status,
             target_statement=node.target,
             deadline_monotonic=deadline_monotonic,
         )
+        accepted = helper_acceptance_settlement_current(proof_state, node, accept_status) and accepted
         if accepted:
             node.pending_helper_acceptance = {}
             record_dossier_lean_attempt_event(
@@ -7345,6 +8761,9 @@ async def _try_proof_state_decl_closure(
                 exit_reason=f"closed_by:{decl_name}",
                 helper_name=helper_name,
                 decl_application_signature=_decl_application_record_signature(),
+            )
+            _supersede_checked_helper_close(
+                proof_state, node_id=node.node_id, helper_name=helper_name,
             )
             return helper_name, attempts
         accept_error_kind = str(accept_status.get("error_kind") or "")
@@ -7736,11 +9155,13 @@ async def _try_proof_state_parent_assembly(
                     timeout_s=operation_timeout,
                     proof_cache=proof_cache,
                     proof_state=proof_state,
+                    target_node_id=node.node_id,
                     target_statement=node.target,
                     status_out=acceptance_status,
                     deadline_monotonic=deadline_monotonic,
                     lean_attempt_observer=assembly_observer,
                 )
+                accepted = helper_acceptance_settlement_current(proof_state, node, acceptance_status) and accepted
             except asyncio.CancelledError:
                 if not acceptance_status.get("status"):
                     notify_lean_attempt_observer(
@@ -7804,6 +9225,9 @@ async def _try_proof_state_parent_assembly(
                     attempt_count=index,
                     exit_reason="assembled_from_children",
                     helper_name=helper_name,
+                )
+                _supersede_checked_helper_close(
+                    proof_state, node_id=node.node_id, helper_name=helper_name,
                 )
                 return helper_name, attempts
             acceptance_error_kind = str(
@@ -7892,6 +9316,57 @@ async def _try_proof_state_parent_assembly(
     return "", attempts
 
 
+def _root_proof_context_guard(
+    *, conv: Any, lean: LeanRunner, dossier: ProofDossier, proof_state: ProofSearchState,
+    helper_context: Sequence[str],
+) -> Callable[[], bool]:
+    """Bind an asynchronous root check to its target and replay dependencies."""
+    root_id = proof_state.root_node_id
+    root = proof_state.nodes.get(root_id)
+    graph = dossier.proof_graph
+    graph_root_id = graph.root_node_id
+    graph_root = graph.nodes.get(graph_root_id)
+    checked_target = str(getattr(conv, "goal_statement", "") or "").strip()
+    targets_aligned = bool(checked_target and root is not None and graph_root is not None and all(
+        str(target or "").strip() == checked_target for target in (
+            dossier.root_statement, getattr(proof_state, "root_statement", checked_target), root.target,
+            graph.root_statement, graph_root.statement,
+        )
+    ))
+    runner_current = _helper_acceptance_runtime_guard(lean, dossier=dossier)
+    checked_names = tuple(_helper_names_from_blocks(helper_context))
+
+    def frame() -> Tuple[Any, ...]:
+        # Read the existing inventory without re-running helper classification
+        # or dependency closure. Source/dependency edits invalidate a landing
+        # check even when its helper names remain unchanged.
+        helpers = _helper_replay_inventory(dossier, checked_names)
+        return (
+            str(getattr(conv, "goal_statement", "") or ""),
+            _proof_state_acceptance_preamble(conv), _proof_state_check_preamble(conv),
+            dossier.root_statement, str(getattr(proof_state, "root_statement", "") or ""),
+            getattr(root, "target", ""), getattr(root, "statement_environment_hash", ""),
+            graph.root_statement, getattr(graph_root, "statement", ""),
+            dossier.current_lean_environment_hash, helpers,
+            _root_tactic_answer_policy(conv=conv, dossier=dossier),
+        )
+
+    expected = frame()
+
+    def current() -> bool:
+        return bool(
+            targets_aligned
+            and proof_state.root_node_id == root_id
+            and proof_state.nodes.get(root_id) is root
+            and dossier.proof_graph is graph
+            and graph.root_node_id == graph_root_id
+            and graph.nodes.get(graph_root_id) is graph_root
+            and runner_current() and frame() == expected
+        )
+
+    return current
+
+
 async def _try_proof_state_root_exact_helper(
     *,
     conv: Any,
@@ -7942,31 +9417,44 @@ async def _try_proof_state_root_exact_helper(
             _proof_state_verified_helper_blocks(dossier),
             [helper_source] if helper_source else [],
         )
+    checked_statement = str(conv.goal_statement)
+    checked_preamble = _proof_state_acceptance_preamble(conv)
+    context_current = _root_proof_context_guard(
+        conv=conv, lean=lean, dossier=dossier, proof_state=proof_state,
+        helper_context=helper_context,
+    )
+    if not context_current():
+        record["verdict"] = "root_exact_context_changed"
+        record["root_exact_retryable"] = True
+        return False, "", record
+
     async def run_check() -> Any:
+        if not context_current():
+            raise RuntimeError("root proof context changed before Lean dispatch")
         try:
             return await lean.check(
-                conv.goal_statement,
+                checked_statement,
                 proof,
                 helper_context,
-                preamble_override=_proof_state_acceptance_preamble(conv),
+                preamble_override=checked_preamble,
                 timeout_s=timeout,
                 check_kind="proof_state_root_exact_helper",
             )
         except TypeError:
             try:
                 return await lean.check(
-                    conv.goal_statement,
+                    checked_statement,
                     proof,
                     helper_context,
-                    preamble_override=_proof_state_acceptance_preamble(conv),
+                    preamble_override=checked_preamble,
                     timeout_s=timeout,
                 )
             except TypeError:
                 return await lean.check(
-                    conv.goal_statement,
+                    checked_statement,
                     proof,
                     helper_context,
-                    preamble_override=_proof_state_acceptance_preamble(conv),
+                    preamble_override=checked_preamble,
                 )
 
     try:
@@ -7994,6 +9482,11 @@ async def _try_proof_state_root_exact_helper(
     record["accepted"] = lean_accepted
     record["lean_accepted"] = lean_accepted
     record["verdict"] = "solved" if lean_accepted else "tactic_rejected"
+    if not context_current():
+        record["accepted"] = False
+        record["verdict"] = "root_exact_context_changed"
+        record["root_exact_retryable"] = True
+        return False, "", record
     if not lean_accepted:
         error_type = canonical_error_type(
             getattr(result, "parsed", None)
@@ -8046,6 +9539,15 @@ async def _try_proof_state_root_exact_helper(
         helper_context=helper_context,
         helper_names=helper_names,
     )
+    if not set(replay_helpers).issubset(helper_context):
+        record["accepted"] = False
+        record["verdict"] = "root_exact_context_changed"
+        record["root_exact_retryable"] = True
+        return False, "", record
+    # Helper elaboration can add syntax, attributes, and auxiliary declarations.
+    # Only the complete ordered prefix was checked; dependency selection alone
+    # does not certify deleting or reordering any of its declarations.
+    replay_helpers = list(helper_context)
     helper_names = _helper_names_from_blocks(replay_helpers) or helper_names
     from ensemble_prover.root_finalization import (
         finalize_root_solution,
@@ -9025,7 +10527,7 @@ async def _try_proof_state_root_tactic_assembly(
     helper_names = _helper_names_from_blocks(helpers)
     if not helpers:
         return False, None, [], []
-    if int(max_candidates or 0) <= 0 or float(timeout_s or 0.0) <= 0.0:
+    if int(max_candidates or 0) == 0 or float(timeout_s or 0.0) <= 0.0:
         return False, None, [], [
             {
                 "phase": "proof_state_root_assembly",
@@ -9041,6 +10543,21 @@ async def _try_proof_state_root_tactic_assembly(
         ]
 
     root_tactic_preamble = _proof_state_acceptance_preamble(conv)
+    checked_statement = str(conv.goal_statement)
+    context_current = _root_proof_context_guard(
+        conv=conv, lean=lean, dossier=dossier, proof_state=proof_state,
+        helper_context=helpers,
+    )
+    if not context_current():
+        return False, None, [], [{
+            "phase": "proof_state_root_assembly", "turn_in_phase": turn,
+            "root_tactic_context_preserved": True,
+            "verdict": "root_tactic_context_changed",
+        }]
+    checked_active_targets = copy.deepcopy(tuple(
+        item for item in dossier.active_root_targets if isinstance(item, dict)
+    ))
+    checked_frame_helpers = tuple(dossier.verified_helper_blocks(refresh_quality=False))
     context_timeout = (
         float(timeout_s or 0.0)
         if context_timeout_s is None
@@ -9079,6 +10596,7 @@ async def _try_proof_state_root_tactic_assembly(
         answer_policy=_root_tactic_answer_policy(conv=conv, dossier=dossier),
     )
     root_node = proof_state.nodes.get(proof_state.root_node_id)
+    checked_root_target = getattr(root_node, "target", "")
     active_root_targets = _proof_state_active_root_targets_for_frame(dossier)
     direct_root_tactic = not active_root_targets
     from .tactic_service_history import commit_renewal, history_for_obligation, record_attempts
@@ -9192,7 +10710,7 @@ async def _try_proof_state_root_tactic_assembly(
         {
             "root_tactic_context_key": context_key,
             "tactic_timeout_s": str(round(max(0.0, context_timeout), 3)),
-            "max_candidates": str(max(0, int(max_candidates or 0))),
+            "max_candidates": str(int(max_candidates or 0)),
             "portfolio_service_history": service_history,
             **_tactic_renewal_controls(dossier),
         }
@@ -9219,18 +10737,16 @@ async def _try_proof_state_root_tactic_assembly(
     )
 
     async def run_root_tactic() -> Any:
+        if not context_current():
+            raise RuntimeError("root proof context changed before Lean dispatch")
         return await try_close_root_with_active_lift(
                 lean=lean,
-                goal_statement=conv.goal_statement,
+                goal_statement=checked_statement,
                 preamble=root_tactic_preamble,
                 helpers=helpers,
-                active_root_targets=tuple(
-                    item
-                    for item in list(getattr(dossier, "active_root_targets", []) or ())
-                    if isinstance(item, dict)
-                ),
+                active_root_targets=checked_active_targets,
                 timeout_s=float(timeout_s or 0.0),
-                max_candidates=max(1, int(max_candidates or 1)),
+                max_candidates=int(max_candidates or 0),
                 candidate_portfolio=resumed_candidates or None,
                 candidate_portfolio_offset=resumed_offset,
                 candidate_portfolio_phase=resumed_phase,
@@ -9248,7 +10764,7 @@ async def _try_proof_state_root_tactic_assembly(
                 pattern_cache=root_tactic_pattern_cache,
                 pattern_context=root_tactic_pattern_context,
                 defer_success_cache=True,
-                active_root_frame_helper_blocks=dossier.verified_helper_blocks(),
+                active_root_frame_helper_blocks=checked_frame_helpers,
                 tactic_closer=try_close_with_tactics,
                 suppress_solution_placeholders=(
                     answer_safety_suppress_solution_placeholders
@@ -9265,6 +10781,19 @@ async def _try_proof_state_root_tactic_assembly(
                 attempt_observer=None,
             )
 
+    def changed_context_failure(*, elapsed_s: float, reason: str) -> Any:
+        # An obsolete owner or runner frame cannot consume the current
+        # context's retry opportunity, including when no check was dispatched.
+        return False, None, [], [{
+            "phase": "proof_state_root_assembly", "turn_in_phase": turn,
+            "root_tactic_context_key": context_key,
+            "tactic_elapsed_s": elapsed_s,
+            "tactic_attempts": [],
+            "tactic_exit_reason": reason,
+            "root_tactic_context_preserved": True,
+            "verdict": "root_tactic_context_changed",
+        }]
+
     try:
         root_tactic = await _await_serialized_lean_operation(
             lean,
@@ -9274,6 +10803,10 @@ async def _try_proof_state_root_tactic_assembly(
             operation_label="proof_state_root_tactic",
         )
     except _LeanOperationDeadline:
+        if not context_current():
+            return changed_context_failure(
+                elapsed_s=max(0.0, float(timeout_s or 0.0)), reason="timeout",
+            )
         if (was_deferred and allow_deferred_retry
                 and not portfolio_continuation.get("pending_reference_confirmation")):
             _mark_root_tactic_context_continued(proof_state, context_key)
@@ -9302,6 +10835,10 @@ async def _try_proof_state_root_tactic_assembly(
             }
         ]
     except Exception as exc:
+        if not context_current():
+            return changed_context_failure(
+                elapsed_s=0.0, reason=f"{type(exc).__name__}: {exc}",
+            )
         if (was_deferred and allow_deferred_retry
                 and not portfolio_continuation.get("pending_reference_confirmation")):
             _mark_root_tactic_context_continued(proof_state, context_key)
@@ -9329,18 +10866,7 @@ async def _try_proof_state_root_tactic_assembly(
                 "verdict": "tactic_exception",
             }
         ]
-    setattr(proof_state, "_tactic_pattern_cache", root_tactic_pattern_cache)
-    if root_node is not None:
-        root_node.root_tactic_service_history = record_attempts(
-            commit_renewal(service_history, getattr(root_tactic, "cache_metadata", {}) or {}),
-            list(getattr(root_tactic, "attempts", ()) or ()),
-            allowance_s=context_timeout,
-        )
-    _record_completed_tactic_observer_events(
-        dossier,
-        "proof_state_root_tactic",
-        root_tactic,
-    )
+    _record_completed_tactic_observer_events(dossier, "proof_state_root_tactic", root_tactic)
     success_attempt = next(
         (
             attempt
@@ -9349,6 +10875,76 @@ async def _try_proof_state_root_tactic_assembly(
         ),
         None,
     )
+
+    def retain_finalization_retry() -> None:
+        if root_node is None:
+            return
+        from .tactic_service_history import admit_candidates, retain_acceptance_retry
+
+        # A successful lift may not have generated any original-root
+        # candidates. Save its exact root proof in that target's lane.
+        statement = checked_statement
+        lane_key = text_hash(f"{len(statement)}:{statement}{root_tactic_preamble}")
+        attempt = success_attempt or {}
+        candidate = TacticCandidate(
+            proof=root_tactic.proof,
+            tactic=str(attempt.get("tactic") or "root_finalization_retry"),
+            source=str(attempt.get("source") or "root_finalization_retry"),
+            helper=attempt.get("helper"),
+        )
+        history = root_node.root_tactic_service_history
+        if lane_key not in history.get("renewal_lanes", {}):
+            _, lanes = admit_candidates(
+                [candidate], history, lane_key=lane_key,
+                helper_hashes=helper_hashes, allowance_s=context_timeout,
+                provider_sequence=_tactic_renewal_controls(dossier)["portfolio_provider_sequence"],
+            )
+            history = commit_renewal(history, {"portfolio_renewal_lanes": lanes})
+        root_node.root_tactic_service_history = retain_acceptance_retry(
+            history, candidate, lane_key=lane_key,
+        )
+
+    if not context_current():
+        if (root_node is not None
+                and proof_state.nodes.get(proof_state.root_node_id) is root_node
+                and root_node.target == checked_root_target
+                and _proof_state_root_tactic_obligation_key(
+                    conv=conv, dossier=dossier, proof_state=proof_state,
+                ) == obligation_key):
+            # Service costs remain history for this obligation, even when
+            # its execution context changed. No success cache or completion
+            # certificate is installed from this stale result.
+            root_node.root_tactic_service_history = record_attempts(
+                commit_renewal(service_history, getattr(root_tactic, "cache_metadata", {}) or {}),
+                list(getattr(root_tactic, "attempts", ()) or ()), allowance_s=context_timeout,
+            )
+            from .tactic_service_history import retain_context_retries
+
+            root_node.root_tactic_service_history = retain_context_retries(
+                root_node.root_tactic_service_history, root_tactic.attempts,
+            )
+            if root_tactic.ok and root_tactic.proof:
+                # The checked proof remains a candidate for this obligation.
+                # Recording service must not consume it before a check in the
+                # current context can authorize finalization.
+                retain_finalization_retry()
+        return False, None, [], [{
+            "phase": "proof_state_root_assembly", "turn_in_phase": turn,
+            "root_tactic_context_key": context_key,
+            "tactic_elapsed_s": root_tactic.elapsed_s,
+            "tactic_attempts": root_tactic.attempts[:10],
+            **tactic_attempt_telemetry_fields(root_tactic.attempts),
+            **tactic_stage_telemetry_fields(root_tactic.attempts),
+            "root_tactic_context_preserved": True,
+            "verdict": "root_tactic_context_changed",
+        }]
+    setattr(proof_state, "_tactic_pattern_cache", root_tactic_pattern_cache)
+    if root_node is not None:
+        root_node.root_tactic_service_history = record_attempts(
+            commit_renewal(service_history, getattr(root_tactic, "cache_metadata", {}) or {}),
+            list(getattr(root_tactic, "attempts", ()) or ()),
+            allowance_s=context_timeout,
+        )
     root_tactic_exit_reason = str(
         getattr(root_tactic, "exit_reason", "") or ""
     )
@@ -9558,34 +11154,6 @@ async def _try_proof_state_root_tactic_assembly(
             cache_metadata.get("active_root_lift_succeeded")
         )
     if root_tactic.ok and root_tactic.proof:
-        def retain_finalization_retry() -> None:
-            if root_node is None:
-                return
-            from .tactic_service_history import admit_candidates, retain_acceptance_retry
-
-            # A successful lift may not have generated any original-root
-            # candidates. Save its exact root proof in that target's lane.
-            statement = str(getattr(conv, "goal_statement", "") or "")
-            lane_key = text_hash(f"{len(statement)}:{statement}{root_tactic_preamble}")
-            attempt = success_attempt or {}
-            candidate = TacticCandidate(
-                proof=root_tactic.proof,
-                tactic=str(attempt.get("tactic") or "root_finalization_retry"),
-                source=str(attempt.get("source") or "root_finalization_retry"),
-                helper=attempt.get("helper"),
-            )
-            history = root_node.root_tactic_service_history
-            if lane_key not in history.get("renewal_lanes", {}):
-                _, lanes = admit_candidates(
-                    [candidate], history, lane_key=lane_key,
-                    helper_hashes=helper_hashes, allowance_s=context_timeout,
-                    provider_sequence=_tactic_renewal_controls(dossier)["portfolio_provider_sequence"],
-                )
-                history = commit_renewal(history, {"portfolio_renewal_lanes": lanes})
-            root_node.root_tactic_service_history = retain_acceptance_retry(
-                history, candidate, lane_key=lane_key,
-            )
-
         contract_success_attempt = success_attempt
         if active_root_target_statement_text and isinstance(success_attempt, dict):
             contract_success_attempt = {
@@ -9648,6 +11216,11 @@ async def _try_proof_state_root_tactic_assembly(
             helper_context=helpers,
             helper_names=route_helper_names,
         )
+        if not set(replay_helpers).issubset(helpers):
+            record["verdict"] = "root_tactic_context_changed"
+            record["root_tactic_context_preserved"] = True
+            return False, None, [], [record]
+        replay_helpers = list(helpers)
         replay_helper_names = route_helper_names or _helper_names_from_blocks(
             replay_helpers
         )
@@ -9681,7 +11254,7 @@ async def _try_proof_state_root_tactic_assembly(
                 )
                 if str(node_id or "").strip()
             ),
-            dependency_helper_names=route_helper_names or replay_helper_names,
+            dependency_helper_names=route_helper_names,
             target_statement=str(
                 getattr(dossier, "root_statement", "")
                 or getattr(conv, "goal_statement", "")
@@ -9762,6 +11335,249 @@ async def _try_proof_state_root_tactic_assembly(
     return False, None, [], [record]
 
 
+async def _certify_cache_target_observation(
+    *, lean: LeanRunner, conv: Any, dossier: ProofDossier,
+    proof_state: ProofSearchState, node: ProofStateNode, helper_name: str,
+    target_context: Sequence[str],
+    timeout_s: float, deadline_monotonic: float,
+    status_out: Optional[Dict[str, Any]] = None,
+    runtime_current: Optional[Callable[[], bool]] = None,
+    observation_handoff: Optional[_HelperCacheClosureHandoff] = None,
+    source_contract_refreshed: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Bind fresh target evidence after an independently audited application.
+
+    Most ordinary cache hits already have graph authority. Alternate source
+    spellings need observations of the actual helper constant and the target
+    in the original preamble. Keeping those observations separate avoids
+    letting helper declarations change how the target is elaborated.
+    """
+    def unavailable(error_kind: str, *, error: str = "") -> bool:
+        if status_out is not None:
+            status_out.clear()
+            status_out.update(status="retryable_error", error_kind=error_kind, error=error[:240])
+        return False
+
+    unavailable("cache_target_contract_unavailable")
+    runtime_current = runtime_current or _helper_acceptance_runtime_guard(lean, dossier=dossier)
+    if not runtime_current() or proof_state.nodes.get(node.node_id) is not node:
+        return unavailable("cache_target_context_changed")
+    if proof_state._verified_helper_certifies_state_node(dossier, node, helper_name):
+        return True
+    analyzer = getattr(lean, "analyze_statement_contracts", None)
+    helper = dossier.verified_helpers.get(helper_name)
+    if not callable(analyzer) or helper is None:
+        return False
+    from .contract_identity import (
+        lean_contract_statement_source_key, make_lean_contract_evidence_receipt,
+        parse_lean_contract_identity,
+    )
+    from .proof_graph import graph_helper_bound_contract_identity
+    from .verified_helper_contract import (
+        refresh_verified_helper_contract,
+        verified_helper_contract_fields,
+    )
+
+    target = node.target
+    environment = node.statement_environment_hash
+    preamble = _proof_state_check_preamble(conv)
+    feedback_preamble = str(getattr(conv, "preamble", "") or "")
+    answer_policy = _root_tactic_answer_policy(conv=conv, dossier=dossier)
+    context = tuple(merge_context_helpers(target_context, [helper.source]))
+    context_names = tuple(_helper_names_from_blocks(context))
+    context_inventory = _helper_replay_inventory(dossier, context_names)
+    source = helper.source
+
+    def current() -> bool:
+        retained = dossier.verified_helpers.get(helper_name)
+        return bool(
+            proof_state.nodes.get(node.node_id) is node
+            and node.target == target and node.statement_environment_hash == environment
+            and dossier.current_lean_environment_hash == environment
+            and _proof_state_check_preamble(conv) == preamble
+            and str(getattr(conv, "preamble", "") or "") == feedback_preamble
+            and _root_tactic_answer_policy(conv=conv, dossier=dossier) == answer_policy
+            and _helper_replay_inventory(dossier, context_names) == context_inventory
+            and retained is not None and retained.source == source
+            and runtime_current()
+        )
+
+    if not current():
+        return unavailable("cache_target_context_changed")
+
+    async def observe(statement: str, **options: Any) -> Mapping[str, Any]:
+        allowance = _fully_funded_operation_timeout(timeout_s, deadline_monotonic)
+        if not current():
+            unavailable("cache_target_context_changed")
+            return {}
+        if allowance <= 0.0:
+            unavailable("cache_target_contract_timeout")
+            return {}
+
+        async def operation() -> Any:
+            if not current():
+                raise _CacheTargetContextChanged
+            return await analyzer(
+                (statement,), preamble_override=preamble,
+                timeout_s=allowance, **options,
+            )
+
+        try:
+            analyses, output, returncode = await _await_serialized_lean_operation(
+                lean, operation, timeout_s=allowance,
+                deadline_monotonic=deadline_monotonic,
+                operation_label="cache_target_contract",
+            )
+        except asyncio.TimeoutError as exc:
+            unavailable(
+                "cache_target_contract_timeout" if current() else "cache_target_context_changed",
+                error=str(exc),
+            )
+            return {}
+        except Exception as exc:
+            unavailable(
+                "cache_target_contract_unavailable" if current() else "cache_target_context_changed",
+                error=str(exc),
+            )
+            return {}
+        if not current():
+            unavailable("cache_target_context_changed")
+            return {}
+        if returncode or len(analyses) != 1:
+            unavailable("cache_target_contract_unavailable", error=str(output))
+            return {}
+        return verified_helper_contract_fields(
+            analyses[0], statement=statement, environment_hash=environment,
+        )
+
+    graph = dossier.proof_graph
+    graph_helper = graph.nodes.get(graph.helper_name_to_node_id.get(helper_name, ""))
+    if not graph_helper_bound_contract_identity(graph_helper):
+        try:
+            if not {"declaration_sources", "declaration_context"} <= set(
+                inspect.signature(analyzer).parameters,
+            ):
+                return False
+        except (TypeError, ValueError):
+            return False
+        fields = await observe(
+            helper_decl_statement(source), declaration_names=(helper_name,),
+            declaration_sources=(source,),
+            declaration_context=tuple(merge_context_helpers(context, [source])),
+        )
+        if not fields or not current():
+            return False
+        if not refresh_verified_helper_contract(dossier, helper, fields):
+            return False
+        if source_contract_refreshed is not None:
+            source_contract_refreshed()
+        # Fresh evidence can change this helper's visibility without changing
+        # its checked source. Keep observing in the original replay prefix.
+        context_inventory = _helper_replay_inventory(dossier, context_names)
+    fields = await observe(target, declaration_context=tuple(target_context))
+    if not fields:
+        return False
+    key = lean_contract_statement_source_key(target)
+    identity = str(fields["contract_identity"])
+    metadata = {
+        "statement_environment_hash": environment,
+        "contract_identity": identity,
+        "contract_identity_statement_key": key,
+        "contract_identity_environment_hash": environment,
+        "contract_identity_evidence_receipt": make_lean_contract_evidence_receipt(
+            identity, key, environment,
+        ),
+    }
+    certified = proof_state._verified_helper_certifies_state_node(
+        dossier, node, helper_name, target_observation=metadata,
+    )
+    if observation_handoff is not None:
+        observation_handoff.stage_target_observation(dossier, helper_name, metadata, current)
+    elif current():
+        # Standalone observation has no enclosing completion callbacks. Its
+        # own synchronous return remains the authoritative publication point.
+        _publish_cache_target_observation(dossier, proof_state, node, metadata)
+    else:
+        return unavailable("cache_target_context_changed")
+    if certified:
+        return True
+    graph_helper = graph.nodes.get(graph.helper_name_to_node_id.get(helper_name, ""))
+    helper_identity = parse_lean_contract_identity(graph_helper_bound_contract_identity(graph_helper))
+    target_identity = parse_lean_contract_identity(identity)
+    if helper_identity is not None and target_identity is not None and helper_identity[0] != target_identity[0]:
+        # Only complete, source-bound observations establish a semantic
+        # mismatch. Worker failures and stale contexts retain the candidate's
+        # write-ahead record for an independently checked retry.
+        if status_out is not None:
+            status_out.clear()
+            status_out.update(status="rejected", error_kind="cache_target_contract_mismatch")
+    return False
+
+
+def _publish_cache_target_observation(
+    dossier: ProofDossier, proof_state: ProofSearchState, node: ProofStateNode,
+    metadata: Dict[str, Any],
+) -> None:
+    dossier.proof_graph.ensure_state_node(
+        proof_state._graph_node_id(node.node_id), kind="proof_state_child_goal",
+        name=node.node_id, statement=node.target, metadata=metadata,
+    )
+
+
+def _cache_hit_progress_context(
+    *, conv: Any, lean: Any, dossier: ProofDossier, node: ProofStateNode,
+    timeout_s: float,
+) -> str:
+    """Bind advisory failed-body progress to its full replay and allowance.
+
+    This is scheduling memory, never a proof or imported-code receipt. A
+    changed helper inventory, target, verifier policy, environment or allowance
+    restores every body. Process-local config addresses do not survive restart.
+    """
+    from .verified_helper_contract import helper_contract_runner_context
+
+    helpers = _proof_state_verified_helper_blocks(dossier)
+    _, acceptance_context, _ = _helper_acceptance_request_hashes(
+        conv=conv, dossier=dossier, node=node, helper_block="", source="cache_hit",
+        verified_helpers=helpers,
+    )
+    runner_context = helper_contract_runner_context(lean)
+    return text_hash(json.dumps({
+        "generation": "cache-replay-progress-v1",
+        "acceptance_context": acceptance_context,
+        "inventory": _helper_replay_inventory(dossier, tuple(_helper_names_from_blocks(helpers))),
+        "environment": dossier.current_lean_environment_hash,
+        "runner_type": f"{type(lean).__module__}.{type(lean).__qualname__}",
+        "runner_context": runner_context[1:],
+        "runner_policy": _helper_acceptance_runner_policy_hash(lean),
+        "timeout_s": float(timeout_s),
+    }, sort_keys=True, separators=(",", ":"), default=str))
+
+
+@dataclass
+class _CacheReplayService:
+    """One elapsed service quantum shared by resume and fresh cache replay."""
+
+    deadline_monotonic: float = 0.0
+    work_started: bool = False
+
+    def should_yield(self) -> bool:
+        return bool(self.work_started and self.deadline_monotonic > 0.0
+                    and time.monotonic() >= self.deadline_monotonic)
+
+
+def _cache_hit_progress(node: ProofStateNode, context_hash: str) -> Dict[str, Any]:
+    progress = getattr(node, "cache_lookup_progress", {})
+    if (not isinstance(progress, dict) or progress.get("schema_version") != 1
+            or progress.get("context_hash") != context_hash
+            or not isinstance(progress.get("completed_source_hashes"), list)
+            or any(not isinstance(key, str) for key in progress["completed_source_hashes"])):
+        progress = {"schema_version": 1, "context_hash": context_hash,
+                    "completed_source_hashes": []}
+        node.cache_lookup_progress = progress
+    return progress
+
+
 async def _try_proof_state_cache_hit(
     *,
     conv: Any,
@@ -9773,23 +11589,37 @@ async def _try_proof_state_cache_hit(
     turn: int,
     timeout_s: float,
     deadline_monotonic: float = 0.0,
+    cache_service: Optional[_CacheReplayService] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     if (
         proof_cache is None
         or node.status == "proved"
-        or _fully_funded_operation_timeout(timeout_s, deadline_monotonic) <= 0.0
+        or timeout_s <= 0.0
+        or (_fully_funded_operation_timeout(timeout_s, deadline_monotonic) <= 0.0
+            and not (cache_service is not None and cache_service.work_started))
     ):
         return "", []
     records: List[Dict[str, Any]] = []
     preamble = _proof_state_check_preamble(conv)
-    for record in proof_cache.lookup(node.target, preamble=preamble, max_hits=3):
+    progress_context = _cache_hit_progress_context(
+        conv=conv, lean=lean, dossier=dossier, node=node, timeout_s=timeout_s,
+    )
+    progress = _cache_hit_progress(node, progress_context)
+    completed = set(progress["completed_source_hashes"])
+    iterator = getattr(proof_cache, "iter_lookup", None)
+    candidates = (iterator(node.target, preamble=preamble) if callable(iterator)
+                  else proof_cache.lookup(node.target, preamble=preamble, max_hits=None))
+    for record in candidates:
         operation_timeout = _fully_funded_operation_timeout(
             timeout_s,
             deadline_monotonic,
         )
-        if operation_timeout <= 0.0:
+        if operation_timeout <= 0.0 and cache_service is None:
             break
         helper_block = str(record.get("source") or "").strip()
+        candidate_source_key = text_hash(helper_block)
+        if candidate_source_key in completed:
+            continue
         helper_name = helper_decl_name(helper_block) or ""
         # Tag emitted by lookup() so the recorder can attribute hits per
         # tier (tier1 = same-preamble, tier2 = cross-preamble fallback).
@@ -9798,7 +11628,6 @@ async def _try_proof_state_cache_hit(
             continue
         rejection = _proof_state_helper_policy_rejection(
             helper_block,
-            expected_statement=node.target,
         )
         if rejection:
             records.append(
@@ -9822,8 +11651,10 @@ async def _try_proof_state_cache_hit(
                 str(getattr(existing, "source", "") or "")
             )
             existing_key = canonicalize_lean_statement_for_identity(existing_statement)
-            target_key = canonicalize_lean_statement_for_identity(node.target)
-            if existing_key and existing_key == target_key:
+            candidate_key = canonicalize_lean_statement_for_identity(
+                helper_decl_statement(helper_block),
+            )
+            if existing_key and existing_key == candidate_key:
                 # Same-statement publication is not a current-context receipt.
                 # Fall through to the complete acceptance/visibility checks.
                 reused_existing_helper = True
@@ -9849,7 +11680,9 @@ async def _try_proof_state_cache_hit(
             node=node,
             helper_block=helper_block,
             source=f"cache_hit:{record.get('source_hash') or helper_name}",
-            continuation={"kind": "cache_hit"},
+            context_hash=progress_context,
+            continuation={"kind": "cache_hit", "timeout_s": timeout_s,
+                          "cache_progress_context_hash": progress_context},
         )
         if not staged_acceptance:
             records.append(
@@ -9867,6 +11700,22 @@ async def _try_proof_state_cache_hit(
                 }
             )
             return "", records
+        service_yield = cache_service is not None and cache_service.should_yield()
+        if service_yield or operation_timeout <= 0.0:
+            # Own the exact next source before yielding. Progress alone is not
+            # a scheduler item; this unstarted WAL exposes helper acceptance
+            # even after the tactic/declaration frontier has drained.
+            records.append({
+                "phase": "proof_state_cache_lookup", "turn_in_phase": turn,
+                "node_id": node.node_id, "target": node.target,
+                "cached_helper": helper_name, "accepted": False,
+                "cache_continuation_pending": True,
+                "all_operations_deferred_before_launch": True,
+                "deadline_deferred": operation_timeout <= 0.0,
+                "verdict": ("cache_lookup_service_yield" if service_yield
+                            else "cache_lookup_deadline_yield"),
+            })
+            return "", records
         acceptance_status: Dict[str, Any] = {}
         accepted = await _accept_proof_state_helper(
             lean=lean,
@@ -9879,9 +11728,14 @@ async def _try_proof_state_cache_hit(
             proof_cache=None,
             proof_state=proof_state,
             target_statement=node.target,
+            require_target_application=True,
+            target_node_id=node.node_id,
             deadline_monotonic=deadline_monotonic,
             status_out=acceptance_status,
         )
+        accepted = helper_acceptance_settlement_current(proof_state, node, acceptance_status) and accepted
+        if cache_service is not None and acceptance_status.get("lean_attempted"):
+            cache_service.work_started = True
         records.append(
             {
                 "phase": "proof_state_cache_lookup",
@@ -9892,6 +11746,7 @@ async def _try_proof_state_cache_hit(
                 "cache_source_hash": str(record.get("source_hash") or ""),
                 "cache_lookup_tier": cache_tier,
                 "accepted": bool(accepted),
+                "acceptance_status": dict(acceptance_status),
                 "reused_existing_helper": bool(
                     accepted and reused_existing_helper
                 ),
@@ -9899,7 +11754,8 @@ async def _try_proof_state_cache_hit(
         )
         if accepted:
             node.pending_helper_acceptance = {}
-            proof_state.record_cache_hit(
+            _record_accepted_cache_hit(
+                proof_state,
                 node_id=node.node_id,
                 helper_name=helper_name,
             )
@@ -9917,6 +11773,11 @@ async def _try_proof_state_cache_hit(
             records[-1]["acceptance_status"] = dict(acceptance_status)
             return "", records
         node.pending_helper_acceptance = {}
+        if acceptance_status.get("status") == "rejected":
+            # Only a completed current-context negative settles this body.
+            # Queued/deferred/cancelled/worker failures retain their WAL above.
+            completed.add(candidate_source_key)
+            progress["completed_source_hashes"].append(candidate_source_key)
     return "", records
 
 
@@ -10100,7 +11961,7 @@ async def _try_proof_state_lemma_dag_helpers(
     deadline_monotonic: float = 0.0,
     proof_cache: Optional[MiniVerifiedLemmaCache] = None,
     target_task_id: str = "",
-    max_parent_stub_goals: int = 8,
+    max_parent_stub_goals: int = -1,
     initial_proposed_count: int = 0,
     initial_accepted_count: int = 0,
     initial_candidate_node_ids: Optional[Sequence[str]] = None,
@@ -10542,10 +12403,12 @@ async def _try_proof_state_lemma_dag_helpers(
                 timeout_s=float(timeout_s or 0.0),
                 proof_cache=proof_cache,
                 proof_state=proof_state,
+                target_node_id=task.node_id,
                 target_statement=str(getattr(task, "target", "") or ""),
                 status_out=accept_status,
                 deadline_monotonic=deadline_monotonic,
             )
+            accepted = helper_acceptance_settlement_current(proof_state, task, accept_status) and accepted
             if accepted:
                 task.pending_helper_acceptance = {}
                 landed_helper_name = str(
@@ -10858,7 +12721,7 @@ def _proof_state_child_tactic_context_keys(
     pattern_context.update(
         {
             "tactic_timeout_class": timeout_class,
-            "max_candidates": str(max(0, int(max_candidates or 0))),
+            "max_candidates": str(int(max_candidates or 0)),
         }
     )
     context = {
@@ -11445,11 +13308,16 @@ async def _try_proof_state_one_child_closure(
     action_deadline_monotonic: float = 0.0,
     candidate_attempt_limit: int = 0,
     service_slice_s: float = 0.0,
+    cache_service: Optional[_CacheReplayService] = None,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Run the declaration/tactic/assembler swarm for one proof-state node."""
 
     accepted_helpers: List[str] = []
     records: List[Dict[str, Any]] = []
+    if cache_service is None:
+        cache_service = _CacheReplayService(
+            time.monotonic() + service_slice_s if service_slice_s > 0.0 else 0.0,
+        )
     allowed = {
         str(item or "").strip()
         for item in list(allowed_work_types or ())
@@ -11557,7 +13425,7 @@ async def _try_proof_state_one_child_closure(
                         round(max(0.0, float(timeout_s or 0.0)), 3)
                     ),
                     "max_candidates": str(
-                        max(0, int(max_candidates or 0))
+                        int(max_candidates or 0)
                     ),
                 }
             )
@@ -11696,6 +13564,33 @@ async def _try_proof_state_one_child_closure(
             if "caller_context_hash" in pending
             else pending.get("context_hash") or ""
         )
+        saved_continuation = dict(pending.get("continuation") or {})
+        if saved_continuation.get("kind") == "cache_seed_batch":
+            caller_context_hash = _cache_seed_pending_runtime_hash(lean)
+            saved_timeout = saved_continuation.get("timeout_s")
+            try:
+                saved_allowance = 0.0 if isinstance(saved_timeout, bool) else float(saved_timeout)
+            except (TypeError, ValueError, OverflowError):
+                saved_allowance = 0.0
+            if math.isfinite(saved_allowance) and saved_allowance > 0:
+                saved_continuation["timeout_s"] = max(saved_allowance, float(timeout_s))
+                pending["continuation"] = saved_continuation
+        if saved_continuation.get("kind") == "cache_hit":
+            try:
+                saved_allowance = float(saved_continuation.get(
+                    "timeout_s", _typed_residual_operation_timeout(lean, timeout_s),
+                ))
+            except (TypeError, ValueError, OverflowError):
+                saved_allowance = float(timeout_s)
+            if not math.isfinite(saved_allowance) or saved_allowance <= 0:
+                saved_allowance = float(timeout_s)
+            saved_allowance = max(saved_allowance, float(timeout_s))
+            caller_context_hash = _cache_hit_progress_context(
+                conv=conv, lean=lean, dossier=dossier, node=node, timeout_s=saved_allowance,
+            )
+            saved_continuation["timeout_s"] = saved_allowance
+            saved_continuation["cache_progress_context_hash"] = caller_context_hash
+            pending["continuation"] = saved_continuation
         request_hash, exact_context_hash, retry_key = (
             _helper_acceptance_request_hashes(
                 conv=conv,
@@ -11715,6 +13610,7 @@ async def _try_proof_state_one_child_closure(
             pending["verifier_retry_key"] = retry_key
             pending.pop("verifier_failure", None)
             node.pending_helper_acceptance = pending
+            _renew_pending_helper_acceptance_lifetime(node)
             if prior_retry_key and prior_retry_key != retry_key:
                 proof_state.clear_verifier_retry_state(node, prior_retry_key)
         if proof_state.verifier_retry_status(node, retry_key) == "cooling":
@@ -11738,12 +13634,15 @@ async def _try_proof_state_one_child_closure(
         )
         continuation = dict(pending.get("continuation") or {})
         continuation_kind = str(continuation.get("kind") or "")
-        if continuation_kind == "cache_seed_batch":
-            # The first pending helper and its suffix share the same explicit
-            # verifier policy. Do not replace a saved 12s override with the
-            # generic residual verifier's 300s allowance on resume. Missing or
-            # malformed saved budgets defer without allocating fresh work.
+        if continuation_kind in {"cache_seed_batch", "cache_hit"}:
+            # Keep the candidate's explicit verification allowance instead of
+            # silently replacing it with the generic residual budget. Cache-hit
+            # resumes above accept an explicitly larger caller allocation;
+            # legacy cache-hit WALs retain the historical residual allowance.
+            # Missing/malformed seed-batch budgets defer without fresh work.
             saved_timeout = continuation.get("timeout_s")
+            if continuation_kind == "cache_hit":
+                saved_timeout = continuation.get("timeout_s", pending_acceptance_timeout_s)
             try:
                 pending_acceptance_timeout_s = (
                     0.0 if isinstance(saved_timeout, bool) else float(saved_timeout)
@@ -11764,7 +13663,7 @@ async def _try_proof_state_one_child_closure(
         cache_seed_batch_admission: Optional[_CacheSeedBatchAdmission] = None
         if cache_seed_batch_receipt is not None:
             cache_seed_batch_admission = cache_seed_batch_receipt.admission(
-                conv=conv,
+                lean=lean, conv=conv,
                 dossier=dossier,
                 helper_block=helper_block,
             )
@@ -11814,6 +13713,7 @@ async def _try_proof_state_one_child_closure(
                 # not bypass replay-name/source-hash gates for an excluded head.
                 # The seeder also advances independent suffix candidates when
                 # a legacy head's provenance has not yet been recovered.
+                released_owner = _claim_pending_helper_acceptance_attempt(proof_state, node, helper_block)
                 node.pending_helper_acceptance = {}
                 try:
                     cache_summary = await seed_verified_helpers_from_same_problem_cache(
@@ -11831,11 +13731,24 @@ async def _try_proof_state_one_child_closure(
                         _batch_receipt_key=str(continuation.get("batch_receipt_key") or ""),
                     )
                 except BaseException:
-                    if not node.pending_helper_acceptance:
+                    if (node.status not in {"proved", "obsolete"}
+                            and _pending_helper_acceptance_claim_is_current(
+                                proof_state, node, released_owner, released=True,
+                            )):
                         node.pending_helper_acceptance = pending
                     raise
                 records.append(cache_summary)
                 return True, list(cache_summary.get("accepted_helper_names") or [])
+        if continuation_kind == "cache_hit" and cache_service.should_yield():
+            records.append({
+                "phase": "proof_state_cache_lookup", "turn_in_phase": turn,
+                "node_id": node.node_id, "target": node.target,
+                "cached_helper": helper_name, "accepted": False,
+                "cache_continuation_pending": True,
+                "all_operations_deferred_before_launch": True,
+                "verdict": "cache_lookup_service_yield",
+            })
+            return True, []
         accepted = await _accept_proof_state_helper(
             lean=lean,
             conv=conv,
@@ -11847,12 +13760,18 @@ async def _try_proof_state_one_child_closure(
             proof_cache=proof_cache,
             proof_state=proof_state,
             target_statement=node.target,
+            require_target_application=continuation_kind == "cache_hit",
+            target_node_id=node.node_id,
             deadline_monotonic=action_deadline_monotonic,
             status_out=acceptance_status,
             cache_seed_batch_receipt=cache_seed_batch_receipt,
             cache_seed_batch_context=cache_seed_batch_context,
             cache_seed_batch_admission=cache_seed_batch_admission,
+            require_cache_seed_observation=continuation_kind == "cache_seed_batch",
         )
+        accepted = helper_acceptance_settlement_current(proof_state, node, acceptance_status) and accepted
+        if acceptance_status.get("lean_attempted"):
+            cache_service.work_started = True
         if accepted:
             helper_name = str(
                 acceptance_status.get("accepted_helper_name") or helper_name
@@ -11920,7 +13839,8 @@ async def _try_proof_state_one_child_closure(
                     helper_name=helper_name,
                 )
             elif continuation_kind == "cache_hit":
-                proof_state.record_cache_hit(
+                _record_accepted_cache_hit(
+                    proof_state,
                     node_id=node.node_id,
                     helper_name=helper_name,
                 )
@@ -12140,6 +14060,10 @@ async def _try_proof_state_one_child_closure(
                     accepted=True,
                     helper_name=helper_name,
                 )
+            if continuation_kind != "cache_hit":
+                _supersede_checked_helper_close(
+                    proof_state, node_id=node.node_id, helper_name=helper_name,
+                )
             records.append(
                 {
                     "phase": "proof_state_pending_acceptance",
@@ -12158,6 +14082,7 @@ async def _try_proof_state_one_child_closure(
                 proof_state=proof_state,
                 node=node,
                 status=acceptance_status,
+                expected_pending=pending,
             )
             pending = dict(node.pending_helper_acceptance or {})
             attempt_count = _durable_nonnegative_int(
@@ -12205,6 +14130,26 @@ async def _try_proof_state_one_child_closure(
         lemma_suffix_resumed = False
         resumed_helper_names: List[str] = []
         continuation_kind = str(continuation.get("kind") or "")
+        if continuation_kind == "cache_hit" and acceptance_status.get("status") == "rejected":
+            progress_context = str(continuation.get("cache_progress_context_hash") or "")
+            if progress_context:
+                progress = _cache_hit_progress(node, progress_context)
+                source_key = text_hash(helper_block)
+                if source_key not in progress["completed_source_hashes"]:
+                    progress["completed_source_hashes"].append(source_key)
+            # Selected helper-acceptance work still owns the cache suffix.
+            # It need not be selected as a cache-hit work type to continue.
+            cached_helper, cache_records = await _try_proof_state_cache_hit(
+                conv=conv, lean=lean, dossier=dossier, proof_state=proof_state,
+                node=node, proof_cache=proof_cache, turn=turn,
+                timeout_s=pending_acceptance_timeout_s,
+                deadline_monotonic=action_deadline_monotonic,
+                cache_service=cache_service,
+            )
+            records.extend(cache_records)
+            return bool(cached_helper or node.pending_helper_acceptance), (
+                [cached_helper] if cached_helper else []
+            )
         if continuation_kind == "lemma_dag":
             prior_node_ids = [
                 str(item)
@@ -12503,10 +14448,13 @@ async def _try_proof_state_one_child_closure(
             turn=turn,
             timeout_s=_remaining_timeout(timeout_s),
             deadline_monotonic=action_deadline_monotonic,
+            cache_service=cache_service,
         )
         records.extend(cache_records)
         if cached_helper:
             return [cached_helper], records
+        if node.pending_helper_acceptance:
+            return [], records
 
     if allow_parent_assembly:
         assembled_helper, assembly_attempts = await _try_proof_state_parent_assembly(
@@ -12627,9 +14575,9 @@ async def _try_proof_state_one_child_closure(
         )
         return accepted_helpers, records
 
-    if int(max_candidates or 0) <= 0 or _remaining_timeout(timeout_s) <= 0.0:
+    if int(max_candidates or 0) == 0 or _remaining_timeout(timeout_s) <= 0.0:
         deadline_deferred = bool(
-            int(max_candidates or 0) > 0
+            int(max_candidates or 0) != 0
             and float(timeout_s or 0.0) > 0.0
             and float(action_deadline_monotonic or 0.0) > 0.0
         )
@@ -12707,7 +14655,7 @@ async def _try_proof_state_one_child_closure(
     tactic_pattern_context.update(
         {
             "tactic_timeout_s": str(round(max(0.0, float(timeout_s or 0.0)), 3)),
-            "max_candidates": str(max(0, int(max_candidates or 0))),
+            "max_candidates": str(int(max_candidates or 0)),
         }
     )
     tactic_available_timeout = _remaining_timeout(timeout_s)
@@ -12827,7 +14775,9 @@ async def _try_proof_state_one_child_closure(
     # Resume the unattempted suffix of one generated/ranked portfolio after
     # an acceptance veto. This preserves the configured candidate budget
     # without regenerating a full swarm for every Lean-successful proof.
-    for _veto_loop in range(max(1, int(max_candidates or 1))):
+    _veto_loop = 0
+    while int(max_candidates or 0) < 0 or _veto_loop < int(max_candidates or 0):
+        _veto_loop += 1
         if candidate_attempt_limit > 0 and remaining_candidate_attempts <= 0:
             final_exit_reason = "candidate_quantum_exhausted"
             break
@@ -12848,7 +14798,7 @@ async def _try_proof_state_one_child_closure(
                 tactic_preamble,
                 tactic_helpers,
                 timeout_s=operation_timeout,
-                max_candidates=max(1, int(max_candidates or 1)),
+                max_candidates=int(max_candidates or 0),
                 pattern_cache=operation_pattern_cache,
                 pattern_context=tactic_pattern_context,
                 defer_success_cache=True,
@@ -13025,10 +14975,12 @@ async def _try_proof_state_one_child_closure(
             timeout_s=operation_timeout,
             proof_cache=proof_cache,
             proof_state=proof_state,
+            target_node_id=node.node_id,
             target_statement=node.target,
             deadline_monotonic=action_deadline_monotonic,
             status_out=acceptance_status,
         )
+        accepted = helper_acceptance_settlement_current(proof_state, node, acceptance_status) and accepted
         if accepted:
             node.pending_helper_acceptance = {}
             record_dossier_lean_attempt_event(
@@ -13073,6 +15025,11 @@ async def _try_proof_state_one_child_closure(
         node.pending_helper_acceptance = {}
         had_acceptance_veto = True
         vetoed_proof = str(getattr(result, "proof", "") or "").strip()
+        if vetoed_proof in suppressed_proofs:
+            # A compatibility backend that ignores suppression must not spin
+            # indefinitely after the same proof is rejected by acceptance.
+            final_exit_reason = "acceptance_vetoed"
+            break
         if vetoed_proof:
             suppressed_proofs.add(vetoed_proof)
         if isinstance(local_success_attempt, dict):
@@ -13457,10 +15414,12 @@ async def _try_proof_state_one_child_closure(
                         timeout_s=acceptance_timeout,
                         proof_cache=proof_cache,
                         proof_state=proof_state,
+                        target_node_id=node.node_id,
                         target_statement=node.target,
                         deadline_monotonic=action_deadline_monotonic,
                         status_out=acceptance_status,
                     )
+                    accepted = helper_acceptance_settlement_current(proof_state, node, acceptance_status) and accepted
                 elif staged_formal_acceptance:
                     acceptance_status.update(
                         {
@@ -13596,7 +15555,10 @@ async def _try_proof_state_one_child_closure(
             if receipt_status != "residual_attestation_admitted" or not spawned:
                 continue
             tactic_spawned.extend(spawned)
-            if len(tactic_spawned) >= max(1, int(max_residual_goals or 1)):
+            if (
+                int(max_residual_goals or 0) >= 0
+                and len(tactic_spawned) >= int(max_residual_goals or 0)
+            ):
                 break
         if tactic_spawned:
             node.action = "assemble_from_children"
@@ -13716,6 +15678,10 @@ async def _try_proof_state_one_child_closure(
         )
     else:
         node.blocker = final_exit_reason
+    if helper_name:
+        _supersede_checked_helper_close(
+            proof_state, node_id=node.node_id, helper_name=helper_name,
+        )
     proof_state.record_tactic_pattern_cache_metrics(
         getattr(result, "cache_metadata", {})
     )
@@ -13785,7 +15751,7 @@ async def _try_proof_state_child_closures(
     max_candidates: int,
     max_nodes: int,
     max_decl_applications: int = 6,
-    max_residual_goals: int = 4,
+    max_residual_goals: int = -1,
     batch_parallelism: int = 1,
     proof_cache: Optional[MiniVerifiedLemmaCache] = None,
     target_node_ids: Optional[Sequence[str]] = None,
@@ -13796,12 +15762,26 @@ async def _try_proof_state_child_closures(
     action_deadline_monotonic: float = 0.0,
     candidate_attempt_limit: int = 0,
     service_slice_s: float = 0.0,
+    service_started_monotonic: float = 0.0,
     status_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Optional[str], List[str]]:
     """Try deterministic closures for scheduled child goals, then assemble root."""
 
     if dossier is None or proof_state is None:
         return False, None, []
+    cache_service = _CacheReplayService(
+        (service_started_monotonic or time.monotonic()) + service_slice_s
+        if service_slice_s > 0.0 else 0.0,
+    )
+    runtime_current = _helper_acceptance_runtime_guard(lean, dossier=dossier)
+
+    def runtime_handoff_is_current() -> bool:
+        if runtime_current():
+            return True
+        if status_out is not None:
+            status_out["retryable_infrastructure"] = True
+            status_out["error_kind"] = "helper_acceptance_runtime_changed"
+        return False
 
     # ``timeout_s`` is a full per-operation capability. Only a separately
     # supplied enclosing hard deadline may bound the action. Formal search's
@@ -13836,7 +15816,8 @@ async def _try_proof_state_child_closures(
                     if type(value) in (int, float) and math.isfinite(value) and value >= 0:
                         totals[key] = totals.get(key, 0.0) + value
                 status_out["stage_timing_scope"] = "per_check_inclusive"
-        for key in ("child_tactic_continuation_pending", "child_tactic_cursor_advanced"):
+        for key in ("child_tactic_continuation_pending", "child_tactic_cursor_advanced",
+                    "cache_continuation_pending"):
             status_out[key] = bool(
                 status_out.get(key) or any(record.get(key) for record in records)
             )
@@ -14023,6 +16004,11 @@ async def _try_proof_state_child_closures(
                     }
                 )
     async def _run_root_exact_checkpoint() -> Tuple[bool, Optional[str]]:
+        # A committed helper can remain in the dossier after its admission
+        # owner changes. That does not authorize the captured runner to
+        # continue through root finalization in this dispatch.
+        if not runtime_handoff_is_current():
+            return False, None
         state_ok, state_proof, root_helpers, root_records = (
             await _try_proof_state_root_exact_frontier(
                 conv=conv,
@@ -14343,6 +16329,7 @@ async def _try_proof_state_child_closures(
                 candidate_attempt_limit=candidate_attempt_limit,
                 service_slice_s=service_slice_s,
                 formal_search_config=formal_search_config,
+                cache_service=cache_service,
                 formal_search_client=formal_search_client,
                 cost_controller=cost_controller,
                 action_deadline_monotonic=action_deadline_monotonic,
@@ -14416,6 +16403,8 @@ async def _try_proof_state_child_closures(
 
     results: List[Tuple[List[str], List[Dict[str, Any]]]] = []
     for node in nodes:
+        if not runtime_handoff_is_current():
+            break
         if (
             float(timeout_s or 0.0) > 0.0
             and action_deadline_monotonic > 0.0
@@ -14438,6 +16427,9 @@ async def _try_proof_state_child_closures(
         if recorder is not None:
             for record in records:
                 recorder.record_turn(record)
+
+    if not runtime_handoff_is_current():
+        return False, None, accepted_helpers
 
     if checks_enabled and targeted_child_work:
         state_ok, state_proof = await _run_root_exact_checkpoint()

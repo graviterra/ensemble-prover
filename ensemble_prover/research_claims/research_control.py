@@ -334,6 +334,23 @@ class ResearchControl:
                     self.handle_yield(current, exc.reason)
                     return False
                 state = self.controller.snapshot()
+                if current.get("role") == "review":
+                    from .frontier.approaches import can_admit_review
+                    from .frontier.persist import load_campaign
+
+                    campaign = load_campaign(self.store, state["owner_id"])
+                    if campaign is not None:
+                        lane = campaign["lanes"].get("provider") or {}
+                        budget = campaign["retries"].get(current.get("frontier_operation_lineage") or "") or {}
+                        reason = None
+                        if budget.get("paused"):
+                            reason = "research_review_paused_operational"
+                        elif (lane.get("paused") and not lane.get("recovery_open")
+                              or not current.get("frontier_review_admitted") and not can_admit_review(campaign)):
+                            reason = "research_control_deferred"
+                        if reason is not None:
+                            self.handle_yield(current, reason)
+                            return False
                 if (current.get("role") == "research" and current.get("frontier_recovery_settled")
                         and not current.get("research_control", {}).get("closed")):
                     # Recovery has already settled the interrupted quantum and
@@ -516,7 +533,7 @@ class ResearchControl:
                     return
             if adaptive and job["role"] == "research" and reason in {
                 "stale_permit_basis", "stale_frontier_scope", "formal_authority_revoked",
-                "permit_expired", "claim_expired", "retry_exhausted",
+                "permit_expired", "claim_expired", "retry_exhausted", "retry_deadline",
             }:
                 if reason == "stale_frontier_scope" and job.get("frontier_permit_consumed"):
                     from .frontier.hooks import retire_stale_research_response
@@ -524,7 +541,22 @@ class ResearchControl:
                     with self.controller._edit() as (live, _):
                         retire_stale_research_response(self.controller, live, job, "research_scope_changed")
                     return
-                if reason == "retry_exhausted":
+                if reason in {"retry_exhausted", "retry_deadline"}:
+                    from .frontier.hooks import _campaign, _save
+
+                    # Admission is transactional: raising the refusal rolled
+                    # back its tentative pause. Persist that refusal here so
+                    # the same expired operation cannot immediately requeue.
+                    with self.controller._edit() as (live, run):
+                        current = _campaign(self.controller, live)
+                        approach = current["approaches"].get(job.get("frontier_approach_id") or "", {})
+                        lineage = job.get("frontier_operation_lineage") or approach.get("operation_lineage")
+                        budget = current["retries"].get(lineage or "")
+                        if budget is not None:
+                            budget["paused"] = True
+                            job["frontier_operation_lineage"] = lineage
+                            approach["operation_lineage"] = lineage
+                            _save(self.controller, live, run, current)
                     reason = "paused_operational"
                 else:
                     from .frontier.hooks import _campaign, prepare_research_claim
@@ -539,7 +571,20 @@ class ResearchControl:
                     job.update(status="waiting", last_error=reason)
                     self.store.save_job(job)
                     return
-            if adaptive and job["role"] == "review" and reason == "research_control_deferred":
+            if adaptive and job["role"] == "review" and reason in {
+                "research_control_deferred", "research_review_paused_operational",
+                "research_review_retry_deadline", "research_review_retry_exhausted", "research_review_lane_paused",
+            }:
+                if reason in {"research_review_retry_deadline", "research_review_retry_exhausted"}:
+                    from .frontier.hooks import _campaign, _save
+
+                    with self.controller._edit() as (live, run):
+                        current = _campaign(self.controller, live)
+                        budget = current["retries"].get(job.get("frontier_operation_lineage") or "")
+                        if budget is not None:
+                            budget["paused"] = True
+                            _save(self.controller, live, run, current)
+                    reason = "research_review_paused_operational"
                 job.update(status="waiting", last_error=reason)
                 self.store.save_job(job)
                 return

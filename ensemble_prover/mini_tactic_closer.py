@@ -17,6 +17,7 @@ import inspect
 import math
 import re
 import time
+from bisect import bisect_left
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
@@ -50,8 +51,9 @@ from .utils import normalize_statement
 
 
 DEFAULT_TIMEOUT_S = 30.0
-DEFAULT_MAX_CANDIDATES = 64
+DEFAULT_MAX_CANDIDATES = -1
 OUTPUT_PREVIEW_CHARS = 1200
+# The small scripts are a cheap prefix. Complete helper families follow them.
 HELPER_STITCH_LIMIT = 12
 HELPER_SET_EXT_LIMIT = 8
 HELPER_DIRECT_SIMPA_LIMIT = 16
@@ -74,65 +76,147 @@ _DECL_NAME_RE = re.compile(
     rf"({_LEAN_NAME_SEGMENT_RE}(?:\.{_LEAN_NAME_SEGMENT_RE})*)",
     flags=re.UNICODE,
 )
+_CONJUNCTION_BINDER_PREFIX_RE = re.compile(r"(?:forall|let|match)(?![\w'])")
 
 
-def _strip_balanced_outer_parens(text: str) -> str:
-    stripped = str(text or "").strip()
-    while stripped.startswith("(") and stripped.endswith(")"):
-        depth = 0
-        balanced_outer = True
-        for index, char in enumerate(stripped):
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0 and index != len(stripped) - 1:
-                    balanced_outer = False
-                    break
-            if depth < 0:
-                balanced_outer = False
+@dataclass(frozen=True)
+class _ConjunctionSourceIndex:
+    raw: str
+    closing: dict[int, int]
+    conjunctions: dict[int, list[int]]
+    lower_precedence: dict[int, list[int]]
+
+    def split_range(
+        self, start: int, end: int, scope: int
+    ) -> tuple[int, int, int, int | None]:
+        """Find the outer conjunction without copying or rescanning subtrees."""
+        raw = self.raw
+        while True:
+            while start < end and raw[start].isspace():
+                start += 1
+            while end > start and raw[end - 1].isspace():
+                end -= 1
+            if start < end and raw[start] == "(" and self.closing.get(start) == end - 1:
+                scope = start
+                start, end = start + 1, end - 1
+            else:
                 break
-        if not balanced_outer or depth != 0:
-            break
-        stripped = stripped[1:-1].strip()
-    return stripped
+        ands = self.conjunctions.get(scope, [])
+        and_index = bisect_left(ands, start)
+        low_ops = self.lower_precedence.get(scope, [])
+        low_index = bisect_left(low_ops, start)
+        atomic = (
+            raw.startswith(("∀", "∃"), start)
+            or _CONJUNCTION_BINDER_PREFIX_RE.match(raw, start, end) is not None
+            or (low_index < len(low_ops) and low_ops[low_index] < end)
+            or and_index == len(ands)
+            or ands[and_index] >= end
+        )
+        return start, end, scope, None if atomic else ands[and_index]
 
 
-def _split_top_level_once(text: str, symbol: str) -> tuple[str, str] | None:
-    raw = str(text or "")
-    depth = 0
-    for index, char in enumerate(raw):
-        if char in "([{":
-            depth += 1
-        elif char in ")]}":
-            depth = max(0, depth - 1)
-        elif depth == 0 and char == symbol:
-            left = raw[:index].strip()
-            right = raw[index + 1 :].strip()
-            if left and right:
-                return left, right
-            return None
-    return None
+def _index_conjunction_source(statement: str) -> _ConjunctionSourceIndex | None:
+    """Index advisory conjunction syntax once, preserving nested source ranges."""
+    raw = str(statement or "").strip()
+    closing: dict[int, int] = {}
+    conjunctions: dict[int, list[int]] = {}
+    lower_precedence: dict[int, list[int]] = {}
+    stack: list[int] = []
+    paired = {")": "(", "]": "[", "}": "{"}
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char in ('"', "«"):
+            quote = '"' if char == '"' else "»"
+            index += 1
+            while index < len(raw) and raw[index] != quote:
+                index += 2 if raw[index] == "\\" and quote == '"' else 1
+            if index >= len(raw):
+                return None
+        elif char in "([{":
+            stack.append(index)
+        elif char in paired:
+            if not stack or raw[stack[-1]] != paired[char]:
+                return None
+            closing[stack.pop()] = index
+        elif char == "∧":
+            conjunctions.setdefault(stack[-1] if stack else -1, []).append(index)
+        elif char in "∨↔→" or raw.startswith(("->", "<->"), index):
+            lower_precedence.setdefault(stack[-1] if stack else -1, []).append(index)
+        index += 1
+    if stack:
+        return None
+    return _ConjunctionSourceIndex(raw, closing, conjunctions, lower_precedence)
 
 
 def _conjunction_projection_paths(statement: str) -> list[str]:
-    """Return valid Lean projection suffixes for top-level conjunction leaves."""
+    """Return the cheap projection prefix without quadratic subtree copies.
 
-    def walk(expr: str, prefix: str) -> list[str]:
-        current = _strip_balanced_outer_parens(expr)
-        split = _split_top_level_once(current, "∧")
-        if split is None:
-            return [prefix] if prefix else []
-        left, right = split
-        return [
-            *walk(left, f"{prefix}.1" if prefix else ".1"),
-            *walk(right, f"{prefix}.2" if prefix else ".2"),
-        ]
-
-    paths = walk(statement, "")
-    if len(paths) < 2:
+    Persistent path links retain only one edge per visited conjunction. Only
+    the selected leaf paths become strings, so even a deeply left-associated
+    source takes space linear in the source and the returned proof text.
+    """
+    indexed = _index_conjunction_source(statement)
+    if indexed is None:
         return []
-    return paths[:MAX_CONJUNCTION_PROJECTIONS]
+    paths: list[str] = []
+    links: list[tuple[int, str]] = []
+    pending = [(0, len(indexed.raw), -1, -1)]
+    while pending and len(paths) < MAX_CONJUNCTION_PROJECTIONS:
+        start, end, scope, link = pending.pop()
+        start, end, scope, split = indexed.split_range(start, end, scope)
+        if start == end:
+            return []
+        if split is None:
+            fragments = []
+            while link >= 0:
+                link, edge = links[link]
+                fragments.append(edge)
+            if fragments:
+                paths.append("".join(reversed(fragments)))
+            continue
+        left_link = len(links)
+        links.extend(((link, ".1"), (link, ".2")))
+        pending.extend([
+            (split + 1, end, scope, left_link + 1),
+            (start, split, scope, left_link),
+        ])
+    return paths if len(paths) >= 2 else []
+
+
+def _conjunction_destructuring_pattern(
+    statement: str, *, prefix: str
+) -> tuple[str, list[str]]:
+    """Build a linear-size ``rcases`` pattern for every conjunction leaf.
+
+    This is advisory syntax generation, never proof authority. Forall and
+    implication sources need instantiation before projection, so the general
+    helper tactics handle those instead. Lean validates the final pattern.
+    """
+    indexed = _index_conjunction_source(statement)
+    if indexed is None:
+        return "", []
+
+    fragments: list[str] = []
+    names: list[str] = []
+    pending: list[str | tuple[int, int, int]] = [(0, len(indexed.raw), -1)]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            fragments.append(current)
+            continue
+        start, end, scope, split = indexed.split_range(*current)
+        if start == end:
+            return "", []
+        if split is None:
+            name = f"{prefix}_{len(names)}"
+            names.append(name)
+            fragments.append(name)
+            continue
+        pending.extend([
+            "⟩", (split + 1, end, scope), ", ", (start, split, scope), "⟨",
+        ])
+    return ("".join(fragments), names) if len(names) >= 2 else ("", [])
 
 
 def _normalize_statement_for_tactic_cache(statement: str) -> str:
@@ -1243,6 +1327,8 @@ def generate_tactic_candidates(
     perform oracle-style probing.
     """
 
+    if int(max_candidates or 0) == 0:
+        return []
     helper_names = _recent_first_helpers(
         _dedupe_helpers(
             helpers,
@@ -1396,7 +1482,7 @@ def generate_tactic_candidates(
             if projection_candidate_count >= MAX_CONJUNCTION_PROJECTION_HELPERS:
                 return
 
-    def add_helper_set_ext_stitch_candidates() -> None:
+    def add_helper_set_ext_stitch_candidates(*, complete: bool = False) -> None:
         if len(helper_names) < 2:
             return
         from .proof_state import lean_statement_conclusion
@@ -1412,9 +1498,9 @@ def generate_tactic_candidates(
         if not any(marker in compact_goal for marker in ("Set", "{", "∈")):
             return
         intro_prefix = ("intros",) if needs_intro_candidate else ()
-        stitch_helpers = helper_names[:HELPER_SET_EXT_LIMIT]
+        stitch_helpers = helper_names if complete else helper_names[:HELPER_SET_EXT_LIMIT]
         helper_list = ", ".join(stitch_helpers)
-        helper_aesop_list = _aesop_safe_rule_list(stitch_helpers[:8])
+        helper_aesop_list = _aesop_safe_rule_list(stitch_helpers)
         add_lines(
             (
                 *intro_prefix,
@@ -1452,12 +1538,14 @@ def generate_tactic_candidates(
             source="helper_set_ext_stitch",
         )
 
-    def add_helper_stitch_candidates() -> None:
+    def add_helper_stitch_candidates(*, complete: bool = False) -> None:
         if len(helper_names) < 2:
             return
-        stitch_helpers = helper_names[:HELPER_STITCH_LIMIT]
+        stitch_helpers = helper_names if complete else helper_names[:HELPER_STITCH_LIMIT]
         helper_list = ", ".join(stitch_helpers)
-        helper_aesop_list = _aesop_safe_rule_list(stitch_helpers[:8])
+        helper_aesop_list = _aesop_safe_rule_list(
+            stitch_helpers if complete else stitch_helpers[:8]
+        )
         add_lines(
             ("classical", f"solve_by_elim [{helper_list}]"),
             tactic=f"classical solve_by_elim [{helper_list}]",
@@ -1546,8 +1634,8 @@ def generate_tactic_candidates(
                     if triple_count >= MAX_STRUCTURAL_TRIPLE_CANDIDATES:
                         return
 
-    def add_helper_local_context_candidates() -> None:
-        local_helpers = helper_names[:HELPER_STITCH_LIMIT]
+    def add_helper_local_context_candidates(*, complete: bool = False) -> None:
+        local_helpers = helper_names if complete else helper_names[:HELPER_STITCH_LIMIT]
         if len(local_helpers) < 2:
             return
         have_lines = [
@@ -1556,7 +1644,9 @@ def generate_tactic_candidates(
         ]
         local_names = [f"h_mini_{i}" for i in range(len(local_helpers))]
         local_list = ", ".join(local_names)
-        local_aesop_list = _aesop_safe_rule_list(local_names[:8])
+        local_aesop_list = _aesop_safe_rule_list(
+            local_names if complete else local_names[:8]
+        )
         prefix_tactic = "; ".join(have_lines)
         for tactic in (
             f"solve_by_elim [{local_list}]",
@@ -1633,6 +1723,87 @@ def generate_tactic_candidates(
                     source="helper_intro_simpa",
                     helper=helper,
                 )
+
+    def add_complete_helper_families() -> None:
+        """Keep every helper eligible without enumerating helper combinations.
+
+        The early scripts preserve inexpensive recent-helper ordering. These
+        scripts delegate combinations to Lean and grow linearly with the helper
+        context. Each remains an ordinary independently checked portfolio item,
+        with the same continuation, timeout and proof-audit authority as the
+        early scripts. ``intros`` has no source-level telescope count cutoff.
+        """
+
+        if not helper_names:
+            return
+        add_helper_set_ext_stitch_candidates(complete=True)
+        add_helper_stitch_candidates(complete=True)
+        add_helper_local_context_candidates(complete=True)
+        helper_list = ", ".join(helper_names)
+        helper_aesop_list = _aesop_safe_rule_list(helper_names)
+        if needs_intro_candidate:
+            # The named positional prefix is intentionally cheap. Inference
+            # supplies every helper argument here, including long telescopes
+            # and helpers outside the early positional-application tranche.
+            add_lines(
+                ("intros", f"solve_by_elim [{helper_list}]"),
+                tactic=f"intros; solve_by_elim [{helper_list}]",
+                source="helper_stitch_solve_by_elim",
+            )
+            add_lines(
+                ("intros", "classical", f"aesop (add safe {helper_aesop_list})"),
+                tactic=f"intros; classical; aesop (add safe {helper_aesop_list})",
+                source="helper_stitch_aesop",
+            )
+        if len(helper_names) > HELPER_STRUCTURAL_LIMIT and "∨" in goal_text:
+            for side in ("left", "right"):
+                add_lines(
+                    ("intros", side, f"solve_by_elim [{helper_list}]"),
+                    tactic=f"intros; {side}; solve_by_elim [{helper_list}]",
+                    source="helper_structural_or",
+                )
+        if "∧" in goal_text:
+            # Explicit pair/triple guesses are just the cheap prefix. This
+            # leaves every conjunction leaf to inference over all helpers.
+            add_lines(
+                ("intros", "repeat' apply And.intro", f"all_goals solve_by_elim [{helper_list}]"),
+                tactic=f"intros; repeat' apply And.intro; all_goals solve_by_elim [{helper_list}]",
+                source="helper_structural_conjunction",
+            )
+
+        projection_lines: list[str] = []
+        projected_helpers: list[str] = []
+        for index, helper in enumerate(helper_names):
+            pattern, _ = _conjunction_destructuring_pattern(
+                helper_statements.get(helper, ""), prefix=f"h_mini_full_conj_{index}"
+            )
+            if not pattern:
+                continue
+            local_source = f"h_mini_full_source_{index}"
+            projection_lines.extend([
+                f"have {local_source} := {helper}",
+                f"try rcases {local_source} with {pattern}",
+            ])
+            projected_helpers.append(helper)
+        if projection_lines:
+            # A single shared destructuring prefix replaces the quadratic
+            # repetition of every other helper in one script per conjunction.
+            # Destructured leaves are local assumptions, which solve_by_elim
+            # already considers. A failed advisory pattern must not poison the
+            # other projections by naming locals that were never introduced.
+            fact_list = helper_list
+            add_lines(
+                (
+                    "intros", "classical", *projection_lines,
+                    "repeat' apply And.intro", f"all_goals solve_by_elim [{fact_list}]",
+                ),
+                tactic="; ".join([
+                    "intros", "classical", *projection_lines,
+                    "repeat' apply And.intro", f"all_goals solve_by_elim [{fact_list}]",
+                ]),
+                source="helper_stitch_conjunction_complete",
+                helper=",".join(projected_helpers),
+            )
 
     def add_direct_helper_preflight_candidates() -> None:
         """Try cheap direct helper closes before broad tactic portfolios."""
@@ -1714,6 +1885,7 @@ def generate_tactic_candidates(
         add(f"simpa using {helper}", source="helper_simpa", helper=helper)
     add_helper_structural_candidates()
     add_helper_local_context_candidates()
+    add_complete_helper_families()
 
     for helper in helper_names:
         add(f"simpa using {helper}", source="helper_simpa", helper=helper)
@@ -1745,8 +1917,8 @@ def generate_tactic_candidates(
     for tactic in ("ext <;> simp_all", "ext <;> norm_num at *"):
         add(tactic, source="structural_ext")
 
-    cap = max(0, int(max_candidates or 0))
-    bounded = candidates[:cap] if cap else []
+    cap = int(max_candidates or 0)
+    bounded = candidates if cap < 0 else candidates[:cap]
     if not batch_helper_applications:
         return bounded
     return [
@@ -1768,6 +1940,8 @@ def generate_source_specific_tactic_candidates(
 ) -> list[TacticCandidate]:
     """Generate candidates owned by source-specific lanes before mixed capping."""
 
+    if int(max_candidates or 0) == 0:
+        return []
     del helpers, suppress_solution_placeholders, opaque_mode
     del allow_official_answer_visibility
     del official_answer_payload_present
@@ -1799,12 +1973,12 @@ def generate_source_specific_tactic_candidates(
         for script in finset_reindexing_scripts(
             profile,
             needs_intro=needs_intro_candidate,
-            max_scripts=max(DEFAULT_MAX_CANDIDATES, int(max_candidates or 0)),
+            max_scripts=-1,
         ):
             add_lines(script.lines, tactic=script.tactic, source=script.source)
 
-    cap = max(0, int(max_candidates or 0))
-    return candidates[:cap] if cap else candidates
+    cap = int(max_candidates or 0)
+    return candidates if cap < 0 else candidates[:cap]
 
 
 def _merge_tactic_candidates(
@@ -2211,8 +2385,10 @@ class DeterministicTacticBackend:
             if str(prefix or "").strip()
         )
         reused_portfolio = candidate_portfolio is not None
-        if reused_portfolio:
-            candidates: Sequence[TacticCandidate] = tuple(candidate_portfolio or ())
+        if int(max_candidates or 0) == 0:
+            candidates: Sequence[TacticCandidate] = ()
+        elif reused_portfolio:
+            candidates = tuple(candidate_portfolio or ())
         else:
             generation_cap = int(max_candidates)
             generation_helpers = (
@@ -2226,17 +2402,14 @@ class DeterministicTacticBackend:
                     goal_statement,
                     generation_helpers,
                     source_prefixes=prefixes,
-                    max_candidates=max(
-                        DEFAULT_MAX_CANDIDATES,
-                        int(max_candidates or 0),
-                    ),
+                    max_candidates=-1,
                     suppress_solution_placeholders=suppress_solution_placeholders,
                     opaque_mode=opaque_mode,
                     allow_official_answer_visibility=allow_official_answer_visibility,
                     official_answer_payload_present=official_answer_payload_present,
                 )
             if (prefixes or excluded_prefixes) and generation_cap > 0:
-                generation_cap = max(generation_cap, DEFAULT_MAX_CANDIDATES)
+                generation_cap = -1
             candidates = generate_tactic_candidates(
                 goal_statement,
                 generation_helpers,
@@ -2873,7 +3046,8 @@ async def try_close_with_tactics(
             only for candidate generation. Lean replay still receives every
             declaration in ``helpers`` so dependent proof names remain valid.
         timeout_s: Total wall-clock budget for the candidate loop.
-        max_candidates: Deterministic cap on generated candidates.
+        max_candidates: Generated candidate limit; -1 keeps the complete portfolio,
+            0 disables generation, and a positive value selects a prefix.
         backend: Optional swappable backend, e.g. a future tactic_tree adapter.
         pattern_cache: Optional run-local cache that prioritizes tactics that
             already worked for the same normalized goal/preamble/helper set.

@@ -157,7 +157,18 @@ def canonicalize_contract_type_aliases(text: str) -> str:
 
 
 def compact_contract_surface(text: str) -> str:
-    """Discard only insignificant whitespace; preserve literals and tokens."""
+    """Collapse whitespace runs without joining executable Lean tokens.
+
+    The environment can register notation containing identifier prefixes,
+    operators, or delimiters. Without its token table, deleting even a single
+    whitespace boundary can change the proposition. Formatting equivalence
+    beyond this conservative surface key requires semantic evidence.
+    """
+    # Layout can be executable, including through environment-defined syntax.
+    # A keyword list cannot establish that a line break is presentation-only.
+    if "\n" in text or "\r" in text:
+        return text.strip()
+
     out: list[str] = []
     index = 0
     while index < len(text):
@@ -178,9 +189,7 @@ def compact_contract_surface(text: str) -> str:
         end = index + 1
         while end < len(text) and text[end].isspace():
             end += 1
-        if (out and end < len(text)
-                and (out[-1][-1].isalnum() or out[-1][-1] in "_'»")
-                and (text[end].isalnum() or text[end] in "_'«")):
+        if out and end < len(text) and out[-1] != " ":
             out.append(" ")
         index = end
     return "".join(out).strip()

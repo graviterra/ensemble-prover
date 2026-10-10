@@ -37,7 +37,7 @@ class RootTacticCloseAction:
         *,
         phase: str = "root_tactic_prepass",
         timeout_s: float = 40.0,
-        max_candidates: int = 64,
+        max_candidates: int = -1,
     ) -> None:
         self.phase = str(phase or "root_tactic_prepass")
         self.timeout_s = float(timeout_s or 0.0)
@@ -50,7 +50,7 @@ class RootTacticCloseAction:
 
 
     def is_applicable(self, session: Any) -> bool:
-        if self.timeout_s <= 0.0 or self.max_candidates <= 0:
+        if self.timeout_s <= 0.0 or self.max_candidates == 0:
             return False
         if session.dossier is None or session.lean is None:
             return False
@@ -119,7 +119,7 @@ class RootTacticCloseAction:
                     "tactic_timeout_s": str(
                         round(max(0.0, float(self.timeout_s or 0.0)), 3)
                     ),
-                    "max_candidates": str(max(0, int(self.max_candidates or 0))),
+                    "max_candidates": str(int(self.max_candidates or 0)),
                 },
                 finalize_root=False,
                 excluded_source_prefixes=excluded_source_prefixes,

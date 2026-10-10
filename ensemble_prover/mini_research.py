@@ -26,6 +26,7 @@ from typing import Any
 import uuid
 
 from .proof_dossier import canonical_dossier_statement_key
+from .prompt_page_text import prompt_page_text
 from .research_claims.native_guidance import is_proof_candidate
 
 _CURRENT: contextvars.ContextVar[Any] = contextvars.ContextVar("native_research_owner", default=None)
@@ -122,6 +123,27 @@ async def _checkpoint(session: Any) -> None:
         await registry.commit_session(session.checkpoint_lane_key, session)
 
 
+def _research_governor_clock(session: Any) -> dict[str, Any]:
+    """Bind overlap observations to one live clock, across checkpoint restores."""
+    clock = getattr(session, "_native_research_governor_clock", None)
+    if clock is None:
+        clock = {"identity": uuid.uuid4().hex, "restored_elapsed_s": None}
+        session._native_research_governor_clock = clock
+    return clock
+
+
+def _historical_governor_observation(session: Any, record: dict[str, Any], observed: float) -> float:
+    clock = _research_governor_clock(session)
+    restored = clock["restored_elapsed_s"]
+    if record.get("governor_clock_id") != clock["identity"] and restored is not None:
+        # Current-process startup/proof service cannot overlap a previous
+        # process's research. Later checkpoints retain each older clock's
+        # coverage rather than attributing intervening service to that clock.
+        coverage = clock.get("coverage_by_clock", {}).get(record.get("governor_clock_id"), restored)
+        return min(observed, coverage)
+    return observed
+
+
 def _grant_usage(run: dict[str, Any], grant: dict[str, Any]) -> tuple[int, bool]:
     """Bound an unfinished grant by subsequent funding, without guessed refunds."""
     if "used" in grant:
@@ -158,14 +180,10 @@ def _allowed(session: Any) -> bool:
 
 
 def _native_quantum_seconds(donor: Any) -> float:
-    """Size a finite research slice for the donated provider's normal latency.
+    """Size the admission slice, leaving dispatched generations to their owner.
 
-    A subscription reasoning request can legitimately need several minutes.
-    The former unconditional 120-second slice cancelled those requests before
-    they returned any usable answer, even under the parent's soft policy.
-    Provider timeouts are sizing hints here, not additional smaller hard caps:
-    the transport still enforces its own policy, and every existing donor or
-    parent hard limit takes precedence over this scheduling allowance.
+    Expiry yields before another request; it never cancels paid work by itself.
+    Transport watchdogs and explicit donor/parent hard bounds remain in force.
     """
     seconds = 600.0
     config = getattr(donor.client, "cfg", None)
@@ -573,6 +591,14 @@ class NativeResearchCoordinator:
                     release_capacity_reserve(session, "no_applicable_research")
             if reason is None:
                 return delivery_changed
+            if state.get("idle_research") is not None and not state.get("grant"):
+                try:
+                    if state["idle_research"] == self._idle_research_key(session):
+                        return delivery_changed
+                except (OSError, ValueError, RuntimeError, sqlite3.Error):
+                    # A failed optional readiness hint cannot suppress work.
+                    pass
+                state.pop("idle_research", None)
             state["last_trigger_work"] = {key: state[key] for key in (
                 "paid_actions", "requests_since_audit", "requests_since_verified_progress")}
             state["paid_actions"] = 0
@@ -591,6 +617,41 @@ class NativeResearchCoordinator:
                 _event(session, "research_unavailable", error_type=type(exc).__name__)
                 release_capacity_reserve(session, "research_unavailable")
                 return False
+
+    def _idle_research_key(self, session: Any) -> str | None:
+        """Wake an idle ledger for changed evidence, eligibility, or a due retry.
+
+        Project scheduling fields in SQLite rather than repeatedly decoding
+        archived transcripts just to decide that nothing has changed.
+        """
+        if self.store is None:
+            return None
+        now = time.time()
+        jobs = []
+        for row in self.store._connection.execute(
+            "SELECT job_id, status, json_extract(record, '$.turn'), "
+            "json_extract(record, '$.last_error'), json_extract(record, '$.response'), "
+            "json_array_length(record, '$.inbox'), "
+            "json_array_length(record, '$.late_research_candidates'), "
+            "json_extract(record, '$.retry_after') FROM discovery_jobs ORDER BY rowid"
+        ):
+            jobs.append([*row[:-1], row[-1], row[-1] is None or row[-1] <= now])
+        revisions = [tuple(row) for row in self.store._connection.execute(
+            "SELECT record_id, revision FROM frontier_records WHERE kind = 'campaign' ORDER BY record_id"
+        )]
+        timers = [(*row, row[-1] <= now) for row in self.store._connection.execute(
+            "SELECT frontier_records.record_id, timer.fullkey, timer.atom "
+            "FROM frontier_records, json_tree(frontier_records.record) AS timer "
+            "WHERE kind = 'campaign' AND timer.key IN ('waiting_until', 'expires_at') "
+            "AND timer.type IN ('integer', 'real') ORDER BY frontier_records.record_id, timer.fullkey"
+        )]
+        return _hash({
+            "target_context": self._target_context_binding(session.conv),
+            "proof_boundary": self._state(session).get("last_boundary"),
+            "proof_requests": self._state(session).get("requests_since_verified_progress"),
+            "objections": self._objections_for(session.conv),
+            "jobs": jobs, "frontier_revisions": revisions, "frontier_timers": timers,
+        })
 
     def _directory(self) -> Path:
         stable_root = getattr(self.registry, "registry_root", None)
@@ -757,6 +818,9 @@ class NativeResearchCoordinator:
         baselines.setdefault(context_binding, checkpoint)
         self.store.save_run(run)
         recorded_contexts = run.get("native_job_contexts", {})
+        from .research_claims.frontier.hooks import mode_of
+
+        adaptive = mode_of(run.get("strategy_review") or {}) == "adaptive"
         available = False
         for job in jobs.values():
             if (job["role"] not in {"research", "review"}
@@ -773,17 +837,29 @@ class NativeResearchCoordinator:
             job["native_target_claim_id"] = claim_id
             self.store.save_job(job)
 
+            control = job.get("research_control") or {}
+            deferred = adaptive and job["status"] == "waiting" and (
+                job.get("last_error") in {
+                    "research_control_deferred", "research_review_paused_operational",
+                    "research_review_lane_paused", "paused_operational", "retry_deadline", "retry_exhausted",
+                    "fairness", "suspended", "frontier_permit_required", "stale_permit_basis",
+                    "stale_frontier_scope", "formal_authority_revoked", "permit_expired", "claim_expired",
+                }
+                or control.get("phase_deferred") or control.get("waiting_for")
+            )
             self.loop._notify(job["job_id"], {
                 "native_proof_checkpoint": checkpoint,
                 "active_target": statement,
                 "instruction": "Read the exact checkpoint and answer its active target and objections. Audit the route, constants, hypotheses and ancestors. Search original sources for the bottleneck or counterexamples when relevant. Execute a discriminating check or a substantively different derivation. A proof, refuted strengthening, corrected intermediate statement, or precise unresolved obstruction is useful; a renamed plan is insufficient. Never weaken the original theorem or treat a refuted strengthening as a refutation of it.",
-            }, requires_response=True)
+            }, requires_response=not deferred)
             updated = self.store.job(job["job_id"])
             updated["native_proof_checkpoint"] = checkpoint
             self.store.save_job(updated)
             # Refresh evidence through the inbox, preserving the assigned
             # investigation (including a reviewer's discriminating follow-up).
-            available = available or updated["status"] in {"pending", "responded"}
+            # A new checkpoint is evidence, not a scheduling permit. The
+            # frontier owner wakes deferred jobs when their eligibility changes.
+            available = available or updated["status"] in {"pending", "responded", "waiting"}
         if not available:
             job = self.store.add_job(claim_id, question)
             job["native_target_claim_id"] = claim_id
@@ -904,7 +980,9 @@ class NativeResearchCoordinator:
             self.store.save_run(run)
 
     async def _investigate(self, session: Any, reason: str, *, background: bool = False) -> bool:
-        from .mini_research_budget import select_donor, debit_donor, release_capacity_reserve
+        from .mini_research_budget import (
+            select_donor, debit_donor, release_capacity_reserve, remaining_owner_seconds,
+        )
         state = self._state(session)
         grant = state.get("grant")
         donor = select_donor(session)
@@ -925,12 +1003,52 @@ class NativeResearchCoordinator:
                 run["native_active_target_claim_id"] = grant.get("target_claim_id", "native-root")
                 run["native_active_target_context_binding"] = grant.get("target_context_binding")
                 run["native_grant_requests"] = grant["requests"]
+                parent_remaining = remaining_owner_seconds(session)
+                if parent_remaining is not None:
+                    from .research_claims.native_deadline import (
+                        native_admission_deadline_only, paid_work_deadline,
+                    )
+
+                    # A restored response may settle after admission expires,
+                    # but its tools still obey the current recursive owner.
+                    prior_deadline = paid_work_deadline(run)
+                    parent_deadline = time.time() + parent_remaining
+                    deadline_field = (
+                        "native_grant_hard_deadline"
+                        if native_admission_deadline_only(run) else "deadline"
+                    )
+                    run[deadline_field] = (
+                        parent_deadline if prior_deadline is None
+                        else min(prior_deadline, parent_deadline)
+                    )
+                recovery_id = uuid.uuid4().hex
+                saved_grant.setdefault("recovery_intervals", {})[recovery_id] = {
+                    "governor_elapsed_at_start": float(getattr(session, "run_governor_elapsed_s", 0.0)),
+                    "governor_clock_id": _research_governor_clock(session)["identity"],
+                }
                 self.store.save_run(run)
-                await self.loop.advance_native(
-                    max_requests=0, timeout_s=1,
-                    target_claim_id=grant.get("target_claim_id", "native-root"),
-                )
-            self._reconcile(session, grant, interrupted=True)
+                recovery_started = time.monotonic()
+                try:
+                    await self.loop.advance_native(
+                        max_requests=0, timeout_s=1,
+                        target_claim_id=grant.get("target_claim_id", "native-root"),
+                    )
+                finally:
+                    # Persist measured replay service before touching the
+                    # session checkpoint. A killed process leaves the empty
+                    # intent above, which retains conservative accounting.
+                    recovery_elapsed = max(0.0, time.monotonic() - recovery_started)
+                    with self.store.atomic():
+                        recovered_run = self.store.run_record()
+                        interval = recovered_run["native_grants"][grant["id"]]["recovery_intervals"][recovery_id]
+                        interval["elapsed_s"] = recovery_elapsed
+                        self.store.save_run(recovered_run)
+                    accrue = getattr(session, "_accrue_run_governor_elapsed", None)
+                    if callable(accrue):
+                        accrue()
+                    self._reconcile(session, grant, interrupted=True, recovery_id=recovery_id)
+            else:
+                self._reconcile(session, grant, interrupted=True)
             self._settle_answered_objections(session, grant)
             state["grant"] = None
             await _checkpoint(session)
@@ -984,8 +1102,15 @@ class NativeResearchCoordinator:
         timeout = min(timeout, _native_quantum_seconds(donor))
         grant["expires_at"] = time.time() + timeout
         grant["seconds"] = timeout
+        grant["reserved_seconds"] = donor.remaining_seconds if donor.remaining_seconds is not None else timeout
+        grant["deadline_policy"] = "admission_only"
+        grant["hard_expires_at"] = (
+            time.time() + donor.remaining_seconds
+            if donor.remaining_seconds is not None else None
+        )
         grant["background"] = background
         grant["governor_elapsed_at_start"] = float(getattr(session, "run_governor_elapsed_s", 0.0))
+        grant["governor_clock_id"] = _research_governor_clock(session)["identity"]
         state["grant"] = grant
         # The budget debit and unique grant id precede every external request.
         await _checkpoint(session)
@@ -1018,6 +1143,8 @@ class NativeResearchCoordinator:
             run.update(max_requests=run["requests_used"] + grant["requests"],
                        started_at=run.get("started_at") or time.time(), deadline=grant["expires_at"],
                        max_seconds=timeout, request_timeout_s=timeout, status="running",
+                       native_grant_deadline_policy=grant["deadline_policy"],
+                       native_grant_hard_deadline=grant["hard_expires_at"],
                        native_active_target_claim_id=claim_id,
                        native_active_target_context_binding=grant["target_context_binding"],
                        native_grant_requests=grant["requests"])
@@ -1033,9 +1160,20 @@ class NativeResearchCoordinator:
         _event(session, "research_started", reason=reason, grant_id=grant["id"],
                requests=grant["requests"], timeout_s=timeout, ledger=str(self.store.directory))
         remaining = grant["expires_at"] - time.time()
-        parent_remaining = getattr(session, "_run_governor_remaining_s", lambda: None)()
+        parent_remaining = remaining_owner_seconds(session)
         if parent_remaining is not None:
             remaining = min(remaining, parent_remaining)
+            parent_deadline = time.time() + max(0.0, parent_remaining)
+            hard_deadline = grant["hard_expires_at"]
+            if hard_deadline is None or parent_deadline < hard_deadline:
+                # Checkpoint awaits can consume parent time. Tighten the same
+                # durable hard bound; never replenish the donor's allowance.
+                grant["hard_expires_at"] = parent_deadline
+                with self.store.atomic():
+                    run = self.store.run_record()
+                    run["native_grant_hard_deadline"] = parent_deadline
+                    run["native_grants"][grant["id"]]["hard_expires_at"] = parent_deadline
+                    self.store.save_run(run)
         permitted = _allowed(session)
         pending: dict[str, Any] = {
             "session": session, "donor": donor, "grant": grant, "elapsed": 0.0,
@@ -1110,7 +1248,7 @@ class NativeResearchCoordinator:
                 await asyncio.gather(planner_wait, return_exceptions=True)
 
     async def _settle_pending(self, session: Any, *, wait: bool = False,
-                              deliver: bool = True) -> bool:
+                              deliver: bool = True, checkpoint: bool = True) -> bool:
         """Apply a completed ledger round only at its session's settled boundary."""
         from .mini_research_budget import charge_elapsed
 
@@ -1155,13 +1293,21 @@ class NativeResearchCoordinator:
                 self._settle_answered_objections(session, grant)
                 if deliver and _allowed(session):
                     self._deliver(session)
+                if (result.get("reason") in {"no_ready_work", "research_allocation_deferred"}
+                        and result.get("paid_dispatches", 0) == 0
+                        and not result.get("renewed_grant_can_resume", False)):
+                    state["idle_research"] = self._idle_research_key(session)
+                else:
+                    state.pop("idle_research", None)
                 pending["settlement_stage"] = "checkpoint"
-                await _checkpoint(session)
+                if checkpoint:
+                    await _checkpoint(session)
                 self._pending = None
         research_outcome = result.get("reason", "unknown")
         if research_outcome in {"quantum_timeout", "deadline_exhausted", "parent_deadline_exhausted"}:
             _event(session, "research_timed_out", reason=research_outcome,
-                   timeout_s=grant["seconds"], paid_dispatches=result.get("paid_dispatches", 0),
+                   timeout_s=grant.get("reserved_seconds", grant["seconds"]),
+                   admission_slice_s=grant["seconds"], paid_dispatches=result.get("paid_dispatches", 0),
                    guidance_available=bool(self.guidance))
         _event(session, "research_round_complete", reason=research_outcome,
                research_round=state["rounds"], research_elapsed_s=elapsed,
@@ -1170,6 +1316,61 @@ class NativeResearchCoordinator:
         _event(session, "proof_resumed", research_round=state["rounds"],
                research_outcome=research_outcome, guidance_available=bool(self.guidance))
         return self._guidance_for(session.conv) is not None
+
+    async def settle_session_before_rebind(self, session: Any, *, abandoned: bool = False) -> None:
+        """Preserve funded research before replacing its exact session owner.
+
+        Healthy service slices keep the same owner and do not call this. A
+        capability replacement waits for the original research grant, then
+        checkpoints its advice and charges before the old session is copied.
+        Cancelling this wait leaves ownership with the old session.
+        """
+        async with self.lock:
+            if not self.has_pending(session):
+                return
+            pending = self._pending
+            task = pending["task"]
+            if not task.done():
+                grant = pending.get("grant", {})
+                admission_only = grant.get("deadline_policy") == "admission_only"
+                if not admission_only and grant.get("expires_at") is None:
+                    raise ValueError("Pending research rebind has no admitted deadline")
+                deadline = (
+                    grant["hard_expires_at"]
+                    if admission_only
+                    else grant.get("expires_at")
+                )
+                if (deadline is None and not admission_only) or (
+                    deadline is not None and (
+                        type(deadline) not in {int, float}
+                        or not math.isfinite(deadline) or deadline <= 0
+                    )
+                ):
+                    raise ValueError("Pending research rebind has an invalid hard deadline")
+                remaining = None if deadline is None else max(0.0, deadline - time.time())
+                governor_remaining = getattr(session, "_run_governor_remaining_s", lambda: None)()
+                if governor_remaining is not None:
+                    governor_remaining = max(0.0, governor_remaining)
+                    remaining = governor_remaining if remaining is None else min(remaining, governor_remaining)
+                ancestor_deadline = float(getattr(session, "recursive_elapsed_deadline_epoch_s", 0.0) or 0.0)
+                if ancestor_deadline > 0:
+                    ancestor_remaining = max(0.0, ancestor_deadline - time.time())
+                    remaining = ancestor_remaining if remaining is None else min(remaining, ancestor_remaining)
+                # asyncio.wait does not forward cancellation to paid work.
+                await asyncio.wait({task}, timeout=remaining)
+                if not task.done():
+                    task.cancel()
+                    cleanup_s = max(0.001, float(getattr(session, "recursive_helper_cleanup_timeout_s", 1.0) or 1.0))
+                    await asyncio.wait({task}, timeout=cleanup_s)
+                    if not task.done():
+                        raise RuntimeError("Pending research did not settle before session rebind")
+            # An abandoned child can settle only physical research accounting;
+            # its mutable proof state cannot become a replacement checkpoint.
+            # The research ledger keeps the completed result for fresh replay.
+            await self._settle_pending(session, wait=True, deliver=not abandoned,
+                                       checkpoint=not abandoned)
+            if self.has_pending(session):
+                raise RuntimeError("Research settlement retained its old session owner")
 
     async def release_session(self, session: Any) -> None:
         """Fence and reap this session's research before it leaves ownership."""
@@ -1203,7 +1404,8 @@ class NativeResearchCoordinator:
         self.donor_key = key
 
     def _reconcile(self, session: Any, grant: dict[str, Any], *,
-                   elapsed_s: float | None = None, interrupted: bool = False) -> None:
+                   elapsed_s: float | None = None, interrupted: bool = False,
+                   recovery_id: str | None = None) -> None:
         with self.store.atomic():
             run = self.store.run_record()
             saved = run["native_grants"].get(grant["id"])
@@ -1241,32 +1443,56 @@ class NativeResearchCoordinator:
                 if elapsed_s is not None:
                     saved["elapsed_s"] = elapsed_s
                 if interrupted:
-                    # A killed process cannot report its precise active duration.
-                    # Charge its bounded reserved time rather than renew it.
-                    elapsed = saved.get("elapsed_s", grant.get("seconds", 0.0))
-                    uncharged = max(0.0, elapsed - grant.get("elapsed_accounted", 0.0))
-                    budget = session.budgets[grant["action_id"]]
-                    if "elapsed_s" in saved:
-                        from .mini_research_budget import restore_elapsed
+                    from .mini_research_budget import reconcile_recovery_elapsed
 
-                        previously_charged = budget.total_seconds
-                        restore_elapsed(
-                            session, grant["action_id"], uncharged,
-                            execution_id=grant["id"], cumulative_seconds=elapsed,
-                        )
-                        uncharged = budget.total_seconds - previously_charged
-                    else:
-                        # This preserves the conservative admission debit,
-                        # while distinguishing it from measured service.
-                        budget.consume_elapsed(uncharged)
-                        budget.historical_execution_cost_incomplete = True
+                    previous = grant.get("elapsed_accounted", 0.0)
+                    # Budget observations may fail after the resource debit.
+                    # Freeze the old marker's original-governor meaning before
+                    # the cumulative debit begins to include replay service.
+                    grant.setdefault("original_governor_accounted", previous)
+                    reconcile_recovery_elapsed(session, grant, saved)
+                    intervals = saved.get("recovery_intervals", {})
+                    original_elapsed = saved.get("elapsed_s", saved.get(
+                        "reserved_seconds", grant.get("reserved_seconds", grant.get("seconds", 0.0)),
+                    ))
+                    if any("elapsed_s" not in interval for interval in intervals.values()):
+                        original_elapsed = max(original_elapsed, saved.get(
+                            "reserved_seconds", grant.get("reserved_seconds", grant.get("seconds", 0.0)),
+                        ))
+                    original_previous = grant.get("original_governor_accounted", previous)
+                    uncharged = max(0.0, original_elapsed - original_previous)
                     current_elapsed = float(getattr(session, "run_governor_elapsed_s", 0))
+                    observed_elapsed = current_elapsed
+                    historical_observed = (
+                        intervals[recovery_id]["governor_elapsed_at_start"]
+                        if recovery_id is not None else observed_elapsed
+                    )
+                    recovery_accounted = grant.setdefault("recovery_governor_accounted", {})
+                    before_recovery = min([historical_observed, *(
+                        interval["governor_elapsed_at_start"]
+                        for interval_id, interval in intervals.items()
+                        if ("elapsed_s" not in interval
+                            or interval["elapsed_s"] > recovery_accounted.get(interval_id, 0.0))
+                    )])
+                    before_recovery = _historical_governor_observation(session, grant, before_recovery)
                     overlap = (
-                        max(0.0, current_elapsed - grant["governor_elapsed_at_start"])
+                        max(0.0, before_recovery - grant["governor_elapsed_at_start"])
                         if grant.get("background") and "governor_elapsed_at_start" in grant else 0.0
                     )
                     session.run_governor_elapsed_s = current_elapsed + max(0.0, uncharged - overlap)
-                    grant["elapsed_accounted"] = elapsed
+                    grant["original_governor_accounted"] = max(original_elapsed, original_previous)
+                    for interval_id, interval in intervals.items():
+                        if "elapsed_s" not in interval:
+                            continue
+                        elapsed = interval["elapsed_s"]
+                        missing = max(0.0, elapsed - recovery_accounted.get(interval_id, 0.0))
+                        # Restoring historical cost above is not current
+                        # execution overlapping this foreground replay.
+                        observed = observed_elapsed if interval_id == recovery_id else historical_observed
+                        observed = _historical_governor_observation(session, interval, observed)
+                        overlap = max(0.0, observed - interval["governor_elapsed_at_start"])
+                        session.run_governor_elapsed_s += max(0.0, missing - overlap)
+                        recovery_accounted[interval_id] = elapsed
                 saved.update(used=used, closed=True)
                 # Release only a modern, fenced grant with authoritative zero
                 # exposure. The session checkpoint records the release too;
@@ -1476,6 +1702,30 @@ class NativeResearchCoordinator:
             self.temporary.cleanup()
 
 
+def record_native_proof_work(session: Any, outcome: Any) -> None:
+    """Seal work accounting with its applied action, without dispatching research.
+
+    Only the scheduler's applied outcome ledger supplies accounting authority.
+    A subsequent research boundary reuses the same receipt, including after a
+    checkpoint restart, so publication and audit cadence cannot diverge.
+    """
+    owner = current_native_research()
+    if owner is None or not getattr(owner, "active", False) or not _allowed(session):
+        return
+    metadata = getattr(outcome, "metadata", {}) or {}
+    dispatch_id = str(metadata.get("action_dispatch_id") or "").strip()
+    committed = getattr(session, "_applied_action_dispatch_outcomes", {}).get(dispatch_id)
+    if committed is None:
+        return
+    try:
+        owner._account_proof_work(session, owner._state(session), committed)
+    except ValueError as exc:
+        from .mini_research_budget import release_capacity_reserve
+
+        release_capacity_reserve(session, "research_unavailable")
+        _event(session, "research_unavailable", error_type=type(exc).__name__)
+
+
 async def maybe_research(session: Any, outcome: Any = None, *, frontier_exhausted: bool = False) -> bool:
     owner = current_native_research()
     if owner is None:
@@ -1557,7 +1807,17 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
             )}
         if owner.store is None:
             raise ValueError("no native research artifacts yet")
-        return read_page(owner.store, **payload)
+        from .mini_policy import _conversation_should_redact_solution_refs
+
+        redact = _conversation_should_redact_solution_refs(conv)
+
+        def prompt_text(content: str) -> str:
+            return prompt_page_text(content, redact_solution_refs=redact)
+
+        # Apply the current policy before slicing: a reference can cross a
+        # page boundary. Page identities and offsets describe the visible text;
+        # the original research artifact remains available in the archive.
+        return read_page(owner.store, text_transform=prompt_text, **payload)
     if name != "request_native_research":
         raise ValueError("unknown native research tool")
     object_fields(payload, {"statement", "reason", "evidence_artifact_ids"}, {"statement", "reason"}, name)

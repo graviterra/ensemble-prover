@@ -179,8 +179,8 @@ class GraphRecursiveDecomposeAction:
     FRONTIER_ACTION_FAMILY: ClassVar[str] = "graph_recursive_decompose"
     SELECTED_FRONTIER_PRECHECK: ClassVar[bool] = True
 
-    DEFAULT_MAX_INVOCATIONS: ClassVar[int] = 6
-    DEFAULT_MAX_HELPER_ONLY_PASSES_PER_OBLIGATION: ClassVar[int] = 1
+    DEFAULT_MAX_INVOCATIONS: ClassVar[int] = -1
+    DEFAULT_MAX_HELPER_ONLY_PASSES_PER_OBLIGATION: ClassVar[int] = -1
     FAILED_DISPATCH_DURABLE_STATE_FIELDS: ClassVar[FrozenSet[str]] = frozenset(
         {"_recursive_driver_state"}
     )
@@ -250,19 +250,19 @@ class GraphRecursiveDecomposeAction:
         repair_retrieval_top_k: int = 6,
         proof_state_child_tactics_enabled: bool = False,
         proof_state_child_tactic_timeout_s: float = DEFAULT_PROOF_STATE_CHILD_TACTIC_TIMEOUT_S,
-        proof_state_child_tactic_max_candidates: int = 32,
+        proof_state_child_tactic_max_candidates: int = -1,
         root_tactic_timeout_s: float = 40.0,
-        root_tactic_max_candidates: int = 64,
+        root_tactic_max_candidates: int = -1,
         proof_state_child_goal_limit: int = 3,
         proof_state_decl_application_limit: int = 6,
         proof_state_batch_parallelism: int = 1,
-        max_recursion_depth: int = 2,
+        max_recursion_depth: int = 0,
         max_invocations: int = DEFAULT_MAX_INVOCATIONS,
         max_helper_only_passes_per_obligation: int = (
             DEFAULT_MAX_HELPER_ONLY_PASSES_PER_OBLIGATION
         ),
         min_statement_length: int = 20,
-        max_internal_turns: int = 20,
+        max_internal_turns: int = 0,
     ) -> None:
         self.id = str(action_id or "graph_recursive_decompose")
         self.priority = int(priority)
@@ -293,11 +293,8 @@ class GraphRecursiveDecomposeAction:
         )
         self.proof_state_batch_parallelism = int(proof_state_batch_parallelism or 1)
         self.max_recursion_depth = max(0, int(max_recursion_depth or 0))
-        self.max_invocations = max(0, int(max_invocations or 0))
-        self.max_helper_only_passes_per_obligation = max(
-            0,
-            int(max_helper_only_passes_per_obligation or 0),
-        )
+        self.max_invocations = int(max_invocations)
+        self.max_helper_only_passes_per_obligation = int(max_helper_only_passes_per_obligation)
         self.min_statement_length = max(0, int(min_statement_length or 0))
         try:
             configured_subpass_turn_capacity = max(
@@ -314,10 +311,9 @@ class GraphRecursiveDecomposeAction:
         # complete, explicitly bounded pass; otherwise production's 20-claim
         # configuration rejects the action before ``run`` and silently removes
         # this proof family from the scheduler.
-        self.max_internal_turns = max(
-            1,
-            int(max_internal_turns or 1),
-            configured_subpass_turn_capacity,
+        self.max_internal_turns = (
+            max(int(max_internal_turns), configured_subpass_turn_capacity)
+            if int(max_internal_turns) > 0 else 0
         )
         # Search-continuation accounting uses this explicit attribute rather
         # than ``budget_attr``: the latter also participates in unrelated
@@ -347,7 +343,7 @@ class GraphRecursiveDecomposeAction:
             elif broker is not None:
                 broker.acknowledge(identity)
         self._planner_job_receipt_identities = retained
-        if planner_pending:
+        if planner_pending or outcome.metadata.get("child_service_yielded"):
             return
         self._nested_execution_frame = {}
         self._recursive_driver_state = {}
@@ -394,7 +390,7 @@ class GraphRecursiveDecomposeAction:
 
     def _decrement_budget(self, session: Any) -> None:
         remaining = self._budget_remaining(session)
-        session.graph_recursive_decompose_remaining = max(0, remaining - 1)
+        session.graph_recursive_decompose_remaining = -1 if remaining < 0 else max(0, remaining - 1)
 
     def _recover_inflight_reservation(self, session: Any) -> int:
         """Restore a graph-recursive sub-pass interrupted after checkpoint."""
@@ -413,7 +409,7 @@ class GraphRecursiveDecomposeAction:
         current = int(
             getattr(session, "graph_recursive_decompose_remaining", 0) or 0
         )
-        session.graph_recursive_decompose_remaining = current + reserved
+        session.graph_recursive_decompose_remaining = -1 if current < 0 else current + reserved
 
         ancestor_key = str(record.get("ancestor_key") or "").strip()
         stack = getattr(session, "graph_recursive_decompose_stack", None)
@@ -1246,18 +1242,20 @@ class GraphRecursiveDecomposeAction:
     def _scale_sub_config(
         self, depth: int, ancestor_keys: Optional[Sequence[str]] = None,
     ) -> Any:
-        """Return a config for the recursive sub-pass with reduced budgets."""
+        """Keep one dispatch pass while preserving uncapped claim capacity."""
         base = self.config
         if base is None:
             return None
-        # Clamp passes to 1 — sub-pass must not iterate. Reduce max_claims by
-        # depth so deeper recursion produces fewer sub-claims (geometric
-        # backoff bounds total internal turns).
+        # A graph dispatch owns one pass. An explicit finite claim policy
+        # retains its depth scaling; unlimited capacity stays unlimited.
         try:
-            current_claims = int(getattr(base, "max_claims", 4) or 4)
+            current_claims = int(getattr(base, "max_claims", -1))
         except Exception:
-            current_claims = 4
-        scaled_claims = max(1, current_claims - max(0, depth))
+            current_claims = -1
+        scaled_claims = (
+            current_claims if current_claims <= 0
+            else max(1, current_claims - max(0, depth))
+        )
         try:
             scaled = dataclass_replace(base, passes=1, max_claims=scaled_claims)
         except Exception:
@@ -1268,9 +1266,11 @@ class GraphRecursiveDecomposeAction:
 
     def _internal_turn_budget_exceeded(self, depth: int) -> bool:
         cfg = self._scale_sub_config(depth)
-        if cfg is None:
+        if cfg is None or self.max_internal_turns <= 0:
             return False
         try:
+            if any(int(getattr(cfg, key, 1)) < 0 for key in ("passes", "max_claims", "turns_per_claim")):
+                return True
             passes = max(1, int(getattr(cfg, "passes", 1) or 1))
             claims = max(1, int(getattr(cfg, "max_claims", 1) or 1))
             turns = max(1, int(getattr(cfg, "turns_per_claim", 1) or 1))
@@ -1282,7 +1282,12 @@ class GraphRecursiveDecomposeAction:
     # Public action protocol.
     # ---------------------------------------------------------------------
 
+    def should_yield_static_dispatch(self, session: Any) -> bool:
+        return bool(self._recursive_driver_state.pop("yield_to_parent", False))
+
     def is_applicable(self, session: Any) -> bool:
+        if int(getattr(self.config, "max_claims", -1)) == 0:
+            return False
         if self._pending_planner_job_launch is not None:
             return False
         pending_identity = self._recursive_driver_state.get(
@@ -1328,8 +1333,9 @@ class GraphRecursiveDecomposeAction:
         if obligation is None:
             return False
         available_passes = self._budget_remaining(session)
-        available_passes += self._inflight_reserved_passes(session)
-        if available_passes <= 0:
+        if available_passes >= 0:
+            available_passes += self._inflight_reserved_passes(session)
+        if available_passes == 0:
             self._bump_metric(
                 session, "mini_session_graph_recursive_decompose_budget_exhausted"
             )
@@ -1608,12 +1614,7 @@ class GraphRecursiveDecomposeAction:
         started = time.monotonic()
         self._recover_inflight_reservation(session)
         graph = self._graph(session)
-        pending_target = (
-            self._recursive_driver_state.get("graph_recursive_target")
-            if str(self._recursive_driver_state.get("phase") or "")
-            == "planner_job_pending"
-            else None
-        )
+        pending_target = self._recursive_driver_state.get("graph_recursive_target")
         saved_work_record = (
             dict(pending_target.get("work_item_record") or {})
             if isinstance(pending_target, dict)
@@ -2051,11 +2052,11 @@ class GraphRecursiveDecomposeAction:
                 else True
             )
         )
-        raw_recursive_helper_max_depth = getattr(session, "max_recursion_depth", 3)
+        raw_recursive_helper_max_depth = getattr(session, "max_recursion_depth", 0)
         recursive_helper_max_depth = int(
             raw_recursive_helper_max_depth
             if raw_recursive_helper_max_depth is not None
-            else 3
+            else 0
         )
         recursive_helper_depth = int(getattr(session, "recursion_depth", 0) or 0)
         if self.max_recursion_depth > 0:
@@ -2276,13 +2277,13 @@ class GraphRecursiveDecomposeAction:
                 recursive_helper_prover_enabled=recursive_helper_enabled,
                 recursive_helper_max_depth=recursive_helper_max_depth,
                 recursive_helper_max_attempts_per_node=int(
-                    getattr(recursive_helper_action, "max_attempts_per_node", 2)
-                    if getattr(recursive_helper_action, "max_attempts_per_node", 2)
+                    getattr(recursive_helper_action, "max_attempts_per_node", 0)
+                    if getattr(recursive_helper_action, "max_attempts_per_node", 0)
                     is not None
-                    else 2
+                    else 0
                 ),
                 recursive_helper_turns=int(
-                    getattr(recursive_helper_action, "helper_turns", 5) or 5
+                    getattr(recursive_helper_action, "helper_turns", -1)
                 ),
                 recursive_helper_refine=bool(
                     getattr(recursive_helper_action, "refine_enabled", False)
@@ -2327,6 +2328,36 @@ class GraphRecursiveDecomposeAction:
                 planner_frontier_signature=recursive_attempt_context_hash,
                 planner_owner_lane_id=f"{self.id}:{obligation_id}",
             )
+            if getattr(result, "failure_reason", "") == "recursive_child_service_yield":
+                sub_pass_interrupted = True
+                self._checkpoint_graph_subpass_context = graph_subpass_checkpoint_context()
+                from ..session import _dispatch_capability_generation_nonce
+                self._suspended_graph_subpass_dossier = (
+                    (id(getattr(session, "checkpoint_registry", None)),
+                     str(getattr(session, "session_activation_id", "")),
+                     _dispatch_capability_generation_nonce(session.lean)),
+                    self._checkpoint_graph_subpass_context, sub_dossier,
+                )
+                self._recursive_driver_state.update(
+                    yield_to_parent=True,
+                    graph_recursive_target={
+                        "obligation_id": obligation_id, "statement_key": ancestor_key,
+                        "statement_hash": text_hash(statement), "child_branch_key": child_branch_key,
+                        "work_item_record": copy.deepcopy(dict(selected_work_record)),
+                    },
+                )
+                return MiniOutcome(
+                    action_id=self.id, solved=False, proof=None,
+                    helpers_added=tuple(merged_helper_names), progress=bool(merged_helper_names),
+                    cost_seconds=max(0.0, time.monotonic() - started),
+                    metadata={
+                        "verdict": "recursive_child_service_yield", "child_service_yielded": True,
+                        "preserve_action_budget": True, "preserve_frontier_work": True,
+                        "preserve_selected_frontier_action": True, "iteration_neutral": True,
+                        "scheduler_neutral": True, "stagnation_neutral": True,
+                        "hard_pivot_neutral": True, "strong_progress": False,
+                    },
+                )
         except PlannerJobYield as pending:
             # This allocation has reached raw provider I/O but has not
             # completed its mathematical transaction. Re-credit the local

@@ -438,7 +438,7 @@ class GraphRootReplanAction(RecursiveControllerAction):
                 or self._recursive_driver_state.get("phase") == "planner_job_pending"
                 or self.id in getattr(session, "recursive_inflight_reservations", {})
                 or (budget is not None and budget.exhausted())
-                or int(getattr(session, self.budget_attr, 0) or 0) <= 0
+                or int(getattr(session, self.budget_attr, 0) or 0) == 0
                 or self.run_conversation_fn is None
                 or not getattr(session.conv, "allow_helper_decomposition", True)):
             return False

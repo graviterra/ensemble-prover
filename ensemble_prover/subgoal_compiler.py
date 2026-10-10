@@ -509,8 +509,8 @@ def build_subgoal_variants(
     *,
     root_statement: str,
     goal_state: Optional[LeanGoalState] = None,
-    max_prefix_chars: int = 600,
-    max_variants: int = 4,
+    max_prefix_chars: int = 0,
+    max_variants: int = -1,
 ) -> List[SubgoalVariant]:
     """Generate context-closed variants for a candidate subgoal."""
     root_binders = expand_relation_forall_binders(root_statement or "")
@@ -630,7 +630,7 @@ def build_subgoal_variants(
         _add(base, "raw")
     else:
         _add(base, "raw")
-    limit = max(1, int(max_variants))
+    limit = int(max_variants)
     if authored_base != base:
         _add(authored_base, "raw")
         if limit >= 2 and len(candidates) > limit:
@@ -639,4 +639,4 @@ def build_subgoal_variants(
                 if candidate.statement == authored_base
             )
             return [*candidates[:limit - 1], authored]
-    return candidates[:limit]
+    return candidates if limit < 0 else candidates[:limit]
