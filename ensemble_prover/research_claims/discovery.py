@@ -16,7 +16,9 @@ import uuid
 from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, TypedDict
+
+from ..provider_tool_protocol import MiniRequestEnvelopePolicy
 
 from .discovery_store import AdmissionStopped, DiscoveryStore, provider_routes
 from .experiments import PythonSandbox
@@ -36,6 +38,13 @@ from .strategy_discovery import SYSTEM as STRATEGY_SYSTEM
 from .strategy import StrategyYield
 from .native_deadline import native_admission_deadline_only, paid_work_deadline, paid_response_deadline
 from .literature import FIELDS as LITERATURE_FIELDS, INSTRUCTIONS as LITERATURE_INSTRUCTIONS, LiteratureTools, source_context
+
+
+class _ResearchRequestOptions(TypedDict, total=False):
+    response_format: str | None
+    max_tokens_override: MiniRequestEnvelopePolicy
+    reasoning_effort_override: None
+    required_keywords: tuple[str, ...]
 
 
 SYSTEM = """You are a mathematical research worker in Ensemble Prover.
@@ -737,13 +746,11 @@ class DiscoveryLoop:
                         )
                         if self.native_mode else None
                     )
-                    request_kwargs = {"response_format": response_format}
+                    request_kwargs: _ResearchRequestOptions = {"response_format": response_format}
                     if request_policy is not None:
-                        request_kwargs.update(
-                            max_tokens_override=request_policy,
-                            reasoning_effort_override=None,
-                            required_keywords=("max_tokens_override", "reasoning_effort_override"),
-                        )
+                        request_kwargs["max_tokens_override"] = request_policy
+                        request_kwargs["reasoning_effort_override"] = None
+                        request_kwargs["required_keywords"] = ("max_tokens_override", "reasoning_effort_override")
                     if self.cost_controller is None:
                         operation = (
                             call_with_optional_usage_callback(client.chat_raw, messages, **request_kwargs)
@@ -931,10 +938,10 @@ class DiscoveryLoop:
                     elif exc.reason == "global_limit":
                         current.update(status="waiting", strategy_capacity_wait=True)
                         self.store.save_job(current)
-                    elif exc.reason.startswith("research_"):
+                    elif exc.reason.startswith("research_") and self.strategy is not None:
                         self.strategy.research.handle_yield(current, exc.reason)
                         current = self.store.job(current["job_id"])
-                    elif exc.reason in {
+                    elif self.strategy is not None and exc.reason in {
                         "fairness", "suspended", "frontier_permit_required", "paused_operational",
                         "stale_permit_basis", "stale_frontier_scope", "formal_authority_revoked",
                         "permit_expired", "claim_expired", "retry_exhausted", "retry_deadline",
@@ -1276,7 +1283,7 @@ class DiscoveryLoop:
                 # This transaction cannot change the route during validation.
                 # Load its job history once: each saved inbox can itself hold
                 # the full transfer history, making per-hop reloads costly.
-                if context_jobs is None:
+                if context_jobs is None or context_run is None:
                     context_jobs = {job["job_id"]: job for job in self.store.jobs()}
                     context_run = self.store.run_record(scheduling=True)
                 successor = self._context_notification_successor(
@@ -1411,7 +1418,7 @@ class DiscoveryLoop:
                             approach = (campaign or {}).get("approaches", {}).get(job.get("frontier_approach_id", ""), {})
                             question = (campaign or {}).get("questions", {}).get(approach.get("question_id", ""), {})
                             route = (campaign or {}).get("routes", {}).get(approach.get("route_id", ""), {})
-                            if (not paid or not approach
+                            if (not paid or not approach or campaign is None
                                     or binding.get("root_binding") != campaign["root"]["binding"]
                                     or binding.get("approach_id") != approach["approach_id"]
                                     or binding.get("question_id") != question.get("question_id")
@@ -1899,7 +1906,7 @@ class DiscoveryLoop:
             self.store.authorize(job["job_id"], job["turn"])
             self._emit("provider_dispatch", job)
 
-        result = None
+        result: dict[str, Any] | None = None
         lease = None
         try:
             lease = self.strategy.prepare_proof(job) if self.strategy is not None else None
@@ -1916,10 +1923,19 @@ class DiscoveryLoop:
 
             if lease is not None:
                 timeout = min(timeout, max(0.001, lease["expires_at"] - time.time()))
-            admission = bind_strategy(self.strategy.controller, lease) if lease is not None else provider_dispatch_guard(authorize)
-            with admission as runtime:
-                result = await runtime.run_operation(self.proof_runner.advance(job), timeout=timeout,
-                    on_late_result=lambda value: self._accept_late_proof(job["job_id"], value)) if lease is not None else await asyncio.wait_for(self.proof_runner.advance(job), timeout=timeout)
+            if lease is not None:
+                if self.strategy is None:
+                    raise RuntimeError("formalization lease has no strategy owner")
+                with bind_strategy(self.strategy.controller, lease) as runtime:
+                    result = await runtime.run_operation(
+                        self.proof_runner.advance(job), timeout=timeout,
+                        on_late_result=lambda value: self._accept_late_proof(job["job_id"], value),
+                    )
+            else:
+                with provider_dispatch_guard(authorize):
+                    result = await asyncio.wait_for(self.proof_runner.advance(job), timeout=timeout)
+            if not isinstance(result, dict):
+                raise ValueError("formalization runner returned an invalid result")
             if not self._formalization_turn_current(job):
                 return
             if self.strategy is not None and result["status"] == "yielded_for_review":
@@ -1932,7 +1948,7 @@ class DiscoveryLoop:
                     return
             if result["status"] == "proved":
                 validate_receipt(self.store, job, result.get("receipt"))
-            if lease is not None:
+            if lease is not None and self.strategy is not None:
                 self.strategy.controller.finish_interval(lease)
             with self.store.atomic():
                 job = self.store.job(job["job_id"])
@@ -2080,7 +2096,7 @@ class DiscoveryLoop:
                     run.update(status=reason, last_error=error)
                     self.store.save_run(run)
         finally:
-            if lease is not None:
+            if lease is not None and self.strategy is not None:
                 self.strategy.controller.finish_interval(lease)
 
     def _formalization_turn_current(self, attempted: dict[str, Any]) -> bool:
@@ -2228,7 +2244,6 @@ class DiscoveryLoop:
             attempted = job
             run = self.store.run_record()
             code = action["code"]
-            result: dict[str, Any]
             # Persist intent before execution. A crashed experiment is uncertain
             # and is never rerun automatically during response replay.
             with self.store.atomic():
@@ -2338,7 +2353,7 @@ class DiscoveryLoop:
         deadline = asyncio.get_running_loop().time() + timeout_s
         admission_only = native_admission_deadline_only(run)
         hard_deadline = paid_work_deadline(run) if admission_only or max_requests == 0 else None
-        execution_deadline = deadline
+        execution_deadline: float | None = deadline
         if admission_only or max_requests == 0:
             # Recovery must also preserve a paid tool beyond the admission
             # slice. Each tool retains its local watchdog and the intersection

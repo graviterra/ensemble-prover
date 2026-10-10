@@ -92,14 +92,23 @@ observation, not computation.
 | `turns.jsonl` and `run.log` | Structured action evidence and readable execution history |
 | `activation_telemetry.json` | Recorded subsystem activity |
 | `attempt_checkpoint.json` | Generation identity and link to durable attempt state |
+| Hidden `.checkpoint_pages/` directories | Authenticated data pages referenced by nearby checkpoint and journal records |
 | Sibling `.mini_attempts/` | Shared checkpoint head and accounting journal needed for resume |
 | Answer preparation directory | Original question, proposed answer, reviews, and proof plan |
 | `runs/mini_prover/solved/` | Reconstructed saved exports and optional graph/presentation artifacts |
 | Research/campaign directories | Their independent ledgers, source documents, reviews, and proof handoffs |
 
 Keep generation directories and `.mini_attempts` together at their recorded
-paths. A log copied on its own cannot restore a run. Logs, catalogs, and checkpoints
+paths, including their hidden directories. Large records share immutable pages;
+copying their JSON receipts alone cannot restore their contents. Keep referenced
+pages with their records and let checkpoint cleanup reclaim unreferenced pages.
+A log copied on its own cannot restore a run. Logs, catalogs, and checkpoints
 can contain private mathematics and model responses.
+
+Paged records support growing histories and individual provider payloads without
+an aggregate size limit. Each page is bounded and checked independently;
+older checkpoint encodings remain readable. Restoring a generation still requires
+memory proportional to its logical state, and earlier generations remain retained.
 
 ## Stop and resume
 

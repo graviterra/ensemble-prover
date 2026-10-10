@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from .lean_decl_parser import _HAVE_KEYWORDS, _LET_KEYWORDS, _matches_word, find_decl_header_end
+from .math_utils import _interpolated_string_prefix_len, _scan_interpolated_string
 
 
 def now_ts() -> float:
@@ -5040,13 +5041,14 @@ def _scan_group(text: str, start: int) -> Optional[int]:
 def _canonicalize_interpolated_big_operator_binders(
     text: str,
     start: int,
+    prefix_length: int,
 ) -> tuple[str, int]:
     """Canonicalize executable interpolation bodies, preserving literal text."""
 
     source = str(text or "")
-    prefix = source[start : start + 3]
+    prefix = source[start : start + prefix_length]
     out = [prefix]
-    index = start + 3
+    index = start + prefix_length
     while index < len(source):
         if source[index] == "\\":
             out.append(source[index : min(len(source), index + 2)])
@@ -5067,6 +5069,14 @@ def _canonicalize_interpolated_big_operator_binders(
         cursor = expression_start
         depth = 1
         while cursor < len(source):
+            nested_prefix = _interpolated_string_prefix_len(source, cursor)
+            if nested_prefix:
+                cursor, closed = _scan_interpolated_string(
+                    source, cursor + nested_prefix, [],
+                )
+                if not closed:
+                    break
+                continue
             skip_to = _lean_lexical_skip_end(source, cursor)
             if skip_to is not None:
                 cursor = max(cursor + 1, skip_to)
@@ -5086,7 +5096,7 @@ def _canonicalize_interpolated_big_operator_binders(
                     index = cursor + 1
                     break
             cursor += 1
-        else:
+        if depth:
             # Preserve malformed tails. Lean will reject them, while ordinary
             # safety validation still sees the complete source.
             out.append(source[index:])
@@ -5108,9 +5118,12 @@ def _canonicalize_big_operator_binders(stmt: str) -> str:
     i = 0
     n = len(stmt)
     while i < n:
-        if stmt.startswith(('s!"', 'm!"'), i):
+        interpolation_prefix = _interpolated_string_prefix_len(stmt, i)
+        if interpolation_prefix:
             interpolated, interpolation_end = (
-                _canonicalize_interpolated_big_operator_binders(stmt, i)
+                _canonicalize_interpolated_big_operator_binders(
+                    stmt, i, interpolation_prefix,
+                )
             )
             out.append(interpolated)
             i = max(i + 1, interpolation_end)

@@ -10128,7 +10128,7 @@ class ConversationTurnAction(ProviderLaneBankMixin):
         history = self._bounded_json_copy(
             raw.get("history"),
             # Retain the complete conversation. The durable record writer
-            # enforces the overall storage limit, not a small context cap.
+            # divides large values into independently bounded storage pages.
             max_chars=None,
             label="conversation provider quantum history",
         )

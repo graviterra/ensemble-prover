@@ -143,7 +143,7 @@ def _decode(value: Any) -> Any:
         if type(value["message"]) is not str:
             raise ValueError("malformed settled exception")
         return RuntimeError(value["message"])
-    cls = _VALUE_CLASSES.get(kind)
+    cls = _VALUE_CLASSES.get(kind) if isinstance(kind, str) else None
     if cls is not None and set(value) == {"value_type", "fields"}:
         payload = value["fields"]
         if type(payload) is not dict or set(payload) != {item.name for item in fields(cls)}:
@@ -459,8 +459,9 @@ def _clear_saved_helper_contract(dossier: ProofDossier, helper: Any) -> bool:
         setattr(helper, name, [] if name in {
             "contract_binder_sorts", "contract_proof_binder_types",
         } else "")
-    node_id = dossier.proof_graph.helper_name_to_node_id.get(helper.name)
-    node = dossier.proof_graph.nodes.get(node_id)
+    graph = dossier.proof_graph
+    node_id = graph.helper_name_to_node_id.get(helper.name) if graph is not None else None
+    node = graph.nodes.get(node_id) if graph is not None and node_id is not None else None
     if node is not None:
         for name in fields:
             key = "verified_helper_" + name

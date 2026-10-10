@@ -7,97 +7,139 @@ never receipts; malformed published records stop recovery explicitly.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 import fcntl
-import hashlib
-import json
 import os
 from pathlib import Path
 import tempfile
 import threading
-from typing import Any, Iterator
+from typing import Any, BinaryIO, Iterator
 
-from ensemble_prover.state_data import clone_json_value
+from ensemble_prover.json_pages import canonical_identity, canonical_parts, strict_loads
+
+from .checkpoint_pages import ENCODING, PageStore
 
 _MAX_RECORD_BYTES = 256 * 1024 * 1024
 
 
-def _reject_constant(value: str) -> None:
-    raise ValueError(f"non-finite JSON constant: {value}")
+_PAGE_STORES: OrderedDict[tuple[int, int], PageStore] = OrderedDict()
+_PAGE_STORES_LOCK = threading.Lock()
 
 
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
+def _page_store(parent: Path, *, directory_fd: int | None = None) -> PageStore:
+    if str(parent).startswith("/proc/self/fd/"):
+        return PageStore(parent)
+    info = parent.stat() if directory_fd is None else os.fstat(directory_fd)
+    key = info.st_dev, info.st_ino
+    with _PAGE_STORES_LOCK:
+        store = _PAGE_STORES.get(key)
+        if store is None:
+            store = PageStore(parent, parent_identity=key)
+            _PAGE_STORES[key] = store
+        else:
+            # The inode can survive a rename or the removal of an earlier alias.
+            # Retain its durability hints while using the caller's current path.
+            store.parent = parent
+            _PAGE_STORES.move_to_end(key)
+        while len(_PAGE_STORES) > 16:
+            _PAGE_STORES.popitem(last=False)
+    return store
 
 
-def _canonical_bytes(record: dict[str, Any]) -> bytes:
-    value = clone_json_value(record, label="durable checkpoint")
-    if type(value) is not dict:
-        raise ValueError("checkpoint JSON must be an object")
-
-    def validate_keys(item: Any) -> None:
-        if type(item) is dict:
-            if any(type(key) is not str for key in item):
-                raise ValueError("checkpoint JSON object keys must be strings")
-            for child in item.values():
-                validate_keys(child)
-        elif type(item) in {list, tuple}:
-            for child in item:
-                validate_keys(child)
-
-    validate_keys(value)
-    content = json.dumps(value, ensure_ascii=False, allow_nan=False,
-                         sort_keys=True, separators=(",", ":")).encode("utf-8")
-    if len(content) > _MAX_RECORD_BYTES:
-        raise ValueError("durable checkpoint exceeds record size limit")
-    return content
+def release_checkpoint_cache(parent: Path) -> None:
+    """Release an owner's immutable string/page hints when its generation closes."""
+    try:
+        info = parent.stat()
+    except OSError:
+        # Cache hints are optional; inaccessible paths must not retain locks
+        # or prevent the owning registry's remaining cleanup.
+        return
+    with _PAGE_STORES_LOCK:
+        _PAGE_STORES.pop((info.st_dev, info.st_ino), None)
 
 
-def read_checkpoint_record(path: str | Path) -> dict[str, Any]:
-    """Read inert JSON, rejecting duplicate keys, truncation and nonfinite data."""
-    with Path(path).open("rb") as handle:
+def collect_checkpoint_pages(parent: Path) -> None:
+    """Optional cleanup after publication under exclusive attempt ownership."""
+    try:
+        _page_store(parent).collect(record_limit=_MAX_RECORD_BYTES, parent=parent)
+    except (OSError, ValueError):
+        # A cleanup failure cannot revoke an acknowledged checkpoint.
+        pass
+
+
+def read_checkpoint_record(path: str | Path, *, page_parent: Path | None = None) -> dict[str, Any]:
+    """Read old JSON or authenticate and reconstruct independently bounded pages."""
+    source = Path(path)
+    with source.open("rb") as handle:
         data = handle.read(_MAX_RECORD_BYTES + 1)
+    return decode_checkpoint_record(data, page_parent=source.parent if page_parent is None else page_parent)
+
+
+def decode_checkpoint_record(data: bytes, *, page_parent: Path) -> dict[str, Any]:
+    """Decode one physical receipt, preserving its exact bytes for importers."""
     if len(data) > _MAX_RECORD_BYTES:
         raise ValueError("durable checkpoint exceeds record size limit")
-    try:
-        value = json.loads(data, object_pairs_hook=_unique_object,
-                           parse_constant=_reject_constant)
-    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
-        raise ValueError("corrupt checkpoint JSON") from error
+    value = strict_loads(data)
     if type(value) is not dict:
         raise ValueError("checkpoint JSON must be an object")
-    _canonical_bytes(value)
+    if "checkpoint_encoding" in value:
+        if value["checkpoint_encoding"] != ENCODING:
+            raise ValueError("unsupported checkpoint page encoding")
+        # The directory may be an already validated provider archive descriptor.
+        value = _page_store(page_parent).decode(
+            value, limit=min(64 * 1024, _MAX_RECORD_BYTES), parent=page_parent,
+        )
     return value
 
 
 def write_checkpoint_record(path: str | Path, record: dict[str, Any]) -> None:
-    """Atomically publish a complete record; propagate every durability error."""
-    content = _canonical_bytes(record)
+    """Publish bounded immutable pages before the atomic record commit point."""
+    if type(record) is not dict:
+        raise ValueError("checkpoint JSON must be an object")
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=".checkpoint-", suffix=".tmp",
-                                             dir=destination.parent)
+    directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    pinned_parent = Path(f"/proc/self/fd/{directory}")
+    temporary = None
     try:
+        content = bytearray()
+        threshold = min(64 * 1024, _MAX_RECORD_BYTES)
+        for part in canonical_parts(record):
+            content.extend(part)
+            if len(content) > threshold:
+                break
+        paged = len(content) > threshold or "checkpoint_encoding" in record
+        if paged:
+            envelope = _page_store(destination.parent, directory_fd=directory).encode(
+                record, limit=_MAX_RECORD_BYTES, parent=pinned_parent,
+            )
+            content = bytearray().join(canonical_parts(envelope))
+        descriptor, temporary = tempfile.mkstemp(prefix=".checkpoint-", suffix=".tmp",
+                                                 dir=pinned_parent)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        os.replace(temporary, pinned_parent / destination.name)
+        os.fsync(directory)
+        current, original = destination.parent.stat(), os.fstat(directory)
+        if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+            raise ValueError("checkpoint record directory was replaced during IO")
+        if not paged:
+            with _PAGE_STORES_LOCK:
+                store = _PAGE_STORES.get((original.st_dev, original.st_ino))
+            if store is not None:
+                store.clear_string_hints()
     finally:
         try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(directory)
 
 
 @contextmanager
@@ -117,7 +159,10 @@ def _read_journal_unlocked(path: Path) -> list[dict[str, Any]]:
     for sequence, source in enumerate(sorted(path.glob("[0-9]*.json")), 1):
         if source.name != f"{sequence:020d}.json":
             raise ValueError("corrupt journal sequence or filename")
-        entry = read_checkpoint_record(source)
+        try:
+            entry = read_checkpoint_record(source)
+        except ValueError as error:
+            raise ValueError(f"corrupt journal record {source.name}") from error
         if (set(entry) != {"schema_version", "sequence", "previous_hash", "kind", "payload", "record_hash"}
                 or type(entry["sequence"]) is not int
                 or entry["sequence"] != sequence
@@ -127,7 +172,7 @@ def _read_journal_unlocked(path: Path) -> list[dict[str, Any]]:
                 or type(entry["payload"]) is not dict):
             raise ValueError("corrupt journal record or sequence")
         material = {key: value for key, value in entry.items() if key != "record_hash"}
-        digest = hashlib.sha256(_canonical_bytes(material)).hexdigest()
+        digest = canonical_identity(material)[0]
         if entry["record_hash"] != digest:
             raise ValueError("corrupt journal record hash")
         records.append(entry)
@@ -161,7 +206,7 @@ class JournalWriter:
         self.directory.mkdir(parents=True, exist_ok=True)
         self._mutex = threading.Lock()
         self._failed = False
-        self._owner = (self.directory / ".owner.lock").open("a+b")
+        self._owner: BinaryIO | None = (self.directory / ".owner.lock").open("a+b")
         try:
             operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
             try:
@@ -188,7 +233,7 @@ class JournalWriter:
                 material = {"schema_version": 1, "sequence": sequence,
                             "previous_hash": self._record_hash,
                             "kind": kind, "payload": payload}
-                digest = hashlib.sha256(_canonical_bytes(material)).hexdigest()
+                digest = canonical_identity(material)[0]
                 destination = self.directory / f"{sequence:020d}.json"
                 with _journal_lock(self.directory, exclusive=True):
                     if destination.exists() or destination.is_symlink():
@@ -206,6 +251,7 @@ class JournalWriter:
             if self._owner is not None:
                 self._owner.close()
                 self._owner = None
+                release_checkpoint_cache(self.directory)
 
 
 def append_journal_record(path: str | Path, *, kind: str, payload: dict[str, Any]) -> dict[str, Any]:

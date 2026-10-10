@@ -143,7 +143,7 @@ def read_verified_helpers(
 ) -> dict[str, Any]:
     """Read only a freshly validated dispatch scope; never admit retrieved facts."""
     from .proof_dossier import helper_decl_name, helper_prompt_signature
-    from .prompt_page_text import prompt_page_text
+    from .prompt_page_text import prompt_page_json
     from .utils import canonical_lean_identifier
 
     name = args.get("name", "")
@@ -174,6 +174,8 @@ def read_verified_helpers(
     records = []
     for source in sources:
         helper_name = helper_decl_name(source)
+        if helper_name is None:
+            raise ValueError("validated helper context contains an unnamed declaration")
         helper = dossier.verified_helpers[helper_name]
         if name and exact_name != canonical_lean_identifier(helper_name.removeprefix("_root_.")):
             continue
@@ -207,8 +209,16 @@ def read_verified_helpers(
                 keys.insert(keys.index(name), identity)
         return {key: ordered_fields(value[key]) for key in keys}
 
-    content = json.dumps(ordered_fields(records), ensure_ascii=False)
-    content = prompt_page_text(content, redact_solution_refs=redact_solution_refs)
+    independent_names = frozenset(
+        (record_index, field_name, name_index)
+        for record_index, record in enumerate(records)
+        for field_name in ("support_names", "replay_context_names")
+        for name_index in range(len(record[field_name]))
+    )
+    content = prompt_page_json(
+        ordered_fields(records), redact_solution_refs=redact_solution_refs,
+        isolated_string_paths=independent_names,
+    )
     identity = hashlib.sha256(json.dumps({
         "scope": list(sources), "name": name, "query": query, "content": content,
     }, ensure_ascii=False, sort_keys=True).encode()).hexdigest()

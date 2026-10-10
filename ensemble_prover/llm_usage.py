@@ -2478,7 +2478,7 @@ class CostBudgetController:
         *,
         client: Any,
         call_kind: str,
-        max_tokens_override: Optional[int] = None,
+        max_tokens_override: int | MiniRequestEnvelopePolicy | None = None,
         candidate_count: int = 1,
     ) -> bool:
         """Whether even a zero-input reservation can fit the current budget.
@@ -4642,7 +4642,7 @@ class CostBudgetController:
         invoke: Callable[[Optional[Callable[[ProviderUsageRecord], Any]]], Any],
         action_id: str = "",
         tools: Optional[Sequence[Dict[str, Any]]] = None,
-        max_tokens_override: Optional[int] = None,
+        max_tokens_override: int | MiniRequestEnvelopePolicy | None = None,
         candidate_count: int = 1,
         metadata: Optional[Mapping[str, Any]] = None,
         retryable_exception_no_charge: Optional[Callable[[BaseException], bool]] = None,
@@ -5822,7 +5822,7 @@ async def metered_or_plain_call(
     invoke: Callable[[Optional[Callable[[ProviderUsageRecord], Any]]], Any],
     action_id: str = "",
     tools: Optional[Sequence[Dict[str, Any]]] = None,
-    max_tokens_override: Optional[int] = None,
+    max_tokens_override: int | MiniRequestEnvelopePolicy | None = None,
     candidate_count: int = 1,
     metadata: Optional[Mapping[str, Any]] = None,
     retryable_exception_no_charge: Optional[Callable[[BaseException], bool]] = None,

@@ -15,7 +15,7 @@ from console.launcher import read_boot_id, read_launches, read_proc_identity
 from console.runs import RunInfo
 from console.session import AttachedRun
 from console.summary import SummaryView, load_summary
-from .mathematics import node_mathematics
+from .mathematics import _load_checkpoint, checkpoint_supports, node_mathematics
 
 _MAX_TEXT_BYTES = 256 * 1024
 _MAX_LEAN_BYTES = 2 * 1024 * 1024
@@ -374,7 +374,30 @@ def decorate_detail(
     body["formalization"] = formalization
     graph = body.get("graph")
     root = graph[0] if isinstance(graph, list) and graph and isinstance(graph[0], dict) else {}
-    body["nodeEvidence"] = node_mathematics(attached, str(root.get("label") or ""))
+    checkpoint = _load_checkpoint(attached.run_dir)
+    # Active CLI runs often have no summary yet. Use the committed input identity
+    # rather than leaving their theorem label and mathematical inspector empty.
+    if not body.get("problem") and checkpoint.get("theorem"):
+        body["problem"] = checkpoint["theorem"]
+        root["label"] = checkpoint["theorem"]
+    evidence = node_mathematics(attached, str(root.get("label") or ""), checkpoint=checkpoint)
+    body["nodeEvidence"] = evidence
+    if isinstance(graph, list):
+        known = {node["id"] for node in graph}
+        for node_id in evidence:
+            if node_id == "root" or node_id in known:
+                continue
+            graph.append({"id": node_id, "label": node_id.removeprefix("helper:"), "kind": "helper",
+                          "status": "recorded", "supports": [], "recordedAtS": None})
+        event_nodes = known.copy()
+        known.update(evidence)
+        root["supports"] = [f"helper:{name}" for name in dict.fromkeys(attached.state.root_dependency_helper_names)
+                            if f"helper:{name}" in known]
+        for node in graph[1:]:
+            name = node["label"]
+            supports = attached.state.helper_supports.get(name, []) if node["id"] in event_nodes else checkpoint_supports(checkpoint, name, attached.state.helper_math)
+            node["supports"] = [f"helper:{support}" for support in dict.fromkeys(supports)
+                                if support != name and f"helper:{support}" in known]
 
 
 def launch_root_status(record: Any, formalization_status: str) -> str:

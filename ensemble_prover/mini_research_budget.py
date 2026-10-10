@@ -151,7 +151,10 @@ def pending_research_reservation(session: Any, action_id: str) -> tuple[int, flo
     if not isinstance(grant, dict) or not grant.get("background"):
         return 0, 0.0
     requests = max(0, int(grant["requests"]) - int(grant.get("accounted", 0)))
-    seconds = float(grant.get("reserved_seconds", grant["seconds"])) if grant["action_id"] == action_id else 0.0
+    reserved = grant.get("reserved_seconds", grant["seconds"]) if grant["action_id"] == action_id else 0.0
+    if reserved is None:
+        raise ValueError("invalid pending research time reservation")
+    seconds = float(reserved)
     if not math.isfinite(seconds) or seconds < 0:
         raise ValueError("invalid pending research time reservation")
     return requests, seconds

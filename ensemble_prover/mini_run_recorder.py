@@ -1226,7 +1226,7 @@ class RunRecorder:
             raise ValueError("Invalid predecessor generation path")
         predecessor = Path(state["output_dir"]).resolve()
         destination = destination.resolve()
-        checkpoint_artifacts = {"attempt_checkpoint.json", "checkpoints"}
+        checkpoint_artifacts = {"attempt_checkpoint.json", "checkpoints", ".checkpoint_pages"}
         from .mini_generation_artifacts import validate_startup_artifact_receipts
         checkpoint_artifacts.update(validate_startup_artifact_receipts(destination, startup_artifacts))
         if destination == predecessor or (

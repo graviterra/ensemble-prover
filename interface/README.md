@@ -86,6 +86,11 @@ configured repository in both English and Lean modes.
 
 **Progress** opens the most recent active or recorded run. Select a graph node
 to inspect its status, recorded support relationships, and receipt time.
+Helpers are collected from acceptance events and the latest committed
+verified-helper inventory, including cache imports and helpers added during
+ordinary proof turns. Inventory updates appear after a checkpoint is committed;
+these helpers may have no recorded acceptance time. Both legacy and paged
+checkpoints are supported, with bounded reads and integrity checks.
 The **Formal mathematics** panel shows its recorded Lean statement. Expand
 **Recorded Lean proof source** to read an available proof. Helper proofs must
 match the recorded statement identity and verification environment; conflicting,

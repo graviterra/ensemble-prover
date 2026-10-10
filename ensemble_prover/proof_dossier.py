@@ -8291,6 +8291,8 @@ class ProofDossier:
     )
 
     def __post_init__(self) -> None:
+        # Present only while imported parser receipts await fresh helper replay.
+        self._checkpoint_pending_answer_receipts: Set[str]
         self.suppress_solution_placeholders = (
             effective_solution_placeholder_suppression(
                 suppress_solution_placeholders=(

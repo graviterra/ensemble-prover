@@ -493,7 +493,9 @@ def _resumable_checkpoint_dir(
         return None
     attempt_dir = Path(row["attempts"][-1].get("output_dir") or "")
     try:
-        record = json.loads((attempt_dir / "attempt_checkpoint.json").read_text())
+        from .mini_session.durable_checkpoint import read_checkpoint_record
+
+        record = read_checkpoint_record(attempt_dir / "attempt_checkpoint.json")
         saved_hash = record["identity"]["executor_source_hash"]
         from .mini_checkpoint_cli import executor_source_fingerprint
 
@@ -1303,7 +1305,9 @@ def _attempt_dir_in_use(output_dir: Any) -> bool:
     if not root:
         return True
     try:
-        record = json.loads((Path(root) / "attempt_checkpoint.json").read_text())
+        from .mini_session.durable_checkpoint import read_checkpoint_record
+
+        record = read_checkpoint_record(Path(root) / "attempt_checkpoint.json")
         lock_path = Path(record["registry_root"]) / "writer.lock"
     except (OSError, ValueError, KeyError, TypeError):
         lock_path = None

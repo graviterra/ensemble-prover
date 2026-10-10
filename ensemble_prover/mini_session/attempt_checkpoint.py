@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import hashlib
 import inspect
-import json
 import math
 import time
 import uuid
@@ -19,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from ..state_data import clone_json_value
+from ..json_pages import MerkleHasher
 from ..llm_error_policy import classify_llm_exception, is_resumable_provider_failure
 from ..tactic_attempt_telemetry import MONOTONIC_LEAN_ATTEMPT_METRICS
 
@@ -28,6 +27,8 @@ if TYPE_CHECKING:
 
 _MANIFEST = "attempt_checkpoint.json"
 _SCHEMA = 1
+_SNAPSHOT_HASH_ENCODING = "json-merkle-sha256-v1"
+_SNAPSHOT_HASHER = MerkleHasher()
 
 
 def _json(value: Any) -> Any:
@@ -35,10 +36,12 @@ def _json(value: Any) -> Any:
 
 
 def _digest(value: Any) -> str:
-    return hashlib.sha256(json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-        allow_nan=False,
-    ).encode()).hexdigest()
+    from ..json_pages import canonical_identity
+    if type(value) is dict and "snapshot_hash_encoding" in value:
+        if value["snapshot_hash_encoding"] != _SNAPSHOT_HASH_ENCODING:
+            raise ValueError("Unsupported checkpoint snapshot hash encoding")
+        return _SNAPSHOT_HASHER.digest(value)
+    return canonical_identity(value)[0]
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -83,7 +86,7 @@ def expand_completed_children(
     names are content hashes; their complete payloads remain inert JSON and
     require the same session admission checks as an uncompressed snapshot.
     """
-    from ..snapshot_codec import MAX_SNAPSHOT_BYTES, decompress_snapshot, snapshot_bytes
+    from ..snapshot_codec import decompress_snapshot
 
     if (type(record) is not dict or type(record.get("schema_version")) is not int
             or record["schema_version"] not in {2, 3}):
@@ -94,14 +97,6 @@ def expand_completed_children(
     archived = record.pop("archived_children", None)
     if type(archived) is not dict:
         raise ValueError("Invalid completed child archive map")
-    expanded_size = len(snapshot_bytes(record))
-    if expanded_size > MAX_SNAPSHOT_BYTES:
-        raise ValueError("expanded checkpoint exceeds snapshot size limit")
-    # The archive envelope is not part of the expanded checkpoint. Allow only
-    # this fixed overhead beyond the remaining space before decompressing.
-    envelope_size = len(snapshot_bytes({
-        "session": None, "child": None, "planner_receipts": None,
-    }))
     for lane, digest in archived.items():
         if (type(lane) is not str or not lane or type(digest) is not str
                 or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
@@ -110,9 +105,7 @@ def expand_completed_children(
         if (set(archive) != {"encoding", "sha256", "data"}
                 or archive["encoding"] != "json-zlib-v1" or archive["sha256"] != digest):
             raise ValueError("Invalid completed child archive")
-        payload = decompress_snapshot(
-            archive["data"], max_bytes=MAX_SNAPSHOT_BYTES - expanded_size + envelope_size,
-        )
+        payload = decompress_snapshot(archive["data"])
         if (type(payload) is not dict or _digest(payload) != digest
                 or set(payload) != {"session", "child", "planner_receipts"}
                 or type(payload["child"]) is not dict
@@ -123,10 +116,6 @@ def expand_completed_children(
             if type(record.get(field)) is not dict or lane in record[field]:
                 raise ValueError("Conflicting completed child archive lane")
             if value is not None:
-                expanded_size += (len(snapshot_bytes(lane)) + 1 + len(snapshot_bytes(value))
-                                  + int(bool(record[field])))
-                if expanded_size > MAX_SNAPSHOT_BYTES:
-                    raise ValueError("expanded checkpoint exceeds snapshot size limit")
                 record[field][lane] = value
     if has_provider_archives:
         from .provider_lane_archives import ProviderLaneArchiveStore
@@ -494,6 +483,8 @@ class AttemptCheckpointRegistry:
         self._outer_state: dict[str, Any] = {}
         self._planner_receipts: dict[str, dict[str, Any]] = {}
         self._durable_child_archives: set[str] = set()
+        self._owned_sessions: dict[str, dict[str, Any]] = {}
+        self._child_archive_cache: dict[str, tuple[Any, Any, Any, str]] = {}
         self._snapshot_provider_archive_refs: dict[Path, set[str]] = {}
         # One process-local owner per lane, held weakly so a finished child
         # that no longer has an external owner does not keep a live capability
@@ -647,11 +638,14 @@ class AttemptCheckpointRegistry:
         storage_schema = record.get("schema_version")
         record = self._expand_completed_children(record)
         required = {"schema_version", "attempt_id", "identity", "sessions", "children", "outer_state", "planner_receipts", "cost_ledger", "recorder", "journal_watermark", "predecessor", "worker_active_elapsed_s", "worker_observed_epoch_s", "worker_generation_completed"}
-        optional = {"execution_audit", "execution_service"}
+        optional = {"execution_audit", "execution_service", "snapshot_hash_encoding"}
         if (type(record) is not dict or not required <= set(record)
                 or set(record) - required - optional
                 or type(record["schema_version"]) is not int or record["schema_version"] != _SCHEMA):
             raise ValueError("Unsupported attempt checkpoint snapshot schema")
+        if ("snapshot_hash_encoding" in record
+                and record["snapshot_hash_encoding"] != _SNAPSHOT_HASH_ENCODING):
+            raise ValueError("Unsupported checkpoint snapshot hash encoding")
         if (record["identity"] != (self.identity if expected_identity is None else expected_identity)
                 or record["attempt_id"] != self.attempt_id):
             raise ValueError("Attempt checkpoint snapshot identity mismatch")
@@ -700,10 +694,7 @@ class AttemptCheckpointRegistry:
         Earlier generations may still refer to them, so they are never pruned
         by the ordinary snapshot writer.
         """
-        from ..snapshot_codec import MAX_SNAPSHOT_BYTES, compress_snapshot, snapshot_bytes
-
-        if len(snapshot_bytes(record)) > MAX_SNAPSHOT_BYTES:
-            raise ValueError("checkpoint exceeds snapshot size limit")
+        from ..snapshot_codec import _equivalent, compress_snapshot
         archived: dict[str, str] = {}
         sessions = dict(record["sessions"])
         children = dict(record["children"])
@@ -713,7 +704,13 @@ class AttemptCheckpointRegistry:
                 continue
             payload = {"session": sessions[lane], "child": frame,
                        "planner_receipts": receipts.get(lane)}
-            digest = _digest(payload)
+            cached = self._child_archive_cache.get(lane)
+            if (cached is not None and cached[0] is sessions[lane]
+                    and _equivalent(cached[1], frame)
+                    and _equivalent(cached[2], receipts.get(lane))):
+                digest = cached[3]
+            else:
+                digest = _digest(payload)
             path = self.registry_root / "completed" / f"{digest}.json"
             # An existing file can be an orphan from a writer whose rename
             # succeeded but directory fsync failed. Only this writer's own
@@ -722,6 +719,9 @@ class AttemptCheckpointRegistry:
                 _write(path, {"encoding": "json-zlib-v1", "sha256": digest,
                               "data": compress_snapshot(payload)})
                 self._durable_child_archives.add(digest)
+            self._child_archive_cache[lane] = (
+                sessions[lane], _json(frame), _json(receipts.get(lane)), digest,
+            )
             archived[lane] = digest
             sessions.pop(lane)
             children.pop(lane)
@@ -740,6 +740,7 @@ class AttemptCheckpointRegistry:
         observed_epoch_s = time.time()
         return {
             "schema_version": _SCHEMA, "attempt_id": self.attempt_id,
+            "snapshot_hash_encoding": _SNAPSHOT_HASH_ENCODING,
             "identity": self.identity, "sessions": self._sessions,
             "children": self._children, "outer_state": self._outer_state,
             "planner_receipts": self._planner_receipts,
@@ -773,18 +774,18 @@ class AttemptCheckpointRegistry:
         try:
             from .provider_lane_archives import session_has_provider_archives
 
-            prepared = _json(record)
+            prepared = _json({key: value for key, value in record.items() if key != "sessions"})
             prepared["sessions"] = {
-                lane: self._provider_lane_archives.compact_session(session)
-                for lane, session in prepared["sessions"].items()
+                lane: session if self._owned_sessions.get(lane) is session
+                else self._provider_lane_archives.compact_session(session)
+                for lane, session in record["sessions"].items()
             }
             has_provider_archives = any(
                 session_has_provider_archives(session)
                 for session in prepared["sessions"].values()
             )
-            # Archive paid bodies before either whole-attempt size checks or
-            # completed-child compression. Their independent archive/decode
-            # bounds must not become an aggregate limit on retained search.
+            # Archive immutable paid bodies before completed-child packing.
+            # Each logical record can span independently bounded storage pages.
             snapshot = self._archive_completed_children(prepared)
             if has_provider_archives:
                 snapshot = {**snapshot, "schema_version": 3}
@@ -831,6 +832,13 @@ class AttemptCheckpointRegistry:
             *self._snapshot_provider_archive_refs.values(),
         )
         self._provider_lane_archives.collect_unreferenced(retained_provider_archives)
+        from .durable_checkpoint import collect_checkpoint_pages
+        collect_checkpoint_pages(self.directory / "checkpoints")
+        self._owned_sessions = dict(prepared["sessions"])
+        self._child_archive_cache = {
+            lane: cached for lane, cached in self._child_archive_cache.items()
+            if lane in snapshot.get("archived_children", {})
+        }
         return prepared["sessions"]
 
     @property
@@ -1349,6 +1357,15 @@ class AttemptCheckpointRegistry:
 
     def close(self) -> None:
         self._closed = True
+        from .durable_checkpoint import release_checkpoint_cache
+        release_checkpoint_cache(self.directory)
+        release_checkpoint_cache(self.directory / "checkpoints")
+        if hasattr(self, "registry_root"):
+            release_checkpoint_cache(self.registry_root)
+            release_checkpoint_cache(self.registry_root / "completed")
+        _SNAPSHOT_HASHER.clear()
+        self._owned_sessions.clear()
+        self._child_archive_cache.clear()
         if self._journal_writer is not None:
             self._journal_writer.close()
             self._journal_writer = None

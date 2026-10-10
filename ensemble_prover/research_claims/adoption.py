@@ -86,17 +86,19 @@ def _saved_contracts(snapshot: dict[str, Any], checkpoint: str) -> list[dict[str
                 },
             )
             contract["session_ids"].append(session_id)
-            if len(contracts) > 1024:
-                raise ValueError("Mini adoption has more than 1024 distinct contracts")
     return sorted(contracts.values(), key=lambda item: (item["statement"], item["formal_context"]))
 
 
 def read_mini_run(directory: Path) -> dict[str, Any]:
     from ..theorem_project import TheoremProjectRequest, resolve_theorem_project
+    from ..mini_session.attempt_checkpoint import _digest
+    from ..mini_session.durable_checkpoint import decode_checkpoint_record
+    from ..json_pages import canonical_parts
 
     directory = directory.resolve(strict=True)
     metadata_bytes = _read(directory / "attempt_checkpoint.json")
-    metadata = json.loads(metadata_bytes)
+    metadata = decode_checkpoint_record(metadata_bytes, page_parent=directory)
+    metadata_paged = json.loads(metadata_bytes).get("checkpoint_encoding") == "checkpoint-json-pages-v1"
     identity = metadata["identity"]
     original = identity["input"]
     source = Path(original["source_path"]).resolve(strict=True)
@@ -107,8 +109,14 @@ def read_mini_run(directory: Path) -> dict[str, Any]:
     checkpoint = Path(head["snapshot_path"]).resolve(strict=True)
     if not checkpoint.is_relative_to(directory):
         raise ValueError("Mini checkpoint escapes the selected run")
-    data = _read(checkpoint)
-    if hashlib.sha256(data).hexdigest() != head["snapshot_hash"]:
+    # Keep the original physical receipt; a paged receipt is accompanied by
+    # a portable expanded artifact below so imported evidence remains usable.
+    data = _read(checkpoint, limit=256 * 1024 * 1024)
+    snapshot = decode_checkpoint_record(data, page_parent=checkpoint.parent)
+    paged = json.loads(data).get("checkpoint_encoding") == "checkpoint-json-pages-v1"
+    digest = (_digest(snapshot) if paged or "snapshot_hash_encoding" in snapshot
+              else hashlib.sha256(data).hexdigest())
+    if digest != head["snapshot_hash"]:
         raise ValueError("Mini checkpoint hash changed")
     config = identity["cli_config"]
     problem = resolve_theorem_project(
@@ -122,7 +130,6 @@ def read_mini_run(directory: Path) -> dict[str, Any]:
             ),
         )
     )
-    snapshot = json.loads(data)  # Data only: never deserialize checkpoint objects.
     expanded_checkpoint = None
     if snapshot.get("schema_version") in {2, 3}:
         from ..mini_session.attempt_checkpoint import (
@@ -135,7 +142,9 @@ def read_mini_run(directory: Path) -> dict[str, Any]:
         snapshot = expand_completed_children(
             snapshot, Path(manifest["registry_root"]), hydrate_provider_lanes=False,
         )
-        expanded_checkpoint = json_text(snapshot).encode()
+        expanded_checkpoint = b"".join(canonical_parts(snapshot))
+    elif paged:
+        expanded_checkpoint = b"".join(canonical_parts(snapshot))
     contracts = _saved_contracts(snapshot, head["snapshot_hash"])
     statements = {contract["statement"] for contract in contracts}
     # Retain the old convenience fields only where their statement-only key is
@@ -159,6 +168,8 @@ def read_mini_run(directory: Path) -> dict[str, Any]:
     }
     if expanded_checkpoint is not None:
         result["expanded_checkpoint"] = expanded_checkpoint
+    if metadata_paged:
+        result["expanded_metadata"] = b"".join(canonical_parts(metadata))
     return result
 
 
@@ -170,6 +181,11 @@ def import_artifacts(store: Any, adoption: dict[str, Any]) -> None:
         metadata = store.put_artifact(
             adoption["metadata"], name="original-mini-checkpoint-metadata.json"
         )
+        expanded_metadata = None
+        if "expanded_metadata" in adoption:
+            expanded_metadata = store.put_artifact(
+                adoption["expanded_metadata"], name="expanded-mini-checkpoint-metadata.json"
+            )
         checkpoint = store.put_artifact(
             adoption["checkpoint"], name="original-mini-checkpoint.json"
         )
@@ -230,6 +246,8 @@ def import_artifacts(store: Any, adoption: dict[str, Any]) -> None:
         }
         if expanded_checkpoint:
             record["expanded_checkpoint_artifact"] = expanded_checkpoint
+        if expanded_metadata:
+            record["expanded_metadata_artifact"] = expanded_metadata
         record["inventory_artifact"] = store.put_artifact(
             json_text(record).encode(), name="adoption-inventory.json"
         )

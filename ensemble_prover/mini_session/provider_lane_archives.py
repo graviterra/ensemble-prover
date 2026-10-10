@@ -2,21 +2,20 @@
 
 Only the attempt registry owns archive references. Runtime actions and exported
 session records receive complete inert envelopes, with live authority checked
-independently when a lane is activated. Ordinary checkpoint metadata and each
-archive retain their existing storage bounds; cold bodies are never expanded
-together to apply an additional aggregate provider limit.
+independently when a lane is activated. Checkpoint metadata and each archive
+can span independently bounded pages; cold bodies are never expanded together
+to apply an additional aggregate provider limit.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 import stat
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from ensemble_prover.snapshot_codec import snapshot_bytes
+from ensemble_prover.json_pages import canonical_identity
 from ensemble_prover.state_data import clone_json_value
 
 from .durable_checkpoint import read_checkpoint_record, write_checkpoint_record
@@ -29,7 +28,7 @@ _ENVELOPE_KEYS = {"encoding", "sha256", "expanded_bytes", "header", "data"}
 
 
 def _digest(value: Any) -> str:
-    return hashlib.sha256(snapshot_bytes(value)).hexdigest()
+    return canonical_identity(value)[0]
 
 
 def _is_digest(value: Any) -> bool:
@@ -224,7 +223,10 @@ class ProviderLaneArchiveStore:
                 try:
                     if not stat.S_ISREG(os.fstat(file_fd).st_mode):
                         raise ValueError("Missing or invalid provider archive file")
-                    envelope = read_checkpoint_record(Path(f"/proc/self/fd/{file_fd}"))
+                    envelope = read_checkpoint_record(
+                        Path(f"/proc/self/fd/{file_fd}"),
+                        page_parent=Path(f"/proc/self/fd/{directory_fd}"),
+                    )
                 finally:
                     os.close(file_fd)
         except OSError as error:
@@ -325,3 +327,5 @@ class ProviderLaneArchiveStore:
         except (OSError, ValueError):
             # Optional cleanup cannot invalidate an otherwise durable commit.
             return
+        from .durable_checkpoint import collect_checkpoint_pages
+        collect_checkpoint_pages(self.directory)

@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Mapping
 
 from ensemble_prover.snapshot_codec import compress_snapshot, decompress_snapshot, snapshot_bytes
+from ensemble_prover.json_pages import canonical_identity
 
 from .state_codec import StateSnapshotCompatibilityError
 
@@ -53,9 +54,9 @@ def encode_provider_lane(
     """Encode a validated owned value once, when it leaves the active slot."""
     body = {"checkpoint": checkpoint, "prompt_scope": prompt_scope,
             "context_identity": context_identity}
-    raw = snapshot_bytes(body)
-    return {"encoding": "json-zlib-v1", "sha256": hashlib.sha256(raw).hexdigest(),
-            "expanded_bytes": len(raw), "header": _header(body),
+    digest, expanded_bytes = canonical_identity(body)
+    return {"encoding": "json-zlib-v1", "sha256": digest,
+            "expanded_bytes": expanded_bytes, "header": _header(body),
             "data": compress_snapshot(body)}
 
 
@@ -72,10 +73,10 @@ def decode_provider_lane(
                 or type(envelope["data"]) is not str):
             raise ValueError("invalid envelope")
         body = decompress_snapshot(envelope["data"], max_bytes=envelope["expanded_bytes"])
-        raw = snapshot_bytes(body)
+        digest, expanded_bytes = canonical_identity(body)
         if (type(body) is not dict or set(body) != _BODY_KEYS
-                or len(raw) != envelope["expanded_bytes"]
-                or hashlib.sha256(raw).hexdigest() != envelope["sha256"]
+                or expanded_bytes != envelope["expanded_bytes"]
+                or digest != envelope["sha256"]
                 or type(body["context_identity"]) is not str
                 or len(body["context_identity"]) != 64):
             raise ValueError("invalid body identity")
@@ -411,6 +412,6 @@ class ProviderLaneBankMixin(ABC):
 
     def _refresh_active_provider_digest(self) -> None:
         self._provider_quantum_active_digest = (
-            hashlib.sha256(snapshot_bytes(self._provider_quantum_checkpoint)).hexdigest()
+            canonical_identity(self._provider_quantum_checkpoint)[0]
             if self._provider_quantum_checkpoint else ""
         )
