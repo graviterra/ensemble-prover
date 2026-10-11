@@ -61,6 +61,7 @@ class MathematicalMemoryAction:
             and config.probes_enabled
             and (
                 wake
+                or service.has_pending_continuation()
                 or service.context_id()
                 not in session.mathematical_memory_state.get("attempted_contexts", ())
                 or prior_revision != service.retrieval_revision()
@@ -114,6 +115,7 @@ class MathematicalMemoryAction:
             result_candidate = None
             made_progress = False
             verdict = "observed"
+            failure_type = ""
             stage = "admission"
             goal_id = ""
             request_id = str((request or {}).get("request_id", ""))
@@ -267,6 +269,8 @@ class MathematicalMemoryAction:
                         verdict = "capture_incomplete"
                     else:
                         stage = "find_candidates"
+                        if request or wake_candidate_id:
+                            session.mathematical_memory_state.pop("candidate_continuation", None)
                         candidates = await service.find_candidates(goal, budget, pin)
                         if wake_candidate_id:
                             candidates = tuple(
@@ -287,6 +291,7 @@ class MathematicalMemoryAction:
                         for candidate in candidates[: config.prepared_candidate_cap]:
                             budget.check_cancelled()
                             if not service.candidate_eligible(candidate, budget=budget):
+                                service.visit_candidate(candidate.candidate_id)
                                 continue
                             if budget.probes_used >= config.probe_cap:
                                 verdict = "probe_coverage_exhausted"
@@ -321,8 +326,10 @@ class MathematicalMemoryAction:
                             before = service.context_id()
                             stage = "activate_candidate"
                             if not await service.activate_candidate(candidate, budget):
+                                service.visit_candidate(candidate.candidate_id)
                                 continue
                             if not service.candidate_eligible(candidate, budget=budget):
+                                service.visit_candidate(candidate.candidate_id)
                                 continue
                             if before != service.context_id():
                                 # Activation changes the actual environment; one fresh
@@ -334,6 +341,8 @@ class MathematicalMemoryAction:
                             if not service.application_eligible(
                                 candidate.candidate_id, budget=budget
                             ):
+                                service.visit_candidate(candidate.candidate_id)
+                                card["outcome"] = "application_ineligible"
                                 continue
                             stage = "probe"
                             observation = await service.prepare_and_probe(
@@ -350,6 +359,7 @@ class MathematicalMemoryAction:
                             )
                             if not service.candidate_eligible(candidate, budget=budget):
                                 continue
+                            service.visit_candidate(candidate.candidate_id)
                             payload = observation.to_record()
                             payload["candidate_id"] = candidate.candidate_id
                             payload["statement"] = goal.statement
@@ -536,6 +546,7 @@ class MathematicalMemoryAction:
                 raise
             except (TimeoutError, OSError, ValueError, TypeError, RuntimeError) as exc:
                 verdict = f"{type(exc).__name__}: {exc}"
+                failure_type = type(exc).__name__
                 if request:
                     settle_request("unresolved" if admitted else "rejected", verdict)
             finally:
@@ -560,6 +571,7 @@ class MathematicalMemoryAction:
                 metadata={
                     "verdict": verdict,
                     "stage": stage,
+                    "failure_type": failure_type,
                     "memory_input_generation": (
                         pin.to_record() if "pin" in locals() else None
                     ),

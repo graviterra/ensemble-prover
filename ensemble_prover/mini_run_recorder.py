@@ -777,6 +777,8 @@ class RunRecorder:
         self._turns_fp = turns_path.open("w", encoding="utf-8")
         self._turns_hasher = hashlib.sha256()
         self._trace_snapshot = None
+        from .trace_payloads import TracePayloadStore
+        self._trace_payload_store = TracePayloadStore(self.output_dir)
         self._orig_stdout = None if task_local_console else sys.stdout
         self._orig_stderr = None if task_local_console else sys.stderr
         self._task_console_capture = (
@@ -1275,6 +1277,8 @@ class RunRecorder:
                     incomplete_tail_bytes = len(raw)
                     break
                 row = json.loads(raw)
+                from .trace_payloads import expand_trace_payloads
+                row = expand_trace_payloads(row, predecessor)
                 clone_json_value(row, label="predecessor trace tail")
                 expected_index += 1
                 if type(row) is not dict or type(row.get("turn_index")) is not int or row["turn_index"] != expected_index:
@@ -2274,6 +2278,25 @@ class RunRecorder:
                     "terminal_proof_search_phase",
                     "session_terminal_failure",
                 )
+        if (
+            phase == "session_sustained_helper_progress"
+            and str(record.get("session_scope") or "problem") == "problem"
+        ):
+            # This safeguard stops the outer session after its funded work
+            # drains. A prior planner impasse is history, not that stop's cause.
+            # Child-local stalls must never become the parent run's verdict.
+            if verdict == "sustained_helper_progress_stalled":
+                self._metric_snapshot(
+                    "terminal_proof_search_reason", "sustained_helper_progress_stalled",
+                )
+                self._metric_snapshot("terminal_proof_search_phase", phase)
+            elif (
+                verdict == "helper_progress_window_explicitly_reopened"
+                and self.metrics.get("terminal_proof_search_reason")
+                == "sustained_helper_progress_stalled"
+            ):
+                self._metric_snapshot("terminal_proof_search_reason", "")
+                self._metric_snapshot("terminal_proof_search_phase", "")
         if phase == "session_no_applicable_recovery":
             if verdict == "repair_restore_failure_selector_reanchored":
                 key = "mini_session_no_applicable_repair_restore_reanchors"
@@ -3147,6 +3170,7 @@ class RunRecorder:
                 stored_record = {**record, "snapshot": encode_trace_snapshot(
                     trace_snapshot, self._trace_snapshot,
                 )}
+            stored_record = self._trace_payload_store.encode(stored_record)
             encoded_line = json.dumps(stored_record, ensure_ascii=False) + "\n"
             append_started = True
             self._turns_fp.write(encoded_line)
@@ -3359,8 +3383,11 @@ class RunRecorder:
         if should_print_llm_response:
             content = str(record.get("llm_response") or "")
             if content.strip():
-                llm_elapsed = record.get("llm_elapsed_s")
-                llm_part = f", {llm_elapsed}s" if llm_elapsed is not None else ""
+                turn_elapsed = record.get("turn_loop_elapsed_s", record.get("llm_elapsed_s"))
+                provider_elapsed = record.get("provider_elapsed_s", record.get("provider_call_elapsed_s"))
+                llm_part = f", turn {turn_elapsed}s" if turn_elapsed is not None else ""
+                if provider_elapsed is not None:
+                    llm_part += f", provider {provider_elapsed}s"
                 lines.append(f"  assistant ({len(content)} chars{llm_part}):")
                 limit = self.live_trace_response_chars
                 preview = content if limit is None else content[:limit]

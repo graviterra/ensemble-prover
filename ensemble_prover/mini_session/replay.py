@@ -3335,7 +3335,10 @@ def load_turn_trace(run_dir: str | Path) -> TraceLoadResult:
             continue
         try:
             record = json.loads(line)
-        except json.JSONDecodeError:
+            if isinstance(record, dict):
+                from ..trace_payloads import expand_trace_payloads
+                record = expand_trace_payloads(record, path.parent)
+        except (json.JSONDecodeError, ValueError, OSError, RecursionError):
             malformed += 1
             continue
         if isinstance(record, dict):

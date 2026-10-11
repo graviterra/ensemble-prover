@@ -461,6 +461,10 @@ def _run_detail_body(
         "childRootFinalizations": int(state.child_root_finalizations),
         "lastEventS": state.last_elapsed_s if state.rows else None,
         "cost": cost_text(state, summary),
+        "tokenUsage": state.token_usage.view(
+            partial=attached.partial_trace or state.generation_boundary,
+            backlog=attached.backlog,
+        ),
         "process": launch_process(record) if record is not None else {
             "status": attached.liveness.status,
             "detail": attached.liveness.detail,

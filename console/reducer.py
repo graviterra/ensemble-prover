@@ -18,6 +18,8 @@ Rules that matter more than any single field:
 
 from __future__ import annotations
 
+from .token_usage import TokenUsageState
+
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -76,6 +78,7 @@ class Lane:
 
 @dataclass
 class RunState:
+    token_usage: TokenUsageState = field(default_factory=TokenUsageState)
     live_math: LiveMathState = field(default_factory=LiveMathState)
     rows: int = 0
     last_elapsed_s: float = 0.0
@@ -583,6 +586,7 @@ def reduce(state: RunState, rec: Any) -> RunState:
         state.invalid_rows += 1
         return state
     state.live_math.consume(rec)
+    state.token_usage.consume(rec)
     state.rows += 1
     elapsed = _num(rec.get("elapsed_s"))
     if elapsed is not None:

@@ -46,7 +46,7 @@ def research_view(store: Any, key: str, value: dict[str, Any], *, limit: int) ->
     # Recent reports help researchers avoid repeating diagnoses. These are exact
     # excerpts, never substituted mathematical summaries or complete coverage.
     if key == "cumulative_research_comparison":
-        for name in ("reviewed_findings", "prior_reports"):
+        for name in ("scoped_obstructions", "reviewed_findings", "prior_reports"):
             selected = []
             for entry in reversed(value.get(name, [])):
                 entry = {field: item[:120] if isinstance(item, str) and field in {
@@ -95,6 +95,23 @@ def outcome_index(value: Any) -> list[dict[str, Any]]:
 def window(store: Any, value: dict[str, Any], *, limit: int) -> dict[str, Any]:
     if type(limit) is not int or limit < 2:
         raise ValueError("context limit must be an integer of at least 2")
+    # The immutable assignment owns its space before history or retrieval memory.
+    if isinstance(value.get("assigned_research_subject"), dict):
+        from .research_subject import bounded_subject
+        remaining = {key: item for key, item in value.items() if key != "assigned_research_subject"}
+        subject_limit = min(10000, max(340, limit - 520) if limit < 1800 else limit * 2 // 3)
+        subject = bounded_subject(store, value["assigned_research_subject"], subject_limit)
+        protected = {"assigned_research_subject": subject}
+        allocation = remaining.get("research_allocation")
+        if isinstance(allocation, dict) and limit < 1800:
+            protected["research_allocation"] = {key: allocation[key] for key in (
+                "requests_remaining", "must_conclude") if key in allocation}
+            del remaining["research_allocation"]
+        overhead = len(json_text(protected)) - 1
+        reduced = window(store, remaining, limit=limit - overhead)
+        reduced.update(protected)
+        assert len(json_text(reduced)) <= limit
+        return reduced
     result = deepcopy(value)
     if len(json_text(result)) <= limit:
         return result

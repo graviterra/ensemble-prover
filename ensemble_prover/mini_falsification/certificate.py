@@ -506,11 +506,26 @@ def _proof_candidates(candidate: CounterexampleCandidate) -> tuple[str, ...]:
                 "by\n  intro h\n  have hbad := @h " + witnesses + "\n  simp at hbad",
                 "by\n  intro h\n  have hbad := @h "
                 + witnesses
-                + "\n  decide +kernel at hbad",
+                + "\n  revert hbad\n  decide +kernel",
             )
         )
     proofs.extend(("by\n  norm_num", "by\n  simp", "by\n  decide +kernel"))
-    return tuple(dict.fromkeys(proofs))
+    unique_proofs = tuple(dict.fromkeys(proofs))
+    if candidate.engine == "graph":
+        # Graph observation recipes may be inapplicable to the specialized
+        # proposition (for example adjacency instead of graph equality).
+        # Try these bounded alternatives inside one Lean invocation, so each
+        # failed observation does not spend another process startup from the
+        # same certification quantum. `solve` backtracks when an alternative
+        # leaves goals open; a nested `exact (by ...)` can instead recover with
+        # an admitted term and prevent a later valid observation from running.
+        branches = ["by", "  solve"]
+        for proof in unique_proofs:
+            body = proof.splitlines()[1:]
+            branches.append("  | " + body[0].strip())
+            branches.extend("  " + line for line in body[1:])
+        return ("\n".join(branches),)
+    return unique_proofs
 
 
 async def _call_check(

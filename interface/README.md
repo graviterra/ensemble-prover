@@ -96,6 +96,21 @@ The **Formal mathematics** panel shows its recorded Lean statement. Expand
 match the recorded statement identity and verification environment; conflicting,
 incomplete, or oversized records show an explanation instead of an inferred proof.
 The displayed source does not change the root or export status.
+The **Token usage** panel updates with the page every four seconds. It shows
+provider-reported input and generated tokens, cache usage, and a role breakdown.
+Input includes cache reads and writes; generated tokens include reported
+reasoning. Counts cover the loaded trace, including child work and late usage
+receipts. An incomplete or resumed trace is identified rather than presented
+as the entire attempt's consumption.
+
+Calls awaiting usage appear separately. Where Claude Code emits thinking-block
+estimates, changes can be recorded every two seconds. These estimates can reset
+between blocks and are never added to reported totals. Providers that expose
+usage only after a call completes show a waiting message. Missing reports,
+stale observations, paused updates, and reads that are still catching up remain
+visible; unknown consumption is not displayed as zero. Older running workers
+retain their existing telemetry cadence until restarted.
+
 **Graph & evidence** adds a node search and the retained event log. Milestones
 open recorded receipts; the graph continues to show current recorded state,
 so selecting a milestone does not reconstruct a historical graph.

@@ -3066,6 +3066,7 @@ class OpenAICompatClient:
         self.last_tool_request_skipped: bool = False
         self.last_temperature_requested: Optional[float] = None
         self.last_temperature_sent: Optional[float] = None
+        self.last_temperature_control_supported: Optional[bool] = None
         self.last_temperature_provider_dropped: bool = False
         self.last_temperature_provider_drop_reason: str = ""
         self.last_reasoning_control_requested: str = ""
@@ -3179,6 +3180,7 @@ class OpenAICompatClient:
         self.last_tool_request_skipped = False
         self.last_temperature_requested = None
         self.last_temperature_sent = None
+        self.last_temperature_control_supported = None
         self.last_temperature_provider_dropped = False
         self.last_temperature_provider_drop_reason = ""
         self.last_reasoning_control_requested = ""
@@ -4616,6 +4618,7 @@ class OpenAICompatClient:
         )
         self.last_temperature_requested = requested_temperature
         self.last_temperature_sent = None
+        self.last_temperature_control_supported = None
         self.last_temperature_provider_dropped = False
         self.last_temperature_provider_drop_reason = ""
         self.last_reasoning_control_requested = ""
@@ -4707,6 +4710,18 @@ class OpenAICompatClient:
                 self.last_reasoning_control_decision = (
                     "openai_chat_tools_reasoning_effort_forced_none"
                 )
+        actual_effort = payload.get("reasoning_effort", effective_reasoning_effort)
+        thinking = payload.get("thinking")
+        actual_thinking = (
+            thinking.get("type") == "enabled"
+            if isinstance(thinking, dict) and thinking.get("type") in {"enabled", "disabled"}
+            else bool(getattr(self.cfg, "thinking_enabled", False))
+            and str(actual_effort or "").strip().lower() != "none"
+        )
+        self.last_temperature_control_supported = _supports_sampling_controls(
+            base_url=self.base_url, model=self.cfg.model,
+            reasoning_effort=actual_effort, thinking_enabled=actual_thinking,
+        )
         return payload
 
     def _sampling_metadata_for_payload(
@@ -4963,6 +4978,7 @@ class OpenAICompatClient:
                     if _cacheable_unsupported_parameter(exc, "temperature"):
                         self._unsupported_payload_parameters.add("temperature")
                     self.last_temperature_sent = None
+                    self.last_temperature_control_supported = False
                     self.last_temperature_provider_dropped = True
                     self.last_temperature_provider_drop_reason = "provider_400_retry"
                     continue
@@ -6269,6 +6285,7 @@ class OpenAICompatClient:
             reasoning_control_required
         )
         self.last_temperature_sent = None
+        self.last_temperature_control_supported = False
         self.last_temperature_provider_dropped = True
         self.last_temperature_provider_drop_reason = "responses_api_reasoning"
         publish_provider_request_metadata(
@@ -6557,6 +6574,7 @@ class OpenAICompatClient:
             reasoning_control_required
         )
         self.last_temperature_sent = None
+        self.last_temperature_control_supported = False
         self.last_temperature_provider_dropped = True
         self.last_temperature_provider_drop_reason = (
             "responses_api_reasoning"

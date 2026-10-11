@@ -5762,7 +5762,6 @@ async def run_conversation(
         strategy_runtime.prepare_conversation(conv, dossier)
     from .mini_research import prepare_native_conversation
 
-    native_tools = prepare_native_conversation(conv, dossier)
     compute_examples_tool_enabled = _effective_compute_examples_tool_enabled(
         compute_examples_tool_enabled,
         searcher=searcher,
@@ -5770,6 +5769,8 @@ async def run_conversation(
         try_lean_tool_enabled=bool(try_lean_tool_enabled),
         apply_decl_to_goal_tool_enabled=bool(apply_decl_to_goal_tool_enabled),
     )
+    conv._native_compute_examples_enabled = bool(compute_examples_tool_enabled)
+    native_tools = prepare_native_conversation(conv, dossier)
     base_use_tools = (
         searcher is not None
         or lean_check_tool_enabled
@@ -13688,6 +13689,11 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--private-source-capsule",
+        action="store_true",
+        help="Save private allowlisted runtime source and lock files under the run directory for diagnosis.",
+    )
+    p.add_argument(
         "--terminal-trace",
         choices=("compact", "full", "jsonl", "off"),
         default="compact",
@@ -14739,6 +14745,10 @@ def _install_cooperative_stop_signal_handlers(
     main_task = asyncio.current_task()
     if main_task is None:
         return lambda: None
+    from .shutdown import install_shutdown_state, reset_shutdown_state
+    from .mini_session.process_watchdog import worker_shutdown_timeout_s
+
+    shutdown_state, shutdown_token = install_shutdown_state()
     installed: List[int] = []
     hard_stop_timer: Optional[threading.Timer] = None
 
@@ -14755,7 +14765,10 @@ def _install_cooperative_stop_signal_handlers(
             if hard_stop_timeout_s > 0.0:
                 _hard_stop(signum)
             return
-        stop_signals.append(int(signum))
+        original_signal = shutdown_state.adopt_supervisor_stop() or int(signum)
+        stop_signals.append(original_signal)
+        shutdown_state.begin(hard_stop_timeout_s or worker_shutdown_timeout_s(),
+                             reason=f"signal:{original_signal}")
         if cancel_all_tasks:
             for task in asyncio.all_tasks(loop):
                 if task is not main_task and not task.done():
@@ -14778,6 +14791,7 @@ def _install_cooperative_stop_signal_handlers(
         installed.append(int(handled))
 
     def _uninstall() -> None:
+        nonlocal shutdown_token
         # Once a cooperative stop was delivered, keep the hard-stop lease
         # alive through ``asyncio.run``'s own final task-cancellation sweep.
         # A sample that suppresses CancelledError may outlive ``_main_async``;
@@ -14786,6 +14800,9 @@ def _install_cooperative_stop_signal_handlers(
         # teardown still cancels the dormant lease.
         if hard_stop_timer is not None and not stop_signals:
             hard_stop_timer.cancel()
+        if shutdown_token is not None:
+            reset_shutdown_state(shutdown_token)
+            shutdown_token = None
         for handled in installed:
             try:
                 loop.remove_signal_handler(handled)
@@ -15101,18 +15118,26 @@ async def _supervised_resource_close(
 ) -> None:
     """Bound teardown so final accounting cannot hang behind a stuck close."""
 
+    from .shutdown import current_shutdown, remaining_cleanup_seconds
+
+    shutdown_state = current_shutdown()
+    if shutdown_state is not None:
+        shutdown_state.record("resource_close_started", owner=label)
+
     task = asyncio.ensure_future(awaitable)
     done, _pending = await asyncio.wait(
         {task},
-        timeout=max(0.0, float(timeout_s or 0.0)),
+        timeout=remaining_cleanup_seconds(float(timeout_s or 0.0)),
     )
     if task in done:
         await task
+        if shutdown_state is not None:
+            shutdown_state.record("resource_close_finished", owner=label)
         return
     task.cancel()
     done, _pending = await asyncio.wait(
         {task},
-        timeout=max(0.0, float(cancel_grace_s or 0.0)),
+        timeout=remaining_cleanup_seconds(float(cancel_grace_s or 0.0)),
     )
     if task in done:
         try:
@@ -15122,6 +15147,10 @@ async def _supervised_resource_close(
         return
 
     from .mini_session.process_watchdog import is_watchdog_worker
+
+    if shutdown_state is not None:
+        shutdown_state.unfinished[label] = [{"name": task.get_name()}]
+        shutdown_state.record("resource_close_unfinished", owner=label)
 
     if is_watchdog_worker():
         # The active shutdown lease is the only mechanism that can both bound
@@ -15418,6 +15447,11 @@ async def _main_async(args: argparse.Namespace) -> int:
         output_dir = Path(args.output_dir).resolve()
     else:
         output_dir = _allocate_default_mini_run_dir(problem.artifact_slug)
+    from .shutdown import current_shutdown
+
+    shutdown_state = current_shutdown()
+    if shutdown_state is not None:
+        shutdown_state.output_dir = output_dir
     from .local_inference.roles import activate_local_inference, initialize_local_resources, prepare_local_inference
     checkpoint_registry = None
     try:
@@ -15464,6 +15498,18 @@ async def _main_async(args: argparse.Namespace) -> int:
         raise
     if checkpoint_registry is not None:
         checkpoint_registry.recorder = recorder
+    # Resume validation must see the pristine generation before optional
+    # diagnostic artifacts populate it.
+    if getattr(args, "private_source_capsule", False):
+        from .source_capsule import capture_source_capsule
+
+        try:
+            run_source_provenance["private_capsule"] = capture_source_capsule(
+                Path(run_source_provenance["repository_root"]), output_dir)
+        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+            run_source_provenance["private_capsule"] = {
+                "available": False, "error_type": type(exc).__name__, "replay_complete": False,
+            }
     configure_live_trace = getattr(recorder, "configure_live_trace", None)
     if callable(configure_live_trace):
         configure_live_trace(str(getattr(args, "terminal_trace", "compact") or "compact"))
@@ -16447,10 +16493,15 @@ async def _main_async(args: argparse.Namespace) -> int:
             )
 
             shutdown_timeout_s = worker_shutdown_timeout_s()
+            shutdown_state = current_shutdown()
+            shutdown_deadline = (
+                shutdown_state.begin(shutdown_timeout_s, stop_work=False)
+                if shutdown_state is not None else time.monotonic() + shutdown_timeout_s
+            )
             shutdown_leases.append(
                 begin_process_deadline(
                     deadline_monotonic=(
-                        time.monotonic() + shutdown_timeout_s
+                        shutdown_deadline
                         if shutdown_timeout_s > 0.0
                         else 0.0
                     ),

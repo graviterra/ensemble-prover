@@ -1,4 +1,5 @@
 import type { LiveMathView } from "./liveMath";
+import type { TokenUsage } from "./tokenUsage";
 
 export type LibraryRun = {
   id: string;
@@ -38,6 +39,7 @@ export type GraphNode = {
 };
 
 export type RunDetail = {
+  tokenUsage?: TokenUsage;
   liveMath?: LiveMathView;
   kind: string;
   problem: string;

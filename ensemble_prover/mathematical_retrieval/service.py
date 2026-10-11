@@ -191,14 +191,25 @@ def _is_putnam_bench_problem_entry(entry: Any) -> bool:
     ) or is_putnam_bench_problem_declaration(_entry_name(entry))
 
 
-def _helper_record_id(record: Mapping[str, Any]) -> str:
-    """Hash every retrieval-relevant field of one durable helper row."""
+def _helper_record_discovery_identity(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    identity = record.get("_retrieval_advisory_identity")
+    if not isinstance(identity, Mapping) or any(
+        str(identity.get(key) or "").strip() != str(record.get(key) or "").strip()
+        for key in ("source_hash", "preamble_hash", "theorem_name")
+    ):
+        return record
+    return identity
 
+
+def _helper_record_id(record: Mapping[str, Any]) -> str:
+    """Preserve discovery pins when admitted source metadata is normalized."""
+
+    identity = _helper_record_discovery_identity(record)
     return stable_retrieval_hash(
         {
-            "name": str(record.get("name") or "").strip(),
+            "name": str(identity.get("name") or "").strip(),
             "statement": str(
-                record.get("statement_preview") or record.get("statement") or ""
+                identity.get("statement_preview") or identity.get("statement") or ""
             ).strip(),
             "source_hash": str(record.get("source_hash") or "").strip(),
             "theorem_name": str(record.get("theorem_name") or "").strip(),
@@ -1523,7 +1534,7 @@ class VerifiedHelperSource:
         self._entries: tuple[Any, ...] = ()
         self._inverted: dict[str, set[int]] = {}
         if record_generation is None:
-            getter = getattr(self.cache, "retrieval_records", None)
+            getter = (getattr(self.cache, "advisory_retrieval_records", None) or getattr(self.cache, "retrieval_records", None))
             initial_records = list(getter() or ()) if callable(getter) else []
             self._record_generation = {
                 _helper_record_id(record): str(
@@ -1559,7 +1570,7 @@ class VerifiedHelperSource:
                     (*self.allowed_source_hashes, clean)
                 )
             if self.allowed_record_ids is not None:
-                getter = getattr(self.cache, "retrieval_records", None)
+                getter = (getattr(self.cache, "advisory_retrieval_records", None) or getattr(self.cache, "retrieval_records", None))
                 records = list(getter() or ()) if callable(getter) else []
                 # Preserve the pin: a recheck of a shared source_hash must only
                 # flip availability for records ALREADY in the allowed set, never
@@ -1585,7 +1596,7 @@ class VerifiedHelperSource:
         # _ensure_index only filters on allowed_record_ids, so enforce the hash
         # pin by deriving the matching record ids — otherwise this pin is a no-op
         # and records with other source hashes still get indexed.
-        getter = getattr(self.cache, "retrieval_records", None)
+        getter = (getattr(self.cache, "advisory_retrieval_records", None) or getattr(self.cache, "retrieval_records", None))
         records = list(getter() or ()) if callable(getter) else []
         self.allowed_record_ids = frozenset(
             _helper_record_id(record)
@@ -1718,10 +1729,13 @@ class VerifiedHelperSource:
         deadline_monotonic: Optional[float] = None,
         deadline_exhausted: Optional[Callable[[], bool]] = None,
     ) -> None:
+        refresh = getattr(self.cache, "refresh_read_paths", None)
+        if callable(refresh):
+            refresh()
         snapshot = self.snapshot_id()
         if self._indexed_snapshot == snapshot:
             return
-        records = getattr(self.cache, "retrieval_records", None)
+        records = (getattr(self.cache, "advisory_retrieval_records", None) or getattr(self.cache, "retrieval_records", None))
         raw_records = list(records() or ()) if callable(records) else []
         entries: list[Any] = []
         inverted: dict[str, set[int]] = defaultdict(set)
@@ -1739,21 +1753,28 @@ class VerifiedHelperSource:
             ):
                 continue
             name = str(record.get("name") or "").strip()
-            original_name = name
             statement = str(
                 record.get("statement_preview") or record.get("statement") or ""
             ).strip()
             source = str(record.get("source") or "").strip()
             source_hash = str(record.get("source_hash") or "").strip()
+            if source and (not name or not statement):
+                # Missing advisory fields must not prevent selection of a
+                # valid declaration. This extracts syntax only; selected
+                # entries still pass the full semantic admission policy.
+                from ensemble_prover.proof_dossier import helper_decl_name, helper_decl_statement
+
+                name = name or helper_decl_name(source) or ""
+                statement = statement or helper_decl_statement(source) or ""
+            original_name = name
             name = self._active_helper_names_by_source_hash.get(source_hash, name)
             if not name or not statement or not source or not source_hash:
                 continue
-            context_name = (
-                self._context_name_for_source(source, source_hash, bindings)
-                if bindings and source_hash not in self._active_source_hashes
-                else ""
-            )
+            # Resolve renamed context membership only for selected candidates;
+            # normalizing every historical body defeats deferred admission.
+            context_name = ""
             name = context_name or name
+            discovery = _helper_record_discovery_identity(record)
             entry = SimpleNamespace(
                 name=name,
                 type=statement,
@@ -1763,9 +1784,24 @@ class VerifiedHelperSource:
                 source="verified_helper",
                 _helper_source=source,
                 _source_hash=source_hash,
-                _owner_theorem=str(record.get("theorem_name") or ""),
+                _preamble_hash=str(record.get("preamble_hash") or "").strip(),
+                _owner_theorem=str(record.get("theorem_name") or "").strip(),
+                _record_identity={
+                    "theorem_name": str(record.get("theorem_name") or "").strip(),
+                    "name": str(discovery.get("name") or "").strip(),
+                    "statement": str(
+                        discovery.get("statement_preview") or discovery.get("statement") or ""
+                    ).strip(),
+                },
                 _original_helper_name=original_name,
                 _helper_context_id=self._helper_context_id if context_name else "",
+                _entry_index=len(entries),
+                # Preserve discovery relevance alongside the current admitted
+                # declaration. These hints never become returned metadata.
+                _advisory_rank_text=(
+                    f"{name} {discovery.get('name', '')} "
+                    f"{discovery.get('statement_preview') or discovery.get('statement') or ''}"
+                ),
             )
             index = len(entries)
             entries.append(entry)
@@ -1806,8 +1842,52 @@ class VerifiedHelperSource:
         return ""
 
     def iter_entries(self) -> Sequence[Any]:
+        """Return advisory inventory; consumers must admit selected entries."""
         self._ensure_index()
         return self._entries
+
+    def _entry_is_admitted(self, entry: Any) -> bool:
+        previous_tokens = _normalized_analogy_tokens(
+            f"{entry.name} {entry._original_helper_name} {entry.type} {entry._owner_theorem}"
+        )
+        declaration_getter = getattr(self.cache, "admitted_retrieval_declaration", None)
+        if callable(declaration_getter):
+            declaration = declaration_getter(
+                entry._source_hash, entry._preamble_hash,
+                source=entry._helper_source, refresh=False,
+                record_identity=entry._record_identity,
+            )
+            if declaration is None:
+                return False
+            entry._helper_source = declaration["source"]
+            entry._original_helper_name = declaration["name"]
+            entry.type = declaration["statement"]
+            entry.name = self._active_helper_names_by_source_hash.get(
+                entry._source_hash, declaration["name"]
+            )
+            entry._helper_context_id = ""
+        else:
+            admit = getattr(self.cache, "admit_retrieval_record", None)
+            if callable(admit) and not admit(entry._source_hash, entry._preamble_hash, refresh=False):
+                return False
+        if self._helper_context_bindings and entry._source_hash not in self._active_source_hashes:
+            bindings: dict[str, list[tuple[str, str]]] = defaultdict(list)
+            for name, source_digest, normalized_digest in self._helper_context_bindings:
+                bindings[normalized_digest].append((name, source_digest))
+            context_name = self._context_name_for_source(entry._helper_source, entry._source_hash, bindings)
+            if context_name:
+                entry.name = context_name
+                entry._helper_context_id = self._helper_context_id
+        index = getattr(entry, "_entry_index", -1)
+        if 0 <= index < len(self._entries) and self._entries[index] is entry:
+            current_tokens = _normalized_analogy_tokens(
+                f"{entry.name} {entry._original_helper_name} {entry.type} {entry._owner_theorem}"
+            )
+            for token in previous_tokens - current_tokens:
+                self._inverted.get(token, set()).discard(index)
+            for token in current_tokens - previous_tokens:
+                self._inverted.setdefault(token, set()).add(index)
+        return True
 
     def _origin(self, entry: Any) -> CandidateOrigin:
         source_hash = str(_entry_value(entry, "_source_hash", "") or "")
@@ -1876,9 +1956,12 @@ class VerifiedHelperSource:
                 if _retrieval_elapsed(deadline_monotonic, deadline_exhausted):
                     break
                 entry = self._entries[index]
-                score = _analogy_score(
-                    query_text,
-                    f"{_entry_name(entry)} {entry._original_helper_name} {_entry_type(entry)}",
+                score = max(
+                    _analogy_score(query_text, entry._advisory_rank_text),
+                    _analogy_score(
+                        query_text,
+                        f"{entry.name} {entry._original_helper_name} {entry.type}",
+                    ),
                 )
                 if query.theorem_name and str(
                     _entry_value(entry, "_owner_theorem", "") or ""
@@ -1887,17 +1970,26 @@ class VerifiedHelperSource:
                 if score > 0.0:
                     scored.append((score, index))
             scored.sort(key=lambda item: (-item[0], _entry_name(self._entries[item[1]])))
-            hits = tuple(
-                SourceHit(
-                    entry=self._entries[index],
+            admitted_hits: list[SourceHit] = []
+            for score, index in scored:
+                if len(admitted_hits) >= max_results or _retrieval_elapsed(
+                    deadline_monotonic, deadline_exhausted
+                ):
+                    break
+                entry = self._entries[index]
+                if not self._entry_is_admitted(entry):
+                    continue
+                # The limit bounds returned facts, not advisory candidates:
+                # rejected rows can persist in this snapshot across searches.
+                admitted_hits.append(SourceHit(
+                    entry=entry,
                     score=score,
                     channel="verified_helper_semantic",
-                    origin=self._origin(self._entries[index]),
+                    origin=self._origin(entry),
                     reasons=("semantic_helper_analogy",),
                     details={"semantic_helper_analogy": score},
-                )
-                for score, index in scored[:max_results]
-            )
+                ))
+            hits = tuple(admitted_hits)
             source_truncated = _retrieval_elapsed(
                 deadline_monotonic,
                 deadline_exhausted,
@@ -2791,7 +2883,8 @@ class MathematicalRetrievalService:
                 continue
 
             if isinstance(source, VerifiedHelperSource):
-                cache_records = getattr(source.cache, "retrieval_records", None)
+                cache_records = (getattr(source.cache, "advisory_retrieval_records", None)
+                                 or getattr(source.cache, "retrieval_records", None))
                 available_generation = dict(source.record_generation())
                 available_generation.update({
                     _helper_record_id(item): str(item.get("source_hash") or "").strip()
@@ -3581,6 +3674,8 @@ class MathematicalRetrievalService:
                         required_bundle_ids=(bundle_id,) if bundle_id else (),
                     )
                 elif isinstance(source, VerifiedHelperSource):
+                    if not source._entry_is_admitted(entry):
+                        continue
                     origin = source._origin(entry)
                 else:
                     continue
@@ -3618,7 +3713,7 @@ class MathematicalRetrievalService:
                 required_bundle_ids=(bundle_id,) if bundle_id else (),
             )
         if isinstance(source, VerifiedHelperSource):
-            return source._origin(entry)
+            return source._origin(entry) if source._entry_is_admitted(entry) else None
         return None
 
     def _query_scoped_large_type_entries(
@@ -3973,10 +4068,21 @@ class MathematicalRetrievalService:
                         deadline_exhausted=type_deadline_exhausted,
                     )
                 )
+        helper_sources = {source.source_id: source for source in self.sources
+                          if isinstance(source, VerifiedHelperSource)}
+        for source in helper_sources.values():
+            refresh = getattr(source.cache, "refresh_read_paths", None)
+            if callable(refresh):
+                refresh()
         deduplicated_hits: dict[
             tuple[tuple[str, str, str, str, str], str, str], SourceHit
         ] = {}
         for hit in all_hits:
+            helper_source = helper_sources.get(hit.origin.source_id)
+            if helper_source is not None:
+                if not helper_source._entry_is_admitted(hit.entry):
+                    continue
+                hit = replace(hit, origin=helper_source._origin(hit.entry))
             key = (self._candidate_key(hit), hit.origin.source_id, hit.channel)
             previous = deduplicated_hits.get(key)
             if previous is None or hit.score > previous.score:

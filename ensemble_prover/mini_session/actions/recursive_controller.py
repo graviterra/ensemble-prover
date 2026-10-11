@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import json
+import math
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 import time
@@ -131,6 +134,7 @@ class RecursiveControllerAction:
             "_pending_planner_job_launch",
             "_planner_job_receipt_identities",
             "_planner_equivalent_wait",
+            "_planner_helper_admission",
         }
     )
 
@@ -171,6 +175,7 @@ class RecursiveControllerAction:
                 self._recursive_fixed_point_reason or ""
             ),
             "planner_equivalent_wait": dict(self._planner_equivalent_wait),
+            "planner_helper_admission": copy.deepcopy(self._planner_helper_admission),
         }
 
     def apply_scheduler_runtime_state(self, state: Any) -> None:
@@ -199,6 +204,9 @@ class RecursiveControllerAction:
             or not isinstance(ledger.get("state"), dict)
         )):
             raise StateSnapshotCompatibilityError("malformed root portfolio ledger")
+        helper_admission = self._validated_helper_admission(
+            record.get("planner_helper_admission", {})
+        )
         self._recursive_driver_state = copy.deepcopy(driver_state)
         self._recursive_root_portfolio_ledger = (
             {"revision": ledger["revision"], "state": root_portfolio_state(ledger["state"])}
@@ -218,6 +226,7 @@ class RecursiveControllerAction:
             record.get("recursive_fixed_point_reason") or ""
         )
         self._planner_equivalent_wait = dict(wait)
+        self._planner_helper_admission = helper_admission
 
     async def restore_checkpoint_children(self, session: Any, frames: dict[str, Any]) -> None:
         from ..durable_recursive_child import restore_controller_children
@@ -286,6 +295,7 @@ class RecursiveControllerAction:
         self._recursive_fixed_point_reason = ""
         self._pending_planner_job_launch: Optional[PlannerJobLaunch] = None
         self._planner_equivalent_wait: dict[str, str] = {}
+        self._planner_helper_admission: dict[str, Any] = {}
         self._planner_job_receipt_identities: dict[
             tuple[str, str], Any
         ] = {}
@@ -320,6 +330,151 @@ class RecursiveControllerAction:
             }
             for action in actions
         ])
+
+    @staticmethod
+    def _validated_helper_admission(value: Any) -> dict[str, Any]:
+        if not value:
+            return {}
+        if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
+                or value.get("schema_version") != 1):
+            raise StateSnapshotCompatibilityError("malformed planner helper admission")
+        baseline = value.get("baseline")
+        if not isinstance(baseline, dict) or not all(
+            isinstance(baseline.get(key), str) and baseline[key]
+            for key in ("base_signature", "exact_signature")
+        ) or not isinstance(baseline.get("helper_hashes"), list) or any(
+            not isinstance(item, str) or not item for item in baseline["helper_hashes"]
+        ):
+            raise StateSnapshotCompatibilityError("malformed planner admission baseline")
+        rounds = value.get("backoff_round", 0)
+        if type(rounds) is not int or not 0 <= rounds <= 4:
+            raise StateSnapshotCompatibilityError("malformed planner admission backoff")
+        pending = value.get("pending", {})
+        if not isinstance(pending, dict) or (pending and (
+            not isinstance(pending.get("admission_id"), str)
+            or not pending["admission_id"]
+            or not isinstance(pending.get("exact_signature"), str)
+            or not pending["exact_signature"]
+            or any(type(pending.get(key)) not in (int, float)
+                   or not math.isfinite(pending[key]) or pending[key] < 0
+                   for key in ("first_seen_at", "ready_at"))
+            or pending["ready_at"] < pending["first_seen_at"]
+            or pending["ready_at"] - pending["first_seen_at"] > 900.0
+        )):
+            raise StateSnapshotCompatibilityError("malformed planner admission wait")
+        return copy.deepcopy(value)
+
+    @staticmethod
+    def _admission_context(session: Any) -> dict[str, Any]:
+        getter = getattr(session, "_recursive_planner_admission_context", None)
+        return dict(getter() or {}) if callable(getter) else {}
+
+    def _unknown_helper_delta(self, context: dict[str, Any]) -> list[str]:
+        baseline = self._planner_helper_admission.get("baseline", {})
+        old = baseline.get("helper_hashes", [])
+        current = context.get("helper_hashes", [])
+        if (not baseline or context.get("base_signature") != baseline.get("base_signature")
+                or context.get("checked_obligation_bindings", []) != baseline.get("checked_obligation_bindings", [])
+                or current[:len(old)] != old):
+            return []
+        return current[len(old):]
+
+    def _helper_admission_id(self, context: dict[str, Any]) -> str:
+        baseline = self._planner_helper_admission.get("baseline", {})
+        return hashlib.sha256(json.dumps({
+            "baseline": baseline.get("exact_signature", ""),
+            "frontier": context.get("exact_signature", ""),
+            "baseline_checked_bindings": baseline.get("checked_obligation_bindings", []),
+            "checked_bindings": context.get("checked_obligation_bindings", []),
+        }, sort_keys=True).encode()).hexdigest()
+
+    def _new_checked_binding(self, context: dict[str, Any]) -> bool:
+        baseline = self._planner_helper_admission.get("baseline", {})
+        previous = baseline.get("checked_obligation_bindings", [])
+        return bool(baseline and any(
+            binding not in previous for binding in context.get("checked_obligation_bindings", [])
+        ))
+
+    def reconcile_planner_admission(self, session: Any, context: dict[str, Any]) -> None:
+        """Coalesce unknown append-only helper changes at a durable boundary.
+
+        This state grants scheduling opportunity only. Execution fingerprints,
+        verification authority and provider/pass allocations remain exact.
+        """
+        fixed = self._recursive_fixed_point_environment_signature
+        if not fixed or not context:
+            return
+        if not self._planner_helper_admission:
+            # A legacy fixed point can be reconstructed only at the same exact
+            # frontier. A changed legacy frontier receives its ordinary retry.
+            if context.get("exact_signature") == fixed:
+                self._planner_helper_admission = {
+                    "schema_version": 1, "baseline": copy.deepcopy(context),
+                    "pending": {}, "backoff_round": 0,
+                }
+            return
+        checked_binding = self._new_checked_binding(context)
+        delta = self._unknown_helper_delta(context)
+        if not delta and not checked_binding:
+            self._planner_helper_admission["pending"] = {}
+            return
+        old_pending = self._planner_helper_admission.get("pending", {})
+        now = time.time()
+        first_seen = float(old_pending.get("first_seen_at", now))
+        delay = min(900.0, 60.0 * 2 ** min(4, self._planner_helper_admission.get("backoff_round", 0)))
+        remaining_getter = getattr(session, "_run_governor_remaining_s", None)
+        remaining = remaining_getter() if callable(remaining_getter) else None
+        if remaining is not None:
+            delay = min(delay, max(0.0, float(remaining) / 4.0))
+        ready_at = float(old_pending.get("ready_at", first_seen + delay))
+        if checked_binding:
+            first_seen = now
+            ready_at = now
+        admission_id = self._helper_admission_id(context)
+        if admission_id == self._planner_helper_admission.get("last_consumed_admission_id"):
+            self._planner_helper_admission["pending"] = {}
+            return
+        self._planner_helper_admission["pending"] = {
+            "admission_id": admission_id, "exact_signature": context["exact_signature"],
+            "first_seen_at": first_seen, "ready_at": ready_at,
+            "reason": "checked_obligation" if checked_binding else "helper_exploration",
+        }
+
+    def _helper_delta_waiting(self, session: Any) -> bool:
+        context = self._admission_context(session)
+        delta = self._unknown_helper_delta(context)
+        if (delta and self._helper_admission_id(context)
+                == self._planner_helper_admission.get("last_consumed_admission_id")):
+            return True
+        if not delta or len(delta) >= 3:
+            return False
+        pending = self._planner_helper_admission.get("pending", {})
+        # Observations happen before a snapshot, never inside this pure probe.
+        return not pending or time.time() < float(pending["ready_at"])
+
+    def next_eligible_at(self, session: Any) -> float:
+        if (not self._recursive_fixed_point_environment_signature
+                or int(getattr(session, self.budget_attr, 0) or 0) == 0
+                or not self._helper_delta_waiting(session)):
+            return 0.0
+        return float(self._planner_helper_admission.get("pending", {}).get("ready_at", 0.0))
+
+    def _consume_helper_admission(self, session: Any) -> None:
+        pending = self._planner_helper_admission.get("pending", {})
+        if not pending:
+            return
+        context = self._admission_context(session)
+        if self._helper_admission_id(context) != pending.get("admission_id"):
+            # A dispatch-time change is consumed by the exact request that is
+            # actually reserved, never by the earlier quotation's identifier.
+            pending = {**pending, "admission_id": self._helper_admission_id(context)}
+        if pending:
+            self._planner_helper_admission["last_consumed_admission_id"] = pending["admission_id"]
+            if pending.get("reason") != "checked_obligation":
+                self._planner_helper_admission["backoff_round"] = (
+                    min(4, int(self._planner_helper_admission.get("backoff_round", 0)) + 1)
+                )
+            self._planner_helper_admission["pending"] = {}
 
     @staticmethod
     def _session_progress_signature(session: Any) -> str:
@@ -408,6 +563,14 @@ class RecursiveControllerAction:
                 fixed_point_signature
             )
             self._recursive_fixed_point_reason = fixed_point_reason
+            context = dict(outcome.metadata.get("recursive_planner_admission_context") or {})
+            if context and context.get("exact_signature") == fixed_point_signature:
+                same_base = context.get("base_signature") == self._planner_helper_admission.get("baseline", {}).get("base_signature")
+                self._planner_helper_admission = {
+                    "schema_version": 1, "baseline": copy.deepcopy(context), "pending": {},
+                    "backoff_round": self._planner_helper_admission.get("backoff_round", 0) if same_base else 0,
+                    "last_consumed_admission_id": self._planner_helper_admission.get("last_consumed_admission_id", ""),
+                }
         if not bool(outcome.metadata.get("recursive_pass_quantum_yield")):
             terminal_result = self._recursive_driver_state.get("terminal_result")
             terminal_failure_reason = (
@@ -709,13 +872,22 @@ class RecursiveControllerAction:
                 )
                 if status == "pending":
                     return False
+        checked_binding_changed = False
         if self._recursive_fixed_point_environment_signature:
             current_signature = self._session_progress_signature(session)
+            context = self._admission_context(session)
+            checked_binding_changed = self._new_checked_binding(context)
+            if (self._planner_helper_admission
+                    and self._helper_admission_id(context)
+                    == self._planner_helper_admission.get("last_consumed_admission_id")):
+                return False
             if (
                 not current_signature
-                or current_signature
-                == self._recursive_fixed_point_environment_signature
+                or (current_signature == self._recursive_fixed_point_environment_signature
+                    and not checked_binding_changed)
             ):
+                return False
+            if self._helper_delta_waiting(session):
                 return False
         available_passes = int(getattr(session, self.budget_attr, 0) or 0)
         if available_passes >= 0:
@@ -724,9 +896,8 @@ class RecursiveControllerAction:
         # provider work.  It must remain dispatchable after the pass that made
         # it consumed the final budget unit, otherwise the durable outcome is
         # stranded before ``on_outcome_applied`` can publish its fixed point.
-        if available_passes == 0 and not self._terminal_receipt_pending_publication(
-            session
-        ):
+        if available_passes == 0 and (checked_binding_changed
+                or not self._terminal_receipt_pending_publication(session)):
             return False
         if self.run_conversation_fn is None:
             return False
@@ -760,9 +931,12 @@ class RecursiveControllerAction:
         # is cleared. The root execution keys remain independently scoped.
         root_portfolio_for_attempt = self._shared_root_portfolio(session)[1]
         self._planner_equivalent_wait = {}
+        reopening_checked_binding = False
         if self._recursive_fixed_point_environment_signature:
             current_signature = self._session_progress_signature(session)
-            if current_signature != self._recursive_fixed_point_environment_signature:
+            reopening_checked_binding = self._new_checked_binding(self._admission_context(session))
+            if (current_signature != self._recursive_fixed_point_environment_signature
+                    or reopening_checked_binding):
                 # ``is_applicable`` is probe-pure; publish reopening only once
                 # the action is actually dispatched over the changed frontier.
                 self._recursive_fixed_point_environment_signature = ""
@@ -770,7 +944,7 @@ class RecursiveControllerAction:
         stale_terminal_receipt = bool(
             str(self._recursive_driver_state.get("phase") or "")
             == "terminal_committed"
-            and not self._terminal_receipt_pending_publication(session)
+            and (reopening_checked_binding or not self._terminal_receipt_pending_publication(session))
         )
         # Consume the already-paid committed reservation before discarding a
         # stale/legacy terminal receipt.  Clearing first would misclassify it as
@@ -922,6 +1096,8 @@ class RecursiveControllerAction:
         if reserved_passes > 0:
             self._reserve_inflight(session, reserved_passes)
         setattr(session, self.budget_attr, remaining_after_reserve)
+        if reserved_passes > 0:
+            self._consume_helper_admission(session)
 
         problem_text = self._planner_problem_text(session)
         helpers_before = set(_verified_helper_names(session.dossier))
@@ -992,6 +1168,9 @@ class RecursiveControllerAction:
                     # atomically publishing it with the session checkpoint.
                     published_state["outer_recursive_planner_signature"] = (
                         self._session_progress_signature(session)
+                    )
+                    published_state["outer_recursive_planner_admission_context"] = (
+                        self._admission_context(session)
                     )
                 self._recursive_driver_state = published_state
                 revision, _ = self._shared_root_portfolio(session)
@@ -1678,6 +1857,10 @@ class RecursiveControllerAction:
                 ),
                 "recursive_fixed_point_environment_signature": (
                     fixed_point_signature
+                ),
+                "recursive_planner_admission_context": (
+                    dict(self._recursive_driver_state.get("outer_recursive_planner_admission_context")
+                         or self._admission_context(session)) if fixed_point_reason else {}
                 ),
                 "recursive_failure_reason": failure_reason,
                 "recursive_impasse_reason": (

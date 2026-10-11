@@ -830,6 +830,14 @@ async def _run_try_lean_tool_impl(
         check_lemmas = [*lemmas, code]
 
     async def _check_with_compat(candidate_code: str) -> Any:
+        from .execution_spans import execution_span, record_lean_result
+        with execution_span("lean_check") as span:
+            result = await _check_with_compat_impl(candidate_code)
+            record_lean_result(result)
+            span["disposition"] = "accepted" if getattr(result, "ok", False) else "rejected"
+            return result
+
+    async def _check_with_compat_impl(candidate_code: str) -> Any:
         checker = lean
         if feedback_context:
             from .lean_runner import FeedbackLeanResult
@@ -1094,7 +1102,7 @@ class CheckedDeclarationReceipt:
         )
 
 
-async def run_try_lean_tool(*args: Any, **kwargs: Any) -> str:
+async def _run_try_lean_tool_transaction(*args: Any, **kwargs: Any) -> str:
     """Run scratch validation without allowing a late dossier commit."""
 
     caller_accepted_code_out = kwargs.pop("accepted_code_out", None)
@@ -1170,3 +1178,17 @@ async def run_try_lean_tool(*args: Any, **kwargs: Any) -> str:
                 lean=lean, is_current=is_current,
             ))
     return result
+
+
+async def run_try_lean_tool(*args: Any, **kwargs: Any) -> str:
+    """Preserve structured diagnostics across acceptance, rejection and cancellation."""
+    from contextlib import nullcontext
+    from .execution_spans import collect_execution_spans, execution_span
+    sink = kwargs.pop("execution_telemetry_out", None)
+    collector = collect_execution_spans(sink) if isinstance(sink, dict) else nullcontext()
+    with collector, execution_span("try_lean_tool") as span:
+        result = await _run_try_lean_tool_transaction(*args, **kwargs)
+        span["disposition"] = ("accepted" if result.startswith("try_lean accepted.") else
+                               "cancelled" if result.startswith("try_lean cancelled") else
+                               "infrastructure_error" if "infrastructure error" in result[:100] else "rejected")
+        return result

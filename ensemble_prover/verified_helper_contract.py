@@ -302,12 +302,43 @@ async def analyze_verified_helper_source_contract(
     an adapter without this capability leaves typed evidence unavailable.
     """
     from .proof_dossier import helper_decl_statement
+    from .mini_recursive import _live_lean_capability_for_new_work
+    from .execution_spans import execution_span
 
-    return await analyze_verified_helper_contract(
-        lean, helper_decl_statement(source), preamble=preamble, context=context,
-        environment_hash=environment_hash, timeout_s=timeout_s,
-        context_is_current=context_is_current, declaration_source=source,
-    )
+    live = _live_lean_capability_for_new_work(lean)
+    guard = helper_contract_context_guard(live)
+    key = (source, preamble, tuple(context), environment_hash)
+    cache = getattr(live, "_accepted_source_contract_observations", [])
+    for recorded_key, recorded_guard, fields in cache:
+        if key == recorded_key and recorded_guard() and context_is_current():
+            return copy.deepcopy(fields)
+    with execution_span("helper_contract_observation"):
+        fields = await analyze_verified_helper_contract(
+            lean, helper_decl_statement(source), preamble=preamble, context=context,
+            environment_hash=environment_hash, timeout_s=timeout_s,
+            context_is_current=lambda: (guard() and context_is_current()
+                and _live_lean_capability_for_new_work(lean) is live), declaration_source=source,
+        )
+    if fields and guard() and context_is_current() and _live_lean_capability_for_new_work(lean) is live:
+        # This live-only cache retains exact source/context and a generation
+        # guard. It stores typed observations, never root-reduction authority.
+        retained = [(old_key, old_guard, old_fields) for old_key, old_guard, old_fields in cache
+                    if old_key != key and old_guard()]
+        retained.append((key, guard, copy.deepcopy(dict(fields))))
+        # Bound retained source bytes as well as entries (large replay contexts).
+        total = 0
+        bounded = []
+        for entry in reversed(retained[-16:]):
+            weight = sum(len(item.encode()) for item in (entry[0][0], entry[0][1], *entry[0][2]))
+            if total + weight > 4 * 1024 * 1024:
+                break
+            bounded.append(entry)
+            total += weight
+        try:
+            live._accepted_source_contract_observations = list(reversed(bounded))
+        except (AttributeError, TypeError):
+            pass  # Immutable adapters remain correct without this optimization.
+    return fields
 
 
 def helper_contract_runner_context(lean: Any) -> tuple[Any, ...]:

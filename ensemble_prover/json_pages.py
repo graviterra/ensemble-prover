@@ -167,7 +167,9 @@ def strict_loads(raw: bytes) -> Any:
     try:
         return json.loads(raw, object_pairs_hook=_unique_object,
                           parse_constant=reject, parse_float=finite)
-    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+    except RecursionError as error:
+        raise ValueError("JSON page exceeds supported nesting") from error
+    except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid JSON page") from error
 
 

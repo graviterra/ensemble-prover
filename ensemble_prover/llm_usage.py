@@ -1079,6 +1079,10 @@ async def notify_provider_dispatch_observer(
 ) -> Dict[str, Any]:
     """Authorize one transport dispatch and return its accounting receipt."""
 
+    from .shutdown import require_work_admission
+
+    require_work_admission()
+
     require_hard_timeout_capability_active(
         "provider transport dispatch authorization"
     )
@@ -4038,7 +4042,19 @@ class CostBudgetController:
                 if release_reservation
                 else {}
             )
-        usage_receipts_missing = bool(not records or missing_target_costs)
+        # A scheduler yield or cancellation before transport admission has no
+        # provider consumption to report. Require the authenticated dispatch
+        # ledger: an opaque adapter's empty response still means unknown usage.
+        no_provider_exposure = bool(
+            not records
+            and has_authenticated_dispatch_counts
+            and status in {"pre_dispatch_failure", "cancelled"}
+            and not any(exposed_target_counts.values())
+            and not exposed_receipt_costs
+        )
+        usage_receipts_missing = bool(
+            (not records and not no_provider_exposure) or missing_target_costs
+        )
         partial_usage_observed = any(
             record.usage_source == "claude_code_subscription_partial_usage"
             and record.raw_usage.get("incomplete") is True
@@ -4053,6 +4069,7 @@ class CostBudgetController:
         # counters unavailable. Keep token completeness independent from
         # receipt presence so an unavailable total never becomes reported zero.
         token_usage_status = (
+            "not_applicable" if no_provider_exposure else
             "unknown" if not any(token_totals_available) else
             "partial" if usage_missing or not all(token_totals_available) else
             "reported"
@@ -4567,7 +4584,7 @@ class CostBudgetController:
                 event["llm_missing_usage_charged"] = False
             elif usage_missing:
                 event["llm_missing_usage_charged"] = bool(unknown_cost > 0.0)
-            if token_usage_status != "reported":
+            if token_usage_status in {"unknown", "partial"}:
                 event["reasoning_output_tokens_unknown"] = True
             if usage_missing and bool(event.get("llm_retry_deadline_exhausted")):
                 event["llm_usage_missing_due_to_retry_deadline"] = True

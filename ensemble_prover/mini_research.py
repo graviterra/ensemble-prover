@@ -22,6 +22,7 @@ import sqlite3
 from pathlib import Path
 import tempfile
 import time
+import weakref
 from typing import Any, TYPE_CHECKING, TypeGuard
 import uuid
 
@@ -172,6 +173,11 @@ def _grant_usage(run: dict[str, Any], grant: dict[str, Any]) -> tuple[int, bool]
 
 
 def _allowed(session: Any) -> bool:
+    from .shutdown import current_shutdown
+
+    shutdown_state = current_shutdown()
+    if shutdown_state is not None and shutdown_state.stop_requested:
+        return False
     if getattr(session, "scope", "problem") not in {"problem", "attempt", "sample", "parallel_fanin_recursive", "subgoal"}:
         return False
     if getattr(session, "root_finalized", False) or getattr(session, "terminal_failure_reason", ""):
@@ -215,6 +221,12 @@ class NativeResearchCoordinator:
         self.last_research_dispatches = 0
         self.store: DiscoveryStore | None = None
         self.loop: DiscoveryLoop | None = None
+        self._retiring_loops: dict[int, DiscoveryLoop] = {}
+        self._loop_quiescence: dict[int, asyncio.Task[None]] = {}
+        self._terminal_quiescence: set[int] = set()
+        self._replay_tasks: set[asyncio.Task[None]] = set()
+        self._release_tasks: dict[int, asyncio.Task[None]] = {}
+        self._release_deadlines: dict[int, tuple[Any, float]] = {}
         self.donor_key: tuple[int, str] | None = None
         self.temporary: tempfile.TemporaryDirectory[str] | None = None
         self.guidance: dict[str, Any] | None = None
@@ -404,13 +416,15 @@ class NativeResearchCoordinator:
         saved = store.run_record()["native_grants"].get(grant["id"], {})
         if not self._grant_answers_context(saved, session.conv):
             return
-        serviced = grant.get("objections", [])
+        # Checkpoint JSON uses arrays where older in-memory contracts used
+        # tuples. Compare the complete wire record, preserving every binding.
+        serviced = {_json(item) for item in grant.get("objections", [])}
         self.pending_objections[:] = [
-            item for item in self.pending_objections if item not in serviced
+            item for item in self.pending_objections if _json(item) not in serviced
         ]
         session.conv._native_research_objections = [
             item for item in getattr(session.conv, "_native_research_objections", [])
-            if item not in serviced
+            if _json(item) not in serviced
         ]
 
     def _queue_planner_impasse(self, session: Any, outcome: Any, state: dict[str, Any]) -> None:
@@ -532,18 +546,48 @@ class NativeResearchCoordinator:
                    requests_since_audit=state["requests_since_audit"],
                    requests_since_verified_progress=state["requests_since_verified_progress"])
 
+    def _session_released(self, session: Any) -> bool:
+        entry = getattr(self, "_released_sessions", {}).get(id(session))
+        return (entry() if isinstance(entry, weakref.ReferenceType) else entry) is session
+
+    def _mark_session_released(self, session: Any) -> None:
+        released = self.__dict__.setdefault("_released_sessions", {})
+        identity = id(session)
+        def discard(reference: Any) -> None:
+            if released.get(identity) is reference:
+                released.pop(identity, None)
+        try:
+            released[identity] = weakref.ref(session, discard)
+        except TypeError:
+            # Non-weak-referenceable adapters retain their identity explicitly.
+            released[identity] = session
+
     async def boundary(self, session: Any, outcome: Any = None, *, frontier_exhausted: bool = False,
                        background: bool = False) -> bool:
+        if self._session_released(session):
+            return False
         from .mini_research_budget import (
             capacity_reserve_due, initialize_capacity_reserve, release_capacity_reserve,
         )
         if not self.active or not _allowed(session):
             release_capacity_reserve(session, "research_unavailable")
             return False
+        # A release caller may have left while its paid replay or checkpoint
+        # finished autonomously. Complete that old owner's barrier before
+        # admitting new work, retaining its deadline while any work remains.
+        from .shutdown import ShutdownIncomplete
+
+        for released_owner, deadline in tuple(getattr(self, "_release_deadlines", {}).values()):
+            try:
+                await self.release_session(released_owner, deadline=deadline)
+            except ShutdownIncomplete:
+                release_capacity_reserve(session, "research_cleanup_pending")
+                return False
         # A single run owner services explicit child requests at their own
         # settled boundaries, using that child's existing proof allocation.
         async with self.lock:
-            if not _allowed(session):
+            if (not self.active or not _allowed(session)
+                    or self._session_released(session)):
                 release_capacity_reserve(session, "research_unavailable")
                 return False
             if self._pending is None:
@@ -555,6 +599,9 @@ class NativeResearchCoordinator:
                 except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                     self._settlement_deferred(session, exc)
                     return False
+            if (not self.active or not _allowed(session)
+                    or self._session_released(session)):
+                return False
             try:
                 state = self._state(session)
                 initialize_capacity_reserve(session)
@@ -753,8 +800,25 @@ class NativeResearchCoordinator:
         helpers = getattr(dossier, "verified_helpers", {}) or {}
         if isinstance(helpers, dict):
             helpers = list(helpers.values())
+        from .research_claims.research_contracts import helper_inventory
+        inventory = helper_inventory(dossier)
+        requests = self._objections_for(session.conv)
+        contracts = []
+        for request in requests:
+            packet = deepcopy(request.get("research_contract_packet"))
+            if packet:
+                for helper in packet.get("cited_helpers", []):
+                    current = inventory.get(helper["name"])
+                    helper["binding_status"] = ("current" if current and all(
+                        helper.get(key) == current.get(key) for key in (
+                            "source_hash", "contract_identity", "environment_hash")) else "stale")
+                contracts.append(packet)
         context = {
             "original_target": self._visible_target(session), "trigger": reason,
+            "research_contracts": contracts,
+            "diagnostic_capabilities": {"native_experiments": False,
+                "proof_compute_examples": getattr(session.conv, "_native_compute_examples_enabled", None),
+                "routing": "Propose exact finite queries with propose_diagnostic; the proof owner executes only through its enabled existing tool."},
             "active_target": {"statement": self._target(session.conv),
                               "scope": getattr(session, "scope", "problem"),
                               "lane": str(getattr(session, "checkpoint_lane_key", ""))},
@@ -1007,6 +1071,12 @@ class NativeResearchCoordinator:
         from .mini_research_budget import (
             select_donor, debit_donor, release_capacity_reserve, remaining_owner_seconds,
         )
+        def admitted() -> bool:
+            return bool(self.active and _allowed(session)
+                        and not self._session_released(session))
+
+        if not admitted():
+            return False
         state = self._state(session)
         grant = state.get("grant")
         donor = select_donor(session)
@@ -1018,6 +1088,8 @@ class NativeResearchCoordinator:
                 raise ValueError("saved research donor no longer exists")
             self._open(session, action.client)
             await self._ensure_loop(session, action.client, str(action.role))
+            if not admitted():
+                return False
             store = self._require_store()
             loop = self._require_loop()
             run = store.run_record()
@@ -1053,31 +1125,42 @@ class NativeResearchCoordinator:
                     "governor_clock_id": _research_governor_clock(session)["identity"],
                 }
                 store.save_run(run)
-                recovery_started = time.monotonic()
-                try:
-                    await loop.advance_native(
-                        max_requests=0, timeout_s=1,
-                        target_claim_id=grant.get("target_claim_id", "native-root"),
-                    )
-                finally:
-                    # Persist measured replay service before touching the
-                    # session checkpoint. A killed process leaves the empty
-                    # intent above, which retains conservative accounting.
-                    recovery_elapsed = max(0.0, time.monotonic() - recovery_started)
-                    with store.atomic():
-                        recovered_run = store.run_record()
-                        interval = recovered_run["native_grants"][grant["id"]]["recovery_intervals"][recovery_id]
-                        interval["elapsed_s"] = recovery_elapsed
-                        store.save_run(recovered_run)
-                    accrue = getattr(session, "_accrue_run_governor_elapsed", None)
-                    if callable(accrue):
-                        accrue()
-                    self._reconcile(session, grant, interrupted=True, recovery_id=recovery_id)
+                recovery_grant: dict[str, Any] = grant
+
+                async def replay() -> None:
+                    recovery_started = time.monotonic()
+                    try:
+                        await loop.advance_native(
+                            max_requests=0, timeout_s=1,
+                            target_claim_id=recovery_grant.get("target_claim_id", "native-root"),
+                        )
+                    finally:
+                        # Keep replay and its accounting under one task owner.
+                        # A killed process leaves the precommitted empty intent.
+                        recovery_elapsed = max(0.0, time.monotonic() - recovery_started)
+                        with store.atomic():
+                            recovered_run = store.run_record()
+                            interval = recovered_run["native_grants"][recovery_grant["id"]]["recovery_intervals"][recovery_id]
+                            interval["elapsed_s"] = recovery_elapsed
+                            store.save_run(recovered_run)
+                        accrue = getattr(session, "_accrue_run_governor_elapsed", None)
+                        if callable(accrue):
+                            accrue()
+                        self._reconcile(session, recovery_grant, interrupted=True, recovery_id=recovery_id)
+
+                replay_task = asyncio.create_task(replay(), name="native_research_replay")
+                self._replay_tasks.add(replay_task)
+                replay_task.add_done_callback(self._replay_tasks.discard)
+                await replay_task
             else:
                 self._reconcile(session, grant, interrupted=True)
-            self._settle_answered_objections(session, grant)
             state["grant"] = None
+            if not admitted():
+                return False
+            self._settle_answered_objections(session, grant)
             await _checkpoint(session)
+            if not admitted():
+                return False
             self._deliver(session)
             return self._guidance_for(session.conv) is not None
         if donor is None:
@@ -1100,6 +1183,8 @@ class NativeResearchCoordinator:
             release_capacity_reserve(session, "no_applicable_research")
             return self._guidance_for(session.conv) is not None
         await self._ensure_loop(session, donor.client, donor.role)
+        if not admitted():
+            return False
         assert self.store is not None
         loop = self._require_loop()
         run = self.store.run_record()
@@ -1141,6 +1226,8 @@ class NativeResearchCoordinator:
         state["grant"] = grant
         # The budget debit and unique grant id precede every external request.
         await _checkpoint(session)
+        if not admitted():
+            return False
         with self.store.atomic():
             run = self.store.run_record()
             grants = run["native_grants"]
@@ -1183,6 +1270,8 @@ class NativeResearchCoordinator:
         # Cross-store funding becomes durable before any provider task exists.
         grant["funding_phase"] = "committed"
         await _checkpoint(session)
+        if not admitted():
+            return False
         state["rounds"] += 1
         _event(session, "research_started", reason=reason, grant_id=grant["id"],
                requests=grant["requests"], timeout_s=timeout, ledger=str(self.store.directory))
@@ -1276,7 +1365,8 @@ class NativeResearchCoordinator:
                 await asyncio.gather(planner_wait, return_exceptions=True)
 
     async def _settle_pending(self, session: Any, *, wait: bool = False,
-                              deliver: bool = True, checkpoint: bool = True) -> bool:
+                              deliver: bool = True, checkpoint: bool = True,
+                              logical_updates: bool = True) -> bool:
         """Apply a completed ledger round only at its session's settled boundary."""
         from .mini_research_budget import charge_elapsed
 
@@ -1319,19 +1409,31 @@ class NativeResearchCoordinator:
                     accrue()
                 pending["settlement_stage"] = "advice_settlement"
                 state["grant"] = None
-                self._settle_answered_objections(session, grant)
-                if deliver and _allowed(session):
+                logical_updates = bool(logical_updates and self.active and _allowed(session)
+                                       and not self._session_released(session))
+                if logical_updates:
+                    self._settle_answered_objections(session, grant)
+                if logical_updates and deliver and _allowed(session):
                     self._deliver(session)
-                if (result.get("reason") in {"no_ready_work", "research_allocation_deferred"}
+                if logical_updates and (result.get("reason") in {"no_ready_work", "research_allocation_deferred"}
                         and result.get("paid_dispatches", 0) == 0
                         and not result.get("renewed_grant_can_resume", False)):
                     state["idle_research"] = self._idle_research_key(session)
-                else:
+                elif logical_updates:
                     state.pop("idle_research", None)
                 pending["settlement_stage"] = "checkpoint"
-                if checkpoint:
+                if checkpoint and logical_updates:
                     await _checkpoint(session)
+                elif checkpoint:
+                    registry = getattr(session, "checkpoint_registry", None)
+                    commit_service = getattr(registry, "commit_execution_service", None)
+                    if callable(commit_service):
+                        await commit_service(session.checkpoint_lane_key, session)
                 self._pending = None
+        if not logical_updates:
+            _event(session, "research_accounting_settled", grant_id=grant["id"],
+                   research_elapsed_s=elapsed)
+            return False
         research_outcome = result.get("reason", "unknown")
         if research_outcome in {"quantum_timeout", "deadline_exhausted", "parent_deadline_exhausted"}:
             _event(session, "research_timed_out", reason=research_outcome,
@@ -1397,40 +1499,164 @@ class NativeResearchCoordinator:
             # its mutable proof state cannot become a replacement checkpoint.
             # The research ledger keeps the completed result for fresh replay.
             await self._settle_pending(session, wait=True, deliver=not abandoned,
-                                       checkpoint=not abandoned)
+                                       checkpoint=not abandoned, logical_updates=not abandoned)
             if self.has_pending(session):
                 raise RuntimeError("Research settlement retained its old session owner")
 
-    async def release_session(self, session: Any) -> None:
+    def _start_loop_quiescence(self, loop: DiscoveryLoop, *, deadline: float,
+                               terminal: bool = True) -> asyncio.Task:
+        """Keep a single disposal owner, including when its caller is cancelled."""
+        retiring = self.__dict__.setdefault("_retiring_loops", {})
+        tasks = self.__dict__.setdefault("_loop_quiescence", {})
+        terminal_tasks = self.__dict__.setdefault("_terminal_quiescence", set())
+        identity = id(loop)
+        previous = tasks.get(identity)
+        if previous is not None and not previous.done():
+            if not terminal or identity in terminal_tasks:
+                return previous
+            # Replace only an opportunistic waiter, retaining every disposal
+            # task. Its local retirement allowance is not a terminal lease.
+            previous.cancel()
+        else:
+            previous = None
+
+        async def quiesce() -> None:
+            if previous is not None:
+                await asyncio.gather(previous, return_exceptions=True)
+            if terminal:
+                await loop.quiesce(deadline=deadline)
+            else:
+                await loop.quiesce(deadline=deadline, terminal=False)
+            retiring.pop(identity, None)
+
+        task = asyncio.create_task(quiesce(), name="native_research_quiesce")
+        tasks[identity] = task
+        if terminal:
+            terminal_tasks.add(identity)
+
+        def finished(done: asyncio.Task) -> None:
+            # Failed or cancelled disposal leaves the loop owned for retry.
+            # Retrieve failures even when an ordinary donor change has no waiter.
+            if not done.cancelled():
+                done.exception()
+            if tasks.get(identity) is done:
+                tasks.pop(identity)
+                terminal_tasks.discard(identity)
+
+        task.add_done_callback(finished)
+        return task
+
+    async def _quiesce_owned_loops(self, *, deadline: float,
+                                  child: asyncio.Task | None = None) -> None:
+        from .shutdown import ShutdownIncomplete, join_owned_tasks
+
+        loops = dict(getattr(self, "_retiring_loops", {}))
+        if self.loop is not None:
+            loops[id(self.loop)] = self.loop
+        quiescence = {self._start_loop_quiescence(loop, deadline=deadline)
+                      for loop in loops.values()}
+        owned = (quiescence | ({child} if child is not None else set())
+                 | set(getattr(self, "_replay_tasks", ()))
+                 | set(getattr(self, "_release_tasks", {}).values()))
+        self._shutdown_owned_tasks = owned
+        await join_owned_tasks(owned, deadline=deadline, label="native_research_release")
+        for task in quiescence:
+            if task.cancelled():
+                raise ShutdownIncomplete("native research quiescence was cancelled")
+            task.result()
+        self._shutdown_owned_tasks = set()
+
+    async def release_session(self, session: Any, *, deadline: float | None = None) -> None:
         """Fence and reap this session's research before it leaves ownership."""
-        async with self.lock:
+        from .shutdown import ShutdownIncomplete, cleanup_deadline, join_owned_tasks
+
+        self._mark_session_released(session)
+        if deadline is None:
+            deadline = cleanup_deadline()
+        pending = self._pending
+        if pending is not None and pending["session"] is not session:
+            return
+        # Replay and owner-lock unwind can outlive a release without any
+        # funded generation in _pending. Retain the exact session identity and
+        # its lease until all of that session's cleanup has completed.
+        leases = self.__dict__.setdefault("_release_deadlines", {})
+        previous_lease = leases.get(id(session))
+        if previous_lease is not None:
+            deadline = min(previous_lease[1], deadline)
+        if pending is not None:
+            deadline = min(pending.get("release_deadline", deadline), deadline)
+            pending["release_deadline"] = deadline
+        leases[id(session)] = (session, deadline)
+        task = pending["task"] if pending is not None else None
+        # Transport close must be able to release a child that suppresses
+        # cancellation; no owner lock is held while that child is joined.
+        if task is not None and not task.done():
+            task.cancel()
+        await self._quiesce_owned_loops(deadline=deadline, child=task)
+        releases = self.__dict__.setdefault("_release_tasks", {})
+        settlement = releases.get(id(session))
+        if settlement is None or settlement.done():
+            async def settle() -> None:
+                # Both lock acquisition and persistence remain owned if a
+                # caller cancels or the checkpoint resists cancellation.
+                async with self.lock:
+                    current = self._pending
+                    if current is None or current["session"] is not session:
+                        return
+                    try:
+                        await self._settle_pending(session, wait=True, deliver=False,
+                                                   checkpoint=True, logical_updates=False)
+                    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                        # Durable grants and physical receipts remain the
+                        # recovery source after a storage failure.
+                        self._settlement_deferred(session, exc)
+
+            settlement = asyncio.create_task(settle(), name="native_research_settlement")
+            releases[id(session)] = settlement
             pending = self._pending
-            if pending is None or pending["session"] is not session:
-                return
-            task = pending["task"]
-            if not task.done():
-                task.cancel()
-            try:
-                await self._settle_pending(session, wait=True, deliver=False)
-            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-                # Its durable grant and paid research receipts remain the
-                # recovery source. Optional ledger storage cannot revoke a
-                # root already accepted by the proof session.
-                self._settlement_deferred(session, exc)
+            if pending is not None and pending["session"] is session:
+                pending["settlement_task"] = settlement
+
+            def finished(done: asyncio.Task) -> None:
+                if not done.cancelled():
+                    done.exception()
+                if releases.get(id(session)) is done:
+                    releases.pop(id(session))
+                    if (not done.cancelled() and done.exception() is None
+                            and (self._pending is None or self._pending["session"] is not session)):
+                        leases.pop(id(session), None)
+
+            settlement.add_done_callback(finished)
+        self._shutdown_owned_tasks.add(settlement)
+        await join_owned_tasks({settlement}, deadline=deadline, label="native_research_lock_and_checkpoint")
+        if settlement.cancelled():
+            raise ShutdownIncomplete("native research settlement was cancelled")
+        settlement.result()
+        self._shutdown_owned_tasks.discard(settlement)
+        if self._pending is None or self._pending["session"] is not session:
+            leases.pop(id(session), None)
 
     async def _ensure_loop(self, session: Any, client: Any, role: str) -> None:
         from .mini_research_budget import clone_research_client
         from .research_claims.discovery import DiscoveryLoop
+        from .shutdown import cleanup_deadline
+
+        if not self.active or self._session_released(session):
+            return
         key = (id(client), role)
         if self.loop is not None and key == self.donor_key:
             return
-        if self.loop is not None:
-            await self.loop._retire_clients(set(), closing=True, preserve_failure=True)
         def fresh_transport(worker: str) -> Any:
             return clone_research_client(client)
-        self.loop = DiscoveryLoop(self._require_store(), fresh_transport, fresh_transport, native_mode=True,
+        replacement = DiscoveryLoop(self._require_store(), fresh_transport, fresh_transport, native_mode=True,
             cost_controller=getattr(session, "cost_controller", None), owns_clients=True,
             cost_roles={"research": role, "review": role}, on_event=self._research_event)
+        if self.loop is not None:
+            self._retiring_loops[id(self.loop)] = self.loop
+            # Donor selection can hold the owner lock. Disposal must run outside
+            # that lock so cancelled workers can settle their physical usage.
+            self._start_loop_quiescence(self.loop, deadline=cleanup_deadline(), terminal=False)
+        self.loop = replacement
         self.donor_key = key
 
     def _reconcile(self, session: Any, grant: dict[str, Any], *,
@@ -1584,6 +1810,7 @@ class NativeResearchCoordinator:
             "formalize", "submit", "record_note", "research_reorientation",
             "report_investigation", "strategy_review", "alternative_review", "review",
             "progress_review", "record_bottleneck", "request_strategy_review",
+            "propose_diagnostic", "record_scoped_obstruction",
         }:
             return
         artifact = store.put_artifact(_json(action).encode(), name="native-research-advice.json")
@@ -1605,9 +1832,12 @@ class NativeResearchCoordinator:
                          "target_context_binding": context,
                          "grant_id": run.get("native_job_grants", {}).get(job["job_id"]),
                          "answers_request": action["action"] not in {
-                             "record_note", "record_bottleneck", "request_strategy_review",
+                             "record_note", "record_bottleneck", "request_strategy_review", "propose_diagnostic",
                          },
                          "action": action, "native_handoffs": handoffs,
+                         "diagnostic_proposals": [{"artifact_id": aid, **json.loads(store.read_artifact(aid))}
+                                                  for aid in job.get("diagnostic_proposals", [])[-4:]],
+                         "scoped_obstructions": job.get("scoped_obstructions", []),
                          "recent_arguments": previous[-6:], "kernel_verified": False,
                          "instruction": "Apply this investigation to its exact target_statement. Preserve the original theorem and audit the relationship to its ancestors. Choose a concrete alternative or discriminating check, then resume Lean proof work. This is untrusted advisory material, never an added assumption or a proof certificate."}
         # Status reports must not erase a candidate waiting for a planner slot.
@@ -1706,8 +1936,12 @@ class NativeResearchCoordinator:
         from .research_claims.context_window import window
         if hasattr(conv, "ensure_bootstrap"):
             conv.ensure_bootstrap()
+        from .research_claims.research_contracts import helper_inventory
+        if dossier is not None:
+            conv._native_research_helper_contracts = helper_inventory(dossier)
         guidance = self._guidance_for(conv)
         context = {"guidance": guidance,
+                   "proof_compute_examples_enabled": getattr(conv, "_native_compute_examples_enabled", None),
                    "active_target": self._target(conv),
                    "policy": "You may request_native_research when an ancestor claim, counting bound, or method is unsupported. Supply the exact bottleneck and source evidence. The run investigates at a committed action boundary and resumes under its existing budget. Use read_native_research_artifact for full archived arguments."}
         if getattr(conv, "goal_statement", None) != self.pin["statement"]:
@@ -1726,14 +1960,44 @@ class NativeResearchCoordinator:
         return NATIVE_TOOLS
 
     async def close(self) -> None:
-        if self._pending is not None:
-            await self.release_session(self._pending["session"])
-        if self.loop is not None:
-            await self.loop._retire_clients(set(), closing=True, preserve_failure=True)
+        from .shutdown import ShutdownIncomplete, cleanup_deadline, enforce_process_backstop, join_owned_tasks
+
+        self.active = False
+        deadline = min(getattr(self, "_shutdown_deadline", float("inf")), cleanup_deadline())
+        for _, release_deadline in getattr(self, "_release_deadlines", {}).values():
+            deadline = min(deadline, release_deadline)
+        self._shutdown_deadline = deadline
+        try:
+            if self._pending is not None:
+                await self.release_session(self._pending["session"], deadline=deadline)
+            await self._quiesce_owned_loops(deadline=deadline)
+            barrier = getattr(self, "_close_barrier", None)
+            if barrier is None or barrier.done():
+                async def owner_barrier() -> None:
+                    # Transport termination precedes this barrier. Restored
+                    # replay and other boundaries must finish their accounting
+                    # even when no funded generation is registered in _pending.
+                    async with self.lock:
+                        pass
+
+                barrier = asyncio.create_task(owner_barrier(), name="native_research_owner_barrier")
+                self._close_barrier = barrier
+            self._shutdown_owned_tasks.add(barrier)
+            await join_owned_tasks({barrier}, deadline=deadline, label="native_research_owner_barrier")
+            if barrier.cancelled():
+                raise ShutdownIncomplete("native research owner barrier was cancelled")
+            barrier.result()
+            self._shutdown_owned_tasks.discard(barrier)
+        except ShutdownIncomplete:
+            await enforce_process_backstop()
+            raise
         if self.store is not None:
             self.store.close()
+            self.store = None
         if self.temporary is not None:
             self.temporary.cleanup()
+            self.temporary = None
+        self.__dict__.setdefault("_release_deadlines", {}).clear()
 
 
 def record_native_proof_work(session: Any, outcome: Any) -> None:
@@ -1854,7 +2118,8 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
         return read_page(owner.store, text_transform=prompt_text, **payload)
     if name != "request_native_research":
         raise ValueError("unknown native research tool")
-    object_fields(payload, {"statement", "reason", "evidence_artifact_ids"}, {"statement", "reason"}, name)
+    from .research_claims.research_contracts import REQUEST_FIELDS, bind_request
+    object_fields(payload, {"statement", "reason", "evidence_artifact_ids"} | REQUEST_FIELDS, {"statement", "reason"}, name)
     text(payload["statement"], "exact bottleneck")
     text(payload["reason"], "complete objection")
     ids = payload.get("evidence_artifact_ids", [])
@@ -1864,10 +2129,16 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
         if owner.store is None:
             raise ValueError("unknown native evidence")
         owner.store.read_artifact(artifact)
-    payload = {**payload, "target_statement": owner._target(conv)}
+    contract_packet = bind_request(payload, getattr(conv, "_native_research_helper_contracts", {}),
+                                   root_statement=owner.pin["statement"], context_binding=owner._target_context_binding(conv))
+    payload = json.loads(_json({
+        **payload, "target_statement": owner._target(conv),
+        "research_contract_packet": contract_packet,
+    }))
     owner._objections_for(conv)  # Retire answered IDs before deduplicating a new request.
     objections = list(getattr(conv, "_native_research_objections", []) or [])
-    if not any({key: value for key, value in item.items() if key != "request_id"} == payload
+    request_key = _json(payload)
+    if not any(_json({key: value for key, value in item.items() if key != "request_id"}) == request_key
                for item in objections):
         objections.append({**payload, "request_id": uuid.uuid4().hex})
     # Every stamped request must remain in checkpointed conversation state
@@ -1880,13 +2151,30 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
     )
     return {"status": "queued_for_committed_boundary", "kernel_verified": False,
             "target_statement": owner._target(conv), "service_scope": "requesting_session",
-            "instruction": "Preserve exact reasoning and settle this action; research will inspect the obstacle within remaining settings."}
+            "compatibility_obligations": contract_packet["compatibility_obligations"],
+            "instruction": "Preserve exact reasoning and settle this action; research will first audit the proposed bridge, including quantitative costs, within remaining settings."}
 
+
+_CONTRACT_SCHEMA = {"type": "object", "properties": {
+    "statement": {"type": "string"}, "domain": {"type": "string"},
+    "hypotheses": {"type": "array", "items": {"type": "string"}},
+    "quantifiers": {"type": "array", "items": {"type": "string"}}},
+    "required": ["statement", "domain"], "additionalProperties": False}
+_RESEARCH_CONTRACT_PROPERTIES = {
+    "contract": _CONTRACT_SCHEMA,
+    "cited_helpers": {"type": "array", "maxItems": 16, "items": {
+        "type": "object", "properties": {key: {"type": "string"} for key in (
+            "name", "source_hash", "contract_identity", "environment_hash", "instantiation", "claimed_premise")},
+        "required": ["name", "source_hash"], "additionalProperties": False}},
+    "relation_to_root": {"type": "string", "enum": ["equivalent", "sufficient", "necessary", "diagnostic", "unknown"]},
+    "route_id": {"type": "string"}, "obligation_id": {"type": "string"},
+    "question_revision": {"type": "integer", "minimum": 0}, "quantitative_budget": {"type": "string"},
+    "parameter_dependencies": {"type": "array", "items": {"type": "string"}}}
 
 NATIVE_TOOLS = [
     {"type": "function", "function": {"name": "request_native_research",
      "description": "Request independent investigation of an unsupported ancestor or stalled method; never refutes or stops the run.",
-     "parameters": {"type": "object", "properties": {"statement": {"type": "string"}, "reason": {"type": "string"}, "evidence_artifact_ids": {"type": "array", "items": {"type": "string"}}}, "required": ["statement", "reason"], "additionalProperties": False}}},
+     "parameters": {"type": "object", "properties": {**_RESEARCH_CONTRACT_PROPERTIES, "statement": {"type": "string"}, "reason": {"type": "string"}, "evidence_artifact_ids": {"type": "array", "items": {"type": "string"}}}, "required": ["statement", "reason"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "read_native_research_artifact",
      "description": "Read exact pages of archived research arguments or sources. Offset is a nonnegative integer character index (default 0); length is an integer from 1 to 12000 characters (default 6000). Follow next_offset until null to read the complete selected text. Omit artifact_id for the complete current advice envelope, including argument and handoff links. If advice is not yet available for the active target and context, returns not_available_yet; reading does not start research.",
      "parameters": {"type": "object", "properties": {"artifact_id": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "length": {"type": "integer", "minimum": 1, "maximum": 12000, "default": 6000}, "path": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}}, "required": [], "additionalProperties": False}}},

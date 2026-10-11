@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from ..subprocess_environment import trusted_provider_worker_environment
+from .usage_recovery import _is_finite_number
 from ..local_inference.network_policy import propagate_owned_network_policy, restore_owned_worker_network_policy
 
 
@@ -949,6 +950,9 @@ def _recover_watchdog_turn_metadata(
 ) -> Dict[str, Any]:
     """Recover bounded terminal diagnostics when the worker wrote no summary."""
 
+    from .usage_recovery import UsageLifecycleRecovery
+
+    lifecycle = UsageLifecycleRecovery()
     turns_path = output_dir / "turns.jsonl"
     if not turns_path.is_file():
         return {}
@@ -1030,9 +1034,7 @@ def _recover_watchdog_turn_metadata(
                 if "elapsed_s" in record:
                     raw_elapsed_s = record.get("elapsed_s")
                     if (
-                        isinstance(raw_elapsed_s, (int, float))
-                        and not isinstance(raw_elapsed_s, bool)
-                        and math.isfinite(float(raw_elapsed_s))
+                        _is_finite_number(raw_elapsed_s)
                         and float(raw_elapsed_s) >= 0.0
                     ):
                         elapsed_s = float(raw_elapsed_s)
@@ -1052,15 +1054,17 @@ def _recover_watchdog_turn_metadata(
                         last_valid_turn.pop("elapsed_s", None)
             else:
                 invalid_turn_indices += 1
+            safe_role = _safe_watchdog_usage_role(record.get("role"))
+            duplicate_usage = lifecycle.observe(record, role=safe_role)
             phase = str(record.get("phase") or "")
             verdict = str(record.get("verdict") or "")
-            usage_counter_event = phase == "llm_usage" and verdict in {
+            usage_counter_event = not duplicate_usage and phase == "llm_usage" and verdict in {
                 "llm_usage_recorded",
                 "llm_usage_missing",
                 "llm_late_dispatch_missing_usage",
                 "llm_late_pre_generation_rejection_recorded",
             }
-            token_event = phase == "llm_usage" and verdict in {
+            token_event = not duplicate_usage and phase == "llm_usage" and verdict in {
                 "llm_usage_recorded",
                 "llm_usage_missing",
             }
@@ -1073,10 +1077,8 @@ def _recover_watchdog_turn_metadata(
                 else 0
             )
             usage_contribution: Optional[Dict[str, int]] = None
-            safe_role = ""
             if usage_counter_event:
                 recovered_usage_events += 1
-                safe_role = _safe_watchdog_usage_role(record.get("role"))
                 if event_turn_index > 0:
                     usage_contribution = {
                         "turn_index": event_turn_index,
@@ -1103,45 +1105,53 @@ def _recover_watchdog_turn_metadata(
                     recovered_usage_missing_events += 1
                     if usage_contribution is not None:
                         usage_contribution["llm_usage_missing_events"] = 1
-            if token_event:
+            if token_event or lifecycle.reconciled:
                 recovered_token_turn_index = max(
                     recovered_token_turn_index,
                     event_turn_index,
                 )
-                role_totals = (
-                    recovered_role_token_totals.setdefault(
-                        safe_role,
-                        {key: 0 for key in token_keys},
-                    )
-                    if safe_role
-                    else None
-                )
+                if usage_contribution is None and event_turn_index > 0:
+                    usage_contribution = {"turn_index": event_turn_index}
+                    recovered_usage_counter_contributions.append(usage_contribution)
+                # Only the in-memory lifecycle reconciler can emit signed
+                # corrections. Arbitrary negative counters in JSON remain
+                # invalid, including rows imitating these internal fields.
+                reconciled_tokens = lifecycle.token_deltas is not None
                 for key in token_keys:
-                    value = record.get(key, 0)
+                    value = (lifecycle.token_deltas.get(key, 0)
+                             if lifecycle.token_deltas is not None else record.get(key, 0))
                     if (
-                        not isinstance(value, (int, float))
-                        or isinstance(value, bool)
-                        or not math.isfinite(float(value))
-                        or float(value) < 0.0
-                        or not float(value).is_integer()
+                        not _is_finite_number(value)
+                        or (float(value) < 0.0 and not reconciled_tokens)
+                        or (isinstance(value, float) and not value.is_integer())
                     ):
                         if key in record:
                             invalid_usage_counters += 1
                         continue
                     decoded = int(value)
                     recovered_token_totals[key] += decoded
-                    if role_totals is not None:
-                        role_totals[key] += decoded
                     if usage_contribution is not None:
                         usage_contribution[key] = decoded
-                        if safe_role:
-                            usage_contribution[f"{safe_role}_{key}"] = decoded
-                event_cost = record.get("cost_usd")
+                    role_deltas = (
+                        {role: deltas.get(key, 0) for role, deltas in lifecycle.role_token_deltas.items()}
+                        if reconciled_tokens else {safe_role: decoded}
+                    )
+                    for role, delta in role_deltas.items():
+                        if not role:
+                            continue
+                        role_totals = recovered_role_token_totals.setdefault(
+                            role, {name: 0 for name in token_keys},
+                        )
+                        role_totals[key] += delta
+                        if usage_contribution is not None:
+                            usage_contribution[f"{role}_{key}"] = delta
+                event_cost = (
+                    lifecycle.cost_delta if lifecycle.cost_delta is not None
+                    else record.get("cost_usd") if token_event else None
+                )
                 if (
-                    isinstance(event_cost, (int, float))
-                    and not isinstance(event_cost, bool)
-                    and math.isfinite(float(event_cost))
-                    and float(event_cost) >= 0.0
+                    _is_finite_number(event_cost)
+                    and (float(event_cost) >= 0.0 or lifecycle.cost_delta is not None)
                 ):
                     legacy_observed_usage_cost += float(event_cost)
                     legacy_usage_events_seen += 1
@@ -1186,9 +1196,7 @@ def _recover_watchdog_turn_metadata(
                 for key in numeric_usage_keys:
                     value = record.get(key)
                     if (
-                        isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        and math.isfinite(float(value))
+                        _is_finite_number(value)
                         and float(value) >= 0.0
                     ):
                         recovered_usage[key] = float(value)
@@ -1225,9 +1233,7 @@ def _recover_watchdog_turn_metadata(
                 authority_numeric = {
                     key: float(record[key])
                     for key in authority_numeric_keys
-                    if isinstance(record.get(key), (int, float))
-                    and not isinstance(record.get(key), bool)
-                    and math.isfinite(float(record[key]))
+                    if _is_finite_number(record.get(key))
                     and float(record[key]) >= 0.0
                 }
                 authority_booleans = {
@@ -1343,7 +1349,8 @@ def _recover_watchdog_turn_metadata(
         "watchdog_recovery_nonmonotonic_elapsed_values": (
             nonmonotonic_elapsed_values
         ),
-        "watchdog_recovery_usage_complete": complete_usage_trace,
+        "watchdog_recovery_trace_scan_complete": complete_usage_trace,
+        **lifecycle.summary(trace_complete=complete_usage_trace),
         "watchdog_recovery_first_turn_index": first_valid_turn_index,
         "watchdog_recovery_last_turn_index": last_valid_turn_index,
         "watchdog_recovery_bytes_scanned": bytes_scanned,
@@ -1390,13 +1397,9 @@ def _recover_watchdog_turn_metadata(
             "llm_budget_committed_cost_usd"
         )
         if (
-            isinstance(legacy_accounted, (int, float))
-            and not isinstance(legacy_accounted, bool)
-            and math.isfinite(float(legacy_accounted))
+            _is_finite_number(legacy_accounted)
             and float(legacy_accounted) + 1e-9 >= legacy_observed_usage_cost
-            and isinstance(legacy_committed, (int, float))
-            and not isinstance(legacy_committed, bool)
-            and math.isfinite(float(legacy_committed))
+            and _is_finite_number(legacy_committed)
             and float(legacy_committed) + 1e-9 >= float(legacy_accounted)
         ):
             # Pre-authority traces still contain additive per-call exact cost
@@ -1492,9 +1495,7 @@ def _recover_watchdog_turn_metadata(
                 "accounted_cost_usd",
                 "llm_budget_accounted_cost_usd",
             )
-            if isinstance(accounting_source.get(key), (int, float))
-            and not isinstance(accounting_source.get(key), bool)
-            and math.isfinite(float(accounting_source[key]))
+            if _is_finite_number(accounting_source.get(key))
             and float(accounting_source[key]) >= 0.0
         ]
         accounted_ceiling = (
@@ -1514,9 +1515,7 @@ def _recover_watchdog_turn_metadata(
                 "committed_cost_usd",
                 "llm_budget_committed_cost_usd",
             )
-            if isinstance(accounting_source.get(key), (int, float))
-            and not isinstance(accounting_source.get(key), bool)
-            and math.isfinite(float(accounting_source[key]))
+            if _is_finite_number(accounting_source.get(key))
             and float(accounting_source[key]) >= 0.0
         ]
         committed_ceiling = (
@@ -1603,6 +1602,9 @@ def _recover_watchdog_turn_metadata(
                 accounting[key] = numeric
         if accounting:
             recovered["watchdog_recovered_accounting"] = accounting
+            recovered["_watchdog_recovered_accounting_is_modern"] = bool(
+                authoritative_usage_position > 0 and atomic_authority_selected
+            )
             if authoritative_usage_turn_index > 0:
                 recovered["watchdog_recovered_accounting_turn_index"] = (
                     authoritative_usage_turn_index
@@ -1661,6 +1663,9 @@ def _write_failure_summary(
         recovered_accounting = dict(
             recovered.get("watchdog_recovered_accounting") or {}
         )
+        recovered_accounting_is_modern = recovered.pop(
+            "_watchdog_recovered_accounting_is_modern", False,
+        )
         recovered_usage_counter_contributions = list(
             recovered.pop(
                 "_watchdog_recovered_usage_counter_contributions",
@@ -1680,13 +1685,11 @@ def _write_failure_summary(
             # the bounded recovery scan contains only the ledger tail.
             recovered["total_turns"] = recovered_last_turn_index
             recovered["total_turns_is_lower_bound"] = not bool(
-                recovered.get("watchdog_recovery_usage_complete", False)
+                recovered.get("watchdog_recovery_trace_scan_complete", False)
             )
         recovered_elapsed_s = recovered.get("watchdog_recovery_max_elapsed_s")
         if (
-            isinstance(recovered_elapsed_s, (int, float))
-            and not isinstance(recovered_elapsed_s, bool)
-            and math.isfinite(float(recovered_elapsed_s))
+            _is_finite_number(recovered_elapsed_s)
             and float(recovered_elapsed_s) >= 0.0
         ):
             recovered["wall_clock_s"] = float(recovered_elapsed_s)
@@ -1744,9 +1747,7 @@ def _write_failure_summary(
             int(existing_unpriced_raw) if existing_unpriced_valid else 0
         )
         existing_unknown_positive = bool(
-            isinstance(existing_unknown, (int, float))
-            and not isinstance(existing_unknown, bool)
-            and math.isfinite(float(existing_unknown))
+            _is_finite_number(existing_unknown)
             and float(existing_unknown) > 1e-12
         )
         existing_incomplete = bool(
@@ -1770,9 +1771,7 @@ def _write_failure_summary(
         )
         existing_has_accounting_authority = bool(
             all(
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and math.isfinite(float(value))
+                _is_finite_number(value)
                 and float(value) >= 0.0
                 for value in existing_authority_numbers
             )
@@ -1794,6 +1793,10 @@ def _write_failure_summary(
         )
         recovered_authority_is_newer = bool(
             existing_has_accounting_authority
+            and (
+                recovered_accounting_is_modern
+                or existing.get("watchdog_accounting_source") == "trace_receipts"
+            )
             and isinstance(existing_turn_count, int)
             and not isinstance(existing_turn_count, bool)
             and isinstance(recovered_accounting_turn_index, int)
@@ -1852,7 +1855,11 @@ def _write_failure_summary(
             {
                 key: value
                 for key, value in recovered.items()
-                if key.startswith("watchdog_")
+                if key.startswith("watchdog_") or key in {
+                    "request_usage_complete", "dispatched_without_terminal_usage_count",
+                    "prepared_without_terminal_record_count", "llm_observed_provider_exposure_count",
+                    "llm_outstanding_provider_exposure_count", "token_totals_are_lower_bound",
+                }
             }
         )
         recovered_counter_keys = {
@@ -1880,7 +1887,7 @@ def _write_failure_summary(
         recovered_counters_are_authoritative = not existing_has_accounting_authority
         if recovered_counters_are_authoritative:
             if (
-                recovered.get("watchdog_recovery_usage_complete", False)
+                recovered.get("watchdog_recovery_trace_scan_complete", False)
                 and recovered.get("llm_usage_events", 0) > 0
             ):
                 # The complete trace replaces a legacy/non-authoritative
@@ -1906,7 +1913,7 @@ def _write_failure_summary(
             ):
                 payload["total_turns"] = recovered_last_turn_index
                 payload["total_turns_is_lower_bound"] = not bool(
-                    recovered.get("watchdog_recovery_usage_complete", False)
+                    recovered.get("watchdog_recovery_trace_scan_complete", False)
                 )
         elif (
             isinstance(existing_turn_count, int)
@@ -1921,6 +1928,7 @@ def _write_failure_summary(
             # than that prefix; replacing with the full trace could discard a
             # prefix event that reached memory but not JSONL.
             merged_counter_turn = existing_turn_count
+            merged_counter_keys = set(recovered_counter_keys)
             for key in recovered_counter_keys:
                 existing_value = existing.get(key)
                 if isinstance(existing_value, int) and not isinstance(
@@ -1941,10 +1949,15 @@ def _write_failure_summary(
                 for key, value in contribution.items():
                     if key == "turn_index":
                         continue
-                    payload[key] = max(0, int(payload.get(key, 0) or 0)) + max(
-                        0,
-                        int(value or 0),
-                    )
+                    merged_counter_keys.add(key)
+                    # These are generated scanner deltas, not JSON fields.
+                    # A late alias may undo usage counted before the cutoff.
+                    payload[key] = int(payload.get(key, 0) or 0) + int(value or 0)
+            # Clamp only the final sum: a role omitted from the prefix can
+            # receive both a correction and an upgrade in the scanned suffix.
+            for key in merged_counter_keys:
+                if key in payload:
+                    payload[key] = max(0, int(payload[key]))
             payload["total_turns"] = merged_counter_turn
         if recovered_accounting and (
             not existing_has_accounting_authority
@@ -1958,7 +1971,13 @@ def _write_failure_summary(
             # ``total_turns`` proves that the append-only turn ledger contains
             # a newer cumulative authority receipt.
             payload.update(recovered_accounting)
+            payload["watchdog_accounting_source"] = (
+                "controller_snapshot" if recovered_accounting_is_modern else "trace_receipts"
+            )
         elif existing_has_accounting_authority:
+            payload["watchdog_accounting_source"] = existing.get(
+                "watchdog_accounting_source", "controller_snapshot",
+            )
             # Normalize compatibility aliases from the same winning bundle.
             # A field absent from the existing summary must not leak through
             # from an older recovered turn and contradict its authority.
@@ -1973,9 +1992,7 @@ def _write_failure_summary(
             )
             payload["llm_budget_committed_cost_usd"] = (
                 float(existing_committed)
-                if isinstance(existing_committed, (int, float))
-                and not isinstance(existing_committed, bool)
-                and math.isfinite(float(existing_committed))
+                if _is_finite_number(existing_committed)
                 and float(existing_committed) >= float(existing_accounted)
                 else float(existing_accounted)
             )
@@ -1991,9 +2008,7 @@ def _write_failure_summary(
 
         def valid_nonnegative_float(value: Any) -> Optional[float]:
             if (
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and math.isfinite(float(value))
+                _is_finite_number(value)
                 and float(value) >= 0.0
             ):
                 return float(value)
@@ -2021,7 +2036,7 @@ def _write_failure_summary(
             else False
         )
         recovered_total_lower_bound = not bool(
-            recovered.get("watchdog_recovery_usage_complete", False)
+            recovered.get("watchdog_recovery_trace_scan_complete", False)
         )
         if recovered_total is None:
             resolved_total = existing_total
@@ -2596,6 +2611,18 @@ def _run_cli_worker_in_dedicated_supervisor(
             # The SIGSTOP/SIGKILL sweep remains the bounded backstop.
             if cooperative_stop_signals and cooperative_stop_sent <= 0.0:
                 cooperative_stop_sent = time.monotonic()
+                if output_dir is not None:
+                    from ..shutdown import ShutdownState
+
+                    supervisor_stop = ShutdownState(
+                        nonce=nonce,
+                        deadline=cooperative_stop_sent + max(0.0, float(cooperative_stop_grace_s)),
+                        stop_requested=True, output_dir=output_dir,
+                    )
+                    supervisor_stop.record(
+                        "supervisor_stop_requested", original_signal=int(cooperative_stop_signals[0]),
+                        forwarded_signal=int(signal.SIGTERM), worker_pid=proc.pid,
+                    )
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)
                 except (ProcessLookupError, PermissionError, OSError):
@@ -2690,6 +2717,8 @@ def _run_cli_worker_in_dedicated_supervisor(
                             )
                 return int(returncode)
             if cooperative_stop_expired:
+                if output_dir is not None:
+                    supervisor_stop.record("supervisor_cooperative_deadline_expired")
                 violation = (
                     "watchdog_cooperative_stop_timeout:"
                     f"{int(cooperative_stop_signals[0])}"

@@ -21585,10 +21585,12 @@ class MiniSession:
         return False
 
     def select_next_action(self) -> Optional[Action]:
+        from ..shutdown import require_work_admission
         from .actions.recursive_controller import (
             preserve_helper_continuations_during_selection,
         )
 
+        require_work_admission()
         self._flush_pending_acceptance_records()
         with preserve_helper_continuations_during_selection(self):
             return self._select_next_action()
@@ -25154,6 +25156,7 @@ class MiniSession:
 
         from .replay import scheduler_snapshot
 
+        self._reconcile_recursive_planner_admissions()
         snapshot = scheduler_snapshot(
             self,
             case_id=f"{self.scope}:iter:{int(self.iteration or 0)}",
@@ -25463,6 +25466,9 @@ class MiniSession:
         - its budget is exhausted.
         """
 
+        from ..shutdown import require_work_admission
+
+        require_work_admission()
         for action in self.actions:
             if action.id != action_id:
                 continue
@@ -31166,6 +31172,10 @@ class MiniSession:
             "hard_pivot_triggered": hard_pivot_triggered,
             "verdict": "outcome_applied",
         }
+        for name in ("stage", "verdict", "failure_type"):
+            value = metadata.get(name)
+            if isinstance(value, str) and value:
+                record["action_" + name] = value[:512]
         if isinstance(metadata.get("proof_lineage"), dict):
             record["proof_lineage"] = dict(metadata["proof_lineage"])
         # surface the absolute conversation-turn index for any
@@ -31190,6 +31200,12 @@ class MiniSession:
             "lean_feedback_source",
             "llm_response_recorded",
             "llm_turn_elapsed_s",
+            "turn_loop_elapsed_s",
+            "provider_elapsed_s",
+            "temperature_strategy_requested",
+            "temperature_control_supported",
+            "temperature_diversification_available",
+            "diversification_intervention",
             "max_tokens_override",
             "max_tokens_override_reason",
             "formalization_llm_request_timeout_s",
@@ -31930,7 +31946,7 @@ class MiniSession:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    def _recursive_planner_frontier_signature(self) -> str:
+    def _recursive_planner_frontier_signature(self, *, include_helper_delta: bool = True) -> str:
         """Hash only stable inputs that can change recursive planning.
 
         The generic progress signature intentionally contains the
@@ -32121,7 +32137,9 @@ class MiniSession:
             "active_root_targets": _stable_value(
                 tuple(getattr(dossier, "active_root_targets", ()) or ())
             ),
-            "verified_helper_blocks": [text_hash(block) for block in helper_blocks],
+            "verified_helper_blocks": (
+                [text_hash(block) for block in helper_blocks] if include_helper_delta else []
+            ),
             "proposed_helpers_prompt_hash": text_hash(proposed_prompt),
             "proof_idea_lifecycle": proof_idea_lifecycle,
             "theory_bundle_ids": sorted(
@@ -32175,6 +32193,48 @@ class MiniSession:
             ensure_ascii=True,
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    def _recursive_planner_admission_context(self) -> Dict[str, Any]:
+        """Scheduling-only projection; exact execution identities retain helpers."""
+        blocks = getattr(self.dossier, "verified_helper_blocks", lambda: ())()
+        graph = getattr(self.dossier, "proof_graph", None)
+        graph_nodes = getattr(graph, "nodes", {}) or {}
+        certifies = getattr(graph, "_helper_certifies_node", None)
+        checked_bindings = []
+        visible_hashes = {text_hash(str(block or "")) for block in blocks}
+        if callable(certifies):
+            for node in graph_nodes.values():
+                if (getattr(node, "status", "") != "proved"
+                        or getattr(node, "kind", "") not in {
+                            "proposed_claim", "formal_variant", "missing_obligation",
+                            "proof_state_root", "proof_state_child_goal",
+                        }):
+                    continue
+                helper_id = (getattr(node, "metadata", {}) or {}).get("verified_by_helper_node_id", "")
+                helper = graph_nodes.get(helper_id)
+                if (helper is not None and getattr(helper, "source_hash", "") in visible_hashes
+                        and certifies(helper, node)):
+                    checked_bindings.append([str(node.node_id), str(helper_id), str(helper.source_hash)])
+        return {
+            "schema_version": 1,
+            "exact_signature": self._recursive_planner_frontier_signature(),
+            "base_signature": self._recursive_planner_frontier_signature(include_helper_delta=False),
+            "helper_hashes": [text_hash(str(block or "")) for block in blocks],
+            "checked_obligation_bindings": sorted(checked_bindings),
+        }
+
+    def _reconcile_recursive_planner_admissions(self) -> None:
+        """Observe deltas once at a durable boundary, never in quotation probes."""
+        interested = [
+            action for action in self.actions
+            if getattr(action, "_recursive_fixed_point_environment_signature", "")
+            and callable(getattr(action, "reconcile_planner_admission", None))
+        ]
+        if not interested:
+            return
+        context = self._recursive_planner_admission_context()
+        for action in interested:
+            action.reconcile_planner_admission(self, context)
 
     def _graph_obligation_progress_contract(self, node: Any) -> Tuple[str, str, str, str]:
         """Keep the observed typed target exact while its receipts are refined."""

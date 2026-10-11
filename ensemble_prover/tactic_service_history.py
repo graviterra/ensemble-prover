@@ -64,6 +64,28 @@ def validate_service_history(value: Any) -> dict[str, Any]:
         "sequence": sequence,
         "entries": clean,
     }
+    # One bounded scheduling hint remembers an operation that could not start
+    # a check. It never changes the allowance actually served to a candidate.
+    deferral = value.get("root_dispatch_deferral")
+    if isinstance(deferral, Mapping):
+        allowance = deferral.get("allowance_s")
+        provider_sequence = deferral.get("provider_sequence")
+        if (
+            isinstance(deferral.get("context_key"), str)
+            and _KEY.fullmatch(deferral["context_key"])
+            and type(allowance) in {int, float}
+            and 0 <= allowance <= 1e15
+            and math.isfinite(allowance)
+            and type(provider_sequence) is int
+            and 0 <= provider_sequence <= _MAX_COUNTER
+            and type(deferral.get("drain")) is bool
+        ):
+            result["root_dispatch_deferral"] = {
+                "context_key": deferral["context_key"],
+                "allowance_s": float(allowance),
+                "provider_sequence": provider_sequence,
+                "drain": deferral["drain"],
+            }
     lanes = value.get("renewal_lanes", {})
     if not isinstance(lanes, Mapping):
         return {}
@@ -177,6 +199,29 @@ def _stronger_allowance(requested: float, served: float) -> bool:
     # Match the closer's full-funding tolerance. Ordinary dispatch overhead
     # must not renew a check that already received its configured opportunity.
     return requested > served + max(0.01, requested * 0.01)
+
+
+def unserved_admission_available(
+    state: Any, *, lane_key: str, candidates: Sequence[Mapping[str, Any]],
+    helper_hashes: Sequence[str], allowance_s: float,
+) -> bool:
+    """Find an exact queued grant without renewing an unimproved timeout."""
+    checked = validate_service_history(state)
+    lane = checked.get("renewal_lanes", {}).get(lane_key)
+    if not lane or lane["helper_hashes"] != list(helper_hashes):
+        return False
+    proofs = {item["proof"] for item in candidates}
+    admitted = set(lane["admitted"]) - set(lane["resource_wait"])
+    for candidate in lane["deferred"]:
+        proof = candidate["proof"]
+        if proof not in proofs or _proof_key(proof) not in admitted:
+            continue
+        entry = checked["entries"].get(_proof_key(proof, lane_key), {})
+        if not entry.get("resource_inconclusive") or _stronger_allowance(
+            allowance_s, entry["allowance_s"],
+        ):
+            return True
+    return False
 
 
 def renewal_work_available(

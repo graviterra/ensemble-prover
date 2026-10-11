@@ -19,8 +19,6 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-_LOGGER = logging.getLogger(__name__)
-
 from .state_data import clone_json_value
 from .falsification_cursor_identity import (
     FALSIFICATION_CURSOR_TARGET_SCHEMA,
@@ -104,6 +102,8 @@ from .utils import (
     has_placeholder_tactics,
     rename_lean_identifier,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class StaleProofIdeaContextProjectionError(ValueError):
@@ -13456,7 +13456,38 @@ class ProofDossier:
         helper.closed_open_premise_statements = closed_open_statements
         helper.render_policy = render_policy
 
+    def helper_revision(self) -> Optional[str]:
+        """Exact runtime content identity, including policy and graph revocation."""
+        from .helper_snapshot import helper_revision
+        return helper_revision(self)
+
     def _refresh_verified_helper_quality(self) -> None:
+        revision = self.helper_revision()
+        if revision is not None and revision == getattr(self, "_helper_quality_revision", None):
+            return
+        self._helper_quality_revision = None
+        if getattr(self, "_helper_quality_refresh_active", False):
+            return
+        self._helper_quality_refresh_active = True
+        try:
+            # Visibility can depend on a later helper in registry order. Reach
+            # the same fixed point repeated old read calls would reach before
+            # freezing the view; an unstable or failed pass is never cached.
+            for _ in range(max(1, len(self.verified_helpers) + 1)):
+                from .execution_spans import execution_span
+                with execution_span("helper_quality_reconciliation"):
+                    self._refresh_verified_helper_quality_uncached()
+                after = self.helper_revision()
+                if revision is not None and after == revision:
+                    self._helper_quality_revision = after
+                    break
+                if after is None:
+                    break
+                revision = after
+        finally:
+            self._helper_quality_refresh_active = False
+
+    def _refresh_verified_helper_quality_uncached(self) -> None:
         from .verified_helper_contract import helper_source_contract_is_context_sensitive
 
         helpers = list(self.verified_helpers.values())
@@ -14122,6 +14153,16 @@ class ProofDossier:
 
         if refresh_quality:
             self._refresh_verified_helper_quality()
+        revision = self.helper_revision()
+        cached = getattr(self, "_helper_blocks_snapshot", None)
+        if revision is not None and cached is not None and cached[0] == revision:
+            return list(cached[1])
+        result = self._verified_helper_blocks_uncached()
+        if revision is not None:
+            self._helper_blocks_snapshot = (revision, tuple(result))
+        return result
+
+    def _verified_helper_blocks_uncached(self) -> List[str]:
         answer_safety_kwargs = self._answer_safety_kwargs()
         helpers = list(self.verified_helpers.items())
         if not helpers:
@@ -20998,6 +21039,21 @@ class ProofDossier:
         self, blocks: Sequence[str], *, refresh_quality: bool = True,
     ) -> Tuple[str, ...]:
         """Freeze an explicit helper scope after checking its current evidence."""
+        sources = tuple(blocks)
+        if refresh_quality:
+            self._refresh_verified_helper_quality()
+        revision = self.helper_revision()
+        cached = getattr(self, "_validated_helper_context_snapshot", None)
+        if revision is not None and cached == (revision, sources):
+            return sources
+        result = self._validate_helper_context_uncached(sources, refresh_quality=False)
+        if revision is not None:
+            self._validated_helper_context_snapshot = (revision, sources)
+        return result
+
+    def _validate_helper_context_uncached(
+        self, blocks: Sequence[str], *, refresh_quality: bool = True,
+    ) -> Tuple[str, ...]:
         sources = tuple(blocks)
         names = [helper_decl_name(block) for block in sources]
         if (

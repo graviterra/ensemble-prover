@@ -6,6 +6,7 @@ import { ProofGraph } from "../components/ProofGraph";
 import { StopDialog } from "../components/StopDialog";
 import { PollingControls } from "../components/PollingControls";
 import { NodeMathematics } from "../components/NodeMathematics";
+import { TokenUsagePanel } from "../components/TokenUsagePanel";
 import { markStopSent, wasStopSent } from "../storage";
 import { startPolling } from "../polling";
 import type { Polling } from "../polling";
@@ -136,6 +137,8 @@ export function AttemptScreen({ id, onLibrary, expanded = false, paused: control
       </div>
 
       <LiveMathPanel value={detail?.liveMath} paused={paused} readFailed={!!error} />
+      <TokenUsagePanel value={detail?.tokenUsage} paused={paused} readFailed={!!error}
+        lastEventS={detail?.lastEventS} traceAgeS={detail?.liveMath?.health.traceAgeS} />
       <MemoryPanel key={id} runId={id} value={detail?.liveMath?.memory} paused={paused} />
 
       <div className={`proof-workspace${expanded ? " is-expanded" : ""}`}>

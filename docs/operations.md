@@ -63,6 +63,12 @@ Startup events include a `verified_helper_cache` stage with wall time and proces
 CPU time. This stage is nested within proof-session initialization; do not add
 its duration to that containing stage when calculating total startup time.
 
+The helper cache reads global identities and supersession information before
+performing semantic admission for the selected theorem. Repeated dossier reads
+reuse reconciliation only while the source, contracts, permissions, and recorded
+authority still match. Reusing a checked context does not replace final root
+verification.
+
 ## Read the mathematical and operational status together
 
 In the browser, inspect **Mathematical focus**, **Runtime evidence**, and
@@ -90,6 +96,8 @@ observation, not computation.
 | --- | --- |
 | `summary.json` | Terminal outcome, export status, usage, and proof dossier |
 | `turns.jsonl` and `run.log` | Structured action evidence and readable execution history |
+| `trace_payloads/` | Immutable large response and tool bodies referenced by trace records |
+| `shutdown.jsonl` | Cleanup deadlines, owners, and unfinished task locations |
 | `activation_telemetry.json` | Recorded subsystem activity |
 | `attempt_checkpoint.json` | Generation identity and link to durable attempt state |
 | Hidden `.checkpoint_pages/` directories | Authenticated data pages referenced by nearby checkpoint and journal records |
@@ -105,6 +113,20 @@ pages with their records and let checkpoint cleanup reclaim unreferenced pages.
 A log copied on its own cannot restore a run. Logs, catalogs, and checkpoints
 can contain private mathematics and model responses.
 
+Large repeated trace fields may use `_payload_refs` instead of inline bodies.
+Keep `trace_payloads/` beside `turns.jsonl`; the replay and telemetry readers
+expand and hash-check these references. Custom readers can call
+`ensemble_prover.trace_payloads.expand_trace_payloads(record, run_directory)`.
+Earlier inline records remain supported.
+
+For a private executable-source snapshot, add `--private-source-capsule` when
+starting a Mini run. Its manifest records allowlisted Python source and relevant
+dependency locks, file modes, symlink identities, omissions, and capture stability.
+It excludes unrelated untracked files and does not follow source symlinks. This
+optional capsule is separate from the small source fingerprint. It does not pin
+the running process or capture the complete Lean project, so it does not claim
+complete replayability.
+
 Paged records support growing histories and individual provider payloads without
 an aggregate size limit. Each page is bounded and checked independently;
 older checkpoint encodings remain readable. Restoring a generation still requires
@@ -116,6 +138,14 @@ Send one interrupt and allow cooperative cleanup, or use the confirmed stop
 control for a browser-owned attempt. A stop request is not confirmation that all
 processes have exited. Repeated interrupts can escalate before artifacts finish
 writing.
+
+Cleanup owners share the stop deadline. Transport close can release cancelled
+research tasks before their owner joins them; late physical usage can settle
+without delivering further proof advice. Research loops retired by a donor or
+role change retain cleanup ownership. Their ledger stays open through owned
+response replay, transport disposal, and final accounting checkpoint work.
+Cleanup retries preserve the established stop deadline. The process supervisor
+remains the backstop for a worker that cannot quiesce within its grace period.
 
 Resume the latest Mini generation into a new output directory:
 
@@ -158,6 +188,22 @@ root solves. A research note does not satisfy the gate.
 Start with the latest complete events and the terminal summary. Identify the
 active scope, action, provider request, and governing deadline before changing
 settings.
+
+`turn_loop_elapsed_s` includes provider, tool, and orchestration work;
+`provider_elapsed_s` records the provider portion available from the adapter.
+The older `llm_elapsed_s` field retains its whole-loop meaning. Nested execution
+spans record their parent and exclusive wall time where available; overlapping
+durations must not be added as though they were sequential.
+
+`watchdog_recovery_trace_scan_complete` describes the trace scan.
+`request_usage_complete` separately reports whether observed request lifecycles
+have terminal usage: `null` means the evidence cannot establish completeness.
+Aggregate and per-dispatch receipts are reconciled using the attempts they cover.
+Overlapping receipts with unresolved coverage remain uncertain even when every
+dispatch has a terminal record.
+When `token_totals_are_lower_bound` is true, known tokens exclude unresolved
+consumption. An observed provider exposure does not establish a price for
+subscription usage.
 
 | Symptom | Useful next check |
 | --- | --- |

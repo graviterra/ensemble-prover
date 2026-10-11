@@ -343,6 +343,8 @@ def _get_solved_turn(run_dir: Path) -> Optional[Dict[str, Any]]:
     for line in t_path.read_text(encoding="utf-8").splitlines():
         try:
             rec = json.loads(line)
+            from .trace_payloads import expand_trace_payloads
+            rec = expand_trace_payloads(rec, run_dir)
         except Exception:
             continue
         if rec.get("verdict") == "solved":

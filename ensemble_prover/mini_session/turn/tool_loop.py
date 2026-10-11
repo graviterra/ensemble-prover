@@ -5608,6 +5608,7 @@ async def _call_llm_with_tools_one_round_impl(
                     # is not refusal to follow cadence guidance.
                     batch_formal_cadence_requested = True
                 tool_call_started = time.monotonic()
+                formal_tool_telemetry: dict[str, Any] = {}
                 promoted_state_status: Optional[str] = None
                 compute_runner_invoked = False
                 search_runner_invoked = False
@@ -5625,7 +5626,14 @@ async def _call_llm_with_tools_one_round_impl(
                     formal_runner_invoked = True
                     return await runner(*runner_args, **runner_kwargs)
 
+                from contextlib import ExitStack
+                from ...execution_spans import collect_execution_spans, execution_span
+                tool_spans = ExitStack()
+                tool_spans.enter_context(collect_execution_spans(formal_tool_telemetry))
+                tool_span = tool_spans.enter_context(execution_span("tool_execution_and_registration"))
                 try:
+                    from ...shutdown import require_work_admission
+                    require_work_admission()
                     from ...research_claims.strategy_runtime import current_strategy
 
                     strategy_runtime = current_strategy()
@@ -5950,6 +5958,7 @@ async def _call_llm_with_tools_one_round_impl(
                                 ),
                                 accepted_code_out=accepted_code_out,
                                 checked_declaration_out=checked_declaration_out,
+                                execution_telemetry_out=formal_tool_telemetry,
                             )
                         )
                         if result_text.startswith("try_lean accepted."):
@@ -6626,6 +6635,8 @@ async def _call_llm_with_tools_one_round_impl(
                         timed_out_record["skipped_reason"] = (
                             "llm_turn_elapsed_budget_exhausted"
                         )
+                    if formal_tool_telemetry:
+                        timed_out_record["execution_telemetry"] = formal_tool_telemetry
                     tool_call_log.append(timed_out_record)
                     for remaining_index, remaining_tc in enumerate(
                         calls_to_run[index + 1 :],
@@ -6744,6 +6755,8 @@ async def _call_llm_with_tools_one_round_impl(
                             cancelled_record["skipped_reason"] = "tool_loop_cancelled"
                     else:
                         cancelled_record["skipped_reason"] = "tool_loop_cancelled"
+                    if formal_tool_telemetry:
+                        cancelled_record["execution_telemetry"] = formal_tool_telemetry
                     tool_call_log.append(cancelled_record)
                     for remaining_index, remaining_tc in enumerate(
                         calls_to_run[index + 1 :],
@@ -6847,6 +6860,11 @@ async def _call_llm_with_tools_one_round_impl(
                         f"{safe_exc_type}: {safe_exc} "
                         "(synthesized tool error message to keep transcript well-formed)",
                     )
+                finally:
+                    import sys
+                    if runner_raised:
+                        tool_span["disposition"] = "failed"
+                    tool_spans.__exit__(*sys.exc_info())
                 conv.history.append(
                     {
                         "role": "tool",
@@ -7096,6 +7114,8 @@ async def _call_llm_with_tools_one_round_impl(
                     tool_call_record["semantic_diagnostic_progress"] = (
                         diagnostic_progress_reason
                     )
+                if formal_tool_telemetry:
+                    tool_call_record["execution_telemetry"] = formal_tool_telemetry
                 tool_call_log.append(tool_call_record)
 
                 call_signature = _tool_call_signature(tc)
@@ -8585,6 +8605,9 @@ async def call_llm_with_tools_one_round(*args: Any, **kwargs: Any) -> ToolLoopRe
 
     from ...mini_research import prepare_native_conversation
 
+    kwargs["conv"]._native_compute_examples_enabled = bool(kwargs.get("compute_examples_tool_enabled", False))
+    from ...shutdown import require_work_admission
+    require_work_admission()
     native_tools = prepare_native_conversation(kwargs["conv"], kwargs.get("dossier"))
     if native_tools:
         tool_list = list(kwargs.get("tools_list") or ())

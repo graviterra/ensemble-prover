@@ -76,6 +76,7 @@ class ProviderProgressForwarder:
         self.last_time: float | None = None
         self.last_status = ""
         self.last_retry_count = 0
+        self.last_token_estimate: int | None = None
 
     def publish(self, snapshot: dict[str, Any]) -> None:
         if not self.active or self.sink is None:
@@ -89,10 +90,13 @@ class ProviderProgressForwarder:
         now = time.monotonic()
         retry_count = snapshot.get("retry_event_count", 0)
         status = snapshot["status"]
-        if (self.last_time is not None and now - self.last_time < 30.0
+        estimate = snapshot.get("current_block_estimated_tokens") if status == "thinking" else None
+        interval = 2.0 if estimate is not None and estimate != self.last_token_estimate else 30.0
+        if (self.last_time is not None and now - self.last_time < interval
                 and status == self.last_status and retry_count == self.last_retry_count):
             return
         self.last_time, self.last_status, self.last_retry_count = now, status, retry_count
+        self.last_token_estimate = estimate
         verdict = f"provider_{status}"
         if "current_block_estimated_tokens" in snapshot:
             verdict += f" thinking_block_estimate={snapshot['current_block_estimated_tokens']} (not billed)"

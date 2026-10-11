@@ -414,19 +414,29 @@ class MathematicalMemoryService:
                 or statement
             )
         preamble = str(session.acceptance_preamble())
+        revision_fn = getattr(session.dossier, "helper_revision", None)
+        revision = revision_fn() if callable(revision_fn) else None
+        key = (statement, preamble, revision, self.policy_id)
+        cached = getattr(self, "_context_snapshot", None)
+        if revision is not None and cached is not None and cached[0] == key:
+            return cached[1]
         lemmas = tuple(session.dossier.verified_helper_blocks())
-        return statement, preamble, lemmas
+        result = (statement, preamble, lemmas)
+        revision = revision_fn() if callable(revision_fn) else None
+        if revision is not None:
+            self._context_snapshot = ((statement, preamble, revision, self.policy_id), result)
+        return result
 
     def context_id(self) -> str:
         statement, preamble, lemmas = self.context()
-        return content_digest(
-            {
-                "statement": statement,
-                "preamble": preamble,
-                "helpers": lemmas,
-                "policy": self.policy_id,
-            }
-        )
+        key = (statement, preamble, lemmas, self.policy_id)
+        cached = getattr(self, "_context_id_snapshot", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        identity = content_digest({"statement": statement, "preamble": preamble,
+                                   "helpers": lemmas, "policy": self.policy_id})
+        self._context_id_snapshot = (key, identity)
+        return identity
 
     def retrieval_revision(self) -> str:
         """Track only the retrieval pool currently admitted by its existing pins."""
@@ -950,21 +960,76 @@ class MathematicalMemoryService:
             or registry.source_matches(identity, source_digest)
         )
 
+    def _continuation_binding(self) -> dict[str, Any]:
+        generation = self.catalog.generation()
+        return {"environment_id": self.context_id(), "policy_id": self.policy_id,
+                "policy": content_digest(self.policy.to_record()),
+                "index_revision": self.retrieval_revision(),
+                "catalog_lineage": generation.lineage, "catalog_epoch": generation.epoch}
+
+    def continuation(self) -> dict[str, Any] | None:
+        session = self.session()
+        if session is None:
+            return None
+        state = session.mathematical_memory_state
+        cursor = state.get("candidate_continuation")
+        if (not isinstance(cursor, dict) or cursor.get("binding") != self._continuation_binding()
+                or not isinstance(cursor.get("candidates"), list)
+                or not isinstance(cursor.get("visited"), list)
+                or not isinstance(cursor.get("coverage"), dict)
+                or len(cursor["candidates"]) > self.config.cheap_candidate_cap
+                or len(cursor["visited"]) > 2 * self.config.cheap_candidate_cap
+                or any(not isinstance(item, str) for item in cursor["visited"])
+                or type(cursor.get("retrieval_passes")) is not int
+                or not 1 <= cursor["retrieval_passes"] <= 2):
+            state.pop("candidate_continuation", None)
+            return None
+        return cursor
+
+    def has_pending_continuation(self) -> bool:
+        cursor = self.continuation()
+        if cursor is None:
+            return False
+        visited = set(cursor["visited"])
+        return (any(isinstance(row, dict) and row.get("candidate_id") not in visited
+                    for row in cursor["candidates"])
+                or bool(cursor.get("coverage", {}).get("partial")) and cursor["retrieval_passes"] < 2)
+
+    def visit_candidate(self, candidate_id: str) -> None:
+        cursor = self.continuation()
+        if cursor is not None and candidate_id not in cursor["visited"]:
+            cursor["visited"].append(candidate_id)
+
     async def capture_goal(self, budget: MemoryBudget) -> Any:
         from .profiles import capture_goal
+        from ensemble_prover.mini_recursive import _live_lean_capability_for_new_work
+        from ensemble_prover.verified_helper_contract import helper_contract_context_guard
 
+        self.check_budget(budget)
         session = self.session()
         statement, preamble, lemmas = self.context()
+        environment_id = self.context_id()
         source = preamble + "\n" + "\n".join(lemmas) + "\n" + statement
-        return await capture_goal(
-            session.lean,
-            statement=statement,
-            source=source,
-            environment_id=self.context_id(),
-            preamble=preamble,
-            lemmas=lemmas,
-            budget=budget,
+        live = _live_lean_capability_for_new_work(session.lean)
+        key = (id(live), environment_id, source)
+        cached = getattr(self, "_captured_goal_snapshot", None)
+        if cached is not None and cached[0] == key and cached[1]():
+            return cached[2]
+        estimate = float(getattr(self, "_goal_capture_elapsed_s", 0.0))
+        if estimate > 0 and budget.remaining_s() < estimate:
+            raise TimeoutError("remaining memory allocation cannot fund the observed goal capture")
+        guard = helper_contract_context_guard(live)
+        started = time.monotonic()
+        result = await capture_goal(
+            session.lean, statement=statement, source=source,
+            environment_id=environment_id, preamble=preamble, lemmas=lemmas, budget=budget,
         )
+        self._goal_capture_elapsed_s = time.monotonic() - started
+        if self.context_id() != environment_id or not guard():
+            raise ValueError("goal capture context changed")
+        if result.complete and live is not None:
+            self._captured_goal_snapshot = (key, guard, result)
+        return result
 
     async def find_candidates(
         self, goal: Any, budget: MemoryBudget, pinned_generation: GenerationPin
@@ -975,6 +1040,32 @@ class MathematicalMemoryService:
         if session is None or session.searcher is None:
             return ()
         self.check_budget(budget)
+        from ensemble_prover.mathematical_retrieval.model import RetrievalCandidate
+        binding = self._continuation_binding()
+        cursor = self.continuation()
+        if cursor is not None and cursor.get("goal_id") != goal.goal_id:
+            cursor = None
+        visited = set(cursor["visited"]) if cursor else set()
+        passes = cursor["retrieval_passes"] if cursor else 0
+        if cursor is not None:
+            try:
+                remaining = tuple(RetrievalCandidate.from_record(row)
+                                  for row in cursor["candidates"] if row.get("candidate_id") not in visited)
+            except (ValueError, TypeError, KeyError):
+                session.mathematical_memory_state.pop("candidate_continuation", None)
+                remaining, cursor, visited, passes = (), None, set(), 0
+            if remaining:
+                self.candidate_coverage = dict(cursor["coverage"])
+                eligible = []
+                for candidate in remaining:
+                    if self.candidate_eligible(candidate, budget=budget):
+                        eligible.append(candidate)
+                    else:
+                        self.visit_candidate(candidate.candidate_id)
+                return tuple(eligible)
+            if cursor is not None and (not cursor["coverage"].get("partial") or passes >= 2):
+                self.candidate_coverage = dict(cursor["coverage"])
+                return ()
         statement, _, _ = self.context()
         query = RetrievalQuery.create(
             target_statement=statement,
@@ -989,7 +1080,6 @@ class MathematicalMemoryService:
             deadline_monotonic=budget.deadline_monotonic,
             deadline_exhausted=lambda: budget.remaining_s() <= 0,
         )
-        self.check_budget(budget)
         self.candidate_coverage = {
             "partial": bool(
                 result.truncated
@@ -1005,10 +1095,31 @@ class MathematicalMemoryService:
                 outcome.to_record() for outcome in result.source_reports
             ],
         }
+        # Retain advisory results before a deadline exception discards the local
+        # action. Resumption rechecks policy/source eligibility and ordinary Lean
+        # admission; serialized candidates confer no checked authority.
+        if binding != self._continuation_binding():
+            raise ValueError("retrieval context changed")
+        retained = []
+        size = 0
+        for candidate in result.candidates[:self.config.cheap_candidate_cap]:
+            row = candidate.to_record(include_helper_source=True)
+            size += len(canonical_json(row))
+            if size > 2_000_000:
+                self.candidate_coverage["partial"] = True
+                break
+            retained.append(row)
+        session.mathematical_memory_state["candidate_continuation"] = {
+            "binding": binding, "goal_id": goal.goal_id, "candidates": retained,
+            "visited": list(visited), "coverage": dict(self.candidate_coverage),
+            "retrieval_passes": passes + 1, "authority": "advisory_candidates_only",
+        }
+        self.check_budget(budget)
         candidates = tuple(
             candidate
-            for candidate in result.candidates
-            if self.candidate_eligible(candidate, budget=budget)
+            for row in retained
+            for candidate in (RetrievalCandidate.from_record(row),)
+            if candidate.candidate_id not in visited and self.candidate_eligible(candidate, budget=budget)
         )
         # Existing retrieval performed source admission; memory only reorders
         # that already eligible pool and retains an exploration position.

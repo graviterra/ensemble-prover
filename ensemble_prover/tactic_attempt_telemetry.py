@@ -9,8 +9,11 @@ the preview only for backward compatibility with historical records.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import hashlib
+import json
 import math
 from typing import Any, Callable, Dict
+import uuid
 
 
 _TIMEOUT_ERROR_TYPES = {
@@ -96,6 +99,7 @@ MONOTONIC_LEAN_ATTEMPT_METRICS = frozenset(
             for suffix in (
                 "contexts",
                 "candidates_generated",
+                "candidate_inventory_slots",
                 "certificates_accepted",
             )
         ),
@@ -210,6 +214,38 @@ def tactic_stage_telemetry_fields(
                 if math.isfinite(total):
                     totals[key] = total
     return {"tactic_stage_timings": totals, "tactic_stage_timing_scope": "per_check_inclusive"}
+
+
+def tactic_portfolio_identity_fields(
+    *, lane: str, generation_context_key: str, candidates: Sequence[Any] | None,
+    candidate_inventory_count: int, phase: str = "direct",
+) -> Dict[str, Any]:
+    """Describe inventory identity and one service invocation without deduping checks.
+
+    A generation identity is available only with the complete ordered portfolio.
+    The execution identifier names this emitted invocation record; cursors and
+    measured attempt counts remain the authority for how much work was done.
+    """
+    inventory = []
+    for candidate in candidates or ():
+        item = {key: getattr(candidate, key, None) for key in ("proof", "tactic", "source", "helper")}
+        if (not all(isinstance(item[key], str) for key in ("proof", "tactic", "source"))
+                or item["helper"] is not None and not isinstance(item["helper"], str)):
+            inventory = []
+            break
+        inventory.append(item)
+    identity = {"schema_version": 1, "lane": lane, "context": generation_context_key,
+                "phase": phase, "candidates": inventory}
+    known = bool(generation_context_key and inventory)
+    return {
+        "candidate_inventory_count": max(0, int(candidate_inventory_count)),
+        "tactic_lane": lane,
+        "portfolio_generation_id": hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest() if known else "",
+        "portfolio_generation_identity_known": known,
+        "generation_context_key": generation_context_key,
+        "tactic_execution_id": uuid.uuid4().hex,
+        "tactic_execution_identity_scope": "service_invocation_record",
+    }
 
 
 def tactic_record_telemetry(record: Mapping[str, Any]) -> Dict[str, int]:
@@ -332,6 +368,7 @@ def summarize_tactic_records(
             {
                 "contexts": 0,
                 "candidates_generated": 0,
+                "candidate_inventory_slots_observed": 0,
                 "attempts_observed_lower_bound": 0,
                 "exact_records": 0,
                 "inexact_records": 0,
@@ -342,7 +379,8 @@ def summarize_tactic_records(
             candidates = max(
                 0,
                 int(
-                    record.get("candidate_count")
+                    record.get("candidate_inventory_count")
+                    or record.get("candidate_count")
                     or record.get("tactic_candidate_count")
                     or 0
                 ),
@@ -351,6 +389,9 @@ def summarize_tactic_records(
             candidates = 0
         bucket["contexts"] += 1
         bucket["candidates_generated"] += candidates
+        # The historical name is retained for readers. Repeated continuation
+        # records expose the same inventory, not repeated candidate generation.
+        bucket["candidate_inventory_slots_observed"] += candidates
         bucket["attempts_observed_lower_bound"] += int(
             telemetry["tactic_count_lower_bound"]
         )
@@ -399,6 +440,11 @@ def record_dossier_lean_attempt_event(
         except (TypeError, ValueError):
             candidate_count = 0
         if candidate_count:
+            _increment_metric(
+                dossier,
+                f"{metric.removesuffix('_attempts')}_candidate_inventory_slots",
+                candidate_count,
+            )
             _increment_metric(
                 dossier,
                 f"{metric.removesuffix('_attempts')}_candidates_generated",

@@ -14217,6 +14217,22 @@ class ConversationTurnAction(ProviderLaneBankMixin):
             ),
         )
         temperature_metadata = temperature_decision.metadata(client=client)
+        if (temperature_decision.phase_key == "stagnation_escape"
+                and temperature_metadata.get("temperature_diversification_available") is False):
+            intervention_key = str(conv.goal_statement).strip()
+            if getattr(conv, "_sampling_route_intervention_target", None) != intervention_key:
+                conv.history.append({
+                    "role": "user",
+                    "content": (
+                        "This transport cannot vary sampling temperature. For this stalled target, "
+                        "choose a different mathematical question or a discriminating exact check. "
+                        "State its relation to the original target, preserve its quantifiers and "
+                        "quantitative budget, and retain previously established obstructions."
+                    ),
+                    "_sampling_route_intervention": True,
+                })
+                conv._sampling_route_intervention_target = intervention_key
+            temperature_metadata["diversification_intervention"] = "mathematical_question"
         future_provider_exposure_blocked = self._future_provider_exposure_blocked(session)
         if future_provider_exposure_blocked:
             # A paid eligibility exception authorizes local replay only, never
@@ -17286,6 +17302,8 @@ class ConversationTurnAction(ProviderLaneBankMixin):
             "messages_sent": loop_result.sent_messages,
             "llm_response": content,
             "llm_elapsed_s": loop_result.elapsed_s,
+            "turn_loop_elapsed_s": loop_result.elapsed_s,
+            "provider_elapsed_s": float(getattr(loop_result, "provider_call_elapsed_s", 0.0) or 0.0),
             "tool_state_updates": int(
                 getattr(loop_result, "tool_state_updates", 0) or 0
             ),
@@ -23662,6 +23680,10 @@ def _emit_record(session: Any, record: Dict[str, Any]) -> None:
     """
 
     record = dict(record)
+    if "llm_elapsed_s" in record:
+        record.setdefault("turn_loop_elapsed_s", record["llm_elapsed_s"])
+    if "provider_call_elapsed_s" in record:
+        record.setdefault("provider_elapsed_s", record["provider_call_elapsed_s"])
     if "conv_turn_absolute" not in record:
         absolute = getattr(session, "_conversation_turn_count", None)
         if isinstance(absolute, int) and absolute > 0:

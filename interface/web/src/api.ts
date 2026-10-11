@@ -2,6 +2,7 @@ import type { Formalization, GraphNode, Lane, LibraryRun, Milestone, NodeEvidenc
 import { publicMessage, toNode } from "./words";
 
 import { parseLiveMath } from "./liveMath";
+import { parseTokenUsage } from "./tokenUsage";
 import { parseMemory, parseMemoryRequest } from "./memory";
 import type { MemoryRequest, MemoryView } from "./memory";
 
@@ -191,6 +192,7 @@ export function asDetail(value: unknown): RunDetail {
     rootStatus: asText(row.rootStatus),
     childRootFinalizations: asCount(row.childRootFinalizations),
     liveMath: parseLiveMath(row.liveMath),
+    tokenUsage: parseTokenUsage(row.tokenUsage),
     lastEventS: asCount(row.lastEventS),
     process: { status: asText(process.status), detail: asText(process.detail) },
     lanes: asLanes(row.lanes),

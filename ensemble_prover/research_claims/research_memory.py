@@ -358,6 +358,9 @@ def _own_context(store: Any, job: dict[str, Any], *, limit: int = 16000) -> dict
         }
         item["ranges"] = entry["ranges"][:12]
         item["range_coverage"] = "complete" if len(entry["ranges"]) <= 12 else "partial"
+        item["range_coverage_meaning"] = "inventory_of_past_retrieved_intervals"
+        item["document_retrieval_coverage"] = ("complete" if entry["ranges"] == [[0, entry["characters"]]] else "partial")
+        item["currently_dispatched_coverage"] = "see_request_delivery_manifest"
         packet["coverage"].append(item)
         if len(json_text(packet)) > inventory_limit:
             packet["coverage"].pop()

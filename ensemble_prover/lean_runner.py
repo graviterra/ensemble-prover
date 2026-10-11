@@ -760,7 +760,7 @@ run_cmd do
 
 _AUDIT_RECEIPT_VERSION = 2
 _AUDIT_POLICY_VERSION = "kernel-checked-delta-v2"
-_AUDIT_OBSERVER_GENERATION = 4
+_AUDIT_OBSERVER_GENERATION = 5
 _HELPER_USAGE_VERSION = 2
 _AGGREGATE_AUDIT_MARKER_RE = re.compile(r"ENSEMBLE_AUDIT_RECEIPT:([^\r\n]*)")
 
@@ -787,14 +787,14 @@ unsafe def _root_.{function} (bindingText goalName : _root_.String) (provenanceN
   unless goals.length == 1 do
     _root_.Lean.throwError "scratch audit: missing or ambiguous target"
   let target := goals.head!
-  let (_, unionState) := ((names.forM _root_.Lean.CollectAxioms.collect).run env).run {{}}
+  let (_, unionState@_) := ((names.forM _root_.Lean.CollectAxioms.collect).run env).run {{}}
   let targetAxioms ← _root_.Lean.collectAxioms target
   let allowed := [`propext, `Classical.choice, `Quot.sound]
   let forbidden := unionState.axioms.filter fun name => !allowed.contains name
-  let .ok binding := _root_.Lean.Json.parse bindingText | _root_.Lean.throwError "scratch audit: invalid binding"
+  let .ok binding@_ := _root_.Lean.Json.parse bindingText | _root_.Lean.throwError "scratch audit: invalid binding"
   let mut provenance : _root_.Array _root_.Lean.Json := #[]
   for requested in provenanceNames do
-    let .ok parsed := _root_.Lean.Parser.runParserCategory env `term requested
+    let .ok parsed@_ := _root_.Lean.Parser.runParserCategory env `term requested
       | _root_.Lean.throwError "scratch audit: malformed provenance name"
     unless parsed.isIdent do _root_.Lean.throwError "scratch audit: invalid provenance name"
     let resolved ← _root_.Lean.resolveGlobalConstNoOverload parsed
@@ -1059,21 +1059,21 @@ def _root_.{witness}_guard (goal : _root_.Lean.Name) : _root_.Lean.Elab.Command.
     let mut matched := false
     for _ in [:params.size] do
       let mut next := #[]
-      for (actual, first, saved, _) in pending do
+      for (actual@_, first@_, saved@_, _) in pending do
         _root_.Lean.setMCtx saved
         if ← _root_.Lean.Meta.isDefEq expected actual then
           let mut renamed : _root_.Array _root_.Lean.Name := #[]
           let mut validLevels := true
           for level in levels do
             match ← _root_.Lean.instantiateLevelMVars level with
-            | .param name =>
+            | .param name@_ =>
               if renamed.contains name then validLevels := false
               renamed := renamed.push name
             | _ => validLevels := false
           if validLevels then
             matched := true
             break
-        let .forallE name domain body _ := actual | continue
+        let .forallE name@_ domain@_ body@_ _ := actual | continue
         for index in [first:sectionVars.size] do
           _root_.Lean.setMCtx saved
           let argument := sectionVars[index]!
@@ -1085,9 +1085,9 @@ def _root_.{witness}_guard (goal : _root_.Lean.Name) : _root_.Lean.Elab.Command.
               -- Original section variables generalize in declaration order.
               -- Equivalent states with more variables available subsume later
               -- choices, avoiding permutations of duplicate unused binders.
-              unless next.any (fun (other, start, _, assignments) =>
+              unless next.any (fun (other@_, start@_, _, assignments@_) =>
                   other == remaining && start ≤ index + 1 && assignments == renamed) do
-                next := next.filter fun (other, start, _, assignments) =>
+                next := next.filter fun (other@_, start@_, _, assignments@_) =>
                   !(other == remaining && index + 1 ≤ start && assignments == renamed)
                 next := next.push (remaining, index + 1,
                   ← _root_.Lean.MonadMCtx.getMCtx, renamed)
@@ -3252,7 +3252,7 @@ class LeanStatementContractAnalysis:
 _LEAN_RESIDUAL_BATCH_FORMAT_VERSION = 2
 _LEAN_RESIDUAL_SOURCE_MAX_CHARS = 1_000_000
 LEAN_RESIDUAL_VERIFIER_GENERATION = (
-    f"lean-residual-batch-v{_LEAN_RESIDUAL_BATCH_FORMAT_VERSION}:observer-v2"
+    f"lean-residual-batch-v{_LEAN_RESIDUAL_BATCH_FORMAT_VERSION}:observer-v3"
 )
 
 
@@ -5510,10 +5510,12 @@ class LeanRunner:
             if remaining <= 0.0:
                 return self._execution_deadline_result("environment transition")
             try:
-                await asyncio.wait_for(
-                    admit_environment_execution(),
-                    timeout=remaining,
-                )
+                from .execution_spans import execution_span
+                with execution_span("lean_environment_wait"):
+                    await asyncio.wait_for(
+                        admit_environment_execution(),
+                        timeout=remaining,
+                    )
             except asyncio.TimeoutError:
                 return self._execution_deadline_result("environment transition")
             return await self._execute_content_unbarriered(
@@ -5728,7 +5730,9 @@ class LeanRunner:
             if remaining > 0.0:
                 acquire_task = asyncio.ensure_future(sem.acquire())
                 try:
-                    await asyncio.wait_for(acquire_task, timeout=remaining)
+                    from .execution_spans import execution_span
+                    with execution_span("lean_queue_wait"):
+                        await asyncio.wait_for(acquire_task, timeout=remaining)
                     sem_acquired = True
                 except asyncio.TimeoutError:
                     queue_admission_timed_out = True
@@ -6434,11 +6438,13 @@ class LeanRunner:
                 raise RuntimeError(f"REPL terminated by signal {-returncode}")
             return result
 
-        repl = await self._await_repl_resource(
-            self._get_repl(),
-            deadline_monotonic=deadline_monotonic,
-            operation_label="repl acquisition",
-        )
+        from .execution_spans import execution_span
+        with execution_span("lean_backend_acquisition"):
+            repl = await self._await_repl_resource(
+                self._get_repl(),
+                deadline_monotonic=deadline_monotonic,
+                operation_label="repl acquisition",
+            )
         if repl is None:
             if self._configured_use_repl():
                 self._repl_fallback_count += 1
@@ -7056,6 +7062,7 @@ class LeanRunner:
     ) -> LeanResult:
         from .utils import normalize_classical_tactic_prefix
 
+        from .execution_spans import execution_span
         check_started = time.monotonic()
         stage_timings: Dict[str, float] = {}
         requested_proof_code = proof_code
@@ -7176,18 +7183,19 @@ class LeanRunner:
                                 + f'-- ensemble-completion-v2:{boundary_marker}\n'
                                 + f'run_cmd _root_.Lean.logInfo "{boundary_marker}"\n')
             stage_start = time.monotonic()
-            file_path, execution, write_error = await self._execute_generated_file(
-                mode=f"{check_kind}_source_boundary",
-                goal_name=f"{goal_name}_source_boundary",
-                content=boundary_content,
-                timeout_s=timeout_s,
-                fast_fail_timeout_s=fast_fail_timeout_s,
-                warning_as_error=warning_as_error,
-                dispatch_observer=dispatch_observer,
-                operation_deadline=operation_deadline,
-                **({"allow_pending_reference_confirmation": True}
-                   if allow_pending_reference_confirmation else {}),
-            )
+            with execution_span("source_admission"):
+                file_path, execution, write_error = await self._execute_generated_file(
+                    mode=f"{check_kind}_source_boundary",
+                    goal_name=f"{goal_name}_source_boundary",
+                    content=boundary_content,
+                    timeout_s=timeout_s,
+                    fast_fail_timeout_s=fast_fail_timeout_s,
+                    warning_as_error=warning_as_error,
+                    dispatch_observer=dispatch_observer,
+                    operation_deadline=operation_deadline,
+                    **({"allow_pending_reference_confirmation": True}
+                       if allow_pending_reference_confirmation else {}),
+                )
             stage_timings["source_admission_s"] = time.monotonic() - stage_start
         if not source_boundary_required or (execution is not None and execution.returncode == 0):
             remaining = self._execution_time_remaining(operation_deadline)
@@ -7199,18 +7207,19 @@ class LeanRunner:
                 )
             else:
                 stage_start = time.monotonic()
-                file_path, execution, write_error = await self._execute_generated_file(
-                    mode=check_kind,
-                    goal_name=goal_name,
-                    content=content,
-                    timeout_s=timeout_s,
-                    fast_fail_timeout_s=fast_fail_timeout_s,
-                    warning_as_error=warning_as_error,
-                    dispatch_observer=dispatch_observer,
-                    operation_deadline=operation_deadline,
-                    **({"force_reference": True} if force_reference else {}),
-                    **({"allow_pending_reference_confirmation": True} if allow_pending_reference_confirmation else {}),
-                )
+                with execution_span("proof_and_axiom_audit"):
+                    file_path, execution, write_error = await self._execute_generated_file(
+                        mode=check_kind,
+                        goal_name=goal_name,
+                        content=content,
+                        timeout_s=timeout_s,
+                        fast_fail_timeout_s=fast_fail_timeout_s,
+                        warning_as_error=warning_as_error,
+                        dispatch_observer=dispatch_observer,
+                        operation_deadline=operation_deadline,
+                        **({"force_reference": True} if force_reference else {}),
+                        **({"allow_pending_reference_confirmation": True} if allow_pending_reference_confirmation else {}),
+                    )
                 stage_timings["proof_and_audit_s"] = time.monotonic() - stage_start
         if execution is None:
             # Parse disk-write failures into LeanResult.parsed with
@@ -8945,12 +8954,12 @@ class LeanRunner:
         )
         render_expression = "Lean.Meta.ppExpr type"
         if not pp_explicit:
-            render_expression = """let (term, infos) ← Lean.PrettyPrinter.delabCore type {}
+            render_expression = """let (term@_, infos@_) ← Lean.PrettyPrinter.delabCore type {}
       Lean.PrettyPrinter.Delaborator.delab
     let omitted ← `(⋯)
     let replacement ← `(by first | assumption | rfl | decide | omega)
     let mut proofPositions : Std.HashSet Nat := {}
-    for (position, item) in infos.toArray do
+    for (position@_, item@_) in infos.toArray do
       if let .ofDelabTermInfo detail@_ := item then
         if detail.stx.isOfKind omitted.raw.getKind then
           unless ← Lean.Meta.withLCtx detail.lctx {} <| Lean.Meta.isProof detail.expr do
@@ -8958,7 +8967,7 @@ class LeanRunner:
           proofPositions := proofPositions.insert position
     let rebuilt ← term.raw.replaceM fun stx => do
       if stx.isOfKind omitted.raw.getKind then
-        let some position := stx.getPos?
+        let some position@_ := stx.getPos?
           | Lean.throwError "source rendering omission lacks an expression position"
         unless proofPositions.contains position.byteIdx do
           Lean.throwError "source rendering omission lacks proof provenance"
@@ -10024,9 +10033,9 @@ private def {serializer_prefix}_elabType
                 "          _root_.Lean.Meta.transform closed (post := fun expression => do",
                 "            match expression with",
                 "            | .proj name@_ index@_ major@_ =>",
-                "              let some info := _root_.Lean.getStructureInfo? (← _root_.Lean.MonadEnv.getEnv) name",
+                "              let some info@_ := _root_.Lean.getStructureInfo? (← _root_.Lean.MonadEnv.getEnv) name",
                 "                | return .done expression",
-                "              let some field := info.fieldNames[index]?",
+                "              let some field@_ := info.fieldNames[index]?",
                 "                | return .done expression",
                 "              return .done (← _root_.Lean.Meta.mkProjection major field)",
                 "            | _ => return .done expression)",
@@ -10675,12 +10684,12 @@ private def {serializer_prefix}_declaredType (source : _root_.String) (line colu
   let requested := if rooted then
       ident.getId.replacePrefix `_root_ _root_.Lean.Name.anonymous
     else ident.getId
-  let mut candidates := env.constants.map₂.toList.filter fun (name, _) =>
+  let mut candidates := env.constants.map₂.toList.filter fun (name@_, _) =>
     let sourceName := if line != 0 then _root_.Lean.privateToUserName name else name
     if rooted then sourceName == requested else requested.isSuffixOf sourceName
   if line != 0 then
-    candidates ← candidates.filterM fun (name, _) => do
-      let some ranges ← _root_.Lean.findDeclarationRangesCore? name | pure false
+    candidates ← candidates.filterM fun (name@_, _) => do
+      let some ranges@_ ← _root_.Lean.findDeclarationRangesCore? name | pure false
       pure (ranges.selectionRange.pos.line == line &&
         ranges.selectionRange.pos.column == column)
   unless candidates.length == 1 do

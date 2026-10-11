@@ -95,7 +95,11 @@ class MiniTemperatureDecision:
             None if is_api_default_temperature_override(effective) else effective
         )
         constrained = _local_temperature_policy(client) in {"fixed", "forbidden"}
+        support = _sampling_controls_support_static(client)
         return {
+            "temperature_strategy_requested": self.value,
+            "temperature_control_supported": support,
+            "temperature_diversification_available": False if constrained else support,
             "temperature_requested": self.value,
             "effective_temperature": effective_value,
             "temperature_api_default": bool(self.api_default) and not constrained,
@@ -137,6 +141,8 @@ def mini_automatic_temperature_override(client: Any, requested: Any) -> Any:
         return None
     if policy == "fixed":
         return float(client._local_role.sampling.temperature.value)
+    if _client_base_url(client).split(":", 1)[0].lower() in {"codex", "claude-code"}:
+        return API_DEFAULT_TEMPERATURE
     return requested
 
 
@@ -219,6 +225,8 @@ def _sampling_controls_support_static(client: Any) -> Optional[bool]:
     if _client_thinking_enabled(client):
         return False
     base_url = _client_base_url(client)
+    if base_url.split(":", 1)[0].lower() in {"codex", "claude-code"}:
+        return False
     model = _client_model(client).strip().lower()
     provider = provider_for_base_url(base_url)
     if provider is None:
@@ -419,6 +427,12 @@ def refresh_temperature_metadata_from_client(
     """Overlay post-call provider sampling telemetry onto phase metadata."""
 
     refreshed = dict(metadata or {})
+    actual_support = getattr(client, "last_temperature_control_supported", None)
+    if type(actual_support) is bool:
+        refreshed["temperature_control_supported"] = actual_support
+        refreshed["temperature_diversification_available"] = (
+            actual_support and _local_temperature_policy(client) not in {"fixed", "forbidden"}
+        )
     requested = getattr(
         client,
         "last_temperature_requested",
@@ -431,6 +445,11 @@ def refresh_temperature_metadata_from_client(
     if sent is not _MISSING_TEMPERATURE_ATTR:
         sent = _json_safe_temperature_telemetry(sent)
         refreshed["temperature_sent"] = sent
+        if sent is not None and type(actual_support) is not bool:
+            refreshed["temperature_control_supported"] = True
+            refreshed["temperature_diversification_available"] = (
+                _local_temperature_policy(client) not in {"fixed", "forbidden"}
+            )
     dropped = getattr(
         client,
         "last_temperature_provider_dropped",
@@ -438,6 +457,9 @@ def refresh_temperature_metadata_from_client(
     )
     if dropped is not _MISSING_TEMPERATURE_ATTR:
         refreshed["temperature_provider_dropped"] = bool(dropped)
+        if dropped:
+            refreshed["temperature_control_supported"] = False
+            refreshed["temperature_diversification_available"] = False
     drop_reason = getattr(
         client,
         "last_temperature_provider_drop_reason",

@@ -28,8 +28,11 @@ When context_reaudit_required is true, re-audit the current target and hypothese
 before executing the carried assignment. Prior-context arguments are advisory
 history, not current evidence or proof authority; inspect context_transfer.
 An assigned research_reorientation reviewer must independently inspect the
-checkpoint and conclude with:
-{"action":"research_reorientation","rationale":"what failed and why",
+immutable assigned_research_subject, and conclude with its exact subject_id.
+An acknowledgement is not evidence of comprehension. Use inspection_status:"incomplete"
+to continue reading within the existing allocation, or "claimed_complete" when ready.
+Conclude with:
+{"action":"research_reorientation","subject_id":"assigned subject_id","rationale":"what failed and why",
  "next_question":"specific next mathematical task",
  "first_uncertain_inference":"exact bottleneck",
  "discriminating_check":"calculation, derivation, or source check to execute",
@@ -286,7 +289,8 @@ class ResearchControl:
             packet = load_json(self.store.read_artifact(checkpoint).decode())
             result["native_current_context"] = {
                 key: packet.get(key) for key in (
-                    "active_target", "formal_context", "first_uncertain_inference", "objections", "failure")
+                    "active_target", "formal_context", "first_uncertain_inference", "objections", "failure",
+                    "research_contracts", "diagnostic_capabilities") if key in packet
             }
         if job.get("research_reorientation_for"):
             from .model import load_json
@@ -312,6 +316,9 @@ class ResearchControl:
                         },
                         "instruction": "Independently inspect this completed report for substantive NEW evidence advancing its exact assigned inference. You may add substantive_progress:true to research_reorientation only for an actual new derivation, check or useful source application; repeated facts, plans and revised wording do not qualify. Missing/false means no progress credit. This assessment conveys research relevance, never proof authority.",
                     }
+        if job.get("research_reorientation_for"):
+            from .research_subject import subject_view
+            result["assigned_research_subject"] = subject_view(self.store, job)
         return result
 
     def before_request(self, job: dict[str, Any]) -> bool:
@@ -662,6 +669,8 @@ class ResearchControl:
                 )
                 reviewer.update(research_reorientation_for=job["job_id"], research_checkpoint=checkpoint,
                                 research_portfolio_checkpoints=[checkpoint])
+                from .research_subject import ensure_subject
+                ensure_subject(self.store, reviewer)
                 self._carry_memory(job, reviewer)
                 if adaptive and job.get("frontier_approach_id"):
                     from .frontier.hooks import _campaign, _save, bind_review_job
@@ -783,7 +792,15 @@ class ResearchControl:
         child.update(research_directive=directive, research_prior_checkpoint=checkpoint,
                      research_route_signature=signature,
                      research_portfolio_checkpoints=reviewer.get("research_portfolio_checkpoints", []))
-        if reviewer.get("frontier_approach_id") and directive.get("approach_decision") == "alternative":
+        stale_subject = False
+        if reviewer.get("assigned_research_subject"):
+            from .research_subject import ensure_subject
+            subject = ensure_subject(self.store, reviewer)
+            producer = self.store.job(reviewer["research_reorientation_for"])
+            stale_subject = subject["binding"] != producer.get("frontier_report_basis", {}).get("binding", {})
+        if stale_subject:
+            child.update(status="superseded", last_error="stale_assigned_question")
+        elif reviewer.get("frontier_approach_id") and directive.get("approach_decision") == "alternative":
             from .frontier.owner import FrontierOwner
 
             approach = FrontierOwner(self.controller).reorient_alternative(reviewer, directive)
@@ -822,6 +839,19 @@ class ResearchControl:
             raise ValueError("only the assigned independent checkpoint reviewer may reorient")
         if job.get("research_control", {}).get("closed"):
             raise ValueError("the assigned allocation has already ended")
+        from .research_subject import ensure_subject
+        subject = ensure_subject(self.store, job)
+        if action.get("subject_id") != subject["subject_id"]:
+            raise ValueError("research_reorientation must acknowledge the exact assigned subject_id")
+        inspection = action.get("inspection_status", "claimed_complete")
+        if inspection not in {"incomplete", "claimed_complete"}:
+            raise ValueError("inspection_status must be incomplete or claimed_complete")
+        job["research_inspection"] = {"subject_id": subject["subject_id"], "status": inspection,
+                                      "authority": "worker_claim_not_comprehension"}
+        self.store.save_job(job)
+        if inspection == "incomplete":
+            return {"status": "inspection_incomplete", "subject_id": subject["subject_id"],
+                    "kernel_verified": False, "instruction": "Continue inspecting within the existing allocation."}
         directive = {key: action[key] for key in REORIENTATION_FIELDS}
         from .frontier.approaches import normalize_mechanism
 

@@ -2746,22 +2746,31 @@ def _graph_find_top_level_symbol(text: str, symbol: str, start: int) -> int:
 
 
 _GRAPH_MATCH_PARSE_LIMIT = 16
+_GRAPH_CONDITIONAL_WORK_LIMIT = 262_144
 
 
 class _GraphSurfaceBudget:
-    """Match-parse budget for one invocation chain.
+    """Shared parsing limits for one synchronous invocation chain.
 
-    Ordinary bindings are not counted. Only nested ``match`` parsing consumes
-    the budget, and the counters belong to the calling thread so one deep
-    statement cannot reject another statement running beside it.
+    Match nesting and conditional-source traversal have separate allowances.
+    Counters belong to the calling thread so one difficult statement cannot
+    reject another statement running beside it.
     """
 
-    __slots__ = ("active", "exhausted", "match_depth")
+    __slots__ = ("active", "exhausted", "match_depth", "conditional_work_remaining")
 
     def __init__(self) -> None:
         self.active = False
         self.exhausted = False
         self.match_depth = 0
+        self.conditional_work_remaining = _GRAPH_CONDITIONAL_WORK_LIMIT
+
+    def consume_conditional_work(self, amount: int) -> bool:
+        if self.exhausted or amount > self.conditional_work_remaining:
+            self.exhausted = True
+            return False
+        self.conditional_work_remaining -= amount
+        return True
 
 
 _graph_surface_budgets = local()
@@ -3063,8 +3072,8 @@ _GRAPH_ARM_DECLARATIONS = (
 )
 
 
-def _graph_contains_match_keyword(text: str) -> bool:
-    """Return whether ``match`` occurs as a keyword outside comments and strings."""
+def _graph_contains_term_keyword(text: str, *keywords: str) -> bool:
+    """Find a term keyword outside comments, strings, and quoted identifiers."""
 
     raw = str(text or "")
     index = 0
@@ -3073,7 +3082,7 @@ def _graph_contains_match_keyword(text: str) -> bool:
         if skip_to is not None:
             index = skip_to
             continue
-        if _graph_keyword_at(raw, index, "match"):
+        if any(_graph_keyword_at(raw, index, keyword) for keyword in keywords):
             return True
         index += 1
     return False
@@ -5680,6 +5689,8 @@ def _graph_fragment_role_ok(
         extended = _graph_join_binder_context(binder_context, binder)
         return _graph_fragment_role_ok(body, role, extended)
     if _graph_keyword_at(raw, 0, "if"):
+        if role == "prop":
+            return _graph_iterative_conditional_proposition(raw, binder_context)
         incomplete, branches = _graph_conditional_structure(raw)
         full_condition = _graph_leading_conditional_condition(raw)
         binder_name, condition = _graph_split_named_if_condition(full_condition)
@@ -5769,7 +5780,7 @@ def _graph_fragment_role_ok(
             arguments = _graph_application_arg_texts(raw, qualified)
             if arguments:
                 return all(_graph_term_tokens_ok(argument) for argument in arguments)
-    if _graph_contains_match_keyword(raw):
+    if _graph_contains_term_keyword(raw, "match"):
         if role == "cond":
             return _graph_term_tokens_ok(raw) and not _graph_obvious_noncondition_term(
                 raw, binder_context
@@ -5780,18 +5791,19 @@ def _graph_fragment_role_ok(
     return True
 
 
-def _graph_matches_are_propositions(text: str, binder_context: str = "") -> bool:
-    """Require a proposition only where a match itself supplies the proposition.
+def _graph_structured_terms_are_propositions(text: str, binder_context: str = "") -> bool:
+    """Require propositions where match or conditional results supply one.
 
     A match used as a data operand of a relation or application may return
     data. Its scrutinee, patterns, and arms still cannot hide declarations
     or proof syntax. A match that is the proposition keeps proposition arms.
+    Conditional results keep the same surrounding role even without a match.
     """
 
     if _graph_surface_budget().exhausted:
         return False
     raw = graph_identity_text(text)
-    if not raw or not _graph_contains_match_keyword(raw):
+    if not raw or not _graph_contains_term_keyword(raw, "match", "if"):
         return True
     return _graph_fragment_role_ok(raw, "prop", binder_context)
 
@@ -6205,7 +6217,11 @@ def _graph_quantified_predicate_body_is_formal(
     binder_context: str,
 ) -> bool:
     compact = graph_identity_text(body)
-    if not compact:
+    if not compact or _graph_contains_top_level_proposition_marker(compact):
+        # An infix proposition is handled by the structured proposition walk.
+        # Treating its leading atom as a predicate would override a rejection
+        # of a later operand, such as ``True ∧ (match b with | _ => Nat)``.
+        # Operators inside grouped application arguments keep their data role.
         return False
     prop_signatures = _graph_binder_prop_signatures(binder_context)
     bound_names = set(_graph_binder_context_names(binder_context))
@@ -6247,6 +6263,163 @@ def _graph_proposition_quantifier_token_len(text: str) -> int:
     return _graph_top_level_quantifier_token_len(text, 0)
 
 
+def _graph_conditional_proposition_leaf(text: str, binder_context: str) -> bool:
+    """Classify a conditional result through transparent proposition wrappers.
+
+    An ascription is not evidence of its subject's type. Inspect the subject
+    in the same scope, including when a named condition proof hides a Prop
+    variable. Only the unshadowed global identity function is transparent;
+    ordinary applications still use the guarded proposition classifier.
+    """
+
+    budget = _graph_surface_budget()
+    if not budget.active:
+        budget = _GraphSurfaceBudget()
+    if not budget.consume_conditional_work(len(text) + len(binder_context)):
+        return False
+    raw = graph_identity_text(text)
+    local_names = {
+        _graph_local_name_key(name)
+        for name in _graph_binder_context_names(binder_context)
+    }
+
+    # Index the original leaf once. Peeling id/ascription layers then moves
+    # source bounds and jumps over groups instead of scanning and copying
+    # every remaining suffix. The allowance also covers repeated leaf checks
+    # and fallback calls in the enclosing statement invocation.
+    groups: Dict[int, int] = {}
+    islands: Dict[int, int] = {}
+    stack: List[Tuple[int, str]] = []
+    index = 0
+    while index < len(raw):
+        skipped = _lean_lexical_skip_end(raw, index)
+        if skipped is not None:
+            islands[index] = skipped
+            index = skipped
+            continue
+        char = raw[index]
+        if char in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE:
+            stack.append((index, _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE[char]))
+        elif char in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE.values():
+            if not stack or stack[-1][1] != char:
+                return False
+            opening, _closing = stack.pop()
+            groups[opening] = index + 1
+        index += 1
+    if stack:
+        return False
+
+    def strip_span(start: int, end: int) -> Tuple[int, int]:
+        while start < end:
+            if not budget.consume_conditional_work(1):
+                return end, end
+            if raw[start].isspace():
+                start += 1
+            elif raw[end - 1].isspace():
+                end -= 1
+            elif raw[start] == "(" and groups.get(start) == end:
+                start += 1
+                end -= 1
+            else:
+                break
+        return start, end
+
+    def ascription(start: int, end: int) -> int:
+        index = start
+        while index < end:
+            if not budget.consume_conditional_work(1):
+                return -1
+            skipped = groups.get(index, islands.get(index))
+            if skipped is not None:
+                index = skipped
+            elif raw.startswith((":=", "=>"), index):
+                index += 2
+            elif raw[index] == ":":
+                # An ordinary ascription is transparent only at exact Prop.
+                if raw[index + 1 : end].strip() == "Prop":
+                    return index
+                return -1
+            else:
+                index += 1
+        return -1
+
+    def argument_spans(start: int, end: int) -> List[Tuple[int, int]] | None:
+        if start < end and not raw[start].isspace() and raw[start] != "(":
+            return None
+        arguments: List[Tuple[int, int]] = []
+        index = start
+        while index < end:
+            if not budget.consume_conditional_work(1):
+                return None
+            if raw[index].isspace():
+                index += 1
+                continue
+            opening = index
+            if index in groups:
+                index = groups[index]
+            else:
+                while index < end and not raw[index].isspace():
+                    if not budget.consume_conditional_work(1):
+                        return None
+                    if index in islands:
+                        index = islands[index]
+                    elif index in groups:
+                        break
+                    else:
+                        index += 1
+            if index == opening:
+                return None
+            arguments.append((opening, index))
+            if len(arguments) > 2:
+                # Neither a constant nor id can use another argument.
+                return None
+        return arguments
+
+    start, end = 0, len(raw)
+    while start < end:
+        start, end = strip_span(start, end)
+        if start >= end:
+            return False
+        colon = ascription(start, end)
+        if budget.exhausted:
+            return False
+        if colon >= 0:
+            end = colon
+            continue
+        explicit = raw[start] == "@"
+        application_start = start + 1 if explicit else start
+        while application_start < end and raw[application_start].isspace():
+            application_start += 1
+        head_start = application_start
+        if raw.startswith("_root_.", head_start):
+            head_start += len("_root_.")
+        if head_start < end and raw[head_start] == "«":
+            head_end = islands.get(head_start, head_start)
+        else:
+            match = re.compile(r"(?:[^\W\d_]|_)[\w'.]*", flags=re.UNICODE).match(
+                raw, head_start, end
+            )
+            head_end = match.end() if match else head_start
+        surface = raw[application_start:head_end]
+        if explicit and head_end == end and _graph_unicode_identifier_name(surface) == surface:
+            start = application_start
+            continue
+        _surface, global_head = _graph_annotation_head(surface, local_names)
+        arguments = argument_spans(head_end, end) if surface else None
+        if global_head in {"True", "False"} and arguments == []:
+            return True
+        if global_head == "id":
+            if arguments and len(arguments) == (2 if explicit else 1):
+                type_start, type_end = strip_span(*arguments[0])
+                if not explicit or raw[type_start:type_end] == "Prop":
+                    start, end = arguments[-1]
+                    continue
+        if not budget.consume_conditional_work(end - start + len(binder_context)):
+            return False
+        return graph_statement_is_executable(raw[start:end], binder_context=binder_context)
+    return False
+
+
 def _graph_iterative_conditional_proposition(
     text: str, binder_context: str = ""
 ) -> bool:
@@ -6268,7 +6441,7 @@ def _graph_iterative_conditional_proposition(
             # Classify the parenthesis-stripped leaf. A grouped quantifier,
             # predicate, let, or open is the same proposition as the text
             # inside the group. The stored statement is left unchanged.
-            if not graph_statement_is_executable(raw, binder_context=context):
+            if not _graph_conditional_proposition_leaf(raw, context):
                 return False
             continue
         incomplete, branches = _graph_conditional_structure(raw)
@@ -6359,8 +6532,9 @@ def _graph_quantified_statement_is_executable(
 def graph_statement_is_executable(text: str, *, binder_context: str = "") -> bool:
     """Return whether text is plausibly an executable Lean proposition.
 
-    Nested match parsing is bounded on this thread. Ordinary bindings are not
-    counted. A match nest that would overflow the interpreter is not executable.
+    Match depth and conditional traversal work are bounded on this thread.
+    Exhaustion conservatively declines scheduling, including when a nested
+    fallback would otherwise accept a fragment of the same statement.
     """
 
     budget = _graph_surface_budget()
@@ -6369,6 +6543,7 @@ def graph_statement_is_executable(text: str, *, binder_context: str = "") -> boo
         budget.active = True
         budget.exhausted = False
         budget.match_depth = 0
+        budget.conditional_work_remaining = _GRAPH_CONDITIONAL_WORK_LIMIT
     exhausted = False
     try:
         if budget.exhausted:
@@ -6385,6 +6560,7 @@ def graph_statement_is_executable(text: str, *, binder_context: str = "") -> boo
             exhausted = budget.exhausted
             budget.exhausted = False
             budget.match_depth = 0
+            budget.conditional_work_remaining = _GRAPH_CONDITIONAL_WORK_LIMIT
             budget.active = False
     if exhausted:
         return False
@@ -6541,8 +6717,8 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
         return graph_statement_is_executable(
             unwrapped, binder_context=binder_context
         )
-    if _graph_keyword_at(compact, 0, "if"):
-        return _graph_iterative_conditional_proposition(compact, binder_context)
+    if _graph_keyword_at(unwrapped, 0, "if"):
+        return _graph_iterative_conditional_proposition(unwrapped, binder_context)
     is_have = compact.startswith(("have ", "have\n"))
     if is_have:
         # Term-level `have name := value; proposition` has the same binding
@@ -6601,7 +6777,7 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
         return match_executable
     if _graph_has_top_level_proof_tail(compact):
         return False
-    if not _graph_matches_are_propositions(compact, binder_context):
+    if not _graph_structured_terms_are_propositions(compact, binder_context):
         return False
     if compact.startswith("¬"):
         return True
@@ -8865,7 +9041,16 @@ def _graph_may_be_root_adjacent(
     conclusion: str, root_statement: str, *, conclusion_bound_names: Sequence[str] = (),
 ) -> bool:
     """Coarse safety filter; never a certificate or assembly equivalence."""
+    return _large_lexical_result(
+        ("may_be_root_adjacent", conclusion, root_statement, tuple(conclusion_bound_names)),
+        lambda: _uncached_graph_may_be_root_adjacent(
+            conclusion, root_statement, conclusion_bound_names=conclusion_bound_names),
+    )
 
+
+def _uncached_graph_may_be_root_adjacent(
+    conclusion: str, root_statement: str, *, conclusion_bound_names: Sequence[str] = (),
+) -> bool:
     def advisory_key(text: str, names: Sequence[str]) -> str:
         source, mapping = _graph_contract_alpha_source(text, names)
         source = _graph_contract_alpha_replace_scoped(

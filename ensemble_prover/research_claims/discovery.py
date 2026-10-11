@@ -16,9 +16,10 @@ import uuid
 from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable, Mapping, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Mapping, TypedDict
 
-from ..provider_tool_protocol import MiniRequestEnvelopePolicy
+if TYPE_CHECKING:
+    from ..provider_tool_protocol import MiniRequestEnvelopePolicy
 
 from .discovery_store import AdmissionStopped, DiscoveryStore, provider_routes
 from .experiments import PythonSandbox
@@ -107,6 +108,12 @@ Return exactly one JSON action per response, with no additional fields:
   Suspends this program without model calls until a child result or review
   arrives. Use this instead of repeatedly polling for unfinished work.
 
+For native proof runs, propose_diagnostic with scope, contract (statement/domain/
+hypotheses/quantifiers), queries, expected_outcomes and optional mode (eval/reduce/check)
+queues bounded compute_examples inputs for the proof owner. It does not execute
+an experiment or enable a disabled tool. Finite observations cannot refute the root.
+Use record_scoped_obstruction with an exact auxiliary contract, reason and
+evidence_artifact_ids to retain a failed mechanism without changing root authority.
 Review workers may read artifacts/claims or run enabled experiments, but must
 conclude with {"action":"review","verdict":"supported|refuted|unresolved|dismissed",
 "rationale":"complete independent checks and any counterarguments"}.
@@ -129,6 +136,8 @@ _FIELDS = {
     "read_artifact": {"artifact_id"},
     "read_claim": {"claim_id"},
     "record_note": {"note", "next_step", "source_artifact_ids"},
+    "propose_diagnostic": {"scope", "contract", "queries", "expected_outcomes"},
+    "record_scoped_obstruction": {"contract", "reason", "evidence_artifact_ids"},
     "formalize": {"proof_plan"},
     "continue_formalization": {"program_id"},
     "finish": {"reason"},
@@ -306,6 +315,7 @@ class DiscoveryLoop:
         self._owned_clients: dict[int, Any] = {}
         self._retiring_transports: dict[int, asyncio.Task[Any]] = {}
         self._retiring_closures: dict[int, asyncio.Task[None]] = {}
+        self._shutdown_owned_tasks: set[asyncio.Task[Any]] = set()
         self._closing_clients = False
         for provider in self.providers.values():
             if hasattr(provider, "chat_raw"):
@@ -348,6 +358,7 @@ class DiscoveryLoop:
         *,
         closing: bool = False,
         preserve_failure: bool = False,
+        deadline: float | None = None,
     ) -> None:
         """Release unused owned pools only after their worker operations join."""
         if not self.owns_clients:
@@ -372,22 +383,28 @@ class DiscoveryLoop:
         for identity in list(self._client_locks):
             if identity not in retained:
                 self._client_locks.pop(identity)
-        if self.strategy is not None or self.native_mode:
+        if closing or self.strategy is not None or self.native_mode:
             # Pool disposal is independent of mathematical work. Keep strong
             # ownership of slow disposals, and bound the whole cleanup batch.
             for identity in list(self._owned_clients):
+                if identity in getattr(self, "_failed_retirement_ids", ()):
+                    continue
                 if identity in retained or (not closing and identity in self._retiring_transports):
                     continue
                 # Final owner shutdown must reach the client's quiescence
                 # barrier even when an HTTP request resists cancellation.
                 # Ordinary quanta retain those tails for late candidate ingress.
-                client = self._owned_clients.pop(identity)
+                client = self._owned_clients[identity]
+                previous = self._retiring_closures.get(identity)
+                if previous is not None and previous.done():
+                    self._retiring_closures.pop(identity)
                 if identity not in self._retiring_closures:
                     self._retiring_closures[identity] = asyncio.create_task(
                         self._close_retired_client(identity, client)
                     )
             if self._retiring_closures:
-                await asyncio.wait(set(self._retiring_closures.values()), timeout=.05)
+                timeout = .05 if deadline is None else min(.05, max(0.0, deadline - time.monotonic()))
+                await asyncio.wait(set(self._retiring_closures.values()), timeout=timeout)
             return
         failure: BaseException | None = None
         for identity in list(self._owned_clients):
@@ -412,12 +429,50 @@ class DiscoveryLoop:
         if failure is not None and not preserve_failure:
             raise failure
 
+    async def quiesce(self, *, deadline: float, terminal: bool = True) -> None:
+        """Stop owned transports before joining their cancelled workers."""
+        from ..shutdown import ShutdownIncomplete, join_owned_tasks
+
+        deadline = min(getattr(self, "_shutdown_deadline", deadline), deadline)
+        if terminal:
+            # An opportunistic donor retirement bounds only its waiter. An
+            # established terminal lease remains binding until cleanup succeeds.
+            self._shutdown_deadline = deadline
+        await self._retire_clients(set(), closing=True, preserve_failure=True, deadline=deadline)
+        while True:
+            tasks = (set(self._retiring_closures.values())
+                     | set(self._retiring_transports.values())
+                     | set(getattr(self, "_shutdown_owned_tasks", ())))
+            await join_owned_tasks(tasks, deadline=deadline,
+                                   label="research_discovery_quiesce")
+            # A completing response may register a replacement disposal after
+            # cancellation of the previous one. Drain that live ownership under
+            # the same lease, without retrying a recorded disposal failure.
+            current = (set(self._retiring_closures.values())
+                       | set(self._retiring_transports.values())
+                       | set(getattr(self, "_shutdown_owned_tasks", ())))
+            if not any(not task.done() for task in current):
+                break
+        failures = self.__dict__.pop("_retiring_failures", [])
+        if failures:
+            raise failures[0]
+        if self._owned_clients:
+            raise ShutdownIncomplete("research client disposal has not confirmed quiescence")
+        self._shutdown_owned_tasks = set()
+        self.__dict__.pop("_shutdown_deadline", None)
+
     async def _close_retired_client(self, identity: int, client: Any) -> None:
         try:
             await client.close()
+            self._owned_clients.pop(identity, None)
         except asyncio.CancelledError:
+            # Cancellation of a disposal task is not evidence that its
+            # transport closed. Retain the client for retry/process teardown.
             raise
         except Exception as exc:
+            self.__dict__.setdefault("_failed_retirement_ids", set()).add(identity)
+            if self.strategy is None and not self.native_mode:
+                self.__dict__.setdefault("_retiring_failures", []).append(exc)
             try:
                 logging.getLogger(__name__).warning(
                     "Research client cleanup failed (%s)", type(exc).__name__
@@ -428,6 +483,9 @@ class DiscoveryLoop:
             self._retiring_closures.pop(identity, None)
 
     def _context(self, job: dict[str, Any]) -> dict[str, Any]:
+        if job.get("research_reorientation_for"):
+            from .research_subject import ensure_subject
+            ensure_subject(self.store, job)
         with self.store.read_snapshot():
             run = self.store.run_record()
             context = {
@@ -613,7 +671,7 @@ class DiscoveryLoop:
                     from .context_window import window
                     from .research_memory import context as memory_context
                     limit = self.store.run_record().get("context_char_limit", 20000)
-                    memory_limit = max(400, min(12000, limit // 2))
+                    memory_limit = max(400, min(4000, limit // 5)) if job.get("assigned_research_subject") else max(400, min(12000, limit // 2))
                     memory = memory_context(self.store, job, limit=memory_limit)
                     memory_size = len(json_text({"research_memory": memory})) - 1
                     notifications = context.pop("prior_context_notifications", None)
@@ -670,12 +728,16 @@ class DiscoveryLoop:
                     tool_result=None,
                     last_error_details=None,
                 )
+                from .research_subject import delivery_manifest
+                job["request_delivery_manifest"] = self._blob(
+                    delivery_manifest(self.store, messages, job["request"]), "request-delivery-manifest.json")
                 job.pop("native_response_attempt_id", None)
                 self.store.save_job(job)
 
             requested_job = dict(job)
             admission_open = True
             dispatch_attempts: list[str] = []
+            authorized_request_attempts: list[str] = []
 
             def settle_dispatches(outcome: str) -> None:
                 if self.strategy is not None:
@@ -705,13 +767,16 @@ class DiscoveryLoop:
                         raise
                 else:
                     self.store.authorize(job["job_id"], job["turn"])
+                attempt = str((details or {}).get("provider_dispatch_attempt_id", ""))
+                if attempt:
+                    authorized_request_attempts.append(attempt)
                 self._emit("provider_dispatch", job)
                 return details
 
             run = self.store.run_record()
-            timeout = min(
-                run["request_timeout_s"], max(0, run["deadline"] - time.time())
-            )
+            timeout = run["request_timeout_s"]
+            if run["deadline"] is not None:
+                timeout = min(timeout, max(0, run["deadline"] - time.time()))
             if self.native_mode and native_admission_deadline_only(run):
                 # The borrowed client retains its own request watchdog. The
                 # allocation deadline controls admission, not this paid reply.
@@ -833,11 +898,12 @@ class DiscoveryLoop:
                                 finally:
                                     identity = id(client)
                                     if self._closing_clients and identity in self._owned_clients:
-                                        # The scheduler may already have returned and
-                                        # its ledger closed. Resource ownership still
-                                        # lasts until this transport finishes.
-                                        owned = self._owned_clients.pop(identity)
-                                        if identity not in self._retiring_closures:
+                                        # Response completion does not establish
+                                        # transport disposal. Keep its owner until
+                                        # close succeeds, including after failures.
+                                        owned = self._owned_clients[identity]
+                                        if (identity not in self._retiring_closures
+                                                and identity not in getattr(self, "_failed_retirement_ids", ())):
                                             self._retiring_closures[identity] = asyncio.create_task(
                                                 self._close_retired_client(identity, owned)
                                             )
@@ -861,6 +927,12 @@ class DiscoveryLoop:
                         and job["turn"] == requested_job["turn"]
                         and job["revision"] == requested_job["revision"]
                     )
+                    if current_response and authorized_request_attempts:
+                        from .research_subject import delivery_manifest
+                        job["request_delivery_manifest"] = self._blob(delivery_manifest(
+                            self.store, messages, requested_job["request"],
+                            dispatch_attempt_id=authorized_request_attempts[-1],
+                            response_artifact=response_artifact), "request-delivery-manifest.json")
                     from .frontier.hooks import mode_of
 
                     if (self.strategy is not None and dispatch_attempts
@@ -1116,9 +1188,10 @@ class DiscoveryLoop:
             else {"polarity"}
             if kind == "formalize"
             else {"path", "offset", "length"} if kind == "read_artifact"
-            else {"substantive_progress", "competing_approach_ids", "progress_delta",
+            else {"subject_id", "inspection_status", "substantive_progress", "competing_approach_ids", "progress_delta",
                   "approach_decision", "approach_mechanism", "approach_difference"}
             if kind == "research_reorientation"
+            else {"mode"} if kind == "propose_diagnostic"
             else {"progress_delta"} if kind == "alternative_review"
             else set()
         )
@@ -1133,6 +1206,8 @@ class DiscoveryLoop:
             "read_artifact",
             "read_claim",
             "record_note",
+            "propose_diagnostic",
+            "record_scoped_obstruction",
             "experiment",
             "strategy_review",
             "progress_review",
@@ -1504,6 +1579,14 @@ class DiscoveryLoop:
             if self.strategy is None:
                 raise ValueError("strategy recovery is not enabled for this run")
             return self.strategy.apply_action(job, action)
+        if kind == "propose_diagnostic":
+            from .research_contracts import diagnostic_proposal
+            if not self.native_mode:
+                raise ValueError("proof diagnostic proposals require the native proof owner")
+            return diagnostic_proposal(self.store, job, action)
+        if kind == "record_scoped_obstruction":
+            from .research_contracts import scoped_obstruction
+            return scoped_obstruction(self.store, job, action)
         if kind == "record_note":
             if self.strategy is None:
                 raise ValueError("working research notes require strategy recovery")
@@ -2374,6 +2457,47 @@ class DiscoveryLoop:
         last_provider_error: dict[str, Any] | None = None
         transition_limit = 32 + 4 * min(max_requests, 32)
         initial_handoffs = set(self.store.run_record()["handoffs"])
+        initial_reports = {job["job_id"]: job.get("investigation_artifact")
+                           for job in self.store.jobs()}
+        report_scope_fields = ("target_id", "target_revision", "native_target_binding",
+                               "native_active_target_claim_id", "native_active_target_context_binding")
+        initial_report_scope = tuple(run.get(key) for key in report_scope_fields)
+        report_target = target_claim_id or run.get("native_active_target_claim_id") or run["target_id"]
+        report_target_revision = self.store.get_claim(report_target)["revision"]
+        initial_report_sequence = run.get("research_report_sequence", 0)
+
+        def completed_report_ready(job: dict[str, Any], current_run: dict[str, Any]) -> bool:
+            # An ordinary report is already consumable advisory guidance. Its
+            # independent review stays queued for a later quantum. Existing
+            # reports and work from another owner/context cannot end this slice.
+            if (job["role"] != "research" or job["status"] != "finished"
+                    or job.get("alternative_for") or not job.get("investigation_artifact")
+                    or job["investigation_artifact"] == initial_reports.get(job["job_id"])
+                    or job.get("research_report_sequence", 0) <= initial_report_sequence
+                    or current_run["status"] != "running"
+                    or tuple(current_run.get(key) for key in report_scope_fields) != initial_report_scope
+                    or self.store.get_claim(report_target)["revision"] != report_target_revision):
+                return False
+            from .research_control import native_job_context
+
+            jobs = {item["job_id"]: item for item in self.store.jobs()}
+            if (self.native_job_target(job, jobs) != report_target
+                    or native_job_context(job, jobs, recorded_contexts=current_run.get("native_job_contexts", {}))
+                    != current_run.get("native_active_target_context_binding")):
+                return False
+            seen: set[str] = set()
+            while job["job_id"] not in seen:
+                seen.add(job["job_id"])
+                if (job["status"] == "stale"
+                        or self.store.get_claim(job["claim_id"])["revision"] != job["revision"]):
+                    return False
+                parent_id = job.get("parent_job")
+                if parent_id is None:
+                    return True
+                if parent_id not in jobs:
+                    return False
+                job = jobs[parent_id]
+            return False
 
         def admitted_requests() -> int:
             # Earlier guards can accept an intent that a later guard refuses.
@@ -2480,7 +2604,9 @@ class DiscoveryLoop:
                                 last_provider_error = advanced["last_error_details"]
                             transitions += 1
                             current_job = None
-                            if set(self.store.run_record()["handoffs"]) - initial_handoffs:
+                            current_run = self.store.run_record()
+                            if (set(current_run["handoffs"]) - initial_handoffs
+                                    or completed_report_ready(advanced, current_run)):
                                 reason = "guidance_ready"
                                 break
                         else:
@@ -2576,6 +2702,10 @@ class DiscoveryLoop:
                         self.store.save_job(job)
             primary_failure = False
             try:
+                if any(not task.done() for task in getattr(self, "_shutdown_owned_tasks", ())):
+                    from ..shutdown import ShutdownIncomplete
+                    raise ShutdownIncomplete("previous discovery workers have not settled")
+                self.__dict__.pop("_shutdown_deadline", None)
                 self._closing_clients = False
                 no_service_transitions = 0
                 last_requests_used = self.store.run_record()["requests_used"]
@@ -2698,11 +2828,37 @@ class DiscoveryLoop:
             finally:
                 for task in tasks:
                     task.cancel()
+                self._shutdown_owned_tasks = set(tasks) | {
+                    task for task in getattr(self, "_shutdown_owned_tasks", ()) if not task.done()
+                }
                 try:
+                    from ..shutdown import cleanup_deadline, current_shutdown
+
+                    # Standalone strategy execution has a loop owner that
+                    # drains retained transports and closes its loop under
+                    # one existing deadline. Mini's shared shutdown owner
+                    # instead requires quiescence before recorder finalization.
+                    if self.strategy is None or current_shutdown() is not None:
+                        await self.quiesce(deadline=cleanup_deadline())
+                    # Consume child exceptions only after bounded joining;
+                    # transport termination has already released owned IO.
                     await asyncio.gather(*tasks, return_exceptions=True)
-                except BaseException:
-                    primary_failure = True
-                    raise
+                except BaseException as cleanup_error:
+                    from ..shutdown import ShutdownIncomplete
+
+                    if isinstance(cleanup_error, (ShutdownIncomplete, asyncio.CancelledError)):
+                        primary_failure = True
+                        raise
+                    verified = False
+                    try:
+                        if self.store.run_record()["status"] in {"proved", "refuted"}:
+                            status = self.store.status()
+                            verified = status["root_proved"] or status["root_refuted"]
+                    except Exception:
+                        pass
+                    if not verified and not primary_failure:
+                        primary_failure = True
+                        raise
                 finally:
                     try:
                         await self._retire_clients(

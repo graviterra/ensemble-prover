@@ -3640,11 +3640,15 @@ def _checked_evidence_target_refutes_statement(
     target: Any,
     statement_text: str,
     statement_key: str,
+    *,
+    consume_work: Optional[Callable[[int], None]] = None,
 ) -> bool:
     return bool(
         _lean_target_negates_statement(target, statement_key, statement_text)
         or _lean_target_implication_to_false_refutes_statement(target, statement_text)
-        or _lean_counterexample_target_refutes_statement(target, statement_text)
+        or _lean_counterexample_target_refutes_statement(
+            target, statement_text, consume_work=consume_work
+        )
     )
 
 
@@ -4261,7 +4265,13 @@ def _formula_implies_false_negates(
     )
 
 
-def _flatten_conjunction_formulas(text: str) -> tuple[str, ...]:
+def _flatten_conjunction_formulas(
+    text: str,
+    *,
+    consume_work: Optional[Callable[[int], None]] = None,
+) -> tuple[str, ...]:
+    if consume_work is not None:
+        consume_work(1 + len(text))
     body = _strip_balanced_outer_parens(str(text or "").strip())
     if not body:
         return ()
@@ -4270,8 +4280,31 @@ def _flatten_conjunction_formulas(text: str) -> tuple[str, ...]:
         return (body,)
     flattened: list[str] = []
     for part in parts:
-        flattened.extend(_flatten_conjunction_formulas(part))
+        flattened.extend(
+            _flatten_conjunction_formulas(part, consume_work=consume_work)
+        )
     return tuple(item for item in flattened if item)
+
+
+# Refutation matching also runs synchronously in evidence and contract checks.
+# Bound all callers, including those that do not provide a shared search budget.
+_COUNTEREXAMPLE_BOOLEAN_WORK_LIMIT = 65_536
+
+
+class _CounterexampleBooleanBudgetExhausted(Exception):
+    pass
+
+
+class _CounterexampleBooleanBudget:
+    def __init__(self) -> None:
+        self.remaining = _COUNTEREXAMPLE_BOOLEAN_WORK_LIMIT
+        self.exhausted = False
+
+    def consume(self, amount: int) -> None:
+        if self.exhausted or amount > self.remaining:
+            self.exhausted = True
+            raise _CounterexampleBooleanBudgetExhausted
+        self.remaining -= amount
 
 
 def _counterexample_body_refutes_statement(
@@ -4282,14 +4315,52 @@ def _counterexample_body_refutes_statement(
     target_bound_names: Sequence[str],
     statement_bound_names: Sequence[str],
     target_premises: Sequence[str] = (),
+    consume_work: Optional[Callable[[int], None]] = None,
 ) -> bool:
-    conjuncts = _flatten_conjunction_formulas(target_body)
+    if consume_work is None:
+        consume_work = _CounterexampleBooleanBudget().consume
+    try:
+        return _counterexample_body_refutes_statement_with_budget(
+            target_body,
+            premises=premises,
+            conclusion=conclusion,
+            target_bound_names=target_bound_names,
+            statement_bound_names=statement_bound_names,
+            target_premises=target_premises,
+            consume_work=consume_work,
+        )
+    except _CounterexampleBooleanBudgetExhausted:
+        return False
+
+
+def _counterexample_body_refutes_statement_with_budget(
+    target_body: str,
+    *,
+    premises: Sequence[str],
+    conclusion: str,
+    target_bound_names: Sequence[str],
+    statement_bound_names: Sequence[str],
+    target_premises: Sequence[str] = (),
+    consume_work: Callable[[int], None],
+) -> bool:
+    conjuncts = _flatten_conjunction_formulas(target_body, consume_work=consume_work)
     normalized_conclusion = _strip_balanced_outer_parens(conclusion)
     positive_candidates = list(conjuncts)
     for premise in target_premises:
-        positive_candidates.extend(_flatten_conjunction_formulas(premise))
+        positive_candidates.extend(
+            _flatten_conjunction_formulas(premise, consume_work=consume_work)
+        )
+
+    def charge_formula(formula: str, facts: Sequence[str]) -> None:
+        # Charge the recursive visit and comparisons against every fact.
+        # A caller can share one budget across multiple candidate analyses.
+        consume_work(
+            (1 + len(formula)) * (1 + len(facts))
+            + sum(len(fact) for fact in facts)
+        )
 
     def evidence_proves(formula: str, facts: Sequence[str]) -> bool:
+        charge_formula(formula, facts)
         normalized = _strip_balanced_outer_parens(formula)
         if _formula_alpha_matches_any(
             normalized,
@@ -4336,6 +4407,7 @@ def _counterexample_body_refutes_statement(
         )
 
     def evidence_refutes(formula: str, facts: Sequence[str]) -> bool:
+        charge_formula(formula, facts)
         normalized = _strip_balanced_outer_parens(formula)
         # A disjunctive witness fact is usable only if every possible branch
         # refutes the conclusion. This recursively implements the Boolean
@@ -4347,7 +4419,12 @@ def _counterexample_body_refutes_statement(
                 return all(
                     evidence_refutes(
                         normalized,
-                        [*remaining, *_flatten_conjunction_formulas(branch)],
+                        [
+                            *remaining,
+                            *_flatten_conjunction_formulas(
+                                branch, consume_work=consume_work
+                            ),
+                        ],
                     )
                     for branch in branches
                 )
@@ -4473,6 +4550,7 @@ def _lean_counterexample_target_refutes_statement(
     statement: str,
     *,
     allow_inferred_relation_binders: bool = False,
+    consume_work: Optional[Callable[[int], None]] = None,
 ) -> bool:
     from .proof_state import _identity_requires_exact_source, _identity_source_text
 
@@ -4556,6 +4634,7 @@ def _lean_counterexample_target_refutes_statement(
         target_bound_names=target_bound_names,
         statement_bound_names=statement_bound_names,
         target_premises=target_premises,
+        consume_work=consume_work,
     ):
         return True
     return False
@@ -8640,31 +8719,39 @@ def _top_level_quantifier_token_len(text: str, index: int) -> int:
 
 def _strip_balanced_outer_parens(text: str) -> str:
     s = str(text or "").strip()
-    while s.startswith("(") and s.endswith(")"):
-        depth = 0
-        balanced = True
-        index = 0
-        while index < len(s):
-            skip_to = _lean_surface_lexical_skip_end(s, index)
-            if skip_to is not None:
-                index = skip_to
-                continue
-            ch = s[index]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0 and index != len(s) - 1:
-                    balanced = False
-                    break
-                if depth < 0:
-                    balanced = False
-                    break
-            index += 1
-        if not balanced or depth != 0:
-            break
-        s = s[1:-1].strip()
-    return s
+    if not (s.startswith("(") and s.endswith(")")):
+        return s
+    # Match once, then peel by index. Rescanning each successively shorter
+    # wrapper makes a deeply grouped model response quadratic to inspect.
+    opening: list[int] = []
+    matching: dict[int, int] = {}
+    index = 0
+    while index < len(s):
+        skip_to = _lean_surface_lexical_skip_end(s, index)
+        if skip_to is not None:
+            index = skip_to
+            continue
+        ch = s[index]
+        if ch == "(":
+            opening.append(index)
+        elif ch == ")":
+            if not opening:
+                return s
+            matching[opening.pop()] = index
+            if not opening and index != len(s) - 1:
+                return s
+        index += 1
+    if opening:
+        return s
+    left, right = 0, len(s)
+    while matching.get(left) == right - 1:
+        left += 1
+        right -= 1
+        while left < right and s[left].isspace():
+            left += 1
+        while left < right and s[right - 1].isspace():
+            right -= 1
+    return s[left:right]
 
 
 def _find_top_level_comma(text: str) -> int:

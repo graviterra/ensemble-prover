@@ -850,7 +850,11 @@ def load_jsonl_events(path: str | Path) -> Tuple[List[Dict[str, Any]], int]:
             continue
         try:
             record = _strict_json_loads(line)
+            if isinstance(record, dict):
+                from .trace_payloads import expand_trace_payloads
+                record = expand_trace_payloads(record, trace_path.parent)
         except (
+            OSError,
             json.JSONDecodeError,
             RecursionError,
             ValueError,

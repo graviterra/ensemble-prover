@@ -5350,7 +5350,7 @@ async def prove_problem_via_session(
             ):
                 return
             base_cache = shared_proof_cache or MiniVerifiedLemmaCache(
-                proof_cache_base_path
+                proof_cache_base_path, lazy_semantic_admission=True,
             )
             merged = 0
             completed_samples = sorted(

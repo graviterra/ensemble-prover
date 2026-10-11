@@ -18,6 +18,10 @@ MINI_THEORY_SCHEMA_VERSION = 3
 # Advancing the policy also invalidates earlier published bundles and terminal
 # rejections instead of reusing their stale semantic/verification evidence.
 THEORY_POLICY_VERSION = 17
+# The bounded curation audit evolves independently of kernel-valid bundles.
+# Old accepted bundles remain usable; affected rejected promotion receipts are
+# reconsidered under the current audit while retaining their authority lineage.
+THEORY_AUDIT_POLICY_VERSION = 2
 
 TheoryNeedKind = Literal[
     "definition",
@@ -499,6 +503,8 @@ class TheoryVerificationReceipt:
     verification_output_hash: str = ""
     compiled_artifact_hash: str = ""
     diagnostic: str = ""
+    audit_policy_version: int = 0
+    audit_outcome: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

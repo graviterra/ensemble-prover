@@ -10,6 +10,7 @@ falsified without that certificate.
 
 from __future__ import annotations
 
+import re
 import textwrap
 import time
 from typing import Any, Callable, Optional, Sequence, Tuple
@@ -43,7 +44,6 @@ from ensemble_prover.lean_parser import canonical_error_type
 # need omega/decide, so allow more than the 8s certifier default, but keep it
 # capped so a pathological body cannot stall the (already-failed) prove path.
 _CERTIFY_TIMEOUT_S = 30.0
-
 
 def _original_target_parser(lean: Any, *, feedback: bool = False) -> Any:
     from ensemble_prover.lean_runner import LeanRunner
@@ -297,6 +297,96 @@ def _direct_negation_proof_from_declaration(
         return ""
 
 
+def _counterexample_target_is_replay_candidate(
+    target: str,
+    statement: str,
+    *,
+    consume_work: Optional[Callable[[int], None]] = None,
+) -> bool:
+    """Select existential evidence for exact Lean replay, never source authority.
+
+    Grouping and subtype notation make source identity deliberately opaque.
+    They can still suggest a proof to the kernel, provided the original bytes
+    are retained in that proof and the active target is independently checked.
+    Domain, arity and propositional checks only avoid unrelated replay work.
+    """
+
+    from ensemble_prover.mini_recursive import (
+        _CounterexampleBooleanBudget,
+        _CounterexampleBooleanBudgetExhausted,
+        _canonical_nonproof_parameter_profile,
+        _counterexample_body_refutes_statement,
+        _find_top_level_comma,
+        _flatten_conjunction_formulas,
+        _lean_target_negation_candidate,
+        _statement_premises_and_conclusion,
+        _strip_balanced_outer_parens,
+        _strip_leading_exists_binders_with_names_and_premises,
+        _strip_prefix_exists_fun_surface,
+    )
+
+    tail = _strip_balanced_outer_parens(target)
+    prefixes: list[str] = []
+    while True:
+        quantifier = re.match(r"^(?:∃|exists\b)\s*", tail)
+        if quantifier is not None:
+            comma = _find_top_level_comma(tail)
+            if comma < 0:
+                return False
+            binder, remaining = tail[quantifier.end() : comma], tail[comma + 1 :]
+        else:
+            binder, remaining = _strip_prefix_exists_fun_surface(tail)
+            if not binder or not remaining:
+                break
+        prefixes.append(f"∀ {binder}, ")
+        tail = _strip_balanced_outer_parens(remaining)
+    if not prefixes or _canonical_nonproof_parameter_profile(
+        "".join(prefixes) + tail
+    ) != _canonical_nonproof_parameter_profile(statement):
+        return False
+    premises, conclusion, statement_names = _statement_premises_and_conclusion(statement)
+    body, target_names, target_premises = (
+        _strip_leading_exists_binders_with_names_and_premises(target)
+    )
+    if not body or not conclusion or not target_names or not statement_names:
+        return False
+    context = {
+        "premises": premises,
+        "target_bound_names": target_names,
+        "statement_bound_names": statement_names,
+        "target_premises": target_premises,
+    }
+    if consume_work is None:
+        consume_work = _CounterexampleBooleanBudget().consume
+
+    def packed_negation_candidate(fact: str) -> bool:
+        consume_work(1 + len(fact) + len(conclusion))
+        return _lean_target_negation_candidate(fact, conclusion)
+
+    try:
+        if _counterexample_body_refutes_statement(
+            body, conclusion=conclusion, consume_work=consume_work, **context
+        ):
+            return True
+        # Packed negation of an entire grouped conclusion is also only a replay
+        # hint. Require its original binder names and every premise; the generated
+        # proof retains the original fact rather than substituting a parsed formula.
+        return bool(
+            target_names == statement_names
+            and any(
+                packed_negation_candidate(fact)
+                for fact in _flatten_conjunction_formulas(
+                    body, consume_work=consume_work
+                )
+            )
+            and _counterexample_body_refutes_statement(
+                body, conclusion="False", consume_work=consume_work, **context
+            )
+        )
+    except _CounterexampleBooleanBudgetExhausted:
+        return False
+
+
 def counterexample_negation_proof_from_declaration(
     declaration: str,
     statement: str,
@@ -305,15 +395,16 @@ def counterexample_negation_proof_from_declaration(
 
     Direct negations use advisory spelling matches so ordinary grouping and
     packed syntax can reach the certifier. Counterexample synthesis uses the
-    conservative relation matcher. The declaration itself is embedded as
-    a local ``have`` and the original universal claim is introduced before
-    ``aesop`` performs only the implication/conjunction/quantifier plumbing.
+    conservative relation matcher and advisory replay candidates. The declaration
+    itself is embedded as a local ``have`` and the original universal claim is
+    introduced before ``aesop`` performs the logical plumbing.
     This synthesized proof still has to pass fresh Lean replay and the axiom
     audit, so parsing can never mint authority by itself.
     """
 
     try:
         from ensemble_prover.mini_recursive import (
+            _CounterexampleBooleanBudget,
             _checked_evidence_code_has_ambient_context,
             _checked_evidence_code_has_proof_placeholder,
             _checked_evidence_target_refutes_statement,
@@ -350,16 +441,24 @@ def counterexample_negation_proof_from_declaration(
         if len(targets) != 1:
             return ""
         target = str(targets[0] or "").strip()
+        # Share the bound across strict matching and both advisory attempts.
+        # Each of these selectors can visit the same disjunctive witness tree.
+        budget = _CounterexampleBooleanBudget()
         if not target or not (
             _checked_evidence_target_refutes_statement(
                 target,
                 statement_text,
                 _lean_compact_key(statement_text),
+                consume_work=budget.consume,
             )
             or _lean_counterexample_target_refutes_statement(
                 target,
                 statement_text,
                 allow_inferred_relation_binders=True,
+                consume_work=budget.consume,
+            )
+            or _counterexample_target_is_replay_candidate(
+                target, statement_text, consume_work=budget.consume
             )
         ):
             return ""

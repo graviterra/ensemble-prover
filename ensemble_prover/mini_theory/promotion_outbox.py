@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 from ..proof_dossier import VerifiedHelper, text_hash
-from .model import THEORY_POLICY_VERSION, TheoryBundleCandidate
+from .model import THEORY_AUDIT_POLICY_VERSION, THEORY_POLICY_VERSION, TheoryBundleCandidate
 from .promotion_context import helper_promotion_context, lean_name_components, validate_promotion_context, split_promotion_context
 from .promotion import DECLARATION_EXTRACTION_POLICY_VERSION, VerifiedHelperPromoter, _used_problem_constants
 
@@ -1070,6 +1070,7 @@ class PromotionOutbox:
         )
         published = 0
         rejected = 0
+        audit_deferred = 0
         context_recapture_required = 0
         authoritative_ids = context.authoritative_ids
         for entry in entries:
@@ -1083,8 +1084,10 @@ class PromotionOutbox:
                 published += 1
             elif status == "terminal_rejected":
                 rejected += 1
+            elif status == "audit_deferred":
+                audit_deferred += 1
         claimed = len(tuple(self._regular_json_files(self._claim_scope_root())))
-        pending = max(0, len(authoritative_ids) - published - rejected)
+        pending = max(0, len(authoritative_ids) - published - rejected - audit_deferred)
         return {
             "created": sum(1 for entry in entries if entry.owner_id == owner_id),
             "receipts": len(entries),
@@ -1092,6 +1095,7 @@ class PromotionOutbox:
             "claimed": claimed,
             "published": published,
             "rejected": rejected,
+            "audit_deferred": audit_deferred,
             "context_recapture_required": context_recapture_required,
         }
 
@@ -1423,7 +1427,8 @@ class PromotionOutbox:
                             verdict = "helper_promotion_claim_lost_retryable"
                     elif (
                         cancelled
-                        or bool(getattr(result, "retryable", False))
+                        or (bool(getattr(result, "retryable", False))
+                            and not self._audit_deferred_diagnostic(diagnostic))
                         or self._retryable_diagnostic(diagnostic)
                     ):
                         report.retryable += 1
@@ -1433,13 +1438,19 @@ class PromotionOutbox:
                             "schema_version": PROMOTION_OUTBOX_SCHEMA_VERSION,
                             "result_policy_version": PROMOTION_RESULT_POLICY_VERSION,
                             "entry_id": entry.entry_id,
-                            "status": "terminal_rejected",
+                            "status": (
+                                "audit_deferred" if self._audit_deferred_diagnostic(
+                                    diagnostic
+                                ) else "terminal_rejected"
+                            ),
                             "diagnostic": str(
                                 getattr(result, "diagnostic", "") or ""
                             ),
                             "declaration_extraction_policy_version": DECLARATION_EXTRACTION_POLICY_VERSION,
                             "environment_key": self.environment_key,
                             "policy_version": self.policy_version,
+                            "audit_policy_version": THEORY_AUDIT_POLICY_VERSION,
+                            "audit_resource_key": self._audit_resource_key(),
                             "settled_ts": time.time(),
                         }
                         settled = self._settle(entry, result_payload, claim)
@@ -1449,8 +1460,12 @@ class PromotionOutbox:
                                 None,
                             )
                         if settled:
-                            report.rejected += 1
-                            verdict = "helper_not_promoted"
+                            if result_payload["status"] == "audit_deferred":
+                                report.deferred += 1
+                                verdict = "helper_promotion_deferred_audit"
+                            else:
+                                report.rejected += 1
+                                verdict = "helper_not_promoted"
                         else:
                             report.retryable += 1
                             verdict = "helper_promotion_claim_lost_retryable"
@@ -1513,6 +1528,14 @@ class PromotionOutbox:
             else:
                 report.remaining = len(remaining_entries)
         return report
+
+    @staticmethod
+    def _audit_deferred_diagnostic(diagnostic: str) -> bool:
+        return str(diagnostic or "").partition(":")[0] in {
+            "circularity_audit_inconclusive",
+            "lean_audit_resource_budget_exhausted",
+            "lean_audit_failed",
+        }
 
     @staticmethod
     def _retryable_diagnostic(diagnostic: str) -> bool:
@@ -2815,6 +2838,27 @@ class PromotionOutbox:
         context.result_memo[entry_id] = payload
         return payload
 
+    def _audit_resource_key(self) -> str:
+        """Stable allocations permit a deferred audit retry without a hot loop.
+
+        Absolute deadlines deliberately do not participate: time passing is
+        not a new audit allocation. Environment identity already scopes results.
+        """
+        from ensemble_prover.lean_runner import (
+            current_lean_heartbeat_limit,
+            current_lean_memory_limit,
+        )
+
+        verifier = getattr(self.library, "verifier", None)
+        return _sha256(_canonical_json({
+            "timeout_s": getattr(verifier, "timeout_s", None),
+            "max_evidence": getattr(verifier, "audit_max_evidence", 4096),
+            "max_search": getattr(verifier, "audit_max_search", 4096),
+            "max_proof": getattr(verifier, "audit_max_proof", 65536),
+            "heartbeats": current_lean_heartbeat_limit(),
+            "memory_mb": current_lean_memory_limit(),
+        }))
+
     def _valid_result_payload(
         self,
         entry: Optional[PromotionOutboxEntry],
@@ -2835,10 +2879,27 @@ class PromotionOutbox:
             or payload.get("entry_id") != entry.entry_id
             or payload.get("environment_key") != self.environment_key
             or payload.get("policy_version") != self.policy_version
-            or payload.get("status") not in ("published", "terminal_rejected")
+            or payload.get("status") not in ("published", "terminal_rejected", "audit_deferred")
         ):
             return False
+        if payload.get("status") == "audit_deferred":
+            return bool(
+                self._audit_deferred_diagnostic(str(payload.get("diagnostic") or ""))
+                and payload.get("audit_policy_version") == THEORY_AUDIT_POLICY_VERSION
+                and payload.get("audit_resource_key") == self._audit_resource_key()
+            )
         if payload.get("status") == "terminal_rejected":
+            # Revisit only affected curation decisions. The normal newest-
+            # receipt, revocation and under-lock claim checks still govern the
+            # work; old results are retained by the existing sidecar archive.
+            if (
+                str(payload.get("diagnostic") or "").startswith((
+                    "circular_premise_conclusion:",
+                    "need_relative_circular_premise:",
+                ))
+                and payload.get("audit_policy_version", 0) != THEORY_AUDIT_POLICY_VERSION
+            ):
+                return False
             if (
                 payload.get("diagnostic") == "helper_declaration_not_extractable"
                 and "declaration_extraction_policy_version" not in payload

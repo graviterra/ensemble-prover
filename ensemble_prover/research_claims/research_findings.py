@@ -31,9 +31,15 @@ def comparison_packet(store: Any, producer: dict[str, Any]) -> dict[str, Any]:
             historical_baselines.append({"artifact_id": artifact, "context_binding": predecessor,
                                          "requires_context_reaudit": True})
     prior = []
+    scoped_obstructions = []
     for job in jobs.values():
         artifact = job.get("investigation_artifact")
         job_context = native_job_context(job, jobs, recorded_contexts=recorded_contexts)
+        if job_context in comparison_contexts and (context is not None or native_job_target(job, jobs) == target):
+            for aid in job.get("scoped_obstructions", []):
+                record = load_json(store.read_artifact(aid).decode())
+                scoped_obstructions.append({"artifact_id": aid, **record,
+                    "context_binding": job_context, "requires_context_reaudit": job_context != context})
         if (not artifact or job["job_id"] == producer["job_id"]
                 or (context is None and native_job_target(job, jobs) != target)
                 or job_context not in comparison_contexts
@@ -67,6 +73,7 @@ def comparison_packet(store: Any, producer: dict[str, Any]) -> dict[str, Any]:
             "prior_reports": prior,
             "prior_report_artifact_ids": list(dict.fromkeys(item["artifact_id"] for item in prior)),
             "reviewed_findings": findings,
+            "scoped_obstructions": scoped_obstructions,
             "historical_baselines": historical_baselines,
             "authority": "Research comparison is advisory; formal truth requires the existing verifier. Prior-context history requires re-audit; its claims and progress credit are not transferred."}
 
@@ -77,7 +84,7 @@ def validate_delta(delta: Any) -> dict[str, Any]:
         raise ValueError("progress_delta must be an object")
     fields = {"conclusion", "new_inference", "kind", "assumptions",
               "baseline_artifact_ids", "prior_report_artifact_ids"}
-    if set(delta) != fields:
+    if set(delta) not in (fields, fields | {"comparison_scope_artifact"}):
         raise ValueError("progress_delta requires conclusion, new_inference, kind, assumptions, baseline_artifact_ids and prior_report_artifact_ids")
     for field in ("conclusion", "new_inference", "kind"):
         if not isinstance(delta[field], str) or not delta[field].strip():
@@ -88,6 +95,8 @@ def validate_delta(delta: Any) -> dict[str, Any]:
         if (not isinstance(delta[field], list)
                 or any(not isinstance(item, str) or not item.strip() for item in delta[field])):
             raise ValueError(f"progress_delta.{field} must be an array of nonempty strings")
+    if "comparison_scope_artifact" in delta and (not isinstance(delta["comparison_scope_artifact"], str) or not delta["comparison_scope_artifact"].strip()):
+        raise ValueError("comparison_scope_artifact must be a nonempty artifact ID")
     return delta
 
 
@@ -113,8 +122,24 @@ def assess_delta(controller: Any, campaign: dict[str, Any], producer: dict[str, 
         return {"status": "novelty_unresolved", "credit_minted": False}
     finding = validate_delta(delta)
     comparison = comparison_packet(controller.store, producer)
+    expected_comparison = comparison
+    scoped_artifact = finding.get("comparison_scope_artifact")
+    if scoped_artifact:
+        reviewer = controller.store.job(reviewer_id)
+        reference = reviewer.get("assigned_research_subject")
+        if not reference:
+            return {"status": "unbound_comparison_scope", "credit_minted": False}
+        subject_packet = load_json(controller.store.read_artifact(reference).decode())
+        scoped = subject_packet.get("scoped_comparison", {})
+        if (scoped.get("artifact_id") != scoped_artifact
+                or subject_packet.get("producer_job_id") != producer["job_id"]
+                or subject_packet.get("report_artifact") != producer.get("investigation_artifact")
+                or subject_packet.get("binding") != producer.get("frontier_report_basis", {}).get("binding", {})):
+            return {"status": "unbound_comparison_scope", "credit_minted": False}
+        controller.store.read_artifact(scoped_artifact)
+        expected_comparison = scoped
     for field in ("baseline_artifact_ids", "prior_report_artifact_ids"):
-        if set(finding[field]) != set(comparison[field]):
+        if set(finding[field]) != set(expected_comparison[field]):
             return {"status": "cumulative_comparison_required", "credit_minted": False}
     signature = _conclusion_signature(finding)
     identity = digest({
@@ -146,5 +171,7 @@ def assess_delta(controller: Any, campaign: dict[str, Any], producer: dict[str, 
                           "reviewer_id": reviewer_id, "producer_id": producer["job_id"],
                           "target_claim_id": comparison["target_claim_id"],
                           "context_binding": comparison["context_binding"],
+                          "comparison_scope": "assigned_question" if scoped_artifact else "cumulative",
+                          "global_novelty": "unknown" if scoped_artifact else "reviewer_claim",
                           "assessment": result, "kernel_verified": False}
     return result

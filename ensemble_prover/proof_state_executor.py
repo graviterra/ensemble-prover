@@ -75,6 +75,7 @@ from .proof_dossier import (
     ProofDossier,
     _decl_application_error_is_lean_diagnostic,
     _prompt_safe_lean_diagnostic_text,
+    active_root_targets_for_frame,
     active_root_target_statement,
     dossier_root_equivalence_placeholder,
     helper_decl_name,
@@ -115,6 +116,7 @@ from .tactic_attempt_telemetry import (
     notify_lean_attempt_observer,
     record_dossier_lean_attempt_event,
     tactic_attempt_telemetry_fields,
+    tactic_portfolio_identity_fields,
     tactic_stage_telemetry_fields,
 )
 
@@ -167,12 +169,116 @@ def _tactic_renewal_controls(dossier: Any) -> Dict[str, Any]:
     return {"portfolio_provider_sequence": sequence, "portfolio_drain": drain}
 
 
-def _tactic_renewal_available(history: Any, dossier: Any, timeout_s: float, *, include_admitted: bool = True, obligation_key: Optional[str] = None) -> bool:
-    from .tactic_service_history import history_for_obligation, renewal_work_available
+def _tactic_dispatch_allowance(timeout_s: float) -> float:
+    from .lean_runner import current_lean_deadline
+
+    owner_deadline = current_lean_deadline()
+    if owner_deadline is not None:
+        timeout_s = min(timeout_s, max(0.0, owner_deadline - time.monotonic()))
+    return max(0.0, timeout_s)
+
+
+def _root_tactic_phase_lane_keys(
+    *, goal_statement: str, preamble: str,
+    active_root_targets: Sequence[Mapping[str, Any]], frame_helpers: Sequence[str],
+) -> Dict[str, str]:
+    """Bind executable phases to the same framed targets as the tactic backend."""
+    active_statement = active_root_target_statement(active_root_targets_for_frame(
+        active_root_targets, root_statement=goal_statement, preamble=preamble,
+        helper_blocks=frame_helpers, require_helper_context_hash_match=True,
+    ), require_single=True, require_no_hypotheses=False, include_hypotheses=True)
+    root_lane = text_hash(f"{len(goal_statement)}:{goal_statement}{preamble}")
+    if active_statement and active_statement != goal_statement.strip():
+        return {
+            "active": text_hash(f"{len(active_statement)}:{active_statement}{preamble}"),
+            "lift": root_lane, "fallback": root_lane,
+        }
+    return {"direct": root_lane}
+
+
+def _root_tactic_unserved_continuation(
+    history: Any, continuation: Any, *, context_key: str,
+    obligation_key: str, helper_hashes: Sequence[str], allowance_s: float,
+    lane_key: str,
+) -> bool:
+    from .tactic_service_history import history_for_obligation, unserved_admission_available
+
+    continuation = validated_root_tactic_portfolio_continuation(continuation)
+    if (not continuation or continuation.get("context_key") != context_key
+            or continuation.get("obligation_key") != obligation_key
+            or continuation.get("execution_helper_hashes") != list(helper_hashes)):
+        return False
+    return unserved_admission_available(
+        history_for_obligation(history, obligation_key),
+        lane_key=lane_key,
+        candidates=continuation["candidates"][continuation["next_candidate_index"]:][:1],
+        helper_hashes=helper_hashes, allowance_s=allowance_s,
+    )
+
+
+def _root_tactic_continuation_for_phases(
+    continuation: Any, *, phase_lane_keys: Mapping[str, str], history: Any,
+    context_key: str, obligation_key: str, helper_hashes: Sequence[str],
+    allowance_s: float,
+) -> Dict[str, Any]:
+    """Select executable work, repairing only an exactly admitted legacy cursor."""
+    continuation = validated_root_tactic_portfolio_continuation(continuation)
+    phase = continuation.get("phase")
+    if phase in phase_lane_keys:
+        return continuation
+    # Older checkpoints labeled any nonempty frame active, even when its
+    # targets selected direct root execution. Recover only already admitted,
+    # unserved work in this exact root lane and current execution context.
+    if phase == "active" and "direct" in phase_lane_keys:
+        if _root_tactic_unserved_continuation(
+            history, continuation, context_key=context_key,
+            obligation_key=obligation_key, helper_hashes=helper_hashes,
+            allowance_s=allowance_s, lane_key=phase_lane_keys["direct"],
+        ):
+            return {**continuation, "phase": "direct"}
+    return {}
+
+
+def _tactic_renewal_available(
+    history: Any, dossier: Any, timeout_s: float, *,
+    include_admitted: bool = True, obligation_key: Optional[str] = None,
+    context_key: str = "", continuation: Any = None,
+    helper_hashes: Sequence[str] = (), continuation_lane_key: str = "",
+    target_lane_keys: Optional[Sequence[str]] = None,
+) -> bool:
+    from .tactic_service_history import (
+        _stronger_allowance, history_for_obligation, renewal_work_available,
+        validate_service_history,
+    )
 
     controls = _tactic_renewal_controls(dossier)
+    timeout_s = _tactic_dispatch_allowance(timeout_s)
     if obligation_key is not None:
         history = history_for_obligation(history, obligation_key)
+    else:
+        history = validate_service_history(history)
+    if target_lane_keys is not None:
+        # Checkpoints can retain other targets' scheduling hints. Only phases
+        # executable in this root frame can authorize another dispatch.
+        history["renewal_lanes"] = {
+            key: lane for key, lane in history.get("renewal_lanes", {}).items()
+            if key in target_lane_keys
+        }
+    # A saved exact cursor has already paid generation costs. A dispatch
+    # deferral suppresses regeneration, not service of that admitted work.
+    if context_key and _root_tactic_unserved_continuation(
+        history, continuation, context_key=context_key,
+        obligation_key=obligation_key or history.get("obligation_key", ""),
+        helper_hashes=helper_hashes, allowance_s=timeout_s,
+        lane_key=continuation_lane_key,
+    ):
+        return True
+    deferral = history.get("root_dispatch_deferral", {})
+    if (context_key and deferral.get("context_key") == context_key
+            and deferral.get("provider_sequence") == controls["portfolio_provider_sequence"]
+            and deferral.get("drain") == controls["portfolio_drain"]
+            and not _stronger_allowance(timeout_s, deferral["allowance_s"])):
+        return False
     return renewal_work_available(
         history, provider_sequence=controls["portfolio_provider_sequence"],
         drain=controls["portfolio_drain"], allowance_s=timeout_s,
@@ -1390,12 +1496,30 @@ def _has_untried_proof_state_root_tactic_context(
     continuation = validated_root_tactic_portfolio_continuation(
         getattr(root_node, "root_tactic_portfolio_continuation", {})
     )
+    phase_lane_keys = _root_tactic_phase_lane_keys(
+        goal_statement=str(getattr(conv, "goal_statement", "") or ""),
+        preamble=_proof_state_acceptance_preamble(conv),
+        active_root_targets=dossier.active_root_targets,
+        frame_helpers=dossier.verified_helper_blocks(refresh_quality=False),
+    )
+    obligation_key = _proof_state_root_tactic_obligation_key(
+        conv=conv, dossier=dossier, proof_state=proof_state,
+    )
+    helper_hashes = [text_hash(str(block)) for block in helpers]
+    continuation = _root_tactic_continuation_for_phases(
+        continuation, phase_lane_keys=phase_lane_keys,
+        history=getattr(root_node, "root_tactic_service_history", {}),
+        context_key=key, obligation_key=obligation_key,
+        helper_hashes=helper_hashes, allowance_s=_tactic_dispatch_allowance(timeout_s),
+    )
     if _tactic_renewal_available(
         getattr(root_node, "root_tactic_service_history", {}), dossier, timeout_s,
         include_admitted=not bool(continuation),
-        obligation_key=_proof_state_root_tactic_obligation_key(
-            conv=conv, dossier=dossier, proof_state=proof_state,
-        ),
+        obligation_key=obligation_key,
+        context_key=key, continuation=continuation,
+        helper_hashes=helper_hashes,
+        continuation_lane_key=phase_lane_keys.get(continuation.get("phase"), ""),
+        target_lane_keys=tuple(phase_lane_keys.values()),
     ):
         return True
     if (
@@ -1486,12 +1610,22 @@ def _has_current_root_tactic_portfolio_continuation(
             # The fast path is an optimization only. If a lightweight
             # readiness probe cannot prove it is safe, run normal prechecks.
             return False
-    phase = str(continuation.get("phase") or "")
-    direct_root_tactic = not _proof_state_active_root_targets_for_frame(dossier)
-    return bool(
-        (direct_root_tactic and phase in {"", "direct"})
-        or (not direct_root_tactic and phase in {"", "active", "lift", "fallback"})
+    phase_lane_keys = _root_tactic_phase_lane_keys(
+        goal_statement=str(getattr(conv, "goal_statement", "") or ""),
+        preamble=_proof_state_acceptance_preamble(conv),
+        active_root_targets=dossier.active_root_targets,
+        frame_helpers=dossier.verified_helper_blocks(refresh_quality=False),
     )
+    return bool(_root_tactic_continuation_for_phases(
+        continuation, phase_lane_keys=phase_lane_keys,
+        history=getattr(root_node, "root_tactic_service_history", {}),
+        context_key=context_key,
+        obligation_key=_proof_state_root_tactic_obligation_key(
+            conv=conv, dossier=dossier, proof_state=proof_state,
+        ),
+        helper_hashes=[text_hash(str(block)) for block in helpers],
+        allowance_s=_tactic_dispatch_allowance(timeout_s),
+    ))
 
 
 def _is_tactic_mode_proof(body: str) -> bool:
@@ -6446,6 +6580,13 @@ async def _accept_proof_state_helper(
             )
             return False
     if transaction.enabled and not transaction.committed:
+        # Rollback intentionally removes the provisional helper. Its
+        # publication receipt no longer applies to the restored registry;
+        # keep the original frame and runtime guards for the final callback.
+        published_context_current = None
+        if not runtime_current():
+            publication_context_error = acceptance_error_kind(runtime_context_error())
+            restore_changed_owner_handoff()
         _status(
             "retryable_error",
             error_kind=publication_context_error or (
@@ -10597,8 +10738,12 @@ async def _try_proof_state_root_tactic_assembly(
     )
     root_node = proof_state.nodes.get(proof_state.root_node_id)
     checked_root_target = getattr(root_node, "target", "")
-    active_root_targets = _proof_state_active_root_targets_for_frame(dossier)
-    direct_root_tactic = not active_root_targets
+    phase_lane_keys = _root_tactic_phase_lane_keys(
+        goal_statement=checked_statement,
+        preamble=root_tactic_preamble, active_root_targets=checked_active_targets,
+        frame_helpers=checked_frame_helpers,
+    )
+    direct_root_tactic = "direct" in phase_lane_keys
     from .tactic_service_history import commit_renewal, history_for_obligation, record_attempts
 
     obligation_key = _proof_state_root_tactic_obligation_key(
@@ -10620,6 +10765,11 @@ async def _try_proof_state_root_tactic_assembly(
         or portfolio_continuation.get("context_key") or context_key
     )
     helper_hashes = [text_hash(str(block)) for block in helpers]
+    portfolio_continuation = _root_tactic_continuation_for_phases(
+        portfolio_continuation, phase_lane_keys=phase_lane_keys, history=service_history,
+        context_key=context_key, obligation_key=obligation_key, helper_hashes=helper_hashes,
+        allowance_s=_tactic_dispatch_allowance(min(float(timeout_s), context_timeout)),
+    )
     previous_helper_hashes = portfolio_continuation.get("execution_helper_hashes")
     if (portfolio_continuation.get("obligation_key") == obligation_key
             and isinstance(previous_helper_hashes, list)
@@ -10630,35 +10780,43 @@ async def _try_proof_state_root_tactic_assembly(
         # proofs/assemblies were considered before entering this lane.
         portfolio_continuation["context_key"] = context_key
         portfolio_continuation["generation_context_key"] = generation_context_key
-    continuation_phase = str(portfolio_continuation.get("phase") or "")
     if (
         str(portfolio_continuation.get("context_key") or "") != context_key
         or portfolio_continuation.get("obligation_key", obligation_key) != obligation_key
-        or (
-            direct_root_tactic
-            and continuation_phase not in {"", "direct"}
-        )
-        or (
-            not direct_root_tactic
-            and continuation_phase not in {"", "active", "lift", "fallback"}
-        )
     ):
         portfolio_continuation = {}
     if not portfolio_continuation:
         generation_context_key = context_key
     if root_node is not None and not portfolio_continuation and raw_continuation:
         root_node.root_tactic_portfolio_continuation = {}
-    if _tactic_renewal_available(service_history, dossier, context_timeout, include_admitted=not bool(portfolio_continuation)):
-        _clear_root_tactic_context_retry_markers(proof_state, context_key)
+    continuation_lane_key = phase_lane_keys.get(portfolio_continuation.get("phase"), "")
+    # Context identity retains the configured allowance. Retry admission must
+    # use this operation's actual grant: an unchanged short lease cannot renew
+    # itself merely because the enclosing context permits a longer check.
+    renewal_timeout = min(float(timeout_s), context_timeout)
+    renewal_available = _tactic_renewal_available(
+        service_history, dossier, renewal_timeout,
+        include_admitted=not bool(portfolio_continuation),
+        context_key=context_key, continuation=portfolio_continuation,
+        helper_hashes=helper_hashes,
+        continuation_lane_key=continuation_lane_key,
+        target_lane_keys=tuple(phase_lane_keys.values()),
+    )
     deferred_keys = _root_tactic_deferred_context_keys(proof_state)
     was_deferred = context_key in deferred_keys
-    if (context_key in _root_tactic_attempted_context_keys(proof_state)
-            and not _tactic_renewal_available(service_history, dossier, context_timeout, include_admitted=not bool(portfolio_continuation))
-            and not (portfolio_continuation and (
-                generation_context_key != context_key
-                or portfolio_continuation.get("pending_reference_confirmation") is True
-            ))):
-        if root_node is not None:
+    was_attempted = context_key in _root_tactic_attempted_context_keys(proof_state)
+    continuation_retry = bool(portfolio_continuation and (
+        generation_context_key != context_key
+        or portfolio_continuation.get("pending_reference_confirmation") is True
+    ))
+
+    def already_attempted_result() -> Any:
+        if root_node is not None and not _root_tactic_unserved_continuation(
+            service_history, portfolio_continuation, context_key=context_key,
+            obligation_key=obligation_key, helper_hashes=helper_hashes,
+            allowance_s=context_timeout,
+            lane_key=continuation_lane_key,
+        ):
             root_node.root_tactic_portfolio_continuation = {}
         try:
             proof_state.root_tactic_context_skips += 1
@@ -10673,7 +10831,10 @@ async def _try_proof_state_root_tactic_assembly(
                 "verdict": "root_tactic_context_already_attempted",
             }
         ]
-    if was_deferred:
+
+    if was_attempted and not renewal_available and not continuation_retry:
+        return already_attempted_result()
+    if was_deferred and not renewal_available:
         if not allow_deferred_retry:
             try:
                 proof_state.root_tactic_deferred_skips += 1
@@ -10739,7 +10900,30 @@ async def _try_proof_state_root_tactic_assembly(
     async def run_root_tactic() -> Any:
         if not context_current():
             raise RuntimeError("root proof context changed before Lean dispatch")
-        return await try_close_root_with_active_lift(
+        # Lock admission spends the inherited lease. Eligibility observed
+        # before waiting cannot reset durable retry state. Return the decision
+        # to the owner; this result-only task may outlive a cancelled caller.
+        dispatch_renewal = _tactic_renewal_available(
+            service_history, dossier, renewal_timeout,
+            include_admitted=not bool(portfolio_continuation),
+            context_key=context_key, continuation=portfolio_continuation,
+            helper_hashes=helper_hashes,
+            continuation_lane_key=continuation_lane_key,
+            target_lane_keys=tuple(phase_lane_keys.values()),
+        )
+        dispatch_controls = _tactic_renewal_controls(dossier)
+        dispatch_deferral = {
+            "context_key": context_key,
+            "allowance_s": _tactic_dispatch_allowance(renewal_timeout),
+            "provider_sequence": dispatch_controls["portfolio_provider_sequence"],
+            "drain": dispatch_controls["portfolio_drain"],
+        }
+        if (not dispatch_renewal and (
+                (was_attempted and not continuation_retry)
+                or (was_deferred and not allow_deferred_retry))):
+            return None, False, dispatch_deferral
+        root_tactic_pattern_context.update(dispatch_controls)
+        result = await try_close_root_with_active_lift(
                 lean=lean,
                 goal_statement=checked_statement,
                 preamble=root_tactic_preamble,
@@ -10780,6 +10964,7 @@ async def _try_proof_state_root_tactic_assembly(
                 # completes; detached tails must be mutation-free.
                 attempt_observer=None,
             )
+        return result, dispatch_renewal, dispatch_deferral
 
     def changed_context_failure(*, elapsed_s: float, reason: str) -> Any:
         # An obsolete owner or runner frame cannot consume the current
@@ -10795,7 +10980,7 @@ async def _try_proof_state_root_tactic_assembly(
         }]
 
     try:
-        root_tactic = await _await_serialized_lean_operation(
+        root_tactic, dispatch_renewal, dispatch_deferral = await _await_serialized_lean_operation(
             lean,
             run_root_tactic,
             timeout_s=float(timeout_s or 0.0),
@@ -10866,6 +11051,18 @@ async def _try_proof_state_root_tactic_assembly(
                 "verdict": "tactic_exception",
             }
         ]
+    if root_tactic is None:
+        if not context_current():
+            return changed_context_failure(elapsed_s=0.0, reason="renewal_expired")
+        if was_attempted and not continuation_retry:
+            return already_attempted_result()
+        return False, None, [], [{
+            "phase": "proof_state_root_assembly", "turn_in_phase": turn,
+            "accepted_helpers": list(helper_names),
+            "root_tactic_context_key": context_key,
+            "root_tactic_context_deferred": True,
+            "verdict": "root_tactic_context_deferred",
+        }]
     _record_completed_tactic_observer_events(dossier, "proof_state_root_tactic", root_tactic)
     success_attempt = next(
         (
@@ -10938,6 +11135,11 @@ async def _try_proof_state_root_tactic_assembly(
             "root_tactic_context_preserved": True,
             "verdict": "root_tactic_context_changed",
         }]
+    if dispatch_renewal and root_tactic.attempts:
+        # Only completed service in the still-current context spends a new
+        # opportunity. A zero-check timeout cannot renew a stalled context.
+        _clear_root_tactic_context_retry_markers(proof_state, context_key)
+        was_deferred = False
     setattr(proof_state, "_tactic_pattern_cache", root_tactic_pattern_cache)
     if root_node is not None:
         root_node.root_tactic_service_history = record_attempts(
@@ -10945,6 +11147,13 @@ async def _try_proof_state_root_tactic_assembly(
             list(getattr(root_tactic, "attempts", ()) or ()),
             allowance_s=context_timeout,
         )
+        if root_tactic.attempts:
+            root_node.root_tactic_service_history.pop("root_dispatch_deferral", None)
+        elif dispatch_renewal and not resumed_candidates:
+            # A completed zero-check renewal records only its actual dispatch
+            # grant. Do not retry identical generation overhead indefinitely,
+            # and do not attribute the lost time to a candidate's service.
+            root_node.root_tactic_service_history["root_dispatch_deferral"] = dispatch_deferral
     root_tactic_exit_reason = str(
         getattr(root_tactic, "exit_reason", "") or ""
     )
@@ -11029,6 +11238,12 @@ async def _try_proof_state_root_tactic_assembly(
             "turn_in_phase": turn,
             "accepted_helpers": list(helper_names),
             "root_tactic_context_key": context_key,
+            **tactic_portfolio_identity_fields(
+                lane="proof_state_root_tactic", generation_context_key=generation_context_key,
+                candidates=getattr(root_tactic, "candidate_portfolio", ()),
+                candidate_inventory_count=root_tactic.candidate_count,
+                phase=str(getattr(root_tactic, "cache_metadata", {}).get("root_tactic_candidate_portfolio_phase") or "direct"),
+            ),
             "tactic_candidate_count": root_tactic.candidate_count,
             "cursor_before": resumed_offset,
             "cursor_after": int(getattr(root_tactic, "next_candidate_index", resumed_offset)),
@@ -11074,6 +11289,12 @@ async def _try_proof_state_root_tactic_assembly(
             "accepted_helpers": list(helper_names),
             "root_tactic_context_key": context_key,
             "generation_context_key": generation_context_key,
+            **tactic_portfolio_identity_fields(
+                lane="proof_state_root_tactic", generation_context_key=generation_context_key,
+                candidates=getattr(root_tactic, "candidate_portfolio", ()),
+                candidate_inventory_count=root_tactic.candidate_count,
+                phase=str(getattr(root_tactic, "cache_metadata", {}).get("root_tactic_candidate_portfolio_phase") or "direct"),
+            ),
             "tactic_candidate_count": root_tactic.candidate_count,
             "cursor_before": resumed_offset,
             "cursor_after": int(getattr(root_tactic, "next_candidate_index", resumed_offset)),
@@ -11117,7 +11338,13 @@ async def _try_proof_state_root_tactic_assembly(
         "turn_in_phase": turn,
         "accepted_helpers": list(helper_names),
         "root_tactic_context_key": context_key,
-        "tactic_candidate_count": root_tactic.candidate_count,
+        **tactic_portfolio_identity_fields(
+                lane="proof_state_root_tactic", generation_context_key=generation_context_key,
+                candidates=getattr(root_tactic, "candidate_portfolio", ()),
+                candidate_inventory_count=root_tactic.candidate_count,
+                phase=str(getattr(root_tactic, "cache_metadata", {}).get("root_tactic_candidate_portfolio_phase") or "direct"),
+            ),
+            "tactic_candidate_count": root_tactic.candidate_count,
             "cursor_before": resumed_offset,
             "cursor_after": int(getattr(root_tactic, "next_candidate_index", resumed_offset)),
             "context_identity": context_key,
@@ -15124,6 +15351,10 @@ async def _try_proof_state_one_child_closure(
                 "phase": "proof_state_child_tactic",
                 "turn_in_phase": turn, "node_id": node.node_id,
                 "target": node.target,
+                **tactic_portfolio_identity_fields(
+                    lane="proof_state_child_tactic", generation_context_key=generation_context["context_key"],
+                    candidates=candidate_portfolio, candidate_inventory_count=result.candidate_count,
+                ),
                 "tactic_candidate_count": result.candidate_count,
                 "cursor_before": resumed_offset,
                 "cursor_after": candidate_portfolio_offset,
@@ -15586,7 +15817,11 @@ async def _try_proof_state_one_child_closure(
             "phase": "proof_state_child_tactic",
             "turn_in_phase": turn, "node_id": node.node_id,
             "target": node.target,
-            "tactic_candidate_count": result.candidate_count,
+            **tactic_portfolio_identity_fields(
+                    lane="proof_state_child_tactic", generation_context_key=generation_context["context_key"],
+                    candidates=candidate_portfolio, candidate_inventory_count=result.candidate_count,
+                ),
+                "tactic_candidate_count": result.candidate_count,
                 "cursor_before": resumed_offset,
                 "cursor_after": candidate_portfolio_offset,
                 "context_identity": tactic_terminal_context_key,
@@ -15692,7 +15927,11 @@ async def _try_proof_state_one_child_closure(
             "node_id": node.node_id,
             "target": node.target,
             "helper_name": helper_name,
-            "tactic_candidate_count": result.candidate_count,
+            **tactic_portfolio_identity_fields(
+                    lane="proof_state_child_tactic", generation_context_key=generation_context["context_key"],
+                    candidates=candidate_portfolio, candidate_inventory_count=result.candidate_count,
+                ),
+                "tactic_candidate_count": result.candidate_count,
                 "cursor_before": resumed_offset,
                 "cursor_after": candidate_portfolio_offset,
                 "context_identity": tactic_terminal_context_key,

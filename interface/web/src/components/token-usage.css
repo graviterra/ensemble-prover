@@ -1,0 +1,14 @@
+.token-usage { margin: 1.5rem 0; padding: 1.4rem; border: 1px solid var(--line, #c9c8bf); border-radius: 12px; }
+.token-heading { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: .5rem; }
+.token-heading h2 { margin: 0; }
+.token-totals { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin: 1.3rem 0; }
+.token-totals dt { font-size: .9rem; }
+.token-totals dd { margin: .25rem 0; font-size: clamp(1.3rem, 3vw, 2rem); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.token-usage small { display: block; font-size: .8rem; opacity: .8; }
+.token-calls ul { list-style: none; padding: 0; }
+.token-calls li { display: flex; justify-content: space-between; gap: 1rem; padding: .7rem 0; border-top: 1px solid var(--line, #c9c8bf); overflow-wrap: anywhere; }
+.token-table { overflow-x: auto; }
+.token-table table { width: 100%; border-collapse: collapse; margin-top: .75rem; font-variant-numeric: tabular-nums; }
+.token-table th, .token-table td { padding: .5rem; text-align: right; white-space: nowrap; }
+.token-table th:first-child { text-align: left; }
+@media (max-width: 650px) { .token-totals { grid-template-columns: 1fr; } .token-calls li { flex-direction: column; } }

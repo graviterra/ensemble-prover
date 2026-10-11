@@ -192,6 +192,12 @@ class FrontierOwner:
                     or producer_id not in authorization.get("producer_ids", [])):
                 raise FrontierRefusal("assigned_independent_report_review_required")
             producer = self.store.job(producer_id)
+            if reviewer.get("assigned_research_subject"):
+                from ..research_subject import ensure_subject
+                subject = ensure_subject(self.store, reviewer)
+                if (subject["report_artifact"] != producer.get("investigation_artifact")
+                        or subject["binding"] != producer.get("frontier_report_basis", {}).get("binding", {})):
+                    return {"status": "stale_assigned_report", "credit_minted": False}
             if producer["worker"] == reviewer["worker"]:
                 raise FrontierRefusal("independent_report_reviewer_required")
             from ..research_findings import assess_delta

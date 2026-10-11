@@ -2593,7 +2593,7 @@ class DeterministicTacticBackend:
                     allow_official_answer_visibility=allow_official_answer_visibility,
                     official_answer_payload_present=official_answer_payload_present,
                 )],
-                allowance_s=float(timeout_s),
+                allowance_s=max(0.0, deadline - time.monotonic()),
                 provider_sequence=int(pattern_context.get("portfolio_provider_sequence", 0)),
                 drain=pattern_context.get("portfolio_drain") is True,
                 max_candidates=max_candidates,

@@ -3086,9 +3086,40 @@ def _balanced_outer_parens(text: str) -> bool:
 
 def _strip_balanced_outer_parens(text: str) -> str:
     out = str(text or "").strip()
-    while _balanced_outer_parens(out):
-        out = out[1:-1].strip()
-    return out
+    if not (out.startswith("(") and out.endswith(")")):
+        return out
+    # Preserve the historical depth scanner's treatment of every group kind,
+    # but match once so redundant wrappers do not require quadratic rescans.
+    opening: list[int] = []
+    matching: dict[int, int] = {}
+    index = 0
+    while index < len(out):
+        quote_end = _lean_quote_end(out, index)
+        if quote_end > index:
+            index = quote_end
+            continue
+        ch = out[index]
+        if ch in "([{⟨":
+            opening.append(index)
+        elif ch in ")]}⟩":
+            if not opening:
+                return out
+            matching[opening.pop()] = index
+            if not opening and index < len(out) - 1:
+                return out
+        index += 1
+    if opening:
+        return out
+    left, right = 0, len(out)
+    while (left < right and out[left] == "(" and out[right - 1] == ")"
+           and matching.get(left) == right - 1):
+        left += 1
+        right -= 1
+        while left < right and out[left].isspace():
+            left += 1
+        while left < right and out[right - 1].isspace():
+            right -= 1
+    return out[left:right]
 
 
 def _find_top_level_operator(text: str, operator: str) -> int:

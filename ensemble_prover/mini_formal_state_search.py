@@ -1327,6 +1327,9 @@ def _formal_policy_temperature(client: Any, cfg: FormalStateSearchConfig) -> Any
 def _formal_policy_identity(client: Any, cfg: FormalStateSearchConfig) -> str:
     """Bind retry memory to the concrete provider policy that created it."""
 
+    from .sampling_controls import is_api_default_temperature_override
+
+    temperature = _formal_policy_temperature(client, cfg)
     raw_configs = _formal_policy_provider_configs(client)
     targets = []
     for provider_cfg in raw_configs:
@@ -1393,7 +1396,9 @@ def _formal_policy_identity(client: Any, cfg: FormalStateSearchConfig) -> str:
         "max_zero_yield_quanta": int(cfg.max_zero_yield_quanta),
         "value_weight": float(cfg.value_weight),
         "novelty_weight": float(cfg.novelty_weight),
-        "model_temperature": _formal_policy_temperature(client, cfg),
+        "model_temperature": (
+            "api_default" if is_api_default_temperature_override(temperature) else temperature
+        ),
     }
     # Preserve existing cloud retry keys exactly. Local deployments need the
     # source distinction because automatic defaults defer to frozen controls.

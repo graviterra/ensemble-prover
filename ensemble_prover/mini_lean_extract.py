@@ -2694,11 +2694,24 @@ def _extract_single_decl_body(chunk: str) -> Optional[str]:
 
 
 def _normalize_statement_for_contract(text: object) -> str:
-    from .proof_graph import graph_exact_statement_text, _graph_compact_lean_whitespace
+    from .proof_graph import (
+        graph_exact_statement_text,
+        _graph_compact_lean_whitespace,
+        _graph_matching_group_index,
+    )
 
     compact = graph_exact_statement_text(str(text or ""))
     if not compact:
         return ""
+    # Declaration extraction protects multiline types with one layout wrapper.
+    # Ignore that wrapper only when selecting a body for checked replay; the
+    # original declaration, proof, and exact contract identity remain intact.
+    if (
+        compact.startswith("(\n")
+        and compact.endswith("\n)")
+        and _graph_matching_group_index(compact, 0) == len(compact) - 1
+    ):
+        compact = compact[2:-2].strip()
     try:
         from ensemble_prover.proof_state import (
             canonicalize_lean_statement_for_identity,

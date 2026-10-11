@@ -9,6 +9,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
+from itertools import chain
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -429,6 +430,20 @@ def _cache_candidate_source_keys(source: str) -> Tuple[str, ...]:
 
 
 @lru_cache(maxsize=32768)
+def _cached_helper_source_declaration(source: str) -> Tuple[str, str, str, str]:
+    """Derive declaration metadata solely from an exact helper body."""
+
+    source = str(source or "").strip()
+    source_statement = helper_decl_statement(source)
+    return (
+        str(helper_decl_name(source) or ""),
+        source_statement,
+        _normalize_cache_statement(source_statement),
+        text_hash(source),
+    )
+
+
+@lru_cache(maxsize=32768)
 def _cached_semantic_record_analysis(
     source: str,
     fallback_statement: str,
@@ -448,10 +463,9 @@ def _cached_semantic_record_analysis(
     """
 
     helper_source = str(source or "").strip()
-    source_statement = helper_decl_statement(helper_source)
-    statement_source = source_statement or str(fallback_statement or "")
-    statement = _normalize_cache_statement(statement_source)
-    source_hash = text_hash(helper_source)
+    _name, source_statement, statement, source_hash = _cached_helper_source_declaration(helper_source)
+    if not source_statement:
+        statement = _normalize_cache_statement(str(fallback_statement or ""))
     if not helper_source or not statement or not source_hash:
         return "field_rejected", source_statement, statement, source_hash, ""
     if not source_statement or graph_statement_non_theorem_reason(source_statement):
@@ -584,8 +598,13 @@ class MiniVerifiedLemmaCache:
         *,
         read_paths: Sequence[Path] = (),
         validated_seed: Optional["MiniVerifiedLemmaCache"] = None,
+        lazy_semantic_admission: bool = False,
         store_failure_metric_sink: Optional[Callable[[str, int], None]] = None,
     ) -> None:
+        self._lazy_semantic_admission = bool(lazy_semantic_admission)
+        # All raw rows and storage fences are observed before selection. These
+        # are advisory candidates; no pending record can enter a proof context.
+        self._pending_ingest_records: List[Tuple[Dict[str, Any], bool, str]] = []
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._deadline_publication_disabled = self._disabled_marker_path(
@@ -627,6 +646,7 @@ class MiniVerifiedLemmaCache:
         self._read_paths: List[Path] = [Path(item) for item in (read_paths or ())]
         self._read_path_line_counts: Dict[str, int] = {}
         self._read_path_snapshots: Dict[str, Tuple[int, int, int, int, int]] = {}
+        self._read_path_prefix_hashes: Dict[str, str] = {}
         self.last_merge_errors: List[str] = []
         self.last_ingest_rejections: List[str] = []
         self.total_ingest_schema_migrated = 0
@@ -699,6 +719,10 @@ class MiniVerifiedLemmaCache:
         if line_count is None or snapshot is None:
             return ""
 
+        if not self._lazy_semantic_admission:
+            seed._admit_pending_records()
+        self._pending_ingest_records = [(_clone_cache_record(record), False, key)
+            for record, _local, key in seed._pending_ingest_records]
         self._by_exact_key = {
             key: [_clone_cache_record(record) for record in records]
             for key, records in seed._by_exact_key.items()
@@ -721,6 +745,8 @@ class MiniVerifiedLemmaCache:
         self._cache_access_seq = int(seed._cache_access_seq or 0)
         self._read_path_line_counts[seed_path_key] = int(line_count or 0)
         self._read_path_snapshots[seed_path_key] = tuple(snapshot)
+        if seed_path_key in seed._read_path_prefix_hashes:
+            self._read_path_prefix_hashes[seed_path_key] = seed._read_path_prefix_hashes[seed_path_key]
         return seed_path_key
 
     # Most-recent N retained; older entries are dropped to prevent
@@ -788,6 +814,7 @@ class MiniVerifiedLemmaCache:
                 "targets": (),
             }
         self.refresh_read_paths()
+        self._admit_pending_records()
         targets: List[Dict[str, Any]] = []
         source_statements = {
             lean_contract_statement_source_key(str(statement or "")): str(statement or "")
@@ -1073,6 +1100,7 @@ class MiniVerifiedLemmaCache:
             self._record_store_failure(quarantine_exc)
         if not quarantined:
             self._disable_deadline_publication_cache(exc)
+        self._pending_ingest_records.clear()
         self._by_exact_key.clear()
         self._by_canonical_statement.clear()
         self._by_theorem_name.clear()
@@ -1086,6 +1114,7 @@ class MiniVerifiedLemmaCache:
         # sibling rows when the empty indexes are rebuilt.
         self._read_path_line_counts.clear()
         self._read_path_snapshots.clear()
+        self._read_path_prefix_hashes.clear()
 
     def _index_stored_record(
         self,
@@ -1386,6 +1415,7 @@ class MiniVerifiedLemmaCache:
             return None
         source_hash = text_hash(source)
         preamble_hash = text_hash(preamble)
+        self._admit_pending_records(source_keys={f"{source_hash}:{preamble_hash}"})
         owner_record_id = self._owner_record_id(
             source_hash,
             preamble_hash,
@@ -1474,6 +1504,7 @@ class MiniVerifiedLemmaCache:
         if cap == 0:
             return []
         self.refresh_read_paths()
+        self._admit_pending_records()
         selected = self._select_lookup_records(
             statement,
             preamble=preamble,
@@ -1586,6 +1617,7 @@ class MiniVerifiedLemmaCache:
         if not name or cap == 0:
             return []
         self.refresh_read_paths()
+        self._admit_pending_records(theorem_name=name)
 
         candidates = [
             _clone_cache_record(record)
@@ -1827,6 +1859,7 @@ class MiniVerifiedLemmaCache:
             return None
         self.refresh_read_paths()
         exact_source = str(source or "").strip()
+        self._admit_pending_records(theorem_name=str(theorem_name or "").strip())
         owner_records = self._by_theorem_name.get(str(theorem_name or "").strip(), ())
         if not any(str(row.get("source") or "").strip() == exact_source for row in owner_records):
             return None
@@ -1841,6 +1874,126 @@ class MiniVerifiedLemmaCache:
             )
             if str(record.get("source") or "").strip() == exact_source
         ), None)
+
+    def advisory_retrieval_records(self) -> List[Dict[str, Any]]:
+        """Cheap discovery metadata; selected rows still require admission.
+
+        This surface never means a source passed semantic or current Lean checks.
+        Every pending source retains its exact digest and global owner aliases.
+        """
+        if self._cache_is_disabled():
+            return []
+        self.refresh_read_paths()
+        rows: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        advisory_bodies: Dict[Tuple[str, str], Tuple[str, str, str]] = {}
+        provenance_bodies: Set[Tuple[str, str]] = set()
+
+        def retain(record: Dict[str, Any], *, provenance: bool, source_hash: str = "") -> None:
+            body = (source_hash or str(record.get("source_hash") or "").strip(),
+                    str(record.get("preamble_hash") or "").strip())
+            key = (*body, str(record.get("theorem_name") or "").strip())
+            if provenance:
+                # Match admission: a current row upgrades the single legacy
+                # body, while duplicate current owner memberships keep their
+                # first discovery identity. Distinct current owners survive.
+                legacy_key = advisory_bodies.pop(body, None)
+                if legacy_key is not None:
+                    rows.pop(legacy_key, None)
+                provenance_bodies.add(body)
+                if key in rows:
+                    return
+            else:
+                # A legacy duplicate cannot introduce an owner membership or
+                # replace a provenance-bearing body's selected declaration.
+                if body in provenance_bodies or body in advisory_bodies:
+                    return
+                advisory_bodies[body] = key
+            copied = _clone_cache_record(record)
+            copied["source_hash"] = body[0]
+            rows[key] = copied
+
+        # Statement lookup deliberately deduplicates bodies. Discovery pins
+        # also identify their owners, whose aliases survive in the owner index.
+        for bucket in (*self._by_canonical_statement.values(), *self._by_theorem_name.values()):
+            for row in bucket:
+                retain(row, provenance=self._record_is_provenance_bearing(row))
+        for row, _local, source_key in self._pending_ingest_records:
+            origin = self._record_origin_schema_version(row)
+            if origin is not None:
+                retain(row, provenance=origin >= self._PROVENANCE_SCHEMA_VERSION,
+                       source_hash=source_key.split(":", 1)[0])
+        return list(rows.values())
+
+    def admit_retrieval_record(self, source_hash: str, preamble_hash: str, *, refresh: bool = True) -> bool:
+        """Apply the full existing semantic policy to one selected exact source."""
+        if self._cache_is_disabled():
+            return False
+        if refresh:
+            self.refresh_read_paths()
+        source_key = f"{source_hash}:{preamble_hash}"
+        self._admit_pending_records(source_keys={source_key})
+        return source_key in self._source_hashes
+
+    def admitted_retrieval_declaration(
+        self,
+        source_hash: str,
+        preamble_hash: str,
+        *,
+        source: str,
+        refresh: bool = True,
+        record_identity: Optional[Mapping[str, str]] = None,
+    ) -> Optional[Dict[str, str]]:
+        """Return source-derived metadata after exact body/environment admission.
+
+        This declaration view carries no replay-closure or ownership receipt.
+        Callers still recheck the full body in their current Lean environment.
+        """
+
+        body = str(source or "").strip()
+        if text_hash(body) != source_hash or not self.admit_retrieval_record(
+            source_hash, preamble_hash, refresh=refresh
+        ):
+            return None
+        if record_identity is not None:
+            owner = str(record_identity.get("theorem_name") or "").strip()
+            owner_records = chain(
+                self._by_theorem_name.get(owner, ()),
+                (
+                    record for bucket in self._by_canonical_statement.values() for record in bucket
+                    if str(record.get("theorem_name") or "").strip() == owner
+                ),
+            )
+            for record in owner_records:
+                if (
+                    str(record.get("source_hash") or "").strip() != source_hash
+                    or str(record.get("preamble_hash") or "").strip() != preamble_hash
+                    or str(record.get("source") or "").strip() != body
+                ):
+                    continue
+                identity = record.get("_retrieval_advisory_identity")
+                if not isinstance(identity, Mapping) or any(
+                    str(identity.get(key) or "").strip() != str(record.get(key) or "").strip()
+                    for key in ("source_hash", "preamble_hash", "theorem_name")
+                ):
+                    identity = record
+                if (
+                    str(identity.get("name") or "").strip() == record_identity.get("name", "")
+                    and str(identity.get("statement_preview") or identity.get("statement") or "").strip()
+                    == record_identity.get("statement", "")
+                ):
+                    break
+            else:
+                return None
+        name, _source_statement, statement, actual_hash = _cached_helper_source_declaration(body)
+        if not name or not statement:
+            return None
+        return {
+            "name": name,
+            "statement": statement,
+            "source": body,
+            "source_hash": actual_hash,
+            "preamble_hash": preamble_hash,
+        }
 
     def retrieval_records(self, *, max_records: Optional[int] = None) -> List[Dict[str, Any]]:
         """Return unique verified bodies for semantic discovery.
@@ -1860,6 +2013,7 @@ class MiniVerifiedLemmaCache:
         if cap == 0:
             return []
         self.refresh_read_paths()
+        self._admit_pending_records()
         candidates: List[Dict[str, Any]] = []
         seen_source_hashes: Set[str] = set()
         for statement_hash in sorted(self._by_canonical_statement):
@@ -2357,9 +2511,32 @@ class MiniVerifiedLemmaCache:
         exact_key = f"{statement_hash}:{preamble_hash}"
         canonical_key = statement_hash
         migrated = _clone_cache_record(record)
+        # Preserve the discovery pin while replacing untrusted display fields.
+        # This identity is advisory and bound to the admitted body, environment,
+        # and owner; it never conveys replay or current-environment authority.
+        identity = record.get("_retrieval_advisory_identity")
+        if not isinstance(identity, dict) or any(
+            str(identity.get(key) or "").strip() != expected
+            for key, expected in (
+                ("source_hash", source_hash),
+                ("preamble_hash", preamble_hash),
+                ("theorem_name", theorem_name),
+            )
+        ):
+            identity = {
+                "name": str(record.get("name") or "").strip(),
+                "statement": str(record.get("statement_preview") or record.get("statement") or "").strip(),
+                "source_hash": source_hash,
+                "preamble_hash": preamble_hash,
+                "theorem_name": theorem_name,
+            }
+        migrated["_retrieval_advisory_identity"] = _clone_cache_record(identity)
+        migrated["name"] = _cached_helper_source_declaration(source)[0]
         migrated["statement"] = statement
+        migrated["statement_preview"] = _compact_search_text(statement, limit=4000)
         migrated["statement_hash"] = statement_hash
         migrated["source_hash"] = source_hash
+        migrated["preamble_hash"] = preamble_hash
         migrated["theorem_name"] = theorem_name
         provenance_bearing = (
             origin_schema_version >= self._PROVENANCE_SCHEMA_VERSION
@@ -2380,6 +2557,48 @@ class MiniVerifiedLemmaCache:
         return exact_key, canonical_key, source_key, owner_record_id, migrated
 
     def _ingest_record(self, record: Dict[str, Any], *, local: bool = False) -> bool:
+        if self._lazy_semantic_admission:
+            if self._record_origin_schema_version(record) is None:
+                self._note_ingest("schema_rejected", f"schema_unmigratable v{record.get('schema_version')!r}")
+                return False
+            source = str(record.get("source") or "").strip()
+            preamble = str(record.get("preamble_hash") or "").strip()
+            if not source or not preamble:
+                self._note_ingest("field_rejected", "missing source/preamble")
+                return False
+            source_key = f"{text_hash(source)}:{preamble}"
+            self._pending_ingest_records.append((_clone_cache_record(record), local, source_key))
+            # A selected old row must immediately see a foreign provenance
+            # upgrade for the same exact source. Never hide that global lineage.
+            if source_key in self._source_hashes:
+                self._admit_pending_records(source_keys={source_key})
+            return True
+        return self._ingest_record_validated(record, local=local)
+
+    def _admit_pending_records(self, *, theorem_name: Optional[str] = None,
+                               source_keys: Optional[Set[str]] = None) -> None:
+        if not self._pending_ingest_records or self._cache_is_disabled():
+            return
+        selected = set(source_keys or ())
+        if theorem_name is not None:
+            selected.update(key for record, _local, key in self._pending_ingest_records
+                            if str(record.get("theorem_name") or "").strip() == theorem_name)
+        all_rows = theorem_name is None and source_keys is None
+        pending: List[Tuple[Dict[str, Any], bool, str]] = []
+        retained: List[Tuple[Dict[str, Any], bool, str]] = []
+        for item in self._pending_ingest_records:
+            (pending if all_rows or item[2] in selected else retained).append(item)
+        self._pending_ingest_records = retained
+        for index, (record, local, _key) in enumerate(pending):
+            try:
+                self._ingest_record_validated(record, local=local)
+            except BaseException:
+                # Retry unprocessed rows after interruption; never silently lose
+                # the latest provenance-bearing row behind an older index entry.
+                self._pending_ingest_records = pending[index:] + self._pending_ingest_records
+                raise
+
+    def _ingest_record_validated(self, record: Dict[str, Any], *, local: bool = False) -> bool:
         keys = self._record_ingest_keys(
             record,
             dedupe_owner_records=not local,
@@ -2469,6 +2688,7 @@ class MiniVerifiedLemmaCache:
             if keys is None:
                 continue
             _exact_key, _canonical_key, source_key, owner_record_id, migrated = keys
+            self._admit_pending_records(source_keys={source_key})
             if owner_record_id in self._owner_record_ids:
                 self._note_ingest(
                     "owner_deduped",
@@ -2537,6 +2757,8 @@ class MiniVerifiedLemmaCache:
         self._local_owner_record_ids.clear()
         self._read_path_line_counts.clear()
         self._read_path_snapshots.clear()
+        self._read_path_prefix_hashes.clear()
+        self._pending_ingest_records.clear()
 
     def _reload_all_storage(self) -> int:
         """Rebuild indexes after a read-through source was replaced."""
@@ -2563,6 +2785,7 @@ class MiniVerifiedLemmaCache:
                     rebuild_on_replacement=False,
                 )
             self._load(self.path)
+            self._admit_pending_records(source_keys=known_source_keys)
         finally:
             self._defer_cache_bucket_trim = False
             self._storage_reload_depth -= 1
@@ -2580,21 +2803,30 @@ class MiniVerifiedLemmaCache:
         load_path = Path(path)
         key = self._read_path_key(load_path)
         if not load_path.exists():
-            return 0
+            return self._reload_all_storage() if key in self._read_path_snapshots and rebuild_on_replacement else 0
         try:
             trusted_snapshot = self._read_trusted_locked_snapshot(load_path)
         except Exception:
-            return 0
+            trusted_snapshot = None
         if trusted_snapshot is None:
-            return 0
+            # Losing a source's trust revokes already indexed candidates too.
+            return self._reload_all_storage() if key in self._read_path_snapshots and rebuild_on_replacement else 0
         trusted_text, snapshot = trusted_snapshot
+        previous_snapshot = self._read_path_snapshots.get(key)
+        previous_prefix = self._read_path_prefix_hashes.get(key)
+        if snapshot == previous_snapshot and previous_prefix is not None:
+            return 0
         lines = trusted_text.splitlines()
         start = int(self._read_path_line_counts.get(key, 0) or 0)
-        previous_snapshot = self._read_path_snapshots.get(key)
         replaced = bool(
             previous_snapshot is not None
             and (
                 snapshot[:2] != previous_snapshot[:2]
+                or start > len(lines)
+                or (
+                    previous_prefix is not None
+                    and previous_prefix != text_hash("\n".join(lines[:start]))
+                )
                 or snapshot[2] < previous_snapshot[2]
                 or (
                     snapshot[2] == previous_snapshot[2]
@@ -2628,6 +2860,7 @@ class MiniVerifiedLemmaCache:
                 loaded += 1
         self._read_path_line_counts[key] = next_start
         self._read_path_snapshots[key] = snapshot
+        self._read_path_prefix_hashes[key] = text_hash("\n".join(lines[:next_start]))
         return loaded
 
     def _load(self, path: Path) -> None:
@@ -2666,6 +2899,7 @@ class MiniVerifiedLemmaCache:
             self._ingest_record(record, local=True)
         self._read_path_line_counts[key] = next_start
         self._read_path_snapshots[key] = snapshot
+        self._read_path_prefix_hashes[key] = text_hash("\n".join(lines[:next_start]))
 
 
 def cache_owner_theorem_name(dossier: Any) -> str:
@@ -2991,6 +3225,7 @@ def _make_proof_state_cache(
                 read_paths.append(sibling_path)
     return MiniVerifiedLemmaCache(
         cache_path,
+        lazy_semantic_admission=True,
         read_paths=tuple(dict.fromkeys(read_paths)),
         validated_seed=validated_seed,
         store_failure_metric_sink=store_failure_metric_sink,
