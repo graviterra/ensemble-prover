@@ -16,7 +16,11 @@ _MAX_BYTES = 16 * 1024 * 1024
 _MIN_BYTES = 4096
 
 
-def _read_blob(directory: Path, digest: str) -> Any:
+def _read_blob_bytes(
+    directory: Path, digest: str, *, max_bytes: int = _MAX_BYTES,
+) -> bytes:
+    """Read authenticated payload bytes within the caller's remaining budget."""
+    limit = min(_MAX_BYTES, max(0, max_bytes))
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ValueError("invalid trace payload identity")
     parent = directory / "trace_payloads"
@@ -27,10 +31,14 @@ def _read_blob(directory: Path, digest: str) -> Any:
         import stat
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError("trace payload is not a regular file")
-        raw = stream.read(_MAX_BYTES + 1)
-    if len(raw) > _MAX_BYTES or hashlib.sha256(raw).hexdigest() != digest:
+        raw = stream.read(limit + 1)
+    if len(raw) > limit or hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError("trace payload hash or size mismatch")
-    return json.loads(raw)
+    return raw
+
+
+def _read_blob(directory: Path, digest: str) -> Any:
+    return json.loads(_read_blob_bytes(directory, digest))
 
 
 def expand_trace_payloads(record: Mapping[str, Any], directory: Path) -> dict[str, Any]:

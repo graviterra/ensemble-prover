@@ -657,12 +657,17 @@ class NativeResearchCoordinator:
                 return delivery_changed
             if state.get("idle_research") is not None and not state.get("grant"):
                 try:
-                    if state["idle_research"] == self._idle_research_key(session):
+                    if state["idle_research"] == self._idle_research_key(session, objections=objections):
                         return delivery_changed
-                except (OSError, ValueError, RuntimeError, sqlite3.Error):
-                    # A failed optional readiness hint cannot suppress work.
-                    pass
+                except (OSError, ValueError, RuntimeError, sqlite3.Error,
+                        KeyError, TypeError, AttributeError, OverflowError) as exc:
+                    state.pop("idle_research", None)
+                    state.pop("research_pause", None)
+                    _event(session, "research_unavailable", error_type=type(exc).__name__)
+                    release_capacity_reserve(session, "research_unavailable")
+                    return delivery_changed
                 state.pop("idle_research", None)
+                state.pop("research_pause", None)
             state["last_trigger_work"] = {key: state[key] for key in (
                 "paid_actions", "requests_since_audit", "requests_since_verified_progress")}
             state["paid_actions"] = 0
@@ -682,40 +687,199 @@ class NativeResearchCoordinator:
                 release_capacity_reserve(session, "research_unavailable")
                 return False
 
-    def _idle_research_key(self, session: Any) -> str | None:
-        """Wake an idle ledger for changed evidence, eligibility, or a due retry.
+    def _idle_ledger_snapshot(self) -> dict[str, Any] | None:
+        """Cache unchanged scheduling rows, including writes by another owner.
 
-        Project scheduling fields in SQLite rather than repeatedly decoding
-        archived transcripts just to decide that nothing has changed.
+        Local writes change total_changes; other connections change data_version.
+        Deadline comparisons remain outside the cache so time can wake work.
         """
         if self.store is None:
             return None
-        now = time.time()
+        connection = self.store._connection
+        cacheable = not connection.in_transaction
+        version = (connection.total_changes, connection.execute("PRAGMA data_version").fetchone()[0])
+        cached = getattr(self, "_idle_ledger_cache", None)
+        if (cacheable and cached is not None and cached["store"] is self.store
+                and cached["version"] == version):
+            return cached
         jobs = []
-        for row in self.store._connection.execute(
-            "SELECT job_id, status, json_extract(record, '$.turn'), "
-            "json_extract(record, '$.last_error'), json_extract(record, '$.response'), "
-            "json_array_length(record, '$.inbox'), "
-            "json_array_length(record, '$.late_research_candidates'), "
-            "json_extract(record, '$.retry_after') FROM discovery_jobs ORDER BY rowid"
-        ):
-            jobs.append([*row[:-1], row[-1], row[-1] is None or row[-1] <= now])
-        revisions = [tuple(row) for row in self.store._connection.execute(
-            "SELECT record_id, revision FROM frontier_records WHERE kind = 'campaign' ORDER BY record_id"
-        )]
-        timers = [(*row, row[-1] <= now) for row in self.store._connection.execute(
-            "SELECT frontier_records.record_id, timer.fullkey, timer.atom "
-            "FROM frontier_records, json_tree(frontier_records.record) AS timer "
-            "WHERE kind = 'campaign' AND timer.key IN ('waiting_until', 'expires_at') "
-            "AND timer.type IN ('integer', 'real') ORDER BY frontier_records.record_id, timer.fullkey"
-        )]
-        return _hash({
+        from .research_claims.frontier.persist import campaign_id, load_campaign
+        from .research_claims.frontier.status import inconclusive_pause, validate_scheduling_data
+        from .research_claims.store import ResearchStoreError
+
+        with self.store.read_snapshot():
+            jobs = [tuple(row) for row in connection.execute(
+                "SELECT job_id, status, json_extract(record, '$.turn'), "
+                "json_extract(record, '$.last_error'), json_extract(record, '$.response'), "
+                "json_extract(record, '$.inbox'), json_extract(record, '$.late_research_candidates'), "
+                "json_extract(record, '$.question'), json_extract(record, '$.research_control'), "
+                "json_extract(record, '$.role'), json_extract(record, '$.native_target_claim_id'), "
+                "json_extract(record, '$.native_context_binding'), json_extract(record, '$.parent_job'), "
+                "json_extract(record, '$.claim_id'), json_extract(record, '$.revision'), "
+                "json_extract(record, '$.evidence_id'), json_extract(record, '$.strategy_review_id'), "
+                "json_type(record, '$.retry_after'), "
+                "json_extract(record, '$.retry_after') FROM discovery_jobs ORDER BY rowid"
+            )]
+            for job in jobs:
+                timer_type, deadline = job[-2:]
+                if (timer_type not in (None, "null", "integer", "real")
+                        or deadline is not None and not (
+                            type(deadline) is int
+                            or type(deadline) is float and math.isfinite(deadline)
+                        )):
+                    raise ResearchStoreError("invalid research job retry deadline")
+            campaigns = list(connection.execute(
+                "SELECT record_id, revision FROM frontier_records "
+                "WHERE kind = 'campaign' ORDER BY record_id"
+            ))
+            run = self.store.run_record(scheduling=True)
+            strategy = run.get("strategy_review") or {}
+            owner_id = strategy.get("owner_id")
+            pause = None
+            if owner_id is not None and (strategy.get("frontier_research") or {}).get("mode", "off") != "off":
+                campaign = load_campaign(self.store, owner_id)
+                if campaign is None:
+                    raise ResearchStoreError("missing frontier campaign")
+                validate_scheduling_data(campaign)
+                try:
+                    pause = inconclusive_pause(campaign)
+                except (KeyError, TypeError, AttributeError) as exc:
+                    raise ResearchStoreError("invalid frontier campaign scheduling data") from exc
+                if pause is not None:
+                    pause = {**pause, "owner_id": owner_id, "campaign_id": campaign_id(owner_id)}
+            timers = [tuple(row) for row in connection.execute(
+                "SELECT frontier_records.record_id, timer.fullkey, timer.atom "
+                "FROM frontier_records, json_tree(frontier_records.record) AS timer "
+                "WHERE kind = 'campaign' AND timer.key IN ('waiting_until', 'expires_at') "
+                "AND timer.type IN ('integer', 'real') ORDER BY frontier_records.record_id, timer.fullkey"
+            )]
+        snapshot = {
+            "store": self.store, "version": version,
+            "identity": _hash({"jobs": jobs, "owner_id": owner_id,
+                               "targets": run.get("native_mathematical_targets", {}),
+                               "job_contexts": run.get("native_job_contexts", {}),
+                               "reviews": strategy.get("reviews", {}),
+                               "frontier_revisions": [tuple(row) for row in campaigns],
+                               "frontier_timers": timers}),
+            "retry_times": [row[-1] for row in jobs], "timer_times": [row[-1] for row in timers],
+            "owner_id": owner_id, "targets": run.get("native_mathematical_targets", {}),
+            "pause": pause,
+        }
+        if cacheable:
+            self._idle_ledger_cache = snapshot
+        return snapshot
+
+    def _idle_research_key(self, session: Any, *, objections: list[dict[str, Any]] | None = None) -> str | None:
+        """Wake for admissible change, without treating proof churn as a permit."""
+        snapshot = self._idle_ledger_snapshot()
+        if snapshot is None:
+            return None
+        return self._idle_snapshot_key(session, snapshot, now=time.time(), objections=objections)
+
+    def _idle_pause(self, session: Any, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+        pause = snapshot["pause"]
+        binding = self._target_context_binding(session.conv)
+        if (pause is not None and pause["owner_id"] == snapshot["owner_id"]
+                and pause["target_claim_id"] == snapshot["targets"].get(binding)
+                and pause["target_context_binding"] == binding):
+            return pause
+        return None
+
+    def _idle_proof_inputs(self, session: Any, *,
+                           objections: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Freeze the proof scope examined by a research round."""
+        return {
             "target_context": self._target_context_binding(session.conv),
             "proof_boundary": self._state(session).get("last_boundary"),
             "proof_requests": self._state(session).get("requests_since_verified_progress"),
-            "objections": self._objections_for(session.conv),
-            "jobs": jobs, "frontier_revisions": revisions, "frontier_timers": timers,
+            "objections": self._objections_for(session.conv) if objections is None else objections,
+        }
+
+    def _idle_snapshot_key(self, session: Any, snapshot: dict[str, Any], *, now: float,
+                           objections: list[dict[str, Any]] | None = None,
+                           proof_inputs: dict[str, Any] | None = None) -> str:
+        inputs = dict(proof_inputs if proof_inputs is not None else
+                      self._idle_proof_inputs(session, objections=objections))
+        paused = self._idle_pause(session, snapshot) is not None
+        if paused:
+            # Keep every request in its journal. Only the idle wake identity
+            # ignores repeated receipt IDs for an otherwise identical obstacle.
+            inputs["objections"] = sorted({
+                _json({key: value for key, value in item.items() if key != "request_id"})
+                for item in inputs["objections"]
+            })
+            inputs.update(proof_boundary=None, proof_requests=None)
+        return _hash({
+            **inputs, "ledger": snapshot["identity"],
+            "retries_due": [value is None or value <= now for value in snapshot["retry_times"]],
+            "timers_due": [value <= now for value in snapshot["timer_times"]],
         })
+
+    def _observe_idle_research(
+        self, session: Any, proof_inputs: dict[str, Any],
+    ) -> tuple[str, dict[str, Any] | None] | None:
+        """Certify adaptive idle work and its wake identity in one transaction.
+
+        Recheck through the scheduling owner: independent reviews and paid
+        responses can be ready even when an investigation is policy-paused.
+        Retain this observation through accounting instead of absorbing later
+        arrivals into the idle baseline. Deadlines use the observation's time.
+        """
+        from .research_claims.frontier.hooks import mode_of
+        from .research_claims.research_control import native_job_context
+
+        store = self._require_store()
+        loop = self._require_loop()
+        with store.atomic():
+            # Validate the optional campaign projection before scheduling reads.
+            snapshot = self._idle_ledger_snapshot()
+            now = time.time()
+            run = store.run_record(scheduling=True)
+            strategy = run.get("strategy_review") or {}
+            adaptive = mode_of(strategy) == "adaptive"
+            if adaptive and (run["status"] != "running" or store.stop_reason(run)):
+                # A future grant can reactivate waiting reviews. Refusal by an
+                # exhausted grant says nothing about that future readiness.
+                return None
+            if not adaptive:
+                # Legacy workers retain proof-boundary wakeups and their own
+                # no-ready observation; policy pause suppression is adaptive.
+                return self._certified_idle_key(session, snapshot, now, proof_inputs)
+            if any(review["status"] == "review_pending" and review["job_id"] is None
+                   for review in strategy.get("reviews", {}).values()):
+                return None
+            if loop.strategy is not None:
+                if loop.strategy.ensure_work():
+                    return None
+                run = store.run_record(scheduling=True)
+            if run["status"] != "running" or store.stop_reason(run):
+                return None
+            jobs = {job["job_id"]: job for job in store.jobs()}
+            for job in jobs.values():
+                if (job["role"] == "formalization"
+                        or loop.native_job_target(job, jobs) != run.get("native_active_target_claim_id")
+                        or (native_job_context(
+                            job, jobs, recorded_contexts=run.get("native_job_contexts", {}))
+                            != self._target_context_binding(session.conv))):
+                    continue
+                if (job["status"] == "responded"
+                        or job["status"] == "pending" and job.get("retry_after", 0) <= now):
+                    return None
+            snapshot = self._idle_ledger_snapshot()
+            return self._certified_idle_key(session, snapshot, now, proof_inputs)
+
+    def _certified_idle_key(
+        self, session: Any, snapshot: dict[str, Any] | None,
+        now: float, proof_inputs: dict[str, Any],
+    ) -> tuple[str, dict[str, Any] | None] | None:
+        if snapshot is None:
+            return None
+        key = self._idle_snapshot_key(session, snapshot, now=now, proof_inputs=proof_inputs)
+        if key != self._idle_snapshot_key(session, snapshot, now=now):
+            # New inputs must first reach a worker's checkpoint, even if the
+            # existing investigation remains paused under the same allowance.
+            return None
+        return key, self._idle_pause(session, snapshot)
 
     def _directory(self) -> Path:
         stable_root = getattr(self.registry, "registry_root", None)
@@ -1196,13 +1360,14 @@ class NativeResearchCoordinator:
             return False
         timeout = _native_quantum_seconds(donor)
         checkpoint = self._capture(session, reason)
+        proof_inputs = deepcopy(self._idle_proof_inputs(session))
         claim_id = self._research_claim(session)
         grant = {"id": uuid.uuid4().hex, "action_id": donor.action_id,
                  "requests": donor.request_limit, "accounted": 0,
                  "target_statement": self._target(session.conv),
                  "target_context_binding": self._target_context_binding(session.conv),
                  "target_claim_id": claim_id,
-                 "objections": self._objections_for(session.conv),
+                 "objections": deepcopy(proof_inputs["objections"]),
                  "expires_at": time.time() + timeout,
                  "invocation_debit_tracked": True,
                  "funding_phase": "precommit",
@@ -1293,6 +1458,7 @@ class NativeResearchCoordinator:
         permitted = _allowed(session)
         pending: dict[str, Any] = {
             "session": session, "donor": donor, "grant": grant, "elapsed": 0.0,
+            "proof_inputs": proof_inputs,
         }
 
         async def advance() -> dict[str, Any]:
@@ -1395,6 +1561,25 @@ class NativeResearchCoordinator:
                 grant = pending["grant"]
                 pending["settlement_stage"] = "state_binding"
                 state = self._state(session)
+                if ("idle_observation" not in pending
+                        and logical_updates and self.active and _allowed(session)
+                        and not self._session_released(session)
+                        and result.get("reason") in {"no_ready_work", "research_allocation_deferred"}
+                        and result.get("paid_dispatches", 0) == 0
+                        and not result.get("renewed_grant_can_resume", False)):
+                    try:
+                        # Keep the complete decision across checkpoint retries;
+                        # reconciliation closes this grant's admission window.
+                        pending["idle_observation"] = self._observe_idle_research(
+                            session, pending["proof_inputs"],
+                        )
+                    except (OSError, ValueError, RuntimeError, sqlite3.Error,
+                        KeyError, TypeError, AttributeError, OverflowError) as exc:
+                        # Hint failure must not interrupt paid accounting or
+                        # leave a completed grant pending settlement.
+                        _event(session, "research_unavailable", error_type=type(exc).__name__)
+                        pending["idle_observation"] = None
+                idle_observation = pending.get("idle_observation")
                 pending["settlement_stage"] = "elapsed_accounting"
                 uncharged = max(0.0, elapsed - float(grant.get("elapsed_accounted", 0.0)))
                 charge_elapsed(
@@ -1415,12 +1600,16 @@ class NativeResearchCoordinator:
                     self._settle_answered_objections(session, grant)
                 if logical_updates and deliver and _allowed(session):
                     self._deliver(session)
-                if logical_updates and (result.get("reason") in {"no_ready_work", "research_allocation_deferred"}
-                        and result.get("paid_dispatches", 0) == 0
-                        and not result.get("renewed_grant_can_resume", False)):
-                    state["idle_research"] = self._idle_research_key(session)
+                if logical_updates and idle_observation is not None:
+                    state["idle_research"], pause = idle_observation
+                    if pause is not None:
+                        state["research_pause"] = pause
+                        _event(session, "research_paused", **pause)
+                    else:
+                        state.pop("research_pause", None)
                 elif logical_updates:
                     state.pop("idle_research", None)
+                    state.pop("research_pause", None)
                 pending["settlement_stage"] = "checkpoint"
                 if checkpoint and logical_updates:
                     await _checkpoint(session)
@@ -1944,6 +2133,16 @@ class NativeResearchCoordinator:
                    "proof_compute_examples_enabled": getattr(conv, "_native_compute_examples_enabled", None),
                    "active_target": self._target(conv),
                    "policy": "You may request_native_research when an ancestor claim, counting bound, or method is unsupported. Supply the exact bottleneck and source evidence. The run investigates at a committed action boundary and resumes under its existing budget. Use read_native_research_artifact for full archived arguments."}
+        if self._session is not None and self._session.conv is conv:
+            pause = getattr(self._session, "native_research_state", {}).get("research_pause")
+            if isinstance(pause, dict):
+                try:
+                    snapshot = self._idle_ledger_snapshot()
+                    if snapshot is not None and pause == self._idle_pause(self._session, snapshot):
+                        context["research_pause"] = pause
+                except (OSError, ValueError, RuntimeError, sqlite3.Error,
+                        KeyError, TypeError, AttributeError, OverflowError):
+                    pass
         if getattr(conv, "goal_statement", None) != self.pin["statement"]:
             context["original_target"] = self.pin["statement"]
         if guidance is None and self.guidance is not None:

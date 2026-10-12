@@ -853,6 +853,7 @@ def load_jsonl_events(path: str | Path) -> Tuple[List[Dict[str, Any]], int]:
             if isinstance(record, dict):
                 from .trace_payloads import expand_trace_payloads
                 record = expand_trace_payloads(record, trace_path.parent)
+                _validate_finite_json_numbers(record)
         except (
             OSError,
             json.JSONDecodeError,
@@ -932,9 +933,15 @@ def _valid_activation_artifact(
     turns_path: Optional[Path] = None,
     summary_path: Optional[Path] = None,
 ) -> bool:
+    if (
+        value.get("watchdog_bounded_recovery")
+        and value.get("watchdog_payload_recovery_version") != 1
+    ):
+        return False
     if bool(
         value.get("activation_counts_are_lower_bound")
         or value.get("watchdog_recovery_scan_truncated")
+        or _as_int(value.get("malformed_event_count")) > 0
     ):
         return False
     if _as_int(value.get("activation_schema_version")) != ACTIVATION_SCHEMA_VERSION:
@@ -1046,7 +1053,13 @@ def build_activation_telemetry_for_run(
             continue
         if not _fingerprints_match(summary_before, summary_after):
             continue
-        telemetry.update(turns_before)
+        if telemetry["malformed_event_count"] or not turns_before:
+            # A full file scan can still omit unreadable referenced payloads
+            # or malformed rows. Rebuilding partial recovery must not erase
+            # its incompleteness merely because the trace itself is unchanged.
+            telemetry["activation_counts_are_lower_bound"] = True
+        else:
+            telemetry.update(turns_before)
         if disk_summary_valid and (
             summary_override is None
             or _json_values_identical(disk_summary, summary_override)

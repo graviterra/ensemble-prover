@@ -2,9 +2,97 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from .approaches import resume_packet, select_approach
+
+
+def validate_scheduling_data(state: dict[str, Any]) -> None:
+    """Reject malformed scheduling inputs before the optional readiness check.
+
+    Version validation alone does not establish container or policy types.
+    Validation grants no permits and leaves every stored allowance unchanged.
+    """
+    from ..store import ResearchStoreError
+    from .config import DEFAULTS, normalize_config
+
+    def require(condition: bool, field: str) -> None:
+        if not condition:
+            raise ResearchStoreError("invalid frontier campaign scheduling data: " + field)
+
+    policy = state.get("policy")
+    require(isinstance(policy, dict) and set(DEFAULTS) <= policy.keys(), "policy")
+    try:
+        normalize_config(policy)
+    except ValueError as exc:
+        raise ResearchStoreError("invalid frontier campaign scheduling policy") from exc
+    for field in ("approaches", "questions", "routes", "obligations", "reductions",
+                  "permits", "claims", "entitlements", "evidence_events", "lanes", "retries"):
+        records = state.get(field)
+        require(isinstance(records, dict), field)
+        require(all(isinstance(record, dict) for record in records.values()), field)
+    for approach in state["approaches"].values():
+        if approach.get("status") == "waiting":
+            deadline = approach.get("waiting_until")
+            require(deadline is None or type(deadline) is int
+                    or type(deadline) is float and math.isfinite(deadline),
+                    "approaches.waiting_until")
+    for claim in state["claims"].values():
+        if claim.get("status") == "held":
+            expiry = claim.get("expires_at")
+            require(type(expiry) is int or type(expiry) is float and math.isfinite(expiry),
+                    "claims.expires_at")
+    for field in ("resident", "service_queue", "admission_queue"):
+        items = state.get(field)
+        require(isinstance(items, list), field)
+        require(all(isinstance(item, str) and item in state["approaches"] for item in items), field)
+    phase = state.get("phase")
+    require(isinstance(phase, dict), "phase")
+    require(type(phase.get("open")) is bool, "phase.open")
+    require(type(phase.get("reviews_since_work")) is int
+            and phase["reviews_since_work"] >= 0, "phase.reviews_since_work")
+    for field in ("frozen_receipts", "acknowledged", "pending_review"):
+        require(isinstance(phase.get(field), list)
+                and all(isinstance(item, str) for item in phase[field]), "phase." + field)
+    require(isinstance(phase.get("tails"), dict), "phase.tails")
+    for field in ("lanes", "retries"):
+        for record in state[field].values():
+            for flag in ("paused", "recovery_open"):
+                if flag in record:
+                    require(type(record[flag]) is bool, field + "." + flag)
+
+
+def inconclusive_pause(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Explain an exhausted current investigation without granting admission."""
+    if state["policy"]["mode"] != "adaptive" or select_approach(state)[0] is not None:
+        return None
+    target = state.get("native_active_target_claim_id")
+    binding = {"target": target, "context": state.get("native_active_target_context_binding")}
+    paused = []
+    for approach in state["approaches"].values():
+        if target is not None and binding not in approach.get(
+            "native_scope_bindings", [{"target": state["root"]["target_id"], "context": None}],
+        ):
+            continue
+        if (approach["status"] == "paused"
+                and approach.get("resume_condition") == "changed_investigation"
+                and approach["inconclusive_extensions"] > state["policy"]["max_no_progress"]):
+            paused.append({
+                "approach_id": approach["approach_id"],
+                "inconclusive_extensions": approach["inconclusive_extensions"],
+                "resume_condition": approach["resume_condition"],
+            })
+    if not paused:
+        return None
+    return {
+        "reason": "inconclusive_allowance_exhausted",
+        "max_no_progress": state["policy"]["max_no_progress"],
+        "approaches": paused,
+        "target_claim_id": target,
+        "target_context_binding": state.get("native_active_target_context_binding"),
+        "instruction": "Research is paused pending an admitted investigation change or independently reviewed progress. New proof requests, renamed questions, and helper counts do not renew its allowance. Existing proof work continues.",
+    }
 
 
 def _approach_view(state: dict[str, Any], approach: dict[str, Any]) -> dict[str, Any]:
@@ -51,6 +139,7 @@ def project(state: dict[str, Any]) -> dict[str, Any]:
             "route_id": active.get("route_id"),
         },
         "approaches": [_approach_view(state, item) for item in state["approaches"].values()],
+        "research_pause": inconclusive_pause(state),
         "next_investigation": None if selected_approach is None else {
             "approach_id": selected,
             "reason": reason,

@@ -17,6 +17,7 @@ they cannot be moved across event-loop or process-spawn boundaries safely.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -37,6 +38,12 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from ..subprocess_environment import trusted_provider_worker_environment
 from .usage_recovery import _is_finite_number
+from .supervisor_completion import (
+    SupervisorCompletionChannel,
+    _WorkerCleanupIncomplete,
+    _WorkerCleanupState,
+    adopt_supervisor_completion,
+)
 from ..local_inference.network_policy import propagate_owned_network_policy, restore_owned_worker_network_policy
 
 
@@ -51,6 +58,7 @@ _WATCHDOG_HARD_OPERATION_DEADLINES_ENV = (
 _WATCHDOG_SHUTDOWN_TIMEOUT_ENV = "ENSEMBLE_MINI_WATCHDOG_SHUTDOWN_TIMEOUT_S"
 _WATCHDOG_STARTUP_TIMEOUT_ENV = "ENSEMBLE_MINI_WATCHDOG_STARTUP_TIMEOUT_S"
 _WATCHDOG_DEFER_EXPORT_ENV = "ENSEMBLE_MINI_DEFER_SOLVED_EXPORT"
+WORKER_CLEANUP_INCOMPLETE_EXIT_CODE = 125
 _STAGED_SOLUTION_RECEIPT_NAME = "pre_export_solved_receipt.json"
 _STAGED_SOLUTION_SUMMARY_NAME = "pre_export_solved_summary.json"
 _WRITE_LOCK = threading.Lock()
@@ -555,15 +563,61 @@ def _restore_child_subreaper(prior: int) -> None:
         pass
 
 
-def _proc_identity(pid: int) -> Optional[Tuple[int, int]]:
-    """Return ``(pid, starttime)`` so PID reuse cannot redirect a signal."""
+def _proc_stat_observation(
+    pid: int,
+    *,
+    include_zombies: bool = True,
+) -> Tuple[Optional[Tuple[int, int, int]], bool]:
+    """Return ``(pid, starttime, ppid)`` and definitive absence, from one read.
+
+    Permission failures and malformed reads leave identity unknown. They must
+    not erase the supervisor's ownership of a process that may still be alive.
+    """
 
     try:
-        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
-        tail = raw[raw.rfind(")") + 2 :].split()
-        return int(pid), int(tail[19])
-    except (OSError, ValueError, IndexError):
-        return None
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(
+            encoding="utf-8", errors="surrogateescape",
+        )
+        prefix, separator, _command = raw.partition(" (")
+        closing = raw.rfind(")")
+        if not separator or prefix != str(int(pid)) or closing <= len(prefix) + 1:
+            return None, False
+        if raw[closing + 1 : closing + 2] != " ":
+            return None, False
+        tail = raw[closing + 2 :].split()
+        if (len(tail) < 50
+                or tail[0] not in {"R", "S", "D", "Z", "T", "t", "X", "x", "K", "W", "P", "I"}):
+            return None, False
+        # Validate the numeric fields so a missing state or separator cannot
+        # shift a different numeric field into the process start time.
+        for value in tail[1:]:
+            int(value)
+        started = int(tail[19])
+        parent = int(tail[1])
+        if started < 0 or parent < 0:
+            return None, False
+        if not include_zombies and tail[0] in {"Z", "X", "x"}:
+            return None, True
+        return (int(pid), started, parent), False
+    except OSError as exc:
+        return None, exc.errno in {errno.ENOENT, errno.ESRCH}
+    except (ValueError, IndexError):
+        return None, False
+
+
+def _proc_identity_observation(
+    pid: int,
+) -> Tuple[Optional[Tuple[int, int]], bool]:
+    """Return identity and definitive absence; retain unknown observations."""
+
+    observation, absent = _proc_stat_observation(pid)
+    return (observation[:2] if observation is not None else None), absent
+
+
+def _proc_identity(pid: int) -> Optional[Tuple[int, int]]:
+    """Observe ``(pid, starttime)``; signaling also requires a bound handle."""
+
+    return _proc_identity_observation(pid)[0]
 
 
 def _proc_child_pids(pid: int) -> Tuple[int, ...]:
@@ -573,28 +627,29 @@ def _proc_child_pids(pid: int) -> Tuple[int, ...]:
     descendant of the worker or is reparented directly to the supervisor.
     Linux records parenthood per thread, so inspect each task's ``children``
     file; this remains bounded by the owned process's thread count and avoids
-    scanning every process on the host.
+    scanning every process on the host. An unreadable task list or children
+    file raises OSError: partial enumeration cannot establish an empty tree.
     """
 
-    try:
-        task_entries = tuple(Path(f"/proc/{int(pid)}/task").iterdir())
-    except OSError:
-        return ()
+    task_entries = tuple(Path(f"/proc/{int(pid)}/task").iterdir())
+    if not task_entries:
+        raise OSError(errno.ESRCH, "process task list disappeared")
     children: set[int] = set()
     for task_entry in task_entries:
         if not task_entry.name.isdigit():
             continue
         try:
             raw = Path(task_entry, "children").read_text(encoding="utf-8")
-        except OSError:
-            continue
+        except UnicodeError as exc:
+            raise OSError(errno.EIO, "invalid process children list") from exc
         for value in raw.split():
             try:
                 child = int(value)
-            except ValueError:
-                continue
-            if child > 0:
-                children.add(child)
+            except ValueError as exc:
+                raise OSError(errno.EIO, "invalid process children list") from exc
+            if child <= 0:
+                raise OSError(errno.EIO, "invalid child process identifier")
+            children.add(child)
     return tuple(sorted(children))
 
 
@@ -602,7 +657,10 @@ def _refresh_known_tree(
     known: Dict[int, int],
     *,
     ownership_nonce: str,
-) -> None:
+    include_supervisor: bool = True,
+) -> bool:
+    """Refresh ownership and report whether every lineage observation completed."""
+
     del ownership_nonce  # lineage is authoritative inside the private subreaper
 
     # This function is called before every 25 ms deadline poll.  Its former
@@ -611,32 +669,67 @@ def _refresh_known_tree(
     # read a queued lease frame or enforce a 60-second deadline for hours.  The
     # private supervisor has exactly one intentional child (the worker), and
     # PR_SET_CHILD_SUBREAPER reparents orphaned worker descendants back to it.
-    # A bounded traversal of kernel child lists is therefore both complete and
-    # responsive, including for env-scrubbed/new-session double forks.
-    supervisor_pid = os.getpid()
-    pending = [
-        supervisor_pid,
-        *(
-            pid
-            for pid, started in tuple(known.items())
-            if _identity_alive(pid, started)
-        ),
-    ]
+    # Traversal stays within this lineage, including env-scrubbed/new-session
+    # double forks. Its completeness is conditional on readable observations;
+    # callers must distinguish an empty registry from an observed empty tree.
+    # Embedding callers own only their captured roots, not the application's
+    # other children. Only a private supervisor may enumerate itself.
+    pending = []
+    complete = True
+    if include_supervisor:
+        supervisor_identity = _proc_identity(os.getpid())
+        complete = supervisor_identity is not None
+        if supervisor_identity is not None:
+            pending.append(supervisor_identity)
+    for pid, started in tuple(known.items()):
+        identity, absent = _proc_identity_observation(pid)
+        if absent or (identity is not None and identity != (pid, started)):
+            # An exited process or a reused PID is no longer the owned instance.
+            # Its live descendants remain in known or are adopted by our
+            # subreaper and discovered through the supervisor's child list.
+            del known[pid]
+        elif identity == (pid, started):
+            pending.append(identity)
+        else:
+            complete = False
     visited: set[int] = set()
     while pending:
-        parent = pending.pop()
+        parent, parent_started = pending.pop()
         if parent in visited:
             continue
         visited.add(parent)
-        for child in _proc_child_pids(parent):
-            identity = _proc_identity(child)
-            if identity is None:
-                continue
+        if not _identity_alive(parent, parent_started):
+            complete = False
+            continue
+        observed_children = []
+        try:
+            children = _proc_child_pids(parent)
+        except OSError:
+            complete = False
+            continue
+        for child in children:
+            observation, absent = _proc_stat_observation(child)
+            # Child lists are snapshots. A reused child PID must still belong
+            # to this parent. stat's PPID is the parent's TGID, even when a
+            # non-leader thread owns the children file we enumerated.
+            if observation is not None and observation[2] == parent:
+                observed_children.append(observation[:2])
+            elif not absent:
+                complete = False
+        # A replacement parent can have its own children under the same PID.
+        # Commit observations only while the enumerated parent's identity
+        # remains ours across enumeration and every child stat read.
+        if not _identity_alive(parent, parent_started):
+            complete = False
+            continue
+        for identity in observed_children:
+            child = identity[0]
             recorded_start = known.get(child)
             if recorded_start != identity[1]:
                 known[child] = identity[1]
             if child not in visited:
-                pending.append(child)
+                pending.append(identity)
+    return complete
 
 
 def _identity_alive(pid: int, starttime: int) -> bool:
@@ -644,15 +737,39 @@ def _identity_alive(pid: int, starttime: int) -> bool:
 
 
 def _signal_known(known: Dict[int, int], sig: signal.Signals) -> None:
+    """Bind before checking identity so reuse cannot redirect a pidfd signal.
+
+    Missing Python APIs or ENOSYS from pidfd_open retain the legacy checked
+    numeric-PID path. That compatibility path cannot make check/send atomic.
+    Other open errors and all send errors fail closed and can be retried by
+    the bounded cleanup loop.
+    """
+
+    open_pidfd = getattr(os, "pidfd_open", None)
+    send_pidfd = getattr(signal, "pidfd_send_signal", None)
     for pid, started in list(known.items()):
-        if not _identity_alive(pid, started):
-            continue
+        descriptor = None
         try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
-            pass
+            if open_pidfd is not None and send_pidfd is not None:
+                try:
+                    descriptor = open_pidfd(pid)
+                except OSError as exc:
+                    if exc.errno != errno.ENOSYS:
+                        continue
+            if not _identity_alive(pid, started):
+                continue
+            if descriptor is not None:
+                send_pidfd(descriptor, sig)
+            else:
+                os.kill(pid, sig)
         except OSError:
             pass
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def _reap_known_children_nonblocking(
@@ -674,55 +791,71 @@ def _reap_known_children_nonblocking(
 
 
 def _terminate_worker_tree(
-    proc: subprocess.Popen[Any],
+    proc: Optional[subprocess.Popen[Any]],
     known: Dict[int, int],
     *,
     ownership_nonce: str,
-) -> None:
-    """Sweep the worker tree without allowing repeat signals to interrupt it."""
+) -> bool:
+    """Sweep without repeat-signal interruption; return confirmed completion."""
 
     handled_signals = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
-    prior_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+    prior_signal_mask = None
+    complete = False
     try:
-        _terminate_worker_tree_blocked(
+        prior_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+        complete = _terminate_worker_tree_blocked(
             proc,
             known,
             ownership_nonce=ownership_nonce,
         )
+        return complete
+    except BaseException:
+        # An exception during the sweep cannot certify stopped writers.
+        raise _WorkerCleanupIncomplete from None
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, prior_signal_mask)
+        try:
+            if prior_signal_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, prior_signal_mask)
+        except BaseException:
+            # Pending repeat signals can invoke the outer termination handler
+            # as the mask is restored. They must not hide unresolved ownership
+            # and allow that handler to publish a terminal artifact.
+            if not complete:
+                raise _WorkerCleanupIncomplete from None
+            raise
 
 
 def _terminate_worker_tree_blocked(
-    proc: subprocess.Popen[Any],
+    proc: Optional[subprocess.Popen[Any]],
     known: Dict[int, int],
     *,
     ownership_nonce: str,
-) -> None:
-    """Quiesce, discover, kill, and reap the complete private worker tree."""
+) -> bool:
+    """Confirm empty private lineage, including an interrupted root spawn."""
 
-    root_identity = _proc_identity(proc.pid)
-    if root_identity is not None:
-        known.setdefault(*root_identity)
+    # Popen construction can raise after the child starts but before assignment.
+    # The private subreaper still owns that child and can discover/reap it.
+    root_pid = proc.pid if proc is not None else -1
+
+    # A Popen PID may already have been reaped and reused. Discover missing
+    # root ownership through validated lineage, never from its numeric PID.
     # Never resume the tree for a catchable TERM: an adversarial termination
     # handler can fork new session/env-scrubbed children throughout grace.
     # SIGSTOP is uncatchable, so repeated stop/discovery reaches a quiescent
     # ownership closure before SIGKILL.
     stable_rounds = 0
-    prior_pids: set[int] = set()
+    prior_identities: set[Tuple[int, int]] = set()
     for _ in range(64):
         _refresh_known_tree(known, ownership_nonce=ownership_nonce)
         _signal_known(known, signal.SIGSTOP)
         time.sleep(0.005)
-        _refresh_known_tree(known, ownership_nonce=ownership_nonce)
-        current_pids = {
-            pid for pid, started in known.items() if _identity_alive(pid, started)
-        }
-        if current_pids == prior_pids:
+        complete = _refresh_known_tree(known, ownership_nonce=ownership_nonce)
+        current_identities = set(known.items())
+        if complete and current_identities == prior_identities:
             stable_rounds += 1
         else:
             stable_rounds = 0
-            prior_pids = current_pids
+            prior_identities = current_identities
         if stable_rounds >= 3:
             break
     _signal_known(known, signal.SIGKILL)
@@ -736,16 +869,36 @@ def _terminate_worker_tree_blocked(
         _signal_known(known, signal.SIGSTOP)
         _refresh_known_tree(known, ownership_nonce=ownership_nonce)
         _signal_known(known, signal.SIGKILL)
-        _reap_known_children_nonblocking(known, root_pid=proc.pid)
-        proc.poll()  # Reap the Popen-owned root so its zombie is not "alive".
-        if not any(_identity_alive(pid, started) for pid, started in known.items()):
+        _reap_known_children_nonblocking(known, root_pid=root_pid)
+        root_exited = proc is None or proc.poll() is not None
+        complete = _refresh_known_tree(known, ownership_nonce=ownership_nonce)
+        # Refresh retires only confirmed absence/reuse. An unreadable identity
+        # remains owned and must receive the remaining cleanup retry window.
+        # Initial acquisition can also fail with no recorded identity. Retry
+        # until both the root status and the full traversal establish closure.
+        if root_exited and complete and not known:
             break
         time.sleep(0.005)
     try:
-        proc.wait(timeout=_TERMINATE_GRACE_S)
+        if proc is not None:
+            proc.wait(timeout=_TERMINATE_GRACE_S)
     except (subprocess.TimeoutExpired, ChildProcessError):
         pass
-    _reap_known_children_nonblocking(known, root_pid=proc.pid)
+    _reap_known_children_nonblocking(known, root_pid=root_pid)
+    root_exited = proc is None or proc.poll() is not None
+    complete = _refresh_known_tree(known, ownership_nonce=ownership_nonce)
+    cleanup_complete = root_exited and complete and not known
+    if not cleanup_complete:
+        sample = ", ".join(f"{pid}:{started}" for pid, started in list(known.items())[:8])
+        print(
+            "watchdog_worker_cleanup_incomplete: "
+            f"retained {len(known)} process identities after cleanup deadline "
+            f"(pid:starttime {sample}); root_exited={root_exited}, "
+            f"discovery_complete={complete}; safe termination could not be confirmed",
+            file=sys.stderr,
+            flush=True,
+        )
+    return cleanup_complete
 
 
 # token -> (deadline, label, abandoned_reason)
@@ -2115,6 +2268,53 @@ def _write_failure_summary(
         pass
 
 
+def _activation_recovery_events(
+    events: list[Dict[str, Any]], output_dir: Path,
+) -> Tuple[list[Dict[str, Any]], bool]:
+    """Expand classification inputs with a shared byte and processing bound.
+
+    Only tool_call_log affects activation classification. Prompt and response
+    text references need no expansion. Repeated references consume the budget
+    again because their decoded lists require classification again. A failed
+    read exhausts the remaining allowance, bounding IO even for corrupt blobs.
+    """
+    from ensemble_prover.trace_payloads import _read_blob_bytes
+
+    remaining = _WATCHDOG_RECOVERY_MAX_BYTES
+    incomplete = False
+    recovered = []
+    for event in events:
+        refs = event.get("_payload_refs", {})
+        if not isinstance(refs, dict) or set(refs) - {
+            "tool_call_log", "llm_response", "messages_sent",
+        }:
+            incomplete = True
+            continue
+        if any(field in event or not isinstance(digest, str)
+               for field, digest in refs.items()):
+            incomplete = True
+            continue
+        digest = refs.get("tool_call_log")
+        if digest is not None:
+            try:
+                if remaining <= 0:
+                    raise ValueError("activation payload budget exhausted")
+                raw = _read_blob_bytes(output_dir, digest, max_bytes=remaining)
+                remaining -= len(raw)
+                value = _strict_json_loads(raw)
+                if not isinstance(value, list):
+                    raise ValueError("activation tool payload must be a list")
+                event = {**event, "tool_call_log": value}
+            except (OSError, ValueError, RecursionError, OverflowError):
+                remaining = 0
+                incomplete = True
+                # Missing canonical logs can change deduplication and aggregate
+                # fallback keys. Omit the record rather than inventing counts.
+                continue
+        recovered.append(event)
+    return recovered, incomplete
+
+
 def _write_summary_and_activation(output_dir: Path, payload: Dict[str, Any]) -> None:
     destination = output_dir / "summary.json"
     temporary = output_dir / f".summary.watchdog.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -2187,6 +2387,10 @@ def _write_summary_and_activation(output_dir: Path, payload: Dict[str, Any]) -> 
                 raise RuntimeError(
                     "watchdog turns snapshot changed during telemetry classification"
                 )
+        events, payloads_incomplete = _activation_recovery_events(events, output_dir)
+        counts_incomplete = bool(
+            scan_truncated or malformed or payloads_incomplete or not turns_fingerprint
+        )
         activation = build_activation_telemetry(
             events,
             summary=payload,
@@ -2195,10 +2399,12 @@ def _write_summary_and_activation(output_dir: Path, payload: Dict[str, Any]) -> 
         activation["malformed_event_count"] = int(
             activation.get("malformed_event_count", 0) or 0
         ) + malformed
+        counts_incomplete = counts_incomplete or bool(activation["malformed_event_count"])
         activation["watchdog_bounded_recovery"] = True
         activation["watchdog_recovery_scan_truncated"] = bool(scan_truncated)
-        activation["activation_counts_are_lower_bound"] = bool(scan_truncated)
-        if turns_fingerprint and not scan_truncated:
+        activation["watchdog_payload_recovery_version"] = 1
+        activation["activation_counts_are_lower_bound"] = counts_incomplete
+        if turns_fingerprint and not counts_incomplete:
             activation.update(turns_fingerprint)
         payload["activation_telemetry"] = compact_activation_summary(activation)
         replace_summary()
@@ -2225,32 +2431,212 @@ def _write_summary_and_activation(output_dir: Path, payload: Dict[str, Any]) -> 
         pass
 
 
-def _nonzero_worker_summary_is_authoritative(
+@dataclass(frozen=True)
+class _WorkerSummarySnapshot:
+    payload: Dict[str, Any]
+    identity: Tuple[int, int, int, str]
+    sha256: str
+
+
+def _read_nonzero_worker_summary(
     summary_path: Path,
     *,
     theorem_name: str,
     initial_identity: Optional[Tuple[int, int, int, str]],
-) -> bool:
+) -> Optional[_WorkerSummarySnapshot]:
+    """Read a fresh unsolved summary after the worker tree has been reaped.
+
+    Terminal dossiers may exceed the emergency recovery budget. Bind their
+    parsed fields to one stable regular file instead of imposing that budget
+    on the ordinary exit path.
+    """
+
     try:
         current_identity = _artifact_identity(summary_path)
-        if current_identity == initial_identity:
-            return False
-        payload = _read_bounded_json_object(summary_path)
+        if current_identity is None or current_identity == initial_identity:
+            return None
+        snapshot = _stable_full_json_object_with_sha256(
+            summary_path, expected_size=current_identity[2],
+        )
+        if snapshot is None or _artifact_identity(summary_path) != current_identity:
+            return None
+        _size, sha256, payload = snapshot
     except Exception:
-        return False
+        return None
     if not payload:
-        return False
+        return None
     if bool(
         payload.get("solved")
         or payload.get("pre_export_solved")
         or payload.get("session_root_finalized")
         or payload.get("solved_export_verified")
     ):
-        return False
+        return None
     problem = str(payload.get("problem") or payload.get("theorem") or "")
     if theorem_name and problem != theorem_name:
-        return False
-    return bool(str(payload.get("failure_reason") or "").strip())
+        return None
+    if not str(payload.get("failure_reason") or "").strip():
+        return None
+    return _WorkerSummarySnapshot(payload, current_identity, sha256)
+
+
+def _nonzero_worker_summary_is_authoritative(
+    summary_path: Path,
+    *,
+    theorem_name: str,
+    initial_identity: Optional[Tuple[int, int, int, str]],
+) -> bool:
+    return _read_nonzero_worker_summary(
+        summary_path, theorem_name=theorem_name, initial_identity=initial_identity,
+    ) is not None
+
+
+def _activation_source_identity(path: Path) -> Optional[Tuple[int, ...]]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("activation source must be a regular file")
+    return (
+        info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size,
+    )
+
+
+def _preserve_worker_activation(
+    output_dir: Path, summary: _WorkerSummarySnapshot,
+) -> None:
+    """Preserve complete telemetry, or rebuild it without rewriting summary.json.
+
+    Missing or stale telemetry uses the bounded recovery classifier. A truncated
+    scan remains a lower bound and cannot acquire a full-trace fingerprint.
+    """
+
+    from ensemble_prover.activation_telemetry import (
+        ACTIVATION_ARTIFACT_NAME,
+        _valid_activation_artifact,
+        build_activation_telemetry,
+    )
+
+    summary_path = output_dir / "summary.json"
+    summary_fingerprint = {
+        "source_summary_mtime_ns": summary.identity[1],
+        "source_summary_size_bytes": summary.identity[2],
+        "source_summary_sha256": summary.sha256,
+    }
+    turns_path = output_dir / "turns.jsonl"
+    turns_identity = _activation_source_identity(turns_path)
+    activation_path = output_dir / ACTIVATION_ARTIFACT_NAME
+    activation_identity = _artifact_identity(activation_path)
+    if activation_identity is not None:
+        existing = _stable_full_json_object_with_sha256(
+            activation_path, expected_size=activation_identity[2],
+        )
+        if (
+            existing is not None
+            and _artifact_identity(activation_path) == activation_identity
+            and _valid_activation_artifact(existing[2])
+            and all(existing[2].get(key) == value for key, value in summary_fingerprint.items())
+            and turns_identity is not None
+        ):
+            turns_hash = _stable_full_file_sha256(
+                turns_path, expected_size=turns_identity[-1],
+            )
+            if (
+                turns_hash is not None
+                and existing[2].get("source_turns_size_bytes") == turns_hash[0]
+                and existing[2].get("source_turns_sha256") == turns_hash[1]
+                and existing[2].get("source_turns_mtime_ns") == turns_identity[2]
+                and _activation_source_identity(turns_path) == turns_identity
+                and _artifact_identity(summary_path) == summary.identity
+            ):
+                return
+
+    events: list[Dict[str, Any]] = []
+    malformed = 0
+    truncated = False
+    turns_fingerprint: Dict[str, Any] = {}
+    if turns_identity is not None:
+        # Read through one no-follow, nonblocking descriptor so a replaced
+        # pathname cannot redirect classification to a symlink or FIFO.
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(turns_path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or turns_identity != (
+                opened.st_dev, opened.st_ino, opened.st_mtime_ns,
+                opened.st_ctime_ns, opened.st_size,
+            ):
+                raise ValueError("activation source changed before reading")
+            size = turns_identity[-1]
+            start = max(0, size - _WATCHDOG_RECOVERY_MAX_BYTES)
+            offset = max(0, start - 1)
+            raw = os.pread(descriptor, size - offset, offset)
+            after = os.fstat(descriptor)
+            if len(raw) != size - offset or turns_identity != (
+                after.st_dev, after.st_ino, after.st_mtime_ns,
+                after.st_ctime_ns, after.st_size,
+            ) or _activation_source_identity(turns_path) != turns_identity:
+                raise ValueError("activation source changed during reading")
+        finally:
+            os.close(descriptor)
+        truncated = start > 0
+        if truncated:
+            preceding, raw = raw[:1], raw[1:]
+            if preceding != b"\n":
+                newline = raw.find(b"\n")
+                raw = raw[newline + 1:] if newline >= 0 else b""
+        else:
+            turns_fingerprint = {
+                "source_turns_mtime_ns": turns_identity[2],
+                "source_turns_size_bytes": size,
+                "source_turns_sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = _strict_json_loads(line)
+            except (ValueError, RecursionError, OverflowError):
+                malformed += 1
+                continue
+            if isinstance(record, dict):
+                events.append(record)
+            else:
+                malformed += 1
+    events, payloads_incomplete = _activation_recovery_events(events, output_dir)
+    counts_incomplete = bool(
+        truncated or malformed or payloads_incomplete or turns_identity is None
+    )
+    activation = build_activation_telemetry(
+        events, summary=summary.payload, run_dir=output_dir,
+    )
+    activation["malformed_event_count"] = int(
+        activation.get("malformed_event_count", 0) or 0
+    ) + malformed
+    counts_incomplete = counts_incomplete or bool(activation["malformed_event_count"])
+    activation["watchdog_bounded_recovery"] = True
+    activation["watchdog_recovery_scan_truncated"] = truncated
+    activation["watchdog_payload_recovery_version"] = 1
+    activation["activation_counts_are_lower_bound"] = counts_incomplete
+    activation.update(summary_fingerprint)
+    if not counts_incomplete:
+        activation.update(turns_fingerprint)
+    temporary = output_dir / f".{ACTIVATION_ARTIFACT_NAME}.{uuid.uuid4().hex}.tmp"
+    try:
+        temporary.write_text(
+            json.dumps(activation, indent=2, ensure_ascii=False, sort_keys=True, allow_nan=False),
+            encoding="utf-8",
+        )
+        if (
+            _artifact_identity(summary_path) != summary.identity
+            or _activation_source_identity(turns_path) != turns_identity
+        ):
+            raise ValueError("activation sources changed before publication")
+        os.replace(temporary, activation_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _fresh_staged_solution_is_authoritative(
@@ -2518,11 +2904,14 @@ def _run_cli_worker_in_dedicated_supervisor(
     parent_watch_fd: int = -1,
     cooperative_stop_signals: Optional[list] = None,
     cooperative_stop_grace_s: float = _COOPERATIVE_STOP_GRACE_S,
+    cleanup_state: Optional[_WorkerCleanupState] = None,
 ) -> int:
     """Run the Mini CLI in a supervised worker process (Linux/POSIX only)."""
 
     if os.name != "posix" or not Path("/proc").is_dir():
         raise RuntimeError("Mini hard-deadline supervision requires Linux /proc")
+    if cleanup_state is None:
+        cleanup_state = _WorkerCleanupState()
     read_fd, write_fd = os.pipe()
     os.set_inheritable(write_fd, True)
     nonce = uuid.uuid4().hex
@@ -2574,228 +2963,230 @@ def _run_cli_worker_in_dedicated_supervisor(
     )
 
     previous_subreaper = _enable_child_subreaper()
+    pending_error = None
     try:
-        proc = subprocess.Popen(
-            command,
-            env=propagate_owned_network_policy(trusted_provider_worker_environment(env)),
-            pass_fds=(write_fd,),
-            start_new_session=True,
-        )
-        identity = _proc_identity(proc.pid)
-        if identity is None:
-            violation = "watchdog_worker_identity_unavailable"
-        else:
-            known[identity[0]] = identity[1]
-        os.close(write_fd)
-        write_fd = -1
-        os.set_blocking(read_fd, False)
-        selector.register(read_fd, selectors.EVENT_READ)
-        if parent_watch_fd >= 0:
-            os.set_blocking(parent_watch_fd, False)
-            selector.register(parent_watch_fd, selectors.EVENT_READ)
-        cooperative_stop_sent = 0.0
-        while not violation:
-            cooperative_stop_expired = False
-            _refresh_known_tree(known, ownership_nonce=nonce)
-            if parent_watch_fd >= 0:
-                try:
-                    parent_state = os.read(parent_watch_fd, 1)
-                except BlockingIOError:
-                    parent_state = None
-                if parent_state == b"":
-                    violation = "watchdog_supervisor_parent_lost"
-                    break
-            # cooperative stop: forward the first termination
-            # signal to the worker as SIGTERM so it can run its
-            # cancellation barrier and author its own terminal summary.
-            # The SIGSTOP/SIGKILL sweep remains the bounded backstop.
-            if cooperative_stop_signals and cooperative_stop_sent <= 0.0:
-                cooperative_stop_sent = time.monotonic()
-                if output_dir is not None:
-                    from ..shutdown import ShutdownState
-
-                    supervisor_stop = ShutdownState(
-                        nonce=nonce,
-                        deadline=cooperative_stop_sent + max(0.0, float(cooperative_stop_grace_s)),
-                        stop_requested=True, output_dir=output_dir,
-                    )
-                    supervisor_stop.record(
-                        "supervisor_stop_requested", original_signal=int(cooperative_stop_signals[0]),
-                        forwarded_signal=int(signal.SIGTERM), worker_pid=proc.pid,
-                    )
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, OSError):
-                    try:
-                        proc.terminate()
-                    except (ProcessLookupError, OSError):
-                        pass
-            elif (
-                cooperative_stop_sent > 0.0
-                and time.monotonic() - cooperative_stop_sent
-                >= max(0.0, float(cooperative_stop_grace_s))
-            ):
-                cooperative_stop_expired = True
-            # Drain/reap first so a timely queued END or clean exit wins the
-            # scheduling race at the nominal deadline.
-            while True:
-                try:
-                    chunk = os.read(read_fd, 65_536)
-                except BlockingIOError:
-                    break
-                if not chunk:
-                    eof = True
-                    break
-                buffer.extend(chunk)
-            message_violation, ready_now = _consume_messages(
-                buffer,
-                active,
-                expected_nonce=nonce,
-                ready_deadline=startup_deadline,
-            )
-            saw_ready = saw_ready or ready_now
-            if message_violation:
-                violation = message_violation
-                break
-            returncode = proc.poll()
-            if returncode is not None:
-                if buffer:
-                    violation = "watchdog_partial_frame_at_worker_exit"
-                    break
-                non_shutdown = [
-                    label
-                    for _deadline, label, _reason in active.values()
-                    if label != "mini_session_asyncio_shutdown"
-                ]
-                if non_shutdown and not cooperative_stop_signals:
-                    # A cooperative stop cancels the work that held the
-                    # lease; the worker exits with it deliberately armed.
-                    # Treating that as a protocol violation would clobber
-                    # the worker-authored terminal summary.
-                    violation = f"watchdog_worker_exited_with_active_lease:{non_shutdown[0]}"
-                    break
-                # Kill/reap any worker-owned external descendants even on a
-                # clean leader exit; none may outlive the isolated run.
-                _terminate_worker_tree(proc, known, ownership_nonce=nonce)
-                if int(returncode) != 0 and output_dir is not None:
-                    summary_path = output_dir / "summary.json"
-                    # A worker killed by the cooperative stop's SIGTERM (no
-                    # authoritative summary of its own) is a manual stop, not
-                    # an ordinary worker failure — keep the historical
-                    # supervisor-signal verdict for that case.
-                    exit_violation = (
-                        "watchdog_supervisor_signal:"
-                        f"{int(cooperative_stop_signals[0])}"
-                        if cooperative_stop_signals
-                        else f"watchdog_worker_exit_nonzero:{returncode}"
-                    )
-                    if not _nonzero_worker_summary_is_authoritative(
-                        summary_path,
-                        theorem_name=theorem_name,
-                        initial_identity=initial_summary_identity,
-                    ):
-                        _write_failure_summary(
-                            output_dir,
-                            theorem_name=theorem_name,
-                            violation=exit_violation,
-                            initial_summary_identity=initial_summary_identity,
-                            worker_argv=argv,
-                        )
-                    else:
-                        try:
-                            current_payload = _read_bounded_json_object(summary_path)
-                            if not current_payload:
-                                raise ValueError("worker summary is absent or oversized")
-                            _write_summary_and_activation(output_dir, current_payload)
-                        except Exception:
-                            _write_failure_summary(
-                                output_dir,
-                                theorem_name=theorem_name,
-                                violation=exit_violation,
-                                initial_summary_identity=initial_summary_identity,
-                                worker_argv=argv,
-                            )
-                return int(returncode)
-            if cooperative_stop_expired:
-                if output_dir is not None:
-                    supervisor_stop.record("supervisor_cooperative_deadline_expired")
-                violation = (
-                    "watchdog_cooperative_stop_timeout:"
-                    f"{int(cooperative_stop_signals[0])}"
-                )
-                break
-            if eof:
-                # Pipe EOF and process reaping are separate kernel events.
-                # A worker that has already written an authoritative summary
-                # can close its last fd a scheduling quantum before poll()
-                # reports exit; classifying that ordinary exit as protocol
-                # failure overwrites the real setup/search exception. A
-                # worker that deliberately drops supervision but keeps
-                # running still fails closed after this short reap-only grace.
-                try:
-                    proc.wait(timeout=_CHANNEL_EOF_REAP_GRACE_S)
-                except subprocess.TimeoutExpired:
-                    violation = "watchdog_channel_eof_while_worker_running"
-                    break
-                continue
-            now = time.monotonic()
-            if (
-                startup_deadline > 0.0
-                and not saw_ready
-                and now >= startup_deadline
-            ):
-                violation = "watchdog_worker_startup_timeout"
-                break
-            if overall_deadline > 0.0 and now >= overall_deadline:
-                violation = "watchdog_worker_overall_timeout"
-                break
-            expired = [
-                (deadline, label, reason)
-                for deadline, label, reason in active.values()
-                if now >= deadline + _DEADLINE_CLEANUP_GRACE_S
-            ]
-            if expired:
-                _deadline, label, reason = min(expired)
-                violation = (
-                    f"watchdog_deadline_expired:{label}"
-                    + (f":{reason}" if reason else "")
-                )
-                break
-            timeout = _POLL_INTERVAL_S
-            if cooperative_stop_sent > 0.0:
-                grace_deadline = cooperative_stop_sent + max(
-                    0.0, float(cooperative_stop_grace_s)
-                )
-                timeout = min(timeout, max(0.0, grace_deadline - now))
-            if overall_deadline > 0.0:
-                timeout = min(timeout, overall_deadline - now)
-            if startup_deadline > 0.0 and not saw_ready:
-                timeout = min(timeout, startup_deadline - now)
-            if active:
-                nearest = min(
-                    deadline + _DEADLINE_CLEANUP_GRACE_S
-                    for deadline, _label, _reason in active.values()
-                )
-                timeout = min(timeout, max(0.0, nearest - now))
-            selector.select(max(0.0, timeout))
-    finally:
-        if proc is not None and (violation or proc.poll() is None):
-            _terminate_worker_tree(proc, known, ownership_nonce=nonce)
         try:
-            selector.close()
-        finally:
-            for fd in (read_fd, write_fd):
-                if fd >= 0:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
+            proc = subprocess.Popen(
+                command,
+                env=propagate_owned_network_policy(trusted_provider_worker_environment(env)),
+                pass_fds=(write_fd,),
+                start_new_session=True,
+            )
+            identity = _proc_identity(proc.pid)
+            if identity is None:
+                violation = "watchdog_worker_identity_unavailable"
+            else:
+                known[identity[0]] = identity[1]
+            os.close(write_fd)
+            write_fd = -1
+            os.set_blocking(read_fd, False)
+            selector.register(read_fd, selectors.EVENT_READ)
             if parent_watch_fd >= 0:
+                os.set_blocking(parent_watch_fd, False)
+                selector.register(parent_watch_fd, selectors.EVENT_READ)
+            cooperative_stop_sent = 0.0
+            while not violation:
+                cooperative_stop_expired = False
+                _refresh_known_tree(known, ownership_nonce=nonce)
+                if cooperative_stop_signals and len(cooperative_stop_signals) > 1:
+                    # Service escalation only after Popen ownership is acquired.
+                    # Signal handlers never unwind startup or resource teardown.
+                    violation = f"watchdog_supervisor_signal:{int(cooperative_stop_signals[0])}"
+                    break
+                if parent_watch_fd >= 0:
+                    try:
+                        parent_state = os.read(parent_watch_fd, 1)
+                    except BlockingIOError:
+                        parent_state = None
+                    if parent_state == b"":
+                        violation = "watchdog_supervisor_parent_lost"
+                        break
+                # cooperative stop: forward the first termination
+                # signal to the worker as SIGTERM so it can run its
+                # cancellation barrier and author its own terminal summary.
+                # The SIGSTOP/SIGKILL sweep remains the bounded backstop.
+                if cooperative_stop_signals and cooperative_stop_sent <= 0.0:
+                    cooperative_stop_sent = time.monotonic()
+                    if output_dir is not None:
+                        from ..shutdown import ShutdownState
+
+                        supervisor_stop = ShutdownState(
+                            nonce=nonce,
+                            deadline=cooperative_stop_sent + max(0.0, float(cooperative_stop_grace_s)),
+                            stop_requested=True, output_dir=output_dir,
+                        )
+                        supervisor_stop.record(
+                            "supervisor_stop_requested", original_signal=int(cooperative_stop_signals[0]),
+                            forwarded_signal=int(signal.SIGTERM), worker_pid=proc.pid,
+                        )
+                    # Bind every delivery to an owned instance. The root can
+                    # already have been reaped by the EOF grace path, so its old
+                    # numeric process-group ID is never signaling authority.
+                    _signal_known(known, signal.SIGTERM)
+                elif (
+                    cooperative_stop_sent > 0.0
+                    and time.monotonic() - cooperative_stop_sent
+                    >= max(0.0, float(cooperative_stop_grace_s))
+                ):
+                    cooperative_stop_expired = True
+                # Drain/reap first so a timely queued END or clean exit wins the
+                # scheduling race at the nominal deadline.
+                while True:
+                    try:
+                        chunk = os.read(read_fd, 65_536)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        eof = True
+                        break
+                    buffer.extend(chunk)
+                message_violation, ready_now = _consume_messages(
+                    buffer,
+                    active,
+                    expected_nonce=nonce,
+                    ready_deadline=startup_deadline,
+                )
+                saw_ready = saw_ready or ready_now
+                if message_violation:
+                    violation = message_violation
+                    break
+                returncode = proc.poll()
+                if returncode is not None:
+                    if buffer:
+                        violation = "watchdog_partial_frame_at_worker_exit"
+                        break
+                    non_shutdown = [
+                        label
+                        for _deadline, label, _reason in active.values()
+                        if label != "mini_session_asyncio_shutdown"
+                    ]
+                    if non_shutdown and not cooperative_stop_signals:
+                        # A cooperative stop cancels the work that held the
+                        # lease; the worker exits with it deliberately armed.
+                        # Treating that as a protocol violation would clobber
+                        # the worker-authored terminal summary.
+                        violation = f"watchdog_worker_exited_with_active_lease:{non_shutdown[0]}"
+                        break
+                    break
+                if cooperative_stop_expired:
+                    if output_dir is not None:
+                        supervisor_stop.record("supervisor_cooperative_deadline_expired")
+                    violation = (
+                        "watchdog_cooperative_stop_timeout:"
+                        f"{int(cooperative_stop_signals[0])}"
+                    )
+                    break
+                if eof:
+                    # Pipe EOF and process reaping are separate kernel events.
+                    # A worker that has already written an authoritative summary
+                    # can close its last fd a scheduling quantum before poll()
+                    # reports exit; classifying that ordinary exit as protocol
+                    # failure overwrites the real setup/search exception. A
+                    # worker that deliberately drops supervision but keeps
+                    # running still fails closed after this short reap-only grace.
+                    reap_deadline = time.monotonic() + _CHANNEL_EOF_REAP_GRACE_S
+                    while True:
+                        if cooperative_stop_signals and len(cooperative_stop_signals) > 1:
+                            violation = f"watchdog_supervisor_signal:{int(cooperative_stop_signals[0])}"
+                            break
+                        remaining = reap_deadline - time.monotonic()
+                        if remaining <= 0.0:
+                            violation = "watchdog_channel_eof_while_worker_running"
+                            break
+                        try:
+                            proc.wait(timeout=min(_POLL_INTERVAL_S, remaining))
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
+                    if violation:
+                        break
+                    continue
+                now = time.monotonic()
+                if (
+                    startup_deadline > 0.0
+                    and not saw_ready
+                    and now >= startup_deadline
+                ):
+                    violation = "watchdog_worker_startup_timeout"
+                    break
+                if overall_deadline > 0.0 and now >= overall_deadline:
+                    violation = "watchdog_worker_overall_timeout"
+                    break
+                expired = [
+                    (deadline, label, reason)
+                    for deadline, label, reason in active.values()
+                    if now >= deadline + _DEADLINE_CLEANUP_GRACE_S
+                ]
+                if expired:
+                    _deadline, label, reason = min(expired)
+                    violation = (
+                        f"watchdog_deadline_expired:{label}"
+                        + (f":{reason}" if reason else "")
+                    )
+                    break
+                timeout = _POLL_INTERVAL_S
+                if cooperative_stop_sent > 0.0:
+                    grace_deadline = cooperative_stop_sent + max(
+                        0.0, float(cooperative_stop_grace_s)
+                    )
+                    timeout = min(timeout, max(0.0, grace_deadline - now))
+                if overall_deadline > 0.0:
+                    timeout = min(timeout, overall_deadline - now)
+                if startup_deadline > 0.0 and not saw_ready:
+                    timeout = min(timeout, startup_deadline - now)
+                if active:
+                    nearest = min(
+                        deadline + _DEADLINE_CLEANUP_GRACE_S
+                        for deadline, _label, _reason in active.values()
+                    )
+                    timeout = min(timeout, max(0.0, nearest - now))
+                selector.select(max(0.0, timeout))
+        except BaseException as exc:
+            pending_error = exc
+        finally:
+            try:
+                cleanup_state.complete = _terminate_worker_tree(proc, known, ownership_nonce=nonce)
+                if not cleanup_state.complete:
+                    # Replace a pending interrupt as well: the outer signal
+                    # handler must not author a terminal summary with live writers.
+                    raise _WorkerCleanupIncomplete
+            except BaseException as exc:
+                pending_error = exc
+            finally:
+                # Attempt every resource release, preserving the first pending
+                # exception. Incomplete worker cleanup takes priority over any
+                # later interrupt or resource failure.
                 try:
-                    os.close(parent_watch_fd)
-                except OSError:
-                    pass
-            _restore_child_subreaper(previous_subreaper)
+                    try:
+                        selector.close()
+                    except BaseException as exc:
+                        if pending_error is None:
+                            pending_error = exc
+                    for fd in (read_fd, write_fd, parent_watch_fd):
+                        if fd >= 0:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+                            except BaseException as exc:
+                                if pending_error is None:
+                                    pending_error = exc
+                    try:
+                        _restore_child_subreaper(previous_subreaper)
+                    except BaseException as exc:
+                        if pending_error is None:
+                            pending_error = exc
+                finally:
+                    if pending_error is not None:
+                        raise pending_error
+    except _WorkerCleanupIncomplete:
+        print(
+            "Mini-session worker cleanup_incomplete: termination is unconfirmed; "
+            "terminal artifacts were not inspected or published and may still change",
+            file=sys.stderr,
+            flush=True,
+        )
+        return WORKER_CLEANUP_INCOMPLETE_EXIT_CODE
     if violation:
         shutdown_swept_staged_solution = bool(
             violation.startswith(
@@ -2827,7 +3218,41 @@ def _run_cli_worker_in_dedicated_supervisor(
         )
         print(f"Mini-session worker terminated: {violation}", file=sys.stderr)
         return 124
-    return int(proc.returncode if proc is not None and proc.returncode is not None else 1)
+    if int(returncode) != 0 and output_dir is not None:
+        summary_path = output_dir / "summary.json"
+        # A worker killed by the cooperative stop's SIGTERM (no
+        # authoritative summary of its own) is a manual stop, not
+        # an ordinary worker failure — keep the historical
+        # supervisor-signal verdict for that case.
+        exit_violation = (
+            "watchdog_supervisor_signal:"
+            f"{int(cooperative_stop_signals[0])}"
+            if cooperative_stop_signals
+            else f"watchdog_worker_exit_nonzero:{returncode}"
+        )
+        worker_summary = _read_nonzero_worker_summary(
+            summary_path,
+            theorem_name=theorem_name,
+            initial_identity=initial_summary_identity,
+        )
+        if worker_summary is not None:
+            try:
+                _preserve_worker_activation(output_dir, worker_summary)
+            except Exception:
+                # Auxiliary telemetry failure cannot invalidate a
+                # complete worker-authored unsolved summary.
+                pass
+            if _artifact_identity(summary_path) != worker_summary.identity:
+                worker_summary = None
+        if worker_summary is None:
+            _write_failure_summary(
+                output_dir,
+                theorem_name=theorem_name,
+                violation=exit_violation,
+                initial_summary_identity=initial_summary_identity,
+                worker_argv=argv,
+            )
+    return int(returncode)
 
 
 def _wait_for_supervisor(proc: Any, *, max_interrupts: int = 5) -> int:
@@ -2891,9 +3316,20 @@ def run_cli_worker_under_watchdog(
         "shutdown_timeout_s": float(shutdown_timeout_s or 0.0),
         "cooperative_stop_grace_s": float(cooperative_stop_grace_s),
     }
+    try:
+        return _launch_cli_worker_under_watchdog(spec)
+    except _WorkerCleanupIncomplete:
+        return WORKER_CLEANUP_INCOMPLETE_EXIT_CODE
+
+
+def _launch_cli_worker_under_watchdog(spec: Dict[str, Any]) -> int:
+    """Launch and consume a supervisor only after its completion receipt."""
+    completion = SupervisorCompletionChannel()
+    supervisor_proc = None
     spec_path = ""
     parent_read_fd = -1
     parent_write_fd = -1
+    pending_error = None
     try:
         parent_read_fd, parent_write_fd = os.pipe()
         spec["parent_watch_fd"] = parent_read_fd
@@ -2906,31 +3342,63 @@ def run_cli_worker_under_watchdog(
         ) as handle:
             json.dump(spec, handle, sort_keys=True)
             spec_path = handle.name
+        completion.begin_launch()
         supervisor_proc = subprocess.Popen(
             [sys.executable, "-m", __name__, "--supervisor-spec", spec_path],
-            env=propagate_owned_network_policy(trusted_provider_worker_environment()),
-            pass_fds=(parent_read_fd,),
+            env={
+                **propagate_owned_network_policy(trusted_provider_worker_environment()),
+                **completion.environment,
+            },
+            pass_fds=(parent_read_fd, *completion.pass_fds),
         )
+        completion.close_parent_writer()
         return _wait_for_supervisor(supervisor_proc)
+    except BaseException as exc:
+        pending_error = exc
+        raise
     finally:
-        if spec_path:
-            try:
-                Path(spec_path).unlink()
-            except OSError:
-                pass
-        for fd in (parent_read_fd, parent_write_fd):
-            if fd >= 0:
+        try:
+            if spec_path:
                 try:
-                    os.close(fd)
+                    Path(spec_path).unlink()
                 except OSError:
                     pass
+                except BaseException as exc:
+                    if pending_error is None:
+                        pending_error = exc
+            for fd in (parent_read_fd, parent_write_fd):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    except BaseException as exc:
+                        if pending_error is None:
+                            pending_error = exc
+        finally:
+            completion.finalize(supervisor_proc, pending_error=pending_error)
 
 
 def _dedicated_supervisor_main(argv: Sequence[str]) -> int:
+    completion_writer = adopt_supervisor_completion()
+    cleanup_state = _WorkerCleanupState()
+    pending_error = None
+    try:
+        return _dedicated_supervisor_with_completion(argv, cleanup_state)
+    except BaseException as exc:
+        pending_error = exc
+        raise
+    finally:
+        completion_writer.finish(cleanup_state, pending_error=pending_error)
+
+
+def _dedicated_supervisor_with_completion(
+    argv: Sequence[str], cleanup_state: _WorkerCleanupState,
+) -> int:
     restore_owned_worker_network_policy()
     if len(argv) != 2 or argv[0] != "--supervisor-spec":
         print("invalid Mini watchdog supervisor invocation", file=sys.stderr)
-        return 125
+        return WORKER_CLEANUP_INCOMPLETE_EXIT_CODE
     try:
         supervisor_spec_path = Path(argv[1])
         raw_payload = supervisor_spec_path.read_text(encoding="utf-8")
@@ -2942,29 +3410,14 @@ def _dedicated_supervisor_main(argv: Sequence[str]) -> int:
         supervised_output_dir = (
             Path(str(output_value)) if output_value is not None else None
         )
-        initial_summary_identity = (
-            _artifact_identity(supervised_output_dir / "summary.json")
-            if supervised_output_dir is not None
-            else None
-        )
-
-        class SupervisorTermination(BaseException):
-            def __init__(self, signum: int) -> None:
-                self.signum = int(signum)
-
         cooperative_stop_signals: list = []
 
         def terminate_supervisor(signum: int, _frame: Any) -> None:
-            # First signal: request a cooperative worker stop;
-            # the poll loop forwards SIGTERM and starts the bounded grace.
-            # A repeat signal escalates to the immediate freeze-and-kill
-            # sweep, and further repeats are ignored while it runs.
-            if not cooperative_stop_signals:
+            # Only queue intent. Raising here could interrupt Popen before its
+            # handle is assigned or skip teardown between resource guards.
+            # The poll loop forwards the first stop and sweeps on a repeat.
+            if len(cooperative_stop_signals) < 2:
                 cooperative_stop_signals.append(int(signum))
-                return
-            for handled_signal in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-                signal.signal(handled_signal, signal.SIG_IGN)
-            raise SupervisorTermination(signum)
 
         for handled_signal in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(handled_signal, terminate_supervisor)
@@ -2976,8 +3429,7 @@ def _dedicated_supervisor_main(argv: Sequence[str]) -> int:
             supervisor_spec_path.unlink()
         except OSError:
             pass
-        try:
-            supervised_rc = _run_cli_worker_in_dedicated_supervisor(
+        supervised_rc = _run_cli_worker_in_dedicated_supervisor(
             worker_argv,
             overall_timeout_s=float(payload.get("overall_timeout_s") or 0.0),
             worker_command=(
@@ -3001,29 +3453,21 @@ def _dedicated_supervisor_main(argv: Sequence[str]) -> int:
                 if payload.get("cooperative_stop_grace_s") is None
                 else payload.get("cooperative_stop_grace_s")
             ),
-            )
-            if cooperative_stop_signals and supervised_rc != 0:
-                # rc 0 means the worker finished its work during the grace —
-                # surface the clean result, not the interrupt convention.
-                # Preserve the historical signal-exit convention regardless
-                # of whether the worker exited cooperatively or was swept.
-                return 128 + int(cooperative_stop_signals[0])
-            return supervised_rc
-        except SupervisorTermination as exc:
-            _write_failure_summary(
-                supervised_output_dir,
-                theorem_name=str(payload.get("theorem_name") or ""),
-                violation=f"watchdog_supervisor_signal:{exc.signum}",
-                initial_summary_identity=initial_summary_identity,
-                worker_argv=worker_argv,
-            )
-            return 128 + exc.signum
+            cleanup_state=cleanup_state,
+        )
+        if supervised_rc == WORKER_CLEANUP_INCOMPLETE_EXIT_CODE or not cleanup_state.complete:
+            # Preserve unconfirmed cleanup even when termination was requested.
+            return WORKER_CLEANUP_INCOMPLETE_EXIT_CODE
+        if cooperative_stop_signals and supervised_rc != 0:
+            # A clean worker exit during cooperative grace remains successful.
+            return 128 + int(cooperative_stop_signals[0])
+        return supervised_rc
     except Exception as exc:
         print(
             f"Mini watchdog supervisor failed: {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
-        return 125
+        return WORKER_CLEANUP_INCOMPLETE_EXIT_CODE
 
 
 __all__ = [

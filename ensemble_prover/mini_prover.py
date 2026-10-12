@@ -63,6 +63,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, 
 
 from dotenv import load_dotenv
 
+from .mini_session.process_watchdog import WORKER_CLEANUP_INCOMPLETE_EXIT_CODE, _WorkerCleanupIncomplete
+
 from .premise_retrieval import DEFAULT_TOP_K as PREMISE_DEFAULT_TOP_K
 from .config import LeanConfig, RetrievalConfig, RoleConfig
 from .helper_salvage import (
@@ -12177,6 +12179,9 @@ def _auto_export_solved_run(
         result = export_solved_run_in_fresh_process(
             Path(output_dir), lean_project_dir=project_dir,
         )
+    except _WorkerCleanupIncomplete:
+        # This is an unresolved writer, not an ordinary verification failure.
+        raise
     except Exception as exc:
         print(f"Solved Lean export failed: {type(exc).__name__}: {exc}")
         return _mini_solved_export_status(
@@ -15549,6 +15554,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     lean_close_completed = False
     theory_library_close_completed = False
     early_staged_solution_written = False
+    export_cleanup_failure: Optional[_WorkerCleanupIncomplete] = None
     # Programmatic callers may invoke Mini repeatedly in one task/context.
     # Give every concrete role client in this theorem one shared, fresh
     # registry without moving the run lifecycle out of ``_main_async`` (whose
@@ -17578,10 +17584,14 @@ async def _main_async(args: argparse.Namespace) -> int:
                             file=sys.stderr,
                         )
                 if ok and os.environ.get("ENSEMBLE_MINI_DEFER_SOLVED_EXPORT") != "1":
-                    export_status = _auto_export_solved_run(
-                        output_dir,
-                        lean_project_dir=Path(args.lean_project_dir),
-                    )
+                    try:
+                        export_status = _auto_export_solved_run(
+                            output_dir,
+                            lean_project_dir=Path(args.lean_project_dir),
+                        )
+                    except _WorkerCleanupIncomplete as exc:
+                        export_cleanup_failure = exc
+                        raise
                     summary_payload.update(export_status)
                     export_verified = _mini_solved_export_verified_payload(
                         export_status
@@ -17674,7 +17684,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 # ``recorder.close()`` MUST run even if write_summary fails,
                 # otherwise stdout/stderr stay redirected and file handles leak.
                 try:
-                    if checkpoint_registry is not None:
+                    if checkpoint_registry is not None and export_cleanup_failure is None:
                         await checkpoint_registry.complete_worker_generation()
                 finally:
                     try:
@@ -17688,76 +17698,85 @@ async def _main_async(args: argparse.Namespace) -> int:
                         if checkpoint_registry is not None:
                             checkpoint_registry.close()
         finally:
-            # Release LLM HTTP connection pools even if summary writing fails.
-            # ``OpenAICompatClient`` wraps an ``httpx.AsyncClient`` whose
-            # connection pool is held open until ``close()``/``aclose()`` is
-            # awaited. For one-shot CLI use the process exit reaps everything,
-            # but programmatic callers that invoke ``_main_async`` repeatedly
-            # would accumulate pools (and eventually file descriptors)
-            # without these awaits. Per-client try/except so a stuck close on
-            # one client doesn't prevent the other from closing.
-            if (
-                prover_client is not None
-                and id(prover_client) not in llm_client_close_attempted_ids
-            ):
-                try:
-                    await _supervised_resource_close(
-                        prover_client.close(),
-                        label="mini_session_prover_client_close",
-                    )
-                except Exception:
-                    pass
-            if (
-                refiner_client is not None
-                and refiner_client is not prover_client
-                and id(refiner_client) not in llm_client_close_attempted_ids
-            ):
-                try:
-                    await _supervised_resource_close(
-                        refiner_client.close(),
-                        label="mini_session_refiner_client_close",
-                    )
-                except Exception:
-                    pass
-            if (
-                planner_escalation_client is not None
-                and planner_escalation_client is not prover_client
-                and planner_escalation_client is not refiner_client
-                and id(planner_escalation_client)
-                not in llm_client_close_attempted_ids
-            ):
-                try:
-                    await _supervised_resource_close(
-                        planner_escalation_client.close(),
-                        label="mini_session_planner_escalation_client_close",
-                    )
-                except Exception:
-                    pass
-            # Release the LeanRunner's persistent verifier pool /
-            # LeanREPL subprocess for the same programmatic-repeat-caller
-            # reason that motivates the client cleanup above. CLI single-
-            # run use is unaffected (process exit reaps everything), but
-            # callers that invoke ``_main_async`` in a loop (sweep
-            # drivers, in-process test harnesses) would otherwise
-            # accumulate ``lake env lean`` child processes and file
-            # descriptors. ``orchestrator.py`` already mirrors this
-            # pattern.
-            if lean is not None and not lean_close_completed:
-                try:
-                    await _supervised_resource_close(
-                        lean.aclose(),
-                        label="mini_session_lean_close",
-                    )
-                except Exception:
-                    pass
-            if theory_library is not None and not theory_library_close_completed:
-                try:
-                    await _supervised_sync_resource_close(
-                        theory_library.close,
-                        label="mini_session_theory_library_close",
-                    )
-                except Exception:
-                    pass
+            try:
+                # Release LLM HTTP connection pools even if summary writing fails.
+                # ``OpenAICompatClient`` wraps an ``httpx.AsyncClient`` whose
+                # connection pool is held open until ``close()``/``aclose()`` is
+                # awaited. For one-shot CLI use the process exit reaps everything,
+                # but programmatic callers that invoke ``_main_async`` repeatedly
+                # would accumulate pools (and eventually file descriptors)
+                # without these awaits. Per-client try/except so a stuck close on
+                # one client doesn't prevent the other from closing.
+                if (
+                    prover_client is not None
+                    and id(prover_client) not in llm_client_close_attempted_ids
+                ):
+                    try:
+                        await _supervised_resource_close(
+                            prover_client.close(),
+                            label="mini_session_prover_client_close",
+                        )
+                    except Exception:
+                        pass
+                if (
+                    refiner_client is not None
+                    and refiner_client is not prover_client
+                    and id(refiner_client) not in llm_client_close_attempted_ids
+                ):
+                    try:
+                        await _supervised_resource_close(
+                            refiner_client.close(),
+                            label="mini_session_refiner_client_close",
+                        )
+                    except Exception:
+                        pass
+                if (
+                    planner_escalation_client is not None
+                    and planner_escalation_client is not prover_client
+                    and planner_escalation_client is not refiner_client
+                    and id(planner_escalation_client)
+                    not in llm_client_close_attempted_ids
+                ):
+                    try:
+                        await _supervised_resource_close(
+                            planner_escalation_client.close(),
+                            label="mini_session_planner_escalation_client_close",
+                        )
+                    except Exception:
+                        pass
+                # Release the LeanRunner's persistent verifier pool /
+                # LeanREPL subprocess for the same programmatic-repeat-caller
+                # reason that motivates the client cleanup above. CLI single-
+                # run use is unaffected (process exit reaps everything), but
+                # callers that invoke ``_main_async`` in a loop (sweep
+                # drivers, in-process test harnesses) would otherwise
+                # accumulate ``lake env lean`` child processes and file
+                # descriptors. ``orchestrator.py`` already mirrors this
+                # pattern.
+                if lean is not None and not lean_close_completed:
+                    try:
+                        await _supervised_resource_close(
+                            lean.aclose(),
+                            label="mini_session_lean_close",
+                        )
+                    except Exception:
+                        pass
+                if theory_library is not None and not theory_library_close_completed:
+                    try:
+                        await _supervised_sync_resource_close(
+                            theory_library.close,
+                            label="mini_session_theory_library_close",
+                        )
+                    except Exception:
+                        pass
+            finally:
+                if export_cleanup_failure is not None:
+                    try:
+                        _uninstall_cooperative_stop()
+                    finally:
+                        # Resource-close failures cannot acknowledge or hide an
+                        # exporter whose descendant shutdown is unresolved.
+                        raise export_cleanup_failure
 
     _uninstall_cooperative_stop()
     if pending_reraise is not None and not (
@@ -18199,10 +18218,14 @@ def _complete_supervised_solved_export(
         )
         return 1
 
-    export_status = _auto_export_solved_run(
-        output_dir,
-        lean_project_dir=lean_project_dir,
-    )
+    try:
+        export_status = _auto_export_solved_run(
+            output_dir,
+            lean_project_dir=lean_project_dir,
+        )
+    except _WorkerCleanupIncomplete as exc:
+        print(f"Solved export cleanup incomplete: {exc}", file=sys.stderr, flush=True)
+        return WORKER_CLEANUP_INCOMPLETE_EXIT_CODE
     payload.update(export_status)
     export_verified = _mini_solved_export_verified_payload(export_status)
     payload["solved_export_verified"] = export_verified
@@ -18503,10 +18526,11 @@ def main() -> int:
             supervised_output_dir,
             lean_project_dir=Path(args.lean_project_dir),
         )
-        _run_advisory_theory_promotion_maintenance(
-            supervised_output_dir,
-            args=args,
-        )
+        if export_rc != WORKER_CLEANUP_INCOMPLETE_EXIT_CODE:
+            _run_advisory_theory_promotion_maintenance(
+                supervised_output_dir,
+                args=args,
+            )
         return export_rc
 
     lifecycle = begin_process_deadline(
@@ -18519,19 +18543,29 @@ def main() -> int:
         Path(args.output_dir) if getattr(args, "output_dir", None) else None
     )
 
+    worker_cleanup_failure: Optional[_WorkerCleanupIncomplete] = None
+
     async def run_worker() -> int:
-        worker_result: Optional[int] = None
+        nonlocal worker_cleanup_failure
         try:
-            worker_result = await _main_async(args)
-            return worker_result
+            return await _main_async(args)
+        except _WorkerCleanupIncomplete as exc:
+            worker_cleanup_failure = exc
+            raise
         finally:
-            if shutdown_output_dir is not None:
+            if shutdown_output_dir is not None and worker_cleanup_failure is None:
                 _write_asyncio_shutdown_diagnostics(shutdown_output_dir)
 
     try:
-        return asyncio.run(run_worker())
-    finally:
-        lifecycle.close()
+        try:
+            return asyncio.run(run_worker())
+        finally:
+            lifecycle.close()
+    except BaseException:
+        if worker_cleanup_failure is None:
+            raise
+        print(f"Solved export cleanup incomplete: {worker_cleanup_failure}", file=sys.stderr, flush=True)
+        return WORKER_CLEANUP_INCOMPLETE_EXIT_CODE
 
 
 if __name__ == "__main__":

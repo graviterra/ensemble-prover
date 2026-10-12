@@ -36,6 +36,7 @@ from .deadline_guard import (
     create_result_only_deadline_task,
     outer_guard_timeout_s,
 )
+from .lean_names import lean_name_key
 from .lean_parser import (
     _diagnostic_compact_lines,
     canonical_error_type,
@@ -4684,17 +4685,15 @@ def _cache_seed_visible_base_identity(
     ):
         name = str(helper_decl_name(block) or "").strip()
         helper = verified_helpers.get(name)
-        rendered_statement_key = canonicalize_lean_statement_for_identity(
-            helper_decl_statement(block)
-        )
-        stored_statement_key = (
-            canonicalize_lean_statement_for_identity(
-                helper_decl_statement(str(getattr(helper, "source", "") or ""))
+        stored_source = str(getattr(helper, "source", "") or "")
+        same_statement = helper is not None and (
+            block == stored_source
+            or canonicalize_lean_statement_for_identity(helper_decl_statement(block))
+            == canonicalize_lean_statement_for_identity(
+                helper_decl_statement(stored_source)
             )
-            if helper is not None
-            else ""
         )
-        if helper is not None and rendered_statement_key == stored_statement_key:
+        if same_statement:
             if name in excluded:
                 continue
             identity.append(
@@ -5958,12 +5957,7 @@ async def _accept_proof_state_helper(
     stale_dependents: Set[str] = set()
     batch_admission = cache_seed_batch_admission
     recomputed_certified_context = (
-        tuple(
-            merge_context_helpers(
-                list(batch_admission.context),
-                [helper_block],
-            )
-        )
+        (*batch_admission.context, helper_block)
         if batch_admission is not None
         else ()
     )
@@ -6803,6 +6797,7 @@ def _cache_seed_batch_validation_input(
     *,
     dossier: ProofDossier,
     diagnostics_out: Optional[Dict[str, Any]] = None,
+    _merge_prefixes: bool = False,
 ) -> Tuple[
     Tuple[str, ...],
     Tuple[str, ...],
@@ -6817,15 +6812,17 @@ def _cache_seed_batch_validation_input(
     The resulting receipt certifies only the selected exact source/context pairs.
     """
 
+    diagnostics: Dict[str, Any] = {}
+
     def exclude(record: Mapping[str, Any], reason: str) -> None:
         if diagnostics_out is None:
             return
-        diagnostics_out["batch_validation_excluded_count"] = (
-            int(diagnostics_out.get("batch_validation_excluded_count", 0)) + 1
+        diagnostics["batch_validation_excluded_count"] = (
+            int(diagnostics.get("batch_validation_excluded_count", 0)) + 1
         )
-        reasons = diagnostics_out.setdefault("batch_validation_exclusion_reasons", {})
+        reasons = diagnostics.setdefault("batch_validation_exclusion_reasons", {})
         reasons[reason] = int(reasons.get(reason, 0)) + 1
-        details = diagnostics_out.setdefault("batch_validation_excluded_records", [])
+        details = diagnostics.setdefault("batch_validation_excluded_records", [])
         if len(details) < 12:
             details.append({
                 "helper_name": str(
@@ -6896,18 +6893,50 @@ def _cache_seed_batch_validation_input(
         ):
             exclude(record, "replay_source_hash_mismatch")
             continue
-        candidate_context = merge_context_helpers(context, [helper_block])
-        if helper_block not in candidate_context:
-            exclude(record, "helper_missing_from_context")
-            continue
-        if candidate_context[: len(context)] != context:
-            exclude(record, "context_prefix_changed")
-            continue
-        context = candidate_context
+        # Sources have already been dependency-ordered, and this selection
+        # excludes names present in the prefix. Preserve the exact file order;
+        # check merge compatibility once below instead of sorting every prefix.
+        if _merge_prefixes:
+            candidate_context = merge_context_helpers(context, [helper_block])
+            if helper_block not in candidate_context:
+                exclude(record, "helper_missing_from_context")
+                continue
+            if candidate_context[: len(context)] != context:
+                exclude(record, "context_prefix_changed")
+                continue
+            context = candidate_context
+        else:
+            context.append(helper_block)
         covered_contexts.append((helper_block, tuple(context)))
         helper_blocks.append(helper_block)
         available_hashes[helper_name] = actual_source_hash
         seen_source_hashes.add(actual_source_hash)
+    forward_dependency = False
+    if not _merge_prefixes:
+        # Whole-list equality alone cannot certify prefixes: a cycle may cause
+        # the sorter to restore the original order only after later nodes land.
+        # Use the same canonical names and reference analysis as the sorter.
+        names = [lean_name_key(helper_decl_name(block) or "") for block in context]
+        candidate_names = list(dict.fromkeys(name for name in names if name))
+        preceding_names: Set[str] = set()
+        for block, name in zip(context, names):
+            if _helper_referenced_names(block, candidate_names, skip=name) - preceding_names:
+                forward_dependency = True
+                break
+            if name:
+                preceding_names.add(name)
+    if not _merge_prefixes and (
+        forward_dependency or merge_context_helpers(base_context, helper_blocks) != context
+    ):
+        # Aliases or a positional context command can still change ordering.
+        # Revisit compatibility one prefix at a time only for that exceptional
+        # queue, preserving unrelated candidates and their fallback priority.
+        return _cache_seed_batch_validation_input(
+            records, dossier=dossier, diagnostics_out=diagnostics_out,
+            _merge_prefixes=True,
+        )
+    if diagnostics_out is not None:
+        diagnostics_out.update(diagnostics)
     if len(helper_blocks) <= 1:
         return (), (), ()
     final_context = covered_contexts[-1][1]

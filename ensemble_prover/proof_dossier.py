@@ -1284,6 +1284,16 @@ def _strip_lean_comments_outside_backtick_spans_for_prompt(text: str) -> str:
 def _contains_solution_ref_for_prompt(text: str) -> bool:
     """Return whether prompt text contains a direct or split answer ref."""
 
+    from .proof_graph import _large_lexical_result
+
+    source = str(text or "")
+    return _large_lexical_result(
+        ("prompt_contains_solution_ref", source),
+        lambda: _uncached_contains_solution_ref_for_prompt(source),
+    )
+
+
+def _uncached_contains_solution_ref_for_prompt(text: str) -> bool:
     raw = _prompt_security_skeleton_text(text)
     if _SOLUTION_REF_RE.search(raw) or next(
         iter(_iter_prompt_security_matches(raw, _SPLIT_SOLUTION_REF_RE)), None
