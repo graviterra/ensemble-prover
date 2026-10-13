@@ -121,7 +121,7 @@ class MathematicalMemoryAction:
         )
         if available <= 0:
             return False
-        if service.has_deferred_root_finalization() or service.has_pending_source_recovery():
+        if service.deferred_root_recheck_ready() or service.has_pending_source_recovery():
             return True
         try:
             if self._select_pending_request(session, available) is not None:
@@ -292,10 +292,10 @@ class MathematicalMemoryAction:
                             request, budget, source_provenance=annotation_provenance
                         )
                         verdict = "generalization_completed"
-                if service.has_pending_source_recovery():
+                if not request and service.has_pending_source_recovery():
                     stage = "source_recovery"
                     await service.recover_source_context(budget)
-                if not request and service.has_deferred_root_finalization():
+                if not request and service.deferred_root_recheck_ready():
                     stage = "root_recheck"
                     result_candidate = await service.recheck_deferred_root_finalization(budget)
                     if result_candidate is not None:

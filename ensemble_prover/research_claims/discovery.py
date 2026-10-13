@@ -670,6 +670,8 @@ class DiscoveryLoop:
                 if self.strategy is not None and not self.strategy.research.before_request(job):
                     return self.store.job(job["job_id"])
                 job = self.store.job(job["job_id"])
+                from .native_local_proofs import prepare_local_proof_notifications
+                prepare_local_proof_notifications(self.store, job)
                 job["messages"].extend(job["inbox"])
                 job["inbox"] = []
                 context = self._context(job)

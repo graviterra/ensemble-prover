@@ -252,32 +252,44 @@ def _attempt_feedback(store: Any, graph: Any, attempt: Any) -> dict[str, Any] | 
             "instruction": "The exact local task remains available under its existing proof allocation. This feedback does not refute the statement or discard partial proof work."}
 
 
+def _retire_job_result_notifications(job: dict[str, Any], task_id: str | None) -> bool:
+    changed = False
+    for channel in ("messages", "inbox"):
+        for message in job[channel]:
+            try:
+                payload = load_json(message.get("content", ""), max_depth=INTERNAL_JSON_NESTING)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            result = payload.get("local_proof_result")
+            if (not isinstance(result, dict) or task_id is not None and result.get("task_id") != task_id
+                    or not result.get("kernel_verified")):
+                continue
+            message["content"] = json_text({
+                "prior_context_notification": payload,
+                "context_reaudit_required": True,
+                "authority": "advisory_prior_context_history",
+                "kernel_verified": False,
+                "requires_response": payload.get("requires_response", False),
+            })
+            changed = True
+    return changed
+
+
 def _retire_result_notifications(store: Any, task_id: str) -> None:
     """Retain delivered proof text as history when its checked support is absent."""
     for job in store.jobs():
-        changed = False
-        for channel in ("messages", "inbox"):
-            for message in job[channel]:
-                try:
-                    payload = load_json(message.get("content", ""), max_depth=INTERNAL_JSON_NESTING)
-                except (ValueError, TypeError):
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                result = payload.get("local_proof_result")
-                if (not isinstance(result, dict) or result.get("task_id") != task_id
-                        or not result.get("kernel_verified")):
-                    continue
-                message["content"] = json_text({
-                    "prior_context_notification": payload,
-                    "context_reaudit_required": True,
-                    "authority": "advisory_prior_context_history",
-                    "kernel_verified": False,
-                    "requires_response": payload.get("requires_response", False),
-                })
-                changed = True
-        if changed:
+        if _retire_job_result_notifications(job, task_id):
             store.save_job(job)
+
+
+def prepare_local_proof_notifications(store: Any, job: dict[str, Any]) -> None:
+    """Fence uncommitted withdrawals in this job's ordinary dispatch transaction."""
+    if getattr(store, "_local_proof_scan_pending", False):
+        _retire_job_result_notifications(job, None)
+    for task_id in getattr(store, "_local_proof_pending_withdrawals", ()):
+        _retire_job_result_notifications(job, task_id)
 
 
 def _fence_task_nodes(graph: Any, task_id: str) -> None:
@@ -338,22 +350,41 @@ def reconcile_local_proofs(owner: Any, session: Any) -> bool:
     store = owner.store
     graph = session.dossier.proof_graph
     changed = False
+    storage_error: OSError | sqlite3.Error | None = None
     notifier = owner.loop
-    task_ids = list(store.run_record().get("native_local_proof_tasks", {}))
-    latest_attempts = {attempt.node_id: attempt for attempt in graph.attempts} if task_ids else {}
-    for task_id in task_ids:
+    pending = getattr(store, "_local_proof_pending_withdrawals", None)
+    if pending is None:
+        pending = store._local_proof_pending_withdrawals = set()
+    try:
+        tasks = store.run_record().get("native_local_proof_tasks", {})
+    except (OSError, sqlite3.Error):
+        # No individual task can be revalidated without its ledger snapshot.
+        # Keep delivered proof text advisory until a later scan succeeds.
+        store._local_proof_scan_pending = True
+        raise
+    if getattr(store, "_local_proof_scan_pending", False):
+        pending.update(tasks)
+        store._local_proof_scan_pending = False
+    latest_attempts = {attempt.node_id: attempt for attempt in graph.attempts} if tasks else {}
+    for task_id, previous in tasks.items():
         node = None
+        withdraw_result = isinstance(previous, dict) and previous.get("status") == "proved"
+        pending_validation = task_id in pending
+        committed = True
         try:
             # Each task owns a transaction: damaged evidence cannot roll back
             # its siblings' ledger records or previously delivered results.
             with store.atomic():
+                if pending_validation:
+                    _retire_result_notifications(store, task_id)
                 run = store.run_record()
                 task = run["native_local_proof_tasks"][task_id]
                 before = deepcopy(task)
                 if isinstance(task, dict) and task.get("status") == "invalid_request":
+                    withdraw_result = True
                     _fence_task_nodes(graph, task_id)
+                    _retire_result_notifications(store, task_id)
                     if _notify_invalid_task(owner, task_id, task):
-                        _retire_result_notifications(store, task_id)
                         current = store.run_record()
                         current["native_local_proof_tasks"][task_id] = task
                         store.save_run(current)
@@ -365,6 +396,7 @@ def reconcile_local_proofs(owner: Any, session: Any) -> bool:
                         raise ValueError("local proof ledger key changed")
                     hints = _validated_hints(store, task, request)
                 except (ValueError, KeyError, TypeError, FileNotFoundError) as exc:
+                    withdraw_result = True
                     if not isinstance(task, dict):
                         task = {"task_id": task_id, "invalid_record": task}
                     task.update(status="invalid_request", invalid_request={
@@ -397,6 +429,7 @@ def reconcile_local_proofs(owner: Any, session: Any) -> bool:
                     )
                     task["node_id"] = node.node_id
                 if not matches:
+                    withdraw_result = True
                     if task["status"] != "waiting_for_context":
                         task["prior_context_result_artifact"] = task["result_artifact"]
                         _retire_result_notifications(store, task_id)
@@ -407,7 +440,10 @@ def reconcile_local_proofs(owner: Any, session: Any) -> bool:
                               "instruction": "The original local task and attempts are retained. Its exact context must return before further proof work or current proof authority is available."}
                 else:
                     result = _checked_result(session, node, request, context) if node is not None else None
+                    if result is not None:
+                        withdraw_result = False
                     if result is None and task["status"] == "proved":
+                        withdraw_result = True
                         task["prior_context_result_artifact"] = task["result_artifact"]
                         _retire_result_notifications(store, task_id)
                     if result is None and node is not None:
@@ -431,7 +467,8 @@ def reconcile_local_proofs(owner: Any, session: Any) -> bool:
                     result.update(task_id=task_id, lean_statement=request["lean_statement"],
                                   origin=request["origin"], contract=request["contract"], root_proved=False)
                     artifact = store.put_artifact(json_text(result).encode(), name="native-local-proof-result.json")
-                    if task["result_artifact"] != artifact:
+                    if (task["result_artifact"] != artifact
+                            or pending_validation and result["kernel_verified"]):
                         if notifier is None:
                             notifier = _stored_notifier(owner)
                         notifier._notify(request["origin"]["job_id"], {
@@ -455,9 +492,35 @@ def reconcile_local_proofs(owner: Any, session: Any) -> bool:
                 node.metadata["native_local_proof_followup_artifacts"] = list(task["followup_request_artifacts"])
                 node.metadata["native_local_proof_hints"] = hints
                 node.metadata["schedulable"] = matches and node.statement == request["lean_statement"]
+        except (OSError, sqlite3.Error) as exc:
+            committed = False
+            # The failed transaction has rolled back. Still reconcile siblings:
+            # their previously delivered proof authority may need withdrawal.
+            # Report the storage failure after independent transactions finish.
+            _fence_task_nodes(graph, task_id)
+            if storage_error is None:
+                storage_error = exc
+            if withdraw_result:
+                pending.add(task_id)
+                # Withdrawal has no dependence on committing the failed task
+                # update. Preserve it even when quarantine/result bookkeeping
+                # rolled back the first transaction's notification changes.
+                try:
+                    with store.atomic():
+                        _retire_result_notifications(store, task_id)
+                except (OSError, sqlite3.Error):
+                    # A store-wide outage can also prevent withdrawal. Keep
+                    # reporting it while allowing independent siblings to run.
+                    storage_error.add_note("Local proof notification withdrawal was also unavailable.")
         except BaseException:
+            committed = False
             _fence_task_nodes(graph, task_id)
             raise
+        finally:
+            if committed:
+                pending.discard(task_id)
+    if storage_error is not None:
+        raise storage_error
     return changed
 
 

@@ -1243,6 +1243,7 @@ class Conversation:
     allow_helper_decomposition: bool = True
     history: List[Dict[str, Any]] = field(default_factory=list)
     reasoning_notebook: List[Dict[str, Any]] = field(default_factory=list)
+    reasoning_notebook_reads: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # A filled answer definition that is explicitly visible is a real

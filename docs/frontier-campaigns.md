@@ -44,6 +44,13 @@ answers. Switching between proving and refinement on the same target preserves
 unfinished paid tool calls, so a local checker retry can continue without a new
 model request.
 
+Substantial exact quotations of retrieved notebook pages can be stored as
+excerpt references. Each reference records the original page request and range;
+new reasoning remains verbatim. An origin range gives direct access to the
+underlying entries without following a chain of quotations. Reads remain subject
+to the current visibility rules. This limits repeated copying of the notebook
+into itself while keeping the quoted mathematics retrievable.
+
 Notebook entries carry no proof authority. An identifier error or failed tactic
 records a formalization problem; it does not establish that the accompanying
 mathematical idea is false. The notebook survives ordinary checkpoint restoration
@@ -92,6 +99,8 @@ context returns and their checked sources can be validated again. A damaged
 task record is fenced independently, allowing other tasks to continue. Its
 investigator receives an operational failure result and can revise the request
 or continue other research; that result does not refute the local statement.
+If one task's ledger update fails, independent tasks still reconcile their
+results, including withdrawal of proof status whose checked context has changed.
 
 After a verifier retry defers, the proof scheduler allows competing search work
 to run and then returns to the waiting verification. This service order survives

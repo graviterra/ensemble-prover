@@ -27096,16 +27096,29 @@ class MiniSession:
                 "defer_selected_frontier_action": True,
             }
         if not memory_eligible:
+            verdict = "memory_source_policy_no_longer_current"
             if memory is not None:
-                memory.clear_deferred_root_finalization()
+                from sqlite3 import DatabaseError
+                from ..mathematical_memory.catalog import MemoryUnavailable
+
+                memory.defer_root_finalization(candidate)
+                try:
+                    memory.block_deferred_root_recheck()
+                except (OSError, MemoryUnavailable, DatabaseError):
+                    # Retry accounting cannot bypass provisional root cleanup.
+                    # The proof stays inert and no incomplete retry fence is kept.
+                    memory.health = "unavailable"
+                    verdict = "memory_source_temporarily_unavailable"
             self._clear_uncontracted_root_side_effects(
                 candidate=candidate, action_id=outcome.action_id,
-                contract_status={"verdict": "memory_source_policy_no_longer_current"},
+                contract_status={"verdict": verdict},
             )
             self._clear_root_finalized_for_rejected_attempt()
             return {
                 "root_finalization_accepted": False,
-                "root_finalization_verdict": "memory_source_policy_no_longer_current",
+                "root_finalization_verdict": verdict,
+                **({"preserve_frontier_work": True, "defer_selected_frontier_action": True}
+                   if verdict == "memory_source_temporarily_unavailable" else {}),
             }
         if memory is not None:
             memory.clear_deferred_root_finalization()

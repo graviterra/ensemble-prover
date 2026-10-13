@@ -7,6 +7,7 @@ import json
 from typing import Any, Mapping, Sequence
 
 from .prompt_page_text import prompt_page_json
+from .reasoning_notebook_quotes import NotebookQuotations, remember_notebook_read
 
 
 READ_REASONING_NOTEBOOK_TOOL = {
@@ -17,13 +18,19 @@ READ_REASONING_NOTEBOOK_TOOL = {
             "Recover reasoning, assumptions, partial derivations and formalization "
             "diagnostics removed by compaction. This is unverified historical work, "
             "not proof. Search with query or leave it empty to read all entries. "
-            "Continue pages with next_offset and snapshot_id."
+            "Continue pages with next_offset and snapshot_id. Archived excerpt "
+            "references include original_read arguments for direct access to "
+            "original mathematical work without following quotation chains."
         ),
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string"},
             "offset": {"type": "integer", "minimum": 0},
             "length": {"type": "integer", "minimum": 1, "maximum": 12000},
             "snapshot_id": {"type": "string"},
+            "entry_start": {"type": "integer", "minimum": 0,
+                            "description": "First notebook entry to include, counting from zero."},
+            "entry_end": {"type": "integer", "minimum": 0,
+                          "description": "Exclusive upper entry bound; omit to include all entries."},
         }},
     },
 }
@@ -81,6 +88,7 @@ def archive_reasoning(conv: Any, messages: Sequence[Mapping[str, Any]]) -> None:
         if is_target_anchor(message):
             current_anchor = str(message.get("content") or "")
         source_anchors[id(message)] = current_anchor
+    quotations = NotebookQuotations(conv, _read_notebook_page)
     retained = []
     notebook_call_ids: set[str] = set()
     last_anchor = ""
@@ -92,6 +100,8 @@ def archive_reasoning(conv: Any, messages: Sequence[Mapping[str, Any]]) -> None:
         content = str(message.get("content") or "")
         for reasoning in readable_reasoning_parts(message) if role == "assistant" else ():
             content += "\n\nUnverified historical reasoning:\n" + reasoning
+        if role == "assistant":
+            content = quotations.replace(content)
         if content.startswith("[history compaction]"):
             continue
         if role == "assistant":
@@ -138,6 +148,8 @@ def archive_reasoning(conv: Any, messages: Sequence[Mapping[str, Any]]) -> None:
         "scope_at_compaction": str(getattr(conv, "_graph_selected_work_last_scope_key", "") or ""),
         "messages": retained,
     }
+    if quotations.references:
+        entry["notebook_excerpts"] = quotations.references
     # Copy on append also isolates dataclasses.replace handoffs.
     entries = list(getattr(conv, "reasoning_notebook", ()) or ())
     if entry not in entries:
@@ -161,6 +173,17 @@ def archive_pending_tool_candidates(conv: Any, state: Mapping[str, Any], *, targ
 def read_reasoning_notebook(conv: Any, args: Mapping[str, Any]) -> dict[str, Any]:
     from .mini_policy import _conversation_should_redact_solution_refs
 
+    redact = _conversation_should_redact_solution_refs(conv)
+    page = _read_notebook_page(conv, args, redact=redact)
+    remember_notebook_read(conv, args, page, redact=redact)
+    return page
+
+
+def _read_notebook_page(
+    conv: Any, args: Mapping[str, Any], *, redact: bool,
+    projection_cache: dict[tuple, tuple] | None = None,
+    origin_output: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     query = args.get("query", "")
     offset, length = args.get("offset", 0), args.get("length", 6000)
     if (not isinstance(query, str) or type(offset) is not int or offset < 0
@@ -182,25 +205,61 @@ def read_reasoning_notebook(conv: Any, args: Mapping[str, Any]) -> dict[str, Any
         # A notebook is append-only. Later work must not invalidate a reader's
         # immutable prefix; replacing earlier entries still fails the hash.
         entries = entries[:count]
-    # Apply visibility to the entire text before filtering and paging; neither
-    # query matches nor page boundaries may expose hidden answer references.
-    visible = json.loads(prompt_page_json(
-        entries, redact_solution_refs=_conversation_should_redact_solution_refs(conv),
-    ))
-    selected = [entry for entry in visible
-                if query.casefold() in json.dumps(entry, ensure_ascii=False).casefold()]
-    text = prompt_page_json(selected, redact_solution_refs=False)
-    snapshot = f"{count}:" + hashlib.sha256(text.encode()).hexdigest()
+    first, last = args.get("entry_start", 0), args.get("entry_end", count)
+    if type(first) is not int or type(last) is not int or not 0 <= first <= last <= count:
+        raise ValueError("invalid reasoning notebook entry bounds")
+    key = count, query, redact, first, last
+    projected = projection_cache.get(key) if projection_cache is not None else None
+    if projected is None:
+        # Apply visibility to the entire text before filtering and paging;
+        # neither queries nor page boundaries may expose hidden references.
+        visible = json.loads(prompt_page_json(entries, redact_solution_refs=redact))
+        selected_rows = [(index, entry) for index, entry in enumerate(visible)
+                         if first <= index < last
+                         and query.casefold() in json.dumps(entry, ensure_ascii=False).casefold()]
+        selected = [entry for _, entry in selected_rows]
+        text = prompt_page_json(selected, redact_solution_refs=False)
+        snapshot = f"{count}:" + hashlib.sha256(text.encode()).hexdigest()
+        origin_first, origin_last = _original_entry_bounds(selected_rows, first)
+        origin_text = prompt_page_json(visible[origin_first:origin_last], redact_solution_refs=False)
+        origin = {
+            "entry_start": origin_first, "entry_end": origin_last, "length": 12000,
+            "snapshot_id": f"{count}:" + hashlib.sha256(origin_text.encode()).hexdigest(),
+        }
+        projected = text, snapshot, len(selected), origin
+        if projection_cache is not None:
+            projection_cache[key] = projected
+    text, snapshot, matched_entries, origin = projected
+    if origin_output is not None:
+        origin_output.update(origin)
     if (offset and not expected) or (expected is not None and expected != snapshot):
         raise ValueError("reasoning notebook snapshot changed; restart at offset zero")
     if offset > len(text):
         raise ValueError("reasoning notebook offset exceeds snapshot")
     end = min(len(text), offset + length)
     return {
-        "authority": "unverified_history", "matched_entries": len(selected),
+        "authority": "unverified_history", "matched_entries": matched_entries,
         "text": text[offset:end], "snapshot_id": snapshot, "offset": offset,
         "next_offset": end if end < len(text) else None,
     }
+
+
+def _original_entry_bounds(rows: Sequence[tuple[int, Any]], empty_at: int) -> tuple[int, int]:
+    """Locate the flat originals with two indices, independent of quote depth."""
+    first, last = (rows[0][0], rows[-1][0] + 1) if rows else (empty_at, empty_at)
+    for index, entry in rows:
+        references = entry.get("notebook_excerpts", ()) if isinstance(entry, dict) else ()
+        for reference in references if isinstance(references, list) else ():
+            origin = reference.get("original_read") if isinstance(reference, dict) else None
+            start = origin.get("entry_start") if isinstance(origin, dict) else None
+            end = origin.get("entry_end") if isinstance(origin, dict) else None
+            if type(start) is int and type(end) is int and 0 <= start <= end <= index:
+                first = min(first, start)
+            else:
+                # Older references have no locator. All their source records
+                # precede this entry, so the enclosing prefix remains complete.
+                first = 0
+    return first, last
 
 
 def notebook_notice(conv: Any) -> str:

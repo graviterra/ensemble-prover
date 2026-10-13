@@ -170,6 +170,14 @@ never authorize this retry. A changed source policy rejects acceptance, and a
 matching previously completed root loses its current solved status until the
 ordinary acceptance checks succeed again.
 
+Source rejection parks the retained proof text until its context or source
+eligibility changes. Replacing or removing a helper keeps that text available
+for a fresh check against the current helper context. Malformed recovery rows
+are isolated as inert diagnostics while valid source descriptions remain
+available for admission. None of these recovery records replaces a Lean check.
+A completed failed check pauses that proof in its checked context; checker
+timeouts remain retryable, and a changed checker environment permits a new check.
+
 These checks use the configured Lean project and installed toolchain. Configured
 Lean source retains the runner's existing execution permissions; isolated output
 paths do not sandbox metaprogram IO. Live receipts belong to the current process

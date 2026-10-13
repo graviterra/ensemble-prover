@@ -93,6 +93,54 @@ def _retired_support_unknown_names(state: Mapping[str, Any]) -> set[str]:
     return result
 
 
+def _source_recovery_descriptions(
+    records: tuple[Mapping[str, Any], ...],
+) -> tuple[dict[str, list[str]], list[dict[str, Any]], list[Any]]:
+    """Merge independently retained descriptions without granting admission."""
+    from ensemble_prover.mathematical_retrieval.model import RetrievalCandidate
+
+    names_by_source: dict[str, list[str]] = {}
+    sources: dict[str, dict[str, Any]] = {}
+    invalid: list[Any] = []
+    for record in records:
+        names = record.get("helper_names_by_source", {})
+        rows = record.get("source_candidates", ())
+        if not isinstance(names, dict):
+            invalid.append({"helper_names_by_source": names})
+            names = {}
+        for identity, aliases in names.items():
+            if (isinstance(identity, str) and identity
+                    and isinstance(aliases, (list, tuple))
+                    and all(isinstance(name, str) and name for name in aliases)):
+                retained = names_by_source.setdefault(identity, [])
+                retained.extend(name for name in aliases if name not in retained)
+            else:
+                invalid.append({"helper_names_by_source": {identity: aliases}})
+        if not isinstance(rows, (list, tuple)):
+            invalid.append({"source_candidates": rows})
+            rows = ()
+        for row in rows:
+            if (isinstance(row, dict) and isinstance(row.get("candidate_id"), str)
+                    and row["candidate_id"] and isinstance(row.get("origins"), (list, tuple))
+                    and all(isinstance(origin, dict)
+                            and isinstance(origin.get("required_bundle_ids", ()), (list, tuple))
+                            and all(isinstance(bundle, str) for bundle in origin.get("required_bundle_ids", ()))
+                            for origin in row["origins"])):
+                try:
+                    RetrievalCandidate.from_record(row)
+                except (TypeError, ValueError, KeyError, OverflowError):
+                    invalid.append(row)
+                    continue
+                retained = sources.setdefault(row["candidate_id"], row)
+                if content_digest(retained) != content_digest(row):
+                    # Candidate identity omits exact source text. A later
+                    # unadmitted row cannot replace the retained description.
+                    invalid.append({"conflicting_source_candidate": row})
+            else:
+                invalid.append(row)
+    return names_by_source, list(sources.values()), invalid
+
+
 def admit_live_export_credit(
     root: Any,
     event: MemoryEvent,
@@ -2137,24 +2185,19 @@ class MathematicalMemoryService:
         """Retain source descriptions and alias obligations, never admission."""
         session = self.session()
         state = session.mathematical_memory_state
-        previous = state.get("source_recovery", {})
-        if not isinstance(previous, dict) or previous.get("policy_id") != self.policy_id:
-            previous = {}
-        previous_names = previous.get("helper_names_by_source", {})
-        previous_sources = previous.get("source_candidates", ())
-        if (not isinstance(previous_names, dict) or not isinstance(previous_sources, (list, tuple))
-                or any(not isinstance(identity, str) or not identity
-                       or not isinstance(names, (list, tuple))
-                       or any(not isinstance(name, str) or not name for name in names)
-                       for identity, names in previous_names.items())
-                or any(not isinstance(row, dict) or not isinstance(row.get("candidate_id"), str)
-                       or not isinstance(row.get("origins"), (list, tuple))
-                       or any(not isinstance(origin, dict)
-                              or not isinstance(origin.get("required_bundle_ids", ()), (list, tuple))
-                              or any(not isinstance(bundle, str) for bundle in origin.get("required_bundle_ids", ()))
-                              for origin in row["origins"])
-                       for row in previous_sources)):
-            raise ValueError("invalid checkpoint source recovery inventory")
+        descriptions = tuple(record for key in ("deferred_root_finalization", "source_recovery")
+                             if isinstance(record := state.get(key), dict)
+                             and record.get("policy_id") == self.policy_id)
+        previous_names, previous_sources, invalid = _source_recovery_descriptions(descriptions)
+        if invalid:
+            # Diagnostics retain corrupt descriptions as inert checkpoint data.
+            # Valid siblings still undergo their own ordinary source admission.
+            quarantined = state.get("invalid_source_recovery", {})
+            if not isinstance(quarantined, dict):
+                quarantined = {content_digest(quarantined): copy.deepcopy(quarantined)}
+            for item in invalid:
+                quarantined[content_digest(item)] = copy.deepcopy(item)
+            state["invalid_source_recovery"] = quarantined
         required = set(self.known_candidate_ids.values()) | set(self._memory_support_names.values())
         required.update(self._memory_import_owners)
         required.update(state.get("retired_import_owners", ()))
@@ -2195,12 +2238,13 @@ class MathematicalMemoryService:
         """A restored source description needs a fresh funded admission pass."""
         state = self.session().mathematical_memory_state
         record = state.get("source_recovery")
-        if (not isinstance(record, dict) or record.get("policy_id") != self.policy_id
-                or not record.get("source_candidates")):
-            return False
+        if not isinstance(record, dict) or record.get("policy_id") != self.policy_id:
+            record = {}
         try:
             inventory = self.source_recovery_inventory()
         except ValueError:
+            return False
+        if not inventory["source_candidates"]:
             return False
         if record.get("rejected_inventory_id") == content_digest(inventory):
             # A fixed descriptor mismatch stays rejected. A source whose live
@@ -2252,6 +2296,7 @@ class MathematicalMemoryService:
         if not self.has_pending_source_recovery():
             return
         inventory = self.source_recovery_inventory()
+        self.session().mathematical_memory_state["source_recovery"] = copy.deepcopy(inventory)
         pending_root = self.deferred_root_finalization()
         unused_helpers = self._root_unused_helper_ids(pending_root) if pending_root is not None else frozenset()
         rejected_sources: list[ValueError] = []
@@ -2276,7 +2321,7 @@ class MathematicalMemoryService:
                 checked_source = replace(candidate, source_action_id="mathematical_memory_root_recheck")
                 if self.finalization_eligible(checked_source, propagate_unavailable=True, budget=budget):
                     return
-                self.clear_deferred_root_finalization()
+                self.block_deferred_root_recheck(budget=budget)
             raise rejected_sources[0]
 
     def defer_root_finalization(self, candidate: Any) -> None:
@@ -2295,6 +2340,9 @@ class MathematicalMemoryService:
             "Proof candidate awaiting current source authority and a fresh Lean check:\n"
             + json.dumps(record, ensure_ascii=False, sort_keys=True)}])
         inventory = self.source_recovery_inventory()
+        # Persist alias obligations while their original live binding still
+        # exists. Replacing the helper object must not erase its source row.
+        session.mathematical_memory_state["source_recovery"] = copy.deepcopy(inventory)
         session.mathematical_memory_state["deferred_root_finalization"] = {
             "candidate": record, "environment_id": self.context_id(),
             **inventory,
@@ -2313,9 +2361,7 @@ class MathematicalMemoryService:
         if not isinstance(record, dict):
             return None
         payload = record.get("candidate")
-        if (record.get("environment_id") != self.context_id()
-                or record.get("policy_id") != self.policy_id or not isinstance(payload, dict)):
-            self.clear_deferred_root_finalization()
+        if record.get("policy_id") != self.policy_id or not isinstance(payload, dict):
             return None
         try:
             # Serialized certificates and side-effect metadata never survive
@@ -2327,10 +2373,16 @@ class MathematicalMemoryService:
             sequences = (candidate.replay_helpers, candidate.helper_names,
                          candidate.dependency_node_ids, candidate.dependency_helper_names)
             if (not isinstance(candidate.proof, str) or not candidate.proof.strip()
-                    or candidate.target_statement != self.context()[0]
                     or any(not isinstance(items, (tuple, list))
                            or any(not isinstance(item, str) for item in items) for items in sequences)):
                 raise ValueError("invalid deferred proof")
+            if candidate.target_statement != self.context()[0]:
+                return None
+            if record.get("environment_id") != self.context_id():
+                from ensemble_prover.proof_dossier import helper_decl_name
+                helpers = self.context()[2]
+                candidate = replace(candidate, replay_helpers=helpers,
+                                    helper_names=tuple(helper_decl_name(block) for block in helpers))
             return candidate
         except (TypeError, ValueError):
             self.clear_deferred_root_finalization()
@@ -2338,6 +2390,43 @@ class MathematicalMemoryService:
 
     def has_deferred_root_finalization(self) -> bool:
         return self.deferred_root_finalization() is not None
+
+    def block_deferred_root_recheck(
+        self, *, budget: MemoryBudget | None = None, completed_check: bool = False,
+    ) -> None:
+        """Park rejected source work until its context or live authority changes."""
+        record = self.session().mathematical_memory_state.get("deferred_root_finalization")
+        if not isinstance(record, dict):
+            return
+        inventory = self.source_recovery_inventory()
+        denied = [row["candidate_id"] for row in inventory["source_candidates"]
+                  if not self.candidate_eligible(row["candidate_id"], budget=budget)]
+        # Compute all fallible policy checks before publishing the retry fence.
+        record["blocked_recheck"] = {
+            "environment_id": self.context_id(), "inventory_id": content_digest(inventory),
+            "denied_source_ids": denied,
+            **({"checked_runtime_id": self._deferred_root_runtime_id()} if completed_check else {}),
+        }
+
+    def _deferred_root_runtime_id(self) -> str:
+        from ensemble_prover.verified_helper_contract import helper_contract_runner_context
+        runner = self.session().lean
+        return content_digest({"runner_id": id(runner), "context": helper_contract_runner_context(runner)})
+
+    def deferred_root_recheck_ready(self) -> bool:
+        """Retained proof text is actionable only after its rejection changes."""
+        if self.deferred_root_finalization() is None:
+            return False
+        record = self.session().mathematical_memory_state["deferred_root_finalization"]
+        blocked = record.get("blocked_recheck")
+        if not isinstance(blocked, dict):
+            return True
+        if (blocked.get("environment_id") != self.context_id()
+                or blocked.get("inventory_id") != content_digest(self.source_recovery_inventory())
+                or ("checked_runtime_id" in blocked
+                    and blocked["checked_runtime_id"] != self._deferred_root_runtime_id())):
+            return True
+        return any(self.candidate_eligible(identity) for identity in blocked.get("denied_source_ids", ()))
 
     async def _readmit_deferred_helper(
         self, candidate: Any, budget: MemoryBudget, *, helper_name: str | None = None,
@@ -2498,10 +2587,12 @@ class MathematicalMemoryService:
         # prior memory application observation, which may already be consumed.
         candidate = replace(candidate, source_action_id="mathematical_memory_root_recheck")
         unused_helpers = self._root_unused_helper_ids(candidate)
+        if record.get("environment_id") != self.context_id():
+            record = self.source_recovery_inventory()
         try:
             await self._readmit_source_inventory(record, budget, unused_helpers=unused_helpers)
         except ValueError:
-            self.clear_deferred_root_finalization()
+            self.block_deferred_root_recheck(budget=budget)
             raise
         if self.deferred_root_finalization() is None:
             return None
@@ -2510,9 +2601,13 @@ class MathematicalMemoryService:
             # retained proof can be retried. Keep its text without authority.
             return None
         _, preamble, _ = self.context()
+        from ensemble_prover.verified_helper_contract import helper_contract_context_guard
+        runner = session.lean
+        context_id = self.context_id()
+        runtime_current = helper_contract_context_guard(runner)
         checked = await _await_serialized_lean_operation(
-            session.lean,
-            lambda: session.lean.check(
+            runner,
+            lambda: runner.check(
                 candidate.target_statement, candidate.proof, list(candidate.replay_helpers),
                 preamble_override=preamble, timeout_s=budget.remaining_s(),
                 max_heartbeats=budget.max_heartbeats,
@@ -2521,7 +2616,19 @@ class MathematicalMemoryService:
             deadline_monotonic=budget.deadline_monotonic,
         )
         budget.check_cancelled()
+        if session.lean is not runner or not runtime_current() or self.context_id() != context_id:
+            raise OSError("deferred root context changed during recheck")
         if not checked.ok or checked.axiom_audit_ok is not True:
+            from ensemble_prover.lean_parser import LeanParseResult
+            parsed = getattr(checked, "parsed", None)
+            if (isinstance(parsed, LeanParseResult)
+                    and not parsed.timeout and not parsed.infra_failure
+                    and getattr(checked, "returncode", -1) >= 0
+                    and not getattr(checked, "pending_reference_confirmation", False)
+                    and (parsed.sorry_count or any(item.severity == "error" for item in parsed.diagnostics))):
+                # A completed check settles only this exact attempt/context.
+                # Its proof remains available after new context or proof work.
+                self.block_deferred_root_recheck(budget=budget, completed_check=True)
             return None
         if not self.finalization_eligible(candidate, propagate_unavailable=True, budget=budget):
             return None
@@ -3721,6 +3828,31 @@ def snapshot_memory_source_obligations(
         if isinstance(denied, (list, tuple)) and all(isinstance(identity, str) for identity in denied):
             recovery["rejected_source_ids"] = list(denied)
     state["source_recovery"] = recovery
+    retained_root = state.get("deferred_root_finalization")
+    if isinstance(retained_root, dict) and retained_root.get("policy_id") == service.policy_id:
+        admitted_ids = set(service._admitted_source_candidates)
+        admitted_ids.update(receipt.candidate_id for receipt in
+            getattr(getattr(service, "_imported_source_attestor", None), "_receipts", {}).values())
+        selected = {row["candidate_id"]: row for row in recovery["source_candidates"]
+                    if row["candidate_id"] in admitted_ids}
+        frozen = retained_root.get("source_candidates", ())
+        if selected and isinstance(frozen, (list, tuple)):
+            retained_root = copy.deepcopy(retained_root)
+            prior = retained_root.get("prior_source_candidates", ())
+            prior = {content_digest(row): row for row in prior} if isinstance(prior, (list, tuple)) else {}
+            refreshed = []
+            for row in frozen:
+                replacement = selected.get(row.get("candidate_id")) if isinstance(row, dict) else None
+                if replacement is not None and content_digest(row) != content_digest(replacement):
+                    # Only a live admission selects a changed source across a
+                    # restart. Both descriptions remain inert saved work.
+                    prior[content_digest(row)] = row
+                    row = copy.deepcopy(replacement)
+                refreshed.append(row)
+            retained_root["source_candidates"] = refreshed
+            if prior:
+                retained_root["prior_source_candidates"] = list(prior.values())
+            state["deferred_root_finalization"] = retained_root
     return state
 
 

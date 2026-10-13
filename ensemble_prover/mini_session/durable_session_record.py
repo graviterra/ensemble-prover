@@ -722,6 +722,9 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
         raise ValueError("malformed checkpoint conversation")
     if _CONVERSATION_RUNTIME_FIELDS.intersection(conversation):
         raise ValueError("checkpoint conversation cannot restore runtime capabilities")
+    # Historical records predate these inert page descriptions. Restore the
+    # declared field so later dataclass role handoffs can copy the conversation.
+    conversation.setdefault("reasoning_notebook_reads", [])
     values = {key: _decode(value) for key, value in data["session_values"].items()}
     if values.get("_acceptance_receipt_flush_active") is False:
         values.pop("_acceptance_receipt_flush_active")
