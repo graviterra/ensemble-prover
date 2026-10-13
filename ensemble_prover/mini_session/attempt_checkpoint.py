@@ -12,6 +12,7 @@ import math
 import time
 import uuid
 import weakref
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -388,6 +389,21 @@ def _approved_source_transition(
     return {"from": cast(str, old), "to": cast(str, new)} if old != new else {}
 
 
+def _approved_transitions(
+    saved: dict[str, Any], current: dict[str, Any], approval: str,
+    migrate_providers: bool, *, predecessor_generation: str,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    if not migrate_providers:
+        return _approved_source_transition(saved, current, approval), {}
+    from ..mini_provider_migration import provider_transition
+
+    migration = provider_transition(saved, current, predecessor_generation=predecessor_generation)
+    # Input and executor approval remain independently checked. Only the
+    # explicitly validated transport leaves are projected out of this check.
+    fixed = dict(current, cli_config=saved["cli_config"])
+    return _approved_source_transition(saved, fixed, approval), migration
+
+
 def worker_elapsed_for_resume(record: dict[str, Any]) -> float:
     """Include the unknown interval after an interrupted worker observation.
 
@@ -449,10 +465,12 @@ class AttemptCheckpointRegistry:
         self, directory: Path, *, identity: dict[str, Any],
         resume_from: Path | None = None, recorder: Any = None,
         resume_accept_source_hash: str = "",
+        resume_migrate_providers: bool = False,
         cost_controller: Any = None,
         startup_artifacts: dict[str, str] | None = None,
         worker_started_monotonic: float | None = None,
         worker_admitted_elapsed_s: float | None = None,
+        session_context_extension: Callable[[Any], Awaitable[bool]] | None = None,
     ) -> None:
         now = time.monotonic()
         if worker_started_monotonic is None:
@@ -475,6 +493,7 @@ class AttemptCheckpointRegistry:
             raise ValueError("Attempt checkpoint identity must be a nonempty object")
         self.recorder = recorder
         self.cost_controller = cost_controller
+        self._session_context_extension = session_context_extension
         self._lock = asyncio.Lock()
         self._journal_lock = asyncio.Lock()
         self._journal_writer = None
@@ -504,17 +523,22 @@ class AttemptCheckpointRegistry:
         self._restored_journal_watermark = 0
         self._resuming = resume_from is not None
         self.source_transition: dict[str, str] = {}
+        self.provider_migration: dict[str, Any] = {}
+        self.provider_transition: dict[str, Any] = {}
         self._account_failure_planner_retries: dict[str, int] = {}
         if resume_accept_source_hash and resume_from is None:
             raise ValueError("Source approval requires resume_from")
+        if type(resume_migrate_providers) is not bool or resume_migrate_providers and resume_from is None:
+            raise ValueError("Provider migration requires explicit resume_from")
         predecessor = None
         if resume_from is not None:
             predecessor = Path(resume_from).resolve()
             if predecessor == self.directory:
                 raise ValueError("Resume requires a new generation directory")
             manifest = self._load_manifest(predecessor)
-            self.source_transition = _approved_source_transition(
-                manifest["identity"], self.identity, resume_accept_source_hash,
+            self.source_transition, migration = _approved_transitions(
+                manifest["identity"], self.identity, resume_accept_source_hash, resume_migrate_providers,
+                predecessor_generation=manifest["head"]["generation_id"],
             )
             self.attempt_id = manifest["attempt_id"]
             self.registry_root = Path(manifest["registry_root"])
@@ -540,8 +564,9 @@ class AttemptCheckpointRegistry:
                 if (manifest["attempt_id"] != self.attempt_id
                         or Path(manifest["registry_root"]) != self.registry_root):
                     raise ValueError("Attempt checkpoint owner identity changed under lock")
-                self.source_transition = _approved_source_transition(
-                    manifest["identity"], self.identity, resume_accept_source_hash,
+                self.source_transition, migration = _approved_transitions(
+                    manifest["identity"], self.identity, resume_accept_source_hash, resume_migrate_providers,
+                    predecessor_generation=manifest["head"]["generation_id"],
                 )
                 head = _read(self.registry_root / "head.json")
                 # The candidate per-generation manifest may lead the sole
@@ -558,10 +583,22 @@ class AttemptCheckpointRegistry:
                 if _digest(snapshot) != head["snapshot_hash"]:
                     raise ValueError("Attempt checkpoint snapshot hash mismatch")
                 self._restore_snapshot(snapshot, expected_identity=manifest["identity"])
+                if migration:
+                    self.provider_migration = migration
+                    self.provider_transition = migration
                 # A provider-stopped lane must not immediately replay its
                 # stale outage as the result of an explicit fresh recovery.
                 # Successful plans and every other error receipt remain exact.
                 from .planner_jobs import planner_result_from_record
+                from ..mini_provider_migration import migratable_provider_failure, record_needs_migration
+
+                def can_retry_provider(reason: str, lane: str) -> bool:
+                    return is_resumable_provider_failure(reason) or (
+                        migratable_provider_failure(reason)
+                        and lane in self._sessions
+                        and record_needs_migration(self._sessions[lane], self.provider_migration)
+                    )
+
                 for lane, receipts in self._planner_receipts.items():
                     saved = self._sessions.get(lane, {}).get("scheduler", {}).get("session_state", {})
                     terminal_reason = saved.get("terminal_failure_reason", "")
@@ -574,12 +611,12 @@ class AttemptCheckpointRegistry:
                         # setting a session terminal latch. Its typed receipt
                         # is itself evidence of the run-wide provider pause.
                         unlatched_provider_pause = (
-                            is_resumable_provider_failure(reason)
+                            can_retry_provider(reason, lane)
                             and not terminal_reason
                             and saved.get("root_finalized") is False
                         )
-                        if (is_resumable_provider_failure(reason) and (
-                                is_resumable_provider_failure(terminal_reason)
+                        if (can_retry_provider(reason, lane) and (
+                                can_retry_provider(terminal_reason, lane)
                                 or unlatched_provider_pause)):
                             receipts.pop(key)
                             self._account_failure_planner_retries[lane] = self._account_failure_planner_retries.get(lane, 0) + 1
@@ -589,7 +626,7 @@ class AttemptCheckpointRegistry:
                 for lane, frame in self._children.items():
                     saved = self._sessions.get(lane, {}).get("scheduler", {}).get("session_state", {})
                     result = frame.get("result")
-                    if (is_resumable_provider_failure(saved.get("terminal_failure_reason", ""))
+                    if (can_retry_provider(saved.get("terminal_failure_reason", ""), lane)
                             and saved.get("root_finalized") is False
                             and type(result) is dict and set(result) == {"ok", "proof", "timed_out"}
                             and result["ok"] is False and result["proof"] is None
@@ -638,7 +675,7 @@ class AttemptCheckpointRegistry:
         storage_schema = record.get("schema_version")
         record = self._expand_completed_children(record)
         required = {"schema_version", "attempt_id", "identity", "sessions", "children", "outer_state", "planner_receipts", "cost_ledger", "recorder", "journal_watermark", "predecessor", "worker_active_elapsed_s", "worker_observed_epoch_s", "worker_generation_completed"}
-        optional = {"execution_audit", "execution_service", "snapshot_hash_encoding"}
+        optional = {"execution_audit", "execution_service", "snapshot_hash_encoding", "provider_migration"}
         if (type(record) is not dict or not required <= set(record)
                 or set(record) - required - optional
                 or type(record["schema_version"]) is not int or record["schema_version"] != _SCHEMA):
@@ -679,6 +716,13 @@ class AttemptCheckpointRegistry:
             self._provider_lane_archives.validate_session(session)
         self._children = _json(record["children"])
         self._outer_state = _json(record["outer_state"])
+        migration = record.get("provider_migration", {})
+        if migration:
+            if (type(migration) is not dict or set(migration) != {"epoch", "changes"}
+                    or type(migration["epoch"]) is not str or len(migration["epoch"]) != 64
+                    or type(migration["changes"]) is not dict):
+                raise ValueError("Invalid provider migration receipt")
+        self.provider_migration = _json(migration)
         self._planner_receipts = _json(record["planner_receipts"])
         self._execution_audit = execution_audit
         self._execution_service = execution_service
@@ -746,6 +790,7 @@ class AttemptCheckpointRegistry:
             "planner_receipts": self._planner_receipts,
             "execution_audit": self._execution_audit,
             "execution_service": self._execution_service,
+            **({"provider_migration": self.provider_migration} if self.provider_migration else {}),
             "cost_ledger": self._restored_cost_record,
             "recorder": self._restored_recorder_record,
             "journal_watermark": self._restored_journal_watermark,
@@ -932,6 +977,7 @@ class AttemptCheckpointRegistry:
         previous_lane = getattr(session, "checkpoint_lane_key", "")
         try:
             initialize_theory_checkpoint_context(session)
+            session._checkpoint_provider_migration = self.provider_migration
             # Bind immutable disk inputs before providers or prepasses start.
             # Later synchronous captures reuse this verifier generation's hash.
             await asyncio.to_thread(session_checkpoint_identity, session)
@@ -941,6 +987,9 @@ class AttemptCheckpointRegistry:
                     session, self._provider_lane_archives.hydrate_session(record),
                     expected_identity=record["identity"],
                 )
+            elif self.provider_migration:
+                from ..mini_provider_migration import migrate_session_provider_state
+                migrate_session_provider_state(session, self.provider_migration)
             session.checkpoint_registry = self
             session.checkpoint_lane_key = lane_key
             child_frames = self.child_records_for_parent(lane_key)
@@ -980,7 +1029,12 @@ class AttemptCheckpointRegistry:
                 )
             _restore_execution_service(session, self._execution_service.get(lane_key, {}))
             self._adopt_execution_tails(lane_key, session)
-            if record is None:
+            extended = False
+            if self._session_context_extension is not None:
+                # The owner may add independently checked context before any
+                # provider dispatch; persist it in the same cumulative lane.
+                extended = await self._session_context_extension(session)
+            if record is None or extended:
                 await self.commit_session(lane_key, session)
             self._audit_ready_lanes.add(lane_key)
             settled_owner = self._bound_sessions.get(lane_key)

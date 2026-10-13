@@ -303,18 +303,27 @@ async def profile_declaration(
                 else context + "\n" + source
             )
         )
-        _parsed, _output, code = await lean_call(
+        parsed, _output, code = await lean_call(
             runner,
             budget,
             lambda: runner.check_source_declaration_type_equivalence(
                 standalone_source,
-                declaration_name,
+                declaration_name.removeprefix("_root_."),
                 statement,
                 timeout_s=remaining(budget),
                 preamble_override=preamble,
                 max_heartbeats=getattr(budget, "max_heartbeats", None),
             ),
         )
+        # The checker can return operational failure tuples as well as raise.
+        # Preserve its parsed disposition and process status before deciding
+        # that a declaration does not match the proposed type.
+        from ensemble_prover.lean_runner import termination_signal_from_returncode
+
+        if code == 124 or getattr(parsed, "timeout", False):
+            raise TimeoutError("declaration type comparison exhausted its allowance")
+        if getattr(parsed, "infra_failure", False) or termination_signal_from_returncode(code):
+            raise OSError("declaration type comparison infrastructure unavailable")
         if code != 0:
             return DeclarationProfile(
                 **base, diagnostic="declaration_type_binding_failed"
@@ -352,4 +361,13 @@ async def profile_declaration(
             certified_source_binding=source_binding_attested is True,
         )
     except (TimeoutError, OSError, ValueError) as exc:
-        return DeclarationProfile(**base, diagnostic=type(exc).__name__)
+        # Preserve the operational category for every subclass, including
+        # checker-specific storage/connection errors. A live infrastructure
+        # failure cannot become a candidate admission decision downstream.
+        if isinstance(exc, TimeoutError):
+            diagnostic = "TimeoutError"
+        elif isinstance(exc, OSError):
+            diagnostic = "OSError"
+        else:
+            diagnostic = type(exc).__name__
+        return DeclarationProfile(**base, diagnostic=diagnostic)

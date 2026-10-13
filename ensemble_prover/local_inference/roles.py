@@ -622,6 +622,9 @@ def _publish(args: Any, preparation: LocalPreparation) -> None:
 
 
 def _routes(args: Any) -> list[tuple[str, str, str | None]]:
+    from ..mini_research_roles import validate_research_inference_policy
+
+    validate_research_inference_policy(args)
     routes = [
         (
             "prover",

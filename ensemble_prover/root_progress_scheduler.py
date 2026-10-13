@@ -7,6 +7,7 @@ that they imply the root. These profiles never create proof or budget authority.
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import fields
 from typing import Any, Iterable, Mapping
 
@@ -52,14 +53,30 @@ def native_exploration_due(state: Any) -> bool:
     )
 
 
-def native_service_state(state: Any, *, exploration: bool) -> dict[str, int]:
+def native_service_state(
+    state: Any, *, exploration: bool,
+    verifier_retry: bool = False, verifier_retry_yield: bool = False,
+    verifier_retry_key: str = "",
+) -> dict[str, int | str]:
     """Return accounting after one actual, budget-consuming non-assembly service."""
     previous = state if isinstance(state, Mapping) else {}
+    cursor = previous.get("verifier_retry_cursor", "")
+    if not isinstance(cursor, str) or re.fullmatch(r"[0-9a-f]{64}", cursor) is None:
+        cursor = ""
+    if (verifier_retry and isinstance(verifier_retry_key, str)
+            and re.fullmatch(r"[0-9a-f]{64}", verifier_retry_key) is not None):
+        cursor = verifier_retry_key
     return {
         "schema_version": 1,
         "services": _counter(previous.get("services")) + 1,
         "exploration_services": _counter(previous.get("exploration_services"))
         + int(exploration),
+        "verifier_retry_services": _counter(previous.get("verifier_retry_services"))
+        + int(verifier_retry),
+        "verifier_retry_cursor": cursor,
+        "verifier_retry_due": 0 if verifier_retry else int(
+            verifier_retry_yield or _counter(previous.get("verifier_retry_due")) > 0
+        ),
         "services_since_exploration": 0
         if exploration
         else min(

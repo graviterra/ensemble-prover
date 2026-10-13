@@ -1185,6 +1185,16 @@ class StrategyController:
                 return deepcopy(review)
             subject = state["subjects"][review["subject_id"]]
             basis = self._review_basis(subject, review["scope"], review["method"])
+            if review["scope"] == "allocation_exhausted" and verdict != "unresolved":
+                # Exhausting an allocation says nothing about mathematical
+                # viability. Keep the opinion, but require a scoped obstruction
+                # review before it can suspend a claim or method indefinitely
+                # or remove an existing mathematical obstruction.
+                review.update(
+                    requested_verdict=verdict,
+                    decision_constraint="allocation_exhaustion_is_not_obstruction",
+                )
+                verdict = "unresolved"
             review.update(rationale=rationale, verdict=verdict)
             supersession_basis = {
                 rid: self._decision_identity(state["reviews"][rid])

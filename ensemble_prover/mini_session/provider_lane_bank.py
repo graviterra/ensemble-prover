@@ -225,6 +225,13 @@ class ProviderLaneBankMixin(ABC):
             delattr(session.conv, "_provider_call_quantum_state")
 
     def _drop_active_provider_lane(self, session: Any) -> None:
+        from ..reasoning_notebook import archive_pending_tool_candidates, archive_reasoning
+
+        archive_reasoning(session.conv, self._provider_quantum_checkpoint.get("history", ()))
+        archive_pending_tool_candidates(
+            session.conv, self._provider_quantum_checkpoint.get("state", {}),
+            target=self._provider_quantum_checkpoint.get("binding", {}).get("target", ""),
+        )
         lane_id = self._provider_quantum_checkpoint.get("state", {}).get("provider_turn_lane_identity")
         if lane_id:
             self._detach_provider_lane_mirror(session, lane_id)
@@ -258,6 +265,14 @@ class ProviderLaneBankMixin(ABC):
         authority = authority or self._provider_bank_authority(session)
         for lane_id, envelope in tuple(self._provider_quantum_parked.items()):
             if self._provider_lane_status(session, envelope["header"], authority=authority) == "stale":
+                from ..reasoning_notebook import archive_pending_tool_candidates, archive_reasoning
+
+                body = decode_provider_lane(lane_id, envelope, self._validated_provider_quantum_checkpoint)
+                archive_reasoning(session.conv, body["checkpoint"]["history"])
+                archive_pending_tool_candidates(
+                    session.conv, body["checkpoint"]["state"],
+                    target=body["checkpoint"]["binding"].get("target", ""),
+                )
                 self._provider_quantum_parked.pop(lane_id, None)
 
     def _prepare_provider_lane_parking(self, session: Any) -> bool:

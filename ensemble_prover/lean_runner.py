@@ -6611,6 +6611,7 @@ class LeanRunner:
         dispatch_observer: Optional[Callable[[], None]] = None,
         output_path: Optional[Path] = None,
         extra_module_paths: Sequence[Path] = (),
+        source_root: Optional[Path] = None,
     ) -> tuple[int, str]:
         """Standard ``lake env lean`` subprocess with hard-timeout protection.
 
@@ -6636,7 +6637,7 @@ class LeanRunner:
             )
             direct_environment_required = bool(
                 extra_module_paths or configured_module_paths
-            ) or output_path is not None
+            ) or output_path is not None or source_root is not None
             resolved_lean_path = ""
             resolved_lean_executable = ""
             resolution_epoch = LeanREPL.global_env_epoch(
@@ -6746,14 +6747,16 @@ class LeanRunner:
                 )
                 if str(path).strip()
             )
-            if module_paths:
+            if module_paths or direct_environment_required:
                 process_env["LEAN_PATH"] = os.pathsep.join(
                     (*module_paths, resolved_lean_path)
                 ).rstrip(os.pathsep)
             lean_args = (
                 *((f"--memory={_OPERATION_MEMORY_MB.get()}",) if _OPERATION_MEMORY_MB.get() is not None else ()),
                 *((f"-DmaxHeartbeats={_OPERATION_HEARTBEATS.get()}",) if _OPERATION_HEARTBEATS.get() is not None else ()),
-                *(("-R", str(extra_module_paths[0])) if extra_module_paths else ()),
+                *(("-R", str(source_root)) if source_root is not None else (
+                    ("-R", str(extra_module_paths[0])) if extra_module_paths else ()
+                )),
                 *(("-o", str(output_path)) if output_path is not None else ()),
                 str(file_path),
             )

@@ -66,6 +66,8 @@ def native_research_entrypoint(function: Any) -> Any:
                     problem=kwargs.get("problem"), recorder=kwargs.get("recorder"),
                     checkpoint_registry=kwargs.get("checkpoint_registry"),
                     frontier_research=frontier_policy,
+                    research_client=kwargs.get("research_client"),
+                    research_review_client=kwargs.get("research_review_client"),
                 )
                 owner_token = _CURRENT.set(owner)
                 with provider_dispatch_guard(owner.observe_dispatch):
@@ -210,10 +212,13 @@ def _native_quantum_seconds(donor: Any) -> float:
 class NativeResearchCoordinator:
     """Run-scoped runtime capability; durable state contains only plain data."""
     def __init__(self, *, problem: Any, recorder: Any = None, checkpoint_registry: Any = None,
-                 frontier_research: dict[str, Any] | None = None):
+                 frontier_research: dict[str, Any] | None = None,
+                 research_client: Any = None, research_review_client: Any = None):
         from .research_claims.frontier.config import normalize_config
 
         self.frontier_research = normalize_config(frontier_research)
+        self.research_client = research_client
+        self.research_review_client = research_review_client
         self.problem, self.recorder, self.registry = problem, recorder, checkpoint_registry
         self.pid, self.active = os.getpid(), True
         self.lock = asyncio.Lock()
@@ -227,7 +232,7 @@ class NativeResearchCoordinator:
         self._replay_tasks: set[asyncio.Task[None]] = set()
         self._release_tasks: dict[int, asyncio.Task[None]] = {}
         self._release_deadlines: dict[int, tuple[Any, float]] = {}
-        self.donor_key: tuple[int, str] | None = None
+        self.donor_key: tuple[int, int, str] | None = None
         self.temporary: tempfile.TemporaryDirectory[str] | None = None
         self.guidance: dict[str, Any] | None = None
         self.guidance_by_target: dict[str, dict[str, Any]] = {}
@@ -903,10 +908,13 @@ class NativeResearchCoordinator:
         if not (directory / "ledger.sqlite3").exists():
             if state.get("ledger_initialized"):
                 raise ValueError("saved native research ledger is missing")
-            model = str(getattr(getattr(client, "cfg", None), "model", "configured-model"))
+            investigator = self.research_client or client
+            reviewer = self.research_review_client or investigator
+            model = str(getattr(getattr(investigator, "cfg", None), "model", "configured-model"))
+            review_model = str(getattr(getattr(reviewer, "cfg", None), "model", "configured-model"))
             initialize(directory, target=ClaimSpec("native-root", MathematicalContract(
                 self.pin["statement"], "Original Lean theorem; exact formal context in original-target.json"), "native-mini"),
-                sources={"original-target.json": _json(self._visible_target(session))}, model=model, review_model=model,
+                sources={"original-target.json": _json(self._visible_target(session))}, model=model, review_model=review_model,
                 max_requests=1, max_seconds=120, concurrency=1, strategy_recovery=True,
                 strategy_policy={"interval_requests": 5, "interval_seconds": 3600,
                                  "reserve_requests": 1, "reserve_seconds": 1,
@@ -1832,14 +1840,21 @@ class NativeResearchCoordinator:
 
         if not self.active or self._session_released(session):
             return
-        key = (id(client), role)
+        investigator = self.research_client or client
+        reviewer = self.research_review_client or investigator
+        key = (id(investigator), id(reviewer), role)
         if self.loop is not None and key == self.donor_key:
             return
         def fresh_transport(worker: str) -> Any:
-            return clone_research_client(client)
-        replacement = DiscoveryLoop(self._require_store(), fresh_transport, fresh_transport, native_mode=True,
+            return clone_research_client(investigator)
+        def fresh_review_transport(worker: str) -> Any:
+            return clone_research_client(reviewer)
+        replacement = DiscoveryLoop(self._require_store(), fresh_transport, fresh_review_transport, native_mode=True,
             cost_controller=getattr(session, "cost_controller", None), owns_clients=True,
-            cost_roles={"research": role, "review": role}, on_event=self._research_event)
+            cost_roles={"research": "research" if self.research_client is not None else role,
+                        "review": "research_review" if self.research_review_client is not None
+                        else "research" if self.research_client is not None else role},
+            on_event=self._research_event)
         if self.loop is not None:
             self._retiring_loops[id(self.loop)] = self.loop
             # Donor selection can hold the owner lock. Disposal must run outside
@@ -1983,6 +1998,8 @@ class NativeResearchCoordinator:
             context = grant.get("target_context_binding") if grant is not None else None
             run.setdefault("native_job_targets", {})[event["job_id"]] = target or self._target(self._session.conv)
             run.setdefault("native_job_contexts", {})[event["job_id"]] = context or self._target_context_binding(self._session.conv)
+            from .research_claims.native_local_proofs import record_dispatch_context
+            record_dispatch_context(self, self._session, event["job_id"], run)
             if grant is not None:
                 run.setdefault("native_job_grants", {})[event["job_id"]] = grant["id"]
             store.save_run(run)
@@ -2051,6 +2068,12 @@ class NativeResearchCoordinator:
         store.save_run(run)
 
     def _deliver(self, session: Any) -> bool:
+        from .research_claims.native_local_proofs import reconcile_local_proofs
+        try:
+            local_changed = reconcile_local_proofs(self, session)
+        except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error) as exc:
+            _event(session, "local_proof_handoff_unavailable", error_type=type(exc).__name__)
+            local_changed = False
         conv = getattr(session, "conv", None)
         saved = getattr(session, "native_research_state", {}).get("guidance")
         if self.guidance is None and saved:
@@ -2067,7 +2090,7 @@ class NativeResearchCoordinator:
                         candidate = state.get("proof_candidate_guidance")
                     if (not self._guidance_matches(candidate, conv)
                             or not is_proof_candidate(candidate.get("action"))):
-                        return False
+                        return local_changed
                     guidance = candidate
                 state["proof_candidate_guidance"] = deepcopy(guidance)
                 # Bind prompt novelty to substantive content and the exact
@@ -2119,7 +2142,7 @@ class NativeResearchCoordinator:
                             return True
             except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                 _event(session, "research_unavailable", error_type=type(exc).__name__)
-        return False
+        return local_changed
 
     def prepare(self, conv: Any, dossier: Any = None) -> list[dict[str, Any]]:
         from .research_claims.context_window import window
@@ -2133,6 +2156,8 @@ class NativeResearchCoordinator:
                    "proof_compute_examples_enabled": getattr(conv, "_native_compute_examples_enabled", None),
                    "active_target": self._target(conv),
                    "policy": "You may request_native_research when an ancestor claim, counting bound, or method is unsupported. Supply the exact bottleneck and source evidence. The run investigates at a committed action boundary and resumes under its existing budget. Use read_native_research_artifact for full archived arguments."}
+        from .research_claims.native_local_proofs import task_inventory
+        context["local_proof_tasks"] = task_inventory(self.store)
         if self._session is not None and self._session.conv is conv:
             pause = getattr(self._session, "native_research_state", {}).get("research_pause")
             if isinstance(pause, dict):

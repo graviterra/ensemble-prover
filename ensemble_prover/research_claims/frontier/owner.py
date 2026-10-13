@@ -252,6 +252,9 @@ class FrontierOwner:
             producer = self.store.job(producer_id)
             if producer["worker"] == reviewer["worker"] or not report_scope_current(self.controller, campaign, producer):
                 return None
+            authorization = campaign["review_authorizations"].get(reviewer.get("frontier_review_authorization", ""), {})
+            if authorization.get("status") != "open" or producer_id not in authorization.get("producer_ids", []):
+                return None
             approach = campaign["approaches"][producer["frontier_approach_id"]]
             previous = campaign["questions"][approach["question_id"]]
             route = campaign["routes"][approach["route_id"]]
@@ -275,6 +278,11 @@ class FrontierOwner:
                 for permit in transferable:
                     replace_stale_permit(campaign, permit["permit_id"], now=self.controller.clock(), still_relevant=True,
                                          expires_at=self.controller.clock() + campaign["policy"]["permit_lease_seconds"])
+            from .continuation import continue_campaign_exploration
+
+            continue_campaign_exploration(
+                campaign, producer=producer, reviewer=reviewer, now=self.controller.clock(),
+            )
             return question
 
         return self._edit(run)

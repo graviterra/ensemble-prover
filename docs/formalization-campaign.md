@@ -54,9 +54,52 @@ frozen statement, and dependencies still match. It does not need to repeat
 proof search merely because module admission was interrupted.
 
 The saved proof is checked again, not trusted automatically. Repeated admission
-rejection sends the task back for repair. Within a failed Mini attempt, cached
-verified helpers may be rechecked and reused, but the campaign does not restore
-the entire previous Mini search graph or its failed strategies.
+rejection sends the task back for repair.
+
+## Continue unfinished Mini work
+
+Each Mini invocation writes a new generation under `proof_runs`, preserving the
+previous generation's evidence. A later attempt on the same frozen statement
+restores committed search state, conversation, verified helpers, provider
+continuations, and consumed action budgets. Lean rechecks saved mathematical
+artifacts before they become usable. Strategy review yields, cancellation, and
+operational interruption retain this continuation; they do not authorize new
+model work by themselves.
+
+Continued grants use the restored state and reasoning notebook without embedding
+complete prior runtime archives into each new problem description. Exact attempt
+artifacts remain available through the campaign's `proof_attempt_feedback` events
+and `read_event` research action, including evidence from interrupted attempts.
+
+When proof search identifies a missing prerequisite, `expand` can add it while
+preserving the parent's frozen claim. After the child is independently verified,
+`retry_proof` resumes the same parent attempt and its cumulative budgets. New
+modules undergo fresh Lean admission, and saved mathematical artifacts are
+rechecked in the extended context. Old-context tool receipts retain their
+complete candidate arguments in the reasoning notebook but cannot act as
+verification authority in that context. If saved-session replay, fresh
+prerequisite admission, or extended-context replay fails, the campaign returns
+`continuation_error`. Subsequent
+grants retry that saved proof admission before any new formalizer turn; repair
+the prerequisite or checker failure to continue with the same spent budgets.
+
+The continuation is bound to the exact frozen contract, compiled dependencies,
+project inputs, and Mini options. A mismatch or unavailable checkpoint returns
+`continuation_error` before Mini dispatch. Preserve the saved generation when
+investigating that result. An intentionally changed contract requires a new
+task or campaign; it cannot silently reset the old attempt's finite limits.
+Prover and refiner model, endpoint, and transport settings are also bound. Restore
+those settings to resume a campaign checkpoint; automatic provider migration is
+not available through this campaign interface.
+
+Research campaigns allocate a separate `proof_quantum_s` service interval. At
+its end the formalization campaign returns `proof_quantum_exhausted`; another
+authorized interval resumes the same mathematical attempt. The Python adapter
+exposes this interval as `MiniProver(..., service_quantum_s=...)`. Explicit Mini
+limits, including `run_wall_clock_budget_s`, remain cumulative across intervals.
+Shared clients keep their existing transport and financial owner. Injecting a
+second `cost_controller` or restoring an incompatible financial journal is
+unsupported and fails before model work.
 
 ## Diagnose environment mismatches
 

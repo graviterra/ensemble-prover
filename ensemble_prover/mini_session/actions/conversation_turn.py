@@ -2756,6 +2756,13 @@ def _format_graph_native_selected_work_prompt(
     )
     if record_reason:
         lines.append(f"- obligation reason: {record_reason}")
+    local_hints = merged_record.get("native_local_proof_hints")
+    for hint in local_hints if isinstance(local_hints, list) else ():
+        if not isinstance(hint, Mapping) or not isinstance(hint.get("proof_plan"), str):
+            continue
+        plan = prompt_safe(hint["proof_plan"], limit=300, truncate=False, preserve_layout=True)
+        if plan:
+            lines.append("- unproved local proof guidance (not an assumption or checked result):\n" + plan)
     parent_statement = prompt_safe(
         _formalization_parent_statement(session, merged_record),
         limit=700,
@@ -3148,6 +3155,7 @@ def _purge_stored_graph_selected_work_prompts(
     history = getattr(conv, "history", None)
     if not isinstance(history, list):
         return 0
+    from ...reasoning_notebook import archive_reasoning
     setattr(conv, "_graph_selected_work_scope_anchor_message", None)
     prompt_indices = [
         index
@@ -3186,6 +3194,7 @@ def _purge_stored_graph_selected_work_prompts(
         if prompt_indices:
             cut = prompt_indices[0]
             removed = len(history) - cut
+            archive_reasoning(conv, history[cut:])
             conv.history = history[:cut]
         setattr(conv, "_graph_selected_work_last_scope_key", "")
         setattr(conv, "_graph_selected_work_scope_changed", False)
@@ -3259,6 +3268,7 @@ def _purge_stored_graph_selected_work_prompts(
         if cut_candidates:
             cut = min(cut_candidates)
             removed = len(history) - cut
+            archive_reasoning(conv, history[cut:])
             conv.history = history[:cut]
         else:
             removed = 0
@@ -3277,6 +3287,7 @@ def _purge_stored_graph_selected_work_prompts(
                 unanchored_target_local_start,
             )
             migration_removed = current_segment_start - migration_prefix_cut
+            archive_reasoning(conv, history[migration_prefix_cut:current_segment_start])
             history = [
                 *history[:migration_prefix_cut],
                 *history[current_segment_start:],
@@ -10980,14 +10991,18 @@ class ConversationTurnAction(ProviderLaneBankMixin):
             elif live_is_checkpoint_prefix:
                 merged_history = checkpoint_history
                 transcript_disposition = "checkpoint_transcript_restored"
-            elif state.get("pending_tool_replay") and self._live_provider_quantum_owns_checkpoint(session):
-                # Local compaction may annotate an intact paid protocol round.
-                # A same-lane mirror alone cannot authenticate altered arguments
-                # or tool receipts: recover the original owned transcript then.
-                if self._provider_paid_round_retained(checkpoint_history, live_history, state):
+            elif state.get("pending_tool_replay"):
+                # The validated action checkpoint owns these paid local tools.
+                # A sibling can replace the live mirror and compact its history
+                # without retiring this exact target and repair-cycle receipt.
+                if (self._live_provider_quantum_owns_checkpoint(session)
+                        and self._provider_paid_round_retained(checkpoint_history, live_history, state)):
                     merged_history = live_history
                     transcript_disposition = "owned_paid_tool_transcript_retained"
                 else:
+                    from ...reasoning_notebook import archive_reasoning
+
+                    archive_reasoning(conv, live_history)
                     merged_history = checkpoint_history
                     bank_return_scope = self._provider_quantum_active_prompt_scope
                     transcript_disposition = "owned_paid_tool_transcript_restored"
@@ -11505,6 +11520,9 @@ class ConversationTurnAction(ProviderLaneBankMixin):
             checkpoint["binding"].get("repair_cycle") or ""
         )
         conv._provider_call_quantum_state = copy.deepcopy(checkpoint["state"])
+        from ...reasoning_notebook import archive_reasoning
+
+        archive_reasoning(conv, conv.history)
         conv.history = copy.deepcopy(checkpoint["history"])
         if self._provider_quantum_active_prompt_scope:
             restore_provider_prompt_scope(session, self._provider_quantum_active_prompt_scope)
@@ -14852,6 +14870,16 @@ class ConversationTurnAction(ProviderLaneBankMixin):
                 # Preserve only the owner-produced timeout transcript.  A
                 # resistant child can continue mutating its discarded private
                 # workspace but can no longer overwrite live proof state.
+                # Compaction may already have moved the argument out of that
+                # transcript. Snapshot its inert history at this same owner
+                # boundary; later workspace mutations cannot publish evidence.
+                historical_entries = copy.deepcopy(
+                    list(getattr(workspace_conv, "reasoning_notebook", ()) or ())
+                )
+                existing_entries = list(getattr(conv, "reasoning_notebook", ()) or ())
+                conv.reasoning_notebook = existing_entries + [
+                    entry for entry in historical_entries if entry not in existing_entries
+                ]
                 conv.history = copy.deepcopy(
                     list(getattr(workspace_conv, "history", []) or [])
                 )

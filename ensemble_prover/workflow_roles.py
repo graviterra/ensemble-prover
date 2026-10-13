@@ -19,6 +19,7 @@ CPU when the main parser already has those destinations.
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 import secrets
@@ -495,6 +496,13 @@ def _handoff_namespace(extra: Sequence[str]) -> Any:
 
 def reject_nonlocal_handoff(extra: Sequence[str]) -> None:
     namespace = _handoff_namespace(extra)
+    from .mini_research_roles import validate_research_inference_policy
+
+    # This check belongs to a local-only parent even when the child did not
+    # explicitly repeat the inference policy in its arguments.
+    research_policy = argparse.Namespace(**vars(namespace))
+    research_policy.inference_policy = "local-only"
+    validate_research_inference_policy(research_policy)
     if (
         namespace.prover != "local"
         or not namespace.prover_deployment

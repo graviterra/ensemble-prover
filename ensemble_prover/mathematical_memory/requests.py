@@ -374,7 +374,7 @@ class MemoryRequestStore:
                     ledger["requests"].values(), key=lambda item: item["submitted_at"]
                 )
                 if record.get("status") == "pending"
-            ][: min(limit, 128)],
+            ][: min(limit, self.max_records)],
             write=False,
             deadline_monotonic=deadline_monotonic,
         )

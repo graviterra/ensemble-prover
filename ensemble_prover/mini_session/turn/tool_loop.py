@@ -2327,6 +2327,13 @@ async def _call_llm_with_tools_one_round_impl(
     primitives = _legacy_imports()
     explicit_helper_scope = helper_context_override is not None
     from ...helper_inventory import READ_VERIFIED_HELPERS_TOOL, run_read_verified_helpers_tool
+    from ...reasoning_notebook import READ_REASONING_NOTEBOOK_TOOL, read_reasoning_notebook
+
+    if use_tools:
+        tools_list = list(tools_list)
+        if not any((item.get("function") or {}).get("name") == "read_reasoning_notebook"
+                   for item in tools_list):
+            tools_list.append(READ_REASONING_NOTEBOOK_TOOL)
 
     helper_lookup_enabled = bool(
         use_tools and callable(getattr(dossier, "validate_helper_context", None))
@@ -5653,6 +5660,8 @@ async def _call_llm_with_tools_one_round_impl(
                         from ...mini_research import native_research_tool
 
                         result_text = json.dumps(native_research_tool(name, args, conv), ensure_ascii=False)
+                    elif name == "read_reasoning_notebook":
+                        result_text = json.dumps(read_reasoning_notebook(conv, args), ensure_ascii=False)
                     elif name == "read_verified_helpers" and helper_lookup_enabled:
                         result_text = run_read_verified_helpers_tool(
                             dossier, tool_helper_blocks(), args,

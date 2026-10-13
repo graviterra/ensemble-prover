@@ -311,7 +311,7 @@ async def prepare_and_probe(
             budget,
             lambda: runner.check_source_declaration_type_equivalence(
                 context,
-                profile.declaration_name,
+                profile.declaration_name.removeprefix("_root_."),
                 profile.statement,
                 preamble_override=context,
                 timeout_s=remaining(budget),

@@ -7,6 +7,8 @@ For a map of all workflows and subsystems, start with the
 [proof search](proof-search.md), [provider roles](providers.md),
 [mathematical memory](mathematical-memory.md), and [run operations](operations.md).
 This page is the detailed command and behavior reference.
+For unfinished derivations, local proof requests, and model handoffs during long
+investigations, see [sustained mathematical investigations](frontier-campaigns.md).
 
 Start with a Lean theorem, a natural-language claim, or mathematical notes for
 a longer project. Mini Prover searches for proofs and checks them with Lean.
@@ -1173,6 +1175,30 @@ Explicit policy overrides must match the saved values; terminal trace settings
 and the new output directory may change. `--no-checkpoint` disables persistence
 for a new run. Older `--mini-resume` and branch/fork flag names are not supported.
 
+To continue with a replacement model or provider, explicitly authorize a transport
+handoff and name the new selection:
+
+```bash
+.venv/bin/python -m ensemble_prover.mini_prover \
+  --resume-from runs/mini_prover/example_target_01 \
+  --resume-migrate-providers \
+  --prover claude-code --prover-model <model-name>
+```
+
+The same flag permits changes to existing refiner roles and independently selected
+research roles. Other settings, cumulative budgets, proof obligations and pending
+local tool work remain bound to the original attempt. Provider-specific signed
+continuations are retired; readable mathematical reasoning remains available in
+the reasoning notebook. Local deployment bindings and the presence of a refiner
+action cannot change through this handoff. A simultaneous executor update still
+requires the separate source fingerprint approval below.
+
+Native investigations can use `--research-provider` and `--research-model`, with
+an independent critic selected by `--research-review-provider` and
+`--research-review-model`. Omitted roles inherit the existing donor or investigator
+client. These selections use the campaign's existing authorized resources and
+require autonomous research. They obey the run's inference policy.
+
 The saved state includes committed conversations, accepted helpers, proof work,
 recursive child frames, planner results, and the shared cost ledger. Each
 parallel sample resumes its own lane. Saved proofs pass fresh Lean checks
@@ -1270,15 +1296,18 @@ Diagnostic replay explains recorded behavior; it does not ask a provider to
 continue proof search.
 
 The formalization campaign has a separate durable project ledger. Repeating
-`formalization run` resumes that project and reuses verified components; it
-does not restore every internal Mini search state. See
+`formalization run` resumes that project and compatible committed Mini search
+state, including checked helpers, open obligations, and consumed action budgets.
+Saved mathematics is checked again before use. See
 [the campaign workflow](#19-run-a-multi-file-formalization-campaign).
 
 Autonomous research has its own ledger and admission counters. Repeating its
 `discovery run` command resumes within the original limits, including integrated
 formalization and Mini work when a project was configured. Saved campaign
 contracts, completed modules, and pending source persist; an interrupted inner
-Mini invocation may restart within the same global budget. Neither Mini resume
+Mini invocation resumes its committed continuation within the same global
+budget. A renewed proof service interval does not reset cumulative Mini limits.
+Neither Mini resume
 flags nor standalone campaign invocation budgets apply to discovery. See
 [research budgets and recovery](#research-budgets-and-recovery).
 
@@ -2060,8 +2089,9 @@ stays readable, and resume retires obsolete proof jobs without new budget.
   with an unknown outcome may require another reservation; exactly-once provider
   execution is not promised.
 - Saved formalization campaigns preserve reviewed contracts, completed modules,
-  and pending source. An interrupted inner Mini invocation may restart and uses
-  the same global request/deadline authorization. Bounded local finalization can
+  pending source, and compatible committed Mini continuations. Further proof
+  service uses the same global request/deadline authorization and consumed Mini
+  action budgets. Bounded local finalization can
   recover an already saved proof when no provider budget remains; it cannot
   authorize another model dispatch. After the deadline, this recovery is bounded
   by the saved Lean timeout.

@@ -35,7 +35,7 @@ from ..utils import strip_lean_comments_and_string_literals
 from .documents import SourceLibrary
 from .environment import EnvironmentSnapshot
 from .lean import ModuleArtifact
-from .prover import MiniProverFailure, ProofAttemptFeedbackError
+from .prover import MiniProverFailure, ProofAttemptFeedbackError, ProofContinuationError
 from .store import Claim, LeaseLostError, ProjectStore, Task
 
 
@@ -144,6 +144,10 @@ class _ModelBudgetReached(Exception):
 
 class _LocalRecoveryUnavailable(Exception):
     """The next operation requires work outside local recovery authorization."""
+
+
+class _ProofQuantumReached(Exception):
+    """Mini settled a service quantum; the next one needs caller authorization."""
 
 
 class _ProviderRequestFailed(RuntimeError):
@@ -775,6 +779,96 @@ class Campaign:
             self._save_review(claim, None)
             raise
 
+    def _authorized_dependency_expansion(self, task: Task, old: dict[str, Any],
+                                        new: dict[str, Any]) -> bool:
+        """Only append-only campaign expansion may extend an existing proof context."""
+        if not old.get("frozen_sha256") or any(old.get(key) != new.get(key) for key in (
+            "frozen_sha256", "name", "kernel_target", "environment_id",
+        )):
+            return False
+        if not isinstance(old.get("generation"), int) or old["generation"] >= new["generation"]:
+            return False
+        current = {item["module_name"]: item for item in new["dependency_artifacts"]}
+        if any(current.get(item["module_name"]) != item for item in old["dependency_artifacts"]):
+            return False
+        generations = set()
+        after = 0
+        while page := self.store.events(task.id, limit=100, after=after):
+            for event in page:
+                if event["kind"] == "plan_expanded":
+                    generations.add(event["generation"])
+            after = page[-1]["id"]
+        return all(generation in generations for generation in range(old["generation"], new["generation"]))
+
+    def _prepare_proof_continuation(self, claim: Claim, binding: dict[str, Any],
+                                    run_dir: Path, artifacts: Sequence[ModuleArtifact]) -> dict[str, Any]:
+        """Publish ownership before Mini opens or spends against a new generation.
+
+        Feedback is mathematical context only. These coordinates originate in
+        the campaign and adapter, and never come from model output or artifacts.
+        """
+        task = self.store.get_task(claim.task.id)
+        previous = task.session.get("proof_continuation")
+        if not getattr(self.prover, "supports_durable_continuation", False):
+            if previous is not None:
+                raise ProofContinuationError("Configured prover cannot restore the saved Mini continuation")
+            return {}
+        binding = {**binding, "environment_id": self.environment.id}
+        resume_from = None
+        root = (self.directory / "proof_runs").resolve()
+
+        def owned_directory(value: Any) -> Path:
+            if not isinstance(value, str) or not value:
+                raise ProofContinuationError("Invalid campaign checkpoint directory")
+            path = Path(value)
+            if path.is_symlink() or path.resolve().parent != root:
+                raise ProofContinuationError("Checkpoint is outside the campaign proof generations")
+            return path.resolve()
+
+        if previous is not None:
+            if (not isinstance(previous, dict) or previous.get("schema") != 1
+                    or (previous.get("binding") != binding and not self._authorized_dependency_expansion(
+                        task, previous.get("binding", {}), binding))):
+                raise ProofContinuationError("Saved Mini binding differs from the frozen contract or dependencies")
+            directory = owned_directory(previous.get("run_dir"))
+            if previous.get("status") == "preparing" and not (directory / "attempt_checkpoint.json").exists():
+                # A failure before registry publication cannot have dispatched
+                # Mini work. An existing partial directory is ambiguous.
+                if directory.exists() and any(directory.iterdir()):
+                    raise ProofContinuationError("Incomplete Mini generation requires explicit recovery")
+                prior = previous.get("resume_from")
+                resume_from = owned_directory(prior) if prior is not None else None
+            elif previous.get("status") in {"preparing", "ready"}:
+                resume_from = directory
+            else:
+                raise ProofContinuationError("Unknown Mini continuation state")
+        base_binding = previous.get("base_binding", previous["binding"]) if previous else binding
+        base_preamble = previous.get("base_preamble", self._preamble(artifacts)) if previous else self._preamble(artifacts)
+        imports = [artifact.to_dict() for artifact in artifacts
+                   if f"import {artifact.module_name}" not in base_preamble.splitlines()]
+        prepared = {"schema": 1, "binding": binding, "base_binding": base_binding,
+                    "base_preamble": base_preamble, "run_dir": str(run_dir),
+                    "resume_from": str(resume_from) if resume_from is not None else None,
+                    "status": "preparing"}
+        # Publish routing with ownership before the attempt can start. A
+        # cancellation, storage failure, or worker restart must resume this
+        # search without spending another formalizer turn to select it.
+        self.store.checkpoint(claim, {**task.session, "proof_continuation": prepared,
+                                      "proof_continuation_pending": True})
+
+        async def checkpoint_ready(checkpoint: dict[str, Any]) -> None:
+            if (checkpoint.get("mode") != "mini_checkpoint"
+                    or checkpoint.get("run_dir") != str(run_dir)
+                    or not isinstance(checkpoint.get("attempt_id"), str)):
+                raise ProofContinuationError("Adapter returned invalid checkpoint ownership")
+            self.store.checkpoint(claim, {**self.store.get_task(task.id).session,
+                "proof_continuation": {**prepared, "status": "ready", "checkpoint": checkpoint}})
+
+        return {"continuation": {"mode": "mini_checkpoint", "run_dir": str(resume_from)}
+                if resume_from is not None else None,
+                "checkpoint_binding": base_binding, "checkpoint_preamble": base_preamble,
+                "checkpoint_imports": imports, "checkpoint_callback": checkpoint_ready}
+
     async def _prove(self, claim: Claim) -> None:
         from .prover import ProofAttemptResult
         from ..research_claims.strategy import StrategyYield
@@ -791,6 +885,8 @@ class Campaign:
             "generation": task.generation,
             "name": frozen["name"],
             "kernel_target": frozen["kernel_target"],
+            "frozen_sha256": hashlib.sha256(_json(frozen).encode()).hexdigest(),
+            "dependency_artifacts": [artifact.to_dict() for artifact in self._dependencies(task)[1]],
             "binding_sha256": hashlib.sha256(
                 json.dumps(
                     [frozen, [artifact.to_dict() for artifact in artifacts]],
@@ -800,6 +896,7 @@ class Campaign:
                 ).encode()
             ).hexdigest(),
         }
+        quantum_exhausted = False
         pending = task.session.get("pending_proof")
         if pending:
             if any(pending.get(key) != value for key, value in binding.items()):
@@ -812,9 +909,6 @@ class Campaign:
             if self._local_only:
                 raise _LocalRecoveryUnavailable
             context = self._context(task)
-            if task.session.get("previous_proof_attempt_blob"):
-                context["previous_proof_attempt"] = json.loads(self.store.read_blob(task.session["previous_proof_attempt_blob"]))
-                context["previous_attempt_policy"] = "Retained candidate artifacts are not new assumptions or current proof authority. Revalidate any reused helper in the current frozen environment. Preserve useful mathematics while changing an obstructed route."
             context["original_source"] = self._refs(
                 frozen["source_refs"], required=True
             )
@@ -825,6 +919,24 @@ class Campaign:
             primary_failure = False
             try:
                 prove = getattr(self.prover, "prove_attempt", None) or self.prover.prove
+                run_dir = self.directory / "proof_runs" / claim.token
+                continuation_options = self._prepare_proof_continuation(claim, binding, run_dir, artifacts)
+                if task.session.get("previous_proof_attempt_blob"):
+                    if continuation_options.get("continuation") is None:
+                        context["previous_proof_attempt"] = json.loads(
+                            self.store.read_blob(task.session["previous_proof_attempt_blob"]))
+                        context["previous_attempt_policy"] = (
+                            "Retained candidate artifacts are not new assumptions or current proof authority. "
+                            "Revalidate any reused helper in the current frozen environment. "
+                            "Preserve useful mathematics while changing an obstructed route.")
+                    else:
+                        # The registry restores the mathematical state and notebook.
+                        # Re-embedding its archived runtime files would recursively
+                        # duplicate previous descriptions on every service grant.
+                        context["previous_attempt_policy"] = (
+                            "Continue the saved mathematical attempt with its restored graph, conversation "
+                            "and reasoning notebook. Exact prior artifacts remain in the campaign's "
+                            "proof_attempt_feedback events; they are not new proof authority.")
                 attempt = await prove(
                     task=task,
                     name=frozen["name"],
@@ -832,7 +944,8 @@ class Campaign:
                     proof_plan=frozen["proof_plan"],
                     preamble=self._preamble(artifacts),
                     context=context,
-                    run_dir=self.directory / "proof_runs" / claim.token,
+                    run_dir=run_dir,
+                    **continuation_options,
                 )
                 if isinstance(attempt, ProofAttemptResult):
                     if attempt.status == "yielded_for_review":
@@ -840,6 +953,10 @@ class Campaign:
                             subject_id=attempt.details.get("subject_id", ""), allocation_id=attempt.details.get("allocation_id", ""))
                     if attempt.status not in {"proved", "inconclusive"}:
                         raise ValueError(f"unexpected proof adapter outcome: {attempt.status}")
+                    if attempt.status == "inconclusive" and attempt.details.get("reason") == "service_quantum_exhausted":
+                        quantum_exhausted = True
+                        self.store.checkpoint(claim, {**self.store.get_task(task.id).session,
+                                                     "proof_continuation_pending": True})
                     source = attempt.source
                 else:
                     source = attempt
@@ -878,7 +995,18 @@ class Campaign:
                         raise ProofAttemptFeedbackError(
                             stage="archive", error_type=type(exc).__name__
                         ) from exc
+        if source is None and not quantum_exhausted:
+            session = self.store.get_task(task.id).session
+            if session.get("strategy_continuation_pending") or session.get("proof_continuation_pending"):
+                # Only a normally completed attempt returns mathematical
+                # reconsideration to the formalizer. Failed restoration and
+                # interrupted cleanup keep the saved attempt's routing.
+                self.store.checkpoint(claim, {**session, "strategy_continuation_pending": False,
+                                             "proof_continuation_pending": False})
         if source is None:
+            if quantum_exhausted:
+                self.store.fail(claim, "Mini service quantum ended; committed search is resumable", retry=True)
+                raise _ProofQuantumReached
             self._observe(
                 claim,
                 {
@@ -898,6 +1026,8 @@ class Campaign:
             session = {
                 **self.store.get_task(task.id).session,
                 "pending_proof": candidate,
+                "strategy_continuation_pending": False,
+                "proof_continuation_pending": False,
             }
             self.store.checkpoint(claim, session)
         try:
@@ -947,8 +1077,7 @@ class Campaign:
         if task.session.get("pending_proof"):
             await self._prove(claim)
             return
-        if task.session.get("strategy_continuation_pending") and task.session.get("frozen_statement"):
-            self.store.checkpoint(claim, {**task.session, "strategy_continuation_pending": False})
+        if (task.session.get("strategy_continuation_pending") or task.session.get("proof_continuation_pending")) and task.session.get("frozen_statement"):
             await self._prove(claim)
             return
         pending = task.session.get("pending_review")
@@ -1220,6 +1349,19 @@ class Campaign:
                     )
                 result = self.status()
                 result["stop_reason"] = "local_recovery_only"
+                return result
+            except _ProofQuantumReached:
+                result = self.status()
+                result["stop_reason"] = "proof_quantum_exhausted"
+                return result
+            except ProofContinuationError as exc:
+                with contextlib.suppress(LeaseLostError):
+                    task = self.store.get_task(claim.task.id)
+                    if task.session.get("frozen_statement"):
+                        self.store.checkpoint(claim, {**task.session, "proof_continuation_pending": True})
+                    self.store.fail(claim, str(exc), retry=True)
+                result = self.status()
+                result.update(stop_reason="continuation_error", continuation_error=str(exc))
                 return result
             except ProofAttemptFeedbackError as exc:
                 diagnostic: dict[str, Any] = {

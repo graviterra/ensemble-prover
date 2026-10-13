@@ -126,6 +126,55 @@ independently check, and any claimed specialization link must check separately.
 Several successful examples, a model review, or frequent use cannot publish a
 general theorem.
 
+## Admitting imported source
+
+For registered Mathlib and project sources, memory can establish a live source
+receipt by compiling the exact source in an isolated output directory under its
+original module name. It compares the resulting kernel declarations, including
+their types and bodies, with the installed module. A source file containing a
+matching declaration name or printed type is insufficient.
+
+The receipt binds the source, compiled artifact parts, current context, imported
+dependency closure, and Lean module resolution. A changed artifact or a newly
+shadowed dependency invalidates reuse. Receipt consumption rechecks dependency
+bytes as well as file identities and resolved locations; writes through an
+already writable memory mapping need not change file timestamps. Large import
+closures therefore consume additional checking time within the existing allowance.
+Profiling and application still require a current receipt, and the final proof
+still passes the ordinary Lean acceptance path.
+
+Source compilation, goal capture, and application use the existing memory
+allocation. A candidate-specific admission failure allows other candidates to be
+considered. Checker outages retain retryable work; an unaffordable retry does not
+block independent requests that fit the remaining allocation. Stale requests are
+settled before further checking or model dispatch.
+
+A source file missing before its first admission, exceeding the source byte limit,
+or containing invalid UTF-8 rejects that candidate alone.
+Previously bound source or artifact storage becoming unavailable defers acceptance.
+Catalog deadlines and database availability failures also defer source admission.
+An affected root proof remains an inert candidate in the session and reasoning
+notebook. Recovery uses the existing memory allowance for current source admission
+and a fresh Lean check, including after checkpoint restoration. Checked helper and
+theory source descriptions survive ordinary checkpoints as inputs for current
+admission, even when no root proof was pending. A resumed memory pass funds this
+readmission before retrieving more candidates. Current live bindings remain usable
+after a checkpoint; rejected inventories do not repeatedly consume recovery work.
+If an originally denied source becomes eligible again, its existing recovery
+allocation can resume. A fresh exact proof-use observation can still establish
+that an unrelated retained helper is unused by the root proof.
+Helper recovery preserves the original declaration order, and an interrupted
+recovery retains completed admissions within the live process. Removed helpers
+without remaining source obligations are not reintroduced. Stored certificates
+never authorize this retry. A changed source policy rejects acceptance, and a
+matching previously completed root loses its current solved status until the
+ordinary acceptance checks succeed again.
+
+These checks use the configured Lean project and installed toolchain. Configured
+Lean source retains the runner's existing execution permissions; isolated output
+paths do not sandbox metaprogram IO. Live receipts belong to the current process
+and source context, and do not establish portable cross-problem authority.
+
 ## Cross-problem limits
 
 Portable memory requires current authority for its full source ancestry,

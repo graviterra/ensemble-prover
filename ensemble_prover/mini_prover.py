@@ -1242,6 +1242,7 @@ class Conversation:
     # enabled so explicit helper decomposition remains available there.
     allow_helper_decomposition: bool = True
     history: List[Dict[str, Any]] = field(default_factory=list)
+    reasoning_notebook: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # A filled answer definition that is explicitly visible is a real
@@ -1350,6 +1351,13 @@ class Conversation:
             )
         ]
         removed = self.history[first_assistant:keep_from]
+        from .reasoning_notebook import archive_reasoning
+
+        # Include the following diagnostic even when it remains in the live
+        # suffix, so a later reader can distinguish a Lean error from a
+        # mathematical objection to the archived argument.
+        next_attempt = next((i for i in proof_attempt_indices if i >= keep_from), len(self.history))
+        archive_reasoning(self, self.history[first_assistant:next_attempt])
         raw_kept = self.history[keep_from:]
         anchor_in_tail = bool(
             latest_selected_work_anchor is not None
@@ -1387,8 +1395,8 @@ class Conversation:
         removed_chars = sum(_history_message_payload_chars(msg) for msg in removed)
         summary_lines = [
             "[history compaction]",
-            "Older rejected proof attempts and stale tool results were omitted from this prompt to avoid anchoring on failed code.",
-            "Do not reuse an omitted proof shape merely because it appeared earlier; repair from the latest Lean feedback below.",
+            "Older proof transcripts and tool results are available through read_reasoning_notebook.",
+            "Lean failures concern the submitted formalization; the mathematical arguments remain available for reconsideration.",
         ]
         if summaries:
             summary_lines.append("Compacted failure summary:")
@@ -1538,7 +1546,7 @@ class Conversation:
                 raw_content = str(msg.get("content", "") or "")
                 redact = _conversation_should_redact_solution_refs(self)
                 if retained_tool_names.get(raw_tool_id) in {
-                    "read_verified_helpers", "read_native_research_artifact",
+                    "read_verified_helpers", "read_native_research_artifact", "read_reasoning_notebook",
                 }:
                     # These tool results carry character pages of text or JSON,
                     # possibly ending inside a token: generic literal redaction
@@ -1697,6 +1705,13 @@ class Conversation:
             elif tcid not in active_kept_tool_ids:
                 remove_indices.add(idx)
 
+        from .reasoning_notebook import archive_reasoning
+
+        # Retained tool rounds are shortened below too. Preserve their complete
+        # reasoning and results before any sanitizer applies presentation limits.
+        archive_reasoning(self, [msg for msg in history
+                                if msg.get("role") == "tool"
+                                or (msg.get("role") == "assistant" and msg.get("tool_calls"))])
         if not remove_indices:
             if not tool_assistant_indices:
                 return {}
@@ -2186,6 +2201,11 @@ class Conversation:
             anchor["_required_prompt_context"] = {
                 "kind": "nl_source_and_formalized_target"
             }
+        from .reasoning_notebook import notebook_notice
+
+        notice = notebook_notice(self)
+        if notice:
+            msgs.insert(1, {"role": "user", "content": notice})
         return msgs
 
     def ensure_bootstrap(self) -> None:
@@ -5802,6 +5822,10 @@ async def run_conversation(
         base_tools_list.extend(native_tools)
         base_use_tools = True
     from .helper_inventory import READ_VERIFIED_HELPERS_TOOL, run_read_verified_helpers_tool
+    from .reasoning_notebook import READ_REASONING_NOTEBOOK_TOOL, read_reasoning_notebook
+
+    if base_use_tools:
+        base_tools_list.append(READ_REASONING_NOTEBOOK_TOOL)
 
     helper_lookup_enabled = bool(
         base_use_tools and callable(getattr(dossier, "validate_helper_context", None))
@@ -6862,6 +6886,8 @@ async def run_conversation(
                             from .mini_research import native_research_tool
 
                             result_text = json.dumps(native_research_tool(name, args, conv), ensure_ascii=False)
+                        elif name == "read_reasoning_notebook":
+                            result_text = json.dumps(read_reasoning_notebook(conv, args), ensure_ascii=False)
                         elif name == "read_verified_helpers" and helper_lookup_enabled:
                             result_text = run_read_verified_helpers_tool(
                                 dossier, _current_verified_helper_blocks(), args,
@@ -11225,6 +11251,8 @@ async def prove_problem(
     max_refine_turns: int,
     autonomous_research: bool = True,
     frontier_research: Optional[Dict[str, Any]] = None,
+    research_client: Any = None,
+    research_review_client: Any = None,
     trace_prefix: str = "",
     recorder: Optional[RunRecorder] = None,
     searcher: Optional[MathlibApiSearcher] = None,
@@ -11358,6 +11386,8 @@ async def prove_problem(
                 ("prover", prover_client),
                 ("refiner", refiner_client),
                 ("planner_escalation", planner_escalation_client),
+                ("research", research_client),
+                ("research_review", research_review_client),
             ),
         )
 
@@ -13302,6 +13332,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--answer-refutation-from", default=None, help=argparse.SUPPRESS)
     p.add_argument(
+        "--resume-migrate-providers", action="store_true",
+        help=("Explicitly change selected provider/model options when resuming the same attempt. "
+              "Preserves proofs, pending local work and cumulative limits; retires old provider envelopes."),
+    )
+    p.add_argument(
         "--resume-accept-source-hash", default="", metavar="SAVED_SHA256",
         help=("Explicitly approve resuming after an executor update by supplying the saved "
               "executor_source_hash. Input, policy, checkpoint integrity, budgets, and fresh "
@@ -13357,6 +13392,14 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--refiner-model", default=None)
+    for role in ("research", "research-review"):
+        p.add_argument(
+            f"--{role}-provider", default=None,
+            choices=["openai", "deepseek", "openrouter", "codex", "claude-code", "cursor"],
+            help=("Optional independent native investigation/review provider. "
+                  "Uses existing campaign funding; omitted roles inherit the investigation donor."),
+        )
+        p.add_argument(f"--{role}-model", default=None)
     p.add_argument(
         "--codex-bin", default="codex",
         help="Codex CLI executable for --prover/--refiner codex (ChatGPT subscription sign-in).",
@@ -15487,6 +15530,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 output_dir, identity=cli_attempt_identity(args, problem),
                 resume_from=(Path(args.resume_from) if getattr(args, "resume_from", None) else None),
                 resume_accept_source_hash=str(getattr(args, "resume_accept_source_hash", "") or ""),
+                resume_migrate_providers=bool(getattr(args, "resume_migrate_providers", False)),
                 startup_artifacts=startup_artifacts,
                 worker_started_monotonic=worker_started_monotonic,
                 worker_admitted_elapsed_s=worker_admitted_elapsed_s,
@@ -15535,6 +15579,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     # Pre-try init: the finally-block transport cleanup references this even
     # when setup fails before the escalation client is (conditionally) built.
     planner_escalation_client: Optional[OpenAICompatClient] = None
+    research_role_clients: Dict[str, Any] = {}
     lean: Optional[LeanRunner] = None
     searcher: Optional[Any] = None
     proof_dossier: Optional[ProofDossier] = None
@@ -15574,6 +15619,12 @@ async def _main_async(args: argparse.Namespace) -> int:
                 "action": "checkpoint_resume",
                 "verdict": "executor_source_change_accepted",
                 "source_transition": dict(checkpoint_registry.source_transition),
+                "predecessor": checkpoint_registry.predecessor,
+            })
+        if checkpoint_registry is not None and checkpoint_registry.provider_transition:
+            recorder.record_turn({
+                "action": "checkpoint_resume", "verdict": "provider_migration_accepted",
+                "provider_transition": checkpoint_registry.provider_transition,
                 "predecessor": checkpoint_registry.predecessor,
             })
         print(f"Output dir: {output_dir}")
@@ -15691,7 +15742,12 @@ async def _main_async(args: argparse.Namespace) -> int:
                 refiner_cfg,
                 provider_lane_health_registry=provider_lane_health_registry,
             )
-        for role_client in (prover_client, refiner_client):
+        from .mini_research_roles import build_research_role_clients
+
+        build_research_role_clients(
+            args, research_role_clients, provider_lane_health_registry=provider_lane_health_registry,
+        )
+        for role_client in (prover_client, refiner_client, *research_role_clients.values()):
             if isinstance(role_client, CursorSubscriptionClient):
                 print(
                     "[mini_prover] "
@@ -15794,6 +15850,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                 ("prover", prover_client),
                 ("refiner", refiner_client),
                 ("planner_escalation", planner_escalation_client),
+                *research_role_clients.items(),
             ),
         )
 
@@ -16083,6 +16140,8 @@ async def _main_async(args: argparse.Namespace) -> int:
                 max_refine_turns=int(args.max_refine_turns),
                 autonomous_research=bool(getattr(args, "autonomous_research", True)),
                 frontier_research={"mode": args.frontier_research},
+                research_client=research_role_clients.get("research"),
+                research_review_client=research_role_clients.get("research_review"),
                 recorder=recorder,
                 checkpoint_registry=checkpoint_registry,
                 searcher=searcher,
@@ -16668,6 +16727,7 @@ async def _main_async(args: argparse.Namespace) -> int:
                         prover_client,
                         refiner_client,
                         planner_escalation_client,
+                        *research_role_clients.values(),
                     ):
                         if client is None or id(client) in seen_clients:
                             continue
@@ -17744,6 +17804,15 @@ async def _main_async(args: argparse.Namespace) -> int:
                         )
                     except Exception:
                         pass
+                for research_client in research_role_clients.values():
+                    if id(research_client) not in llm_client_close_attempted_ids:
+                        llm_client_close_attempted_ids.add(id(research_client))
+                        try:
+                            await _supervised_resource_close(
+                                research_client.close(), label="mini_session_research_client_close",
+                            )
+                        except Exception:
+                            pass
                 # Release the LeanRunner's persistent verifier pool /
                 # LeanREPL subprocess for the same programmatic-repeat-caller
                 # reason that motivates the client cleanup above. CLI single-

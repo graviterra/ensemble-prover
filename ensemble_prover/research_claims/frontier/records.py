@@ -49,6 +49,7 @@ APPROACH_STATES = frozenset({
 })
 PERMIT_KINDS = frozenset({
     "initial_exploration",
+    "campaign_exploration",
     "formal_followthrough",
     "research_followthrough",
     "inconclusive_extension",

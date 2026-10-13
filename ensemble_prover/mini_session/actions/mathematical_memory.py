@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import time
 import uuid
-import logging
 from typing import Any, ClassVar, FrozenSet
 
 from ensemble_prover.lean_runner import lean_resource_scope
 from ensemble_prover.mathematical_memory.budget import MemoryBudget
 from ensemble_prover.mathematical_memory.model import content_digest
+from ensemble_prover.mathematical_memory.service import CandidateAdmissionRejected
 from ensemble_prover.root_finalization import (
     RootFinalizationCandidate,
     root_verification_certificate,
@@ -29,6 +31,78 @@ class MathematicalMemoryAction:
         {"session_state", "dossier", "proof_state"}
     )
 
+    @staticmethod
+    def _request_scope_error(service: Any, request: dict[str, Any]) -> str:
+        if (
+            request.get("policy_id") != service.policy_id
+            or request.get("environment_id") != service.context_id()
+        ):
+            return "request policy or environment is no longer current"
+        if request.get("goal_id") != service.current_view().get("goal_id"):
+            return "request belongs to a different captured goal"
+        return ""
+
+    def _select_pending_request(
+        self,
+        session: Any,
+        available: float,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Select affordable work without changing skipped requests or authority."""
+        service = session.mathematical_memory
+        store = service.request_store
+        if store is None or available <= 0:
+            return None
+        capture_seconds = None
+        for row in store.pending(
+            limit=getattr(store, "max_records", 1024),
+            deadline_monotonic=deadline_monotonic,
+        ):
+            request = row["payload"]
+            # Stale scope needs only ledger rejection, never a Lean capture.
+            # Select it before affordability so its request can be settled.
+            if self._request_scope_error(service, request):
+                return request
+            if request.get("kind") != "retry":
+                return request
+            if session.lean is None or not service.config.probes_enabled:
+                continue
+            if capture_seconds is None:
+                capture_seconds = service.goal_capture_required_seconds()
+            requested_seconds = request.get("max_seconds")
+            allowance = available
+            if (
+                type(requested_seconds) in {int, float}
+                and math.isfinite(requested_seconds)
+                and requested_seconds > 0
+            ):
+                allowance = min(allowance, requested_seconds)
+            if allowance >= capture_seconds:
+                return request
+        return None
+
+    def _ordinary_is_applicable(self, session: Any, available: float) -> bool:
+        service = session.mathematical_memory
+        if available <= 0 or session.lean is None or not service.config.probes_enabled:
+            return False
+        if available < service.goal_capture_required_seconds():
+            return False
+        wake = any(
+            row.get("environment_id") == service.context_id()
+            for row in session.mathematical_memory_state.get("wake_proposals", ())
+        )
+        prior_revision = session.mathematical_memory_state.get(
+            "attempted_retrieval_revisions", {}
+        ).get(service.context_id())
+        return (
+            wake
+            or service.has_pending_continuation()
+            or service.context_id()
+            not in session.mathematical_memory_state.get("attempted_contexts", ())
+            or prior_revision != service.retrieval_revision()
+        )
+
     def is_applicable(self, session: Any) -> bool:
         service = getattr(session, "mathematical_memory", None)
         if service is None:
@@ -39,34 +113,22 @@ class MathematicalMemoryAction:
             action_budget is None
             or action_budget.exhausted()
             or config.action_seconds <= 0
-            or service.allocation.available() <= 0
         ):
             return False
+        available = min(
+            max(0.0, config.action_seconds - action_budget.total_seconds),
+            service.allocation.available(),
+        )
+        if available <= 0:
+            return False
+        if service.has_deferred_root_finalization() or service.has_pending_source_recovery():
+            return True
         try:
-            if service.request_store is not None and service.request_store.pending(
-                limit=1
-            ):
+            if self._select_pending_request(session, available) is not None:
                 return True
         except (OSError, ValueError, RuntimeError):
             service.health = "unavailable"
-        wake = any(
-            row.get("environment_id") == service.context_id()
-            for row in session.mathematical_memory_state.get("wake_proposals", ())
-        )
-        prior_revision = session.mathematical_memory_state.get(
-            "attempted_retrieval_revisions", {}
-        ).get(service.context_id())
-        return (
-            session.lean is not None
-            and config.probes_enabled
-            and (
-                wake
-                or service.has_pending_continuation()
-                or service.context_id()
-                not in session.mathematical_memory_state.get("attempted_contexts", ())
-                or prior_revision != service.retrieval_revision()
-            )
-        )
+        return self._ordinary_is_applicable(session, available)
 
     def frontier_is_applicable_probe(self, session: Any) -> bool:
         return self.is_applicable(session)
@@ -142,21 +204,16 @@ class MathematicalMemoryAction:
             try:
                 budget.check_cancelled()
                 if service.request_store is not None:
-                    pending = service.request_store.pending(
-                        limit=1, deadline_monotonic=budget.deadline_monotonic
+                    request = self._select_pending_request(
+                        session,
+                        budget.remaining_s(),
+                        deadline_monotonic=budget.deadline_monotonic,
                     )
-                    request = pending[0]["payload"] if pending else None
                     request_id = str((request or {}).get("request_id", ""))
                 if request:
-                    if (
-                        request.get("policy_id") != service.policy_id
-                        or request.get("environment_id") != service.context_id()
-                    ):
-                        raise ValueError(
-                            "request policy or environment is no longer current"
-                        )
-                    if request.get("goal_id") != service.current_view().get("goal_id"):
-                        raise ValueError("request belongs to a different captured goal")
+                    scope_error = self._request_scope_error(service, request)
+                    if scope_error:
+                        raise ValueError(scope_error)
                     if request.get("kind") in {"retry", "generalization"}:
                         if request.get("allocation_id") not in {
                             budget.owner_id,
@@ -235,7 +292,20 @@ class MathematicalMemoryAction:
                             request, budget, source_provenance=annotation_provenance
                         )
                         verdict = "generalization_completed"
-                if not request or request.get("kind") == "retry":
+                if service.has_pending_source_recovery():
+                    stage = "source_recovery"
+                    await service.recover_source_context(budget)
+                if not request and service.has_deferred_root_finalization():
+                    stage = "root_recheck"
+                    result_candidate = await service.recheck_deferred_root_finalization(budget)
+                    if result_candidate is not None:
+                        verdict = "checked_artifact_awaiting_acceptance"
+                ordinary_work = not request and result_candidate is None and self._ordinary_is_applicable(
+                    session, budget.remaining_s()
+                )
+                if not request and not ordinary_work and result_candidate is None:
+                    verdict = "no_fundable_memory_work"
+                if ordinary_work or (request and request.get("kind") == "retry"):
                     if not config.probes_enabled:
                         raise ValueError("application probing is disabled")
                     wake_candidate_id = ""
@@ -338,25 +408,37 @@ class MathematicalMemoryAction:
                                 goal_id = goal.goal_id
                                 if not goal.complete:
                                     continue
-                            if not service.application_eligible(
+                            if not service.preparation_eligible(
                                 candidate.candidate_id, budget=budget
                             ):
                                 service.visit_candidate(candidate.candidate_id)
                                 card["outcome"] = "application_ineligible"
                                 continue
                             stage = "probe"
-                            observation = await service.prepare_and_probe(
-                                goal,
-                                candidate,
-                                budget,
-                                recipe=retry_recipe,
-                                operation_id=(
-                                    operation_id if retry_event is not None else ""
-                                ),
-                                attempt_id=(
-                                    attempt_id if retry_event is not None else ""
-                                ),
-                            )
+                            try:
+                                observation = await service.prepare_and_probe(
+                                    goal,
+                                    candidate,
+                                    budget,
+                                    recipe=retry_recipe,
+                                    operation_id=(
+                                        operation_id if retry_event is not None else ""
+                                    ),
+                                    attempt_id=(
+                                        attempt_id if retry_event is not None else ""
+                                    ),
+                                )
+                            except CandidateAdmissionRejected as exc:
+                                # Missing source authority belongs to this
+                                # candidate. It cannot refute the goal or turn
+                                # into an application receipt, and need not
+                                # discard the remaining independent candidates.
+                                service.visit_candidate(candidate.candidate_id)
+                                card["outcome"] = "admission_rejected"
+                                card["reason"] = exc.reason
+                                if request:
+                                    raise
+                                continue
                             if not service.candidate_eligible(candidate, budget=budget):
                                 continue
                             service.visit_candidate(candidate.candidate_id)

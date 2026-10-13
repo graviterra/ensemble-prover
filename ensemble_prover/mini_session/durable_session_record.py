@@ -62,6 +62,7 @@ _RUNTIME_FIELDS = frozenset({
     "_mini_recursive_hard_timeout_lease",
     "_checkpoint_initial_theory_context_hash",
     "_acceptance_receipt_flush_active",
+    "_checkpoint_provider_migration",
 })
 # The recursive prove/refine handoff reuses its conversation, including this
 # parent-bound commit/rollback handle. Only the accompanying theory provenance
@@ -867,6 +868,9 @@ async def restore_session_record(session: Any, record: dict[str, Any], *, expect
             graph_root.metadata.pop("proof_state_root_status")
     if bool(getattr(staged, "root_finalized", False)) != bool(staged.dossier.final_proof):
         raise ValueError("checkpoint root authority and scheduler status disagree")
+    from ensemble_prover.mini_provider_migration import migrate_session_provider_state
+
+    migrate_session_provider_state(staged, getattr(session, "_checkpoint_provider_migration", {}))
     (published_values, published_budgets, published_conversation,
      published_dossier, published_graph, published_proof_state,
      published_actions) = _prepare_bound_publication(session, staged)

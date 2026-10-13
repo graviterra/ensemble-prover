@@ -27077,16 +27077,38 @@ class MiniSession:
         candidate = self._hydrate_root_candidate_from_existing_finalization(candidate)
         memory = getattr(self, "mathematical_memory", None)
         from ..mathematical_memory.service import finalization_without_memory_eligible
-        memory_eligible = (
-            memory.finalization_eligible(candidate) if memory is not None
-            else finalization_without_memory_eligible(self, candidate)
-        )
+        try:
+            memory_eligible = (
+                memory.finalization_eligible(candidate, propagate_unavailable=True) if memory is not None
+                else finalization_without_memory_eligible(self, candidate)
+            )
+        except OSError:
+            memory.defer_root_finalization(candidate)
+            self._clear_uncontracted_root_side_effects(
+                candidate=candidate, action_id=outcome.action_id,
+                contract_status={"verdict": "memory_source_temporarily_unavailable"},
+            )
+            self.root_finalized = self._preserve_durable_root_finalization()
+            return {
+                "root_finalization_accepted": False,
+                "root_finalization_verdict": "memory_source_temporarily_unavailable",
+                "preserve_frontier_work": True,
+                "defer_selected_frontier_action": True,
+            }
         if not memory_eligible:
+            if memory is not None:
+                memory.clear_deferred_root_finalization()
+            self._clear_uncontracted_root_side_effects(
+                candidate=candidate, action_id=outcome.action_id,
+                contract_status={"verdict": "memory_source_policy_no_longer_current"},
+            )
             self._clear_root_finalized_for_rejected_attempt()
             return {
                 "root_finalization_accepted": False,
                 "root_finalization_verdict": "memory_source_policy_no_longer_current",
             }
+        if memory is not None:
+            memory.clear_deferred_root_finalization()
         candidate_raw_proof = str(candidate.proof or "").strip()
         candidate_artifact_proof = sanitize_lean_artifact_text(candidate.proof)
         already_recorded = str(
@@ -31589,6 +31611,9 @@ class MiniSession:
         except Exception:
             pass
         old_history = list(getattr(conv, "history", []) or [])
+        from ..reasoning_notebook import archive_reasoning
+
+        archive_reasoning(conv, old_history)
         initial_user = None
         for msg in old_history:
             if msg.get("role") == "user" and "Problem (natural language):" in str(
@@ -35394,18 +35419,51 @@ class MiniSession:
                     and durable_retry_count(pending.get("attempt_count")) > 0
                 )
 
-            deferred = [item for item in ranked if deferred_verifier_retry(item)]
-            if deferred and not any(
-                str(self._work_item_field(item, "work_type", "") or "").strip()
-                in {"assembly", "assemble_route"}
-                for item in ranked
-            ):
-                # A paid verifier-only replay is immediate once. After that
-                # exact request defers, guarantee one different executable
-                # lane gets the next scheduling opportunity. Merely lowering
-                # ProofSearchState's static work order is insufficient: the
-                # cross-action utility rank can otherwise retry a 300-second
-                # verifier operation for seven iterations before exploration.
+            deferred = [
+                item for item in ranked if deferred_verifier_retry(item)
+                and quoted_actions.get(id(item)) is not None
+            ]
+
+            def annotate_retry(item: Any, key: str, value: Any = True) -> None:
+                record = self._work_item_field(item, "graph_record", None)
+                if not isinstance(record, dict) and isinstance(item, dict):
+                    record = item
+                if isinstance(record, dict):
+                    record["root_value_scheduler"][key] = value
+
+            retry_keys: Dict[int, str] = {}
+            for item in deferred:
+                annotate_retry(item, "verifier_retry")
+                node_id = str(self._work_item_field(item, "node_id", "") or "")
+                node = self.proof_state.nodes.get(node_id)
+                pending = (
+                    getattr(node, "pending_residual_goal_extraction", {})
+                    if self._work_item_field(item, "work_type", "") == "residual_goal_extraction"
+                    else getattr(node, "pending_helper_acceptance", {})
+                ) or {}
+                # Utility, frontier order and retry counts can change while
+                # the same paid request waits. Rotate by its stable identity.
+                identity = [node_id, self._work_item_field(item, "work_type", ""),
+                            self._work_item_field(item, "target_hash", ""),
+                            *[str(pending.get(key) or "") for key in (
+                                "helper_block", "parent_proof_stub", "request_context_hash",
+                                "elaboration_context_hash", "acceptance_request_hash",
+                            )]]
+                retry_keys[id(item)] = hashlib.sha256(
+                    json.dumps(identity, ensure_ascii=False).encode("utf-8")
+                ).hexdigest()
+                annotate_retry(item, "verifier_retry_key", retry_keys[id(item)])
+            if deferred:
+                assemblies = [
+                    item for item in ranked
+                    if str(self._work_item_field(item, "work_type", "") or "").strip()
+                    in {"assembly", "assemble_route"}
+                ]
+                # Alternate actual service between paid verifier retries and
+                # other executable work. Quotation cannot spend that turn;
+                # the durable counter advances only during action settlement.
+                # Otherwise repeatedly promoting the competitor can strand
+                # a paid proof forever, even after its verifier recovers.
                 alternate = next(
                     (
                         item
@@ -35414,19 +35472,33 @@ class MiniSession:
                         and str(
                             self._work_item_field(item, "work_type", "") or ""
                         ).strip()
-                        not in {"residual_goal_extraction", "root_repair"}
+                        not in {"residual_goal_extraction", "root_repair", "assembly", "assemble_route"}
                         and self._quote_work_item_action(item) is not None
                     ),
                     None,
                 )
-                if alternate is not None:
+                scheduler_state = getattr(dossier, "native_scheduler_state", {})
+                scheduler_state = scheduler_state if isinstance(scheduler_state, dict) else {}
+                retry_due = durable_retry_count(scheduler_state.get("verifier_retry_due")) > 0
+                if retry_due or alternate is None:
+                    cursor = scheduler_state.get("verifier_retry_cursor", "")
+                    if not isinstance(cursor, str):
+                        cursor = ""
+                    stable = sorted(deferred, key=lambda item: retry_keys[id(item)])
+                    winner = next((item for item in stable if retry_keys[id(item)] > cursor), stable[0])
+                    ranked = [*assemblies, winner, *[
+                        item for item in ranked if item is not winner and item not in assemblies
+                    ]]
+                else:
+                    annotate_retry(alternate, "verifier_retry_yield")
                     ranked = [
+                        *assemblies,
                         alternate,
                         *deferred,
                         *[
                             item
                             for item in ranked
-                            if item is not alternate and item not in deferred
+                            if item is not alternate and item not in deferred and item not in assemblies
                         ],
                     ]
             return ranked
@@ -35457,6 +35529,9 @@ class MiniSession:
         dossier.native_scheduler_state = native_service_state(
             getattr(dossier, "native_scheduler_state", {}),
             exploration=exploration_eligible and scheduler.get("exploration_reserved") is True,
+            verifier_retry=scheduler.get("verifier_retry") is True,
+            verifier_retry_yield=scheduler.get("verifier_retry_yield") is True,
+            verifier_retry_key=scheduler.get("verifier_retry_key", ""),
         )
 
     def _retire_unserviceable_frontier_prefix(
@@ -40779,6 +40854,9 @@ class MiniSession:
         item = self.selected_work_item
         if item is None:
             return None
+        from ..research_claims.native_local_proofs import work_item_context_matches
+        if not work_item_context_matches(self, item):
+            return None
         if work_types:
             work_type = str(self._work_item_field(item, "work_type", "") or "")
             if work_type not in set(work_types):
@@ -42044,6 +42122,9 @@ class MiniSession:
         existing cleanup and telemetry behavior.
         """
 
+        from ..research_claims.native_local_proofs import work_item_context_matches
+        if not work_item_context_matches(self, work_item):
+            return None
         work_type = str(self._work_item_field(work_item, "work_type", "") or "")
         if not work_type:
             return None

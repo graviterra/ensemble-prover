@@ -8206,7 +8206,7 @@ class ProofDossier:
         default_factory=dict
     )
     # Advisory native exploration accounting; never proof or budget authority.
-    native_scheduler_state: Dict[str, int] = field(default_factory=dict)
+    native_scheduler_state: Dict[str, int | str] = field(default_factory=dict)
     proposed_helpers: Dict[str, ProposedHelper] = field(default_factory=dict)
     attempts: List[ProofAttemptRecord] = field(default_factory=list)
     scratch: List[ScratchRecord] = field(default_factory=list)
@@ -12970,7 +12970,18 @@ class ProofDossier:
         if (getattr(helper, "contract_observation_required", False)
                 and not verified_helper_has_typed_binder_evidence(helper)):
             return False
-        return str(getattr(helper, "render_policy", "") or "") in {
+        policy = str(getattr(helper, "render_policy", "") or "")
+        if policy == "advisory_requires_unproved_premise":
+            tags = set(getattr(helper, "quality_tags", ()) or ())
+            # A checked implication remains a theorem before its premises are
+            # proved. Make it available for local application; graph contracts
+            # still retain every obligation needed to reach its conclusion.
+            # Unknown binder semantics have a different authority boundary.
+            return (
+                "hollow_root_reducer" in tags
+                and "unresolved_binder_contract" not in tags
+            )
+        return policy in {
             "",
             "root_authoritative",
         }
@@ -13104,7 +13115,15 @@ class ProofDossier:
                 continue
             statement = helper_decl_statement(helper.source)
             if statement:
-                support.extend(_dossier_support_candidates(statement))
+                if graph_statement_closed_data_requirements(
+                    statement, reference_statement=self.root_statement,
+                ):
+                    # The complete theorem is available, but dropping a data
+                    # binder would silently assume an inhabitant of its type.
+                    # A checked application can supply its conclusion later.
+                    support.append((statement, ()))
+                else:
+                    support.extend(_dossier_support_candidates(statement))
         return support
 
     def activate_active_root_classification_preamble(self, preamble: str) -> None:
@@ -13210,7 +13229,8 @@ class ProofDossier:
         helper: VerifiedHelper,
         *,
         _context_sources_are_plain: Optional[bool] = None,
-    ) -> None:
+    ) -> bool:
+        """Refresh derived quality and report whether premise support was read."""
         statement = helper_decl_statement(helper.source)
         from .verified_helper_contract import (
             helper_contract_context_is_plain, helper_source_contract_is_context_sensitive,
@@ -13364,11 +13384,8 @@ class ProofDossier:
                     closed_open_statements.append(ambiguous_type)
             if not root_authoritative:
                 render_policy = "advisory_requires_unproved_premise"
-        if (premises or data_requirements) and _dossier_may_be_root_adjacent(
-            conclusion,
-            self.root_statement,
-            conclusion_bound_names=bound_names,
-        ):
+        requires_support = bool((premises or data_requirements) and root_adjacent)
+        if requires_support:
             support = self._visible_verified_support_candidates(
                 skip_name=helper.name,
             )
@@ -13465,6 +13482,7 @@ class ProofDossier:
         helper.open_premise_statements = open_statements
         helper.closed_open_premise_statements = closed_open_statements
         helper.render_policy = render_policy
+        return requires_support
 
     def helper_revision(self) -> Optional[str]:
         """Exact runtime content identity, including policy and graph revocation."""
@@ -13499,8 +13517,24 @@ class ProofDossier:
 
     def _refresh_verified_helper_quality_uncached(self) -> None:
         from .verified_helper_contract import helper_source_contract_is_context_sensitive
+        from .helper_snapshot import (
+            helper_classification_context,
+            helper_classification_revision,
+            helper_classification_support,
+        )
 
         helpers = list(self.verified_helpers.values())
+        classifications = getattr(self, "_helper_quality_classifications", {})
+        classifications = {
+            name: record for name, record in classifications.items()
+            if name in self.verified_helpers
+        }
+        self._helper_quality_classifications = classifications
+        classification_context = helper_classification_context(self)
+        support_context = helper_classification_support(self)
+        active_frame_requires_support = bool(
+            self.active_root_targets and self.active_root_classification_preamble_hash
+        )
         # Classify each retained source once, then exclude the helper whose
         # contract is being classified. Rebuild this census on every refresh:
         # replacement, removal, restore and environment changes cannot leave a
@@ -13515,12 +13549,39 @@ class ProofDossier:
         }
         for helper in helpers:
             old_policy = str(getattr(helper, "render_policy", "") or "")
-            self._classify_verified_helper_quality(
-                helper,
-                _context_sources_are_plain=(
-                    not sensitive_source_ids or sensitive_source_ids == {id(helper)}
-                ),
+            context_sources_are_plain = (
+                not sensitive_source_ids or sensitive_source_ids == {id(helper)}
             )
+            cached = classifications.get(helper.name)
+            requires_support = active_frame_requires_support or bool(cached and cached[1])
+            classification_revision = helper_classification_revision(
+                helper, context=classification_context,
+                context_sources_are_plain=context_sources_are_plain,
+                support=support_context, requires_support=requires_support,
+            )
+            if (
+                classification_revision is None
+                or cached is None
+                or cached[0] != classification_revision
+            ):
+                reads_support = self._classify_verified_helper_quality(
+                    helper, _context_sources_are_plain=context_sources_are_plain,
+                )
+                # Legacy adapters returning None conservatively depend on the
+                # complete support snapshot. Only an explicit False omits it.
+                requires_support = active_frame_requires_support or reads_support is not False
+                classification_revision = helper_classification_revision(
+                    helper, context=classification_context,
+                    context_sources_are_plain=context_sources_are_plain,
+                    support=support_context, requires_support=requires_support,
+                )
+                if classification_revision is None:
+                    classifications.pop(helper.name, None)
+                else:
+                    classifications[helper.name] = (classification_revision, requires_support)
+            # Graph metadata, source receipts and progress reductions still
+            # reconcile on every changed dossier revision. Cached quality is
+            # never a substitute for replay or current graph authority.
             if not verified_helper_admission_quality(helper).generic_novelty:
                 stale_delta = _coerce_verified_helper_progress_delta(
                     self.verified_helper_progress_deltas.get(helper.name)
@@ -22592,7 +22653,9 @@ class ProofDossier:
                 str(key): value for key, value in (
                     data.get("native_scheduler_state", {}).items()
                     if isinstance(data.get("native_scheduler_state"), dict) else ()
-                ) if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                ) if (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
+                or (key == "verifier_retry_cursor" and isinstance(value, str)
+                    and (not value or re.fullmatch(r"[0-9a-f]{64}", value) is not None))
             },
             action_value_observations={
                 str(key or "").strip(): {

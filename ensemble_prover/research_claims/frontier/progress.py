@@ -897,7 +897,8 @@ def apply_contribution(
         request_readmission(state, approach_id, now=now)
     if decision["credit_minted"]:
         for provisional in state["permits"].values():
-            if (provisional["approach_id"] == approach_id and provisional["kind"] == "inconclusive_extension"
+            if (provisional["approach_id"] == approach_id
+                    and provisional["kind"] in {"inconclusive_extension", "campaign_exploration"}
                     and provisional["status"] in {"usable", "claimed"}):
                 _invalidate_permit(state, provisional["permit_id"])
     return decision
@@ -994,11 +995,14 @@ def restore_unused_after_dismiss(state: dict[str, Any], approach_id: str, *, now
         return None
     restored = None
     for permit in list(state["permits"].values()):
-        if permit["approach_id"] != approach_id or permit["status"] == "spent":
+        # A hold marks current rights stale without invalidating them. Historical
+        # invalidations include superseded exploration and older generations;
+        # dismissing a hold does not authorize their revival or duplicate credit.
+        if permit["approach_id"] != approach_id or permit["status"] not in {"usable", "claimed"}:
             continue
         if permit.get("entitlement_id") and state["entitlements"][permit["entitlement_id"]]["spent"]:
             continue
-        if permit.get("stale") or permit["status"] == "invalidated" or now >= permit["expires_at"]:
+        if permit.get("stale") or now >= permit["expires_at"]:
             restored = replace_stale_permit(
                 state,
                 permit["permit_id"],

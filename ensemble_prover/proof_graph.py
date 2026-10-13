@@ -10058,17 +10058,30 @@ def _graph_type_is_syntactically_inhabited(type_text: str) -> bool:
         return False
     if compact in (_GRAPH_KNOWN_DATA_ATOM_TYPES - {"Empty"}):
         return True
-    if re.fullmatch(r"(?:Type|Sort|Prop)(?:\s+.+)?", compact):
-        return True
+    implications = _graph_split_top_level_implications(compact)
+    if len(implications) > 1:
+        # A constant function supplies a witness only when its codomain has one.
+        return _graph_type_is_syntactically_inhabited(implications[-1])
     # These constructors have a witness independently of their parameters.
-    # Deliberately exclude Fin, Subtype, PLift, ULift, products, and function
-    # spaces: their inhabitance depends on data that the helper may not have.
+    # Deliberately exclude Fin, Subtype, PLift, ULift, and products: their
+    # inhabitance depends on data that the helper may not have.
+    head = _graph_leading_identifier(compact)
+    if head not in {"List", "Multiset", "Option", "Array", "Set", "Finset",
+                    "WithTop", "WithBot", "Type", "Sort", "Prop"}:
+        return False
+    args = _graph_application_arg_texts(compact, head)
+    if args == []:
+        return head in {"Type", "Sort", "Prop"}
+    if args is None or len(args) != 1 or head == "Prop":
+        return False
+    # Require one complete syntactic argument. A namespace prefix such as
+    # List.EmptyWitness or an outer function/product is not a List application.
+    argument = args[0]
     return bool(
-        re.match(
-            r"^(?:List|Multiset|Option|Array|Set|Finset|PUnit|Unit|Bool|"
-            r"Nat|Int|Rat|Real|Complex|String|WithTop|WithBot)\b",
-            compact,
-        )
+        _graph_leading_identifier(argument) == argument
+        or (head in {"Type", "Sort"} and argument.isdecimal())
+        or (argument[0] in _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE
+            and _graph_matching_group_index(argument, 0) == len(argument) - 1)
     )
 
 
@@ -21859,6 +21872,8 @@ class ProofGraph:
             if metadata.get("materialization_required"):
                 payload["materialization_required"] = True
             for key in (
+                "native_local_proof_hints",
+                "native_local_proof_followup_artifacts",
                 "formalization_bridge_contract",
                 "formalization_bridge_parent_statement",
                 "formalization_obligation_key",

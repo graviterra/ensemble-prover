@@ -16,7 +16,7 @@ from .cost_policy import require_cost_budget_usd
 
 _GENERATION_OPTIONS = frozenset({
     "output_dir", "resume_from", "terminal_trace", "mini_theory_startup_overlay_nonce",
-    "resume_accept_source_hash",
+    "resume_accept_source_hash", "resume_migrate_providers",
     # Consumed upstream before a frozen theorem's Mini attempt begins. It
     # must not change the policy schema of existing ordinary checkpoints.
     "answer_attempts",
@@ -27,6 +27,10 @@ _SUBSCRIPTION_BINARY_OPTIONS = {
     "claude-code": ("claude_code_bin", "claude"),
     "cursor": ("cursor_bin", "agent"),
 }
+
+_RESEARCH_ROLE_OPTIONS = (
+    "research_provider", "research_model", "research_review_provider", "research_review_model",
+)
 
 
 class CheckpointArgumentParser(argparse.ArgumentParser):
@@ -59,8 +63,12 @@ def public_cli_config(args: argparse.Namespace) -> dict[str, Any]:
         key: value for key, value in vars(args).items()
         if not key.startswith("_") and key not in _GENERATION_OPTIONS
     }
+    for option in _RESEARCH_ROLE_OPTIONS:
+        if config.get(option) is None:
+            config.pop(option, None)
     for provider, (option, _) in _SUBSCRIPTION_BINARY_OPTIONS.items():
-        if provider not in {config.get("prover"), config.get("refiner")}:
+        if provider not in {config.get("prover"), config.get("refiner"),
+                            config.get("research_provider"), config.get("research_review_provider")}:
             # Preserve old policy shapes unless this transport is selected.
             config.pop(option, None)
     if getattr(args, "_legacy_autonomous_research_policy", False):
@@ -84,6 +92,8 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
     resume_from = getattr(args, "resume_from", None)
     if getattr(args, "resume_accept_source_hash", "") and not resume_from:
         raise ValueError("Source approval requires --resume-from")
+    if getattr(args, "resume_migrate_providers", False) and not resume_from:
+        raise ValueError("Provider migration requires --resume-from")
     if not resume_from or getattr(args, "_checkpoint_config_resolved", False):
         return args
     from .mini_session.attempt_checkpoint import AttemptCheckpointRegistry
@@ -94,10 +104,17 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
             or type(identity.get("cli_config")) is not dict):
         raise ValueError("Checkpoint does not contain a compatible public CLI configuration")
     saved = clone_json_value(identity["cli_config"], label="saved CLI configuration")
+    if getattr(args, "resume_migrate_providers", False):
+        from .mini_provider_migration import resolve_provider_migration_args
+
+        return resolve_provider_migration_args(args, saved)
     current = public_cli_config(args)
     explicit = getattr(args, "_explicit_cli_destinations", None)
     if not isinstance(explicit, set):
         raise ValueError("Resume configuration requires parsed explicit CLI options")
+    for name in _RESEARCH_ROLE_OPTIONS:
+        if name in saved and name not in explicit:
+            current[name] = saved[name]
     legacy_research = "autonomous_research" not in saved
     if legacy_research:
         if ("autonomous_research" in explicit
@@ -116,7 +133,8 @@ def resolve_resume_args(args: argparse.Namespace) -> argparse.Namespace:
             raise ValueError("Resume configuration override is incompatible: require_output_token_limit")
         current.pop("require_output_token_limit", None)
     for provider, (option, default) in _SUBSCRIPTION_BINARY_OPTIONS.items():
-        if provider in {saved.get("prover"), saved.get("refiner")}:
+        if provider in {saved.get("prover"), saved.get("refiner"),
+                        saved.get("research_provider"), saved.get("research_review_provider")}:
             # Bare resume inherits the saved transport schema, but explicit
             # binary/provider overrides must still pass compatibility checks.
             current[option] = getattr(args, option, default)

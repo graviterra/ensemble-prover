@@ -33,6 +33,28 @@ _LOCAL_EVENTS: dict[str, OrderedDict[str, str]] = {}
 _LOCAL_EVENTS_LOCK = RLock()
 
 
+class CandidateAdmissionRejected(ValueError):
+    """An individual declaration lacks current authority for an application.
+
+    These reasons describe admission, not mathematical failure. Infrastructure
+    faults and allocation exhaustion keep their separate exception types.
+    """
+
+    _MESSAGES = {
+        "candidate_source_ineligible": "candidate source is no longer eligible",
+        "source_version_ineligible": "candidate source version is no longer eligible",
+        "source_authority_changed": "candidate source authority changed during profiling",
+        "helper_binding_ineligible": "admitted helper source binding is no longer eligible",
+        "profile_incomplete": "application source/context attestation is incomplete",
+        "source_binding_unattested": "application source binding is not certified",
+        "application_context_ineligible": "application source/context is no longer eligible",
+    }
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(self._MESSAGES[reason])
+        self.reason = reason
+
+
 def _live_event_key(root: Any) -> str:
     return str(Path(root).absolute())
 
@@ -300,6 +322,9 @@ class MathematicalMemoryService:
         self.known_candidate_ids: dict[str, str] = {}
         self.profile_bundle_bindings: dict[str, tuple[str, ...]] = {}
         self._local_context_sources: dict[int, tuple[Any, str, str]] = {}
+        # Retrieval descriptions retained after actual context admission. They
+        # are restart inputs; the live admission kind is never serialized.
+        self._admitted_source_candidates: dict[str, tuple[Any, str]] = {}
         self._event_deliveries: dict[str, tuple[MemoryEvent, str]] = {}
         self._pending_solution: dict[str, Any] | None = None
         self._reduction_bindings: dict[str, tuple[Any, str, str]] = {}
@@ -769,7 +794,9 @@ class MathematicalMemoryService:
             raise ValueError("local admitted context source version changed")
         return binding[2]
 
-    def _application_source_ids(self, candidate_id: str) -> tuple[str, ...] | None:
+    def _application_source_ids(
+        self, candidate_id: str, *, unused_helpers: frozenset[int] = frozenset(),
+    ) -> tuple[str, ...] | None:
         """Bound every admitted record to its owner; omitted support denies use."""
         from .profiles import digest
 
@@ -798,6 +825,8 @@ class MathematicalMemoryService:
             return None
         identities.extend(sorted(self._memory_import_owners))
         for helper in records:
+            if id(helper) in unused_helpers:
+                continue
             try:
                 local_owner = self._local_context_source_id(helper)
                 controller_owner = (
@@ -934,6 +963,18 @@ class MathematicalMemoryService:
     def application_eligible(
         self, candidate_id: str, *, budget: MemoryBudget | None = None
     ) -> bool:
+        attestor = getattr(self, "_imported_source_attestor", None)
+        receipt = attestor.receipt(candidate_id) if attestor is not None else None
+        if attestor is not None and attestor.requires_receipt(candidate_id) and receipt is None:
+            return False
+        if receipt is not None and not attestor.valid(receipt, budget):
+            return False
+        return self.preparation_eligible(candidate_id, budget=budget)
+
+    def preparation_eligible(
+        self, candidate_id: str, *, budget: MemoryBudget | None = None
+    ) -> bool:
+        """Check source permission before obtaining fresh application authority."""
         if not self.candidate_eligible(candidate_id, budget=budget):
             return False
         identities = self._application_source_ids(candidate_id)
@@ -1000,21 +1041,40 @@ class MathematicalMemoryService:
         if cursor is not None and candidate_id not in cursor["visited"]:
             cursor["visited"].append(candidate_id)
 
+    def _goal_capture_runtime(self) -> tuple[Any, tuple[Any, ...]]:
+        from ensemble_prover.mini_recursive import _live_lean_capability_for_new_work
+
+        session = self.session()
+        statement, preamble, lemmas = self.context()
+        source = preamble + "\n" + "\n".join(lemmas) + "\n" + statement
+        live = _live_lean_capability_for_new_work(session.lean)
+        return live, (id(live), self.context_id(), source)
+
+    def _reusable_goal_capture(self, key: tuple[Any, ...]) -> Any:
+        cached = getattr(self, "_captured_goal_snapshot", None)
+        if cached is not None and cached[0] == key and cached[1]():
+            return cached[2]
+        return None
+
+    def goal_capture_required_seconds(self) -> float:
+        """Price the same capture path that execution will actually require."""
+        _live, key = self._goal_capture_runtime()
+        if self._reusable_goal_capture(key) is not None:
+            return 0.0
+        return max(0.0, float(getattr(self, "_goal_capture_elapsed_s", 0.0)))
+
     async def capture_goal(self, budget: MemoryBudget) -> Any:
         from .profiles import capture_goal
-        from ensemble_prover.mini_recursive import _live_lean_capability_for_new_work
         from ensemble_prover.verified_helper_contract import helper_contract_context_guard
 
         self.check_budget(budget)
         session = self.session()
         statement, preamble, lemmas = self.context()
-        environment_id = self.context_id()
-        source = preamble + "\n" + "\n".join(lemmas) + "\n" + statement
-        live = _live_lean_capability_for_new_work(session.lean)
-        key = (id(live), environment_id, source)
-        cached = getattr(self, "_captured_goal_snapshot", None)
-        if cached is not None and cached[0] == key and cached[1]():
-            return cached[2]
+        live, key = self._goal_capture_runtime()
+        _live_id, environment_id, source = key
+        cached = self._reusable_goal_capture(key)
+        if cached is not None:
+            return cached
         estimate = float(getattr(self, "_goal_capture_elapsed_s", 0.0))
         if estimate > 0 and budget.remaining_s() < estimate:
             raise TimeoutError("remaining memory allocation cannot fund the observed goal capture")
@@ -1176,10 +1236,22 @@ class MathematicalMemoryService:
                     deadline_exhausted=lambda: budget.remaining_s() <= 0,
                 )
                 self.check_budget(budget)
-                if prepared is not None and session.apply_prepared_theory_bundles(
-                    prepared
-                ):
-                    return self.candidate_eligible(candidate, budget=budget)
+                if prepared is not None:
+                    _requested, _previous, selected, snapshot = prepared
+                    selected_ids = set(selected.lean.bundle_ids)
+                    attested_ids = {row.get("bundle_id") for row in snapshot if isinstance(row, dict)}
+                    if (not set(origin.required_bundle_ids).issubset(selected_ids)
+                            or not selected_ids.issubset(attested_ids)):
+                        continue
+                    # The return value describes a changed context, not failed
+                    # admission. A fresh library snapshot may attest the exact
+                    # bundles that were already installed before restart.
+                    session.apply_prepared_theory_bundles(prepared)
+                    if (session.theory_context_pair is selected
+                            and tuple(session.theory_snapshot) == tuple(snapshot)
+                            and tuple(session.theory_imported_bundle_ids) == tuple(selected.lean.bundle_ids)):
+                        self._admitted_source_candidates[candidate.candidate_id] = (candidate, "theory")
+                        return self.candidate_eligible(candidate, budget=budget)
             elif (
                 origin.helper_source
                 and origin.availability == "requires_helper_recheck"
@@ -1225,6 +1297,7 @@ class MathematicalMemoryService:
                         source_digest=digest(helper.source),
                     ):
                         return False
+                    self._admitted_source_candidates[candidate.candidate_id] = (candidate, "helper")
                     self.check_budget(budget)
                     if (
                         registry is not None
@@ -1293,6 +1366,7 @@ class MathematicalMemoryService:
                     )
                     # Imports expose siblings and transitive modules too.
                     self._memory_import_owners.add(candidate.candidate_id)
+                    self._admitted_source_candidates[candidate.candidate_id] = (candidate, "import")
                     session.dossier.record_lean_environment(
                         text_hash(preamble),
                         extends_environment_hash=previous,
@@ -1339,12 +1413,28 @@ class MathematicalMemoryService:
 
         session = self.session()
         if not self.candidate_eligible(candidate, budget=budget):
-            raise ValueError("candidate source is no longer eligible")
+            raise CandidateAdmissionRejected("candidate_source_ineligible")
         _, preamble, lemmas = self.context()
         origins = tuple(candidate.origins)
+        from .source_attestation import (
+            ImportedSourceAttestor, SourceAttestationRejected, source_location, _read,
+        )
+
+        try:
+            owner = getattr(self, "_imported_source_attestor", None)
+            location = source_location(session, candidate, previously_bound=(
+                owner is not None and owner.receipt(candidate.candidate_id) is not None
+            ))
+        except SourceAttestationRejected as exc:
+            raise CandidateAdmissionRejected("source_binding_unattested") from exc
         source = next(
             (origin.helper_source for origin in origins if origin.helper_source), ""
         )
+        if location is not None:
+            try:
+                source = _read(location.source_path, self.config.artifact_byte_cap, budget).decode("utf-8")
+            except (SourceAttestationRejected, UnicodeError) as exc:
+                raise CandidateAdmissionRejected("source_binding_unattested") from exc
         if not source:
             for origin in origins:
                 self.check_budget(budget)
@@ -1395,8 +1485,20 @@ class MathematicalMemoryService:
         if not self.candidate_eligible(
             candidate, source_digest=digest(source), budget=budget
         ):
-            raise ValueError("candidate source version is no longer eligible")
+            raise CandidateAdmissionRejected("source_version_ineligible")
         source_attested = source in lemmas
+        imported_receipt = None
+        if location is not None:
+            attestor = getattr(self, "_imported_source_attestor", None)
+            if attestor is None:
+                attestor = self._imported_source_attestor = ImportedSourceAttestor(self)
+            try:
+                imported_receipt = await attestor.attest(candidate, location, budget)
+            except SourceAttestationRejected as exc:
+                raise CandidateAdmissionRejected("source_binding_unattested") from exc
+            if digest(source) != imported_receipt.source_digest:
+                raise CandidateAdmissionRejected("source_authority_changed")
+            source_attested = True
         attested_bundle_ids: list[str] = []
         library = session.theory_library
         if not source_attested and library is not None:
@@ -1419,20 +1521,36 @@ class MathematicalMemoryService:
                     break
         profile = await profile_declaration(
             session.lean,
-            declaration_name=candidate.declaration_name,
+            declaration_name=(
+                "_root_." + candidate.declaration_name.removeprefix("_root_.")
+                if imported_receipt is not None else candidate.declaration_name
+            ),
             statement=candidate.type_text,
             source=source,
             environment_id=self.context_id(),
-            source_store_id=origins[0].source_id if origins else "",
+            source_store_id=(location.source_store_id if location is not None
+                             else origins[0].source_id if origins else ""),
             preamble=preamble + "\n" + "\n".join(lemmas),
             source_available=True,
             source_binding_attested=source_attested,
             budget=budget,
         )
+        if imported_receipt is not None and not attestor.valid(imported_receipt, budget):
+            raise CandidateAdmissionRejected("source_authority_changed")
+        if not profile.complete:
+            # The live profiler carries operational failures as incomplete
+            # profiles. They are not evidence against this candidate and must
+            # leave its continuation available after the service recovers.
+            if profile.diagnostic == "TimeoutError":
+                raise TimeoutError("memory declaration profiling timed out")
+            if profile.diagnostic == "OSError":
+                raise OSError("memory declaration profiling unavailable")
+            if profile.diagnostic == "profile_extraction_unavailable":
+                raise RuntimeError("memory declaration profile extraction unavailable")
         if not self.candidate_eligible(
             candidate, source_digest=profile.source_digest, budget=budget
         ):
-            raise ValueError("candidate source authority changed during profiling")
+            raise CandidateAdmissionRejected("source_authority_changed")
         if profile.complete:
             self.known_declarations[candidate.declaration_name] = profile
             self.known_candidate_ids[candidate.declaration_name] = (
@@ -1472,24 +1590,27 @@ class MathematicalMemoryService:
                 if not self.bind_context_source_owner(
                     helper, candidate.candidate_id, source_digest=profile.source_digest
                 ):
-                    raise ValueError(
-                        "admitted helper source binding is no longer eligible"
-                    )
+                    raise CandidateAdmissionRejected("helper_binding_ineligible")
         registry = self.provenance_registry
         registered = registry is not None and registry.has_source(
             candidate.candidate_id
         )
-        if (
-            not profile.complete
-            or (registered and not profile.certified_source_binding)
-            or not self.application_eligible(candidate.candidate_id, budget=budget)
-        ):
-            raise ValueError(
-                "application source/context attestation is incomplete or no longer eligible"
-            )
+        if not profile.complete:
+            raise CandidateAdmissionRejected("profile_incomplete")
+        if registered and not profile.certified_source_binding:
+            raise CandidateAdmissionRejected("source_binding_unattested")
+        if not self.application_eligible(candidate.candidate_id, budget=budget):
+            raise CandidateAdmissionRejected("application_context_ineligible")
         selected_recipe = recipe or OperationRecipe(
-            kind="apply", declaration_name=candidate.declaration_name
+            kind="apply", declaration_name=profile.declaration_name
         )
+        if imported_receipt is not None:
+            if selected_recipe.declaration_name.removeprefix("_root_.") != candidate.declaration_name.removeprefix("_root_."):
+                raise CandidateAdmissionRejected("source_binding_unattested")
+            selected_recipe = replace(
+                selected_recipe,
+                declaration_name="_root_." + candidate.declaration_name.removeprefix("_root_."),
+            )
         from .experience import ExperienceIndex
         from .applications import ApplicationObservation
 
@@ -1516,7 +1637,7 @@ class MathematicalMemoryService:
                 "probe_inconclusive",
                 reason="exact_retry_cooldown",
             )
-        return await prepare_and_probe(
+        observation = await prepare_and_probe(
             session.lean,
             goal,
             profile,
@@ -1527,6 +1648,9 @@ class MathematicalMemoryService:
             operation_id=operation_id,
             attempt_id=attempt_id,
         )
+        if imported_receipt is not None and not attestor.valid(imported_receipt, budget):
+            raise CandidateAdmissionRejected("source_authority_changed")
+        return observation
 
     def _attempt_identity(
         self,
@@ -1748,12 +1872,45 @@ class MathematicalMemoryService:
                                 )
                                 del queue[: -self.config.prepared_candidate_cap]
 
-    def finalization_eligible(self, candidate: Any) -> bool:
+    def finalization_eligible(self, candidate: Any, *, propagate_unavailable: bool = False,
+                              budget: MemoryBudget | None = None) -> bool:
         """Recheck the live policy at the ordinary root acceptance seam."""
         from ensemble_prover.root_finalization import sanitize_lean_artifact_text
+        from .catalog import MemoryUnavailable
 
         session = self.session()
         pending = self._pending_solution
+        unused_helpers: frozenset[int] = frozenset()
+
+        def require_source_readmission(identities: tuple[str, ...]) -> None:
+            if not identities or not self.has_pending_source_recovery():
+                return
+            inventory = self.source_recovery_inventory()
+            available = {source["candidate_id"] for source in inventory["source_candidates"]}
+            if (set(identities).issubset(available)
+                    and all(self.candidate_eligible(identity, budget=budget) for identity in identities)):
+                raise OSError("required checkpoint source context awaits fresh admission")
+
+        def application_eligible(identity: str) -> bool:
+            if unused_helpers:
+                attestor = getattr(self, "_imported_source_attestor", None)
+                receipt = attestor.receipt(identity) if attestor is not None else None
+                eligible = not (attestor is not None and attestor.requires_receipt(identity) and receipt is None)
+                if receipt is not None:
+                    eligible = eligible and attestor.valid(receipt, budget)
+                identities = self._application_source_ids(identity, unused_helpers=unused_helpers)
+                eligible = bool(eligible and self.candidate_eligible(identity, budget=budget)
+                                and identities is not None and sources_admitted(identities))
+            else:
+                eligible = (self.application_eligible(identity, budget=budget) if budget is not None
+                            else self.application_eligible(identity))
+            if not eligible:
+                require_source_readmission((identity,))
+            return eligible
+
+        def sources_admitted(identities: tuple[str, ...]) -> bool:
+            return (self._sources_admitted(identities, budget=budget) if budget is not None
+                    else self._sources_admitted(identities))
         try:
             if session is None:
                 return False
@@ -1780,6 +1937,9 @@ class MathematicalMemoryService:
                 if isinstance(usage, HelperUsageObservation) and usage.observed and usage.complete
                 else None
             )
+            unused_helpers = frozenset(id(helper) for helper in session.dossier.verified_helpers.values()
+                if _observation_proves_unused(helper.name, reachable, bindings,
+                                              source_hash=source_digest(helper.source)))
             # An unused exemption is only sound for the exact source the
             # observation requested under that printed name. Every obligation
             # keeps its own identity: a helper is matched against its own
@@ -1817,10 +1977,11 @@ class MathematicalMemoryService:
             # imports that exposed it. Complete proof-use inventories therefore
             # cannot discharge these whole-environment source obligations.
             # Replayed identities retain obligations, never live admission.
-            if not set(retired_imports).issubset(self._memory_import_owners) or any(
-                not self.application_eligible(identity)
-                for identity in self._memory_import_owners
-            ):
+            missing_imports = set(retired_imports) - self._memory_import_owners
+            if missing_imports:
+                require_source_readmission(tuple(missing_imports))
+                return False
+            if any(not application_eligible(identity) for identity in self._memory_import_owners):
                 return False
             for helper in session.dossier.verified_helpers.values():
                 name = canonical_lean_identifier(helper.name)
@@ -1846,9 +2007,12 @@ class MathematicalMemoryService:
                     or "mathematical_memory_owned_context" in helper.provenance_tags
                 )
                 if memory_owned and not owner:
+                    inventory = self.source_recovery_inventory()
+                    require_source_readmission(tuple(identity for identity, names in
+                        inventory["helper_names_by_source"].items() if helper.name in names))
                     return False
                 if owner:
-                    if not self.application_eligible(owner):
+                    if not application_eligible(owner):
                         return False
             for name, identity in support.items():
                 if _observation_proves_unused(
@@ -1858,7 +2022,7 @@ class MathematicalMemoryService:
                     source_hash=candidate_sources.get(identity),
                 ):
                     continue
-                if not self.application_eligible(identity):
+                if not application_eligible(identity):
                     return False
             # Replayed theory imports retain source obligations even when the
             # old service's in-process activation map is gone. Module/constant
@@ -1882,7 +2046,7 @@ class MathematicalMemoryService:
                     "B_" + identity in constant.split(".") for constant in reachable
                 ):
                     continue
-                if not self._sources_admitted((identity,)):
+                if not sources_admitted((identity,)):
                     return False
             live_identities = (
                 set(self.known_candidate_ids.values())
@@ -1903,9 +2067,12 @@ class MathematicalMemoryService:
                 # one needs fresh live admission; a replacement with the same
                 # printed name cannot authorize a different original owner.
                 identities = retired_identities.get(raw_name, ())
-                if raw_name in retired_unknown or not identities or not set(identities).issubset(live_identities):
+                if raw_name in retired_unknown or not identities:
                     return False
-                if any(not self.application_eligible(identity) for identity in identities):
+                if not set(identities).issubset(live_identities):
+                    require_source_readmission(tuple(identities))
+                    return False
+                if any(not application_eligible(identity) for identity in identities):
                     return False
             for node in getattr(
                 getattr(session, "proof_state", None), "nodes", {}
@@ -1941,7 +2108,7 @@ class MathematicalMemoryService:
                         binding is None
                         or binding[0] is not session.proof_state
                         or binding[2] != self.policy_id
-                        or not self.application_eligible(binding[1])
+                        or not application_eligible(binding[1])
                     ):
                         return False
             if candidate.source_action_id != "mathematical_memory":
@@ -1953,10 +2120,416 @@ class MathematicalMemoryService:
                 and pending.get("environment_id") == self.context_id()
                 and pending.get("policy_id") == self.policy_id
                 and tuple(candidate.replay_helpers) == lemmas
-                and self.application_eligible(str(pending.get("candidate_id", "")))
+                and application_eligible(str(pending.get("candidate_id", "")))
             )
-        except (OSError, ValueError, RuntimeError, sqlite3.Error):
+        except (MemoryUnavailable, sqlite3.DatabaseError) as exc:
+            if propagate_unavailable:
+                raise OSError("current memory source authority is unavailable") from exc
             return False
+        except OSError:
+            if propagate_unavailable:
+                raise
+            return False
+        except (ValueError, RuntimeError, sqlite3.Error):
+            return False
+
+    def source_recovery_inventory(self) -> dict[str, Any]:
+        """Retain source descriptions and alias obligations, never admission."""
+        session = self.session()
+        state = session.mathematical_memory_state
+        previous = state.get("source_recovery", {})
+        if not isinstance(previous, dict) or previous.get("policy_id") != self.policy_id:
+            previous = {}
+        previous_names = previous.get("helper_names_by_source", {})
+        previous_sources = previous.get("source_candidates", ())
+        if (not isinstance(previous_names, dict) or not isinstance(previous_sources, (list, tuple))
+                or any(not isinstance(identity, str) or not identity
+                       or not isinstance(names, (list, tuple))
+                       or any(not isinstance(name, str) or not name for name in names)
+                       for identity, names in previous_names.items())
+                or any(not isinstance(row, dict) or not isinstance(row.get("candidate_id"), str)
+                       or not isinstance(row.get("origins"), (list, tuple))
+                       or any(not isinstance(origin, dict)
+                              or not isinstance(origin.get("required_bundle_ids", ()), (list, tuple))
+                              or any(not isinstance(bundle, str) for bundle in origin.get("required_bundle_ids", ()))
+                              for origin in row["origins"])
+                       for row in previous_sources)):
+            raise ValueError("invalid checkpoint source recovery inventory")
+        required = set(self.known_candidate_ids.values()) | set(self._memory_support_names.values())
+        required.update(self._memory_import_owners)
+        required.update(state.get("retired_import_owners", ()))
+        for identities in _merge_retired_support_identities(state.get("retired_support_identities", {})).values():
+            required.update(identities)
+        names_by_source: dict[str, list[str]] = {}
+        for identity, names in previous_names.items():
+            live_names = [name for name in names if name in session.dossier.verified_helpers
+                          and (session.dossier.verified_helpers[name].phase.startswith("mathematical_memory")
+                               or "mathematical_memory_owned_context" in session.dossier.verified_helpers[name].provenance_tags)]
+            if live_names:
+                names_by_source[identity] = live_names
+        for helper in session.dossier.verified_helpers.values():
+            owner = self._local_context_source_id(helper)
+            if owner:
+                # A fresh admission replaces any inert prior ownership claim.
+                for names in names_by_source.values():
+                    if helper.name in names:
+                        names.remove(helper.name)
+                names_by_source.setdefault(owner, []).append(helper.name)
+        names_by_source = {owner: names for owner, names in names_by_source.items() if names}
+        required.update(names_by_source)
+        active_bundles = set(getattr(session, "theory_imported_bundle_ids", ()))
+        active_bundles.update(state.get("retired_bundle_obligations", ()))
+        records = {row["candidate_id"]: row for row in previous_sources}
+        sources = dict(self._admitted_source_candidates)
+        sources.update({receipt.candidate_id: (receipt.candidate, "import") for receipt in
+            getattr(getattr(self, "_imported_source_attestor", None), "_receipts", {}).values()})
+        for identity, (source, _kind) in sources.items():
+            records[identity] = source.to_record(include_helper_source=True)
+        records = {identity: row for identity, row in records.items() if identity in required or any(
+            active_bundles.intersection(origin.get("required_bundle_ids", ()))
+            for origin in row.get("origins", ()) if isinstance(origin, dict))}
+        return {"policy_id": self.policy_id, "source_candidates": list(records.values()),
+                "helper_names_by_source": names_by_source}
+
+    def has_pending_source_recovery(self) -> bool:
+        """A restored source description needs a fresh funded admission pass."""
+        state = self.session().mathematical_memory_state
+        record = state.get("source_recovery")
+        if (not isinstance(record, dict) or record.get("policy_id") != self.policy_id
+                or not record.get("source_candidates")):
+            return False
+        try:
+            inventory = self.source_recovery_inventory()
+        except ValueError:
+            return False
+        if record.get("rejected_inventory_id") == content_digest(inventory):
+            # A fixed descriptor mismatch stays rejected. A source whose live
+            # policy/integrity authority was denied can become eligible again
+            # without changing its original description or the catalog epoch.
+            denied = record.get("rejected_source_ids", ())
+            if (not isinstance(denied, (list, tuple))
+                    or not any(isinstance(identity, str) and self.candidate_eligible(identity)
+                               for identity in denied)):
+                return False
+        for source in inventory["source_candidates"]:
+            identity = source["candidate_id"]
+            names = inventory["helper_names_by_source"].get(identity, ())
+            if names:
+                if any(self._local_context_source_id(self.session().dossier.verified_helpers[name]) != identity
+                       for name in names):
+                    return True
+                continue
+            admission = self._admitted_source_candidates.get(identity)
+            if admission is not None and admission[1] == "theory":
+                continue
+            attestor = getattr(self, "_imported_source_attestor", None)
+            receipt = attestor.receipt(identity) if attestor is not None else None
+            try:
+                if receipt is not None and attestor.valid(receipt):
+                    continue
+            except OSError:
+                pass  # A funded recovery pass reports the operational outage.
+            return True
+        return False
+
+    def _root_unused_helper_ids(self, candidate: Any) -> frozenset[int]:
+        """Select source exemptions only from current exact kernel proof use."""
+        session = self.session()
+        from ensemble_prover.helper_utilization import HelperUsageObservation, source_digest
+        getter = getattr(session.lean, "helper_usage_observation", None)
+        statement, preamble, _helpers = self.context()
+        usage = getter(statement=candidate.target_statement or statement, proof=candidate.proof,
+                       preamble=preamble, lemmas=candidate.replay_helpers) if callable(getter) else None
+        from ensemble_prover.proof_dossier import canonical_lean_identifier
+        reachable = ({canonical_lean_identifier(name) for name in usage.reachable_constants}
+                     if isinstance(usage, HelperUsageObservation) and usage.observed and usage.complete else None)
+        bindings = _trusted_helper_resolution(usage)
+        return frozenset(id(helper) for helper in session.dossier.verified_helpers.values()
+            if _observation_proves_unused(helper.name, reachable, bindings, source_hash=source_digest(helper.source)))
+
+    async def recover_source_context(self, budget: MemoryBudget) -> None:
+        """Readmit checkpoint sources within the existing memory allocation."""
+        if not self.has_pending_source_recovery():
+            return
+        inventory = self.source_recovery_inventory()
+        pending_root = self.deferred_root_finalization()
+        unused_helpers = self._root_unused_helper_ids(pending_root) if pending_root is not None else frozenset()
+        rejected_sources: list[ValueError] = []
+        for source in inventory["source_candidates"]:
+            try:
+                await self._readmit_source_inventory({
+                    "source_candidates": [source],
+                    "helper_names_by_source": {source["candidate_id"]: inventory["helper_names_by_source"][source["candidate_id"]]}
+                    if source["candidate_id"] in inventory["helper_names_by_source"] else {},
+                }, budget, unused_helpers=unused_helpers)
+            except ValueError as exc:
+                # Source-local rejection must not strand a sibling admission.
+                # Operational outages still propagate with prior work retained.
+                rejected_sources.append(exc)
+        if rejected_sources:
+            denied = [source["candidate_id"] for source in inventory["source_candidates"]
+                      if not self.candidate_eligible(source["candidate_id"], budget=budget)]
+            rejected = self.session().mathematical_memory_state["source_recovery"]
+            rejected.update(rejected_inventory_id=content_digest(inventory), rejected_source_ids=denied)
+            candidate = self.deferred_root_finalization()
+            if candidate is not None:
+                checked_source = replace(candidate, source_action_id="mathematical_memory_root_recheck")
+                if self.finalization_eligible(checked_source, propagate_unavailable=True, budget=budget):
+                    return
+                self.clear_deferred_root_finalization()
+            raise rejected_sources[0]
+
+    def defer_root_finalization(self, candidate: Any) -> None:
+        """Retain one exact proof as inert work for a fresh ordinary check."""
+        from dataclasses import asdict
+        import json
+
+        session = self.session()
+        if session is None:
+            return
+        record = asdict(candidate)
+        record.pop("verification_certificate", None)
+        record.pop("metadata", None)
+        from ensemble_prover.reasoning_notebook import archive_reasoning
+        archive_reasoning(session.conv, [{"role": "assistant", "content":
+            "Proof candidate awaiting current source authority and a fresh Lean check:\n"
+            + json.dumps(record, ensure_ascii=False, sort_keys=True)}])
+        inventory = self.source_recovery_inventory()
+        session.mathematical_memory_state["deferred_root_finalization"] = {
+            "candidate": record, "environment_id": self.context_id(),
+            **inventory,
+        }
+
+    def clear_deferred_root_finalization(self) -> None:
+        session = self.session()
+        if session is not None:
+            session.mathematical_memory_state.pop("deferred_root_finalization", None)
+
+    def deferred_root_finalization(self) -> Any:
+        from ensemble_prover.root_finalization import RootFinalizationCandidate
+
+        session = self.session()
+        record = session.mathematical_memory_state.get("deferred_root_finalization") if session else None
+        if not isinstance(record, dict):
+            return None
+        payload = record.get("candidate")
+        if (record.get("environment_id") != self.context_id()
+                or record.get("policy_id") != self.policy_id or not isinstance(payload, dict)):
+            self.clear_deferred_root_finalization()
+            return None
+        try:
+            # Serialized certificates and side-effect metadata never survive
+            # this boundary. Even an in-process retry requires fresh checking.
+            candidate = RootFinalizationCandidate(**{
+                key: value for key, value in payload.items()
+                if key not in {"verification_certificate", "metadata"}
+            })
+            sequences = (candidate.replay_helpers, candidate.helper_names,
+                         candidate.dependency_node_ids, candidate.dependency_helper_names)
+            if (not isinstance(candidate.proof, str) or not candidate.proof.strip()
+                    or candidate.target_statement != self.context()[0]
+                    or any(not isinstance(items, (tuple, list))
+                           or any(not isinstance(item, str) for item in items) for items in sequences)):
+                raise ValueError("invalid deferred proof")
+            return candidate
+        except (TypeError, ValueError):
+            self.clear_deferred_root_finalization()
+            return None
+
+    def has_deferred_root_finalization(self) -> bool:
+        return self.deferred_root_finalization() is not None
+
+    async def _readmit_deferred_helper(
+        self, candidate: Any, budget: MemoryBudget, *, helper_name: str | None = None,
+    ) -> bool:
+        """Recheck an exact existing helper without replacing its replay frame."""
+        from .profiles import digest
+        from .source_attestation import SourceAttestationRejected
+        from ensemble_prover.proof_state_executor import _await_serialized_lean_operation
+        from ensemble_prover.proof_dossier import helper_decl_name
+        from ensemble_prover.utils import rename_lean_identifier
+        from ensemble_prover.verified_helper_contract import helper_contract_context_guard
+
+        session = self.session()
+        helper = session.dossier.verified_helpers.get(helper_name or candidate.declaration_name)
+        if helper is None:
+            return False
+        original_source = next((origin.helper_source for origin in candidate.origins
+            if origin.helper_source and helper_decl_name(origin.helper_source) == candidate.declaration_name
+            and rename_lean_identifier(origin.helper_source, candidate.declaration_name, helper.name).strip()
+                == helper.source), None)
+        if original_source is None:
+            return False
+        # Candidate policy covers the retrieved source before collision renaming;
+        # the local binding covers the exact admitted helper after that rename.
+        original_hash = digest(original_source)
+        source_hash = digest(helper.source)
+        if not self.candidate_eligible(candidate, source_digest=original_hash, budget=budget):
+            raise SourceAttestationRejected("deferred helper source is no longer eligible")
+        if self._local_context_source_id(helper) == candidate.candidate_id:
+            return True
+        _statement, preamble, helpers = self.context()
+        if helper.source not in helpers:
+            return False
+        context_id = self.context_id()
+        runner = session.lean
+        runtime_current = helper_contract_context_guard(runner)
+        # Replay exactly the original ordered prefix. Normal replacement
+        # admission would move this helper after later declarations and change
+        # the retained root's context even when every source is unchanged.
+        prefix = list(helpers[:helpers.index(helper.source) + 1])
+        result = await _await_serialized_lean_operation(
+            runner,
+            lambda: runner.check(
+                candidate.type_text, "by exact @" + helper.name, prefix,
+                preamble_override=preamble, timeout_s=budget.remaining_s(),
+                max_heartbeats=budget.max_heartbeats,
+            ),
+            timeout_s=budget.remaining_s() * 0.95, deadline_monotonic=budget.deadline_monotonic,
+        )
+        self.check_budget(budget)
+        if (session.lean is not runner or not runtime_current() or self.context_id() != context_id
+                or session.dossier.verified_helpers.get(helper.name) is not helper
+                or digest(helper.source) != source_hash):
+            raise OSError("deferred helper context changed during recheck")
+        if not result.ok or result.axiom_audit_ok is not True:
+            raise OSError("deferred helper readmission did not complete")
+        if not self.candidate_eligible(candidate, source_digest=original_hash, budget=budget):
+            raise SourceAttestationRejected("deferred helper source is no longer eligible")
+        if not self.bind_context_source_owner(helper, candidate.candidate_id, source_digest=source_hash):
+            raise OSError("deferred helper context binding is unavailable")
+        self._admitted_source_candidates[candidate.candidate_id] = (candidate, "helper")
+        return True
+
+    async def _readmit_source_inventory(
+        self, record: dict[str, Any], budget: MemoryBudget, *, unused_helpers: frozenset[int] = frozenset(),
+    ) -> None:
+        session = self.session()
+        from ensemble_prover.mathematical_retrieval.model import RetrievalCandidate
+        from .source_attestation import ImportedSourceAttestor, SourceAttestationRejected, source_location
+        retired_support = _merge_retired_support_identities(
+            session.mathematical_memory_state.get("retired_support_identities", {}),
+        )
+        independent_owners = self._memory_import_owners | set(
+            session.mathematical_memory_state.get("retired_import_owners", ()),
+        )
+        independent_owners.update(
+            identity for identities in retired_support.values() for identity in identities
+        )
+
+        def restore_support_name(source: Any) -> None:
+            # A freshly readmitted helper keeps helper ownership. Only names
+            # that actually carried profile/import obligations before restart
+            # re-enter this independent support map.
+            if source.candidate_id in retired_support.get(source.declaration_name, ()):
+                self.known_candidate_ids[source.declaration_name] = source.candidate_id
+
+        source_records = record.get("source_candidates", ())
+        helper_names_by_source = record.get("helper_names_by_source", {})
+        if (not isinstance(source_records, (tuple, list)) or not isinstance(helper_names_by_source, dict)
+                or any(not isinstance(identity, str) or not identity
+                       or not isinstance(names, (tuple, list)) or not names
+                       or any(not isinstance(name, str) or not name for name in names)
+                       for identity, names in helper_names_by_source.items())):
+            raise ValueError("invalid deferred source inventory")
+        for source_record in source_records:
+            self.check_budget(budget)
+            try:
+                if not isinstance(source_record, dict):
+                    raise ValueError("invalid deferred source candidate")
+                source_candidate = RetrievalCandidate.from_record(source_record)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise ValueError("invalid deferred source candidate") from exc
+            name = source_candidate.declaration_name
+            aliases = helper_names_by_source.get(source_candidate.candidate_id, ())
+            if (aliases and source_candidate.candidate_id not in independent_owners
+                    and all(id(session.dossier.verified_helpers.get(alias)) in unused_helpers for alias in aliases)):
+                continue
+            attestor = getattr(self, "_imported_source_attestor", None)
+            receipt = attestor.receipt(source_candidate.candidate_id) if attestor else None
+            if (self.known_candidate_ids.get(name) == source_candidate.candidate_id
+                    and receipt is not None and attestor.valid(receipt, budget)):
+                continue
+            if not self.candidate_eligible(source_candidate, budget=budget):
+                raise SourceAttestationRejected("deferred source is no longer eligible")
+            helper_names = helper_names_by_source.get(source_candidate.candidate_id)
+            if helper_names:
+                for helper_name in helper_names:
+                    self.check_budget(budget)
+                    if not await self._readmit_deferred_helper(source_candidate, budget, helper_name=helper_name):
+                        raise SourceAttestationRejected("deferred helper no longer matches its original source")
+                restore_support_name(source_candidate)
+                continue
+            if await self._readmit_deferred_helper(source_candidate, budget):
+                restore_support_name(source_candidate)
+                continue
+            if not await self.activate_candidate(source_candidate, budget):
+                raise OSError("deferred proof source readmission is unavailable")
+            location = source_location(session, source_candidate, previously_bound=True)
+            if location is None:
+                # A helper or theory source follows its original checked
+                # admission path. An already-imported shortcut or replayed
+                # descriptor cannot recreate this process-owned binding.
+                admission = self._admitted_source_candidates.get(source_candidate.candidate_id)
+                if admission is None or admission[1] not in {"helper", "theory"}:
+                    raise SourceAttestationRejected("deferred source adapter is unavailable")
+            else:
+                if attestor is None:
+                    attestor = self._imported_source_attestor = ImportedSourceAttestor(self)
+                receipt = await attestor.attest(source_candidate, location, budget)
+                if not self.candidate_eligible(
+                    source_candidate, source_digest=receipt.source_digest, budget=budget,
+                ):
+                    raise SourceAttestationRejected("deferred source is no longer eligible")
+            restore_support_name(source_candidate)
+
+    async def recheck_deferred_root_finalization(self, budget: MemoryBudget) -> Any:
+        """Spend the existing allocation on a new check, never a stored receipt."""
+        from dataclasses import replace
+        from ensemble_prover.proof_state_executor import _await_serialized_lean_operation
+        from ensemble_prover.root_finalization import root_verification_certificate
+
+        candidate = self.deferred_root_finalization()
+        session = self.session()
+        if candidate is None or session is None:
+            return None
+        record = session.mathematical_memory_state["deferred_root_finalization"]
+        # This action owns a new complete proof check. Its authority is not the
+        # prior memory application observation, which may already be consumed.
+        candidate = replace(candidate, source_action_id="mathematical_memory_root_recheck")
+        unused_helpers = self._root_unused_helper_ids(candidate)
+        try:
+            await self._readmit_source_inventory(record, budget, unused_helpers=unused_helpers)
+        except ValueError:
+            self.clear_deferred_root_finalization()
+            raise
+        if self.deferred_root_finalization() is None:
+            return None
+        if not self.finalization_eligible(candidate, propagate_unavailable=True, budget=budget):
+            # Restored source obligations need ordinary readmission before any
+            # retained proof can be retried. Keep its text without authority.
+            return None
+        _, preamble, _ = self.context()
+        checked = await _await_serialized_lean_operation(
+            session.lean,
+            lambda: session.lean.check(
+                candidate.target_statement, candidate.proof, list(candidate.replay_helpers),
+                preamble_override=preamble, timeout_s=budget.remaining_s(),
+                max_heartbeats=budget.max_heartbeats,
+            ),
+            timeout_s=budget.remaining_s() * 0.95,
+            deadline_monotonic=budget.deadline_monotonic,
+        )
+        budget.check_cancelled()
+        if not checked.ok or checked.axiom_audit_ok is not True:
+            return None
+        if not self.finalization_eligible(candidate, propagate_unavailable=True, budget=budget):
+            return None
+        return replace(candidate, verification_certificate=root_verification_certificate(
+            proof=candidate.proof, accepted=True, target_statement=candidate.target_statement,
+            replay_helpers=candidate.replay_helpers, helper_names=candidate.helper_names,
+            output=checked.output, phase=candidate.phase, source=candidate.source_action_id,
+        ))
 
     def remember_solution(self, pending: Mapping[str, Any]) -> None:
         self._pending_solution = dict(pending)
@@ -3134,6 +3707,20 @@ def snapshot_memory_source_obligations(
         retired_imports = ()
     imports = set(retired_imports) | service._memory_import_owners
     state["retired_import_owners"] = sorted(imports)
+    try:
+        recovery = service.source_recovery_inventory()
+    except ValueError:
+        # Malformed recovery data grants no authority and cannot prevent the
+        # rest of an otherwise valid session from being checkpointed.
+        recovery = {"policy_id": service.policy_id, "source_candidates": [], "helper_names_by_source": {}}
+    previous_recovery = state.get("source_recovery", {})
+    if (isinstance(previous_recovery, dict)
+            and previous_recovery.get("rejected_inventory_id") == content_digest(recovery)):
+        recovery["rejected_inventory_id"] = content_digest(recovery)
+        denied = previous_recovery.get("rejected_source_ids", ())
+        if isinstance(denied, (list, tuple)) and all(isinstance(identity, str) for identity in denied):
+            recovery["rejected_source_ids"] = list(denied)
+    state["source_recovery"] = recovery
     return state
 
 

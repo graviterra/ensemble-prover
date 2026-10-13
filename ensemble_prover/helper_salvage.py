@@ -1386,16 +1386,25 @@ def order_helpers_for_incremental_validation(
             name_to_indices[name] = []
         name_to_indices[name].append(index)
 
+    # Sources and the complete candidate-name universe are frozen for this
+    # call. Closure expansion and ordering change only which indices are ready;
+    # rescanning a blocked declaration cannot reveal different dependencies.
+    dependencies_by_index: Dict[int, Set[str]] = {}
+
+    def dependencies_for(index: int) -> Set[str]:
+        if index not in dependencies_by_index:
+            dependencies_by_index[index] = _helper_referenced_names(
+                helper_list[index],
+                names_in_order,
+                skip=helper_decl_name(helper_list[index]),
+            )
+        return dependencies_by_index[index]
+
     changed = True
     while changed:
         changed = False
         for index in list(selected_indices):
-            name = helper_decl_name(helper_list[index])
-            deps = _helper_referenced_names(
-                helper_list[index],
-                names_in_order,
-                skip=name,
-            )
+            deps = dependencies_for(index)
             for dep in deps:
                 provider_indices = name_to_indices.get(dep, [])
                 dep_index = next(
@@ -1417,12 +1426,7 @@ def order_helpers_for_incremental_validation(
     while pending:
         progressed = False
         for index in list(pending):
-            name = helper_decl_name(helper_list[index])
-            deps = _helper_referenced_names(
-                helper_list[index],
-                names_in_order,
-                skip=name,
-            )
+            deps = dependencies_for(index)
             missing_provider = False
             for dep in deps:
                 provider_indices = [

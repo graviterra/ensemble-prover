@@ -451,12 +451,10 @@ class ProofBridge:
                     directory / "modules",
                     clients["prover"],
                     clients["refiner"],
+                    service_quantum_s=min(remaining, config["proof_quantum_s"]),
                     options={
                         **self.mini_options,
                         "lean_timeout_s": config["lean_timeout_s"],
-                        "run_wall_clock_budget_s": min(
-                            remaining, config["proof_quantum_s"]
-                        ),
                     },
                 )
                 cleanup.push_async_callback(prover.close)

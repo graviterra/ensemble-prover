@@ -33,6 +33,7 @@ An acknowledgement is not evidence of comprehension. Use inspection_status:"inco
 to continue reading within the existing allocation, or "claimed_complete" when ready.
 Conclude with:
 {"action":"research_reorientation","subject_id":"assigned subject_id","rationale":"what failed and why",
+ "substantive_progress":false,
  "next_question":"specific next mathematical task",
  "first_uncertain_inference":"exact bottleneck",
  "discriminating_check":"calculation, derivation, or source check to execute",
@@ -52,7 +53,10 @@ new conclusion","new_inference":"what the argument adds to the baseline and
 earlier reports","kind":"derivation|formalization|source_verification|obstruction",
 "assumptions":[],"baseline_artifact_ids":[],"prior_report_artifact_ids":[]}.
 Inspect the cumulative_research_comparison packet and explicitly compare every
-listed baseline and prior report. Omit progress credit when novelty is uncertain.
+listed baseline and prior report. Use substantive_progress:false when novelty is
+uncertain; this records no established progress, not failure or futility. A
+concrete reviewed successor may continue under campaign authorization without
+earning progress credit.
 Use inspected source content, precise quantifiers and useful prior work. Do not
 request another generic summary or repeat a prior assignment under a new name.
 """
@@ -314,7 +318,7 @@ class ResearchControl:
                             "baseline_artifact_ids": result["cumulative_research_comparison"]["baseline_artifact_ids"],
                             "prior_report_artifact_ids": result["cumulative_research_comparison"]["prior_report_artifact_ids"],
                         },
-                        "instruction": "Independently inspect this completed report for substantive NEW evidence advancing its exact assigned inference. You may add substantive_progress:true to research_reorientation only for an actual new derivation, check or useful source application; repeated facts, plans and revised wording do not qualify. Missing/false means no progress credit. This assessment conveys research relevance, never proof authority.",
+                        "instruction": "Independently inspect this completed report for substantive NEW evidence advancing its exact assigned inference. Set substantive_progress:true only for an actual new derivation, check or useful source application and provide progress_delta; repeated facts, plans and revised wording do not qualify. Otherwise set substantive_progress:false to record that value remains uncertain. Missing metadata is unknown, not mathematical failure. A concrete reviewed successor may continue within campaign authorization without progress credit. This assessment conveys research relevance, never proof authority.",
                     }
         if job.get("research_reorientation_for"):
             from .research_subject import subject_view
@@ -874,13 +878,23 @@ class ResearchControl:
         from .frontier.hooks import mode_of
 
         progress_assessment = None
-        if mode_of(self.controller.snapshot()) == "adaptive" and action.get("substantive_progress", False):
-            from .frontier.owner import FrontierOwner
+        if mode_of(self.controller.snapshot()) == "adaptive":
+            if action.get("substantive_progress", False):
+                from .frontier.owner import FrontierOwner
 
-            progress_assessment = FrontierOwner(self.controller).assess_report_progress(
-                job, substantive=action["substantive_progress"], rationale=action["rationale"],
-                delta=action.get("progress_delta"),
-            )
+                progress_assessment = FrontierOwner(self.controller).assess_report_progress(
+                    job, substantive=action["substantive_progress"], rationale=action["rationale"],
+                    delta=action.get("progress_delta"),
+                )
+            else:
+                progress_assessment = {
+                    "status": "unknown", "credit_minted": False,
+                    "reason": "assessment_metadata_missing" if "substantive_progress" not in action
+                              else "no_progress_established",
+                    "instruction": "Include substantive_progress in future reviews. Unknown early value does not establish futility; keep the next investigation explicit within existing campaign authorization.",
+                }
+            job["research_progress_assessment"] = progress_assessment
+            directive["progress_assessment"] = progress_assessment
         directive["decision"] = "investigate"
         job["status"] = "finished"
         job.setdefault("research_control", {})["closed"] = True

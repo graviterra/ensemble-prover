@@ -42,6 +42,9 @@ RUNTIME_CAPABILITY_FIELD_NAMES = frozenset(
         "_recursive_lane_authority",
         "_recursive_conversation_lane_ledger",
         "_recursive_paid_no_artifact_observer",
+        # The live coordinator owns the research database and provider loop.
+        # Its ledger is durable independently; restore reattaches a fresh owner.
+        "_native_local_proof_owner",
         # Recursive actions receive a functools.partial bound to the live
         # parent MiniSession.  It is dispatch authority, not action-owned
         # mutable state.  Deep-copying it recursively clones the entire

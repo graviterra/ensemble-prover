@@ -97,6 +97,12 @@ Return exactly one JSON action per response, with no additional fields:
   Use actual Lean failure feedback to repair arguments or pursue another route.
   Reviewed written proofs/counterexamples automatically enter formalization when
   closed_loop is enabled. A reviewer vote alone is never kernel verification.
+{"action":"request_local_proof","lean_statement":"closed Lean proposition with every variable and hypothesis explicit","contract":{"statement":"mathematical intent","domain":"objects and scope","hypotheses":[],"quantifiers":[]},"proof_plan":"proposed local argument or useful exploratory lemma"}
+  Native mode only. Requests a local lemma under the dispatched formal context;
+  its eventual relevance may be unknown. The existing Mini graph proof scheduler
+  checks the exact Lean statement under its existing allocation and returns the
+  result to this job. Waits without provider calls; does not establish the root,
+  alter assumptions, or certify the informal contract. Experiments stay evidence.
 {"action":"request_review","evidence_id":"id","question":"what changed / what to reconsider",
  "supersedes_review_ids":["explicit active review IDs to reconsider"]}
   Requests a fresh review of existing evidence, including dismissal of a filled
@@ -139,6 +145,7 @@ _FIELDS = {
     "propose_diagnostic": {"scope", "contract", "queries", "expected_outcomes"},
     "record_scoped_obstruction": {"contract", "reason", "evidence_artifact_ids"},
     "formalize": {"proof_plan"},
+    "request_local_proof": {"lean_statement", "contract", "proof_plan"},
     "continue_formalization": {"program_id"},
     "finish": {"reason"},
     "wait": {"reason"},
@@ -510,7 +517,7 @@ class DiscoveryLoop:
                 "experiments_enabled": run["experiments"],
                 "closed_loop_enabled": run["closed_loop"] is not None and not self.native_mode,
                 **({"native_proof_owner": {
-                    "policy": "The original Mini session owns proof acceptance. Submit complete plans with formalize to return candidate guidance to it. Investigation reports, gaps and reviews provide context but do not reopen root planning. Research and review never establish the root theorem or change its assumptions.",
+                    "policy": "The original Mini session owns proof acceptance. Submit complete plans with formalize, or request_local_proof for an exact exploratory lemma whose relevance may be uncertain. Local results return to the requesting job. Reports, gaps and reviews remain context. Research never establishes the root theorem or changes its assumptions.",
                     "kernel_verified": False,
                 }} if self.native_mode else {}),
                 "requests_remaining": run["max_requests"] - run["requests_used"],
@@ -1584,6 +1591,11 @@ class DiscoveryLoop:
             if not self.native_mode:
                 raise ValueError("proof diagnostic proposals require the native proof owner")
             return diagnostic_proposal(self.store, job, action)
+        if kind == "request_local_proof":
+            if not self.native_mode:
+                raise ValueError("local proof requests require the native proof owner")
+            from .native_local_proofs import request_local_proof
+            return request_local_proof(self.store, job, action)
         if kind == "record_scoped_obstruction":
             from .research_contracts import scoped_obstruction
             return scoped_obstruction(self.store, job, action)
