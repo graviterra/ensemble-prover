@@ -13488,11 +13488,14 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--reasoning-effort",
+        type=str.lower,
         choices=list(_REASONING_EFFORT_CHOICES),
         default=None,
         help=(
             "Optional provider reasoning effort override. 'none' is an explicit "
-            "off request for providers with an off switch; failed calls may not "
+            "off request; 'max' requests maximum effort on the selected model "
+            "without selecting a Pro model or changing output limits. An "
+            "off switch is provider-dependent. Failed calls may not "
             "return usage, so use run_config plus successful llm_usage records "
             "to audit effective behavior."
         ),
@@ -13505,6 +13508,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--prover-reasoning-effort",
+        type=str.lower,
         choices=list(_REASONING_EFFORT_CHOICES),
         default=None,
         help="Override --reasoning-effort for the prover role.",
@@ -13517,6 +13521,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--refiner-reasoning-effort",
+        type=str.lower,
         choices=list(_REASONING_EFFORT_CHOICES),
         default=None,
         help="Override --reasoning-effort for the refiner role.",

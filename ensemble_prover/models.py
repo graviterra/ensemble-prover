@@ -1353,7 +1353,7 @@ def _resolved_reasoning_effort(
 
     configured = getattr(cfg, "reasoning_effort", None)
     if str(configured or "").strip().lower() == "none":
-        return str(configured).strip()
+        return "none"
     # DeepSeek V4 defaults to thinking. ``thinking_enabled=False`` is only an
     # off switch when the operator explicitly required that control; treating
     # the dataclass default as an opt-out disabled independent planner clients.
@@ -1367,8 +1367,8 @@ def _resolved_reasoning_effort(
     ):
         return "none"
     if reasoning_effort_override is not None:
-        return reasoning_effort_override
-    return configured
+        return str(reasoning_effort_override).strip().lower()
+    return str(configured).strip().lower() if configured is not None else None
 
 
 def _append_reasoning_chunk(parts: List[str], value: str) -> None:
@@ -1990,6 +1990,31 @@ def _transport_retry_window_admissible(
         float(configured_request_window_s) * _TRANSPORT_RETRY_MIN_WINDOW_FRACTION
     )
     return float(retry_window_after_backoff_s) >= required_window_s
+
+
+def _requires_tool_reasoning_control(
+    cfg: RoleConfig,
+    payload: Mapping[str, Any],
+    reasoning_effort_override: Optional[str] = None,
+) -> bool:
+    """Protect Max intent while retaining optional lower-effort tool recovery."""
+    receipt = current_mini_request_envelope_receipt()
+    reasoning = payload.get("reasoning")
+    effort = (
+        reasoning.get("effort")
+        if isinstance(reasoning, Mapping)
+        else payload.get("reasoning_effort")
+    )
+    return bool(
+        getattr(cfg, "reasoning_control_required", False)
+        or str(reasoning_effort_override or "").strip().lower() == "max"
+        or str(getattr(cfg, "reasoning_effort", "")).strip().lower() == "max"
+        or str(effort or "").strip().lower() == "max"
+        or (
+            isinstance(receipt, MiniRequestEnvelopeReceipt)
+            and receipt.reasoning_transport_mode == "max_effort"
+        )
+    )
 
 
 def _prompt_budget_for_cfg(
@@ -4177,6 +4202,23 @@ class OpenAICompatClient:
         self.last_reasoning_control_requested = normalized
         self.last_reasoning_control_required = bool(reasoning_control_required)
         if base_url_matches_provider(self.base_url, "openrouter"):
+            if normalized == "max":
+                from .provider_tool_protocol import openrouter_max_reasoning_effort
+
+                capability = lookup_openrouter_reasoning_capabilities(
+                    self.base_url, self.cfg.model,
+                )
+                selected = openrouter_max_reasoning_effort(self.cfg.model, capability)
+                control = {"effort": selected}
+                payload["reasoning"] = control
+                self.last_reasoning_control_sent = dict(control)
+                self.last_reasoning_capability_record = (
+                    capability.to_record() if capability is not None else {}
+                )
+                self.last_reasoning_control_decision = (
+                    "max_effort_exact" if selected == "max" else "max_effort_provider_alias"
+                )
+                return
             if _deepseek_v4_model(
                 getattr(self.cfg, "model", ""), base_url=self.base_url
             ):
@@ -4630,7 +4672,7 @@ class OpenAICompatClient:
             or str(getattr(self.cfg, "reasoning_effort", "") or "")
             .strip()
             .lower()
-            == "none"
+            in {"none", "max"}
         )
         self.last_reasoning_capability_record = {}
         if api_default_temperature:
@@ -4682,15 +4724,12 @@ class OpenAICompatClient:
                 and str(payload.get("reasoning_effort") or "").strip().lower()
                 != "none"
             ):
-                if bool(
-                    getattr(self.cfg, "reasoning_control_required", False)
+                if _requires_tool_reasoning_control(
+                    self.cfg, payload, reasoning_effort_override
                 ):
-                    # an explicitly REQUIRED
-                    # reasoning level must never be silently reinterpreted as
-                    # 'none'. Internal tool-phase effort requests downgrade
-                    # below; a configuration-level requirement fails closed
-                    # before dispatch so the operator sees a setup error, not
-                    # a quietly weaker model.
+                    # Honor configuration, per-call overrides, and frozen
+                    # request controls. A learned transport constraint cannot
+                    # silently replace a required effort with reasoning-off.
                     raise ProviderCapabilityError(
                         "model family requires reasoning_effort='none' with "
                         "function tools on chat completions, but the "
@@ -4772,12 +4811,17 @@ class OpenAICompatClient:
         operation_timeout_override_s: Optional[float] = None,
         late_usage_callback: Optional[Any] = None,
         reasoning_control_required_override: bool = False,
+        reasoning_effort_override: Optional[str] = None,
     ) -> httpx.Response:
         """POST with fallback for unsupported params (tokens/stop)."""
         current = dict(payload)
         reasoning_control_required = bool(
             reasoning_control_required_override
             or getattr(self.cfg, "reasoning_control_required", False)
+        )
+        # Freeze task-local intent before any awaits; client telemetry is shared.
+        tool_reasoning_control_required = _requires_tool_reasoning_control(
+            self.cfg, payload, reasoning_effort_override
         )
         cached_token_limit_swap = ""
         if (
@@ -5013,9 +5057,7 @@ class OpenAICompatClient:
                         # Changing the effort here loses the requested ability
                         # and some models do not support 'none' at all.
                         raise
-                    if bool(
-                        getattr(self.cfg, "reasoning_control_required", False)
-                    ):
+                    if tool_reasoning_control_required:
                         # never silently downgrade
                         # an explicitly required reasoning level to 'none'.
                         # CACHE the discovered constraint first, so the next
@@ -5973,6 +6015,9 @@ class OpenAICompatClient:
                 payload,
                 temperature_override=temperature_override,
             )
+            # Keep this request's policy across awaits and JSON-format retries.
+            # Other requests can update the client's shared telemetry meanwhile.
+            request_reasoning_control_required = self.last_reasoning_control_required
             try:
                 resp = await self._post_with_token_fallback(
                     url,
@@ -5983,8 +6028,9 @@ class OpenAICompatClient:
                     operation_timeout_override_s=operation_timeout_override_s,
                     late_usage_callback=usage_callback,
                     reasoning_control_required_override=(
-                        self.last_reasoning_control_required
+                        request_reasoning_control_required
                     ),
+                    reasoning_effort_override=reasoning_effort_override,
                 )
                 if requested_tools and effective_tools:
                     self.last_tool_request_effective = (
@@ -6015,8 +6061,9 @@ class OpenAICompatClient:
                             operation_timeout_override_s=operation_timeout_override_s,
                             late_usage_callback=usage_callback,
                             reasoning_control_required_override=(
-                                self.last_reasoning_control_required
+                                request_reasoning_control_required
                             ),
+                            reasoning_effort_override=reasoning_effort_override,
                         )
                         self._record_reasoning_disable_success(payload)
                         return resp
@@ -6211,7 +6258,7 @@ class OpenAICompatClient:
             or str(getattr(self.cfg, "reasoning_effort", "") or "")
             .strip()
             .lower()
-            == "none"
+            in {"none", "max"}
         )
         if _openai_responses_with_reasoning(
             self.base_url, effective_reasoning_effort
@@ -6462,7 +6509,7 @@ class OpenAICompatClient:
             or str(getattr(self.cfg, "reasoning_effort", "") or "")
             .strip()
             .lower()
-            == "none"
+            in {"none", "max"}
         )
         positive_openai_tools_reasoning = bool(
             tools

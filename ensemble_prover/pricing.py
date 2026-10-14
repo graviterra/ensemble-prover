@@ -368,6 +368,12 @@ def _openrouter_reasoning_capabilities(
     raw = entry.get("reasoning")
     reasoning = raw if isinstance(raw, dict) else {}
     raw_efforts = reasoning.get("supported_efforts")
+    # Explicit null advertises every gateway effort; omission advertises no
+    # selector. Keep those meanings distinct, including mandatory reasoning.
+    if "supported_efforts" in reasoning and raw_efforts is None:
+        raw_efforts = ["max", "xhigh", "high", "medium", "low", "minimal"]
+        if reasoning.get("mandatory") is not True:
+            raw_efforts.append("none")
     efforts = tuple(
         dict.fromkeys(
             str(value or "").strip().lower()

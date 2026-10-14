@@ -553,6 +553,11 @@ Role-specific settings override the global settings:
 ```
 
 Accepted effort values are `none`, `low`, `medium`, `high`, and `max`.
+Use `--reasoning-mode on --reasoning-effort max` for maximum effort on both
+configured roles, or set `--prover-reasoning-effort max` and
+`--refiner-reasoning-effort max` separately. The effort flags also accept `Max`
+and `MAX`. See [provider-specific Max behavior](providers.md#reasoning-and-output-capacity)
+for the transport settings and the distinction from Pro models.
 Provider support varies. Explicit controls are fail-closed: if a provider
 rejects a required control, the request fails instead of silently dropping it.
 

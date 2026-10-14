@@ -86,6 +86,45 @@ refiner overrides. `provider-default` sends no explicit reasoning control;
 it does not mean reasoning is disabled. Support for `on`, `off`, effort levels,
 and temperature depends on the selected provider/model.
 
+For maximum reasoning on the prover and refiner, add:
+
+```bash
+--reasoning-mode on --reasoning-effort max
+```
+
+Use `--prover-reasoning-effort max` or `--refiner-reasoning-effort max` to
+select it for one role. In the browser launcher, choose `max` under Reasoning.
+The CLI also accepts `Max` and `MAX`.
+
+| Transport | Max request |
+| --- | --- |
+| Codex | `model_reasoning_effort="max"`; the legacy GPT-5 through GPT-5.5 compatibility alias remains `xhigh` |
+| Claude Code | `--effort max`; availability depends on the selected model, account policy, and installed CLI |
+| OpenAI API | `reasoning.effort="max"` on Responses requests; compatible Chat Completions requests use `reasoning_effort` |
+| DeepSeek API | `reasoning_effort="max"` with thinking enabled |
+| OpenRouter, including Anthropic models | `reasoning.effort="max"` when advertised; established DeepSeek and GPT-5.2 aliases can use advertised `xhigh` |
+
+Max preserves the model identifier, output allowance, and run budgets. Ordinary
+proof and planning requests inherit the role effort. A bounded serialization or
+visibility-recovery request can use its separate lower-effort policy; the recorded
+request settings distinguish it from proof search. Provider receipts show what
+was sent, without guaranteeing internal compute or a model's effective effort.
+Unsupported explicit controls fail instead of being dropped. OpenRouter Max
+requests cannot be replaced with a lower advertised effort or generic enablement.
+
+Max effort and Pro execution are separate selections. OpenAI documents them as
+independent controls, and OpenRouter offers Pro model IDs separately. Choose an
+available Pro model ID explicitly when that is the desired route; selecting Max
+does not rewrite the model or add `reasoning.mode="pro"`. Mini's existing
+`--reasoning-mode on|off|provider-default` controls enablement, not Pro execution.
+Anthropic models are currently available through Claude Code or OpenRouter;
+there is no direct Anthropic Messages API transport in Mini.
+
+Provider references: [OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning),
+[Claude Code effort](https://code.claude.com/docs/en/model-config#effort-level),
+[DeepSeek thinking](https://api-docs.deepseek.com/guides/thinking_mode/), and
+[OpenRouter reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+
 An output allowance limits a request, not the total run. The browser runtime
 panel distinguishes configured settings, prepared requests, and completed
 provider observations. Missing effective settings remain unknown. Cost output

@@ -135,6 +135,39 @@ def mini_reasoning_effort(client: Any, *, minimum: str) -> str:
     return selected
 
 
+def openrouter_max_reasoning_effort(model: str, capability: Any) -> str:
+    """Keep Max exact, with established DeepSeek and GPT-5.2 aliases.
+
+    Missing catalog evidence permits a direct request for provider validation;
+    a catalog explicitly lacking the effort cannot authorize a weaker request.
+    Model selection (including Pro variants) remains independent of effort.
+    """
+
+    if (
+        capability is None
+        or "max" in capability.supported_efforts
+        or (
+            capability.source in {
+                "static_deepseek_v4_contract", "static_deepseek_v4_family_contract",
+            }
+            and not capability.supported_efforts
+        )
+    ):
+        return "max"
+    model_name = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    if (
+        mini_deepseek_v4_model(model)
+        or re.fullmatch(r"gpt-5\.2(?:-.*)?", model_name)
+    ) and "xhigh" in capability.supported_efforts:
+        return "xhigh"
+    from .models import ProviderCapabilityError
+
+    raise ProviderCapabilityError(
+        f"Max reasoning effort cannot be honored: not advertised for OpenRouter model={model}; "
+        "select a model supporting max or explicitly choose a supported effort"
+    )
+
+
 # Published model allowances; request-time OpenRouter metadata remains authoritative.
 # Claude Code aliases are transport-specific and may resolve differently by account.
 _MINI_CLAUDE_TOKEN_DEFAULTS = {
@@ -761,19 +794,36 @@ class MiniRequestEnvelopePolicy:
                             "OpenRouter reasoning capability is temporarily "
                             f"unavailable for model={model}"
                         ) from exc
+        max_effort = ""
         if (
-            self.reasoning_mode == "explicit"
-            and explicit_effort == "max"
-            and mini_deepseek_v4_model(model, base_url=base_url)
-            and capability is not None
-            and "xhigh" in capability.supported_efforts
-            and "max" not in capability.supported_efforts
+            base_url_matches_provider(base_url, "openrouter")
+            and (
+                self.reasoning_mode == "explicit"
+                or not _provider_default_reasoning_requested(cfg)
+                or (
+                    self.reasoning_mode == "floor"
+                    and str(self.reasoning_effort).strip().lower() == "max"
+                )
+            )
+            and (
+                effective_effort == "max"
+                or (
+                    effective_effort == "xhigh"
+                    and (
+                        str(self.reasoning_effort).strip().lower() == "max"
+                        or (
+                            self.reasoning_mode != "explicit"
+                            and str(getattr(cfg, "reasoning_effort", ""))
+                            .strip().lower() == "max"
+                        )
+                    )
+                )
+            )
         ):
-            # Mini's strongest-effort alias is named xhigh by these DeepSeek routes.
-            # Do not extend this equivalence to a weaker advertised high.
-            explicit_effort = "xhigh"
-            if effective_effort == "max":
-                effective_effort = explicit_effort
+            max_effort = openrouter_max_reasoning_effort(model, capability)
+            effective_effort = max_effort
+            if self.reasoning_mode == "explicit":
+                explicit_effort = max_effort
         capability_record = (
             capability.to_record() if capability is not None else {}
         )
@@ -787,8 +837,14 @@ class MiniRequestEnvelopePolicy:
                 effective_effort=str(effective_effort or ""),
                 session_override=self.session_max_tokens_override,
                 capability=capability,
+                exact_effort_control=max_effort,
             )
         )
+        if max_effort:
+            # Max selects effort, not the bounded recovery token-budget shim.
+            # Keep the independently resolved total output allowance unchanged.
+            # Preserve Max intent when the wire spelling is an xhigh alias.
+            transport_mode = "max_effort"
         if messages is not None and not operator_override:
             fitted_tokens = mini_prompt_output_capacity(
                 cfg=cfg, model=model, capability=capability,
@@ -798,17 +854,21 @@ class MiniRequestEnvelopePolicy:
             if fitted_tokens < output_tokens:
                 output_tokens = fitted_tokens
                 cap_source += "+prompt_context"
-        effective_effort, reasoning_transport_control = (
-            _resolve_mini_reasoning_transport_control(
-                cfg=cfg,
-                model=model,
-                base_url=base_url,
-                effective_effort=str(effective_effort or ""),
-                transport_mode=transport_mode,
-                output_tokens=output_tokens,
-                capability=capability,
+        if max_effort:
+            effective_effort = max_effort
+            reasoning_transport_control = {"reasoning": {"effort": max_effort}}
+        else:
+            effective_effort, reasoning_transport_control = (
+                _resolve_mini_reasoning_transport_control(
+                    cfg=cfg,
+                    model=model,
+                    base_url=base_url,
+                    effective_effort=str(effective_effort or ""),
+                    transport_mode=transport_mode,
+                    output_tokens=output_tokens,
+                    capability=capability,
+                )
             )
-        )
         if (
             self.reasoning_mode == "explicit"
             and effective_effort != explicit_effort
@@ -996,6 +1056,7 @@ def _resolve_mini_leaf_output_cap(
     effective_effort: str,
     session_override: Optional[int],
     capability: Any,
+    exact_effort_control: str = "",
 ) -> tuple[int, str, str, bool]:
     if str(base_url or "").strip().lower().startswith("local://"):
         from .models import LocalProviderCapabilityError
@@ -1033,7 +1094,13 @@ def _resolve_mini_leaf_output_cap(
             supports_disable = bool(
                 capability is not None and capability.supports_disable
             )
-            if _provider_default_reasoning_requested(cfg):
+            if exact_effort_control:
+                # The request already resolved an exact effort control.
+                # Missing generic-enable metadata must not block independent
+                # output headroom calculation for that control.
+                reasoning_on = True
+                transport_mode = "advertised_effort"
+            elif _provider_default_reasoning_requested(cfg):
                 # Provider-default/auto omits the reasoning control. Reserve
                 # headroom for provider-side hidden reasoning without turning
                 # Mini's phase effort floor into an explicit disable request.
