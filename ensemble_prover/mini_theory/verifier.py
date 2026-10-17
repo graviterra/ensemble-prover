@@ -566,14 +566,21 @@ class TheoryBundleVerifier:
             env=env,
             cancellation_event=cancellation_event,
         )
+        reported_executable = lean_run.stdout.strip()
+        if lean_run.returncode != 0 or not reported_executable:
+            return "lean_executable_unavailable"
+        lean_path = Path(reported_executable)
+        if not lean_path.is_absolute():
+            lean_path = self.lean_project_dir / lean_path
+        # Bind validation and execution to the probe's working directory while
+        # preserving launcher symlinks whose basename controls tool dispatch.
+        if not lean_path.is_file():
+            return "lean_executable_unavailable"
         path_run = self._run(
             ["lake", "env", "printenv", "LEAN_PATH"],
             env=env,
             cancellation_event=cancellation_event,
         )
-        lean_path = Path(lean_run.stdout.strip())
-        if lean_run.returncode != 0 or not lean_path.is_file():
-            return "lean_executable_unavailable"
         if path_run.returncode != 0 or not path_run.stdout.strip():
             return "lean_path_unavailable"
         return lean_path, path_run.stdout.strip()

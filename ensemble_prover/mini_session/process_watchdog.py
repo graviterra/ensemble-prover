@@ -3345,10 +3345,9 @@ def _launch_cli_worker_under_watchdog(spec: Dict[str, Any]) -> int:
         completion.begin_launch()
         supervisor_proc = subprocess.Popen(
             [sys.executable, "-m", __name__, "--supervisor-spec", spec_path],
-            env={
-                **propagate_owned_network_policy(trusted_provider_worker_environment()),
-                **completion.environment,
-            },
+            env=propagate_owned_network_policy(
+                trusted_provider_worker_environment(overrides=completion.environment),
+            ),
             pass_fds=(parent_read_fd, *completion.pass_fds),
         )
         completion.close_parent_writer()

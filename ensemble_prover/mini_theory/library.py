@@ -4,7 +4,6 @@ from __future__ import annotations
 import time
 
 import json
-import subprocess
 from functools import wraps
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -32,7 +31,6 @@ from .store import (
     TheoryStorePublicationCommitted,
 )
 from .verifier import TheoryBundleVerifier, TheoryVerificationResult
-from ..local_inference.network_policy import prepare_owned_subprocess
 
 
 TheoryMode = Literal["off", "read", "build"]
@@ -760,47 +758,14 @@ class MiniTheoryLibrary:
             configured.append(modules_root)
             setattr(cfg, "module_search_paths", configured)
         if not str(getattr(cfg, "resolved_lean_path", "") or "").strip():
-            project = self.verifier.lean_project_dir
-            try:
-                lean_path_run = subprocess.run(
-                    ["lake", "env", "printenv", "LEAN_PATH"],
-                    cwd=project,
-                    env=prepare_owned_subprocess(("lake", "env", "printenv", "LEAN_PATH"), project=project),
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                )
-                lean_bin_run = subprocess.run(
-                    ["lake", "env", "which", "lean"],
-                    cwd=project,
-                    env=prepare_owned_subprocess(("lake", "env", "which", "lean"), project=project),
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                )
-            except OSError as exc:
-                raise TheoryStoreError(
-                    f"could not resolve Lean environment for theory activation: {exc}"
-                ) from exc
-            lean_path = lean_path_run.stdout.strip()
-            lean_bin = lean_bin_run.stdout.strip()
-            if (
-                lean_path_run.returncode != 0
-                or lean_bin_run.returncode != 0
-                or not lean_path
-                or not lean_bin
-            ):
-                diagnostic = (
-                    lean_path_run.stderr.strip()
-                    or lean_bin_run.stderr.strip()
-                    or "Lake environment resolution failed"
-                )
+            environment = self.verifier._lean_environment()
+            if isinstance(environment, str):
                 raise TheoryStoreError(
                     "could not resolve Lean environment for theory activation: "
-                    + diagnostic
+                    + environment
                 )
+            lean_executable, lean_path = environment
+            lean_bin = str(lean_executable)
             bind_environment = getattr(
                 lean,
                 "bind_resolved_lean_environment",

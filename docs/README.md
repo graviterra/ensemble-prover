@@ -14,6 +14,7 @@ translate a claim, or investigate a problem before choosing a proof approach.
 | Read the complete LLM prompts and find their definitions | [Prompt reference](LLM_PROMPTS.md) |
 | Understand how the prover chooses and checks work | [Proof search and mathematical research](proof-search.md) |
 | Reuse lemmas and understand application history | [Retrieval, theory, and mathematical memory](mathematical-memory.md) |
+| Inspect exact retained research and record possible relevance | [Offline research views](research-projection.md) |
 | Monitor, stop, resume, or diagnose a run | [Operations and recovery](operations.md) |
 | Find detailed command settings | [User Guide](USER_GUIDE.md) · each command's `--help` |
 
