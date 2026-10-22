@@ -90,7 +90,7 @@ _REFUTATION_EXCLUSION_RE = re.compile(
 )
 
 _CONTRADICTION_ASSUMPTION_RE = re.compile(
-    r"(?:^|[,;:]\s*)\s*(?:we\s+)?(?:assume|suppose)\s+"
+    r"(?:^|[,;:])\s*(?:we\s+)?(?:assume|suppose)\s+"
     r"(?:the\s+)?(?:claim|statement|target|route)\s+"
     r"(?:is|was)\s+false\b|"
     r"\bby\s+contradiction\b[^\n]{0,160}\b(?:claim|statement|target|route)\s+"
@@ -105,9 +105,10 @@ _LEAN_BY_CONTRA_RE = re.compile(r"\bby_contra\b|\bbyContradiction\b")
 _REPORTED_QUOTATION_START_RE = re.compile(
     r"\b(?:phrase|wording|quotation|quoted\s+text|instruction|error\s+message|"
     r"(?:earlier|previous|rejected|quoted)\s+(?:message|response|assertion|claim))"
-    r"(?:\s+(?:says?|said|states?|stated|reads?|read|was|is|contains?|contained|"
+    # Keep repeated word alternatives disjoint: reads? already includes read.
+    r"(?:\s+(?:says?|said|states?|stated|reads?|was|is|contains?|contained|"
     r"included?|wrote|asserted|claimed|that|as|follows|literally|explicitly))*"
-    r"\s*:?\s*(?P<quote>[\"'`“‘])",
+    r"\s*(?::\s*)?(?P<quote>[\"'`“‘])",
     re.IGNORECASE,
 )
 
@@ -347,7 +348,7 @@ def _derivation_has_other_subject(text: str, match: re.Match[str]) -> bool:
     return bool(
         re.search(
             r"\b(?:contradiction|(?:(?:unproved\s+|proof\s+)?step|proof))"
-            r"(?:\s*,?\s*(?:that|which))?\s+$",
+            r"(?:\s*(?:,\s*)?(?:that|which))?\s+$",
             before,
             re.IGNORECASE,
         )
