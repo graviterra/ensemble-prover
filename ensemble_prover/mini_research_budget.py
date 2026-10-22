@@ -528,7 +528,11 @@ def reconcile_recovery_elapsed(
     owned_dispatches = {f"research:{execution_id}" for execution_id, _ in measured}
     recorded = sum(receipt["elapsed_seconds"] for receipt in budget.execution_receipts.values()
                    if receipt["dispatch_id"] in owned_dispatches)
-    previous = max(seconds(grant.get("elapsed_accounted", 0.0)), recorded)
+    admission_dispatch = f"research-admission:{grant['id']}"
+    admitted = max((seconds(receipt["details"]["research_admission_seconds"])
+                    for receipt in budget.execution_receipts.values()
+                    if receipt["dispatch_id"] == admission_dispatch), default=0.0)
+    previous = max(seconds(grant.get("elapsed_accounted", 0.0)), recorded, admitted)
     uncharged = max(0.0, elapsed - previous)
     # Debit the full cumulative obligation before recording observations. A
     # diagnostic failure after record_execution must not strand an unmarked
@@ -536,6 +540,21 @@ def reconcile_recovery_elapsed(
     budget.consume_elapsed(uncharged)
     grant["elapsed_accounted"] = max(previous, elapsed)
     budget.historical_execution_cost_incomplete |= incomplete
+    # A resource-only checkpoint can retain the debit while the sealed session
+    # still contains an older grant marker. Bind that debit to its exact grant
+    # so replay cannot charge the reservation again or borrow unrelated costs.
+    # This marker is not measured service or another provider dispatch.
+    budget.record_execution(
+        dispatch_id=admission_dispatch,
+        operation_id=f"research_admission:{float(grant['elapsed_accounted']).hex()}",
+        elapsed_seconds=0.0, productive=False, disposition="research_admission_accounted",
+        details={"research_admission_seconds": grant["elapsed_accounted"]},
+        ownership={
+            "session_id": str(getattr(session, "execution_session_id", "")),
+            "parent_session_id": "", "parent_dispatch_id": "", "parent_operation_id": "",
+            "timing_scope": "background_worker_elapsed_nonadditive_with_proof_wall",
+        },
+    )
     for execution_id, measured_seconds in measured:
         before = budget.total_seconds
         try:

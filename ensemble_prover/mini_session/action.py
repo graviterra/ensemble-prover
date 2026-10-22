@@ -411,6 +411,42 @@ class MiniOutcome:
 # ---------------------------------------------------------------------------
 
 
+def validate_research_admission_receipts(
+    receipts: Dict[str, Dict[str, Any]], *, total_seconds: float, unproductive_seconds: float,
+) -> None:
+    """Reservation markers must be backed by cost, separately for each grant."""
+    admissions: Dict[str, float] = {}
+    measured: Dict[str, float] = {}
+    total = unproductive = 0.0
+    for receipt in receipts.values():
+        dispatch = receipt["dispatch_id"]
+        duration = receipt["elapsed_seconds"]
+        total += duration
+        if not receipt["productive"]:
+            unproductive += duration
+        if dispatch.startswith("research:"):
+            grant = dispatch[len("research:"):].split(":recovery:", 1)[0]
+            measured[grant] = measured.get(grant, 0.0) + duration
+        if not dispatch.startswith("research-admission:"):
+            continue
+        grant = dispatch[len("research-admission:"):]
+        amount = receipt["details"].get("research_admission_seconds")
+        if (not grant or ":recovery:" in grant
+                or set(receipt["details"]) != {"research_admission_seconds"}
+                or type(amount) not in {int, float} or not math.isfinite(amount) or amount < 0
+                or receipt["operation_id"] != f"research_admission:{float(amount).hex()}"
+                or any(receipt[key] != 0 for key in ("elapsed_seconds", "nested_seconds", "service_seconds"))
+                or receipt["productive"] is not False or receipt["semantic_attempt_completed"] is not False
+                or receipt["ownership"].get("timing_scope") != "background_worker_elapsed_nonadditive_with_proof_wall"):
+            raise ValueError("Invalid research admission receipt")
+        admissions[grant] = max(admissions.get(grant, 0.0), amount)
+    if admissions:
+        reserved = sum(max(0.0, amount - measured.get(grant, 0.0)) for grant, amount in admissions.items())
+        if (total_seconds + 1e-5 < total + reserved
+                or unproductive_seconds + 1e-5 < unproductive + reserved):
+            raise ValueError("Research admission receipts exceed their budget debit")
+
+
 @dataclass
 class ActionBudget:
     """Dispatch budget/accounting record, checked between invocations.
@@ -493,6 +529,10 @@ class ActionBudget:
                 raise ValueError("invalid execution receipt details")
             if not isinstance(receipt.get("ownership"), dict):
                 raise ValueError("invalid execution ownership")
+        validate_research_admission_receipts(
+            self.execution_receipts, total_seconds=self.total_seconds,
+            unproductive_seconds=self.unproductive_seconds,
+        )
         if (not math.isfinite(self.execution_service_seconds)
                 or self.execution_service_seconds < 0
                 or abs(self.execution_service_seconds - sum(

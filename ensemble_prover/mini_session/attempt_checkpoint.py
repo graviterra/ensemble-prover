@@ -163,7 +163,7 @@ def _same_physical_receipt(left: dict[str, Any], right: dict[str, Any]) -> bool:
 
 
 def _validated_execution_service(value: Any, sessions: dict[str, Any]) -> dict[str, Any]:
-    from .action import ActionBudget
+    from .action import ActionBudget, validate_research_admission_receipts
 
     if type(value) is not dict:
         raise ValueError("Invalid checkpoint execution service")
@@ -175,8 +175,9 @@ def _validated_execution_service(value: Any, sessions: dict[str, Any]) -> dict[s
         session_state = scheduler.get("session_state") if type(scheduler) is dict else None
         session_id = session_state.get("execution_session_id") if type(session_state) is dict else None
         for action_id, state in actions.items():
+            required = {"receipts", "receipt_order", "historical_execution_cost_incomplete", "observations"}
             if (type(action_id) is not str or not action_id or type(state) is not dict
-                    or set(state) != {"receipts", "receipt_order", "historical_execution_cost_incomplete", "observations"}
+                    or set(state) not in (required, required | {"budget_seconds"})
                     or type(state["receipts"]) is not dict
                     or type(state["receipt_order"]) is not list
                     or type(state["historical_execution_cost_incomplete"]) is not bool
@@ -201,7 +202,12 @@ def _validated_execution_service(value: Any, sessions: dict[str, Any]) -> dict[s
                                               "parent_operation_id", "timing_scope"}
                         or any(type(item) is not str for item in ownership.values())
                         or ownership["session_id"] != session_id
-                        or ownership["timing_scope"] != "inclusive_admission_exclusive_wall_service"
+                        # Background research settles into its donor's lane,
+                        # but its elapsed time is not additive with proof wall time.
+                        or ownership["timing_scope"] not in {
+                            "inclusive_admission_exclusive_wall_service",
+                            "background_worker_elapsed_nonadditive_with_proof_wall",
+                        }
                         or len({bool(ownership[key]) for key in (
                             "parent_session_id", "parent_dispatch_id", "parent_operation_id",
                         )}) != 1):
@@ -211,8 +217,40 @@ def _validated_execution_service(value: Any, sessions: dict[str, Any]) -> dict[s
                             or not math.isfinite(receipt[key]) or receipt[key] < 0):
                         raise ValueError("Invalid checkpoint execution service duration")
             elapsed = sum(receipt["elapsed_seconds"] for receipt in receipts.values())
+            if "budget_seconds" in state:
+                if (type(scheduler) is not dict or type(scheduler.get("budgets")) is not dict
+                        or type(session_id) is not str or not session_id):
+                    raise ValueError("Execution budget floor requires a checkpoint session")
+                floor = state["budget_seconds"]
+                if (type(floor) is not dict or set(floor) != {"total_seconds", "unproductive_seconds"}
+                        or any(type(amount) not in {int, float} or not math.isfinite(amount) or amount < 0
+                               for amount in floor.values())):
+                    raise ValueError("Invalid checkpoint execution budget floor")
+                committed = scheduler["budgets"].get(action_id, {})
+                if type(committed) is not dict:
+                    raise ValueError("Invalid committed execution budget")
+                if (floor["unproductive_seconds"] - committed.get("unproductive_seconds", 0)
+                        > floor["total_seconds"] - committed.get("total_seconds", 0) + 1e-5):
+                    raise ValueError("Execution budget floor cannot publish policy exhaustion")
+                known = {**committed.get("execution_receipts", {}), **receipts}
+                for field, measured in (
+                    ("total_seconds", sum(item["elapsed_seconds"] for item in known.values())),
+                    ("unproductive_seconds", sum(item["elapsed_seconds"] for item in known.values()
+                                                 if not item["productive"])),
+                ):
+                    if floor[field] + 1e-5 < max(committed.get(field, 0), measured):
+                        raise ValueError("Execution budget floor cannot erase committed or measured cost")
+                validate_research_admission_receipts(
+                    known, total_seconds=floor["total_seconds"],
+                    unproductive_seconds=floor["unproductive_seconds"],
+                )
+            elif any(str(receipt["dispatch_id"]).startswith("research-admission:")
+                     for receipt in receipts.values()):
+                raise ValueError("Research admission receipts require execution budget floors")
+            floor = state.get("budget_seconds", {})
             ActionBudget(
-                max_invocations=-1, max_total_seconds=0, total_seconds=elapsed,
+                max_invocations=-1, max_total_seconds=0, total_seconds=floor.get("total_seconds", elapsed),
+                unproductive_seconds=floor.get("unproductive_seconds", 0),
                 execution_receipts=receipts, execution_elapsed_seconds=elapsed,
                 execution_service_seconds=sum(receipt["service_seconds"] for receipt in receipts.values()),
             )
@@ -246,11 +284,32 @@ def _pending_execution_service(state: dict[str, Any], record: dict[str, Any]) ->
         prior = committed_observations.get(action_id, {})
         observations = {key: amount for key, amount in action_state["observations"].items()
                         if amount > prior.get(key, 0)}
-        if receipts or historical or observations:
+        floor = action_state.get("budget_seconds")
+        if floor is not None:
+            # mark_exhausted can raise unproductive_seconds as a policy marker,
+            # even above elapsed time. Only new physical cost can cross this
+            # boundary; preserve a sentinel already in the committed baseline.
+            new_productive = sum(receipt["elapsed_seconds"] for key, receipt in receipts.items()
+                                 if key not in committed and receipt["productive"])
+            new_elapsed = max(0.0, floor["total_seconds"] - budget.get("total_seconds", 0))
+            prior_unproductive = budget.get("unproductive_seconds", 0)
+            floor = {
+                "total_seconds": floor["total_seconds"],
+                "unproductive_seconds": prior_unproductive + min(
+                    max(0.0, floor["unproductive_seconds"] - prior_unproductive),
+                    max(0.0, new_elapsed - new_productive),
+                ),
+            }
+        increased = floor is not None and any(amount > budget.get(key, 0) for key, amount in floor.items())
+        if receipts or historical or observations or increased:
             pending[action_id] = {"receipts": receipts,
                                   "receipt_order": [key for key in action_state["receipt_order"] if key in receipts],
                                   "historical_execution_cost_incomplete": historical,
                                   "observations": observations}
+            if floor is not None:
+                # Equal floors still matter: a new measured receipt may replace
+                # time already debited by the committed conservative reservation.
+                pending[action_id]["budget_seconds"] = dict(floor)
     return pending
 
 
@@ -266,6 +325,7 @@ def _restore_execution_service(session: Any, actions: dict[str, Any]) -> None:
             budget = ActionBudget(max_invocations=1, max_total_seconds=0,
                                   scope=session._declared_action_budget_scope(action))
             session.budgets[action_id] = budget
+        before = {key: getattr(budget, key) for key in ("total_seconds", "unproductive_seconds")}
         for key in state["receipt_order"]:
             receipt = state["receipts"][key]
             previous = budget.execution_receipts.get(key)
@@ -281,6 +341,12 @@ def _restore_execution_service(session: Any, actions: dict[str, Any]) -> None:
                 productive=receipt["productive"], disposition=receipt["disposition"],
                 details=_json(receipt["details"]), ownership=_json(receipt["ownership"]),
             )
+        if "budget_seconds" in state:
+            # Exact service and admission debit are different when recovery
+            # replaces reserved time. Preserve prior costs and the captured net
+            # debit instead of adding the replacement receipt a second time.
+            for key, amount in state["budget_seconds"].items():
+                setattr(budget, key, max(before[key], amount))
         budget.historical_execution_cost_incomplete |= bool(
             state["historical_execution_cost_incomplete"] or budget._execution_pending_count
         )
@@ -292,7 +358,10 @@ def _restore_execution_service(session: Any, actions: dict[str, Any]) -> None:
 
 
 def _execution_service_cursors(session: Any) -> dict[str, Any]:
-    return {action_id: budget.execution_cursor()
+    return {action_id: {**budget.execution_cursor(),
+                        "total_seconds": budget.total_seconds,
+                        "unproductive_seconds": budget.unproductive_seconds,
+                        "historical_execution_cost_incomplete": budget.historical_execution_cost_incomplete}
             for action_id, budget in getattr(session, "budgets", {}).items()}
 
 
@@ -300,8 +369,6 @@ def _capture_execution_service(session: Any, record: dict[str, Any]) -> dict[str
     actions = {}
     observations = getattr(session.dossier, "action_value_observations", {})
     for action_id, budget in getattr(session, "budgets", {}).items():
-        if not budget.execution_receipts:
-            continue
         actions[action_id] = _capture_execution_budget(budget, observations.get(action_id, {}))
     return _pending_execution_service(actions, record)
 
@@ -312,6 +379,8 @@ def _capture_execution_budget(budget: ActionBudget, observations: dict[str, Any]
                      for key, receipt in budget.execution_receipts.items()},
         "receipt_order": list(budget.execution_receipts),
         "historical_execution_cost_incomplete": budget.historical_execution_cost_incomplete,
+        "budget_seconds": {"total_seconds": budget.total_seconds,
+                           "unproductive_seconds": budget.unproductive_seconds},
         "observations": {key: value for key, value in observations.items()
                          if key in _SERVICE_OBSERVATIONS},
     }
@@ -324,7 +393,7 @@ def _merge_execution_service(previous: dict[str, Any], state: dict[str, Any]) ->
             raise ValueError("Conflicting execution service receipt update")
         if previous["receipts"][key]["details"].get("detached_tail_pending") is False:
             receipts[key]["details"]["detached_tail_pending"] = False
-    return {
+    merged = {
         "receipts": receipts,
         "receipt_order": [*previous["receipt_order"], *(
             key for key in state["receipt_order"] if key not in previous["receipts"]
@@ -336,6 +405,21 @@ def _merge_execution_service(previous: dict[str, Any], state: dict[str, Any]) ->
         "observations": {key: max(previous["observations"].get(key, 0), state["observations"].get(key, 0))
                          for key in previous["observations"].keys() | state["observations"].keys()},
     }
+    floors = [item["budget_seconds"] for item in (previous, state) if "budget_seconds" in item]
+    if floors:
+        floor = {key: max(item[key] for item in floors)
+                 for key in ("total_seconds", "unproductive_seconds")}
+        if len(floors) == 1:
+            modern, legacy = (previous, state) if "budget_seconds" in previous else (state, previous)
+            # Old companions represent additional elapsed debits. Receipts
+            # absent from the modern capture cannot be absorbed into its floor.
+            missing = [receipt for key, receipt in legacy["receipts"].items()
+                       if key not in modern["receipts"]]
+            floor["total_seconds"] += sum(receipt["elapsed_seconds"] for receipt in missing)
+            floor["unproductive_seconds"] += sum(receipt["elapsed_seconds"] for receipt in missing
+                                                 if not receipt["productive"])
+        merged["budget_seconds"] = floor
+    return merged
 
 
 @dataclass
