@@ -37,7 +37,7 @@ class Option:
 
 _MODES = ("provider-default", "auto", "on", "off")
 _INFERENCE_POLICIES = ("mixed", "local-only")
-_EFFORTS = ("none", "low", "medium", "high", "max")
+_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 _FIELDS = (
     Option("mathematical-memory", "Mathematical memory", "select", "Search",
            "Off preserves ordinary retrieval. Observe records outcomes; assist probes eligible prior results; develop also runs explicitly allocated generalization jobs.",
@@ -68,7 +68,7 @@ _FIELDS = (
     Option("reasoning-mode", "Global reasoning mode", "select", "Reasoning",
            "Provider default sends no explicit reasoning control. On and off are explicit requests. Auto is an alias for provider-default.", _MODES),
     Option("reasoning-effort", "Global reasoning effort", "select", "Reasoning",
-           "Max requests maximum effort on the selected model; it does not select a Pro model or raise output limits. None disables reasoning where supported.", _EFFORTS),
+           "Xhigh and max are separate requests whose support depends on the provider and model. Max requests maximum effort; it does not select a Pro model or raise output limits. None disables reasoning where supported.", _EFFORTS),
     Option("prover-reasoning-mode", "Prover reasoning mode", "select", "Reasoning",
            "Override global reasoning mode for the prover.", _MODES),
     Option("prover-reasoning-effort", "Prover reasoning effort", "select", "Reasoning",

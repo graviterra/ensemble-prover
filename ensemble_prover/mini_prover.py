@@ -12752,7 +12752,7 @@ def _effective_mini_theory_mode(args: argparse.Namespace) -> str:
 
 
 _REASONING_MODE_CHOICES = (_REASONING_PROVIDER_DEFAULT, "auto", "on", "off")
-_REASONING_EFFORT_CHOICES = ("none", "low", "medium", "high", "max")
+_REASONING_EFFORT_CHOICES = ("none", "low", "medium", "high", "xhigh", "max")
 _LLM_DEADLINE_POLICY_CHOICES = ("soft", "hard")
 _LLM_REQUEST_TIMEOUT_DISABLED = "disabled"
 _LLM_REQUEST_TIMEOUT_DISABLED_ALIASES = {

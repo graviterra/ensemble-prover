@@ -21,7 +21,7 @@ from .errors import LocalInferenceError
 
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 _EFFORT_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-_EFFORTS = frozenset({"none", "low", "medium", "high", "max"})
+_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 _FIELDS = {
     "generic": frozenset({"reasoning_effort"}),
     "vllm": frozenset({"reasoning_effort", "chat_template_kwargs"}),

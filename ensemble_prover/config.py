@@ -1576,10 +1576,10 @@ def validate_config(cfg: AppConfig) -> None:
         if rc.reasoning_effort is not None:
             _require(
                 str(rc.reasoning_effort).strip().lower()
-                in {"none", "low", "medium", "high", "max"},
+                in {"none", "low", "medium", "high", "xhigh", "max"},
                 (
                     f"roles.{rc.name}: reasoning_effort must be one of "
-                    "none|low|medium|high|max when provided"
+                    "none|low|medium|high|xhigh|max when provided"
                 ),
             )
         if rc.context_window is not None:

@@ -1997,7 +1997,7 @@ def _requires_tool_reasoning_control(
     payload: Mapping[str, Any],
     reasoning_effort_override: Optional[str] = None,
 ) -> bool:
-    """Protect Max intent while retaining optional lower-effort tool recovery."""
+    """Protect xhigh/Max intent while retaining optional lower-effort tool recovery."""
     receipt = current_mini_request_envelope_receipt()
     reasoning = payload.get("reasoning")
     effort = (
@@ -2007,12 +2007,12 @@ def _requires_tool_reasoning_control(
     )
     return bool(
         getattr(cfg, "reasoning_control_required", False)
-        or str(reasoning_effort_override or "").strip().lower() == "max"
-        or str(getattr(cfg, "reasoning_effort", "")).strip().lower() == "max"
-        or str(effort or "").strip().lower() == "max"
+        or str(reasoning_effort_override or "").strip().lower() in {"xhigh", "max"}
+        or str(getattr(cfg, "reasoning_effort", "")).strip().lower() in {"xhigh", "max"}
+        or str(effort or "").strip().lower() in {"xhigh", "max"}
         or (
             isinstance(receipt, MiniRequestEnvelopeReceipt)
-            and receipt.reasoning_transport_mode == "max_effort"
+            and receipt.reasoning_transport_mode in {"xhigh_effort", "max_effort"}
         )
     )
 
@@ -4202,13 +4202,13 @@ class OpenAICompatClient:
         self.last_reasoning_control_requested = normalized
         self.last_reasoning_control_required = bool(reasoning_control_required)
         if base_url_matches_provider(self.base_url, "openrouter"):
-            if normalized == "max":
-                from .provider_tool_protocol import openrouter_max_reasoning_effort
+            if normalized in {"xhigh", "max"}:
+                from .provider_tool_protocol import openrouter_exact_reasoning_effort
 
                 capability = lookup_openrouter_reasoning_capabilities(
                     self.base_url, self.cfg.model,
                 )
-                selected = openrouter_max_reasoning_effort(self.cfg.model, capability)
+                selected = openrouter_exact_reasoning_effort(self.cfg.model, capability, normalized)
                 control = {"effort": selected}
                 payload["reasoning"] = control
                 self.last_reasoning_control_sent = dict(control)
@@ -4216,7 +4216,8 @@ class OpenAICompatClient:
                     capability.to_record() if capability is not None else {}
                 )
                 self.last_reasoning_control_decision = (
-                    "max_effort_exact" if selected == "max" else "max_effort_provider_alias"
+                    f"{normalized}_effort_exact" if selected == normalized
+                    else f"{normalized}_effort_provider_alias"
                 )
                 return
             if _deepseek_v4_model(
@@ -4672,7 +4673,7 @@ class OpenAICompatClient:
             or str(getattr(self.cfg, "reasoning_effort", "") or "")
             .strip()
             .lower()
-            in {"none", "max"}
+            in {"none", "xhigh", "max"}
         )
         self.last_reasoning_capability_record = {}
         if api_default_temperature:
@@ -6258,7 +6259,7 @@ class OpenAICompatClient:
             or str(getattr(self.cfg, "reasoning_effort", "") or "")
             .strip()
             .lower()
-            in {"none", "max"}
+            in {"none", "xhigh", "max"}
         )
         if _openai_responses_with_reasoning(
             self.base_url, effective_reasoning_effort
@@ -6509,7 +6510,7 @@ class OpenAICompatClient:
             or str(getattr(self.cfg, "reasoning_effort", "") or "")
             .strip()
             .lower()
-            in {"none", "max"}
+            in {"none", "xhigh", "max"}
         )
         positive_openai_tools_reasoning = bool(
             tools

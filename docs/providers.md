@@ -86,6 +86,15 @@ refiner overrides. `provider-default` sends no explicit reasoning control;
 it does not mean reasoning is disabled. Support for `on`, `off`, effort levels,
 and temperature depends on the selected provider/model.
 
+Effort choices are `none`, `low`, `medium`, `high`, `xhigh`, and `max` in both
+the CLI and browser launcher, including prover and refiner overrides. Use
+`--reasoning-effort xhigh` to request `xhigh` explicitly. Provider mappings
+determine its effective effort: [DeepSeek's native API](https://api-docs.deepseek.com/guides/thinking_mode/)
+maps `xhigh` to `high` and `max` to `max`.
+[OpenRouter effort support](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#discovering-per-model-reasoning-options)
+depends on the routed model's advertised capabilities. `xhigh` and `max` remain
+separate choices even where a provider uses the same transport value.
+
 For maximum reasoning on the prover and refiner, add:
 
 ```bash

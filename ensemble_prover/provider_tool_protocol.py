@@ -135,8 +135,10 @@ def mini_reasoning_effort(client: Any, *, minimum: str) -> str:
     return selected
 
 
-def openrouter_max_reasoning_effort(model: str, capability: Any) -> str:
-    """Keep Max exact, with established DeepSeek and GPT-5.2 aliases.
+def openrouter_exact_reasoning_effort(
+    model: str, capability: Any, effort: str = "max",
+) -> str:
+    """Keep xhigh/Max exact, with established DeepSeek and GPT-5.2 Max aliases.
 
     Missing catalog evidence permits a direct request for provider validation;
     a catalog explicitly lacking the effort cannot authorize a weaker request.
@@ -145,7 +147,7 @@ def openrouter_max_reasoning_effort(model: str, capability: Any) -> str:
 
     if (
         capability is None
-        or "max" in capability.supported_efforts
+        or effort in capability.supported_efforts
         or (
             capability.source in {
                 "static_deepseek_v4_contract", "static_deepseek_v4_family_contract",
@@ -153,9 +155,9 @@ def openrouter_max_reasoning_effort(model: str, capability: Any) -> str:
             and not capability.supported_efforts
         )
     ):
-        return "max"
+        return effort
     model_name = str(model or "").strip().lower().rsplit("/", 1)[-1]
-    if (
+    if effort == "max" and (
         mini_deepseek_v4_model(model)
         or re.fullmatch(r"gpt-5\.2(?:-.*)?", model_name)
     ) and "xhigh" in capability.supported_efforts:
@@ -163,8 +165,8 @@ def openrouter_max_reasoning_effort(model: str, capability: Any) -> str:
     from .models import ProviderCapabilityError
 
     raise ProviderCapabilityError(
-        f"Max reasoning effort cannot be honored: not advertised for OpenRouter model={model}; "
-        "select a model supporting max or explicitly choose a supported effort"
+        f"{effort.capitalize()} reasoning effort cannot be honored: not advertised for OpenRouter model={model}; "
+        f"select a model supporting {effort} or explicitly choose a supported effort"
     )
 
 
@@ -794,7 +796,8 @@ class MiniRequestEnvelopePolicy:
                             "OpenRouter reasoning capability is temporarily "
                             f"unavailable for model={model}"
                         ) from exc
-        max_effort = ""
+        exact_effort = ""
+        exact_effort_mode = "max_effort"
         if (
             base_url_matches_provider(base_url, "openrouter")
             and (
@@ -820,10 +823,24 @@ class MiniRequestEnvelopePolicy:
                 )
             )
         ):
-            max_effort = openrouter_max_reasoning_effort(model, capability)
-            effective_effort = max_effort
+            exact_effort = openrouter_exact_reasoning_effort(model, capability)
+            effective_effort = exact_effort
             if self.reasoning_mode == "explicit":
-                explicit_effort = max_effort
+                explicit_effort = exact_effort
+        elif (
+            base_url_matches_provider(base_url, "openrouter")
+            and effective_effort == "xhigh"
+            and (
+                self.reasoning_mode == "explicit"
+                or not _provider_default_reasoning_requested(cfg)
+                or (
+                    self.reasoning_mode == "floor"
+                    and str(self.reasoning_effort).strip().lower() == "xhigh"
+                )
+            )
+        ):
+            exact_effort = openrouter_exact_reasoning_effort(model, capability, "xhigh")
+            exact_effort_mode = "xhigh_effort"
         capability_record = (
             capability.to_record() if capability is not None else {}
         )
@@ -837,14 +854,14 @@ class MiniRequestEnvelopePolicy:
                 effective_effort=str(effective_effort or ""),
                 session_override=self.session_max_tokens_override,
                 capability=capability,
-                exact_effort_control=max_effort,
+                exact_effort_control=exact_effort,
             )
         )
-        if max_effort:
-            # Max selects effort, not the bounded recovery token-budget shim.
+        if exact_effort:
+            # Explicit high effort bypasses the bounded recovery token-budget shim.
             # Keep the independently resolved total output allowance unchanged.
             # Preserve Max intent when the wire spelling is an xhigh alias.
-            transport_mode = "max_effort"
+            transport_mode = exact_effort_mode
         if messages is not None and not operator_override:
             fitted_tokens = mini_prompt_output_capacity(
                 cfg=cfg, model=model, capability=capability,
@@ -854,9 +871,9 @@ class MiniRequestEnvelopePolicy:
             if fitted_tokens < output_tokens:
                 output_tokens = fitted_tokens
                 cap_source += "+prompt_context"
-        if max_effort:
-            effective_effort = max_effort
-            reasoning_transport_control = {"reasoning": {"effort": max_effort}}
+        if exact_effort:
+            effective_effort = exact_effort
+            reasoning_transport_control = {"reasoning": {"effort": exact_effort}}
         else:
             effective_effort, reasoning_transport_control = (
                 _resolve_mini_reasoning_transport_control(

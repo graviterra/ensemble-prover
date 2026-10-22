@@ -590,7 +590,7 @@ def _reasoning_aware_conversation_cap(cfg: Any) -> int:
             model, base_url=str(getattr(cfg, "base_url", "") or "")
         )
     ) and (
-        effort in {"high", "max"}
+        effort in {"high", "xhigh", "max"}
         or thinking_enabled and effort not in {"none", "low", "medium"}
         or deepseek_default_thinking
     ):
