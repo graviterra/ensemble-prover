@@ -7,6 +7,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence
 from ..math_utils import _strip_lean_comments_and_strings as _executable_lean_code
+from ..helper_retirement import helper_source_is_retired, theory_source_is_retired
 
 from .library import MiniTheoryLibrary, TheoryPublishResult
 from .model import TheoryBundleCandidate
@@ -185,6 +186,9 @@ class VerifiedHelperPromoter:
     ) -> HelperPromotionPreparation:
         helper_name = str(getattr(helper, "name", "") or "").strip()
         source = str(getattr(helper, "source", "") or "").strip()
+        if helper_source_is_retired(source, theorem_name=source_theorem):
+            return HelperPromotionPreparation(helper_name=helper_name, candidate=None,
+                verification=None, diagnostic="operator_retired_helper")
         try:
             context = helper_promotion_context(source, ())
         except ValueError:
@@ -273,6 +277,9 @@ class VerifiedHelperPromoter:
     ) -> HelperPromotionResult:
         candidate = preparation.candidate
         verification = preparation.verification
+        if candidate is not None and theory_source_is_retired(candidate.source, theorem_name=candidate.source_theorem):
+            return HelperPromotionResult(helper_name=preparation.helper_name, candidate=candidate,
+                publication=None, diagnostic="operator_retired_helper")
         if candidate is None or verification is None:
             return HelperPromotionResult(
                 helper_name=preparation.helper_name,

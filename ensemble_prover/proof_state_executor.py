@@ -7906,6 +7906,9 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
             accepted = helper_acceptance_settlement_current(proof_state, root_node, status) and accepted
             record_summary["accepted"] = bool(accepted)
             if accepted:
+                from .helper_advice import restore_helper_advice
+
+                restore_helper_advice(dossier, record, _proof_state_check_preamble(conv))
                 if root_node is not None:
                     root_node.pending_helper_acceptance = {}
                 accepted_source_hashes.add(source_hash)

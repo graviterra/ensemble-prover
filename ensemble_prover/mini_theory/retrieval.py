@@ -83,7 +83,26 @@ class MiniTheoryRetriever:
         self.refresh()
 
     def refresh(self) -> None:
-        self.refresh_from_bundles(self.store.iter_bundles())
+        from ensemble_prover.helper_retirement import retirement_snapshot
+
+        for _attempt in range(3):
+            policy = retirement_snapshot()
+            bundles = list(self.store.iter_bundles())
+            if retirement_snapshot() == policy:
+                self.refresh_from_bundles(bundles)
+                self._retirement_snapshot = policy
+                return
+        # Never stamp an older inventory with a newer policy. Bound retries so
+        # concurrent policy updates cannot keep a retrieval operation running.
+        self.refresh_from_bundles(())
+        self._retirement_snapshot = None
+        raise TheoryStoreError("helper retirement policy changed during theory refresh; retry retrieval")
+
+    def _refresh_retirement_policy(self) -> None:
+        from ensemble_prover.helper_retirement import retirement_snapshot
+
+        if retirement_snapshot() != getattr(self, "_retirement_snapshot", ()):
+            self.refresh()
 
     def refresh_from_bundles(
         self,
@@ -117,6 +136,7 @@ class MiniTheoryRetriever:
         deadline_exhausted: Optional[Callable[[], bool]] = None,
         admission_predicate: Optional[Callable[[TheorySearchHit], bool]] = None,
     ) -> list[TheorySearchHit]:
+        self._refresh_retirement_policy()
         query_tokens = set(_tokens(f"{query_text} {goal_state}"))
         if not query_tokens or max(0, int(max_results or 0)) <= 0:
             return []
@@ -213,6 +233,7 @@ class MiniTheoryRetriever:
         return scored[: max(0, int(max_results or 0))]
 
     def get_by_name(self, fq_name: str) -> Optional[TheorySearchHit]:
+        self._refresh_retirement_policy()
         wanted = str(fq_name or "").strip()
         for bundle, declaration in self._entries:
             if declaration.fq_name != wanted:
@@ -234,6 +255,7 @@ class MiniTheoryRetriever:
     def required_modules(self, bundle_ids: Iterable[str]) -> tuple[str, ...]:
         """Return dependency-first modules for an exact bundle selection."""
 
+        self._refresh_retirement_policy()
         ordered: list[str] = []
         visited: set[str] = set()
         active: set[str] = set()

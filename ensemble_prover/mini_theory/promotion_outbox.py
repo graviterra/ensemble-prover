@@ -115,11 +115,15 @@ def _promotion_verification_diagnostics(result: Any) -> dict[str, Any]:
     return diagnostics
 
 
-def helper_is_promotable(helper: Any) -> tuple[bool, str]:
+def helper_is_promotable(helper: Any, *, theorem_name: str = "") -> tuple[bool, str]:
     """Return whether a dossier helper is generic reusable theory material."""
 
     name = str(getattr(helper, "name", "") or "").strip()
     source = str(getattr(helper, "source", "") or "").strip()
+    from ensemble_prover.helper_retirement import helper_source_is_retired
+
+    if helper_source_is_retired(source, theorem_name=theorem_name):
+        return False, "operator_retired_helper"
     if not name or not source:
         return False, "missing_helper_identity"
     render_policy = str(getattr(helper, "render_policy", "") or "").strip()
@@ -400,7 +404,7 @@ class PromotionOutbox:
     ) -> PromotionEnqueueResult:
         """Persist one immutable receipt; ordinary I/O errors are fail-open."""
 
-        eligible, diagnostic = helper_is_promotable(helper)
+        eligible, diagnostic = helper_is_promotable(helper, theorem_name=source_theorem)
         if not eligible:
             try:
                 revoked = self.revoke(
@@ -636,7 +640,7 @@ class PromotionOutbox:
         another workspace's pending work.
         """
 
-        promotable, _diagnostic = helper_is_promotable(helper)
+        promotable, _diagnostic = helper_is_promotable(helper, theorem_name=source_theorem)
         if not promotable:
             return None
         try:
@@ -857,7 +861,7 @@ class PromotionOutbox:
         expected: dict[str, tuple[Any, ...]] = {}
         helper_lookup = dict(helpers)
         for name, helper in helper_lookup.items():
-            promotable, _diagnostic = helper_is_promotable(helper)
+            promotable, _diagnostic = helper_is_promotable(helper, theorem_name=source_theorem)
             source = str(getattr(helper, "source", "") or "").strip()
             source_hash = str(
                 getattr(helper, "source_hash", "") or ""
@@ -1925,6 +1929,10 @@ class PromotionOutbox:
         entry: PromotionOutboxEntry,
         dependency_results: Sequence[Mapping[str, Any]],
     ) -> tuple[VerifiedHelper, tuple[str, ...], tuple[str, ...]]:
+        from ensemble_prover.helper_retirement import assert_helpers_not_retired
+
+        assert_helpers_not_retired((entry.source, *(item.source for item in entry.support_receipts)),
+                                   theorem_name=entry.source_theorem)
         if _requires_context_recapture(entry):
             raise ValueError("promotion_context_recapture_required")
         source = "\n".join((*helper_promotion_context(entry.source, entry.context_commands), entry.source))
@@ -2532,6 +2540,10 @@ class PromotionOutbox:
         *,
         lock_held: bool = False,
     ) -> str:
+        from ensemble_prover.helper_retirement import helper_source_is_retired
+
+        if helper_source_is_retired(entry.source, theorem_name=entry.source_theorem):
+            return ""
         if entry.schema_version <= 1:
             return (
                 f"legacy:{entry.entry_id}"
@@ -2563,6 +2575,11 @@ class PromotionOutbox:
         cancellation_event: Any = None,
         lock_held: bool = False,
     ) -> set[str]:
+        from ensemble_prover.helper_retirement import helper_source_is_retired
+
+        entries = [entry for entry in entries if not helper_source_is_retired(
+            entry.source, theorem_name=entry.source_theorem,
+        )]
         authoritative: set[str] = set()
         legacy_lineages: dict[
             tuple[str, str, str], list[PromotionOutboxEntry]

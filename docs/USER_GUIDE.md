@@ -939,6 +939,32 @@ checkout.
 
 Do not share a mutable cache between mutually untrusted users.
 
+Large helper collections use a compact selection of complete signatures, with
+exact lookup for the rest. The planner can request additional signatures before
+choosing a route. Conditional reductions retain their hypotheses and do not by
+themselves establish that the remaining assumptions can be proved.
+
+To exclude an unhelpful helper from future reuse, save its complete declaration
+and proof in a Lean file, then record an operator retirement:
+
+```bash
+python -m ensemble_prover.helper_retirement helper.lean --reason "Reason for excluding this source"
+```
+
+The policy binds the exact source, allowing only line-ending and outer-whitespace
+normalization. A changed proof or renamed declaration is a different source.
+`--theorem-name` optionally restricts the decision to one cache owner. The default
+policy file is `$XDG_STATE_HOME/ensemble_prover/helper_retirements.json`, or
+`~/.local/state/ensemble_prover/helper_retirements.json`; set
+`ENSEMBLE_HELPER_RETIREMENTS` to select another file for all readers and writers.
+The command's `--policy` option selects a destination for that invocation only.
+
+Retirement affects cache reuse, helper admission, and theory discovery and
+publication. It does not assert that the theorem is false or erase historical
+run files. A checkpoint containing a retired source cannot resume; start a fresh
+run to recheck the remaining library. Helpers whose saved replay context includes
+that source also require fresh verification without it.
+
 ### Persistent Mini theory
 
 Mini theory defaults to `build` mode and stores content-addressed verified

@@ -25,6 +25,8 @@ from .proof_dossier import (
     verified_helper_is_premise_projection,
 )
 from .helper_quality import classify_auxiliary_statement_quality
+from .helper_advice import capture_helper_advice, validate_cached_helper_advice
+from .helper_retirement import helper_record_is_retired, helper_source_is_retired, retirement_snapshot
 from .contract_identity import lean_contract_statement_source_key
 from .proof_graph import (
     graph_statement_candidate_key,
@@ -165,6 +167,9 @@ class DeadlineAwareCachePublication:
 
         if self.closed:
             return False
+        if helper_record_is_retired(self.record):
+            self.rollback()
+            return False
         # This receipt owns the destination's exclusive path lock.  A prior
         # publisher may have installed the durable fail-closed marker while
         # this receipt was waiting to acquire it, so destination trust must be
@@ -200,6 +205,9 @@ class DeadlineAwareCachePublication:
         if self.closed:
             # An advisory I/O failure closed the receipt without a row.
             return not self.appended
+        if helper_record_is_retired(self.record):
+            self.rollback()
+            return False
         if self._deadline_elapsed():
             self.rollback()
             return False
@@ -602,6 +610,7 @@ class MiniVerifiedLemmaCache:
         store_failure_metric_sink: Optional[Callable[[str, int], None]] = None,
     ) -> None:
         self._lazy_semantic_admission = bool(lazy_semantic_admission)
+        self._retirement_snapshot = retirement_snapshot()
         # All raw rows and storage fences are observed before selection. These
         # are advisory candidates; no pending record can enter a proof context.
         self._pending_ingest_records: List[Tuple[Dict[str, Any], bool, str]] = []
@@ -709,6 +718,7 @@ class MiniVerifiedLemmaCache:
 
         if seed is None or seed is self or seed._cache_is_disabled():
             return ""
+        seed._refresh_retirement_policy()
         seed_path_key = self._read_path_key(seed.path)
         if seed_path_key not in {
             self._read_path_key(read_path) for read_path in self._read_paths
@@ -1391,8 +1401,11 @@ class MiniVerifiedLemmaCache:
         support_source_hashes: Optional[Dict[str, str]] = None,
         replay_context_names: Sequence[str] = (),
         replay_context_source_hashes: Optional[Dict[str, str]] = None,
+        helper_advice: Optional[Dict[str, Any]] = None,
     ) -> Optional[Tuple[Dict[str, Any], str]]:
         source = str(helper_block or "").strip()
+        if helper_source_is_retired(source, theorem_name=theorem_name):
+            return None
         name = helper_decl_name(source) or ""
         statement = helper_decl_statement(source)
         if not source or not name or not statement:
@@ -1471,6 +1484,10 @@ class MiniVerifiedLemmaCache:
                     and str(context_hash or "").strip()
                 },
                 "created_ts": time.time(),
+                "helper_advice": validate_cached_helper_advice(
+                    helper_advice, source=source, theorem_name=theorem_name,
+                    preamble_hash=preamble_hash,
+                ),
             },
             owner_record_id,
         )
@@ -1584,6 +1601,8 @@ class MiniVerifiedLemmaCache:
                 tuple(-value for value in self._cache_record_rank(record)),
             ))
             for record in candidates:
+                if helper_record_is_retired(record):
+                    continue
                 source_hash = str(record.get("source_hash") or "")
                 if source_hash in seen_source_hashes:
                     continue
@@ -1627,7 +1646,7 @@ class MiniVerifiedLemmaCache:
             # pre-provenance row has no closure to reconstruct, so admitting it
             # here would present "no dependencies" as an authoritative fact.
             # Those rows stay in the advisory ``lookup`` tier instead.
-            if self._record_is_provenance_bearing(record)
+            if self._record_is_provenance_bearing(record) and not helper_record_is_retired(record)
         ]
 
         requested_preamble_hash = (
@@ -1889,6 +1908,8 @@ class MiniVerifiedLemmaCache:
         provenance_bodies: Set[Tuple[str, str]] = set()
 
         def retain(record: Dict[str, Any], *, provenance: bool, source_hash: str = "") -> None:
+            if helper_record_is_retired(record):
+                return
             body = (source_hash or str(record.get("source_hash") or "").strip(),
                     str(record.get("preamble_hash") or "").strip())
             key = (*body, str(record.get("theorem_name") or "").strip())
@@ -1928,6 +1949,7 @@ class MiniVerifiedLemmaCache:
         """Apply the full existing semantic policy to one selected exact source."""
         if self._cache_is_disabled():
             return False
+        self._refresh_retirement_policy()
         if refresh:
             self.refresh_read_paths()
         source_key = f"{source_hash}:{preamble_hash}"
@@ -1950,6 +1972,8 @@ class MiniVerifiedLemmaCache:
         """
 
         body = str(source or "").strip()
+        if helper_source_is_retired(body, theorem_name=str((record_identity or {}).get("theorem_name") or "")):
+            return None
         if text_hash(body) != source_hash or not self.admit_retrieval_record(
             source_hash, preamble_hash, refresh=refresh
         ):
@@ -2018,6 +2042,8 @@ class MiniVerifiedLemmaCache:
         seen_source_hashes: Set[str] = set()
         for statement_hash in sorted(self._by_canonical_statement):
             for raw_record in self._by_canonical_statement[statement_hash]:
+                if helper_record_is_retired(raw_record):
+                    continue
                 record = _clone_cache_record(raw_record)
                 source = str(record.get("source") or "").strip()
                 source_hash = str(record.get("source_hash") or "").strip()
@@ -2070,6 +2096,7 @@ class MiniVerifiedLemmaCache:
         support_source_hashes: Optional[Dict[str, str]] = None,
         replay_context_names: Sequence[str] = (),
         replay_context_source_hashes: Optional[Dict[str, str]] = None,
+        helper_advice: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if self._cache_is_disabled():
             return False
@@ -2082,6 +2109,7 @@ class MiniVerifiedLemmaCache:
             support_source_hashes=support_source_hashes,
             replay_context_names=replay_context_names,
             replay_context_source_hashes=replay_context_source_hashes,
+            helper_advice=helper_advice,
         )
         if prepared is None:
             return False
@@ -2092,6 +2120,8 @@ class MiniVerifiedLemmaCache:
                 # A rollback can write this marker while store() waits for
                 # the lock.  Recheck while holding it, before append/index.
                 if self._cache_is_disabled():
+                    return False
+                if helper_record_is_retired(record):
                     return False
                 if owner_record_id in self._local_owner_record_ids:
                     return False
@@ -2120,6 +2150,7 @@ class MiniVerifiedLemmaCache:
         support_source_hashes: Optional[Dict[str, str]] = None,
         replay_context_names: Sequence[str] = (),
         replay_context_source_hashes: Optional[Dict[str, str]] = None,
+        helper_advice: Optional[Dict[str, Any]] = None,
         deadline_exhausted: Callable[[], bool],
     ) -> Optional[DeadlineAwareCachePublication]:
         """Reserve a reversible publication receipt for an elapsed turn.
@@ -2140,6 +2171,7 @@ class MiniVerifiedLemmaCache:
             support_source_hashes=support_source_hashes,
             replay_context_names=replay_context_names,
             replay_context_source_hashes=replay_context_source_hashes,
+            helper_advice=helper_advice,
         )
         if prepared is None:
             return None
@@ -2459,6 +2491,8 @@ class MiniVerifiedLemmaCache:
         """
 
         origin_schema_version = self._record_origin_schema_version(record)
+        if helper_record_is_retired(record):
+            return None
         if origin_schema_version is None:
             self._note_ingest(
                 "schema_rejected",
@@ -2538,6 +2572,10 @@ class MiniVerifiedLemmaCache:
         migrated["source_hash"] = source_hash
         migrated["preamble_hash"] = preamble_hash
         migrated["theorem_name"] = theorem_name
+        migrated["helper_advice"] = validate_cached_helper_advice(
+            record.get("helper_advice"), source=source, theorem_name=theorem_name,
+            preamble_hash=preamble_hash,
+        )
         provenance_bearing = (
             origin_schema_version >= self._PROVENANCE_SCHEMA_VERSION
         )
@@ -2557,6 +2595,8 @@ class MiniVerifiedLemmaCache:
         return exact_key, canonical_key, source_key, owner_record_id, migrated
 
     def _ingest_record(self, record: Dict[str, Any], *, local: bool = False) -> bool:
+        if helper_record_is_retired(record):
+            return False
         if self._lazy_semantic_admission:
             if self._record_origin_schema_version(record) is None:
                 self._note_ingest("schema_rejected", f"schema_unmigratable v{record.get('schema_version')!r}")
@@ -2707,6 +2747,8 @@ class MiniVerifiedLemmaCache:
                             f"{self.path}: destination disabled during merge"
                         )
                         break
+                    if helper_record_is_retired(migrated):
+                        continue
                     with self.path.open("a", encoding="utf-8") as fp:
                         fp.write(json.dumps(migrated, ensure_ascii=False) + "\n")
                 finally:
@@ -2735,12 +2777,19 @@ class MiniVerifiedLemmaCache:
             merged += 1
         return merged
 
+    def _refresh_retirement_policy(self) -> int:
+        current_retirements = retirement_snapshot()
+        if current_retirements != self._retirement_snapshot:
+            self._retirement_snapshot = current_retirements
+            return self._reload_all_storage()
+        return 0
+
     def refresh_read_paths(self) -> int:
         """Ingest records appended to configured read-through cache paths."""
 
         if self._cache_is_disabled():
             return 0
-        loaded = 0
+        loaded = self._refresh_retirement_policy()
         for read_path in self._read_paths:
             loaded += self._load_new_records(Path(read_path))
         return loaded
@@ -2982,6 +3031,7 @@ def store_verified_helper_for_dossier(
             accepts_extra_kwargs = True
         if helper is not None:
             provenance_values = {
+                "helper_advice": capture_helper_advice(dossier, source, preamble),
                 "support_names": list(
                     getattr(helper, "support_names", []) or []
                 ),
@@ -3069,6 +3119,7 @@ def stage_verified_helper_for_dossier(
             accepts_extra_kwargs = True
         if helper is not None:
             provenance_values = {
+                "helper_advice": capture_helper_advice(dossier, source, preamble),
                 "support_names": list(
                     getattr(helper, "support_names", []) or []
                 ),

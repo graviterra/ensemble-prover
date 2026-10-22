@@ -39,6 +39,7 @@ from .contract_identity import (
     parse_lean_contract_identity,
 )
 from .helper_quality import verified_helper_admission_quality
+from .helper_retirement import assert_helpers_not_retired, helper_source_is_retired, retirement_snapshot
 from .lean_artifact_sanitize import (
     sanitize_lean_artifact_text,
     sanitize_lean_artifact_texts,
@@ -12965,8 +12966,9 @@ class ProofDossier:
             "retracted_proof_idea_ids": retracted_proof_idea_ids,
         }
 
-    @staticmethod
-    def _verified_helper_context_visible(helper: VerifiedHelper) -> bool:
+    def _verified_helper_context_visible(self, helper: VerifiedHelper) -> bool:
+        if helper_source_is_retired(helper.source, theorem_name=self.cache_owner_theorem_name or self.theorem_name):
+            return False
         if (getattr(helper, "contract_observation_required", False)
                 and not verified_helper_has_typed_binder_evidence(helper)):
             return False
@@ -14225,6 +14227,8 @@ class ProofDossier:
         if refresh_quality:
             self._refresh_verified_helper_quality()
         revision = self.helper_revision()
+        if revision is not None:
+            revision = (revision, retirement_snapshot())
         cached = getattr(self, "_helper_blocks_snapshot", None)
         if revision is not None and cached is not None and cached[0] == revision:
             return list(cached[1])
@@ -14589,7 +14593,9 @@ class ProofDossier:
             current_environment = str(self.current_lean_environment_hash or "")
             stored_environment = str(getattr(helper, "verification_environment_hash", "") or "")
             authority_reason = ""
-            if not current_source or not helper_hash or text_hash(current_source) != helper_hash:
+            if helper_source_is_retired(current_source, theorem_name=self.cache_owner_theorem_name or self.theorem_name):
+                authority_reason = "operator_retired_helper"
+            elif not current_source or not helper_hash or text_hash(current_source) != helper_hash:
                 authority_reason = "helper_source_hash_mismatch"
             elif (
                 self._equivalent_helper_registry_name(self.verified_helpers, declared_name) != clean_name
@@ -17309,6 +17315,8 @@ class ProofDossier:
         replace_existing_same_name: bool = False,
         _defer_global_derived_refresh: bool = False,
     ) -> Optional[VerifiedHelper]:
+        if helper_source_is_retired(str(source or ""), theorem_name=self.cache_owner_theorem_name or self.theorem_name):
+            return None
         declared_name = helper_decl_name(source)
         if not declared_name:
             return None
@@ -21111,9 +21119,12 @@ class ProofDossier:
     ) -> Tuple[str, ...]:
         """Freeze an explicit helper scope after checking its current evidence."""
         sources = tuple(blocks)
+        assert_helpers_not_retired(sources, theorem_name=self.cache_owner_theorem_name or self.theorem_name)
         if refresh_quality:
             self._refresh_verified_helper_quality()
         revision = self.helper_revision()
+        if revision is not None:
+            revision = (revision, retirement_snapshot())
         cached = getattr(self, "_validated_helper_context_snapshot", None)
         if revision is not None and cached == (revision, sources):
             return sources
@@ -21220,7 +21231,7 @@ class ProofDossier:
     ) -> str:
         """Render a compact model-facing state update.
 
-        Verified helper bodies are never rendered, only their signatures.  The
+        Verified helper bodies are never rendered, only their signatures.
         Every named fact exposes its complete proposition. When exact helper
         lookup is callable, the initial display selects a compact local view;
         the tool retains access to the entire authorized inventory. Callers
@@ -21327,9 +21338,17 @@ class ProofDossier:
             )
         if all_helpers:
             lines.append("- verified helper lemmas supplied as named facts:")
+            lines.append(
+                "  - These are optional mathematical resources. Develop new approaches "
+                "when useful. A verified implication proves its conclusion only after "
+                "all its hypotheses have been established; an existing reduction is "
+                "not evidence that its remaining premise is attainable."
+            )
             if helper_lookup_available:
                 lines.append(
                     f"  - displaying {len(helpers)} of {len(all_helpers)} available helpers; "
+                    "the selection balances building blocks, reformulations and "
+                    "conditional routes. "
                     "read_verified_helpers reads any exact name or pages through the complete "
                     "inventory, including full signatures and advisory history. All available "
                     "helpers remain in the Lean replay context."
@@ -21342,17 +21361,39 @@ class ProofDossier:
                 lines.append(
                     f"  - all verified helper names ({len(all_helpers)}): {all_names}"
                 )
-            for helper in helpers:
-                signature = helper_prompt_signature(
-                    helper.source,
-                    name=helper.name,
-                    redact_solution_refs=redact_solution_refs,
-                )
-                display_name = _prompt_safe_helper_name(
-                    helper.name,
-                    redact_solution_refs=redact_solution_refs,
-                )
-                lines.append(f"  - `{display_name}`: `{signature}`")
+            if helper_lookup_available:
+                from .helper_inventory import helper_presentation_kind
+
+                grouped_helpers: Dict[str, List[VerifiedHelper]] = {}
+                for helper in helpers:
+                    kind = helper_presentation_kind(
+                        helper, target=current_goal_statement or self.root_statement,
+                    )
+                    grouped_helpers.setdefault(kind, []).append(helper)
+                helper_groups = [
+                    (label, grouped_helpers.get(kind, []))
+                    for kind, label in (
+                        ("fact", "Building blocks"),
+                        ("reformulation", "Reformulations"),
+                        ("conditional_route", "Conditional routes; hypotheses still required"),
+                    )
+                ]
+            else:
+                helper_groups = [("", helpers)]
+            for label, group in helper_groups:
+                if label and group:
+                    lines.append(f"  {label}:")
+                for helper in group:
+                    signature = helper_prompt_signature(
+                        helper.source,
+                        name=helper.name,
+                        redact_solution_refs=redact_solution_refs,
+                    )
+                    display_name = _prompt_safe_helper_name(
+                        helper.name,
+                        redact_solution_refs=redact_solution_refs,
+                    )
+                    lines.append(f"  - `{display_name}`: `{signature}`")
         else:
             lines.append("- verified helper lemmas supplied as named facts: none")
 
@@ -22259,6 +22300,11 @@ class ProofDossier:
         pending_answer_receipts: Set[str] = set()
         for raw in list(data.get("verified_helpers") or []):
             if not isinstance(raw, dict):
+                continue
+            if helper_source_is_retired(str(raw.get("source") or ""), theorem_name=str(
+                data.get("cache_owner_theorem_name") or data.get("theorem_name") or ""
+            )):
+                rejected_verified_helper_names.add(str(raw.get("name") or ""))
                 continue
             item = VerifiedHelper(
                 name=str(raw.get("name") or ""),

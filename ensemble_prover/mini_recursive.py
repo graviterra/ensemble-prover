@@ -81,8 +81,10 @@ from .lean_runner import termination_signal_from_returncode
 from .mini_subgoal_planner import (
     MiniSubgoalClaim,
     MiniSubgoalPlan,
+    PlannerHelperQueryError,
     compile_parsed_mini_subgoal_plan,
     parse_mini_subgoal_plan_response,
+    parse_planner_helper_queries,
     planner_visible_json_was_truncated,
     render_mini_subgoal_plan_summary,
     render_mini_subgoal_planner_prompt,
@@ -2391,15 +2393,17 @@ def helper_decl_from_proof(name: str, statement: str, proof: str) -> str:
     return f"theorem {name} : {statement_text} :=\n{proof_text}"
 
 
-def render_answer_safe_helper_summary(
+def _answer_safe_planner_helpers(
     helpers: Sequence[Any],
     *,
     suppress_solution_placeholders: bool = True,
     opaque_mode: bool = True,
     allow_official_answer_visibility: bool = False,
     official_answer_payload_present: Optional[bool] = None,
-) -> str:
-    """Summarize verified helper signatures without exposing theorem bodies."""
+    theorem_name: str = "",
+) -> tuple[Any, ...]:
+    """Freeze the authorized helper inventory shared by briefing and lookup."""
+    from .helper_retirement import helper_source_is_retired
 
     effective_suppression = effective_solution_placeholder_suppression(
         suppress_solution_placeholders=suppress_solution_placeholders,
@@ -2414,10 +2418,12 @@ def render_answer_safe_helper_summary(
         "official_answer_payload_present": official_answer_payload_present,
     }
     redact_solution_refs = effective_suppression
-    rendered: list[str] = []
+    authorized: list[Any] = []
     seen: set[str] = set()
     for helper in helpers or ():
         text = str(getattr(helper, "source", None) or helper or "").strip()
+        if helper_source_is_retired(text, theorem_name=theorem_name):
+            continue
         name = helper_decl_name(text) or str(getattr(helper, "name", "") or "").strip()
         if not name or name in seen:
             continue
@@ -2433,14 +2439,64 @@ def render_answer_safe_helper_summary(
         if is_answer_unsafe_statement_text(signature, **answer_safety_kwargs):
             continue
         seen.add(name)
+        authorized.append(helper)
+    return tuple(authorized)
+
+
+def render_answer_safe_helper_summary(
+    helpers: Sequence[Any],
+    *,
+    suppress_solution_placeholders: bool = True,
+    opaque_mode: bool = True,
+    allow_official_answer_visibility: bool = False,
+    official_answer_payload_present: Optional[bool] = None,
+    target: str = "",
+    lookup_available: bool = False,
+    theorem_name: str = "",
+) -> str:
+    """Summarize full signatures, bounding presentation when lookup is available."""
+    from .helper_inventory import helper_presentation_kind, select_prompt_helpers
+
+    authorized = _answer_safe_planner_helpers(
+        helpers,
+        suppress_solution_placeholders=suppress_solution_placeholders,
+        opaque_mode=opaque_mode,
+        allow_official_answer_visibility=allow_official_answer_visibility,
+        official_answer_payload_present=official_answer_payload_present,
+        theorem_name=theorem_name,
+    )
+    selected = (
+        select_prompt_helpers(authorized, target=target)
+        if lookup_available else authorized
+    )
+    redact_solution_refs = effective_solution_placeholder_suppression(
+        suppress_solution_placeholders=suppress_solution_placeholders,
+        opaque_mode=opaque_mode,
+        allow_official_answer_visibility=allow_official_answer_visibility,
+        official_answer_payload_present=official_answer_payload_present,
+    )
+    rendered: list[str] = []
+    for helper in selected:
+        text = _helper_source_text(helper)
+        name = helper_decl_name(text) or str(getattr(helper, "name", "") or "")
+        signature = helper_prompt_signature(text, name=name, redact_solution_refs=redact_solution_refs)
         display_name = _prompt_safe_helper_name(
             name,
             redact_solution_refs=redact_solution_refs,
         )
-        rendered.append(f"- `{display_name}`: `{signature}`")
-    if not rendered:
+        role = f" [{helper_presentation_kind(helper, target=target)}]" if lookup_available else ""
+        rendered.append(f"- `{display_name}`{role}: `{signature}`")
+    if not authorized:
         return "Verified helper names available: none."
-    return "Verified helper statements available:\n" + "\n".join(rendered)
+    heading = "Verified helper statements available:"
+    if lookup_available:
+        heading += (
+            f" showing {len(selected)} of {len(authorized)}. These are optional resources; "
+            "develop new approaches when useful. A conditional route proves only its "
+            "implication, not its unproved premises. Use helper_queries for any omitted "
+            "signature before deciding that useful evidence is unavailable."
+        )
+    return heading + "\n" + "\n".join(rendered)
 
 
 def _verified_helper_names(helpers: Sequence[Any]) -> set[str]:
@@ -22760,7 +22816,11 @@ async def run_mini_recursive_driver(
 
         rich_helpers = getattr(dossier, "verified_helpers", None)
         if isinstance(rich_helpers, Mapping) and rich_helpers:
-            return tuple(rich_helpers.values())
+            available_sources = {_helper_source_text(helper) for helper in get_helpers() or ()}
+            return tuple(
+                helper for helper in rich_helpers.values()
+                if _helper_source_text(helper) in available_sources
+            )
         return tuple(get_helpers() or ())
 
     def current_planner_helpers() -> Sequence[Any]:
@@ -27524,7 +27584,22 @@ async def run_mini_recursive_driver(
                     },
                 )
 
-            deliberation_helpers_seen = len(current_planner_helpers())
+            planner_helper_sources = {
+                _helper_source_text(helper) for helper in current_planner_helpers()
+            }
+            deliberation_helpers_seen = _planner_semantic_progress_count(
+                [helper for helper in current_helper_evidence_records()
+                 if _helper_source_text(helper) in planner_helper_sources],
+                target=root_statement,
+            )
+            if (planner_deliberation_slot[0] is not None
+                    and planner_deliberation_slot[0].helper_progress_version != 1):
+                # Older checkpoints counted all helper names. Establish one
+                # current semantic baseline before comparing future progress.
+                planner_deliberation_slot[0] = dataclass_replace(
+                    planner_deliberation_slot[0], helpers_seen=deliberation_helpers_seen,
+                    helper_progress_version=1,
+                )
             pass_deliberation_trigger = _planner_deliberation_trigger(
                 config=config,
                 stats=stats,
@@ -35938,6 +36013,7 @@ class DeliberationArtifact:
     model_id: str = ""
     helpers_seen: int = 0
     reasoning_tokens: int = 0
+    helper_progress_version: int = 1
 
     def to_state_record(self) -> dict:
         return {
@@ -35965,6 +36041,7 @@ class DeliberationArtifact:
             "model_id": str(self.model_id),
             "helpers_seen": int(self.helpers_seen),
             "reasoning_tokens": int(self.reasoning_tokens),
+            "helper_progress_version": int(self.helper_progress_version),
         }
 
     @property
@@ -36056,6 +36133,7 @@ class DeliberationArtifact:
                 model_id=str(raw.get("model_id") or ""),
                 helpers_seen=int(raw.get("helpers_seen", 0) or 0),
                 reasoning_tokens=int(raw.get("reasoning_tokens", 0) or 0),
+                helper_progress_version=int(raw.get("helper_progress_version", 0) or 0),
             )
         except (TypeError, ValueError):
             return None
@@ -36186,6 +36264,73 @@ def _parse_deliberation_response(
     )
 
 
+def _planner_semantic_progress_count(helpers: Sequence[Any], *, target: str) -> int:
+    """Count distinct useful facts, excluding target wrappers and aliases."""
+    from .helper_inventory import helper_presentation_kind
+
+    facts = [
+        helper for helper in helpers
+        if helper_presentation_kind(helper, target=target) != "conditional_route"
+        and str(getattr(helper, "render_policy", "") or "") not in {
+            "advisory_requires_unproved_premise", "advisory_root_equivalent",
+        }
+    ]
+    return len(_recursive_helper_evidence_fingerprints(facts))
+
+
+def _planner_saved_catalog_is_authorized(
+    messages: Sequence[Mapping[str, Any]], helpers: Sequence[Any],
+) -> bool:
+    """Keep stored provider bytes within the currently available helper scope."""
+    current_sources = {text_hash(_helper_source_text(helper)) for helper in helpers}
+    scoped = False
+    for message in messages:
+        context = message.get("_required_prompt_context", {})
+        if not isinstance(context, Mapping) or "helper_source_hashes" not in context:
+            continue
+        source_hashes = context["helper_source_hashes"]
+        if (not isinstance(source_hashes, list)
+                or not all(isinstance(value, str) and value in current_sources
+                           for value in source_hashes)):
+            return False
+        scoped = True
+    return scoped or not any(
+        "Verified helper statements available:" in str(message.get("content", ""))
+        for message in messages
+    )
+
+
+def _planner_lookup_owner_deadline(messages: Sequence[Mapping[str, Any]]) -> Optional[float]:
+    deadlines = []
+    for message in messages:
+        context = message.get("_required_prompt_context", {})
+        if not isinstance(context, Mapping):
+            continue
+        value = context.get("helper_operation_deadline_unix")
+        if value is None:
+            continue
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError("invalid saved helper lookup deadline")
+        deadlines.append(float(value))
+    return min(deadlines) if deadlines else None
+
+
+def _planner_lookup_transport_bounds(
+    messages: Sequence[Mapping[str, Any]], *, deadline_monotonic: Optional[float],
+    request_timeout_s: float, operation_timeout_s: float,
+) -> tuple[Optional[float], float, float]:
+    """Constrain downstream transport without changing saved logical material."""
+    owner_deadline = _planner_lookup_owner_deadline(messages)
+    if owner_deadline is None:
+        return deadline_monotonic, request_timeout_s, operation_timeout_s
+    now = time.monotonic()
+    deadline = min(deadline_monotonic or float("inf"), now + owner_deadline - time.time())
+    remaining = deadline - now
+    if remaining <= 0:
+        raise TimeoutError("planner helper lookup owner deadline expired")
+    return deadline, min(request_timeout_s, remaining), min(operation_timeout_s, remaining)
+
+
 def _planner_deliberation_trigger(
     *,
     config: "MiniRecursiveConfig",
@@ -36241,6 +36386,9 @@ async def _request_planner_deliberation(
         Callable[[PlannerJobIdentity], Awaitable[None]]
     ] = None,
     provider_account_pause_enabled: bool = False,
+    helper_source_hashes: Sequence[str] = (),
+    helper_sources: Sequence[str] = (),
+    theorem_name: str = "",
 ) -> Optional[DeliberationArtifact]:
     """Phase A: reasoning-enabled prose deliberation. Never blocks planning."""
 
@@ -36270,6 +36418,7 @@ async def _request_planner_deliberation(
             "pinned": True,
             "_required_prompt_context": {
                 "kind": "mini_recursive_planner_deliberation_core",
+                "helper_source_hashes": list(helper_source_hashes),
                 "units": [
                     "root_target",
                     "planner_contract",
@@ -36519,6 +36668,9 @@ async def _request_planner_deliberation(
         try:
 
             async def run_deliberation_io() -> Any:
+                from .helper_retirement import assert_helpers_not_retired
+
+                assert_helpers_not_retired(helper_sources, theorem_name=theorem_name)
                 dispatch_client = request_client
                 dispatch_output_limit = output_limit
                 if exact_saved_request and planner_job_identity is not None:
@@ -36741,6 +36893,8 @@ async def _request_plan_parse_repair(
         Callable[[PlannerJobIdentity], Awaitable[None]]
     ] = None,
     provider_account_pause_enabled: bool = False,
+    helper_sources: Sequence[str] = (),
+    theorem_name: str = "",
 ) -> Optional["MiniSubgoalPlan"]:
     """One-shot JSON repair re-prompt for a planner response.
 
@@ -36759,7 +36913,15 @@ async def _request_plan_parse_repair(
     # token-exhaustion failure. The repair lane is a syntax normalizer:
     # it may preserve/restructure candidate claims already present in the
     # response, but it may not invent mathematical content.
-    del base_messages
+    helper_source_hashes = sorted({
+        source_hash
+        for message in base_messages
+        for context in [message.get("_required_prompt_context", {})]
+        if isinstance(context, Mapping)
+        for source_hash in context.get("helper_source_hashes", ())
+        if isinstance(source_hash, str)
+    })
+    helper_owner_deadline = _planner_lookup_owner_deadline(base_messages)
     repair_messages = [
         {
             "role": "system",
@@ -36793,6 +36955,8 @@ async def _request_plan_parse_repair(
             "pinned": True,
             "_required_prompt_context": {
                 "kind": "mini_recursive_planner_json_syntax_repair",
+                "helper_source_hashes": helper_source_hashes,
+                "helper_operation_deadline_unix": helper_owner_deadline,
                 "units": ["repair_schema", "malformed_response"],
             },
         },
@@ -36887,6 +37051,13 @@ async def _request_plan_parse_repair(
         )
 
     async def run_parse_repair_io() -> Any:
+        from .helper_retirement import assert_helpers_not_retired
+
+        assert_helpers_not_retired(helper_sources, theorem_name=theorem_name)
+        dispatch_deadline, dispatch_request_timeout, dispatch_operation_timeout = _planner_lookup_transport_bounds(
+            repair_messages, deadline_monotonic=repair_deadline_monotonic,
+            request_timeout_s=request_timeout_s, operation_timeout_s=operation_timeout_s,
+        )
         return await metered_or_plain_call(
             cost_controller=cost_controller,
             client=client,
@@ -36919,9 +37090,9 @@ async def _request_plan_parse_repair(
                 temperature_override=repair_temperature_override,
                 max_tokens_override=repair_output_limit,
                 reasoning_effort_override=repair_reasoning_effort,
-                deadline=_wall_clock_deadline(repair_deadline_monotonic),
-                request_timeout_override_s=request_timeout_s,
-                operation_timeout_override_s=operation_timeout_s,
+                deadline=_wall_clock_deadline(dispatch_deadline),
+                request_timeout_override_s=dispatch_request_timeout,
+                operation_timeout_override_s=dispatch_operation_timeout,
                 usage_callback=usage_callback,
             ),
         )
@@ -36943,6 +37114,11 @@ async def _request_plan_parse_repair(
         run=run_parse_repair_io,
         before_yield=planner_job_pending_callback,
     )
+    from .helper_retirement import assert_helpers_not_retired
+
+    assert_helpers_not_retired(helper_sources, theorem_name=theorem_name)
+    if parse_planner_helper_queries(_planner_raw_response(raw).content) is not None:
+        raise PlannerHelperQueryError("syntax repair returned a helper information request")
     try:
         authoritative_routes = tuple(
             dict.fromkeys(
@@ -37117,6 +37293,30 @@ async def _request_plan(
     provider_account_pause_enabled: bool = False,
 ) -> Optional[MiniSubgoalPlan]:
     started = time.monotonic()
+    helper_lookup_round = 0
+    helper_lookup_seen: set[str] = set()
+
+    def helper_lookup_incomplete(reason: str) -> None:
+        # No mathematical disposition has been returned. Keep operational
+        # limits and protocol errors out of the empty-plan/impasse path.
+        stats.planner_call_failures += 1
+        stats.last_planner_failure_reason = "mini_recursive_planner_helper_lookup_incomplete"
+        stats.last_planner_failure_kind = "planner_helper_lookup"
+        stats.last_planner_failure_metadata = {
+            "planner_failure_stage": "helper_lookup",
+            "helper_lookup_reason": reason,
+            "helper_lookup_round": helper_lookup_round,
+        }
+        _record(record_event, {
+            "phase": "mini_recursive_plan", "pass_index": pass_index,
+            "verdict": "planner_helper_lookup_incomplete",
+            **stats.last_planner_failure_metadata,
+        })
+
+    def assert_planner_catalog_available() -> None:
+        from .helper_retirement import assert_helpers_not_retired
+
+        assert_helpers_not_retired(helper_catalog, theorem_name=theorem_name)
     background_result = (
         planner_job_broker.peek(
             planner_job_identity.job_id, planner_job_identity.request_fingerprint,
@@ -37356,6 +37556,18 @@ async def _request_plan(
             f"planner-context-policy:v1:{planner_request_context_fingerprint}:{policy_key}"
         )
     try:
+        helper_catalog = tuple(
+            _helper_source_text(helper)
+            for helper in _answer_safe_planner_helpers(
+                helpers,
+                suppress_solution_placeholders=suppress_solution_placeholders,
+                opaque_mode=opaque_mode,
+                allow_official_answer_visibility=allow_official_answer_visibility,
+                official_answer_payload_present=official_answer_payload_present,
+                theorem_name=theorem_name,
+            )
+        )
+        helpers = helper_catalog
         proposed_section = _render_proposed_helpers_for_planner(
             proposed_helpers,
             suppress_solution_placeholders=suppress_solution_placeholders,
@@ -37454,6 +37666,9 @@ async def _request_plan(
                         official_answer_payload_present=(
                             official_answer_payload_present
                         ),
+                        target=active_planner_statement or root_statement,
+                        lookup_available=True,
+                        theorem_name=theorem_name,
                     ),
                     max_claims=max(1, claim_limit - 1),
                     # Mirror is_answer_unsafe_statement_text's effective
@@ -37473,6 +37688,20 @@ async def _request_plan(
                 proposed_section,
                 _format_planner_feedback(planner_feedback_items),
                 tranche_instruction,
+                (
+                    "HELPER INFORMATION REQUESTS\n"
+                    "Before a plan or impasse, you may return a separate JSON object "
+                    '{"helper_queries":[{"name":"exact_lemma_name"}]} or '
+                    '{"helper_queries":[{"query":"search terms"}]}. '
+                    "Use {} to browse the inventory. Return one to three queries per "
+                    "turn, at most four lookup turns. Do not include claims, strategy, "
+                    "or an impasse in an information request. Results contain exact "
+                    "signatures and hypotheses, never proof bodies. Continue a page "
+                    "with its next_offset as offset and the same snapshot_id and "
+                    "name/query; optional length is 1..12000 characters. Read all "
+                    "pages of a signature before relying on its premises. Then return "
+                    "the requested plan. Omitted helpers remain available to Lean."
+                ),
                 str(proof_idea_lifecycle_context or ""),
             )
             if str(part or "").strip()
@@ -37566,6 +37795,8 @@ async def _request_plan(
                     "benchmark facts, or output proof code. Unavailable "
                     "non-Mathlib facts may become explicit obligations only "
                     "when you can explain a plausible argument for them. "
+                    "The helper catalog is a selection; request omitted signatures "
+                    "with helper_queries when needed and consider new approaches. "
                     "Assess the decisive unproved bridge before optional "
                     "identities. If the route lacks mathematical support, "
                     "return search_disposition=impasse with an impasse_reason "
@@ -37580,6 +37811,7 @@ async def _request_plan(
                 "pinned": True,
                 "_required_prompt_context": {
                     "kind": "mini_recursive_planner_core",
+                    "helper_source_hashes": [text_hash(source) for source in helper_catalog],
                     "units": [
                         "root_target",
                         "planner_contract",
@@ -37606,6 +37838,26 @@ async def _request_plan(
                     },
                 }
             )
+        saved_scope_messages = _saved_planner_request_messages(
+            planner_job_identity,
+            expected_stages={planner_job_identity.stage} if planner_job_identity else set(),
+        )
+        if (saved_scope_messages is not None
+                and not _planner_saved_catalog_is_authorized(saved_scope_messages, helper_catalog)):
+            helper_lookup_incomplete("saved_catalog_no_longer_authorized")
+            return None
+        if saved_scope_messages is not None:
+            saved_owner_deadline = _planner_lookup_owner_deadline(saved_scope_messages)
+            if saved_owner_deadline is not None:
+                remaining_owner_s = saved_owner_deadline - time.time()
+                if remaining_owner_s <= 0:
+                    helper_lookup_incomplete("operation_deadline")
+                    return None
+                planner_deadlines_enabled = True
+                planner_operation_deadline_monotonic = min(
+                    planner_operation_deadline_monotonic or float("inf"),
+                    time.monotonic() + remaining_owner_s,
+                )
         if (
             planner_job_broker is not None
             and planner_job_identity is not None
@@ -37645,6 +37897,7 @@ async def _request_plan(
             primary_job_identity = planner_job_identity
             deferred_primary_receipt_started = True
             resumed_repair = await _request_plan_parse_repair(
+                helper_sources=helper_catalog, theorem_name=theorem_name,
                 provider_account_pause_enabled=provider_account_pause_enabled,
                 base_messages=request_messages,
                 unparseable_content="",
@@ -37699,6 +37952,8 @@ async def _request_plan(
                 official_answer_payload_present=(official_answer_payload_present),
             )
             fresh_deliberation = await _request_planner_deliberation(
+                helper_source_hashes=[text_hash(source) for source in helper_catalog],
+                helper_sources=helper_catalog, theorem_name=theorem_name,
                 provider_account_pause_enabled=provider_account_pause_enabled,
                 client=deliberation_client,
                 cost_controller=cost_controller,
@@ -37816,6 +38071,7 @@ async def _request_plan(
                     "contract_replan",
                     "reasoning_recovery",
                     "visibility_recovery",
+                    "helper_lookup",
                 }
             ),
         )
@@ -37836,6 +38092,11 @@ async def _request_plan(
         if not saved_context_compatible:
             saved_request_messages = None
             saved_request_io_policy = None
+        if (planner_job_identity is not None
+                and planner_job_identity.stage == "helper_lookup"
+                and saved_request_messages is None):
+            helper_lookup_incomplete("saved_lookup_request_unavailable")
+            return None
         saved_broker_result = (
             planner_job_broker.peek(
                 planner_job_identity.job_id,
@@ -37856,6 +38117,66 @@ async def _request_plan(
         ):
             planner_job_broker.acknowledge(planner_job_identity)
         if saved_request_messages is not None:
+            scoped_catalog_found = False
+            current_sources = {
+                text_hash(_helper_source_text(helper)): helper
+                for helper in helper_catalog
+            }
+            for saved_message in saved_request_messages:
+                context = saved_message.get("_required_prompt_context", {})
+                if isinstance(context, Mapping) and "helper_source_hashes" in context:
+                    source_hashes = context["helper_source_hashes"]
+                    if (not isinstance(source_hashes, list)
+                            or not all(isinstance(value, str) and value in current_sources
+                                       for value in source_hashes)):
+                        helper_lookup_incomplete("saved_catalog_no_longer_authorized")
+                        return None
+                    scoped_catalog_found = True
+                if (isinstance(context, Mapping)
+                        and context.get("kind") == "mini_recursive_planner_helper_lookup"):
+                    source_hashes = context.get("helper_source_hashes")
+                    saved_round = context.get("helper_lookup_round")
+                    saved_deadline = context.get("helper_operation_deadline_unix")
+                    if (not isinstance(source_hashes, list)
+                            or not all(isinstance(value, str) and value in current_sources
+                                       for value in source_hashes)
+                            or type(saved_round) is not int or not 1 <= saved_round <= 4
+                            or (saved_deadline is not None and (
+                                type(saved_deadline) not in (int, float)
+                                or not math.isfinite(saved_deadline)
+                            ))):
+                        helper_lookup_incomplete("saved_catalog_no_longer_authorized")
+                        return None
+                    helper_catalog = tuple(current_sources[value] for value in source_hashes)
+                    helper_lookup_round = saved_round
+                    if saved_deadline is not None:
+                        remaining_lookup_s = saved_deadline - time.time()
+                        if remaining_lookup_s <= 0.0:
+                            helper_lookup_incomplete("operation_deadline")
+                            return None
+                        planner_deadlines_enabled = True
+                        planner_operation_deadline_monotonic = min(
+                            planner_operation_deadline_monotonic or float("inf"),
+                            time.monotonic() + remaining_lookup_s,
+                        )
+                if saved_message.get("role") == "assistant":
+                    try:
+                        prior_queries = parse_planner_helper_queries(saved_message.get("content", ""))
+                    except ValueError:
+                        prior_queries = None
+                    for prior_query in prior_queries or ():
+                        helper_lookup_seen.add(json.dumps(prior_query, sort_keys=True))
+            if not scoped_catalog_found and any(
+                "Verified helper statements available:" in str(message.get("content", ""))
+                for message in saved_request_messages
+            ):
+                helper_lookup_incomplete("legacy_helper_catalog_scope_unavailable")
+                return None
+            if (planner_job_identity is not None
+                    and planner_job_identity.stage == "helper_lookup"
+                    and helper_lookup_round != planner_job_identity.stage_round):
+                helper_lookup_incomplete("invalid_saved_lookup_round")
+                return None
             saved_request_client = _planner_provider_lane_client(
                 plan_request_client,
                 planner_job_identity.provider_lane_fingerprint,
@@ -37916,6 +38237,7 @@ async def _request_plan(
                         "contract_replan",
                         "reasoning_recovery",
                         "visibility_recovery",
+                        "helper_lookup",
                     }
                 )
                 or saved_request_messages is not None
@@ -37979,6 +38301,9 @@ async def _request_plan(
             if saved_request_messages is not None
             else request_messages
         )
+        # Recovery and syntax normalization inherit the exact request that
+        # produced this response, including lookup scope and owner deadline.
+        request_messages = planner_io_messages
         planner_io_stage = (
             planner_job_identity.stage
             if saved_request_messages is not None and planner_job_identity is not None
@@ -37986,6 +38311,9 @@ async def _request_plan(
         )
         planner_io_action_id = "mini_recursive_plan"
         planner_io_call_kind = "chat_raw_json_plan"
+        if planner_io_stage == "helper_lookup":
+            planner_io_action_id = "mini_recursive_plan_helper_lookup"
+            planner_io_call_kind = "chat_raw_json_plan_helper_lookup"
         planner_io_reasoning_effort = planner_reasoning_effort
         planner_io_temperature = temperature_decision.provider_temperature_override(plan_request_client)
         planner_io_max_tokens = planner_max_tokens
@@ -38153,6 +38481,12 @@ async def _request_plan(
             )
 
         async def run_primary_planner_io() -> Any:
+            assert_planner_catalog_available()
+            dispatch_deadline, dispatch_request_timeout, dispatch_operation_timeout = _planner_lookup_transport_bounds(
+                planner_io_messages, deadline_monotonic=planner_io_deadline_monotonic,
+                request_timeout_s=planner_request_timeout_s,
+                operation_timeout_s=planner_operation_timeout_s,
+            )
             return await _await_with_planner_inflight_heartbeat(
                 metered_or_plain_call(
                     cost_controller=cost_controller,
@@ -38201,9 +38535,9 @@ async def _request_plan(
                         # role's configured effort and enforce a high floor.
                         reasoning_effort_override=planner_io_reasoning_effort,
                         max_tokens_override=planner_io_output_limit,
-                        deadline=_wall_clock_deadline(planner_io_deadline_monotonic),
-                        request_timeout_override_s=planner_request_timeout_s,
-                        operation_timeout_override_s=planner_operation_timeout_s,
+                        deadline=_wall_clock_deadline(dispatch_deadline),
+                        request_timeout_override_s=dispatch_request_timeout,
+                        operation_timeout_override_s=dispatch_operation_timeout,
                         usage_callback=usage_callback,
                     ),
                 ),
@@ -38237,6 +38571,7 @@ async def _request_plan(
             "reasoning_recovery",
             "visibility_recovery",
             "parse_repair",
+            "helper_lookup",
         }
         exact_primary_receipt = bool(
             primary_job_identity is not None
@@ -38314,6 +38649,14 @@ async def _request_plan(
                 stats.planner_parse_retries += 1
             else:
                 stats.planner_calls += 1
+        from .helper_retirement import HelperRetirementError
+
+        if isinstance(exc, (HelperRetirementError, PlannerHelperQueryError)):
+            helper_lookup_incomplete(
+                "helper_retired_during_planning" if isinstance(exc, HelperRetirementError)
+                else "information_request_in_syntax_repair"
+            )
+            return None
         if plan_request_client is not client and active_deliberation is not None:
             public_artifact = dataclass_replace(
                 active_deliberation,
@@ -38402,6 +38745,11 @@ async def _request_plan(
         )
         return None
 
+    try:
+        assert_planner_catalog_available()
+    except ValueError:
+        helper_lookup_incomplete("helper_retired_during_planning")
+        return None
     planner_response = _planner_raw_response(raw)
     planner_visibility_recovered = False
     planner_reasoning_recovered = False
@@ -38464,6 +38812,12 @@ async def _request_plan(
         ) = escalation_transport_bounds(plan_call_is_premium)
 
         async def run_resumed_visibility_io() -> Any:
+            assert_planner_catalog_available()
+            dispatch_deadline, dispatch_request_timeout, dispatch_operation_timeout = _planner_lookup_transport_bounds(
+                visibility_messages, deadline_monotonic=None,
+                request_timeout_s=planner_request_timeout_s,
+                operation_timeout_s=planner_operation_timeout_s,
+            )
             return await _await_with_planner_inflight_heartbeat(
                 metered_or_plain_call(
                     cost_controller=cost_controller,
@@ -38491,13 +38845,15 @@ async def _request_plan(
                             "reasoning_effort_override",
                             "request_timeout_override_s",
                             "operation_timeout_override_s",
+                            *(("deadline",) if dispatch_deadline is not None else ()),
                         ),
                         response_format=wire_response_format(plan_request_client, "json"),
                         temperature_override=mini_automatic_temperature_override(plan_request_client, 0.0),
                         reasoning_effort_override=visibility_reasoning_effort,
                         max_tokens_override=visibility_envelope,
-                        request_timeout_override_s=planner_request_timeout_s,
-                        operation_timeout_override_s=planner_operation_timeout_s,
+                        request_timeout_override_s=dispatch_request_timeout,
+                        operation_timeout_override_s=dispatch_operation_timeout,
+                        **({"deadline": _wall_clock_deadline(dispatch_deadline)} if dispatch_deadline is not None else {}),
                         usage_callback=usage_callback,
                     ),
                 ),
@@ -38634,6 +38990,13 @@ async def _request_plan(
             ) = escalation_transport_bounds(plan_call_is_premium)
 
             async def run_reasoning_recovery_io() -> Any:
+                assert_planner_catalog_available()
+                dispatch_deadline, dispatch_request_timeout, dispatch_operation_timeout = _planner_lookup_transport_bounds(
+                    reasoning_messages,
+                    deadline_monotonic=planner_operation_deadline_monotonic if planner_deadlines_enabled else None,
+                    request_timeout_s=planner_request_timeout_s,
+                    operation_timeout_s=planner_operation_timeout_s,
+                )
                 return await _await_with_planner_inflight_heartbeat(
                     metered_or_plain_call(
                         cost_controller=cost_controller,
@@ -38669,13 +39032,9 @@ async def _request_plan(
                             ),
                             reasoning_effort_override=planner_reasoning_effort,
                             max_tokens_override=reasoning_output_limit,
-                            deadline=_wall_clock_deadline(
-                                planner_operation_deadline_monotonic
-                                if planner_deadlines_enabled
-                                else None
-                            ),
-                            request_timeout_override_s=planner_request_timeout_s,
-                            operation_timeout_override_s=planner_operation_timeout_s,
+                            deadline=_wall_clock_deadline(dispatch_deadline),
+                            request_timeout_override_s=dispatch_request_timeout,
+                            operation_timeout_override_s=dispatch_operation_timeout,
                             usage_callback=usage_callback,
                         ),
                     ),
@@ -38878,6 +39237,12 @@ async def _request_plan(
                 ) = escalation_transport_bounds(plan_call_is_premium)
 
                 async def run_visibility_recovery_io() -> Any:
+                    assert_planner_catalog_available()
+                    dispatch_deadline, dispatch_request_timeout, dispatch_operation_timeout = _planner_lookup_transport_bounds(
+                        visibility_messages, deadline_monotonic=None,
+                        request_timeout_s=planner_request_timeout_s,
+                        operation_timeout_s=planner_operation_timeout_s,
+                    )
                     return await _await_with_planner_inflight_heartbeat(
                         metered_or_plain_call(
                             cost_controller=cost_controller,
@@ -38906,13 +39271,15 @@ async def _request_plan(
                                         "reasoning_effort_override",
                                         "request_timeout_override_s",
                                         "operation_timeout_override_s",
+                                        *(("deadline",) if dispatch_deadline is not None else ()),
                                     ),
                                     response_format=wire_response_format(plan_request_client, "json"),
                                     temperature_override=mini_automatic_temperature_override(plan_request_client, 0.0),
                                     reasoning_effort_override=visibility_reasoning_effort,
                                     max_tokens_override=visibility_envelope,
-                                    request_timeout_override_s=planner_request_timeout_s,
-                                    operation_timeout_override_s=planner_operation_timeout_s,
+                                    request_timeout_override_s=dispatch_request_timeout,
+                                    operation_timeout_override_s=dispatch_operation_timeout,
+                                    **({"deadline": _wall_clock_deadline(dispatch_deadline)} if dispatch_deadline is not None else {}),
                                     usage_callback=usage_callback,
                                 )
                             ),
@@ -39078,6 +39445,159 @@ async def _request_plan(
                 },
             )
             return None
+    # Information requests are ordinary paid planner turns. Each continuation
+    # uses the same broker, deadline, financial admission and durable envelope
+    # as the original request; only complete plan responses enter compilation.
+    while True:
+        try:
+            assert_planner_catalog_available()
+            helper_queries = parse_planner_helper_queries(planner_response.content)
+        except ValueError as exc:
+            helper_lookup_incomplete(str(exc))
+            return None
+        if helper_queries is None:
+            break
+        if helper_lookup_round >= 4:
+            helper_lookup_incomplete("lookup_round_limit")
+            return None
+        query_keys = [json.dumps(query, sort_keys=True) for query in helper_queries]
+        if (len(set(query_keys)) != len(query_keys)
+                or any(key in helper_lookup_seen for key in query_keys)):
+            helper_lookup_incomplete("repeated_query")
+            return None
+        if planner_budget_remaining_s() <= 0.0:
+            helper_lookup_incomplete("operation_deadline")
+            return None
+        if cost_controller is not None and cost_controller.exhausted():
+            helper_lookup_incomplete("cost_budget")
+            return None
+        helper_lookup_io_started = False
+        try:
+            from .helper_inventory import read_helper_catalog
+
+            if plan_call_is_premium and (
+                premium_call_authorizer is None
+                or not await premium_call_authorizer("helper_lookup")
+            ):
+                helper_lookup_incomplete("premium_call_limit")
+                return None
+            query_results = [
+                read_helper_catalog(
+                    helper_catalog,
+                    ({**query, "length": min(query.get("length", 6000), 12000 // len(helper_queries))}
+                     if "length" in query or len(helper_queries) > 2 else query),
+                    redact_solution_refs=suppress_solution_placeholders,
+                )
+                for query in helper_queries
+            ]
+            helper_lookup_round += 1
+            helper_lookup_seen.update(query_keys)
+            planner_io_messages = _planner_messages_without_opaque_continuation(
+                planner_io_messages
+            )
+            planner_io_messages.extend([
+                {"role": "assistant", "content": planner_response.content},
+                {
+                    "role": "user",
+                    "content": "Verified helper lookup results:\n" + json.dumps(
+                        query_results, ensure_ascii=False,
+                    ) + "\nUse complete signatures and premises. Return the plan or a new helper query.",
+                    "pinned": True,
+                    "_required_prompt_context": {
+                        "kind": "mini_recursive_planner_helper_lookup",
+                        "units": ["exact_helper_signatures"],
+                        "helper_lookup_round": helper_lookup_round,
+                        "helper_operation_deadline_unix": _wall_clock_deadline(
+                            planner_operation_deadline_monotonic
+                            if planner_deadlines_enabled else None
+                        ),
+                        "helper_source_hashes": [
+                            text_hash(_helper_source_text(helper)) for helper in helper_catalog
+                        ],
+                    },
+                },
+            ])
+            request_messages = planner_io_messages
+            planner_io_stage = "helper_lookup"
+            planner_io_action_id = "mini_recursive_plan_helper_lookup"
+            planner_io_call_kind = "chat_raw_json_plan_helper_lookup"
+            planner_io_max_tokens, planner_io_output_limit = await _prepare_planner_output_request(
+                plan_request_client, planner_envelope, messages=planner_io_messages,
+            )
+            (
+                planner_dispatch_max_attempts,
+                planner_request_timeout_s,
+                planner_operation_timeout_s,
+            ) = escalation_transport_bounds(plan_call_is_premium)
+            planner_io_deadline_monotonic = (
+                planner_operation_deadline_monotonic if planner_deadlines_enabled else None
+            )
+            planner_io_policy = _planner_io_policy_record(
+                max_tokens=planner_io_max_tokens,
+                output_limit=planner_io_output_limit,
+                reasoning_effort=planner_io_reasoning_effort,
+                temperature=planner_io_temperature,
+                provider_dispatch_max_attempts=planner_dispatch_max_attempts,
+                request_timeout_s=planner_request_timeout_s,
+                operation_timeout_s=planner_operation_timeout_s,
+                deadlines_enabled=planner_deadlines_enabled,
+            )
+            primary_job_identity = _planner_stage_job_identity(
+                primary_job_identity, stage="helper_lookup",
+                round_index=helper_lookup_round, material=planner_io_messages,
+                request_context_fingerprint=planner_request_context_fingerprint,
+                io_policy=planner_io_policy,
+            )
+            if planner_job_broker is None or primary_job_identity is None:
+                stats.planner_calls += 1
+            helper_lookup_io_started = True
+            raw = await _await_planner_job_or_yield(
+                provider_account_pause_enabled=provider_account_pause_enabled,
+                broker=planner_job_broker, identity=primary_job_identity,
+                run=run_primary_planner_io,
+                before_yield=planner_job_pending_callback,
+            )
+            if planner_job_broker is not None and primary_job_identity is not None:
+                stats.planner_calls += 1
+            helper_lookup_io_started = False
+            planner_response = _planner_raw_response(raw)
+            if _planner_response_is_incomplete(planner_response)[0]:
+                helper_lookup_incomplete("incomplete_provider_response")
+                return None
+        except Exception as exc:
+            _raise_if_recursive_control_failure(exc)
+            if (helper_lookup_io_started and planner_job_broker is not None
+                    and primary_job_identity is not None):
+                stats.planner_calls += 1
+            classification = classify_llm_exception(exc)
+            scope = llm_failure_scope(classification.failure_reason)
+            if classification.terminal or scope == "scoped":
+                stats.planner_call_failures += 1
+                stats.last_planner_failure_reason = classification.failure_reason
+                stats.last_planner_failure_kind = classification.kind
+                stats.last_planner_failure_metadata = {
+                    **llm_retry_deadline_record_from_exception(exc),
+                    **transport_failure_record_from_exception(exc),
+                    **provider_defer_record_from_exception(plan_request_client, exc),
+                    **planner_failure_projection(
+                        classification, error=exc,
+                        provider_calls_completed=helper_lookup_round, stage="helper_lookup",
+                    ),
+                }
+                if classification.terminal:
+                    stats.planner_terminal_failures += 1
+                else:
+                    stats.planner_scoped_failures += 1
+                _record(record_event, {
+                    "phase": "mini_recursive_plan", "pass_index": pass_index,
+                    "verdict": "plan_call_failed", "error": f"{type(exc).__name__}: {exc}",
+                    "terminal_failure_reason": classification.failure_reason if classification.terminal else "",
+                    **stats.last_planner_failure_metadata,
+                })
+                return None
+            helper_lookup_incomplete(type(exc).__name__)
+            return None
+
     content = planner_response.content
     planner_response_source = ""
     try:
@@ -39150,6 +39670,7 @@ async def _request_plan(
                     planner_operation_timeout_s,
                 ) = escalation_transport_bounds(plan_call_is_premium)
                 repair_plan = await _request_plan_parse_repair(
+                    helper_sources=helper_catalog, theorem_name=theorem_name,
                     provider_account_pause_enabled=provider_account_pause_enabled,
                     base_messages=request_messages,
                     unparseable_content=repair_source,
@@ -39181,6 +39702,14 @@ async def _request_plan(
                 if deferred_repair_job:
                     stats.planner_parse_retries += 1
                 _raise_if_recursive_control_failure(repair_exc)
+                from .helper_retirement import HelperRetirementError
+
+                if isinstance(repair_exc, (HelperRetirementError, PlannerHelperQueryError)):
+                    helper_lookup_incomplete(
+                        "helper_retired_during_planning" if isinstance(repair_exc, HelperRetirementError)
+                        else "information_request_in_syntax_repair"
+                    )
+                    return None
                 repair_plan = None
                 stats.planner_call_failures += 1
                 # A TERMINAL error inside the repair call (e.g. budget exhausted

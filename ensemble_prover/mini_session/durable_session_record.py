@@ -481,11 +481,17 @@ async def _prepare_dossier(
     helper evidence updates the graph bound to its validated scheduler/actions.
     Other callers receive an independently imported dossier as before.
     """
-    dossier = (staged_dossier if staged_dossier is not None
-               else ProofDossier._from_execution_record_for_reverification(data))
     originals = data.get("verified_helpers")
     if type(originals) is not list:
         raise ValueError("checkpoint helper list is malformed")
+    from ensemble_prover.helper_retirement import assert_helpers_not_retired
+
+    assert_helpers_not_retired(
+        (item.get("source", "") for item in originals if isinstance(item, dict)),
+        theorem_name=str(data.get("cache_owner_theorem_name") or data.get("theorem_name") or ""),
+    )
+    dossier = (staged_dossier if staged_dossier is not None
+               else ProofDossier._from_execution_record_for_reverification(data))
     expected = {item["name"]: item for item in originals}
     if len(expected) != len(originals) or set(expected) != set(dossier.verified_helpers):
         raise ValueError("checkpoint helper admission rejected saved source")

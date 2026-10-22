@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from .subgoal_compiler import SubgoalVariant, build_subgoal_variants
 from .utils import normalize_subgoal_statement
@@ -622,6 +622,8 @@ def parse_mini_subgoal_plan_response(raw_response: str) -> MiniSubgoalPlan:
     ``subgoals``, ``lemmas``, ``steps``, or ``plan``.
     """
 
+    if parse_planner_helper_queries(raw_response) is not None:
+        raise PlannerHelperQueryError("helper information requests must be dispatched before compiling a plan")
     parse_errors: list[str] = []
     # Rank parsed candidates and take the max. CLASS is the load-bearing signal:
     # primary (the model's real output, carrying strategy/notes/root_statement) >
@@ -1026,6 +1028,62 @@ def compile_parsed_mini_subgoal_plan(
         max_prefix_chars=max_prefix_chars,
         max_variants=max_variants,
     )
+
+
+class PlannerHelperQueryError(ValueError):
+    """A helper information request cannot be interpreted as a theorem plan."""
+
+
+def parse_planner_helper_queries(content: str) -> Optional[list[dict[str, Any]]]:
+    """Recognize a bounded information request before interpreting a plan.
+
+    Lookup and executable planning are separate protocol turns. A malformed
+    lookup must never become an empty plan or a mathematical impasse.
+    """
+    payloads = []
+    competing_plan = False
+    for candidate in extract_planner_json_candidates(str(content or "")):
+        try:
+            value = json.loads(candidate, strict=False)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, dict) and "helper_queries" in value and value not in payloads:
+            payloads.append(value)
+        elif isinstance(value, dict) and any(
+            isinstance(value.get(key), list) and value[key]
+            for key in ("claims", "subgoals", "lemmas", "steps", "plan")
+        ):
+            competing_plan = True
+    if not payloads:
+        return None
+    if len(payloads) != 1 or competing_plan:
+        raise PlannerHelperQueryError("ambiguous helper information requests")
+    payload = payloads[0]
+    if set(payload) - {"helper_queries", "claims"} or payload.get("claims", []) != []:
+        raise PlannerHelperQueryError("helper_queries must be separate from an executable plan")
+    queries = payload["helper_queries"]
+    if not isinstance(queries, list) or not 1 <= len(queries) <= 3:
+        raise PlannerHelperQueryError("helper_queries must contain one to three queries")
+    for query in queries:
+        if not isinstance(query, dict) or set(query) - {
+            "name", "query", "offset", "length", "snapshot_id",
+        }:
+            raise PlannerHelperQueryError("unsupported helper query fields")
+        if "name" in query and "query" in query:
+            raise PlannerHelperQueryError("use either an exact name or a text query")
+        for key in ("name", "query", "snapshot_id"):
+            if key in query and (
+                not isinstance(query[key], str)
+                or not query[key].strip()
+                or len(query[key]) > 256
+            ):
+                raise PlannerHelperQueryError(f"invalid helper query {key}")
+        for key, low, high in (("offset", 0, 8_000_000), ("length", 1, 12_000)):
+            if key in query and (
+                type(query[key]) is not int or not low <= query[key] <= high
+            ):
+                raise PlannerHelperQueryError(f"invalid helper query {key}")
+    return [dict(query) for query in queries]
 
 
 def render_mini_subgoal_planner_prompt(

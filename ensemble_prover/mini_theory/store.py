@@ -12,6 +12,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Iterator, Optional
+from ensemble_prover.helper_retirement import theory_source_is_retired
 
 from .lease import TheoryLeaseOwner
 from .model import (
@@ -279,6 +280,8 @@ class TheoryStore:
         created_ts: Optional[float] = None,
     ) -> PublishedTheoryBundle:
         self._validate_receipt(candidate, receipt)
+        if theory_source_is_retired(candidate.source, theorem_name=candidate.source_theorem):
+            raise TheoryStoreError("theory publication contains an operator-retired helper")
         published = PublishedTheoryBundle(
             schema_version=MINI_THEORY_SCHEMA_VERSION,
             bundle_id=candidate.bundle_id,
@@ -348,6 +351,8 @@ class TheoryStore:
             committed_candidate: Optional[PublishedTheoryBundle] = None
             try:
                 with self._publish_lock():
+                    if theory_source_is_retired(candidate.source, theorem_name=candidate.source_theorem):
+                        raise TheoryStoreError("theory publication contains an operator-retired helper")
                     if final_dir.exists():
                         existing = self.load(
                             candidate.bundle_id,
@@ -464,6 +469,8 @@ class TheoryStore:
         except Exception as exc:
             raise TheoryStoreError(f"invalid theory manifest {manifest_path}: {exc}") from exc
         source = source_path.read_text(encoding="utf-8").strip()
+        if theory_source_is_retired(source, theorem_name=bundle.source_theorem):
+            return None
         from .model import sanitize_module_segment
 
         expected_segment = sanitize_module_segment(domain)
