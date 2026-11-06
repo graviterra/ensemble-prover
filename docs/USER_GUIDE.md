@@ -932,6 +932,13 @@ rechecked by Lean before being seeded into a new dossier. Its default file is
 `runs/mini_prover_cache/verified_helpers.jsonl` in the Ensemble Prover
 checkout.
 
+When cached helpers use the same name for different declarations, restoration
+considers their exact source dependencies together and prefers larger compatible
+sets. This ordering is a reuse heuristic; every admitted helper still requires
+Lean verification. Distinct recorded contexts for the same proof remain available
+as alternatives. Incompatible declarations cannot coexist under one name in a
+single session, and restoration never replaces an already admitted declaration.
+
 ```bash
 --proof-state-cache-path /path/to/verified_helpers.jsonl
 --no-proof-state-cache

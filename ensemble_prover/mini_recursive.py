@@ -7266,7 +7266,12 @@ def _planner_io_policy_record(
         "schema_version": 1,
         "max_tokens": max(1, int(max_tokens or 1)),
         "reasoning_effort": str(reasoning_effort or ""),
-        "temperature": temperature,
+        # Keep the existing serialized spelling so old durable requests retain
+        # their exact fingerprints. The provider sentinel itself is not JSON.
+        "temperature": (
+            "API_DEFAULT_TEMPERATURE"
+            if temperature is API_DEFAULT_TEMPERATURE else temperature
+        ),
         "provider_dispatch_max_attempts": max(
             0,
             int(provider_dispatch_max_attempts or 0),
@@ -7309,7 +7314,7 @@ def _validated_planner_io_policy(
     if len(reasoning_effort) > 64:
         return None
     temperature = policy.get("temperature")
-    if temperature is not None:
+    if temperature is not None and temperature != "API_DEFAULT_TEMPERATURE":
         try:
             temperature = float(temperature)
         except (TypeError, ValueError, OverflowError):
@@ -7333,6 +7338,16 @@ def _validated_planner_io_policy(
             return None
         normalized["request_envelope_receipts"] = [r.to_record() for r in receipts]
     return normalized
+
+
+def _planner_temperature_override(temperature: Any) -> Any:
+    """Restore the provider sentinel from a validated durable policy."""
+
+    return (
+        API_DEFAULT_TEMPERATURE
+        if temperature == "API_DEFAULT_TEMPERATURE"
+        else temperature
+    )
 
 
 def _planner_bound_request_fingerprint(
@@ -36641,7 +36656,7 @@ async def _request_planner_deliberation(
         max_tokens = int(effective_io_policy["max_tokens"])
         output_limit = current_output_limit
         effective_reasoning_effort = str(effective_io_policy["reasoning_effort"])
-        effective_temperature = effective_io_policy["temperature"]
+        effective_temperature = _planner_temperature_override(effective_io_policy["temperature"])
         effective_dispatch_attempts = int(
             effective_io_policy["provider_dispatch_max_attempts"]
         )
@@ -37039,7 +37054,7 @@ async def _request_plan_parse_repair(
         repair_max_tokens = int(repair_io_policy["max_tokens"])
         repair_output_limit = _saved_planner_output_limit(client, repair_io_policy)
         repair_reasoning_effort = str(repair_io_policy["reasoning_effort"])
-        repair_temperature_override = repair_io_policy["temperature"]
+        repair_temperature_override = _planner_temperature_override(repair_io_policy["temperature"])
         provider_dispatch_max_attempts = int(
             repair_io_policy["provider_dispatch_max_attempts"]
         )
@@ -37296,7 +37311,7 @@ async def _request_plan(
     helper_lookup_round = 0
     helper_lookup_seen: set[str] = set()
 
-    def helper_lookup_incomplete(reason: str) -> None:
+    def helper_lookup_incomplete(reason: str, **metadata: Any) -> None:
         # No mathematical disposition has been returned. Keep operational
         # limits and protocol errors out of the empty-plan/impasse path.
         stats.planner_call_failures += 1
@@ -37306,6 +37321,7 @@ async def _request_plan(
             "planner_failure_stage": "helper_lookup",
             "helper_lookup_reason": reason,
             "helper_lookup_round": helper_lookup_round,
+            **metadata,
         }
         _record(record_event, {
             "phase": "mini_recursive_plan", "pass_index": pass_index,
@@ -38095,7 +38111,11 @@ async def _request_plan(
         if (planner_job_identity is not None
                 and planner_job_identity.stage == "helper_lookup"
                 and saved_request_messages is None):
-            helper_lookup_incomplete("saved_lookup_request_unavailable")
+            helper_lookup_incomplete(
+                "saved_lookup_request_unavailable",
+                saved_request_envelope_valid=saved_request_envelope is not None,
+                saved_request_context_compatible=saved_context_compatible,
+            )
             return None
         saved_broker_result = (
             planner_job_broker.peek(
@@ -38409,7 +38429,7 @@ async def _request_plan(
                 plan_request_client, planner_io_policy,
             )
             planner_io_reasoning_effort = str(planner_io_policy["reasoning_effort"])
-            saved_planner_io_temperature = planner_io_policy["temperature"]
+            saved_planner_io_temperature = _planner_temperature_override(planner_io_policy["temperature"])
             if (
                 planner_io_stage == "visibility_recovery"
                 and saved_planner_io_temperature != mini_automatic_temperature_override(plan_request_client, 0.0)
@@ -38420,6 +38440,7 @@ async def _request_plan(
                 return None
             saved_temperature_is_api_default = (
                 saved_planner_io_temperature is None
+                or saved_planner_io_temperature is API_DEFAULT_TEMPERATURE
             )
             planner_io_temperature = (
                 API_DEFAULT_TEMPERATURE

@@ -1656,7 +1656,9 @@ _GRAPH_LEAN_GROUP_OPEN_TO_CLOSE = {
     "⦃": "⦄",
     "⟨": "⟩",
 }
-_GRAPH_LEAN_IDENTIFIER_PATTERN = r"(?:[A-Za-z_][A-Za-z0-9_'.]*|«[^»]+»)"
+_GRAPH_LEAN_IDENTIFIER_PATTERN = (
+    rf"(?:[{_GRAPH_LEAN_ID_FIRST_CHARS}][{_GRAPH_LEAN_ID_REST_CHARS}.]*|«[^»]+»)"
+)
 _GRAPH_RELATION_BINDER_TOKENS = (
     "∈",
     "∉",
@@ -2105,6 +2107,7 @@ def _graph_let_layout_suffix_starts_body(
     assign_index: int,
     newline_index: int,
     line_end: int,
+    binding_indent: int = 0,
 ) -> bool:
     assigned_prefix = raw[assign_index + 2 : newline_index].strip()
     if not assigned_prefix:
@@ -2116,7 +2119,7 @@ def _graph_let_layout_suffix_starts_body(
     visible_suffix = suffix[indent_len:].lstrip()
     if not visible_suffix:
         return False
-    if indent_len == 0:
+    if indent_len <= binding_indent:
         return True
     name = _graph_let_binding_name_from_prefix(raw[:assign_index])
     return bool(
@@ -2217,6 +2220,9 @@ def _graph_let_binding_is_syntactically_complete(binding: str) -> bool:
         identifier = re.match(_GRAPH_LEAN_IDENTIFIER_PATTERN, parameter_surface[index:])
         if identifier is None:
             return False
+        if identifier.group(0) in {"ℕ", "ℤ", "ℚ", "ℝ", "ℂ"}:
+            # Standard type notation is not an unescaped parameter binder.
+            return False
         index += len(identifier.group(0))
     return bool(
         _graph_text_has_balanced_groups(parameter_surface)
@@ -2224,8 +2230,13 @@ def _graph_let_binding_is_syntactically_complete(binding: str) -> bool:
     )
 
 
-def _graph_top_level_let_parts(text: str) -> Tuple[str, str]:
-    raw = str(text or "").strip()
+def _graph_top_level_let_parts(
+    text: str, *, preserve_layout: bool = False,
+) -> Tuple[str, str]:
+    source = str(text or "")
+    leading = len(source) - len(source.lstrip())
+    binding_indent = leading - source.rfind("\n", 0, leading) - 1
+    raw = source.strip()
     if not re.match(r"^let(?:\s|\(|⟨)", raw):
         return "", ""
     equation_style_let_rec = bool(re.match(r"^let\s+rec\b", raw))
@@ -2247,7 +2258,7 @@ def _graph_top_level_let_parts(text: str) -> Tuple[str, str]:
             break
         elif equation_style_let_rec and depth == 0 and ch == ";":
             binding = raw[:index].strip()
-            remainder = raw[index + 1 :].strip()
+            remainder = raw[index + 1 :] if preserve_layout else raw[index + 1 :].strip()
             return (
                 (binding, remainder)
                 if remainder and _graph_let_binding_is_syntactically_complete(binding)
@@ -2264,7 +2275,7 @@ def _graph_top_level_let_parts(text: str) -> Tuple[str, str]:
             visible_suffix = suffix[indent_len:].lstrip()
             if indent_len == 0 and visible_suffix and not visible_suffix.startswith("|"):
                 binding = raw[:index].strip()
-                remainder = raw[line_end:].strip()
+                remainder = raw[line_end:] if preserve_layout else raw[line_end:].strip()
                 return (
                     (binding, remainder)
                     if remainder
@@ -2289,7 +2300,7 @@ def _graph_top_level_let_parts(text: str) -> Tuple[str, str]:
             depth = max(0, depth - 1)
         elif depth == 0 and ch == ";":
             binding = raw[:index].strip()
-            remainder = raw[index + 1 :].strip()
+            remainder = raw[index + 1 :] if preserve_layout else raw[index + 1 :].strip()
             return (
                 (binding, remainder)
                 if remainder and _graph_let_binding_is_syntactically_complete(binding)
@@ -2306,9 +2317,10 @@ def _graph_top_level_let_parts(text: str) -> Tuple[str, str]:
                 assign_index=assign_index,
                 newline_index=index,
                 line_end=line_end,
+                binding_indent=binding_indent,
             ):
                 binding = raw[:index].strip()
-                remainder = raw[line_end:].strip()
+                remainder = raw[line_end:] if preserve_layout else raw[line_end:].strip()
                 return (
                     (binding, remainder)
                     if remainder
@@ -2318,7 +2330,9 @@ def _graph_top_level_let_parts(text: str) -> Tuple[str, str]:
         elif depth == 0 and _graph_keyword_at(raw, index, "in"):
             if _graph_let_in_candidate_is_body_separator(raw, assign_index, index):
                 binding = raw[:index].strip()
-                remainder = raw[index + len("in") :].strip()
+                remainder = raw[index + len("in") :]
+                if not preserve_layout:
+                    remainder = remainder.strip()
                 return (
                     (binding, remainder)
                     if remainder
@@ -2595,6 +2609,8 @@ def _graph_let_body_is_plausibly_local_prop(
 
 def _graph_conditional_structure(
     text: str,
+    *,
+    preserve_layout: bool = False,
 ) -> Tuple[bool, Optional[Tuple[str, str]]]:
     """Distinguish Lean conditional keywords from a prose ``if`` suffix."""
 
@@ -2631,10 +2647,11 @@ def _graph_conditional_structure(
                         root_else = index
                     pending.pop()
         index += 1
-    branches = (
-        (text[root_then:root_else].strip(), text[root_else + len("else"):].strip())
-        if root_conditional and 0 <= root_then < root_else else None
-    )
+    branches = None
+    if root_conditional and 0 <= root_then < root_else:
+        branches = (text[root_then:root_else], text[root_else + len("else"):])
+        if not preserve_layout:
+            branches = (branches[0].strip(), branches[1].strip())
     return bool(pending), branches
 
 
@@ -5883,30 +5900,38 @@ def _graph_quantified_body_has_proof_tail(text: str) -> bool:
     proof-tail detector.
     """
 
-    def fragment_has_proof_tail(fragment: str) -> bool:
-        body = _graph_strip_balanced_outer_parens(graph_identity_text(fragment))
+    budget = _graph_surface_budget()
+    if not budget.active:
+        budget = _GraphSurfaceBudget()
+    pending = [text]
+    while pending:
+        fragment = pending.pop()
+        if not budget.consume_conditional_work(len(fragment)):
+            return True
+        body = _graph_unwrap_layout_term(fragment)
         if not body or not _graph_text_has_balanced_groups(body):
             return True
-        while _graph_top_level_quantifier_token_len(body, 0) > 0:
+        while _graph_top_level_quantifier_token_len(body.lstrip(), 0) > 0:
+            body = body.lstrip()
             quantifier_len = _graph_top_level_quantifier_token_len(body, 0)
             remainder = body[quantifier_len:].lstrip()
             comma = _graph_find_top_level_comma(remainder)
             if comma < 0:
                 return True
-            body = _graph_strip_balanced_outer_parens(
-                remainder[comma + 1 :].strip()
-            )
+            body = _graph_unwrap_layout_term(remainder[comma + 1 :])
             if not body:
                 return True
         implication_parts = split_lean_top_level_implications(body)
         if len(implication_parts) > 1:
-            return any(fragment_has_proof_tail(part) for part in implication_parts)
-        while body.startswith(("let ", "let\n", "have ", "have\n")):
+            pending.extend(implication_parts)
+            continue
+        while body.lstrip().startswith(("let ", "let\n", "have ", "have\n")):
             # A complete ``have`` is the same local binding as ``let``.
             # A dangling binding, with or without ``match``, still fails closed.
-            if body.startswith(("have ", "have\n")):
-                body = "let" + body[4:]
-            binding, remainder = _graph_top_level_let_parts(body)
+            if body.lstrip().startswith(("have ", "have\n")):
+                start = len(body) - len(body.lstrip())
+                body = body[:start] + "let" + body[start + 4:]
+            binding, remainder = _graph_top_level_let_parts(body, preserve_layout=True)
             if (
                 not binding
                 or not remainder
@@ -5915,10 +5940,30 @@ def _graph_quantified_body_has_proof_tail(text: str) -> bool:
                 return True
             if _graph_has_top_level_proof_tail(binding):
                 return True
-            body = _graph_strip_balanced_outer_parens(remainder)
-        return _graph_has_top_level_proof_tail(body) if body else False
-
-    return fragment_has_proof_tail(text)
+            body = _graph_unwrap_layout_term(remainder)
+        if _graph_keyword_at(body.lstrip(), 0, "if"):
+            # Branch-local let delimiters are not theorem proof delimiters.
+            # Keep their source layout and inspect each complete branch.
+            raw = body.lstrip()
+            incomplete, branches = _graph_conditional_structure(raw, preserve_layout=True)
+            condition = _graph_leading_conditional_condition(raw)
+            if incomplete or not branches or not all(branch.strip() for branch in branches):
+                return True
+            if _graph_has_top_level_proof_tail(condition):
+                return True
+            pending.extend(branches)
+            continue
+        subject, annotation = _graph_top_level_ascription(body)
+        if subject and annotation == "Prop":
+            # Strip only the outer annotation, retaining any local-let layout
+            # inside its subject. Assignments in named arguments stay grouped.
+            pending.append(body[:body.find(subject) + len(subject)])
+            continue
+        if _graph_top_level_token_index(body, ":=") >= 0:
+            return True
+        if body and _graph_has_top_level_proof_tail(body):
+            return True
+    return False
 
 
 def _graph_binder_context_parts(binder_text: str) -> Tuple[str, ...]:
@@ -6277,7 +6322,26 @@ def _graph_conditional_proposition_leaf(text: str, binder_context: str) -> bool:
         budget = _GraphSurfaceBudget()
     if not budget.consume_conditional_work(len(text) + len(binder_context)):
         return False
-    raw = graph_identity_text(text)
+    layout_term = _graph_unwrap_layout_term(text)
+    if layout_term.lstrip().startswith(("let ", "let\n", "have ", "have\n")):
+        # A branch-local definition needs its original newline separators and
+        # indentation. Use the ordinary binding checks, then classify the body
+        # with the conditional leaf rules and the extended local scope.
+        if _graph_quantified_body_has_proof_tail(layout_term):
+            return False
+        binding_source = layout_term
+        start = len(binding_source) - len(binding_source.lstrip())
+        is_have = binding_source[start:].startswith(("have ", "have\n"))
+        if is_have:
+            binding_source = binding_source[:start] + "let" + binding_source[start + 4:]
+        binding, body = _graph_top_level_let_parts(binding_source, preserve_layout=True)
+        if not binding or not body or _graph_let_value_has_residue(binding):
+            return False
+        context = _graph_binder_context_after_let(binder_context, binding, is_have=is_have)
+        # Keep the final body on the conditional leaf path so transparent
+        # wrappers cannot hide a declaration assignment after the proposition.
+        return _graph_conditional_proposition_leaf(body, context)
+    raw = str(text or "")
     local_names = {
         _graph_local_name_key(name)
         for name in _graph_binder_context_names(binder_context)
@@ -6416,7 +6480,16 @@ def _graph_conditional_proposition_leaf(text: str, binder_context: str) -> bool:
                     continue
         if not budget.consume_conditional_work(end - start + len(binder_context)):
             return False
-        return graph_statement_is_executable(raw[start:end], binder_context=binder_context)
+        leaf = raw[start:end]
+        line_start = raw.rfind("\n", 0, start) + 1
+        indentation = raw[line_start:start]
+        if indentation and not indentation.strip():
+            leaf = indentation + leaf
+        if leaf.lstrip().startswith(("let ", "let\n", "have ", "have\n")):
+            return _graph_conditional_proposition_leaf(leaf, binder_context)
+        elif _graph_top_level_token_index(leaf, ":=") >= 0:
+            return False
+        return graph_statement_is_executable(leaf, binder_context=binder_context)
     return False
 
 
@@ -6434,17 +6507,18 @@ def _graph_iterative_conditional_proposition(
     pending: List[Tuple[str, str]] = [(text, binder_context)]
     while pending:
         fragment, context = pending.pop()
-        raw = _graph_strip_balanced_outer_parens(graph_identity_text(fragment))
+        layout_term = _graph_unwrap_layout_term(fragment)
+        raw = layout_term.strip()
         if not raw:
             return False
         if not _graph_keyword_at(raw, 0, "if"):
             # Classify the parenthesis-stripped leaf. A grouped quantifier,
             # predicate, let, or open is the same proposition as the text
             # inside the group. The stored statement is left unchanged.
-            if not _graph_conditional_proposition_leaf(raw, context):
+            if not _graph_conditional_proposition_leaf(layout_term, context):
                 return False
             continue
-        incomplete, branches = _graph_conditional_structure(raw)
+        incomplete, branches = _graph_conditional_structure(raw, preserve_layout=True)
         full_condition = _graph_leading_conditional_condition(raw)
         binder_name, condition = _graph_split_named_if_condition(full_condition)
         if (
@@ -6465,7 +6539,7 @@ def _graph_iterative_conditional_proposition(
 def _graph_quantified_statement_is_executable(
     text: str, *, outer_binder: str = ""
 ) -> bool:
-    body = graph_identity_text(text)
+    body = str(text or "").strip()
     if not body:
         return False
     saw_quantifier = False
@@ -6480,18 +6554,24 @@ def _graph_quantified_statement_is_executable(
         if comma < 0:
             return False
         binder = remainder[:comma].strip()
-        next_body = remainder[comma + 1 :].strip()
+        next_body = remainder[comma + 1 :]
         if not binder or not next_body:
             return False
         binder_contexts.append(binder)
-        body = _graph_strip_balanced_outer_parens(next_body)
+        body = _graph_unwrap_layout_term(next_body)
+        if not body.lstrip().startswith(("∀", "∃", "forall ", "exists ")):
+            break
+        body = body.lstrip()
     if not saw_quantifier or not body:
         return False
+    binder_context = _graph_join_binder_context(outer_binder, *binder_contexts)
     if _graph_quantified_body_looks_like_prose(
         body
     ) or _graph_quantified_body_has_proof_tail(body):
         return False
-    binder_context = _graph_join_binder_context(outer_binder, *binder_contexts)
+    if body.lstrip().startswith(("let ", "let\n")):
+        return graph_statement_is_executable(body, binder_context=binder_context)
+    body = body.strip()
     if _graph_keyword_at(body, 0, "if"):
         return _graph_iterative_conditional_proposition(body, binder_context)
     bare_tail_atom = _graph_bare_prop_atom_name(body)
@@ -6502,12 +6582,6 @@ def _graph_quantified_statement_is_executable(
         return True
     if _graph_context_prop_atom_tail_uses_declared_atoms(binder_context, body):
         return True
-    if body.startswith(("let ", "let\n")):
-        # A quantified proposition may introduce local data before its final
-        # proposition. Delegate the complete let-chain to the same guarded
-        # parser used for a top-level let instead of treating its local value
-        # head as the quantified codomain.
-        return graph_statement_is_executable(body, binder_context=binder_context)
     if _graph_quantified_non_prop_codomain(body, binder_context):
         return False
     if graph_statement_non_theorem_reason(body):
@@ -6705,11 +6779,14 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
         return False
     if compact.startswith(("fun ", "fun\n")):
         return False
-    unwrapped = _graph_strip_balanced_outer_parens(compact)
+    unwrapped = _graph_unwrap_layout_term(text)
     if (
         unwrapped
-        and unwrapped != compact
-        and unwrapped.startswith(("have ", "have\n", "let ", "let\n"))
+        and unwrapped != text
+        and (
+            unwrapped.lstrip().startswith(("have ", "have\n", "let ", "let\n"))
+            or _graph_proposition_quantifier_token_len(unwrapped.lstrip()) > 0
+        )
     ):
         # A parenthesized term-level binder is still the binder, not a proof
         # script. The semicolon that ends the binder is handled by the let
@@ -6717,8 +6794,8 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
         return graph_statement_is_executable(
             unwrapped, binder_context=binder_context
         )
-    if _graph_keyword_at(unwrapped, 0, "if"):
-        return _graph_iterative_conditional_proposition(unwrapped, binder_context)
+    if _graph_keyword_at(unwrapped.strip(), 0, "if"):
+        return _graph_iterative_conditional_proposition(unwrapped.strip(), binder_context)
     is_have = compact.startswith(("have ", "have\n"))
     if is_have:
         # Term-level `have name := value; proposition` has the same binding
@@ -6727,9 +6804,9 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
         stmt = "let" + stmt[4:]
         compact = "let" + compact[4:]
     if compact.startswith(("let ", "let\n")):
-        let_binding, let_body = _graph_top_level_let_parts(text)
+        let_binding, let_body = _graph_top_level_let_parts(text, preserve_layout=True)
         if not let_body:
-            let_binding, let_body = _graph_top_level_let_parts(stmt)
+            let_binding, let_body = _graph_top_level_let_parts(stmt, preserve_layout=True)
         if _graph_let_value_has_residue(let_binding):
             return False
         extended = _graph_binder_context_after_let(
@@ -6768,7 +6845,7 @@ def _graph_statement_is_executable_body(text: str, *, binder_context: str = "") 
         # detector treats every top-level semicolon as tactic syntax, including
         # the delimiters in a valid quantified let-chain.
         return _graph_quantified_statement_is_executable(
-            compact, outer_binder=binder_context
+            text, outer_binder=binder_context
         )
     if _graph_filtered_bigop_with_positions(compact) and not _graph_term_tokens_ok(compact):
         return False
@@ -7823,6 +7900,17 @@ def _graph_statement_key(text: str, *, candidate_only: bool = False) -> str:
     # User notation can include relation symbols and delimiters in a token.
     # Retain lexical whitespace boundaries instead of joining them here.
     return " ".join(normalized.split()).strip()
+
+
+def _graph_unwrap_layout_term(text: str) -> str:
+    """Remove enclosing parentheses without erasing local-let indentation."""
+    value = str(text or "")
+    while True:
+        stripped = value.strip()
+        if (not stripped.startswith("(")
+                or _graph_matching_group_index(stripped, 0) != len(stripped) - 1):
+            return value
+        value = stripped[1:-1]
 
 
 def _graph_strip_balanced_outer_parens(text: str) -> str:

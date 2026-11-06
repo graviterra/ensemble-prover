@@ -1665,14 +1665,27 @@ class MiniVerifiedLemmaCache:
             )
         )
         deduplicated_candidates: List[Dict[str, Any]] = []
-        seen_source_hashes: Set[str] = set()
+        seen_attestations: Set[str] = set()
         for record in candidates:
             source_hash = str(record.get("source_hash") or "").strip()
             source = str(record.get("source") or "").strip()
             source_key = source_hash or text_hash(source)
-            if not source_key or source_key in seen_source_hashes:
+            # A body can have independently checked contexts. Republishing
+            # that body under a larger or incompatible context must not erase
+            # an older usable replay alternative. Ranking still determines
+            # which attestation is tried first, never which one exists.
+            attestation_key = json.dumps(
+                [source_key, *(
+                    record.get(field) for field in (
+                        "support_names", "support_source_hashes",
+                        "replay_context_names", "replay_context_source_hashes",
+                    )
+                )],
+                sort_keys=True, ensure_ascii=False,
+            )
+            if not source_key or attestation_key in seen_attestations:
                 continue
-            seen_source_hashes.add(source_key)
+            seen_attestations.add(attestation_key)
             deduplicated_candidates.append(record)
 
         selected_fact_keys: Set[str] = set()
@@ -1691,10 +1704,10 @@ class MiniVerifiedLemmaCache:
                 break
 
         # The cap counts mathematical candidate facts, not proof bodies. Keep
-        # every body for each selected fact in newest-first order so a stale or
-        # environment-specific body cannot erase a viable fallback.
+        # every body and replay attestation for each selected fact in ranked
+        # order so an incompatible context cannot erase a viable fallback.
         selected: List[Dict[str, Any]] = []
-        selected_source_keys: Set[str] = set()
+        selected_record_ids: Set[int] = set()
         for record in deduplicated_candidates:
             source = str(record.get("source") or "").strip()
             statement = helper_decl_statement(source)
@@ -1704,9 +1717,7 @@ class MiniVerifiedLemmaCache:
             if fact_key not in selected_fact_keys:
                 continue
             selected.append(record)
-            selected_source_keys.add(
-                str(record.get("source_hash") or "").strip() or text_hash(source)
-            )
+            selected_record_ids.add(id(record))
 
         records_by_name: Dict[str, List[Dict[str, Any]]] = {}
         for record in deduplicated_candidates:
@@ -1717,6 +1728,23 @@ class MiniVerifiedLemmaCache:
                 records_by_name.setdefault(name_key, []).append(record)
         pending = list(selected)
         for record in pending:
+            if any(
+                record.get(field) is not None
+                and not isinstance(record[field], expected_type)
+                for field, expected_type in (
+                    ("support_names", (list, tuple)),
+                    ("replay_context_names", (list, tuple)),
+                    ("support_source_hashes", Mapping),
+                    ("replay_context_source_hashes", Mapping),
+                )
+            ):
+                # Preserve malformed candidates for the executor's rejection,
+                # but do not let one receipt prevent valid alternatives from
+                # reaching their independent replay checks.
+                record["_replay_closure_missing"] = [
+                    {"reason": "malformed_dependency_receipts"}
+                ]
+                continue
             replay_expected_hashes = {
                 str(dependency_name or "").strip(): str(
                     source_hash or ""
@@ -1826,16 +1854,9 @@ class MiniVerifiedLemmaCache:
                     )
                     continue
                 for dependency in dependencies:
-                    dependency_source = str(
-                        dependency.get("source") or ""
-                    ).strip()
-                    source_key = (
-                        str(dependency.get("source_hash") or "").strip()
-                        or text_hash(dependency_source)
-                    )
-                    if not source_key or source_key in selected_source_keys:
+                    if id(dependency) in selected_record_ids:
                         continue
-                    selected_source_keys.add(source_key)
+                    selected_record_ids.add(id(dependency))
                     selected.append(dependency)
                     pending.append(dependency)
             if missing_closure:
@@ -1849,11 +1870,7 @@ class MiniVerifiedLemmaCache:
         ordered_selected = [
             record
             for record in deduplicated_candidates
-            if (
-                str(record.get("source_hash") or "").strip()
-                or text_hash(str(record.get("source") or "").strip())
-            )
-            in selected_source_keys
+            if id(record) in selected_record_ids
         ]
         self._touch_index_records_preserving_order(ordered_selected)
         out: List[Dict[str, Any]] = []
@@ -1866,33 +1883,42 @@ class MiniVerifiedLemmaCache:
     def exact_record_for_theorem(
         self, theorem_name: str, source: str, *, preamble: str,
     ) -> Optional[Dict[str, Any]]:
+        """Return the preferred exact-source recovery candidate."""
+        return next(iter(self.exact_records_for_theorem(
+            theorem_name, source, preamble=preamble,
+        )), None)
+
+    def exact_records_for_theorem(
+        self, theorem_name: str, source: str, *, preamble: str,
+    ) -> List[Dict[str, Any]]:
         """Recover an existing candidate's provenance without a popularity cap.
 
         Older pending-helper checkpoints retained the exact body but omitted
         its cache replay receipts. A fresh reader may recover those receipts
         from the same owner/body; it must never infer an empty dependency set
         merely because an ordinary capped lookup no longer serves that body.
-        The returned row remains a candidate requiring current verification.
+        Preserve alternative contexts for the exact owner and source. Every
+        returned row remains a candidate requiring current verification.
         """
         if self._cache_is_disabled():
-            return None
+            return []
         self.refresh_read_paths()
         exact_source = str(source or "").strip()
         self._admit_pending_records(theorem_name=str(theorem_name or "").strip())
         owner_records = self._by_theorem_name.get(str(theorem_name or "").strip(), ())
         if not any(str(row.get("source") or "").strip() == exact_source for row in owner_records):
-            return None
+            return []
         # Use the ordinary closure builder: stored support receipts and
         # source-inferred dependencies are as binding as explicit replay names.
         # The owner bucket bounds the query, without dropping an older exact
         # body merely because newer unrelated facts fill the default cap.
-        return next((
+        return [
             record
             for record in self.records_for_theorem(
                 theorem_name, max_records=max(1, len(owner_records)), preamble=preamble,
             )
             if str(record.get("source") or "").strip() == exact_source
-        ), None)
+        ]
 
     def advisory_retrieval_records(self) -> List[Dict[str, Any]]:
         """Cheap discovery metadata; selected rows still require admission.

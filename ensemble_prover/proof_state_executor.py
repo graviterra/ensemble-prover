@@ -6725,6 +6725,8 @@ def _cache_seed_dependency_receipts(
 
 def _dependency_order_cache_seed_records(
     records: Sequence[Mapping[str, Any]],
+    *,
+    available_hashes: Optional[Mapping[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     indexed: List[Tuple[int, Dict[str, Any], str, str]] = []
     for index, raw in enumerate(records):
@@ -6789,7 +6791,206 @@ def _dependency_order_cache_seed_records(
             ordered.extend(next_pending)
             break
         pending = next_pending
+    # Name-only readiness is sufficient when every name has a single source.
+    # With alternatives, however, it can install an unrelated version before
+    # a preferred dependent's exact context is ready. Plan whole compatible
+    # closures first; admission below still independently checks every source.
+    sources_by_name: Dict[str, Set[str]] = {}
+    for _index, record, source, _source_hash in indexed:
+        name = helper_decl_name(source) or str(record.get("name") or "").strip()
+        if name and source:
+            sources_by_name.setdefault(name, set()).add(text_hash(source))
+    if any(len(sources) > 1 for sources in sources_by_name.values()):
+        return _prioritize_cache_seed_source_closures(
+            [record for _index, record, _source, _source_hash in indexed],
+            fallback_order=ordered,
+            available_hashes=available_hashes or {},
+        )
     return ordered
+
+
+def _prioritize_cache_seed_source_closures(
+    records: Sequence[Dict[str, Any]],
+    *,
+    fallback_order: Sequence[Dict[str, Any]],
+    available_hashes: Mapping[str, str],
+) -> List[Dict[str, Any]]:
+    """Prefer complete exact-source contexts without granting proof authority.
+
+    A failed closure contributes no name choices: an impossible candidate must
+    not strand a later viable family by partially installing its dependencies.
+    Keep every original row in the fallback queue, including malformed rows and
+    alternative replay receipts for the same body. Existing dossier identities
+    are fixed, including when an interrupted seed resumes with a partial prefix.
+    """
+    names = [
+        helper_decl_name(str(record.get("source") or "")) or ""
+        for record in records
+    ]
+    sources = [str(record.get("source") or "").strip() for record in records]
+    hashes = [text_hash(source) if source else "" for source in sources]
+    providers: Dict[str, List[int]] = {}
+    for index, name in enumerate(names):
+        recorded_hash = str(records[index].get("source_hash") or "").strip()
+        if name and (not recorded_hash or recorded_hash == hashes[index]):
+            providers.setdefault(name, []).append(index)
+    dependencies: Dict[int, Optional[Tuple[List[str], Dict[str, str]]]] = {}
+
+    def dependencies_for(index: int) -> Optional[Tuple[List[str], Dict[str, str]]]:
+        if index not in dependencies:
+            record = records[index]
+            recorded_hash = str(record.get("source_hash") or "").strip()
+            try:
+                dep_names, expected, conflicts = _cache_seed_dependency_receipts(
+                    record, names[index],
+                )
+            except _MalformedCacheSeedDependencyReceipts:
+                dependencies[index] = None
+                return None
+            if (
+                not names[index] or not sources[index]
+                or (recorded_hash and recorded_hash != hashes[index])
+                or record.get("_pending_replay_provenance_missing") or conflicts
+                or _proof_state_helper_policy_rejection(sources[index])
+            ):
+                dependencies[index] = None
+                return None
+            lexical = _helper_referenced_names(
+                sources[index], tuple(providers), skip=names[index],
+            )
+            dep_names = list(dict.fromkeys([*dep_names, *sorted(lexical)]))
+            dependencies[index] = dep_names, expected
+        return dependencies[index]
+
+    # Bound advisory planning even if many alternative contexts create an
+    # exponential search space. Exhausting this bound only leaves rows in the
+    # ordinary verification queue; it cannot admit or discard a proof.
+    work_limit = max(1024, 8 * (len(records) + sum(
+        len(deps[0]) if (deps := dependencies_for(index)) is not None else 0
+        for index in range(len(records))
+    )))
+
+    def plan(root: int) -> Optional[Tuple[List[int], Dict[str, str]]]:
+        local_hashes: Dict[str, str] = {}
+        local_providers: Dict[str, int] = {}
+        completed: Set[int] = set()
+        closure: List[int] = []
+        tasks: List[Tuple[str, Any, Any]] = [("enter", root, "")]
+        branches: List[Any] = []
+        work = 0
+        while tasks:
+            work += 1
+            if work > work_limit:
+                return None
+            kind, value, expected_hash = tasks.pop()
+            viable = True
+            if kind == "exit":
+                completed.add(value)
+                closure.append(value)
+            elif kind == "resolve":
+                name = value
+                if name in available_hashes:
+                    viable = not expected_hash or available_hashes[name] == expected_hash
+                elif name in local_hashes:
+                    viable = (
+                        (not expected_hash or local_hashes[name] == expected_hash)
+                        and local_providers[name] in completed
+                    )
+                else:
+                    options = [
+                        candidate for candidate in providers.get(name, ())
+                        if (not expected_hash or hashes[candidate] == expected_hash)
+                        and dependencies_for(candidate) is not None
+                    ]
+                    if not options:
+                        viable = False
+                    else:
+                        if len(options) > 1:
+                            branches.append((
+                                options[1:], list(tasks), dict(local_hashes),
+                                dict(local_providers), set(completed), list(closure),
+                            ))
+                        tasks.append(("enter", options[0], ""))
+            else:
+                index = value
+                name, source_hash = names[index], hashes[index]
+                if name in available_hashes:
+                    viable = available_hashes[name] == source_hash
+                elif name in local_hashes:
+                    viable = (
+                        local_hashes[name] == source_hash
+                        and local_providers[name] in completed
+                    )
+                else:
+                    deps = dependencies_for(index)
+                    if deps is None:
+                        viable = False
+                    else:
+                        local_hashes[name] = source_hash
+                        local_providers[name] = index
+                        dep_names, expected = deps
+                        tasks.append(("exit", index, ""))
+                        tasks.extend(
+                            ("resolve", name, expected.get(name, ""))
+                            for name in reversed(dep_names)
+                        )
+            if not viable:
+                if not branches:
+                    return None
+                options, saved_tasks, saved_hashes, saved_providers, saved_done, saved_closure = branches[-1]
+                candidate = options.pop(0)
+                if not options:
+                    branches.pop()
+                tasks = [*saved_tasks, ("enter", candidate, "")]
+                local_hashes = dict(saved_hashes)
+                local_providers = dict(saved_providers)
+                completed = set(saved_done)
+                closure = list(saved_closure)
+        return closure, local_hashes
+
+    plans = [
+        (root, result) for root in range(len(records))
+        if (result := plan(root)) is not None
+    ]
+    # Prefer the largest coherent reusable context, then the original ranked
+    # candidate order. Recency alone lets a fresh result in a smaller context
+    # repeatedly strand an older, larger family on subsequent restarts.
+    plans.sort(key=lambda item: (-len(item[1][1]), item[0]))
+    fixed = dict(available_hashes)
+    emitted: Set[int] = set()
+    for _root, (closure, assignments) in plans:
+        if any(name in fixed and fixed[name] != source_hash
+               for name, source_hash in assignments.items()):
+            continue
+        for index in closure:
+            if names[index] not in fixed:
+                emitted.add(index)
+                fixed[names[index]] = hashes[index]
+
+    # Retain the previous relative ordering of independent selected records,
+    # while requiring the selected exact providers to precede their users.
+    index_by_id = {id(record): index for index, record in enumerate(records)}
+    pending = [index_by_id[id(row)] for row in fallback_order
+               if index_by_id[id(row)] in emitted]
+    selected_names = {names[index] for index in emitted}
+    emitted_names = set(available_hashes)
+    preferred: List[Dict[str, Any]] = []
+    while pending:
+        next_pending = []
+        for index in pending:
+            deps = dependencies_for(index)
+            if deps is not None and set(deps[0]) & selected_names <= emitted_names:
+                preferred.append(records[index])
+                emitted_names.add(names[index])
+            else:
+                next_pending.append(index)
+        if len(next_pending) == len(pending):
+            # Admission remains authoritative if an unexpected cycle survives.
+            preferred.extend(records[index] for index in next_pending)
+            break
+        pending = next_pending
+    emitted_rows = {id(records[index]) for index in emitted}
+    return preferred + [row for row in fallback_order if id(row) not in emitted_rows]
 
 
 def _cache_seed_batch_validation_input(
@@ -7451,6 +7652,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
         "accepted_helper_names": [],
         "rejected_count": 0,
         "duplicate_count": 0,
+        "skipped_attestation_count": 0,
         "name_collision_count": 0,
         "retryable_error_count": 0,
         "records": [],
@@ -7507,7 +7709,13 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
             metrics[key] = int(metrics.get(key, 0) or 0) + int(amount or 0)
 
     inc("mini_proof_state_cache_seed_candidates", len(candidates))
-    pending = _dependency_order_cache_seed_records(candidates)
+    pending = _dependency_order_cache_seed_records(
+        candidates,
+        available_hashes={
+            name: str(getattr(helper, "source_hash", "") or "")
+            for name, helper in dossier.verified_helpers.items()
+        },
+    )
     root_node = (
         proof_state.nodes.get(proof_state.root_node_id)
         if proof_state is not None
@@ -7663,6 +7871,14 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
         )
     accepted_source_hashes: Set[str] = set()
     accepted_sources: Set[str] = set()
+    skipped_attestation_ids: Set[int] = set()
+
+    def skip_attestation(record: Mapping[str, Any]) -> None:
+        # The body has already been admitted in this seed. Another historical
+        # context is neither another accepted helper nor a rejected proof.
+        skipped_attestation_ids.add(id(record))
+        summary["skipped_attestation_count"] = len(skipped_attestation_ids)
+
     terminal_source_hashes: Set[str] = set()
     deferred_provenance_records: List[Dict[str, Any]] = []
     passes = int(max_passes)
@@ -7696,17 +7912,18 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 continue
             if record.get("_pending_replay_provenance_missing"):
                 if helper_block in accepted_sources:
+                    skip_attestation(record)
                     continue
                 if not any(
-                    str(item.get("source") or "").strip() == helper_block
+                    item is record
                     for item in deferred_provenance_records
                 ):
-                    deferred_provenance_records.append(dict(record))
+                    deferred_provenance_records.append(record)
                 continue
-            if (
-                source_hash in accepted_source_hashes
-                or source_hash in terminal_source_hashes
-            ):
+            if source_hash in accepted_source_hashes:
+                skip_attestation(record)
+                continue
+            if source_hash in terminal_source_hashes:
                 continue
             try:
                 replay_context_names, expected_replay_hashes, conflicting_hashes = (
@@ -7913,6 +8130,9 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                     root_node.pending_helper_acceptance = {}
                 accepted_source_hashes.add(source_hash)
                 accepted_sources.add(helper_block)
+                for item in deferred_provenance_records:
+                    if str(item.get("source") or "").strip() == helper_block:
+                        skip_attestation(item)
                 deferred_provenance_records = [
                     item for item in deferred_provenance_records
                     if str(item.get("source") or "").strip() != helper_block
@@ -7976,6 +8196,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
         for index, record in enumerate(pending):
             source = str(record.get("source") or "").strip()
             if text_hash(source) in accepted_source_hashes:
+                skip_attestation(record)
                 continue
             helper_name = helper_decl_name(source) or ""
             names, hashes, conflicts = _cache_seed_dependency_receipts(
@@ -8015,10 +8236,10 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
         if record.get("_pending_replay_provenance_missing"):
             continue
         source_hash = text_hash(str(record.get("source") or "").strip())
-        if (
-            source_hash in accepted_source_hashes
-            or source_hash in terminal_source_hashes
-        ):
+        if source_hash in accepted_source_hashes:
+            skip_attestation(record)
+            continue
+        if source_hash in terminal_source_hashes:
             continue
         terminal_source_hashes.add(source_hash)
         summary["records"].append(
@@ -8035,7 +8256,7 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
         0,
         len(candidates)
         - int(summary["accepted_count"])
-        - int(summary["duplicate_count"])
+        - int(summary["skipped_attestation_count"])
         - len(deferred_provenance_records),
     )
     summary["rejected_count"] = rejected
@@ -13931,6 +14152,7 @@ async def _try_proof_state_one_child_closure(
                     cache_seed_batch_admission.context
                 )
         if continuation_kind == "cache_seed_batch":
+            recovered_context_alternatives: List[Dict[str, Any]] = []
             raw_cache_record = continuation.get("current_cache_record")
             current_cache_record = (
                 dict(raw_cache_record) if isinstance(raw_cache_record, Mapping) else None
@@ -13940,17 +14162,26 @@ async def _try_proof_state_one_child_closure(
                 or current_cache_record.get("_pending_replay_provenance_missing")
             )
             if needs_provenance:
+                exact_records = getattr(proof_cache, "exact_records_for_theorem", None)
                 exact_record = getattr(proof_cache, "exact_record_for_theorem", None)
-                if callable(exact_record):
+                if callable(exact_records) or callable(exact_record):
                     try:
-                        recovered = exact_record(
+                        recovered_rows = (exact_records if callable(exact_records) else exact_record)(
                             str(continuation.get("theorem_name") or dossier.theorem_name),
                             helper_block, preamble=_proof_state_check_preamble(conv),
                         )
                     except Exception:
-                        recovered = None
-                    if isinstance(recovered, Mapping):
-                        current_cache_record = dict(recovered)
+                        recovered_rows = []
+                    if isinstance(recovered_rows, Mapping):
+                        recovered_rows = [recovered_rows]
+                    recovered = [
+                        dict(row) for row in recovered_rows
+                        if isinstance(row, Mapping)
+                        and str(row.get("source") or "").strip() == helper_block
+                    ] if isinstance(recovered_rows, (list, tuple)) else []
+                    if recovered:
+                        current_cache_record = recovered[0]
+                        recovered_context_alternatives = recovered[1:]
                         needs_provenance = False
                 if needs_provenance and cache_seed_batch_admission is None:
                     # Legacy records omitted the head's replay receipts. A
@@ -13981,8 +14212,9 @@ async def _try_proof_state_one_child_closure(
                         theorem_name=str(continuation.get("theorem_name") or dossier.theorem_name),
                         timeout_s=pending_acceptance_timeout_s,
                         deadline_monotonic=action_deadline_monotonic,
-                        max_helpers=1 + len(continuation.get("remaining_cache_records") or []),
-                        _candidate_records=[current_cache_record, *[
+                        max_helpers=(1 + len(recovered_context_alternatives)
+                                     + len(continuation.get("remaining_cache_records") or [])),
+                        _candidate_records=[current_cache_record, *recovered_context_alternatives, *[
                             dict(item)
                             for item in list(continuation.get("remaining_cache_records") or [])
                             if isinstance(item, Mapping)
