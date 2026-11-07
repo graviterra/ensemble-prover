@@ -29,6 +29,7 @@ from .model import (
     content_hash,
 )
 from .environment import dependency_environment_fingerprint
+from .declaration_types import closed_declaration_type
 from .policy import TheoryPolicy
 from .promotion_context import (
     _DOTTED_IDENT, _IDENT_COMPONENT, _masked_preamble,
@@ -1379,7 +1380,13 @@ class TheoryBundleVerifier:
             lines.extend(
                 (
                     "set_option pp.universes true in",
-                    f"#check _root_.{name}",
+                    "set_option pp.explicit true in",
+                    "set_option pp.piBinderTypes true in",
+                    "set_option pp.funBinderTypes true in",
+                    "set_option pp.deepTerms true in",
+                    "set_option pp.proofs true in",
+                    "set_option pp.maxSteps 1000000 in",
+                    f"#check @_root_.{name}",
                     f"#print axioms _root_.{name}",
                     *(
                         (f"#mini_theory_audit_circular _root_.{name}",)
@@ -1421,16 +1428,14 @@ class TheoryBundleVerifier:
                     # declaration name, not to the type: consume it here so the
                     # captured type keeps only the universes that are genuinely
                     # part of the declaration (e.g. `Eq.{u + 1}`).
-                    rf"(?ms)^(?P<name>{_DOTTED_IDENT})(?:\.\{{[^{{}}]*\}})?"
+                    rf"(?ms)^@?(?P<name>{_DOTTED_IDENT})(?:\.\{{[^{{}}]*\}})?"
                     rf"(?P<type>.*?)(?=^'[^\r\n]+'\s+(?:depends|does)\b)",
                     str(output or ""),
                 ) if lean_name_components(match.group("name")) == lean_name_components(fq_name)
             ), None)
             if type_match is not None:
-                rendered = " ".join(type_match.group("type").split()).strip()
-                if rendered.startswith(":"):
-                    rendered = rendered[1:].strip()
-                type_text = rendered
+                rendered = type_match.group("type").strip()
+                type_text = closed_declaration_type(rendered)
             if not type_text:
                 return [], f"missing_declaration_type:{fq_name}"
             axioms = TheoryBundleVerifier._parse_axioms(output, fq_name)

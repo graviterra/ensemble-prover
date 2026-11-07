@@ -288,38 +288,50 @@ async def prepare_and_probe(
     ):
         return replace(observation, reason="context_changed_recapture_required")
     try:
-        # Loaded profile booleans are advisory. Recheck the live goal expression
-        # and actual declaration type before using the stored application recipe.
-        fresh_goal = await capture_goal(
-            runner,
-            statement=goal.statement,
-            source=goal.source,
-            environment_id=goal.environment_id,
-            source_variant=goal.source_variant,
-            budget=budget,
-            preamble=preamble,
-            lemmas=lemmas,
-        )
-        if (
-            not fresh_goal.complete
-            or fresh_goal.exact_expr_json != goal.exact_expr_json
-        ):
-            return replace(observation, reason="stale_goal_capture")
+        from .runtime_receipts import current_receipt
+
+        remaining(budget)
         context = runner._resolve_preamble(preamble) + "\n" + "\n".join(lemmas)
-        _parsed, _output, code = await lean_call(
-            runner,
-            budget,
-            lambda: runner.check_source_declaration_type_equivalence(
-                context,
-                profile.declaration_name.removeprefix("_root_."),
-                profile.statement,
-                preamble_override=context,
-                timeout_s=remaining(budget),
-                max_heartbeats=getattr(budget, "max_heartbeats", None),
-            ),
-        )
-        if code != 0:
-            return replace(observation, reason="candidate_not_current")
+        goal_guard = current_receipt(goal, runner, budget, context)
+        profile_guard = current_receipt(profile, runner, budget, context)
+        reused_guards = tuple(guard for guard in (goal_guard, profile_guard) if guard is not None)
+
+        def reuse_current() -> bool:
+            return all(guard() for guard in reused_guards)
+
+        # Persisted records and results from other allocations retain the full
+        # live checks. Only exact fresh objects can reuse their semantic work.
+        if goal_guard is None:
+            fresh_goal = await capture_goal(
+                runner,
+                statement=goal.statement,
+                source=goal.source,
+                environment_id=goal.environment_id,
+                source_variant=goal.source_variant,
+                budget=budget,
+                preamble=preamble,
+                lemmas=lemmas,
+            )
+            if (not fresh_goal.complete
+                    or fresh_goal.exact_expr_json != goal.exact_expr_json):
+                return replace(observation, reason="stale_goal_capture")
+        if profile_guard is None:
+            _parsed, _output, code = await lean_call(
+                runner,
+                budget,
+                lambda: runner.check_source_declaration_type_equivalence(
+                    context,
+                    profile.declaration_name.removeprefix("_root_."),
+                    profile.statement,
+                    preamble_override=context,
+                    timeout_s=remaining(budget),
+                    max_heartbeats=getattr(budget, "max_heartbeats", None),
+                ),
+            )
+            if code != 0:
+                return replace(observation, reason="candidate_not_current")
+        if not reuse_current():
+            return replace(observation, reason="semantic_context_changed")
         budget.claim_probe()
         result = await lean_call(
             runner,
@@ -339,6 +351,8 @@ async def prepare_and_probe(
                 max_heartbeats=getattr(budget, "max_heartbeats", None),
             ),
         )
+        if not reuse_current():
+            return replace(observation, reason="semantic_context_changed")
         observation = replace(
             observation,
             outcome=result["outcome"],
@@ -359,6 +373,8 @@ async def prepare_and_probe(
                 lemmas=lemmas,
                 budget=budget,
             )
+            if not reuse_current():
+                return replace(observation, outcome="unavailable", reason="semantic_context_changed")
             if certificate is not None:
                 observation = replace(
                     observation,
@@ -380,10 +396,14 @@ async def prepare_and_probe(
                 ),
             )
             remaining(budget)
+            if not reuse_current():
+                return replace(observation, outcome="unavailable", reason="semantic_context_changed")
             if checked.ok and getattr(checked, "axiom_audit_ok", None) is True:
                 accepted = acceptance(checked, goal, profile, observation)
                 if inspect.isawaitable(accepted):
                     accepted = await accepted
+                if not reuse_current():
+                    return replace(observation, outcome="unavailable", reason="semantic_context_changed")
                 if accepted is True:
                     observation = replace(
                         observation, outcome="checked_solution", checked_result=checked

@@ -18,6 +18,14 @@ Retrieval and Mini theory remain useful with mathematical memory off. Memory
 does not automatically make every historical proof transferable to another
 problem.
 
+The verified-helper cache retains restricted replay prerequisites alongside the
+visible helpers that need them. These prerequisites are available only through
+matching same-problem dependency receipts; they are not ordinary search hits or
+generic promoted lemmas. Restoration checks the full ordered context in Lean and
+keeps restricted support hidden from ordinary proof context.
+Dependency discovery distinguishes multiline local helper functions from global
+declarations, while retaining global references used in their initializers.
+
 ## Finding and applying declarations
 
 The model can search mathematical libraries, inspect declaration types, try a
@@ -57,6 +65,14 @@ on a problem-specific or hidden benchmark constant cannot become generic merely
 because its name looks reusable. Complete declaration names, local notation,
 attributes, and instances matter to the reconstructed source. Publication
 requires policy checks and fresh Lean verification.
+
+Printed declaration signatures are converted to complete quantified types before
+applicability profiling. The resulting type must still agree with the actual
+declaration after Lean elaboration, including for older published bundles.
+Within one live operation, an unchanged goal capture or declaration profile can
+reuse its semantic checks. Reuse requires the exact captured object, checker
+generation, and ordered context; restored records require fresh checking.
+Applications and resulting proofs still pass their normal Lean checks.
 
 Historical context that cannot be safely recaptured stays deferred. The
 `promotion_context_recapture_required` diagnostic calls for restaging from the
@@ -214,6 +230,17 @@ The service's `--memory-root` selects its trusted catalog; owned launches inheri
 that root. Evidence copied for inspection is still checked against current
 source eligibility. Pausing ordinary observation updates does not freeze
 permission checks.
+
+Usage receipts share one complete context artifact instead of duplicating every
+helper and constant inventory in each receipt. When the catalog approaches its
+byte allowance, bounded lossless compaction reclaims space while retaining event
+identities, source evidence, and invalidation records. Query limits still count
+the decoded data. Read compacted catalogs and backups with a version that supports
+this storage encoding.
+
+If storage remains unavailable, candidate work pauses before importing or probing
+that candidate. The attempt records the persistence diagnostic and retains its
+continuation; a storage failure does not mean that the candidate is false.
 
 Inspect or back up a catalog without running a prover:
 

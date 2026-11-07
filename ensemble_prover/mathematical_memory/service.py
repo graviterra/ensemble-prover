@@ -20,6 +20,7 @@ from .budget import MemoryAllocation, MemoryBudget
 from .config import MemoryConfig
 from .model import (
     EligibilityPolicy,
+    EvidenceReference,
     GenerationPin,
     MemoryEvent,
     MemoryProvenance,
@@ -412,6 +413,7 @@ class MathematicalMemoryService:
         )
         self.policy_id = content_digest(self.policy.to_record())
         self.health = "ready"
+        self.persistence_diagnostic = ""
         self.last_view: dict[str, Any] = {}
         self.request_store: Any = None
         output = getattr(getattr(session, "recorder", None), "output_dir", None)
@@ -563,6 +565,7 @@ class MathematicalMemoryService:
         provenance: MemoryProvenance | None = None,
         budget: MemoryBudget | None = None,
         additional_evidence: tuple[Any, ...] = (),
+        additional_artifacts: tuple[tuple[bytes, str], ...] = (),
         retry_of: str = "",
     ) -> MemoryEvent | None:
         try:
@@ -582,10 +585,13 @@ class MathematicalMemoryService:
                 if budget is not None
                 else time.monotonic() + 0.025
             )
-            artifact = self.catalog.put_artifact(
-                canonical_json(dict(payload)).encode(),
-                kind="memory_event",
-                deadline_monotonic=deadline,
+            payload_bytes = canonical_json(dict(payload)).encode()
+            artifact = EvidenceReference(
+                content_digest(payload_bytes), len(payload_bytes), "memory_event",
+            )
+            prepared_artifacts = tuple(
+                (data, EvidenceReference(content_digest(data), len(data), kind))
+                for data, kind in additional_artifacts
             )
             event = MemoryEvent(
                 event_id=event_id or uuid.uuid4().hex,
@@ -599,7 +605,9 @@ class MathematicalMemoryService:
                     if payload.get("candidate_id")
                     else self.provenance()
                 ),
-                evidence=(artifact,) + additional_evidence,
+                evidence=(artifact,) + additional_evidence + tuple(
+                    ref for _, ref in prepared_artifacts
+                ),
                 retry_of=retry_of,
             )
             intent = content_digest(
@@ -630,13 +638,32 @@ class MathematicalMemoryService:
             self._event_deliveries[event.event_id] = (event, intent)
             while len(self._event_deliveries) > 4096:
                 self._event_deliveries.pop(next(iter(self._event_deliveries)))
+            # Check durable capacity before creating evidence files. A full
+            # ledger must not accumulate orphan artifacts on every attempt.
+            # Append repeats the capacity check under its write transaction.
+            self.catalog.ensure_append_capacity(event, deadline_monotonic=deadline)
+            stored_artifact = self.catalog.put_artifact(
+                payload_bytes, kind="memory_event", deadline_monotonic=deadline,
+            )
+            if stored_artifact != artifact:
+                raise ValueError("memory evidence changed during publication")
+            for data, ref in prepared_artifacts:
+                if self.catalog.put_artifact(
+                    data, kind=ref.kind, deadline_monotonic=deadline,
+                ) != ref:
+                    raise ValueError("memory evidence changed during publication")
             result = self.catalog.append(event, deadline_monotonic=deadline)
             if result.status not in {"Stored", "Duplicate", "stored", "duplicate"}:
                 self.health = str(result.status)
+                self.persistence_diagnostic = str(result.diagnostic)[:512]
                 return None
+            if self.persistence_diagnostic:
+                self.health = "ready"
+                self.persistence_diagnostic = ""
             return event
         except (OSError, ValueError, RuntimeError, TimeoutError, sqlite3.Error) as exc:
             self.health = "unavailable"
+            self.persistence_diagnostic = f"{type(exc).__name__}: {exc}"[:512]
             _LOG.debug("Advisory memory persistence unavailable: %s", exc)
             return None
 
@@ -712,6 +739,19 @@ class MathematicalMemoryService:
         consumer_id = content_digest(
             {key: value for key, value in payload.items() if key != "helpers"}
         )
+        # The complete observed context is shared by every per-helper usage
+        # receipt. Copying its whole inventory into each receipt makes durable
+        # storage grow quadratically with the number of checked helpers.
+        context_bytes = canonical_json(dict(payload)).encode()
+        context_ref = EvidenceReference(
+            content_digest(context_bytes), len(context_bytes), "helper_usage_context",
+        )
+        consumer_fields = {
+            key: value for key, value in payload.items()
+            if key not in {
+                "helpers", "direct_constants", "reachable_constants", "lemma_source_hashes",
+            }
+        }
         for name, binding in helpers.items():
             if binding.get("usage") not in {"direct", "transitive", "unused"}:
                 continue
@@ -732,6 +772,7 @@ class MathematicalMemoryService:
                 )
             event_id = content_digest(
                 {
+                    "use_format": 2,
                     "run": self.run_id,
                     "consumer": consumer_id,
                     "source": binding["source_hash"],
@@ -743,7 +784,8 @@ class MathematicalMemoryService:
             self.record(
                 "use",
                 {
-                    **dict(payload),
+                    **consumer_fields,
+                    "usage_context": context_ref.to_record(),
                     "consumer_id": consumer_id,
                     "declaration_name": name,
                     "declaration_id": binding["source_hash"],
@@ -755,6 +797,7 @@ class MathematicalMemoryService:
                 operation_id=consumer_id,
                 attempt_id=consumer_id,
                 provenance=usage_provenance,
+                additional_artifacts=((context_bytes, context_ref.kind),),
             )
 
     def candidate_provenance(
@@ -1567,18 +1610,31 @@ class MathematicalMemoryService:
                     source_attested = True
                     attested_bundle_ids.append(bundle.bundle_id)
                     break
+        from ensemble_prover.mini_theory.declaration_types import closed_declaration_type
+
+        # Old checkpoint candidates retain their original identity and printed
+        # signature. Close that signature only for semantic checking.
+        declaration_type = (
+            closed_declaration_type(candidate.type_text)
+            if any(origin.source_kind == "published_theory" for origin in origins)
+            else candidate.type_text
+        )
         profile = await profile_declaration(
             session.lean,
             declaration_name=(
                 "_root_." + candidate.declaration_name.removeprefix("_root_.")
                 if imported_receipt is not None else candidate.declaration_name
             ),
-            statement=candidate.type_text,
+            statement=declaration_type,
+            legacy_theory_signature=(candidate.type_text if any(
+                origin.source_kind == "published_theory" for origin in origins
+            ) else ""),
             source=source,
             environment_id=self.context_id(),
             source_store_id=(location.source_store_id if location is not None
                              else origins[0].source_id if origins else ""),
             preamble=preamble + "\n" + "\n".join(lemmas),
+            comparison_source=session.lean._resolve_preamble(preamble) + "\n" + "\n".join(lemmas),
             source_available=True,
             source_binding_attested=source_attested,
             budget=budget,
@@ -2467,15 +2523,53 @@ class MathematicalMemoryService:
         # admission would move this helper after later declarations and change
         # the retained root's context even when every source is unchanged.
         prefix = list(helpers[:helpers.index(helper.source) + 1])
+        from ensemble_prover.mini_theory.declaration_types import closed_declaration_type
+
+        declaration_type = (
+            closed_declaration_type(candidate.type_text)
+            if any(origin.source_kind == "published_theory" for origin in candidate.origins)
+            else candidate.type_text
+        )
         result = await _await_serialized_lean_operation(
             runner,
             lambda: runner.check(
-                candidate.type_text, "by exact @" + helper.name, prefix,
+                declaration_type, "by exact @" + helper.name, prefix,
                 preamble_override=preamble, timeout_s=budget.remaining_s(),
                 max_heartbeats=budget.max_heartbeats,
             ),
             timeout_s=budget.remaining_s() * 0.95, deadline_monotonic=budget.deadline_monotonic,
         )
+        if not result.ok and any(
+            origin.source_kind == "published_theory" for origin in candidate.origins
+        ):
+            from .profiles import recover_legacy_declaration_type
+            from ensemble_prover.lean_runner import termination_signal_from_returncode
+
+            parsed = result.parsed
+            if result.returncode == 124 or getattr(parsed, "timeout", False):
+                raise TimeoutError("deferred helper recheck exhausted its allowance")
+            if getattr(parsed, "infra_failure", False) or termination_signal_from_returncode(result.returncode):
+                raise OSError("deferred helper recheck infrastructure unavailable")
+            # This prefix contains the exact current helper after any collision
+            # rename. The original candidate/source equality above and the
+            # context guard below remain necessary for readmission.
+            exact_context = preamble + "\n" + "\n".join(prefix)
+            recovered_type = await recover_legacy_declaration_type(
+                runner, declaration_name=helper.name, statement=declaration_type,
+                legacy_signature=candidate.type_text, render_source=exact_context,
+                comparison_source=exact_context, preamble=preamble, budget=budget,
+            )
+            if recovered_type is not None:
+                result = await _await_serialized_lean_operation(
+                    runner,
+                    lambda: runner.check(
+                        recovered_type, "by exact @" + helper.name, prefix,
+                        preamble_override=preamble, timeout_s=budget.remaining_s(),
+                        max_heartbeats=budget.max_heartbeats,
+                    ),
+                    timeout_s=budget.remaining_s() * 0.95,
+                    deadline_monotonic=budget.deadline_monotonic,
+                )
         self.check_budget(budget)
         if (session.lean is not runner or not runtime_current() or self.context_id() != context_id
                 or session.dossier.verified_helpers.get(helper.name) is not helper
@@ -3483,6 +3577,7 @@ class MathematicalMemoryService:
         view = {
             "mode": self.config.mode,
             "status": self.health,
+            "persistence_diagnostic": self.persistence_diagnostic,
             "generation": pin.to_record(),
             "goal_id": goal_id or previous.get("goal_id", self.context_id()),
             "environment_id": self.context_id(),

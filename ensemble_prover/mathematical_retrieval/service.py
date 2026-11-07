@@ -21,6 +21,7 @@ from ..putnam import (
     is_putnam_bench_problem_source,
 )
 from ..theorem_project import scan_lean_declarations
+from ..mini_theory.declaration_types import closed_declaration_type
 
 from .model import (
     CandidateOrigin,
@@ -1307,7 +1308,7 @@ class PublishedTheorySource:
                 entries.append(
                     SimpleNamespace(
                         name=str(getattr(declaration, "fq_name", "") or ""),
-                        type=str(getattr(declaration, "type_text", "") or ""),
+                        type=closed_declaration_type(str(getattr(declaration, "type_text", "") or "")),
                         kind=str(
                             getattr(declaration, "declaration_kind", "theorem")
                             or "theorem"
@@ -1441,7 +1442,7 @@ class PublishedTheorySource:
                 SourceHit(
                     entry=SimpleNamespace(
                         name=str(getattr(hit, "fq_name", "") or ""),
-                        type=str(getattr(hit, "type_text", "") or ""),
+                        type=closed_declaration_type(str(getattr(hit, "type_text", "") or "")),
                         kind=str(
                             getattr(hit, "declaration_kind", "theorem")
                             or "theorem"
@@ -4197,7 +4198,11 @@ class MathematicalRetrievalService:
                 RetrievalCandidate(
                     candidate_id="",
                     declaration_name=_entry_name(state["entry"]),
-                    type_text=_entry_type(state["entry"]),
+                    type_text=(
+                        closed_declaration_type(_entry_type(state["entry"]))
+                        if any(origin.source_kind == "published_theory" for origin in origins)
+                        else _entry_type(state["entry"])
+                    ),
                     declaration_kind=_entry_kind(state["entry"]),
                     origins=origins,
                     channel_ranks=state["ranks"],

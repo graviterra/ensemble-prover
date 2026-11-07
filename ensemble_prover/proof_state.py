@@ -1838,64 +1838,52 @@ def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, in
         return -1
 
     def local_decl_scope_start(line_index: int, line: str, decl_indent: int) -> int:
-        if ":=" in line and ":= by" not in line:
-            after_assign = line.split(":=", 1)[1].strip()
-            if after_assign:
-                assign_index = line.find(":=")
-                semicolon_index = same_line_decl_separator(line, assign_index + 2)
-                if semicolon_index >= 0:
-                    return line_starts[line_index] + semicolon_index + 1
-                return line_starts[line_index] + len(line)
-            for next_index in range(line_index + 1, len(lines)):
-                next_line = lines[next_index]
-                if not next_line.strip():
-                    continue
-                if _line_indent(next_line) <= decl_indent:
-                    return line_starts[line_index] + len(line)
-                stripped = next_line.strip()
-                if stripped.startswith("by"):
-                    if stripped != "by":
-                        return line_starts[next_index] + len(next_line)
-                    for body_end_index in range(next_index + 1, len(lines)):
-                        body_line = lines[body_end_index]
-                        if not body_line.strip():
-                            continue
-                        if _line_indent(body_line) <= decl_indent:
-                            return line_starts[body_end_index]
-                    return len(code)
-                return line_starts[next_index] + len(next_line)
-            return len(code)
-        if ":= by" not in line:
-            for next_index in range(line_index + 1, len(lines)):
-                next_line = lines[next_index]
-                if not next_line.strip():
-                    continue
-                if _line_indent(next_line) <= decl_indent:
-                    return line_starts[line_index] + len(line)
-                if ":=" not in next_line:
-                    continue
-                if ":= by" not in next_line:
-                    return line_starts[next_index] + len(next_line)
-                after_by = next_line.split(":= by", 1)[1].strip()
-                if after_by:
-                    return line_starts[next_index] + len(next_line)
-                for body_end_index in range(next_index + 1, len(lines)):
-                    body_line = lines[body_end_index]
-                    if not body_line.strip():
-                        continue
-                    if _line_indent(body_line) <= decl_indent:
-                        return line_starts[body_end_index]
+        # The name is unavailable throughout its initializer, even when a
+        # multiline function header or term spans several continuation lines.
+        # A single-line term can end at a tactic separator; a `by` initializer
+        # owns its tactic sequence until the layout returns to the declaration.
+        declaration_start = line_starts[line_index] + decl_indent
+        group_stop = declaration_group_stops.get(declaration_start, len(code))
+        depth = 0
+        for assignment_index in range(line_index, len(lines)):
+            assignment_line = lines[assignment_index]
+            if line_starts[assignment_index] >= group_stop:
                 return len(code)
-            return line_starts[line_index] + len(line)
-        after_by = line.split(":= by", 1)[1].strip()
-        if after_by:
-            return line_starts[line_index] + len(line)
-        for next_index in range(line_index + 1, len(lines)):
-            next_line = lines[next_index]
-            if not next_line.strip():
+            if not assignment_line.strip():
                 continue
-            if _line_indent(next_line) <= decl_indent:
-                return line_starts[next_index]
+            if assignment_index > line_index and _line_indent(assignment_line) <= decl_indent:
+                # Without an assignment, `have` can open a separate proof
+                # goal. Its first bullet proves the new fact without that
+                # fact in scope. Other tactic goal sequencing is ambiguous
+                # here, so retain possible global references conservatively.
+                if assignment_line.lstrip().startswith("·"):
+                    return scope_end(assignment_index, _line_indent(assignment_line))
+                return len(code)
+            # Ignore enclosing assignments and defaults inside function binders.
+            # Only an assignment at the declaration's own depth starts its RHS.
+            assign_index = decl_indent if assignment_index == line_index else 0
+            assignment_stop = min(len(assignment_line), group_stop - line_starts[assignment_index])
+            while assign_index < assignment_stop:
+                skipped = _lean_lexical_skip_end(assignment_line, assign_index)
+                if skipped is not None:
+                    assign_index = skipped
+                    continue
+                char = assignment_line[assign_index]
+                if depth == 0 and assignment_line.startswith(":=", assign_index):
+                    break
+                if char in "([{⦃⟨":
+                    depth += 1
+                elif char in ")]}⦄⟩":
+                    depth = max(0, depth - 1)
+                assign_index += 1
+            if assign_index >= assignment_stop:
+                continue
+            after_assign = assignment_line[assign_index + 2:].strip()
+            if after_assign and not re.match(r"by\b", after_assign):
+                separator = same_line_decl_separator(assignment_line, assign_index + 2)
+                if separator >= 0:
+                    return line_starts[assignment_index] + separator + 1
+            return scope_end(assignment_index, decl_indent)
         return len(code)
 
     def same_line_tactic_scope_start(line_index: int, line: str, start: int) -> int:
@@ -2338,8 +2326,12 @@ def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, in
                         term_let_positions.add(cursor)
             cursor += 1
 
+    # A named local function may put its binders and result type on later
+    # lines. Its declaration token is local, but the initializer still sees
+    # any same-named global; local_decl_scope_start keeps that boundary.
     local_decl_re = re.compile(
-        r"(?<![A-Za-z0-9_'.])(?:have|let|obtain)\s+([A-Za-z_][A-Za-z0-9_']*)\s*(?::|:=)"
+        rf"(?<![A-Za-z0-9_'.])(?:have|let|obtain)\s+({_LEAN_NAME_SEGMENT_PATTERN})"
+        r"(?=\s*(?:[:({\[⦃]|$))"
     )
     local_pattern_decl_re = re.compile(
         r"(?<![A-Za-z0-9_'.])(?:have|let)\s+(.+?)\s*(?::=|:)"
@@ -2365,6 +2357,42 @@ def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, in
         r"(?<![A-Za-z0-9_'.])case\s+[A-Za-z_][A-Za-z0-9_']*\s+([^=|]+)=>"
     )
     fun_re = re.compile(r"(?<![A-Za-z0-9_'.])fun\s+([^=]+?)=>")
+    # A local inside a parenthesized term cannot escape that term, even if
+    # subsequent tactics have the same layout indentation. Track only local
+    # declaration positions, keeping this delimiter pass linear in source size.
+    declaration_positions = {
+        line_starts[line_index] + match.start()
+        for line_index, line in enumerate(lines)
+        for pattern in (local_decl_re, local_pattern_decl_re, obtain_pattern_re)
+        for match in pattern.finditer(line)
+    }
+    declaration_group_starts: Dict[int, int] = {}
+    declaration_group_stops: Dict[int, int] = {}
+    group_declarations: List[Tuple[int, List[int]]] = []
+    cursor = 0
+    while cursor < len(code):
+        skipped = _lean_lexical_skip_end(code, cursor)
+        if skipped is not None:
+            cursor = skipped
+            continue
+        char = code[cursor]
+        if char in "([{⦃⟨":
+            group_declarations.append((cursor, []))
+        elif char in ")]}⦄⟩":
+            if group_declarations:
+                for position in group_declarations.pop()[1]:
+                    declaration_group_stops[position] = cursor
+        elif cursor in declaration_positions and group_declarations:
+            declaration_group_starts[cursor] = group_declarations[-1][0]
+            group_declarations[-1][1].append(cursor)
+        cursor += 1
+
+    def local_decl_scope_end(line_index: int, scope_indent: int, position: int) -> int:
+        return min(
+            scope_end(line_index, scope_indent),
+            declaration_group_stops.get(position, len(code)),
+        )
+
     for line_index, line in enumerate(lines):
         line_start = line_starts[line_index]
         line_indent = _line_indent(line)
@@ -2379,17 +2407,27 @@ def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, in
                 line_start + match.start(1),
                 line_start + match.end(1),
             )
+            header_tail = line[match.end(1):].lstrip()
+            if not header_tail or header_tail[0] in "({[⦃":
+                position = line_start + match.start()
+                prefix_start = max(line_start, declaration_group_starts.get(position, -1) + 1)
+                prefix = code[prefix_start:position].strip()
+                if prefix not in {"", "·", "by", "by ·"}:
+                    # Inline nested initializers without their own delimiter
+                    # have ambiguous term boundaries. Keep possible globals
+                    # until a local function's enclosing scope is established.
+                    continue
             record(
                 match.group(1),
                 local_decl_scope_start(line_index, line, decl_indent),
-                scope_end(line_index, scope_indent),
+                local_decl_scope_end(line_index, scope_indent, line_start + match.start()),
             )
         for match in obtain_pattern_re.finditer(line):
             bullet_pos = line.find("·", 0, match.start(1))
             scope_indent = bullet_pos if bullet_pos >= 0 else max(-1, line_indent - 1)
             decl_indent = match.start(0)
             scope_start = local_decl_scope_start(line_index, line, decl_indent)
-            scope_stop = scope_end(line_index, scope_indent)
+            scope_stop = local_decl_scope_end(line_index, scope_indent, line_start + match.start())
             alternatives = split_pattern_alternatives(match.group(1))
             if len(alternatives) > 1:
                 branch_ranges = tactic_alternative_scope_ranges(
@@ -2417,13 +2455,15 @@ def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, in
                 scope_stop,
             )
         for match in local_pattern_decl_re.finditer(line):
+            if local_decl_re.match(line, match.start()) is not None:
+                continue
             if line_start + match.start() in term_let_positions:
                 continue
             bullet_pos = line.find("·", 0, match.start(1))
             scope_indent = bullet_pos if bullet_pos >= 0 else max(-1, line_indent - 1)
             decl_indent = match.start(0)
             scope_start = local_decl_scope_start(line_index, line, decl_indent)
-            scope_stop = scope_end(line_index, scope_indent)
+            scope_stop = local_decl_scope_end(line_index, scope_indent, line_start + match.start())
             for name, name_start, name_end in pattern_local_name_matches(match.group(1)):
                 record(
                     name,

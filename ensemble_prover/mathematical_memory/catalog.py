@@ -8,6 +8,8 @@ current reconciliation authority supplies complete invalidation coverage.
 from __future__ import annotations
 
 import contextlib
+import base64
+import binascii
 import fcntl
 import hashlib
 import json
@@ -18,6 +20,7 @@ import sqlite3
 import tempfile
 import time
 import uuid
+import zlib
 from dataclasses import dataclass
 from collections.abc import Iterator
 from typing import Any, Callable, Mapping
@@ -41,6 +44,63 @@ from .model import (
 
 class MemoryUnavailable(RuntimeError):
     """An advisory store operation has no usable result."""
+
+
+_STORAGE_ENCODING = "memory-payload-zlib-v1"
+_EVENT_BYTE_LIMIT = 2 * 1024 * 1024
+_PAYLOAD_BYTE_LIMIT = 1024 * 1024
+
+
+def _decode_event_storage(raw: str) -> tuple[dict[str, Any], int]:
+    """Recover an immutable event while bounding compressed and logical bytes."""
+    if type(raw) is not str or len(raw.encode("utf-8")) > _EVENT_BYTE_LIMIT:
+        raise MemoryUnavailable("memory event exceeds byte limit")
+    record = json.loads(raw)
+    if type(record) is not dict:
+        raise MemoryUnavailable("invalid memory event storage")
+    if "_storage_encoding" not in record:
+        return record, len(raw.encode("utf-8"))
+    if record.pop("_storage_encoding") != _STORAGE_ENCODING:
+        raise MemoryUnavailable("unsupported memory event storage encoding")
+    logical_bytes = record.pop("_logical_bytes", None)
+    if type(logical_bytes) is not int or not 0 < logical_bytes <= _EVENT_BYTE_LIMIT:
+        raise MemoryUnavailable("invalid memory event logical size")
+    encoded = record.get("payload")
+    if type(encoded) is not str:
+        raise MemoryUnavailable("invalid compressed memory payload")
+    try:
+        compressed = base64.b64decode(encoded.encode("ascii"), validate=True)
+        inflater = zlib.decompressobj()
+        payload = inflater.decompress(compressed, _PAYLOAD_BYTE_LIMIT + 1)
+        if (len(payload) > _PAYLOAD_BYTE_LIMIT or not inflater.eof
+                or inflater.unused_data or inflater.unconsumed_tail):
+            raise MemoryUnavailable("invalid or oversized compressed memory payload")
+        record["payload"] = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, binascii.Error, zlib.error) as exc:
+        raise MemoryUnavailable("invalid compressed memory payload") from exc
+    if type(record["payload"]) is not dict:
+        raise MemoryUnavailable("invalid compressed memory event payload")
+    actual_bytes = len(canonical_json(record).encode("utf-8"))
+    if actual_bytes != logical_bytes:
+        raise MemoryUnavailable("memory event logical size mismatch")
+    return record, actual_bytes
+
+
+def _encode_event_storage(record: Mapping[str, Any]) -> str:
+    """Compress only the body; indexed provenance remains ordinary JSON."""
+    raw = canonical_json(record)
+    logical_bytes = len(raw.encode("utf-8"))
+    if logical_bytes > _EVENT_BYTE_LIMIT:
+        raise MemoryUnavailable("memory event exceeds byte limit")
+    if logical_bytes < 1024:
+        return raw
+    stored = dict(record)
+    body = canonical_json(stored["payload"]).encode("utf-8")
+    stored["payload"] = base64.b64encode(zlib.compress(body)).decode("ascii")
+    stored["_storage_encoding"] = _STORAGE_ENCODING
+    stored["_logical_bytes"] = logical_bytes
+    encoded = canonical_json(stored)
+    return encoded if len(encoded.encode("utf-8")) + 64 < logical_bytes else raw
 
 
 @dataclass(frozen=True)
@@ -359,7 +419,90 @@ class MemoryCatalog:
                 (str(size + extra_size + mask_bytes),),
             )
 
-    def _charge_event_storage(self, conn: sqlite3.Connection, raw: str) -> bool:
+    def _compact_event_storage(
+        self, conn: sqlite3.Connection, *, deadline_monotonic: float | None,
+        target_bytes: int = 0, max_records: int = 128,
+    ) -> dict[str, int]:
+        """Losslessly reclaim a bounded batch without changing event identities."""
+        deadline = min(time.monotonic() + 0.25, deadline_monotonic or float("inf"))
+        scanned = rewritten = saved = logical_read = 0
+        for table in ("events", "conflicts"):
+            if time.monotonic() >= deadline or scanned >= max_records:
+                break
+            cursor_key = "storage_compaction_" + table + "_after"
+            prior = conn.execute("SELECT value FROM metadata WHERE key=?", (cursor_key,)).fetchone()
+            after = int(prior[0]) if prior else 0
+            rows = conn.execute(
+                f"SELECT rowid,event_id,digest,payload,sequence FROM {table} "
+                "WHERE sequence>? AND json_type(payload,'$._storage_encoding') IS NULL "
+                "AND length(CAST(payload AS BLOB)) BETWEEN 1024 AND 2097152 "
+                "ORDER BY sequence LIMIT ?", (after, max_records - scanned,),
+            )
+            last_sequence = after
+            saw_row = False
+            for row in rows:
+                saw_row = True
+                if time.monotonic() >= deadline or scanned >= max_records:
+                    break
+                raw = row["payload"]
+                size = len(raw.encode("utf-8"))
+                if logical_read + size > 4 * 1024 * 1024:
+                    break
+                scanned += 1
+                logical_read += size
+                last_sequence = row["sequence"]
+                try:
+                    record, _ = _decode_event_storage(raw)
+                    event = MemoryEvent.from_record(record)
+                    if (event.event_id != row["event_id"]
+                            or event.payload_digest != row["digest"]
+                            or canonical_json(event.to_record()) != raw):
+                        continue
+                    encoded = _encode_event_storage(event.to_record())
+                    reduction = size - len(encoded.encode("utf-8"))
+                    if reduction <= 0:
+                        continue
+                except (ValueError, KeyError, TypeError, MemoryUnavailable):
+                    continue
+                conn.execute(
+                    f"UPDATE {table} SET payload=? WHERE rowid=? AND payload=?",
+                    (encoded, row["rowid"], raw),
+                )
+                saved += reduction
+                rewritten += 1
+                if target_bytes and saved >= target_bytes:
+                    break
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata VALUES(?,?)",
+                (cursor_key, str(last_sequence if saw_row else 0)),
+            )
+            if target_bytes and saved >= target_bytes:
+                break
+        if saved:
+            conn.execute(
+                "UPDATE metadata SET value=CAST(value AS INTEGER)-? WHERE key='event_bytes'",
+                (saved,),
+            )
+        return {"scanned": scanned, "rewritten": rewritten, "saved_bytes": saved}
+
+    def compact(
+        self, *, deadline_monotonic: float | None = None, max_records: int = 128,
+    ) -> dict[str, int]:
+        """Compact a bounded batch, retaining all events, masks and evidence."""
+        integer(max_records, "compaction record limit", 1)
+        if max_records > 128:
+            raise ValueError("compaction record limit exceeds bounded batch")
+        if self.read_only:
+            raise MemoryUnavailable("read-only memory catalog")
+        with self._connect(deadline_monotonic) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return self._compact_event_storage(
+                conn, deadline_monotonic=deadline_monotonic, max_records=max_records,
+            )
+
+    def _event_storage_available(
+        self, conn: sqlite3.Connection, cost: int, *, deadline_monotonic: float | None,
+    ) -> bool:
         count = int(
             conn.execute(
                 "SELECT value FROM metadata WHERE key='event_rows'"
@@ -370,14 +513,48 @@ class MemoryCatalog:
                 "SELECT value FROM metadata WHERE key='event_bytes'"
             ).fetchone()[0]
         )
+        if count >= self.event_count_cap:
+            return False
+        if size + cost > self.event_byte_cap:
+            compacted = self._compact_event_storage(
+                conn, deadline_monotonic=deadline_monotonic,
+                target_bytes=size + cost - self.event_byte_cap,
+            )
+            size -= compacted["saved_bytes"]
+        return size + cost <= self.event_byte_cap
+
+    def ensure_append_capacity(
+        self, event: MemoryEvent, *, deadline_monotonic: float | None = None,
+    ) -> None:
+        """Check capacity before evidence I/O; append still rechecks atomically."""
+        if not isinstance(event, MemoryEvent):
+            raise ValueError("capacity check requires a typed immutable event")
+        if self.read_only:
+            raise MemoryUnavailable("read-only memory catalog")
+        raw = _encode_event_storage(event.to_record())
+        with self._connect(deadline_monotonic) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # Existing deliveries must still reach duplicate/conflict handling,
+            # including invalidation when the storage allowance is exhausted.
+            if conn.execute("SELECT 1 FROM events WHERE event_id=?", (event.event_id,)).fetchone():
+                return
+            available = self._event_storage_available(
+                conn, len(raw.encode("utf-8")), deadline_monotonic=deadline_monotonic,
+            )
+        if not available:
+            raise MemoryUnavailable("memory event capacity exhausted")
+
+    def _charge_event_storage(
+        self, conn: sqlite3.Connection, raw: str, *, deadline_monotonic: float | None = None,
+    ) -> bool:
         cost = len(raw.encode("utf-8"))
-        if count >= self.event_count_cap or size + cost > self.event_byte_cap:
+        if not self._event_storage_available(conn, cost, deadline_monotonic=deadline_monotonic):
             return False
         conn.execute(
-            "UPDATE metadata SET value=? WHERE key='event_rows'", (str(count + 1),)
+            "UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='event_rows'"
         )
         conn.execute(
-            "UPDATE metadata SET value=? WHERE key='event_bytes'", (str(size + cost),)
+            "UPDATE metadata SET value=CAST(value AS INTEGER)+? WHERE key='event_bytes'", (cost,),
         )
         return True
 
@@ -600,8 +777,9 @@ class MemoryCatalog:
             return StoreResult(
                 "unavailable", event.event_id, "cancelled or deadline exhausted", True
             )
-        raw = canonical_json(event.to_record())
-        if len(raw.encode("utf-8")) > 2 * 1024 * 1024:
+        try:
+            raw = _encode_event_storage(event.to_record())
+        except MemoryUnavailable:
             return StoreResult(
                 "unavailable", event.event_id, "memory event exceeds byte limit", True
             )
@@ -636,7 +814,7 @@ class MemoryCatalog:
                     ).fetchone()
                     if not prior_conflict:
                         seq = self._advance(conn)
-                        if self._charge_event_storage(conn, raw):
+                        if self._charge_event_storage(conn, raw, deadline_monotonic=deadline_monotonic):
                             conn.execute(
                                 "INSERT INTO conflicts VALUES(?,?,?,?)",
                                 (event.event_id, event.payload_digest, raw, seq),
@@ -653,7 +831,7 @@ class MemoryCatalog:
                         event.event_id,
                         "conflicting immutable event payloads",
                     )
-                if not self._charge_event_storage(conn, raw):
+                if not self._charge_event_storage(conn, raw, deadline_monotonic=deadline_monotonic):
                     return StoreResult(
                         "unavailable",
                         event.event_id,
@@ -1083,22 +1261,38 @@ class MemoryCatalog:
             rows = []
             read_bytes = 0
             byte_truncated = False
+            invalidated = 0
+            storage_diagnostics = []
             for header in headers:
-                if read_bytes + header["size"] > self.query_byte_cap:
+                if (read_bytes + header["size"] > self.query_byte_cap
+                        or header["size"] > _EVENT_BYTE_LIMIT):
                     byte_truncated = True
                     break
-                rows.append(
-                    conn.execute(
-                        "SELECT payload,digest FROM events WHERE event_id=?",
-                        (header["event_id"],),
-                    ).fetchone()
-                )
-                read_bytes += header["size"]
+                row = conn.execute(
+                    "SELECT payload,digest FROM events WHERE event_id=?",
+                    (header["event_id"],),
+                ).fetchone()
+                try:
+                    record, logical_bytes = _decode_event_storage(row["payload"])
+                except (ValueError, KeyError, TypeError, MemoryUnavailable):
+                    invalidated += 1
+                    storage_diagnostics.append("memory event encoding unavailable")
+                    # Failed inflation may have consumed the full bounded
+                    # allowance; malformed rows do not evade query accounting.
+                    read_bytes += _EVENT_BYTE_LIMIT
+                    if read_bytes >= self.query_byte_cap:
+                        byte_truncated = True
+                        break
+                    continue
+                if read_bytes + logical_bytes > self.query_byte_cap:
+                    byte_truncated = True
+                    break
+                rows.append((record, row["digest"]))
+                read_bytes += logical_bytes
         found = []
-        diagnostics = ["memory query byte coverage exhausted"] if byte_truncated else []
-        invalidated = 0
-        complete = not byte_truncated and len(headers) <= self.query_scan_cap
-        for row in rows[: self.query_scan_cap]:
+        diagnostics = storage_diagnostics + (["memory query byte coverage exhausted"] if byte_truncated else [])
+        complete = not byte_truncated and not storage_diagnostics and len(headers) <= self.query_scan_cap
+        for record, expected_digest in rows[: self.query_scan_cap]:
             if (
                 deadline_monotonic is not None
                 and time.monotonic() >= deadline_monotonic
@@ -1107,8 +1301,8 @@ class MemoryCatalog:
                 diagnostics.append("memory deadline exhausted")
                 break
             try:
-                event = MemoryEvent.from_record(json.loads(row["payload"]))
-                if event.payload_digest != row["digest"]:
+                event = MemoryEvent.from_record(record)
+                if event.payload_digest != expected_digest:
                     raise MemoryUnavailable("memory event digest mismatch")
                 if self._eligible(
                     event, policy, denied_events, denied_sources, deadline_monotonic
@@ -1167,7 +1361,8 @@ class MemoryCatalog:
         if not usable or row is None:
             return None
         try:
-            event = MemoryEvent.from_record(json.loads(row["payload"]))
+            record, _ = _decode_event_storage(row["payload"])
+            event = MemoryEvent.from_record(record)
             if event.payload_digest != row["digest"] or not self._eligible(
                 event, policy, denied_events, denied_sources, deadline_monotonic
             ):
@@ -1329,7 +1524,8 @@ class MemoryCatalog:
                 meta = dict(snapshot.execute("SELECT key,value FROM metadata"))
                 refs = {}
                 for (raw,) in snapshot.execute("SELECT payload FROM events"):
-                    for ref in MemoryEvent.from_record(json.loads(raw)).evidence:
+                    record, _ = _decode_event_storage(raw)
+                    for ref in MemoryEvent.from_record(record).evidence:
                         refs[ref.digest] = ref
             # Pending events are separately retained, with unchanged identities.
             pending = dest / "outbox"

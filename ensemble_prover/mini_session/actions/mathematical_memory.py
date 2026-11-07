@@ -11,6 +11,7 @@ from typing import Any, ClassVar, FrozenSet
 
 from ensemble_prover.lean_runner import lean_resource_scope
 from ensemble_prover.mathematical_memory.budget import MemoryBudget
+from ensemble_prover.mathematical_memory.catalog import MemoryUnavailable
 from ensemble_prover.mathematical_memory.model import content_digest
 from ensemble_prover.mathematical_memory.service import CandidateAdmissionRejected
 from ensemble_prover.root_finalization import (
@@ -187,6 +188,13 @@ class MathematicalMemoryAction:
             retry_event = None
             retry_recipe = None
 
+            def require_persistence(event: Any) -> None:
+                if event is None:
+                    detail = getattr(service, "persistence_diagnostic", "")
+                    raise MemoryUnavailable(
+                        detail or "mathematical memory persistence unavailable"
+                    )
+
             def settle_request(status: str, detail: str) -> None:
                 try:
                     service.request_store.transition(
@@ -278,7 +286,7 @@ class MathematicalMemoryAction:
                         deadline_monotonic=budget.deadline_monotonic,
                     )
                     if request.get("kind") in {"pin", "note"}:
-                        service.record(
+                        event = service.record(
                             request["kind"],
                             dict(request),
                             operation_id=operation_id,
@@ -286,6 +294,7 @@ class MathematicalMemoryAction:
                             budget=budget,
                             provenance=annotation_provenance,
                         )
+                        require_persistence(event)
                         verdict = "annotation_recorded"
                     elif request.get("kind") == "generalization":
                         await service.prove_requested_generalization(
@@ -393,6 +402,17 @@ class MathematicalMemoryAction:
                                     for reference in event.evidence
                                 ]
                                 cards.append(card)
+                            else:
+                                # Keep the unverified attempt visible, and keep
+                                # its continuation pending. Without a durable
+                                # candidate receipt, do not activate imports or
+                                # spend the remaining allowance on Lean probes.
+                                card["outcome"] = "persistence_unavailable"
+                                card["reason"] = getattr(
+                                    service, "persistence_diagnostic", ""
+                                )
+                                cards.append(card)
+                                require_persistence(event)
                             before = service.context_id()
                             stage = "activate_candidate"
                             if not await service.activate_candidate(candidate, budget):

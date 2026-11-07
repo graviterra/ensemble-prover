@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
 from ensemble_prover.deep_json import loads_deep_json
+from .runtime_receipts import begin_check, issue
 
 
 def digest(value: str | bytes) -> str:
@@ -230,6 +231,7 @@ async def capture_goal(
 ) -> GoalContextSnapshot:
     resolved_preamble = runner._resolve_preamble(preamble)
     context = resolved_preamble + "\n" + "\n".join(lemmas)
+    pending = begin_check(runner, budget, context)
     base = dict(
         statement=statement,
         source=source,
@@ -258,9 +260,64 @@ async def capture_goal(
             return GoalContextSnapshot(**base, diagnostic="goal_capture_unavailable")
         fields = _analysis_fields(analyses[0])
         fields["complete"] = fields["complete"] and bool(source and environment_id)
-        return GoalContextSnapshot(**base, **fields)
+        result = GoalContextSnapshot(**base, **fields)
+        issue(result, pending, context=context)
+        return result
     except (TimeoutError, OSError, ValueError) as exc:
         return GoalContextSnapshot(**base, diagnostic=type(exc).__name__)
+
+
+async def recover_legacy_declaration_type(
+    runner: Any, *, declaration_name: str, statement: str,
+    legacy_signature: str, render_source: str, comparison_source: str,
+    preamble: str | None, budget: Any,
+) -> str | None:
+    """Recover only a display type freshly reproduced from the exact source.
+
+    The caller must retain and validate the source's identity throughout this
+    operation. A separately supplied legacy string cannot authorize changing
+    a different claimed statement.
+    """
+    from ensemble_prover.mini_theory.declaration_types import closed_declaration_type
+    from ensemble_prover.lean_runner import termination_signal_from_returncode
+
+    if not legacy_signature or statement != closed_declaration_type(legacy_signature):
+        return None
+    legacy_ok, legacy_type, _ = await lean_call(
+        runner, budget,
+        lambda: runner.check_source_declaration_type(
+            render_source, declaration_name.removeprefix("_root_."),
+            timeout_s=remaining(budget), legacy_theory_signature=True,
+            raise_on_operational_failure=True,
+        ),
+    )
+    if not legacy_ok or legacy_type != statement:
+        return None
+    rendered_ok, rendered_type, _ = await lean_call(
+        runner, budget,
+        lambda: runner.check_source_declaration_type(
+            render_source, declaration_name.removeprefix("_root_."),
+            timeout_s=remaining(budget), pp_explicit=True, pp_notation=False,
+            preserve_type_layout=True,
+            raise_on_operational_failure=True,
+        ),
+    )
+    if not rendered_ok:
+        return None
+    parsed, _output, code = await lean_call(
+        runner, budget,
+        lambda: runner.check_source_declaration_type_equivalence(
+            comparison_source, declaration_name.removeprefix("_root_."),
+            rendered_type, timeout_s=remaining(budget),
+            preamble_override=preamble,
+            max_heartbeats=getattr(budget, "max_heartbeats", None),
+        ),
+    )
+    if code == 124 or getattr(parsed, "timeout", False):
+        raise TimeoutError("declaration type recovery exhausted its allowance")
+    if getattr(parsed, "infra_failure", False) or termination_signal_from_returncode(code):
+        raise OSError("declaration type recovery infrastructure unavailable")
+    return rendered_type if code == 0 else None
 
 
 async def profile_declaration(
@@ -275,6 +332,8 @@ async def profile_declaration(
     preamble: str | None = None,
     source_available: bool = False,
     source_binding_attested: bool = False,
+    legacy_theory_signature: str = "",
+    comparison_source: str | None = None,
 ) -> DeclarationProfile:
     base = dict(
         declaration_name=declaration_name,
@@ -287,7 +346,14 @@ async def profile_declaration(
     try:
         # This binds the supplied statement to the kernel declaration, rather
         # than merely proving that a pretty-printed type elaborates somewhere.
-        context = runner._resolve_preamble(preamble)
+        if comparison_source is not None and not source_available:
+            raise ValueError("an exact comparison context requires an available declaration")
+        # The caller can supply the exact resolved application context. Running
+        # the preamble formatter over helper bodies again can change their
+        # indentation and therefore does not establish the same source binding.
+        context = (runner._resolve_preamble(preamble)
+                   if comparison_source is None else comparison_source)
+        comparison_preamble = preamble if comparison_source is None else context
         if source_available and not source_binding_attested:
             base.update(
                 source=context,
@@ -303,6 +369,7 @@ async def profile_declaration(
                 else context + "\n" + source
             )
         )
+        pending = begin_check(runner, budget, standalone_source) if source_available else None
         parsed, _output, code = await lean_call(
             runner,
             budget,
@@ -311,7 +378,7 @@ async def profile_declaration(
                 declaration_name.removeprefix("_root_."),
                 statement,
                 timeout_s=remaining(budget),
-                preamble_override=preamble,
+                preamble_override=comparison_preamble,
                 max_heartbeats=getattr(budget, "max_heartbeats", None),
             ),
         )
@@ -324,6 +391,16 @@ async def profile_declaration(
             raise TimeoutError("declaration type comparison exhausted its allowance")
         if getattr(parsed, "infra_failure", False) or termination_signal_from_returncode(code):
             raise OSError("declaration type comparison infrastructure unavailable")
+        if code != 0 and legacy_theory_signature and source_binding_attested:
+            recovered_type = await recover_legacy_declaration_type(
+                runner, declaration_name=declaration_name, statement=statement,
+                legacy_signature=legacy_theory_signature, render_source=source,
+                comparison_source=standalone_source, preamble=comparison_preamble, budget=budget,
+            )
+            if recovered_type is not None:
+                statement = recovered_type
+                base["statement"] = statement
+                code = 0
         if code != 0:
             return DeclarationProfile(
                 **base, diagnostic="declaration_type_binding_failed"
@@ -352,7 +429,7 @@ async def profile_declaration(
         fields["complete"] = fields["complete"] and bool(
             source and environment_id and source_store_id
         )
-        return DeclarationProfile(
+        result = DeclarationProfile(
             **base,
             **fields,
             binder_sorts=analysis.binder_sorts,
@@ -360,6 +437,8 @@ async def profile_declaration(
             structural_identity=analysis.structural_identity,
             certified_source_binding=source_binding_attested is True,
         )
+        issue(result, pending, context=standalone_source)
+        return result
     except (TimeoutError, OSError, ValueError) as exc:
         # Preserve the operational category for every subclass, including
         # checker-specific storage/connection errors. A live infrastructure

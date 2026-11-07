@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Sequence
 
 from .model import PublishedTheoryBundle, TheoryDeclaration
+from .declaration_types import closed_declaration_type
 from .store import TheoryStore, TheoryStoreError
 
 
@@ -217,7 +218,7 @@ class MiniTheoryRetriever:
             hit = TheorySearchHit(
                     fq_name=declaration.fq_name,
                     declaration_kind=declaration.declaration_kind,
-                    type_text=declaration.type_text,
+                    type_text=closed_declaration_type(declaration.type_text),
                     module_name=bundle.module_name,
                     bundle_id=bundle.bundle_id,
                     domain=bundle.domain,
@@ -241,7 +242,7 @@ class MiniTheoryRetriever:
             return TheorySearchHit(
                 fq_name=declaration.fq_name,
                 declaration_kind=declaration.declaration_kind,
-                type_text=declaration.type_text,
+                type_text=closed_declaration_type(declaration.type_text),
                 module_name=bundle.module_name,
                 bundle_id=bundle.bundle_id,
                 domain=bundle.domain,

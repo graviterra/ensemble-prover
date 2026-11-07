@@ -23,6 +23,7 @@ from .proof_dossier import (
     is_answer_unsafe_helper_source,
     text_hash,
     verified_helper_is_premise_projection,
+    verified_helper_has_typed_binder_evidence,
 )
 from .helper_quality import classify_auxiliary_statement_quality
 from .helper_advice import capture_helper_advice, validate_cached_helper_advice
@@ -574,7 +575,10 @@ class MiniVerifiedLemmaCache:
     never a silent empty index.
     """
 
-    schema_version = 10
+    # Support-only records are owner-scoped replay material, never standalone
+    # retrieval candidates. Older readers reject this schema rather than expose
+    # a support declaration as ordinary cached mathematical progress.
+    schema_version = 11
 
     # Schema v4 introduced replay-context provenance.  Rows written before it
     # cannot supply an implicit tactic dependency, so they are admitted only in
@@ -1134,6 +1138,11 @@ class MiniVerifiedLemmaCache:
         source_hash = str(record.get("source_hash") or "")
         preamble_hash = str(record.get("preamble_hash") or "")
         source_key = f"{source_hash}:{preamble_hash}"
+        if record.get("replay_support_only") is True:
+            self._index_theorem_record(record)
+            self._owner_record_ids.add(owner_record_id)
+            self._local_owner_record_ids.add(owner_record_id)
+            return
         self._supersede_advisory_source_key(source_key, record)
         if source_key not in self._source_hashes:
             self._index_record(record)
@@ -1221,7 +1230,7 @@ class MiniVerifiedLemmaCache:
         record that actually carries a replay closure.
         """
 
-        if source_key not in self._advisory_source_keys:
+        if record.get("replay_support_only") is True or source_key not in self._advisory_source_keys:
             return
         self._evict_advisory_index_records(
             str(record.get("source_hash") or ""),
@@ -1239,7 +1248,7 @@ class MiniVerifiedLemmaCache:
         source_hash = str(record.get("source_hash") or "")
         preamble_hash = str(record.get("preamble_hash") or "")
         source_key = f"{source_hash}:{preamble_hash}"
-        if not source_hash or source_key not in self._advisory_source_keys:
+        if record.get("replay_support_only") is True or not source_hash or source_key not in self._advisory_source_keys:
             return []
         retained: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for tier, index in (
@@ -1320,6 +1329,7 @@ class MiniVerifiedLemmaCache:
                     source_hash,
                     preamble_hash,
                     str(record.get("theorem_name") or ""),
+                    replay_support_only=record.get("replay_support_only") is True,
                 )
                 if record_id == owner_record_id or record_id in seen:
                     continue
@@ -1332,6 +1342,7 @@ class MiniVerifiedLemmaCache:
                 str(record.get("preamble_hash") or ""),
             )
             for record, _local in retained
+            if record.get("replay_support_only") is not True
         }
         for index in (self._by_exact_key, self._by_canonical_statement):
             for key in list(index):
@@ -1384,6 +1395,7 @@ class MiniVerifiedLemmaCache:
                 source_hash,
                 preamble_hash,
                 str(record.get("theorem_name") or ""),
+                replay_support_only=record.get("replay_support_only") is True,
             )
             self._index_theorem_record(record)
             self._owner_record_ids.add(record_id)
@@ -1402,7 +1414,10 @@ class MiniVerifiedLemmaCache:
         replay_context_names: Sequence[str] = (),
         replay_context_source_hashes: Optional[Dict[str, str]] = None,
         helper_advice: Optional[Dict[str, Any]] = None,
+        replay_support_only: bool = False,
     ) -> Optional[Tuple[Dict[str, Any], str]]:
+        if type(replay_support_only) is not bool:
+            return None
         source = str(helper_block or "").strip()
         if helper_source_is_retired(source, theorem_name=theorem_name):
             return None
@@ -1433,11 +1448,13 @@ class MiniVerifiedLemmaCache:
             source_hash,
             preamble_hash,
             theorem_name,
+            replay_support_only=replay_support_only,
         )
         normalized_statement = _normalize_cache_statement(statement)
         return (
             {
                 "schema_version": self.schema_version,
+                "replay_support_only": replay_support_only,
                 "name": name,
                 "statement": normalized_statement,
                 "statement_hash": text_hash(normalized_statement),
@@ -1675,7 +1692,8 @@ class MiniVerifiedLemmaCache:
             # an older usable replay alternative. Ranking still determines
             # which attestation is tried first, never which one exists.
             attestation_key = json.dumps(
-                [source_key, *(
+                [source_key, record.get("replay_support_only") is True,
+                 record.get("preamble_hash") if record.get("replay_support_only") is True else "", *(
                     record.get(field) for field in (
                         "support_names", "support_source_hashes",
                         "replay_context_names", "replay_context_source_hashes",
@@ -1691,6 +1709,8 @@ class MiniVerifiedLemmaCache:
         selected_fact_keys: Set[str] = set()
         ordered_fact_keys: List[str] = []
         for record in deduplicated_candidates:
+            if record.get("replay_support_only") is True:
+                continue
             source = str(record.get("source") or "").strip()
             statement = helper_decl_statement(source)
             fact_key = canonicalize_lean_statement_for_identity(statement) or (
@@ -1709,6 +1729,8 @@ class MiniVerifiedLemmaCache:
         selected: List[Dict[str, Any]] = []
         selected_record_ids: Set[int] = set()
         for record in deduplicated_candidates:
+            if record.get("replay_support_only") is True:
+                continue
             source = str(record.get("source") or "").strip()
             statement = helper_decl_statement(source)
             fact_key = canonicalize_lean_statement_for_identity(statement) or (
@@ -1853,6 +1875,20 @@ class MiniVerifiedLemmaCache:
                         }
                     )
                     continue
+                dependencies = [
+                    dependency for dependency in dependencies
+                    if dependency.get("replay_support_only") is not True or (
+                        bool(expected_hash)
+                        and dependency.get("preamble_hash") == record.get("preamble_hash")
+                    )
+                ]
+                if not dependencies:
+                    missing_closure.append({
+                        "name": dependency_name,
+                        "expected_source_hash": expected_hash,
+                        "reason": "scoped_dependency_source_missing",
+                    })
+                    continue
                 for dependency in dependencies:
                     if id(dependency) in selected_record_ids:
                         continue
@@ -1934,7 +1970,7 @@ class MiniVerifiedLemmaCache:
         provenance_bodies: Set[Tuple[str, str]] = set()
 
         def retain(record: Dict[str, Any], *, provenance: bool, source_hash: str = "") -> None:
-            if helper_record_is_retired(record):
+            if helper_record_is_retired(record) or record.get("replay_support_only") is True:
                 return
             body = (source_hash or str(record.get("source_hash") or "").strip(),
                     str(record.get("preamble_hash") or "").strip())
@@ -2015,7 +2051,8 @@ class MiniVerifiedLemmaCache:
             )
             for record in owner_records:
                 if (
-                    str(record.get("source_hash") or "").strip() != source_hash
+                    record.get("replay_support_only") is True
+                    or str(record.get("source_hash") or "").strip() != source_hash
                     or str(record.get("preamble_hash") or "").strip() != preamble_hash
                     or str(record.get("source") or "").strip() != body
                 ):
@@ -2092,10 +2129,12 @@ class MiniVerifiedLemmaCache:
         source_hash: str,
         preamble_hash: str,
         theorem_name: str,
+        *,
+        replay_support_only: bool = False,
     ) -> str:
         """Return the persistence identity for one body-owner membership."""
 
-        return ":".join(
+        return ("replay-support:" if replay_support_only else "") + ":".join(
             (
                 str(source_hash or ""),
                 str(preamble_hash or ""),
@@ -2123,6 +2162,7 @@ class MiniVerifiedLemmaCache:
         replay_context_names: Sequence[str] = (),
         replay_context_source_hashes: Optional[Dict[str, str]] = None,
         helper_advice: Optional[Dict[str, Any]] = None,
+        replay_support_only: bool = False,
     ) -> bool:
         if self._cache_is_disabled():
             return False
@@ -2136,6 +2176,7 @@ class MiniVerifiedLemmaCache:
             replay_context_names=replay_context_names,
             replay_context_source_hashes=replay_context_source_hashes,
             helper_advice=helper_advice,
+            replay_support_only=replay_support_only,
         )
         if prepared is None:
             return False
@@ -2177,6 +2218,7 @@ class MiniVerifiedLemmaCache:
         replay_context_names: Sequence[str] = (),
         replay_context_source_hashes: Optional[Dict[str, str]] = None,
         helper_advice: Optional[Dict[str, Any]] = None,
+        replay_support_only: bool = False,
         deadline_exhausted: Callable[[], bool],
     ) -> Optional[DeadlineAwareCachePublication]:
         """Reserve a reversible publication receipt for an elapsed turn.
@@ -2198,6 +2240,7 @@ class MiniVerifiedLemmaCache:
             replay_context_names=replay_context_names,
             replay_context_source_hashes=replay_context_source_hashes,
             helper_advice=helper_advice,
+            replay_support_only=replay_support_only,
         )
         if prepared is None:
             return None
@@ -2443,6 +2486,8 @@ class MiniVerifiedLemmaCache:
         supplied, preserve hot entries with recency as the tie-breaker.
         """
 
+        if record.get("replay_support_only") is True:
+            return
         statement = str(record.get("statement") or "")
         preamble_hash = str(record.get("preamble_hash") or "")
         statement_hash = str(record.get("statement_hash") or "") or text_hash(statement)
@@ -2525,6 +2570,10 @@ class MiniVerifiedLemmaCache:
                 f"schema_unmigratable v{record.get('schema_version')!r}",
             )
             return None
+        support_mode = record.get("replay_support_only", False)
+        if type(support_mode) is not bool or (support_mode and origin_schema_version < 11):
+            self._note_ingest("field_rejected", "invalid_replay_support_scope")
+            return None
         source = str(record.get("source") or "").strip()
         (
             semantic_rejection,
@@ -2564,6 +2613,7 @@ class MiniVerifiedLemmaCache:
             source_hash,
             preamble_hash,
             theorem_name,
+            replay_support_only=record.get("replay_support_only") is True,
         )
         if dedupe_owner_records and owner_record_id in self._owner_record_ids:
             self._note_ingest("owner_deduped", theorem_name or source_key)
@@ -2685,7 +2735,7 @@ class MiniVerifiedLemmaCache:
                 return False
             self._supersede_advisory_source_key(source_key, migrated)
         already_indexed = source_key in self._source_hashes
-        if not already_indexed:
+        if not already_indexed and migrated.get("replay_support_only") is not True:
             # Use _index_record so both tiers stay in sync. Pass a fresh copy to
             # protect the on-disk record from later in-memory mutations.
             self._index_record(migrated)
@@ -2788,7 +2838,7 @@ class MiniVerifiedLemmaCache:
             provenance_bearing = self._record_is_provenance_bearing(migrated)
             if provenance_bearing:
                 self._supersede_advisory_source_key(source_key, migrated)
-            if source_key not in self._source_hashes:
+            if source_key not in self._source_hashes and migrated.get("replay_support_only") is not True:
                 self._index_record(migrated)
                 self._source_hashes.add(source_key)
                 if not provenance_bearing:
@@ -2992,6 +3042,39 @@ def cache_owner_theorem_name(dossier: Any) -> str:
     ).strip()
 
 
+def _dossier_cache_publication_mode(dossier: Any, source: str) -> Optional[bool]:
+    """Return ordinary/support-only publication, or reject the candidate.
+
+    Checked route support remains private to exact owner replay dependencies.
+    Other hidden declarations still cannot become cached helper candidates.
+    """
+    visible = getattr(dossier, "is_verified_helper_context_visible", None)
+    helper_name = helper_decl_name(source)
+    if not callable(visible) or not helper_name:
+        return None
+    try:
+        if visible(helper_name):
+            return False
+        helper = (getattr(dossier, "verified_helpers", {}) or {}).get(helper_name)
+        if (
+            helper is None
+            or helper.render_policy != "advisory_route_support_only"
+            or helper.visibility_policy != "advisory_route_support_only"
+            or str(helper.source or "").strip() != source
+            or helper.source_hash != text_hash(source)
+            or (helper.contract_observation_required
+                and not verified_helper_has_typed_binder_evidence(helper))
+        ):
+            return None
+        integrity = dossier.root_replay_integrity_status(
+            helper_names=[helper_name], refresh_quality=False,
+            require_current_environment=True,
+        )
+        return True if integrity.get("ready") else None
+    except Exception:
+        return None
+
+
 def store_verified_helper_for_dossier(
     proof_cache: Any,
     helper_block: str,
@@ -3019,19 +3102,14 @@ def store_verified_helper_for_dossier(
     # ``record_verified_helper`` retains certain advisory certificates for
     # diagnostics/graph bookkeeping even when they are deliberately withheld
     # from usable proof context.  Cache seeding must obey the same quality
-    # boundary as a live session, so direct writers fail closed unless the
-    # owning dossier exposes this exact helper as visible.
-    visible = getattr(dossier, "is_verified_helper_context_visible", None)
-    if not callable(visible):
+    # boundary as a live session. Checked route-only support uses a separate
+    # owner-scoped dependency lane; other hidden helpers remain excluded.
+    replay_support_only = _dossier_cache_publication_mode(dossier, source)
+    if replay_support_only is None or (
+        replay_support_only and not isinstance(proof_cache, MiniVerifiedLemmaCache)
+    ):
         return False
     helper_name = helper_decl_name(source)
-    if not helper_name:
-        return False
-    try:
-        if not bool(visible(helper_name)):
-            return False
-    except Exception:
-        return False
     helper = (getattr(dossier, "verified_helpers", {}) or {}).get(helper_name)
     if verified_helper_is_premise_projection(helper or source):
         return False
@@ -3046,6 +3124,8 @@ def store_verified_helper_for_dossier(
             "theorem_name": owner,
             "phase": str(phase or ""),
         }
+        if replay_support_only:
+            kwargs["replay_support_only"] = True
         try:
             parameters = inspect.signature(store).parameters
             accepts_extra_kwargs = any(
@@ -3106,17 +3186,12 @@ def stage_verified_helper_for_dossier(
     source = str(helper_block or "").strip()
     if not owner or not source:
         return None
-    visible = getattr(dossier, "is_verified_helper_context_visible", None)
-    if not callable(visible):
+    replay_support_only = _dossier_cache_publication_mode(dossier, source)
+    if replay_support_only is None or (
+        replay_support_only and not isinstance(proof_cache, MiniVerifiedLemmaCache)
+    ):
         return None
     helper_name = helper_decl_name(source)
-    if not helper_name:
-        return None
-    try:
-        if not bool(visible(helper_name)):
-            return None
-    except Exception:
-        return None
     helper = (getattr(dossier, "verified_helpers", {}) or {}).get(helper_name)
     if verified_helper_is_premise_projection(helper or source):
         return None
@@ -3134,6 +3209,8 @@ def stage_verified_helper_for_dossier(
             "phase": str(phase or ""),
             "deadline_exhausted": deadline_exhausted,
         }
+        if replay_support_only:
+            kwargs["replay_support_only"] = True
         try:
             parameters = inspect.signature(begin).parameters
             accepts_extra_kwargs = any(
@@ -3174,7 +3251,7 @@ def publish_verified_dossier_helpers_to_cache(
     preamble: str,
     phase: str,
 ) -> Dict[str, int]:
-    """Publish all currently visible helpers owned by ``dossier``.
+    """Publish visible helpers and scoped replay support owned by ``dossier``.
 
     This is the ownership-boundary backstop for helpers merged by complex
     recursive/graph actions.  Ordinary direct writers can call the single-item
@@ -3205,7 +3282,10 @@ def publish_verified_dossier_helpers_to_cache(
             continue
         if callable(visible):
             try:
-                if not bool(visible(item)):
+                if not bool(visible(item)) and not (
+                    getattr(item, "render_policy", "") == "advisory_route_support_only"
+                    and getattr(item, "visibility_policy", "") == "advisory_route_support_only"
+                ):
                     summary["skipped"] += 1
                     continue
             except Exception:

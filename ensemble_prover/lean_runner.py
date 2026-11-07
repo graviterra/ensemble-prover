@@ -8832,6 +8832,9 @@ class LeanRunner:
         pp_universes: bool = False,
         pp_notation: bool = True,
         pp_expand_auxiliaries: bool = False,
+        legacy_theory_signature: bool = False,
+        preserve_type_layout: bool = False,
+        raise_on_operational_failure: bool = False,
     ) -> tuple[bool, str, str]:
         """Compile an exact input module and return its elaborated root type.
 
@@ -8848,11 +8851,19 @@ class LeanRunner:
         notation no longer supplies the expected type for its arguments.
         ``pp_expand_auxiliaries`` uses Lean to inline declaration-local match
         definitions that would be absent when replaying the displayed type.
+        ``legacy_theory_signature`` reproduces the historical Mini theory
+        display for source-bound migration, not general semantic rendering.
+        ``preserve_type_layout`` retains literal and quoted-name whitespace in
+        the complete theory type instead of normalizing the display text.
+        ``raise_on_operational_failure`` preserves transient checker failures
+        for callers that must distinguish them from invalid source.
         """
 
         sanitized, error = self._normalize_check_term_name(theorem_name)
         if error:
             return False, "", error
+        if (legacy_theory_signature or preserve_type_layout) and pp_expand_auxiliaries:
+            raise ValueError("theory signature rendering cannot expand auxiliary declarations")
         if pp_expand_auxiliaries:
             return await self._render_source_type_without_auxiliaries(
                 source, sanitized, timeout_s=timeout_s,
@@ -8885,12 +8896,22 @@ class LeanRunner:
                 "set_option pp.proofs true in\n"
                 "set_option pp.maxSteps 1000000 in\n"
             )
+        # Legacy theory manifests stored a display signature rather than a
+        # complete type. Reproduce that exact producer only for migration;
+        # callers must compare its result before requesting a full type.
+        bounded_theory_report = legacy_theory_signature or preserve_type_layout
+        report_start = "MINI_SOURCE_TYPE_START_" + uuid.uuid4().hex
+        report_end = "MINI_SOURCE_TYPE_END_" + uuid.uuid4().hex
+        if legacy_theory_signature:
+            printer_prefix = "set_option pp.universes true in\n"
         content = (
             str(source or "").rstrip()
             + "\n\n"
+            + (f'#eval IO.println "{report_start}"\n' if bounded_theory_report else "")
             + printer_prefix
-            + f"#check @_root_.{sanitized}\n"
-            + "#check Prop\n"
+            + f"#check {'' if legacy_theory_signature else '@'}_root_.{sanitized}\n"
+            + (f"#print axioms _root_.{sanitized}\n" if bounded_theory_report else "#check Prop\n")
+            + (f'#eval IO.println "{report_end}"\n' if bounded_theory_report else "")
         )
         _path, execution, write_error = await self._execute_generated_file(
             goal_name=f"source_type_{short_id(sanitized + content)}",
@@ -8900,12 +8921,41 @@ class LeanRunner:
             semaphore=self.sem,
         )
         if execution is None:
+            if raise_on_operational_failure:
+                raise OSError(str(write_error or "source type probe unavailable"))
             return False, "", str(write_error or "source type probe unavailable")
         output = execution.output
         if int(execution.returncode) != 0:
+            if raise_on_operational_failure:
+                parsed = parse_lean_output(output, int(execution.returncode))
+                if execution.returncode == 124 or getattr(parsed, "timeout", False):
+                    raise TimeoutError("source type rendering exhausted its allowance")
+                if getattr(parsed, "infra_failure", False) or termination_signal_from_returncode(execution.returncode):
+                    raise OSError("source type rendering infrastructure unavailable")
             return False, "", output
+        report = output
+        if bounded_theory_report:
+            # Ignore diagnostics emitted by the input module itself. A random
+            # report boundary binds the rendering to our requested command.
+            lines = output.split("\n")
+            starts = [i for i, line in enumerate(lines) if line.strip() == report_start]
+            ends = [i for i, line in enumerate(lines) if line.strip() == report_end]
+            if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+                return False, "", output + "\nmissing exact source type report boundary"
+            report = "\n".join(lines[starts[0] + 1:ends[0]])
+            from .mini_theory.verifier import TheoryBundleVerifier
+            records, error = TheoryBundleVerifier._parse_audit((("theorem", sanitized),), report)
+            if error or len(records) != 1:
+                return False, "", output + "\n" + error
+            if preserve_type_layout and not legacy_theory_signature:
+                return True, records[0].type_text, output
+            # The historical producer collapsed layout, including the printed
+            # binder prefix. Match its stored representation only here.
+            from .mini_theory.declaration_types import closed_declaration_type
+            legacy_type = closed_declaration_type(" ".join(records[0].type_text.split()))
+            return True, legacy_type, output
         rendered_types = self._checked_declaration_types_from_output(
-            output,
+            report,
             (sanitized,),
             returncode=execution.returncode,
         )
@@ -9200,7 +9250,10 @@ run_cmd Lean.Elab.Command.liftTermElabM do
             _path, execution, write_error = await self._execute_generated_file(
                 goal_name=f"source_type_equiv_{short_id(module_content + probe)}",
                 content=module_content + "\n" + probe,
-                timeout_s=min(15.0, operation_timeout * 0.4),
+                # The inline check may compile a substantial checked context.
+                # An artificial sub-deadline merely repeats that work in the
+                # module fallback; both routes share the owner's deadline.
+                timeout_s=max(0.001, operation_deadline - time.monotonic()),
                 fast_fail_timeout_s=None,
                 semaphore=self.sem,
             )
@@ -9211,6 +9264,8 @@ run_cmd Lean.Elab.Command.liftTermElabM do
             returncode = int(execution.returncode)
             parsed = parse_lean_output(output, returncode)
             if returncode == 0 and parsed.ok:
+                return parsed, output, returncode
+            if parsed.timeout or parsed.infra_failure or termination_signal_from_returncode(returncode):
                 return parsed, output, returncode
 
         # Core-only projects need not import Lean's command meta API. Compile

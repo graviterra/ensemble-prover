@@ -4640,6 +4640,7 @@ def _cache_seed_context_dependencies_valid(
         for name, helper in dossier.verified_helpers.items()
     }
     resolved_names: Dict[str, str] = {}
+    preceding_names: Set[str] = set()
     for block in context:
         helper_name = dossier._equivalent_helper_registry_name(
             dossier.verified_helpers, str(helper_decl_name(block) or ""),
@@ -4647,6 +4648,21 @@ def _cache_seed_context_dependencies_valid(
         helper = dossier.verified_helpers.get(helper_name)
         if helper is None:
             return False
+        # Names remain dependency evidence even if a legacy or interrupted
+        # record has no parallel hash entry. Every edge must stay within the
+        # already checked ordered prefix, not a later registered declaration.
+        for field in ("support_names", "replay_context_names"):
+            names = getattr(helper, field, ())
+            if not isinstance(names, (list, tuple)):
+                return False
+            for dependency in names:
+                if not isinstance(dependency, str) or not dependency.strip():
+                    return False
+                resolved = dossier._equivalent_helper_registry_name(
+                    dossier.verified_helpers, dependency.strip(),
+                )
+                if not resolved or resolved not in preceding_names:
+                    return False
         for field in ("support_source_hashes", "replay_context_source_hashes"):
             receipts = getattr(helper, field, {})
             if not isinstance(receipts, Mapping):
@@ -4659,8 +4675,10 @@ def _cache_seed_context_dependencies_valid(
                         dossier.verified_helpers, dependency,
                     )
                     resolved_names[dependency] = resolved
-                if not resolved or current_hashes.get(resolved) != str(expected_hash or "").strip():
+                if (not resolved or resolved not in preceding_names
+                        or current_hashes.get(resolved) != str(expected_hash or "").strip()):
                     return False
+        preceding_names.add(helper_name)
     return True
 
 
@@ -5104,6 +5122,7 @@ class _CacheSeedBatchReceipt:
     candidate_identities: Tuple[Tuple[str, str], ...]
     verification_environment_hash: str
     contract_observations: Tuple[Tuple[str, Tuple[Tuple[str, Any], ...]], ...] = ()
+    replay_support_identities: Tuple[Tuple[str, str], ...] = ()
     runtime_owner: Any = None
     runtime_current: Optional[Callable[[], bool]] = None
 
@@ -5231,18 +5250,60 @@ class _CacheSeedBatchReceipt:
                 ]
             )
         )
+        from .helper_retirement import helper_source_is_retired
+        from .proof_dossier import verified_helper_has_typed_binder_evidence
+
+        scoped_support = set(self.replay_support_identities)
+        scoped_prefix_names = {
+            name for name, source_hash in self.candidate_identities[:index]
+            if (name, source_hash) in scoped_support
+        }
         visible_prefix = all(
             (helper := getattr(dossier, "verified_helpers", {}).get(name))
             is not None
-            and dossier._verified_helper_context_visible(helper)  # noqa: SLF001
-            for name, _source_hash in self.candidate_identities[:index]
+            and not helper_source_is_retired(
+                helper.source, theorem_name=dossier.cache_owner_theorem_name or dossier.theorem_name,
+            )
+            and dossier.lean_environment_is_compatible(
+                helper.verification_environment_hash, self.verification_environment_hash,
+            )
+            and (not helper.contract_observation_required
+                 or verified_helper_has_typed_binder_evidence(helper))
+            and (
+                ((name, source_hash) not in scoped_support
+                 and dossier._verified_helper_context_visible(helper))  # noqa: SLF001
+                or (
+                    (name, source_hash) in scoped_support
+                    and helper.render_policy == "advisory_route_support_only"
+                    and helper.visibility_policy == "advisory_route_support_only"
+                )
+            )
+            for name, source_hash in self.candidate_identities[:index]
         )
         if not visible_prefix or _cache_seed_helper_registry_identity(dossier) != expected_registry:
             return False
+        if (scoped_prefix_names and not self.base_context
+                and not self.baseline_helper_identities
+                and not self.baseline_visible_context_identity
+                and not dossier.forced_context_helper_blocks):
+            # A fresh empty-owner batch already certifies this exact ordered
+            # prefix. Its complete current registry, sources, policies,
+            # environments and dependency receipts were checked above/below.
+            # Rebuilding a general renderer here would repeatedly replay the
+            # entire support graph merely to rediscover that same prefix.
+            return _cache_seed_context_dependencies_valid(dossier, admission.context)
         try:
-            visible_context = tuple(_proof_state_verified_helper_blocks(
-                dossier, refresh_quality=False,
-            ))
+            visible_context = tuple(
+                dossier.execution_helper_blocks(
+                    refresh_quality=False,
+                    # A scoped helper can itself require the preceding
+                    # ambient declarations. Validate the entire exact checked
+                    # prefix, not the isolated support declaration.
+                    additional_context=admission.context,
+                ) if scoped_prefix_names else _proof_state_verified_helper_blocks(
+                    dossier, refresh_quality=False,
+                )
+            )
             if published:
                 # The checked declaration may be advisory and absent from the
                 # global renderer. Compare the unchanged original replay frame.
@@ -5251,8 +5312,11 @@ class _CacheSeedBatchReceipt:
         except (ValueError, TypeError):
             return False
         return bool(
-            visible_context == admission.context
-            and _cache_seed_context_dependencies_valid(dossier, visible_context)
+            tuple(block for block in visible_context
+                  if helper_decl_name(block) not in scoped_prefix_names)
+            == tuple(block for block in admission.context
+                     if helper_decl_name(block) not in scoped_prefix_names)
+            and _cache_seed_context_dependencies_valid(dossier, admission.context)
             and _cache_seed_visible_base_identity(
                 dossier,
                 excluded_helper_names=candidate_names,
@@ -5420,6 +5484,8 @@ async def _accept_proof_state_helper(
     defer_cache_seed_derived_refresh: bool = False,
     cache_seed_derived_refresh: Optional["_CacheSeedDerivedRefresh"] = None,
     require_cache_seed_observation: bool = False,
+    cache_replay_support_only: bool = False,
+    cache_seed_replay_context_names: Sequence[str] = (),
     _closure_handoff: Optional[_HelperCacheClosureHandoff] = None,
     _pending_acceptance_owner: Optional[Mapping[str, Any]] = None,
 ) -> bool:
@@ -5840,6 +5906,12 @@ async def _accept_proof_state_helper(
     if not name:
         _status("rejected", error_kind="invalid_helper_name")
         return False
+    if (cache_seed_batch_receipt is not None
+            and (name, text_hash(helper_block)) in cache_seed_batch_receipt.replay_support_identities):
+        # A legacy pending continuation may retain the live receipt while
+        # losing its cache row. Scope is a restriction, so the receipt itself
+        # must preserve it even when its proof authority later expires.
+        cache_replay_support_only = True
     if seed_admission:
         # Statement aliases can name distinct declarations. Only equivalent
         # Lean name spellings identify the declaration being replaced.
@@ -5979,11 +6051,40 @@ async def _accept_proof_state_helper(
             certified_context=batch_admission.certified_context,
         )
     )
+    def seed_replay_context() -> List[str]:
+        visible = list(_proof_state_verified_helper_blocks(dossier))
+        if not seed_admission or not cache_seed_replay_context_names:
+            return visible
+        # Only the deliberately restricted cache support lane may augment
+        # ordinary context. Other advisory declarations (including root
+        # equivalents) retain their existing independent-replay requirements.
+        requested = [name for name in cache_seed_replay_context_names
+                     if (helper := dossier.verified_helpers.get(name)) is not None
+                     and helper.render_policy == "advisory_route_support_only"
+                     and helper.visibility_policy == "advisory_route_support_only"]
+        if not requested:
+            return visible
+        # Include ordinary consumers from the exact recorded replay frame.
+        # Their policy remains visible even when the global renderer omits
+        # them because their ambient support is deliberately scoped.
+        requested.extend(name for name in cache_seed_replay_context_names
+                         if name not in requested
+                         and dossier.is_verified_helper_context_visible(name))
+        scoped = dossier.root_replay_helper_closure(
+            support_helper_names=requested,
+            refresh_quality=False, require_current_environment=True,
+        )
+        if not set(requested).issubset(
+            {helper_decl_name(block) for block in scoped}
+        ):
+            raise _CacheSeedContextChanged
+        return merge_context_helpers(visible, scoped)
+
     try:
         if existing is not None:
             replacement_initial_context = (
                 cache_initial_context if require_target_application
-                else list(_proof_state_verified_helper_blocks(dossier))
+                else seed_replay_context()
             )
             replacement_context_names = tuple(_helper_names_from_blocks(replacement_initial_context))
             replacement_inventory = _helper_replay_inventory(dossier, replacement_context_names)
@@ -6014,7 +6115,7 @@ async def _accept_proof_state_helper(
             context = list(cache_seed_batch_context)
         else:
             context = (cache_initial_context if require_target_application
-                       else list(_proof_state_verified_helper_blocks(dossier)))
+                       else seed_replay_context())
     except asyncio.CancelledError:
         _status("cancelled", error_kind="cancelled")
         raise
@@ -6517,6 +6618,13 @@ async def _accept_proof_state_helper(
                     for block in context
                     if helper_decl_name(block)
                 ],
+                visibility_policy=(
+                    str(getattr(existing, "visibility_policy", "") or "")
+                    if (cache_replay_support_only and existing is not None
+                        and existing.source == helper_block
+                        and existing.source_hash == text_hash(helper_block)) else
+                    "advisory_route_support_only" if cache_replay_support_only else ""
+                ),
                 _defer_global_derived_refresh=defer_derived_refresh,
                 contract_observation_required=contract_observation_required,
                 **contract_fields,
@@ -7050,6 +7158,14 @@ def _cache_seed_batch_validation_input(
     covered_contexts: List[Tuple[str, Tuple[str, ...]]] = []
     seen_source_hashes: Set[str] = set()
     for record in records:
+        if type(record.get("replay_support_only", False)) is not bool:
+            exclude(record, "malformed_support_scope")
+            continue
+        if record.get("replay_support_only") and str(record.get("theorem_name") or "") != (
+            dossier.cache_owner_theorem_name or dossier.theorem_name
+        ):
+            exclude(record, "support_scope_owner_mismatch")
+            continue
         helper_block = str(record.get("source") or "").strip()
         helper_name = helper_decl_name(helper_block) or str(
             record.get("name") or ""
@@ -7524,6 +7640,13 @@ async def _validate_same_problem_cache_batch(
                 ),
                 verification_environment_hash=verification_environment,
                 contract_observations=contract_observations,
+                replay_support_identities=tuple(
+                    (str(helper_decl_name(block) or ""), text_hash(block))
+                    for block in helper_blocks[:candidate_size]
+                    if any(record.get("replay_support_only") is True
+                           and str(record.get("source") or "").strip() == block
+                           for record in records)
+                ),
                 runtime_owner=lean, runtime_current=runtime_current,
             )
             telemetry.update(
@@ -7905,6 +8028,13 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 "pass_index": pass_index,
                 "accepted": False,
             }
+            if (type(record.get("replay_support_only", False)) is not bool
+                    or (record.get("replay_support_only") and str(record.get("theorem_name") or "") != (
+                        dossier.cache_owner_theorem_name or dossier.theorem_name
+                    ))):
+                record_summary["rejection"] = "invalid_replay_support_scope"
+                summary["records"].append(record_summary)
+                continue
             if not helper_block or not helper_name:
                 record_summary["rejection"] = "malformed_cache_record"
                 terminal_source_hashes.add(source_hash)
@@ -8111,6 +8241,8 @@ async def _seed_verified_helpers_from_same_problem_cache_impl(
                 status_out=status,
                 target_statement="",
                 require_relevance_gate=False,
+                cache_replay_support_only=record.get("replay_support_only") is True,
+                cache_seed_replay_context_names=replay_context_names,
                 cache_seed_batch_receipt=(
                     batch_receipt if batch_admission is not None else None
                 ),
