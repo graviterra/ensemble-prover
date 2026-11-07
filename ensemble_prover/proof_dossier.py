@@ -14773,42 +14773,103 @@ class ProofDossier:
                 if consumer not in invalid_names:
                     invalid_names.add(consumer)
                     invalid_pending.append(consumer)
-        for seed in seed_names:
-            pending_names: List[Tuple[str, bool]] = [(seed, False)]
-            while pending_names:
-                name, completed = pending_names.pop()
-                key = str(name or "").strip()
-                clean_name = self._equivalent_helper_registry_name(self.verified_helpers, key) or key
-                if not clean_name or clean_name in emitted:
+        # An exact ambient receipt can authorize replay of a route-support
+        # declaration without making it globally visible. Keep this narrower
+        # permission separate from explicit route scope: it must not grant
+        # arbitrary hidden dependencies the privileges of an explicit seed.
+        ambient_replay_names: Set[str] = set()
+        ambient_support_cache: Dict[str, Set[str]] = {}
+
+        def ambient_route_support(name: str, helper: VerifiedHelper) -> Set[str]:
+            if name in ambient_support_cache:
+                return ambient_support_cache[name]
+            allowed: Set[str] = set()
+            ambient_support_cache[name] = allowed
+            consumer_environment = str(helper.verification_environment_hash or "")
+            if not self.lean_environment_is_compatible(consumer_environment):
+                return allowed
+            receipts = dict(helper.replay_context_source_hashes or {})
+            for raw_support in helper.replay_context_names or ():
+                raw_name = str(raw_support or "").strip()
+                support_name = self._equivalent_helper_registry_name(all_by_name, raw_name) or raw_name
+                support = all_by_name.get(support_name)
+                if support is None or support_name in invalid_names:
                     continue
-                helper = all_by_name.get(clean_name)
-                if completed:
-                    visiting.discard(clean_name)
-                    if not all(support in emitted for support in dependency_names[clean_name]):
+                if (support.render_policy != "advisory_route_support_only"
+                        or support.visibility_policy != "advisory_route_support_only"):
+                    continue
+                receipt = str(receipts.get(raw_name) or receipts.get(support_name) or "")
+                if not receipt or receipt != support.source_hash:
+                    continue
+                if (support.contract_observation_required
+                        and not verified_helper_has_typed_binder_evidence(support)):
+                    continue
+                if not self.lean_environment_is_compatible(
+                    support.verification_environment_hash, consumer_environment,
+                ) or not self.lean_environment_is_compatible(support.verification_environment_hash):
+                    continue
+                allowed.add(support_name)
+            return allowed
+
+        def scope_size() -> int:
+            # Upgrading an ambient permission to explicit scope changes its
+            # transitive privileges even if the union of names is unchanged.
+            return len(route_local_helper_names) + len(ambient_replay_names)
+
+        # A shared dependency that cannot be emitted must not be expanded
+        # again along every path through the graph. Authorization can grow
+        # when a scoped helper admits its own support, so failures are valid
+        # only for the scope in which their dependency walk started.
+        failed_scope_sizes: Dict[str, int] = {}
+        # A later sibling or separate seed can authorize an earlier failed
+        # dependency. Revisit every seed until authorization is stable, rather
+        # than relying on another consumer to happen to retry that dependency.
+        # Every extra pass requires growth in one of two finite, monotone sets.
+        while True:
+            pass_scope_size = scope_size()
+            for seed in seed_names:
+                pending_names: List[Tuple[str, bool, int]] = [(seed, False, 0)]
+                while pending_names:
+                    name, completed, started_scope_size = pending_names.pop()
+                    key = str(name or "").strip()
+                    clean_name = self._equivalent_helper_registry_name(self.verified_helpers, key) or key
+                    if not clean_name or clean_name in emitted:
                         continue
-                    source = str(getattr(helper, "source", "") or "").strip()
-                    if source:
-                        closed_blocks.append(source)
-                        emitted.add(clean_name)
-                    continue
-                if (
-                    clean_name in visiting
-                    or clean_name in invalid_names
-                    or helper is None
-                    or clean_name not in renderable_names
-                    or (
-                        not self._verified_helper_context_visible(helper)
-                        and clean_name not in route_local_helper_names
-                    )
-                ):
-                    continue
-                support_names = dependency_names.get(clean_name, [])
-                dependency_names[clean_name] = support_names
-                if not self._verified_helper_context_visible(helper):
-                    route_local_helper_names.update(support_names)
-                visiting.add(clean_name)
-                pending_names.append((clean_name, True))
-                pending_names.extend((support, False) for support in reversed(support_names))
+                    helper = all_by_name.get(clean_name)
+                    if completed:
+                        visiting.discard(clean_name)
+                        if not all(support in emitted for support in dependency_names[clean_name]):
+                            failed_scope_sizes[clean_name] = started_scope_size
+                            continue
+                        source = str(getattr(helper, "source", "") or "").strip()
+                        if source:
+                            closed_blocks.append(source)
+                            emitted.add(clean_name)
+                        continue
+                    if (
+                        failed_scope_sizes.get(clean_name) == scope_size()
+                        or clean_name in visiting
+                        or clean_name in invalid_names
+                        or helper is None
+                        or clean_name not in renderable_names
+                        or (
+                            not self._verified_helper_context_visible(helper)
+                            and clean_name not in route_local_helper_names
+                            and clean_name not in ambient_replay_names
+                        )
+                    ):
+                        continue
+                    support_names = dependency_names.get(clean_name, [])
+                    dependency_names[clean_name] = support_names
+                    ambient_replay_names.update(ambient_route_support(clean_name, helper))
+                    if (not self._verified_helper_context_visible(helper)
+                            and clean_name in route_local_helper_names):
+                        route_local_helper_names.update(support_names)
+                    visiting.add(clean_name)
+                    pending_names.append((clean_name, True, scope_size()))
+                    pending_names.extend((support, False, 0) for support in reversed(support_names))
+            if scope_size() == pass_scope_size:
+                break
 
         explicit_names = {
             helper_decl_name(block) or ""
