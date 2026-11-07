@@ -6923,9 +6923,43 @@ def _graph_prop_check_term_surface(text: str, depth: int = 0) -> bool:
 
     if depth >= 32:
         return False
-    raw = _graph_strip_balanced_outer_parens(graph_identity_text(text))
+    # Layout separates local declarations from their bodies.  Compacting here
+    # prevents otherwise valid propositions from ever reaching Lean's parser.
+    source = str(text or "")
+    raw = _graph_strip_balanced_outer_parens(source)
     if not raw or not _graph_text_has_balanced_groups(raw):
         return False
+    if _graph_keyword_at(raw, 0, "by"):
+        # Assignments inside tactic-local have/let declarations are valid.
+        # Still inspect every group for commands: this is only eligibility
+        # for Lean's single-term parser and Prop checker, never proof evidence.
+        if not _graph_term_tokens_ok(raw, tactic=True):
+            return False
+        index = 0
+        while index < len(raw):
+            lexical = _lean_lexical_skip_end(raw, index)
+            if lexical is not None:
+                index = lexical
+                continue
+            if raw[index] == "#" or any(
+                _graph_keyword_at(raw, index, word)
+                for word in ("namespace", "section", "end", "import", "export", "attribute", "syntax", "macro", "elab", "initialize")
+            ):
+                return False
+            index += 1
+        return True
+    lambda_prefix = 3 if _graph_keyword_at(raw, 0, "fun") else 1 if raw.startswith("λ") else 0
+    if lambda_prefix:
+        arrows = [
+            (index, token) for token in ("=>", "↦")
+            if (index := _graph_find_top_level_symbol(raw, token, lambda_prefix)) >= 0
+        ]
+        if not arrows:
+            return False
+        index, token = min(arrows)
+        return _graph_prop_check_term_surface(raw[lambda_prefix:index], depth + 1) and _graph_prop_check_term_surface(
+            raw[index + len(token):], depth + 1,
+        )
     quantifier = _graph_proposition_quantifier_token_len(raw)
     if quantifier:
         comma = _graph_find_top_level_comma(raw[quantifier:])
@@ -6937,7 +6971,12 @@ def _graph_prop_check_term_surface(text: str, depth: int = 0) -> bool:
         )
     keyword = "have" if _graph_keyword_at(raw, 0, "have") else "let"
     if _graph_keyword_at(raw, 0, keyword):
-        binding, body = _graph_top_level_let_parts("let" + raw[len(keyword) :])
+        layout_source = source if source.strip() == raw else raw
+        leading = len(layout_source) - len(layout_source.lstrip())
+        binding, body = _graph_top_level_let_parts(
+            layout_source[:leading] + "let" + layout_source[leading + len(keyword):],
+            preserve_layout=True,
+        )
         assignment = _graph_top_level_token_index(binding, ":=")
         return bool(
             body and assignment >= 0
@@ -6960,6 +6999,17 @@ def _graph_prop_check_term_surface(text: str, depth: int = 0) -> bool:
             _graph_prop_check_term_surface(value, depth + 1)
             for value in (scrutinee, *patterns, *arms)
         )
+    # A logical connective may introduce a layout-sensitive operand.
+    # Check each side separately instead of mistaking a nested let assignment
+    # for a top-level declaration. Lean subsequently checks the complete term.
+    for operator in ("↔", "<->", "→", "->", "∧", "/\\", "∨", "\\/"):
+        split = _graph_find_top_level_symbol(raw, operator, 0)
+        if split >= 0:
+            return _graph_prop_check_term_surface(raw[:split], depth + 1) and _graph_prop_check_term_surface(
+                raw[split + len(operator):], depth + 1,
+            )
+    if raw.startswith("¬"):
+        return _graph_prop_check_term_surface(raw[1:], depth + 1)
     if _graph_find_top_level_symbol(raw, ":=", 0) >= 0:
         return False
     if not _graph_term_tokens_ok(raw):
@@ -6974,8 +7024,20 @@ def _graph_prop_check_term_surface(text: str, depth: int = 0) -> bool:
             end = _graph_matching_group_index(raw, index)
             if end < 0:
                 return False
-            if raw[index + 1:end].strip() and not _graph_prop_check_term_surface(raw[index + 1:end], depth + 1):
-                return False
+            interior = raw[index + 1:end]
+            if interior.strip():
+                # Named arguments contain an assignment only inside their
+                # parentheses. Inspect the value as a term; an ungrouped
+                # target followed by := remains ineligible for admission.
+                assignment = _graph_top_level_token_index(interior, ":=")
+                if (
+                    raw[index] == "(" and assignment >= 0
+                    and _graph_unicode_identifier_name(interior[:assignment])
+                    and _graph_prop_check_term_surface(interior[:assignment], depth + 1)
+                ):
+                    interior = interior[assignment + 2:]
+                if not _graph_prop_check_term_surface(interior, depth + 1):
+                    return False
             index = end + 1
             continue
         if raw[index] == "#" or any(
@@ -16463,6 +16525,16 @@ class ProofGraph:
         statement_key = graph_statement_key(statement)
         if not statement_key:
             return None
+        # Declaration extraction can wrap a multiline type to preserve its
+        # layout. A checked consumer can therefore have different source text
+        # from its checked helper, despite their elaborated types agreeing.
+        # Bind this fallback to the requested source, not merely to an optional
+        # consumer supplied for another statement.
+        consumer_identity = (
+            parse_lean_contract_identity(graph_node_bound_contract_identity(consumer_node))
+            if consumer_node is not None and statement == consumer_node.statement
+            else None
+        )
         # This lookup is synchronous: share a fresh census only within this
         # nomination. The later proof transition independently checks authority.
         observed_expressions: Optional[Set[str]] = None
@@ -16503,7 +16575,15 @@ class ProofGraph:
                 exact_statement_key=statement_key,
             ):
                 continue
-            if graph_statement_key(node.statement) == statement_key:
+            helper_identity = (
+                parse_lean_contract_identity(graph_helper_bound_contract_identity(node))
+                if consumer_identity is not None else None
+            )
+            typed_match = bool(
+                consumer_identity is not None and helper_identity is not None
+                and consumer_identity[0] == helper_identity[0]
+            )
+            if graph_statement_key(node.statement) == statement_key or typed_match:
                 if not require_replayable_source:
                     metadata = dict(node.metadata or {})
                     source_recorded = bool(
@@ -17558,8 +17638,7 @@ class ProofGraph:
         if (
             claim is not None
             and claim.kind == "proposed_claim"
-            and graph_statement_key(claim.statement)
-            and graph_statement_key(claim.statement) == graph_statement_key(variant.statement)
+            and self._helper_certifies_node(helper, claim)
         ):
             self.mark_claim_proved_by_helper(
                 claim_id,

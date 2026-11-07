@@ -10371,6 +10371,7 @@ private def {serializer_prefix}_elabType
         declaration_names: Sequence[str] = (),
         declaration_sources: Sequence[str] = (),
         declaration_context: Sequence[str] = (),
+        kernel_checked_types: bool = False,
     ) -> tuple[tuple[LeanStatementContractAnalysis, ...], str, int]:
         """Elaborate propositions and return structural contract evidence.
 
@@ -10388,6 +10389,10 @@ private def {serializer_prefix}_elabType
         later commands make ordinary name resolution ambiguous.
         Pass checked helper blocks in ``declaration_context`` so configured
         preamble commands are resolved before those declarations, as in check.
+        ``kernel_checked_types`` observes raw targets through their independently
+        compiled identity witnesses. This retains declaration-finalized local
+        let annotations when comparing a target with a checked helper type;
+        it neither proves the target nor changes the default raw observation.
         """
 
         operation_started = time.monotonic()
@@ -10406,6 +10411,8 @@ private def {serializer_prefix}_elabType
             return (), "", 0
         observed_names = tuple(str(name or "").strip() for name in declaration_names)
         observed_sources = tuple(str(source or "").strip() for source in declaration_sources)
+        if type(kernel_checked_types) is not bool or (kernel_checked_types and observed_names):
+            raise ValueError("kernel-checked target observation requires a boolean flag and raw statements")
         if observed_names and (
             len(observed_names) != len(raw_statements) or not all(observed_names)
             or defeq_anchor_indices or defeq_candidate_indices
@@ -10633,24 +10640,33 @@ private def {serializer_prefix}_recursiveType (source : _root_.String) :
   let type ← _root_.Lean.Meta.lambdaTelescope witness.value fun params body => do
     if params.isEmpty || body != params.back! then
       _root_.Lean.throwError "recursive contract witness is not an identity"
-    _root_.Lean.Meta.mkForallFVars params.pop (← _root_.Lean.Meta.inferType body)
+    if {str(kernel_checked_types).lower()} then
+      _root_.Lean.Meta.forallBoundedTelescope witness.type (some params.size) fun checkedParams _ => do
+        unless checkedParams.size == params.size do
+          _root_.Lean.throwError "contract witness telescope changed"
+        _root_.Lean.Meta.mkForallFVars checkedParams.pop (← _root_.Lean.Meta.inferType checkedParams.back!)
+    else
+      _root_.Lean.Meta.mkForallFVars params.pop (← _root_.Lean.Meta.inferType body)
   pure type
 
 private def {serializer_prefix}_elabType (source : _root_.String) :
     _root_.Lean.Elab.Term.TermElabM _root_.Lean.Expr :=
   _root_.Lean.Elab.withoutModifyingStateWithInfoAndMessages do
-  let stx ←
-    match _root_.Lean.Parser.runParserCategory (← _root_.Lean.MonadEnv.getEnv) `term
-        ({serializer_prefix}_parserSource source ({serializer_prefix}_witnessName source)) with
-    | .ok stx@_ => pure stx
-    | .error error@_ => _root_.Lean.throwError error
-  let type ← _root_.Lean.Elab.Term.withoutErrToSorry do
-    _root_.Lean.Elab.Term.elabType stx
-  _root_.Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing
-  let type ← _root_.Lean.instantiateMVars type
-  let type ← if (← _root_.Lean.Elab.Term.getLetRecsToLift).isEmpty then
-      pure type
-    else {serializer_prefix}_recursiveType source
+  let type ← if {str(kernel_checked_types).lower()} then
+      {serializer_prefix}_recursiveType source
+    else do
+      let stx ←
+        match _root_.Lean.Parser.runParserCategory (← _root_.Lean.MonadEnv.getEnv) `term
+            ({serializer_prefix}_parserSource source ({serializer_prefix}_witnessName source)) with
+        | .ok stx@_ => pure stx
+        | .error error@_ => _root_.Lean.throwError error
+      let type ← _root_.Lean.Elab.Term.withoutErrToSorry do
+        _root_.Lean.Elab.Term.elabType stx
+      _root_.Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing
+      let type ← _root_.Lean.instantiateMVars type
+      if (← _root_.Lean.Elab.Term.getLetRecsToLift).isEmpty then
+        pure type
+      else {serializer_prefix}_recursiveType source
   -- Ordinary match expressions also reuse compiled witness auxiliaries even
   -- when no local recursive declarations remain to lift.
   -- Remove only fresh auxiliary constants. Their nonce names must never enter
@@ -11161,6 +11177,7 @@ private def {serializer_prefix}_contractDefeq
                                 _operation_deadline=operation_deadline,
                                 _preamble_resolved=True,
                                 max_heartbeats=max_heartbeats,
+                                **({"kernel_checked_types": True} if kernel_checked_types else {}),
                                 **({"declaration_names": tuple(observed_names[index] for index in group)}
                                    if observed_names else {}),
                                 **({"declaration_sources": tuple(observed_sources[index] for index in group)}

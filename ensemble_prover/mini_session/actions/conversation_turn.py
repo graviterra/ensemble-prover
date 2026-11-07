@@ -6536,6 +6536,7 @@ def _mark_graph_native_goal_statement_type_rejected(
 async def _analyze_graph_native_statement_contract(
     lean: Any, *, statement: str, preamble: str,
     replay_helpers: Sequence[str], declaration_source: str = "",
+    kernel_checked_types: bool = False,
 ) -> Any:
     """Observe a checked declaration, or a target in its ordered Lean context."""
     analyzer = getattr(lean, "analyze_statement_contracts", None)
@@ -6547,6 +6548,8 @@ async def _analyze_graph_native_statement_contract(
     try:
         parameters = inspect.signature(analyzer).parameters
         required = {"declaration_context"}
+        if kernel_checked_types:
+            required.add("kernel_checked_types")
         if declaration_source:
             required.update(("declaration_names", "declaration_sources"))
         if not required <= parameters.keys():
@@ -6555,6 +6558,8 @@ async def _analyze_graph_native_statement_contract(
             "preamble_override": preamble,
             "declaration_context": tuple(replay_helpers),
         }
+        if kernel_checked_types:
+            options["kernel_checked_types"] = True
         if declaration_source:
             name = helper_decl_name(declaration_source)
             if not name:
@@ -6700,13 +6705,36 @@ async def _run_graph_native_formalization_helper_contract(
     node = getattr(graph, "nodes", {}).get(node_id) if graph is not None else None
     initial_node_id, initial_node = node_id, node
     initial_statement = str(getattr(node, "statement", "") or "")
+    from ensemble_prover.proof_state_executor import _proof_state_check_preamble
+    from ensemble_prover.verified_helper_contract import helper_contract_context_guard
+
+    initial_runner_is_current = helper_contract_context_guard(lean)
+    initial_model_preamble = str(getattr(conv, "preamble", "") or "")
+    initial_checker_preamble = _proof_state_check_preamble(conv)
+    initial_environment = str(dossier.current_lean_environment_hash or "")
+    initial_context_helpers = tuple(context_helpers or ())
+    initial_target_frame = (
+        graph._proposal_source_frame_key(initial_statement, initial_node.metadata)
+        if initial_node is not None else ""
+    )
     dispatch_publication_guard = publication_guard
 
     def publication_guard() -> None:
         dispatch_publication_guard()
+        if (
+            not initial_runner_is_current()
+            or getattr(dossier, "proof_graph", None) is not graph
+            or str(getattr(conv, "preamble", "") or "") != initial_model_preamble
+            or _proof_state_check_preamble(conv) != initial_checker_preamble
+            or str(dossier.current_lean_environment_hash or "") != initial_environment
+            or tuple(context_helpers or ()) != initial_context_helpers
+        ):
+            raise ValueError("formalization context changed during verification")
         if initial_node is not None and (
             getattr(graph, "nodes", {}).get(initial_node_id) is not initial_node
             or str(initial_node.statement or "") != initial_statement
+            or graph._proposal_source_frame_key(initial_node.statement, initial_node.metadata)
+            != initial_target_frame
         ):
             raise ValueError("formalization target changed during verification")
 
@@ -6968,6 +6996,7 @@ async def _run_graph_native_formalization_helper_contract(
                 conv=conv,
                 replay_helpers=implicit_replay_helpers,
             )
+            publication_guard()
             return bool(getattr(implicit_result, "ok", False))
 
         async def prune_serviceable_subset(
@@ -7021,11 +7050,14 @@ async def _run_graph_native_formalization_helper_contract(
         replay_helpers: Sequence[str],
         *, declaration_source: str = "",
     ) -> Any:
-        return await _analyze_graph_native_statement_contract(
+        analysis = await _analyze_graph_native_statement_contract(
             lean, statement=statement,
             preamble=str(getattr(conv, "preamble", "") or ""),
             replay_helpers=replay_helpers, declaration_source=declaration_source,
+            kernel_checked_types=not bool(declaration_source),
         )
+        publication_guard()
+        return analysis
 
     for candidate in candidates:
         formal_statement = helper_decl_statement(candidate)
@@ -7074,6 +7106,7 @@ async def _run_graph_native_formalization_helper_contract(
             replay_helpers=candidate_replay_helpers,
             usage_sources=[*pre_replay_dependency_blocks, candidate],
         )
+        publication_guard()
         last_declaration_lean_ok = bool(getattr(result, "ok", False))
         if not bool(getattr(result, "ok", False)):
             replay_only_prefix_names = _replay_only_prefix_names(
@@ -7146,8 +7179,16 @@ async def _run_graph_native_formalization_helper_contract(
             lean, preamble=str(getattr(conv, "preamble", "") or ""),
             context=pre_replay_dependency_blocks,
         )
+        # Multiline declaration extraction preserves layout with a wrapper;
+        # source spelling alone cannot compare that type to the selected goal.
+        # Observe both sides in Lean, including a one-line candidate for a
+        # multiline target, rather than normalizing away meaningful layout.
         scoped_candidate = helper_source_contract_is_context_sensitive(
             candidate, context_is_plain=candidate_context_is_plain,
+        ) or any(
+            separator in formal_statement
+            or separator in str(contract.get("target_statement") or "")
+            for separator in ("\n", "\r")
         )
         observation_sources = tuple(dict.fromkeys([
             *(block for block in pre_replay_dependency_blocks
@@ -20804,7 +20845,30 @@ class ConversationTurnAction(ProviderLaneBankMixin):
                 checked_contract_environment = str(dossier.current_lean_environment_hash or "")
                 checked_contract_target = str(selected_goal_statement_override or conv.goal_statement)
                 generated_graph_helper = ""
+                checked_graph = dossier.proof_graph
+                checked_graph_target_node = None
+                checked_graph_parent_node = None
+                checked_graph_target_frame = ""
+                checked_graph_target_analysis = None
                 if graph_native_goal_statement and graph_native_target:
+                    checked_graph_target_node = checked_graph.nodes.get(
+                        str(graph_native_target.get("node_id") or "").strip()
+                    )
+                    if checked_graph_target_node is not None:
+                        checked_graph_target_frame = checked_graph._proposal_source_frame_key(
+                            checked_graph_target_node.statement, checked_graph_target_node.metadata,
+                        )
+                    if checked_graph_target_node is not None and checked_graph_target_node.kind == "formal_variant":
+                        parent = checked_graph.nodes.get(str(
+                            checked_graph_target_node.metadata.get("claim_node_id") or ""
+                        ))
+                        if (parent is not None and parent.kind == "proposed_claim"
+                                and parent.statement == graph_native_goal_statement
+                                and parent.metadata.get("statement_environment_hash") == checked_contract_environment
+                                and checked_graph._proposal_source_frame_key(parent.statement, parent.metadata)
+                                == checked_graph_target_frame
+                                and not checked_graph.is_superseded_tombstone(parent)):
+                            checked_graph_parent_node = parent
                     generated_graph_helper = _graph_native_helper_source(
                         helper_name=_graph_native_helper_name(
                             theorem_name=str(theorem_name or ""),
@@ -20821,6 +20885,24 @@ class ConversationTurnAction(ProviderLaneBankMixin):
                         and _proof_state_check_preamble(conv) == checked_contract_preamble
                         and str(dossier.current_lean_environment_hash or "") == checked_contract_environment
                         and str(selected_goal_statement_override or conv.goal_statement) == checked_contract_target
+                        and (checked_graph_target_node is None or (
+                            dossier.proof_graph is checked_graph
+                            and checked_graph.nodes.get(checked_graph_target_node.node_id)
+                            is checked_graph_target_node
+                            and checked_graph_target_node.statement == graph_native_goal_statement
+                            and checked_graph._proposal_source_frame_key(
+                                checked_graph_target_node.statement, checked_graph_target_node.metadata,
+                            ) == checked_graph_target_frame
+                        ))
+                        and (checked_graph_parent_node is None or (
+                            checked_graph.nodes.get(checked_graph_parent_node.node_id) is checked_graph_parent_node
+                            and checked_graph_parent_node.statement == graph_native_goal_statement
+                            and checked_graph_parent_node.metadata.get("statement_environment_hash") == checked_contract_environment
+                            and checked_graph._proposal_source_frame_key(
+                                checked_graph_parent_node.statement, checked_graph_parent_node.metadata,
+                            ) == checked_graph_target_frame
+                            and not checked_graph.is_superseded_tombstone(checked_graph_parent_node)
+                        ))
                     )
 
                 checked_contract_fields = await analyze_verified_helper_context(
@@ -20830,6 +20912,29 @@ class ConversationTurnAction(ProviderLaneBankMixin):
                     timeout_s=_recursive_contract_operation_timeout_s(session.lean, 0.0),
                     context_is_current=checked_contract_context_is_current,
                 )
+                if generated_graph_helper and checked_graph_target_node is not None:
+                    from ensemble_prover.contract_identity import parse_lean_contract_identity
+
+                    graph_helper_fields = checked_contract_fields.get(generated_graph_helper, {})
+                    helper_identity = parse_lean_contract_identity(str(
+                        graph_helper_fields.get("contract_identity") or ""
+                    ))
+                    target_observation_required = bool(
+                        graph_helper_fields.get("contract_observation_required")
+                        or "\n" in graph_native_goal_statement or "\r" in graph_native_goal_statement
+                    )
+                    if helper_identity is not None and target_observation_required:
+                        observed_target = await _analyze_graph_native_statement_contract(
+                            session.lean, statement=graph_native_goal_statement,
+                            preamble=checked_contract_preamble,
+                            replay_helpers=checked_contract_sources,
+                            kernel_checked_types=True,
+                        )
+                        target_identity = parse_lean_contract_identity(str(
+                            getattr(observed_target, "structural_identity", "") or ""
+                        ))
+                        if target_identity is not None and helper_identity[0] == target_identity[0]:
+                            checked_graph_target_analysis = observed_target
                 publication_guard()
                 if not checked_contract_context_is_current():
                     raise ValueError("accepted helper context changed during contract observation")
@@ -20932,6 +21037,16 @@ class ConversationTurnAction(ProviderLaneBankMixin):
                         if not bool(integrity.get("ready")):
                             dossier.remove_verified_helper(stale_name)
                 if graph_native_goal_statement and graph_native_target:
+                    if checked_graph_target_analysis is not None:
+                        _bind_checked_graph_native_contract(
+                            checked_graph_target_node, checked_graph_target_analysis,
+                            checked_contract_environment,
+                        )
+                        if checked_graph_parent_node is not None:
+                            _bind_checked_graph_native_contract(
+                                checked_graph_parent_node, checked_graph_target_analysis,
+                                checked_contract_environment,
+                            )
                     graph_native_replay_context_names = [
                         helper_decl_name(block) or ""
                         for block in check_lemmas
@@ -20959,7 +21074,49 @@ class ConversationTurnAction(ProviderLaneBankMixin):
                     graph_native_verdict = "proved"
                     graph_native_error_type = ""
                     graph_native_attempt_proof = proof
+                    graph_native_target_certified = False
                     if helper_record is not None:
+                        helper_node_id = checked_graph.helper_name_to_node_id.get(helper_record.name, "")
+                        target_kind = getattr(checked_graph_target_node, "kind", "")
+                        settlement = {
+                            "missing_obligation": checked_graph.mark_obligation_proved_by_helper,
+                            "proposed_claim": checked_graph.mark_claim_proved_by_helper,
+                            "formal_variant": checked_graph.mark_variant_proved_by_helper,
+                        }.get(target_kind)
+                        if settlement is not None:
+                            settlement(target_id, helper_node_id, source_hash=helper_record.source_hash,
+                                       proof_hash=helper_record.source_hash)
+                        graph_native_target_certified = bool(
+                            checked_graph._helper_certifies_node(
+                                checked_graph.nodes.get(helper_node_id), checked_graph_target_node,
+                            )
+                            and checked_graph._proved_node_has_durable_certificate(checked_graph_target_node)
+                        )
+                        if not graph_native_target_certified:
+                            helper_node = checked_graph.nodes.get(helper_node_id)
+                            vacuous_helper_refused = bool(
+                                "structurally_vacuous_helper" in {
+                                    str(tag or "").strip()
+                                    for tag in (getattr(helper_node, "metadata", {}) or {}).get(
+                                        "verified_helper_quality_tags", ()
+                                    ) or ()
+                                }
+                                and target_kind in {"missing_obligation", "proposed_claim", "formal_variant"}
+                                and (getattr(checked_graph_target_node, "metadata", {}) or {}).get(
+                                    "allow_structurally_vacuous_helper"
+                                ) is not True
+                            )
+                            # A policy refusal cannot recover by repeating an
+                            # observation. Consume that attempt normally while
+                            # retaining work whose typed evidence is unavailable.
+                            graph_native_verdict = (
+                                "proof_policy_rejected" if vacuous_helper_refused else "lean_infra_error"
+                            )
+                            graph_native_error_type = (
+                                "graph_native_helper_policy_rejected" if vacuous_helper_refused
+                                else "graph_native_target_certificate_unavailable"
+                            )
+                            graph_native_attempt_proof = ""
                         from ensemble_prover.helper_utilization import record_runner_helper_utilization
                         from ensemble_prover.proof_state_executor import _proof_state_check_preamble
                         record_runner_helper_utilization(
@@ -21010,7 +21167,7 @@ class ConversationTurnAction(ProviderLaneBankMixin):
                             "graph_native_helper_name": helper_name,
                         },
                     )
-                    if helper_record is None:
+                    if helper_record is None or not graph_native_target_certified:
                         # The target's own record was rejected. Auxiliary
                         # support helpers recorded above stay durable in the
                         # dossier and are synced to the graph so assembly can
@@ -21042,7 +21199,7 @@ class ConversationTurnAction(ProviderLaneBankMixin):
                             "helper_name": helper_name,
                             "helpers_added": list(helpers_added),
                             "solved_root": False,
-                            "verdict": "proof_policy_rejected",
+                            "verdict": graph_native_verdict,
                             "error_type": graph_native_error_type,
                         })
                         cost = time.monotonic() - started
@@ -21070,6 +21227,9 @@ class ConversationTurnAction(ProviderLaneBankMixin):
                                 "graph_native_helper_name": helper_name,
                                 "verdict": graph_native_verdict,
                                 "error_type": graph_native_error_type,
+                                "preserve_frontier_work": (
+                                    graph_native_error_type == "graph_native_target_certificate_unavailable"
+                                ),
                                 **skeleton_route_metadata,
                                 "strong_progress": False,
                                 "unverified_decomposition_created": bool(
