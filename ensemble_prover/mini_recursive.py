@@ -7221,6 +7221,51 @@ def _planner_material_fingerprint(material: Any) -> str:
     return text_hash(_planner_material_json(material))
 
 
+def _planner_saved_context_differs_only_in_preamble(
+    identity: PlannerJobIdentity,
+    messages: Sequence[Mapping[str, Any]],
+    current_context: Mapping[str, Any],
+) -> bool:
+    """Authorize advisory reuse only within the same theorem and visibility policy.
+
+    Older envelopes did not store context fields separately. Their rendered
+    preamble can still be recovered and checked against the original context
+    fingerprint; parsing that text alone never authorizes reuse.
+    """
+    saved_digest = identity.request_context_fingerprint
+    if saved_digest.startswith("planner-context-policy:v1:"):
+        parts = saved_digest.split(":")
+        if len(parts) != 4:
+            return False
+        saved_digest = parts[2]
+    for message in messages:
+        context = message.get("_required_prompt_context", {})
+        if not isinstance(context, Mapping) or context.get("kind") != "mini_recursive_planner_core":
+            continue
+        saved_context = context.get("planner_context_material")
+        if isinstance(saved_context, Mapping):
+            candidate = dict(saved_context)
+        else:
+            content = str(message.get("content", ""))
+            marker = "Lean local environment (input definitions, not an official answer):\n"
+            following = "\n\nDecompose the root theorem into an atomic theorem DAG of "
+            candidate = dict(current_context)
+            candidate.pop("generic_preamble_hash", None)
+            if marker in content:
+                _, preamble_and_rest = content.split(marker, 1)
+                if following not in preamble_and_rest:
+                    return False
+                preamble, _ = preamble_and_rest.split(following, 1)
+                candidate["generic_preamble_hash"] = text_hash(preamble)
+        if _planner_material_fingerprint(candidate) != saved_digest:
+            return False
+        candidate.pop("generic_preamble_hash", None)
+        current = dict(current_context)
+        current.pop("generic_preamble_hash", None)
+        return candidate == current
+    return False
+
+
 def _planner_material_json(material: Any) -> str:
     """Canonical, checkpoint-safe encoding of public planner request material."""
 
@@ -37526,8 +37571,7 @@ async def _request_plan(
         and not _solution_names_in_text(visible_answer_preamble)
     ):
         generic_preamble = str(visible_answer_preamble)
-    planner_request_context_fingerprint = _planner_material_fingerprint(
-        {
+    planner_request_context_material = {
             "schema_version": 1,
             "theorem_name": str(theorem_name or ""),
             "root_statement": str(root_statement or ""),
@@ -37538,7 +37582,9 @@ async def _request_plan(
             "official_answer_payload_present": bool(official_answer_payload_present),
             "suppress_solution_placeholders": bool(suppress_solution_placeholders),
             **({"generic_preamble_hash": text_hash(generic_preamble)} if generic_preamble else {}),
-        }
+    }
+    planner_request_context_fingerprint = _planner_material_fingerprint(
+        planner_request_context_material
     )
     if planner_job_identity is not None and (
         not planner_job_identity.request_material_json
@@ -37827,6 +37873,7 @@ async def _request_plan(
                 "pinned": True,
                 "_required_prompt_context": {
                     "kind": "mini_recursive_planner_core",
+                    "planner_context_material": planner_request_context_material,
                     "helper_source_hashes": [text_hash(source) for source in helper_catalog],
                     "units": [
                         "root_target",
@@ -37874,10 +37921,89 @@ async def _request_plan(
                     planner_operation_deadline_monotonic or float("inf"),
                     time.monotonic() + remaining_owner_s,
                 )
+        context_refresh = bool(
+            planner_job_identity is not None
+            and saved_scope_messages is not None
+            and planner_job_identity.request_context_fingerprint
+            and planner_job_identity.request_context_fingerprint != planner_request_context_fingerprint
+            and _planner_saved_context_differs_only_in_preamble(
+                planner_job_identity, saved_scope_messages, planner_request_context_material,
+            )
+        )
+        if context_refresh:
+            # A new local environment needs a newly bound request, but paid
+            # exploration remains useful as explicitly unverified history.
+            # Never compile the old response under the changed definitions.
+            history = []
+            for message in saved_scope_messages:
+                context = message.get("_required_prompt_context", {})
+                if (isinstance(context, Mapping) and context.get("kind") in {
+                        "mini_recursive_planner_helper_lookup", "mini_recursive_planner_context_refresh",
+                }):
+                    previous_round = context.get("helper_lookup_round")
+                    if type(previous_round) is not int or not 0 <= previous_round <= 4:
+                        helper_lookup_incomplete("invalid_saved_lookup_round")
+                        return None
+                    helper_lookup_round = max(helper_lookup_round, previous_round)
+                if (message.get("role") == "assistant"
+                        or (isinstance(context, Mapping) and context.get("kind") in {
+                            "mini_recursive_planner_helper_lookup",
+                            "mini_recursive_planner_context_refresh",
+                        })):
+                    history.append(str(message.get("content", "")))
+            if (planner_job_identity.stage == "helper_lookup"
+                    and helper_lookup_round != planner_job_identity.stage_round):
+                helper_lookup_incomplete("invalid_saved_lookup_round")
+                return None
+            exact_refresh_receipt = bool(
+                background_result is not None and background_result.identity == planner_job_identity
+            )
+            if exact_refresh_receipt:
+                if background_result.exception is not None:
+                    raise background_result.exception
+                paid_response = _planner_raw_response(background_result.value)
+                if paid_response.content:
+                    history.append(paid_response.content)
+                stats.planner_calls += 1
+            # The same signature query is meaningful again in a changed
+            # environment. Preserve the paid round allowance, while query
+            # repetition is scoped to the newly bound environment.
+            helper_lookup_seen.clear()
+            request_messages.append({
+                "role": "user",
+                "content": (
+                    "The local Lean environment changed while this planning request was pending. "
+                    "The current theorem, definitions and helper catalog above are authoritative. "
+                    "The following is unverified planning history from the preceding environment. "
+                    "Recheck all interpretations, names and premises against the current context. "
+                    "Continue its useful investigation; do not treat a prior plan as a checked reduction. "
+                    "If the last response requested helpers, request the still-needed signatures "
+                    "using the current catalog snapshot, then return a complete JSON plan.\n\n"
+                    + "\n\n".join(history)
+                ),
+                "pinned": True,
+                "_required_prompt_context": {
+                    "kind": "mini_recursive_planner_context_refresh",
+                    "units": ["unverified_prior_planning", "current_context_revalidation"],
+                    "helper_lookup_round": helper_lookup_round,
+                    "helper_lookup_seen": sorted(helper_lookup_seen),
+                    "helper_operation_deadline_unix": _wall_clock_deadline(
+                        planner_operation_deadline_monotonic if planner_deadlines_enabled else None
+                    ),
+                },
+            })
+            _record(record_event, {
+                "phase": "mini_recursive_plan", "pass_index": pass_index,
+                "verdict": "planner_context_refresh_preserved",
+                "previous_stage": planner_job_identity.stage,
+                "paid_response_preserved": exact_refresh_receipt,
+                "helper_lookup_round": helper_lookup_round,
+            })
         if (
             planner_job_broker is not None
             and planner_job_identity is not None
             and planner_job_identity.stage == "parse_repair"
+            and not context_refresh
         ):
             parse_context_compatible = bool(
                 not planner_job_identity.request_context_fingerprint
@@ -38110,7 +38236,7 @@ async def _request_plan(
             saved_request_io_policy = None
         if (planner_job_identity is not None
                 and planner_job_identity.stage == "helper_lookup"
-                and saved_request_messages is None):
+                and saved_request_messages is None and not context_refresh):
             helper_lookup_incomplete(
                 "saved_lookup_request_unavailable",
                 saved_request_envelope_valid=saved_request_envelope is not None,
@@ -38132,6 +38258,7 @@ async def _request_plan(
         )
         if (
             not saved_context_compatible
+            and not context_refresh
             and saved_broker_result is not None
             and saved_broker_result.identity == planner_job_identity
         ):
@@ -38179,6 +38306,17 @@ async def _request_plan(
                             planner_operation_deadline_monotonic or float("inf"),
                             time.monotonic() + remaining_lookup_s,
                         )
+                if (isinstance(context, Mapping)
+                        and context.get("kind") == "mini_recursive_planner_context_refresh"):
+                    saved_round = context.get("helper_lookup_round")
+                    prior_keys = context.get("helper_lookup_seen")
+                    if (type(saved_round) is not int or not 0 <= saved_round <= 4
+                            or not isinstance(prior_keys, list)
+                            or not all(isinstance(key, str) for key in prior_keys)):
+                        helper_lookup_incomplete("invalid_saved_lookup_round")
+                        return None
+                    helper_lookup_round = max(helper_lookup_round, saved_round)
+                    helper_lookup_seen.update(prior_keys)
                 if saved_message.get("role") == "assistant":
                     try:
                         prior_queries = parse_planner_helper_queries(saved_message.get("content", ""))
@@ -38609,6 +38747,7 @@ async def _request_plan(
             and primary_job_identity.stage in secondary_receipt_stages
             and not saved_receipt_available
             and not resumable_exact_request
+            and not context_refresh
         ):
             # Downstream work is not derivable from a stage hash. In
             # particular, parse repair requires the exact malformed response.
@@ -38616,7 +38755,7 @@ async def _request_plan(
             return None
         if (
             primary_job_identity is not None
-            and primary_job_identity.stage not in secondary_receipt_stages
+            and (primary_job_identity.stage not in secondary_receipt_stages or context_refresh)
             and not exact_primary_receipt
             and not resumable_exact_request
             and not (

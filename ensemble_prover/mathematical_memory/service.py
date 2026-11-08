@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import contextlib
 import copy
 import re
@@ -1154,6 +1155,29 @@ class MathematicalMemoryService:
             return 0.0
         return max(0.0, float(getattr(self, "_goal_capture_elapsed_s", 0.0)))
 
+    def ordinary_work_required_seconds(self) -> float:
+        """Estimate funding for a semantic attempt, even with a cached goal.
+
+        Goal reuse removes capture work, but declaration profiling and the
+        application still require Lean. After a preparation timeout, use the
+        observed capture cost as a modest admission floor for another attempt.
+        This only schedules work; it never establishes mathematical validity.
+        """
+        required = self.goal_capture_required_seconds()
+        state = self.session().mathematical_memory_state
+        observation = state.get("preparation_timeout_cost", {})
+        if isinstance(observation, dict) and observation.get("environment_id") == self.context_id():
+            observed = observation.get("capture_seconds", 0.0)
+            if type(observed) in (int, float) and math.isfinite(observed) and observed > 0:
+                required = max(required, min(float(observed), self.config.action_seconds))
+        return required
+
+    def observe_preparation_timeout(self) -> None:
+        self.session().mathematical_memory_state["preparation_timeout_cost"] = {
+            "environment_id": self.context_id(),
+            "capture_seconds": max(0.0, float(getattr(self, "_goal_capture_elapsed_s", 0.0))),
+        }
+
     async def capture_goal(self, budget: MemoryBudget) -> Any:
         from .profiles import capture_goal
         from ensemble_prover.verified_helper_contract import helper_contract_context_guard
@@ -1181,6 +1205,55 @@ class MathematicalMemoryService:
         if result.complete and live is not None:
             self._captured_goal_snapshot = (key, guard, result)
         return result
+
+    def _resident_leading_alternative(
+        self, candidates: Any, *, budget: MemoryBudget, visited: set[str],
+    ) -> tuple[Any, ...]:
+        """Try a resident name-family alternative before activating a bundle.
+
+        A matching name is only a retrieval hint. Keep the published candidate
+        with its distinct source/type identity and retain ordinary Lean profiling
+        and application checks for both. At most one alternative is inserted so
+        the resident library cannot crowd out novel discovery candidates.
+        """
+        rows = tuple(candidates)
+        if (not rows or self.config.cheap_candidate_cap < 2
+                or rows[0].availability != "requires_bundle_activation"
+                or not any(origin.source_kind == "published_theory" for origin in rows[0].origins)):
+            return rows
+        from ensemble_prover.lean_names import lean_constant_name_components
+        from ensemble_prover.proof_dossier import helper_decl_name
+        from ensemble_prover.proof_state_scheduler import _local_helper_entries
+        from ensemble_prover.mathematical_retrieval.model import CandidateOrigin, RetrievalCandidate
+
+        target_parts = lean_constant_name_components(rows[0].declaration_name)
+        matches = []
+        for block in self.context()[2]:
+            self.check_budget(budget)
+            name = helper_decl_name(block) or ""
+            parts = lean_constant_name_components(name)
+            if parts and target_parts[-len(parts):] == parts:
+                matches.append((name, block))
+        # Ambiguous aliases do not authorize a preference.
+        if len(matches) != 1:
+            return rows
+        name, block = matches[0]
+        entries = _local_helper_entries((block,))
+        if not entries:
+            return rows
+        local = RetrievalCandidate(
+            "", name, entries[0].type, "theorem",
+            (CandidateOrigin(
+                source_kind="verified_helper", source_id="current_dossier",
+                source_path="verified_helpers", environment_hash=self.context_id(),
+                trust_kind="cached_kernel_verified", availability="already_imported",
+                helper_source=block,
+            ),),
+            reasons=("resident_name_alternative",), availability="already_imported",
+        )
+        if local.candidate_id in visited or not self.candidate_eligible(local, budget=budget):
+            return rows
+        return (local, *(row for row in rows if row.candidate_id != local.candidate_id))
 
     async def find_candidates(
         self, goal: Any, budget: MemoryBudget, pinned_generation: GenerationPin
@@ -1251,9 +1324,21 @@ class MathematicalMemoryService:
         # admission; serialized candidates confer no checked authority.
         if binding != self._continuation_binding():
             raise ValueError("retrieval context changed")
+        # A resident hint is optional. If discovery used its last allowance,
+        # retain its completed advisory results before enforcing the deadline.
+        # Cancellation and detached action scopes still propagate normally.
+        try:
+            candidates_with_alternative = self._resident_leading_alternative(
+                result.candidates, budget=budget, visited=visited,
+            )
+        except TimeoutError:
+            candidates_with_alternative = tuple(result.candidates)
+        if len(candidates_with_alternative) > self.config.cheap_candidate_cap:
+            self.candidate_coverage["partial"] = True
+            self.candidate_coverage["omitted"] = None
         retained = []
         size = 0
-        for candidate in result.candidates[:self.config.cheap_candidate_cap]:
+        for candidate in candidates_with_alternative[:self.config.cheap_candidate_cap]:
             row = candidate.to_record(include_helper_source=True)
             size += len(canonical_json(row))
             if size > 2_000_000:

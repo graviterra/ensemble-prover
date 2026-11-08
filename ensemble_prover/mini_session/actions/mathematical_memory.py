@@ -70,7 +70,7 @@ class MathematicalMemoryAction:
             if session.lean is None or not service.config.probes_enabled:
                 continue
             if capture_seconds is None:
-                capture_seconds = service.goal_capture_required_seconds()
+                capture_seconds = service.ordinary_work_required_seconds()
             requested_seconds = request.get("max_seconds")
             allowance = available
             if (
@@ -87,7 +87,7 @@ class MathematicalMemoryAction:
         service = session.mathematical_memory
         if available <= 0 or session.lean is None or not service.config.probes_enabled:
             return False
-        if available < service.goal_capture_required_seconds():
+        if available < service.ordinary_work_required_seconds():
             return False
         wake = any(
             row.get("environment_id") == service.context_id()
@@ -647,6 +647,8 @@ class MathematicalMemoryAction:
                     )
                 raise
             except (TimeoutError, OSError, ValueError, TypeError, RuntimeError) as exc:
+                if isinstance(exc, TimeoutError) and stage in {"activate_candidate", "probe", "ordinary_check"}:
+                    service.observe_preparation_timeout()
                 verdict = f"{type(exc).__name__}: {exc}"
                 failure_type = type(exc).__name__
                 if request:

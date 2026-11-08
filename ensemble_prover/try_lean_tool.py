@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -563,6 +564,58 @@ def _summarize_result(
     )
 
 
+def _duplicate_declaration_guidance(
+    result: Any, *, preamble: str, context_lemmas: Sequence[str],
+    redact_solution_refs: bool,
+) -> str:
+    """Explain a compiler-reported collision without guessing Lean identity.
+
+    The full name comes from Lean. A source signature is shown only for an
+    unambiguous exact qualified registry entry in the supplied context. Imports
+    and private-name mangling may leave no such entry; lookup guidance remains
+    useful without assigning a different declaration's statement to that name.
+    """
+    if bool(getattr(result, "ok", False)):
+        return ""
+    names: list[str] = []
+    for diagnostic in getattr(getattr(result, "parsed", None), "diagnostics", ()) or ():
+        if str(getattr(diagnostic, "severity", "")).lower() != "error":
+            continue
+        message = str(getattr(diagnostic, "message", "") or "")
+        match = re.search(r"['‘`](.+?)['’`] has already been declared", message, re.DOTALL)
+        if match and match[1] not in names:
+            names.append(match[1])
+    if not names:
+        return ""
+    from .mini_lean_extract import _top_level_declaration_registry
+
+    blocks, ambiguous = _top_level_declaration_registry(
+        "\n\n".join((preamble, *context_lemmas))
+    )
+    guidance = []
+    for name in names[:3]:
+        display_name = _compact(name, 500, redact_solution_refs=redact_solution_refs,
+                                lean_diagnostic=True)
+        text = f"Declaration collision: `{display_name}` already exists in this Lean environment."
+        block = blocks.get(name) if name not in ambiguous else None
+        statement = helper_decl_statement(block) if block else ""
+        if statement:
+            text += " Existing source signature: " + _compact(
+                statement, 1800, redact_solution_refs=redact_solution_refs,
+                lean_diagnostic=True,
+            ) + "."
+        check_code = json.dumps("#check " + display_name, ensure_ascii=False)
+        text += (
+            f" Inspect it with check_lean(code={check_code}) before reproving it. "
+            "Use read_verified_helpers to browse available helper signatures. "
+            "To test a different statement or proof, use an "
+            "anonymous `example` or a fresh declaration name. The collision does "
+            "not verify the submitted statement or proof."
+        )
+        guidance.append(text)
+    return " ".join(guidance)
+
+
 async def _run_try_lean_tool_impl(
     lean: Any,
     *,
@@ -1022,6 +1075,12 @@ async def _run_try_lean_tool_impl(
         submitted_code_line_span=submitted_code_line_span,
         submitted_helper_source_span=submitted_helper_source_span,
     )
+    collision_guidance = _duplicate_declaration_guidance(
+        result, preamble=preamble, context_lemmas=list(context_lemmas or ()),
+        redact_solution_refs=redact_solution_refs,
+    )
+    if collision_guidance:
+        outcome.summary += " " + collision_guidance
     if feedback_context:
         if scratch_accepted(result):
             summary = (
