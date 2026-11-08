@@ -784,8 +784,12 @@ class NativeResearchCoordinator:
     def _idle_pause(self, session: Any, snapshot: dict[str, Any]) -> dict[str, Any] | None:
         pause = snapshot["pause"]
         binding = self._target_context_binding(session.conv)
+        target = snapshot["targets"].get(binding)
+        if (target is None and canonical_dossier_statement_key(self._target(session.conv))
+                == canonical_dossier_statement_key(self.pin["statement"])):
+            target = "native-root"
         if (pause is not None and pause["owner_id"] == snapshot["owner_id"]
-                and pause["target_claim_id"] == snapshot["targets"].get(binding)
+                and pause["target_claim_id"] == target
                 and pause["target_context_binding"] == binding):
             return pause
         return None
@@ -809,10 +813,10 @@ class NativeResearchCoordinator:
         if paused:
             # Keep every request in its journal. Only the idle wake identity
             # ignores repeated receipt IDs for an otherwise identical obstacle.
-            inputs["objections"] = sorted({
-                _json({key: value for key, value in item.items() if key != "request_id"})
-                for item in inputs["objections"]
-            })
+            from .research_claims.native_intake import helper_evidence
+            inputs["objections"] = sorted({_json(item["investigation_change"])
+                                           for item in inputs["objections"] if item.get("investigation_change")})
+            inputs["helper_evidence"] = _hash(helper_evidence(getattr(session, "dossier", None)))
             inputs.update(proof_boundary=None, proof_requests=None)
         return _hash({
             **inputs, "ledger": snapshot["identity"],
@@ -965,6 +969,164 @@ class NativeResearchCoordinator:
                 "problem": str(getattr(self.problem, "docstring", "")),
                 "identity_binding": self.binding}
 
+    def _register_intake_scope(self, session: Any) -> None:
+        state = self._state(session)
+        lane = state.setdefault("intake_lane", str(getattr(session, "checkpoint_lane_key", "")) or uuid.uuid4().hex)
+        scopes = self.__dict__.setdefault("_intake_scopes", {})
+        try:
+            scopes[lane] = weakref.ref(session)
+        except TypeError:
+            scopes[lane] = session
+        if self.loop is not None and self.loop.strategy is not None:
+            self.loop.strategy.research.native_intake_validator = self._validate_intake
+
+    def _validate_intake(self, packet: dict[str, Any]) -> bool | None:
+        """None preserves paid work while its original proof lane is absent."""
+        entry = getattr(self, "_intake_scopes", {}).get(packet["lane"])
+        session = entry() if isinstance(entry, weakref.ReferenceType) else entry
+        if session is None or self._session_released(session):
+            return None
+        if self._target_context_binding(session.conv) != packet["native_context_binding"]:
+            return False
+        from .research_claims.native_intake import helper_evidence
+        current = helper_evidence(getattr(session, "dossier", None))
+        proposals = {_json(item.get("investigation_change")) for item in self._objections_for(session.conv)
+                     if item.get("investigation_change") is not None}
+        return (all(current.get(item["name"]) == item for item in packet["helpers"])
+                and all(_json(item) in proposals for item in packet["proposals"]))
+
+    def _paused_intake(self, session: Any) -> tuple[bool, dict[str, Any] | None]:
+        """Preflight the next donated quantum without capturing a full dossier.
+
+        A stopped old quantum is not evidence that a pending paid response or
+        a newly authorized independent review is unavailable.
+        """
+        from .research_claims.frontier.hooks import mode_of
+        from .research_claims.frontier.owner import FrontierOwner
+        from .research_claims.frontier.approaches import approach_is_held, can_admit_review
+        from .research_claims.native_intake import helper_evidence, scope
+        from .proof_dossier import helper_decl_statement
+
+        store = self._require_store()
+        loop = self._require_loop()
+        run = store.run_record(scheduling=True)
+        if mode_of(run.get("strategy_review") or {}) != "adaptive":
+            return True, None
+        snapshot = self._idle_ledger_snapshot()
+        pause = self._idle_pause(session, snapshot) if snapshot is not None else None
+        if pause is None:
+            return True, None
+        self._state(session)["research_pause"] = deepcopy(pause)
+        context = self._target_context_binding(session.conv)
+        target = pause["target_claim_id"]
+        jobs = store.jobs()
+        campaign = FrontierOwner(loop.strategy.controller).campaign()
+        lane = campaign["lanes"].get("provider") or {}
+        for job in jobs:
+            if (job.get("native_target_claim_id") != target or job.get("native_context_binding") != context
+                    or job.get("research_control", {}).get("closed")):
+                continue
+            if job["status"] == "responded":
+                if job.get("native_intake_id"):
+                    packet = json.loads(store.read_artifact(job["native_intake_artifact"]))
+                    if self._validate_intake(packet) is not True:
+                        continue
+                return True, None
+            authorization = campaign["review_authorizations"].get(job.get("frontier_review_authorization", ""), {})
+            admissions = sum(attempt.get("consumer_id") == job["job_id"] and attempt.get("allocation_id") is None
+                             for attempt in loop.strategy.controller.snapshot()["attempts"].values())
+            current_approach = campaign["approaches"].get(job.get("frontier_approach_id", ""))
+            eligible_review = (authorization.get("status") == "open"
+                and admissions < authorization.get("ceiling", {}).get("requests", 0)
+                and current_approach is not None and not approach_is_held(campaign, current_approach["approach_id"])
+                and current_approach["status"] not in {"completed", "superseded", "dormant", "held"}
+                and job.get("frontier_question_id") == current_approach["question_id"]
+                and store.get_claim(job["claim_id"])["revision"] == job["revision"])
+            if job.get("native_intake_id"):
+                packet = json.loads(store.read_artifact(job["native_intake_artifact"]))
+                eligible_review = (eligible_review and self._validate_intake(packet) is True
+                                   and packet["binding"] == scope(campaign, current_approach))
+            if (eligible_review and job["role"] == "review" and job["status"] in {"pending", "waiting"}
+                    and (job.get("retry_after") or 0) <= time.time()
+                    and (job.get("frontier_review_admitted") or can_admit_review(campaign))
+                    and (not lane.get("paused") or lane.get("recovery_open"))
+                    and not campaign["retries"].get(job.get("frontier_operation_lineage") or "", {}).get("paused")):
+                return True, None
+        if not can_admit_review(campaign) or lane.get("paused") and not lane.get("recovery_open"):
+            return False, None
+        approach = next((campaign["approaches"][item["approach_id"]] for item in pause["approaches"]
+                         if not approach_is_held(campaign, item["approach_id"]) and not
+                         campaign["retries"].get(campaign["approaches"][item["approach_id"]].get("operation_lineage") or "", {}).get("paused")), None)
+        if approach is None:
+            return False, None
+        inventory = helper_evidence(getattr(session, "dossier", None))
+        # The first archived native checkpoint precedes later proof work. It
+        # prevents replaying restored helpers merely because intake is new.
+        baseline_id = run.get("native_research_baselines", {}).get(context)
+        baseline = json.loads(store.read_artifact(baseline_id)) if baseline_id else None
+        if baseline is None:
+            # Legacy ledgers may retain a checkpoint only on the original job.
+            # Choose the earliest exact-context assignment; never invent one.
+            for job in jobs:
+                if job.get("native_context_binding") == context and job.get("native_proof_checkpoint"):
+                    candidate = json.loads(store.read_artifact(job["native_proof_checkpoint"]))
+                    if candidate.get("active_target", {}).get("statement") == self._target(session.conv):
+                        baseline = candidate
+                        break
+        if baseline is not None:
+            old_statements = {canonical_dossier_statement_key(helper_decl_statement(item["source"]))
+                              for item in baseline.get("checked_helpers", [])}
+        else:
+            baseline_key = "intake_baseline_statements:" + context
+            old_statements = set(self._state(session).setdefault(baseline_key, [
+                canonical_dossier_statement_key(item["statement"]) for item in inventory.values()]))
+        considered = set()
+        proposals = set()
+        for job in jobs:
+            if job.get("native_intake_id") and job.get("native_context_binding") == context:
+                previous = json.loads(store.read_artifact(job["native_intake_artifact"]))
+                # Pending assignments reserve their evidence. A claimed complete
+                # decision settles it; stale or incomplete reviews do not claim
+                # that a changed assignment has already been inspected.
+                if ((previous["binding"] == scope(campaign, approach)
+                     and not job.get("research_control", {}).get("closed")
+                     and self._validate_intake(previous) is not False) or
+                    job.get("native_intake_result", {}).get("status") in {
+                        "declined", "investigation_admitted", "existing_work_retained"}):
+                    considered.update(item["progress_key"] for item in previous["helpers"])
+                    proposals.update(_hash(item) for item in previous["proposals"])
+        helpers = [item for item in inventory.values() if item["progress_key"] not in considered
+                   and canonical_dossier_statement_key(item["statement"]) not in old_statements][:16]
+        proposed = []
+        for item in self._objections_for(session.conv):
+            change = item.get("investigation_change")
+            if change is not None and _hash(change) not in proposals:
+                proposed.append(change)
+                proposals.add(_hash(change))
+                if len(proposed) == 4:
+                    break
+        if not helpers and not proposed:
+            return False, None
+        self._register_intake_scope(session)
+        packet = {"version": 1, "origin": "native_evidence_intake", "binding": scope(campaign, approach),
+                  "lane": self._state(session)["intake_lane"], "native_context_binding": context,
+                  "native_target_claim_id": target, "target": self._target(session.conv),
+                  "formal_context": str(getattr(session.conv, "preamble", self.pin["preamble"])),
+                  "question": campaign["questions"][approach["question_id"]],
+                  "helpers": helpers, "proposals": proposed,
+                  "authors": [str(value) for value in [getattr(session, "research_worker_id", None),
+                              getattr(session.conv, "research_worker_id", None)] if value],
+                  "author_provenance": "Proof lane is known; provider worker authorship may be unavailable. Independent fresh review assignment is mandatory.",
+                  "authority": "Local checked evidence and speculative model proposals; root relevance is unreviewed. No progress credit."}
+        from .research_claims.frontier.records import digest
+        # An exhausted inspection remains uninspected history. Identical
+        # evidence cannot silently purchase another ceiling; a changed packet
+        # or explicit new proposal is required for a new assignment.
+        if any(job.get("native_intake_id") == digest(packet)
+               and job.get("research_control", {}).get("closed") for job in jobs):
+            return False, None
+        return True, packet
+
     def _capture(self, session: Any, reason: str) -> str:
         store = self._require_store()
         dossier = getattr(session, "dossier", None)
@@ -1098,7 +1260,7 @@ class NativeResearchCoordinator:
             deferred = adaptive and job["status"] == "waiting" and (
                 job.get("last_error") in {
                     "research_control_deferred", "research_review_paused_operational",
-                    "research_review_lane_paused", "paused_operational", "retry_deadline", "retry_exhausted",
+                    "research_review_lane_paused", "native_intake_lane_unavailable", "paused_operational", "retry_deadline", "retry_exhausted",
                     "fairness", "suspended", "frontier_permit_required", "stale_permit_basis",
                     "stale_frontier_scope", "formal_authority_revoked", "permit_expired", "claim_expired",
                 }
@@ -1366,6 +1528,13 @@ class NativeResearchCoordinator:
             # Optional recovery cannot fund work by guessing a legacy refund.
             _event(session, "research_deferred", reason="ambiguous_legacy_grant_accounting")
             return False
+        self._register_intake_scope(session)
+        ready, intake = self._paused_intake(session)
+        if not ready:
+            state["idle_research"] = self._idle_research_key(session)
+            release_capacity_reserve(session, "no_applicable_research")
+            _event(session, "research_deferred", reason="paused_no_new_reviewable_evidence")
+            return False
         timeout = _native_quantum_seconds(donor)
         checkpoint = self._capture(session, reason)
         proof_inputs = deepcopy(self._idle_proof_inputs(session))
@@ -1439,6 +1608,9 @@ class NativeResearchCoordinator:
                                   "ordinal": len(grants), "closed": False,
                                   "funding_phase": "committed"}
             self.store.save_run(run)
+            if intake is not None:
+                from .research_claims.native_intake import enqueue
+                enqueue(loop, intake, claim_id)
             self._queue_target_work(session, checkpoint, claim_id)
         # Cross-store funding becomes durable before any provider task exists.
         grant["funding_phase"] = "committed"
@@ -1844,6 +2016,7 @@ class NativeResearchCoordinator:
         reviewer = self.research_review_client or investigator
         key = (id(investigator), id(reviewer), role)
         if self.loop is not None and key == self.donor_key:
+            self._register_intake_scope(session)
             return
         def fresh_transport(worker: str) -> Any:
             return clone_research_client(investigator)
@@ -1862,6 +2035,7 @@ class NativeResearchCoordinator:
             self._start_loop_quiescence(self.loop, deadline=cleanup_deadline(), terminal=False)
         self.loop = replacement
         self.donor_key = key
+        self._register_intake_scope(session)
 
     def _reconcile(self, session: Any, grant: dict[str, Any], *,
                    elapsed_s: float | None = None, interrupted: bool = False,
@@ -2155,7 +2329,7 @@ class NativeResearchCoordinator:
         context = {"guidance": guidance,
                    "proof_compute_examples_enabled": getattr(conv, "_native_compute_examples_enabled", None),
                    "active_target": self._target(conv),
-                   "policy": "You may request_native_research when an ancestor claim, counting bound, or method is unsupported. Supply the exact bottleneck and source evidence. The run investigates at a committed action boundary and resumes under its existing budget. Use read_native_research_artifact for full archived arguments."}
+                   "policy": "You may request_native_research when an ancestor claim, counting bound, or method is unsupported. Supply the exact bottleneck and source evidence. The run investigates at a committed action boundary and resumes under its existing budget. When research is paused, you may include investigation_change with mechanism, first_uncertain_inference, discriminating_check, relation_to_root, and difference for an independent bounded review. This is a speculative proposal, not evidence of progress. Use read_native_research_artifact for full archived arguments."}
         from .research_claims.native_local_proofs import task_inventory
         context["local_proof_tasks"] = task_inventory(self.store)
         if self._session is not None and self._session.conv is conv:
@@ -2343,9 +2517,15 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
     if name != "request_native_research":
         raise ValueError("unknown native research tool")
     from .research_claims.research_contracts import REQUEST_FIELDS, bind_request
-    object_fields(payload, {"statement", "reason", "evidence_artifact_ids"} | REQUEST_FIELDS, {"statement", "reason"}, name)
+    object_fields(payload, {"statement", "reason", "evidence_artifact_ids", "investigation_change"} | REQUEST_FIELDS, {"statement", "reason"}, name)
     text(payload["statement"], "exact bottleneck")
     text(payload["reason"], "complete objection")
+    if "investigation_change" in payload:
+        change = payload["investigation_change"]
+        fields = {"mechanism", "first_uncertain_inference", "discriminating_check", "relation_to_root", "difference"}
+        object_fields(change, fields, fields, "investigation_change")
+        for field in fields:
+            text(change[field], field)
     ids = payload.get("evidence_artifact_ids", [])
     if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
         raise ValueError("evidence_artifact_ids must be an array of artifact ids")
@@ -2385,6 +2565,10 @@ _CONTRACT_SCHEMA = {"type": "object", "properties": {
     "quantifiers": {"type": "array", "items": {"type": "string"}}},
     "required": ["statement", "domain"], "additionalProperties": False}
 _RESEARCH_CONTRACT_PROPERTIES = {
+    "investigation_change": {"type": "object", "properties": {key: {"type": "string"} for key in (
+        "mechanism", "first_uncertain_inference", "discriminating_check", "relation_to_root", "difference")},
+        "required": ["mechanism", "first_uncertain_inference", "discriminating_check", "relation_to_root", "difference"],
+        "additionalProperties": False},
     "contract": _CONTRACT_SCHEMA,
     "cited_helpers": {"type": "array", "maxItems": 16, "items": {
         "type": "object", "properties": {key: {"type": "string"} for key in (

@@ -12,6 +12,9 @@ from .model import json_text
 
 
 def ensure_subject(store: Any, job: dict[str, Any]) -> dict[str, Any] | None:
+    if job.get("native_intake_id"):
+        from .native_intake import subject
+        return subject(store, job)
     if not job.get("research_reorientation_for"):
         return None
     reference = job.get("assigned_research_subject")
@@ -90,6 +93,8 @@ def subject_view(store: Any, job: dict[str, Any]) -> dict[str, Any] | None:
 def bounded_subject(store: Any, value: dict[str, Any], limit: int) -> dict[str, Any]:
     """Identity and exact pointer always precede text and older context."""
     result = {key: value[key] for key in ("subject_id", "subject_artifact", "report_artifact")}
+    if value.get("origin"):
+        result["origin"] = value["origin"]
     result.update(coverage="not_in_this_window", inspection="unknown")
     if len(json_text(result)) > limit:
         raise ValueError("context limit cannot fit assigned subject identity")

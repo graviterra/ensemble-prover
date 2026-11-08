@@ -855,7 +855,7 @@ def merge_imports(preamble: str, imports: Sequence[str]) -> str:
     original = str(preamble or "")
     if not additions:
         return original
-    source = original.replace("\r\n", "\n")
+    source = original
     commands, body_start = _scan_lean_header(source)
     existing = set()
     for command in commands:

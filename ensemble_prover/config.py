@@ -237,37 +237,15 @@ def _normalize_import_stmt(text: str) -> str:
 
 
 def _append_imports_to_preamble(preamble: str, extra_imports: Sequence[str]) -> str:
-    base_lines = [
-        line.rstrip() for line in str(preamble or "").splitlines() if line.strip()
-    ]
-    import_indexes = [
-        index
-        for index, line in enumerate(base_lines)
-        if re.match(r"\s*(?:public\s+)?import\s+", line)
-    ]
-    seen = {base_lines[index].strip() for index in import_indexes}
-    additions: List[str] = []
-    for extra in extra_imports:
-        stmt = _normalize_import_stmt(extra)
-        if stmt and stmt not in seen:
-            additions.append(stmt)
-            seen.add(stmt)
-    if not additions:
-        return "\n".join(base_lines) if base_lines else ""
-    if import_indexes:
-        insert_at = import_indexes[-1] + 1
-    else:
-        header_indexes = [
-            index
-            for index, line in enumerate(base_lines)
-            if line.strip() == "prelude"
-            or line.strip() == "module"
-            or line.lstrip().startswith("module ")
-        ]
-        insert_at = header_indexes[-1] + 1 if header_indexes else 0
-    merged = list(base_lines)
-    merged[insert_at:insert_at] = additions
-    return "\n".join(merged)
+    # Import insertion must preserve literal/name contents and stop at the
+    # actual Lean header. Line-based rewriting changes quoted identifiers and
+    # can mistake a comment or string for an import command.
+    from .theorem_project import merge_imports
+
+    additions = tuple(
+        stmt for extra in extra_imports if (stmt := _normalize_import_stmt(extra))
+    )
+    return merge_imports(str(preamble or ""), additions)
 
 
 _AUTOMATIC_ROLE_MAX_TOKENS = cast(int, object())

@@ -11604,6 +11604,17 @@ async def _try_proof_state_root_tactic_assembly(
                 or (resumed_phase, continuation_result_phase) in {("active", "lift"), ("active", "fallback"), ("lift", "fallback")}
                 or any(value > previous_floors.get(key, 0)
                        for key, value in current_floors.items())
+                or (
+                    type(root_tactic_cache_metadata.get("structural_batch_expanded")) is int
+                    and 2 <= root_tactic_cache_metadata["structural_batch_expanded"] <= 8
+                    and root_node is not None
+                    and _root_tactic_unserved_continuation(
+                        root_node.root_tactic_service_history, saved_continuation,
+                        context_key=context_key, obligation_key=obligation_key,
+                        helper_hashes=helper_hashes, allowance_s=renewal_timeout,
+                        lane_key=phase_lane_keys.get(continuation_result_phase, ""),
+                    )
+                )
             )
             if was_deferred and allow_deferred_retry:
                 # A completed check can advance the cursor or fund a larger

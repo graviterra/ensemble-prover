@@ -12,6 +12,7 @@ import re
 import time
 import unicodedata
 import uuid
+from bisect import bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -1784,10 +1785,71 @@ def _lean_identifier_is_projection_field(text: str, start: int) -> bool:
     return start > 0 and text[start - 1] == "."
 
 
+def _lean_quoted_scope_view(code: str) -> Tuple[str, Dict[str, str], Callable[[int], int]]:
+    if "«" not in code:
+        return code, {}, lambda position: position
+
+    # Layout and tactic separators inside an escaped name are literal content.
+    # Use unique identifier atoms only in this lexical scope view, then restore
+    # names and offsets. The original proof source is never rewritten for Lean.
+    prefix = "ensemble_quoted_scope_"
+    while prefix in code:
+        prefix += "_"
+    aliases: Dict[str, str] = {}
+    original_names: Dict[str, str] = {}
+    parts: List[str] = []
+    replacements: List[Tuple[int, int, int, int]] = []
+    previous = 0
+    rewritten_length = 0
+    for match in re.finditer(r"«[^»]*»", code):
+        name = match.group(0)
+        alias = aliases.get(name)
+        if alias is None:
+            alias = f"{prefix}{len(aliases)}"
+            aliases[name] = alias
+            original_names[alias] = name
+        before = code[previous:match.start()]
+        parts.extend((before, alias))
+        rewritten_length += len(before)
+        replacements.append((rewritten_length, rewritten_length + len(alias), match.start(), match.end()))
+        rewritten_length += len(alias)
+        previous = match.end()
+    if not replacements:
+        return code, {}, lambda position: position
+    parts.append(code[previous:])
+    rewritten = "".join(parts)
+    starts = [item[0] for item in replacements]
+
+    def original_offset(position: int) -> int:
+        index = bisect_right(starts, position) - 1
+        if index < 0:
+            return position
+        start, end, original_start, original_end = replacements[index]
+        if position < end:
+            # No reference token starts inside an escaped identifier. Preserve
+            # the containing atom for the few lexical ranges ending within it.
+            return original_start + min(position - start, original_end - original_start)
+        return original_end + position - end
+
+    return rewritten, original_names, original_offset
+
+
 def _lean_local_binder_ranges_in_proof(src: str) -> Dict[str, List[Tuple[int, int]]]:
-    code = _strip_lean_comments_and_strings(src)
+    code, original_names, original_offset = _lean_quoted_scope_view(
+        _strip_lean_comments_and_strings(src)
+    )
+    restored: Dict[str, List[Tuple[int, int]]] = {}
+    for name, ranges in _lean_local_binder_ranges_in_code(code).items():
+        restored.setdefault(original_names.get(name, name), []).extend(
+            (original_offset(start), original_offset(end)) for start, end in ranges
+        )
+    return restored
+
+
+def _lean_local_binder_ranges_in_code(code: str) -> Dict[str, List[Tuple[int, int]]]:
     ranges: Dict[str, List[Tuple[int, int]]] = {}
-    lines = code.splitlines(keepends=True)
+    lines = code.split("\n")
+    lines = [line + "\n" for line in lines[:-1]] + ([lines[-1]] if lines[-1] else [])
     line_starts: List[int] = []
     offset = 0
     for line in lines:
@@ -2875,16 +2937,22 @@ def lean_referenced_helper_names(
     # A component must occur literally somewhere even when a namespace is
     # opened or an identifier atom is quoted. Avoid all scope construction for
     # large targets that cannot mention any candidate declaration.
+    occurrence_text = scan_text.replace("\r\n", "\n") if "\r\n" in scan_text else scan_text
     if not any(
-        component in scan_text
+        component in occurrence_text
         for components in name_components.values()
         for component in components
     ):
         return set()
+    scope_code, original_names, original_offset = _lean_quoted_scope_view(scan_text)
     local_ranges: Dict[Tuple[str, ...], List[Tuple[int, int]]] = {}
-    for local_name, ranges in _lean_local_binder_ranges_in_proof(str(src or "")).items():
-        local_ranges.setdefault(lean_name_components(local_name), []).extend(ranges)
-    lines = scan_text.splitlines(keepends=True)
+    for local_name, ranges in _lean_local_binder_ranges_in_code(scope_code).items():
+        original_name = original_names.get(local_name, local_name)
+        local_ranges.setdefault(lean_name_components(original_name), []).extend(
+            (original_offset(start), original_offset(end)) for start, end in ranges
+        )
+    lines = scope_code.split("\n")
+    lines = [line + "\n" for line in lines[:-1]] + ([lines[-1]] if lines[-1] else [])
     line_starts: List[int] = []
     offset = 0
     for line in lines:
@@ -2898,29 +2966,63 @@ def lean_referenced_helper_names(
                 continue
             if _line_indent(next_line) <= scope_indent:
                 return line_starts[next_index]
-        return len(scan_text)
+        return len(scope_code)
 
     open_namespace_ranges: List[Tuple[Tuple[str, ...], int, int]] = []
+    open_pattern = re.compile(r"(?<![A-Za-z0-9_'.])open\s+(.+?)\s+in\b")
+    open_positions = {
+        line_starts[line_index] + match.start()
+        for line_index, line in enumerate(lines)
+        for match in open_pattern.finditer(line)
+    }
+    open_group_ends: Dict[int, int] = {}
+    if open_positions:
+        groups: List[List[int]] = []
+        cursor = 0
+        while cursor < len(scope_code):
+            skipped = _lean_lexical_skip_end(scope_code, cursor)
+            if skipped is not None:
+                cursor = skipped
+                continue
+            char = scope_code[cursor]
+            if char in "([{⦃⟨":
+                groups.append([])
+            elif char in ")]}⦄⟩":
+                if groups:
+                    for position in groups.pop():
+                        open_group_ends[position] = cursor
+            elif cursor in open_positions and groups:
+                groups[-1].append(cursor)
+            cursor += 1
     for line_index, line in enumerate(lines):
-        for open_match in re.finditer(
-            r"(?<![A-Za-z0-9_'.])open\s+(.+?)\s+in\b",
-            line,
-        ):
+        for open_match in open_pattern.finditer(line):
+            # Scoped openings enable notation/instances, not unqualified
+            # declaration lookup. Quoted «scoped» is a normal namespace atom
+            # in this view and must retain its ordinary opening behavior.
+            if open_match.group(1).split(maxsplit=1)[0] == "scoped":
+                continue
             tail = line[open_match.end() :].strip()
             end = (
                 line_starts[line_index] + len(line)
                 if tail
                 else scoped_line_end(line_index, max(-1, _line_indent(line) - 1))
             )
+            end = min(end, open_group_ends.get(
+                line_starts[line_index] + open_match.start(), len(scope_code),
+            ))
             for namespace in re.findall(
                 _LEAN_QUALIFIED_NAME_PATTERN,
                 open_match.group(1),
             ):
                 open_namespace_ranges.append(
                     (
-                        lean_name_components(namespace),
-                        line_starts[line_index] + open_match.end(),
-                        end,
+                        tuple(
+                            lean_name_components(original_names[part])[0]
+                            if part in original_names else part
+                            for part in lean_name_components(namespace)
+                        ),
+                        original_offset(line_starts[line_index] + open_match.end()),
+                        original_offset(end),
                     )
                 )
 

@@ -1503,13 +1503,25 @@ When context_reaudit_required is true, re-audit the current target and hypothese
 before executing the carried assignment. Prior-context arguments are advisory
 history, not current evidence or proof authority; inspect context_transfer.
 An assigned research_reorientation reviewer must independently inspect the
-checkpoint and conclude with:
-{"action":"research_reorientation","rationale":"what failed and why",
+immutable assigned_research_subject, and conclude with its exact subject_id.
+An acknowledgement is not evidence of comprehension. Use inspection_status:"incomplete"
+to continue reading within the existing allocation, or "claimed_complete" when ready.
+Conclude with:
+{"action":"research_reorientation","subject_id":"assigned subject_id","rationale":"what failed and why",
+ "substantive_progress":false,
  "next_question":"specific next mathematical task",
  "first_uncertain_inference":"exact bottleneck",
  "discriminating_check":"calculation, derivation, or source check to execute",
  "avoid":"unsupported assumptions and exhausted routes to avoid"}.
 This action allocates a new investigation; it cannot establish truth or falsity.
+For an assigned subject with origin native_evidence_intake, additionally provide
+investigation_warranted:true or false. False concludes without a successor; true
+requires a specific changed investigation justified by the exact supplied evidence
+or speculative proposal. Keep substantive_progress:false on this intake path.
+Checked local statements retain all premises and their recorded environment;
+currently_renderable:false means dependencies prevent current proof replay.
+Such statements may guide investigation but require independent checking before
+use in a proof. Intake cannot mint progress credit or reset exhausted allowances.
 When the check distinguishes competing approaches, optionally include
 "competing_approach_ids": ["approach-id", "other-approach-id"] from the frontier
 portfolio. Explain how the possible outcomes separate those approaches in the
@@ -1524,7 +1536,10 @@ new conclusion","new_inference":"what the argument adds to the baseline and
 earlier reports","kind":"derivation|formalization|source_verification|obstruction",
 "assumptions":[],"baseline_artifact_ids":[],"prior_report_artifact_ids":[]}.
 Inspect the cumulative_research_comparison packet and explicitly compare every
-listed baseline and prior report. Omit progress credit when novelty is uncertain.
+listed baseline and prior report. Use substantive_progress:false when novelty is
+uncertain; this records no established progress, not failure or futility. A
+concrete reviewed successor may continue under campaign authorization without
+earning progress credit.
 Use inspected source content, precise quantifiers and useful prior work. Do not
 request another generic summary or repeat a prior assignment under a new name.
 
@@ -1704,13 +1719,25 @@ When context_reaudit_required is true, re-audit the current target and hypothese
 before executing the carried assignment. Prior-context arguments are advisory
 history, not current evidence or proof authority; inspect context_transfer.
 An assigned research_reorientation reviewer must independently inspect the
-checkpoint and conclude with:
-{"action":"research_reorientation","rationale":"what failed and why",
+immutable assigned_research_subject, and conclude with its exact subject_id.
+An acknowledgement is not evidence of comprehension. Use inspection_status:"incomplete"
+to continue reading within the existing allocation, or "claimed_complete" when ready.
+Conclude with:
+{"action":"research_reorientation","subject_id":"assigned subject_id","rationale":"what failed and why",
+ "substantive_progress":false,
  "next_question":"specific next mathematical task",
  "first_uncertain_inference":"exact bottleneck",
  "discriminating_check":"calculation, derivation, or source check to execute",
  "avoid":"unsupported assumptions and exhausted routes to avoid"}.
 This action allocates a new investigation; it cannot establish truth or falsity.
+For an assigned subject with origin native_evidence_intake, additionally provide
+investigation_warranted:true or false. False concludes without a successor; true
+requires a specific changed investigation justified by the exact supplied evidence
+or speculative proposal. Keep substantive_progress:false on this intake path.
+Checked local statements retain all premises and their recorded environment;
+currently_renderable:false means dependencies prevent current proof replay.
+Such statements may guide investigation but require independent checking before
+use in a proof. Intake cannot mint progress credit or reset exhausted allowances.
 When the check distinguishes competing approaches, optionally include
 "competing_approach_ids": ["approach-id", "other-approach-id"] from the frontier
 portfolio. Explain how the possible outcomes separate those approaches in the
@@ -1725,7 +1752,10 @@ new conclusion","new_inference":"what the argument adds to the baseline and
 earlier reports","kind":"derivation|formalization|source_verification|obstruction",
 "assumptions":[],"baseline_artifact_ids":[],"prior_report_artifact_ids":[]}.
 Inspect the cumulative_research_comparison packet and explicitly compare every
-listed baseline and prior report. Omit progress credit when novelty is uncertain.
+listed baseline and prior report. Use substantive_progress:false when novelty is
+uncertain; this records no established progress, not failure or futility. A
+concrete reviewed successor may continue under campaign authorization without
+earning progress credit.
 Use inspected source content, precise quantifiers and useful prior work. Do not
 request another generic summary or repeat a prior assignment under a new name.
 
@@ -4779,6 +4809,123 @@ Complete native research tool descriptions and parameter schemas.
       "parameters": {
         "type": "object",
         "properties": {
+          "investigation_change": {
+            "type": "object",
+            "properties": {
+              "mechanism": {
+                "type": "string"
+              },
+              "first_uncertain_inference": {
+                "type": "string"
+              },
+              "discriminating_check": {
+                "type": "string"
+              },
+              "relation_to_root": {
+                "type": "string"
+              },
+              "difference": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mechanism",
+              "first_uncertain_inference",
+              "discriminating_check",
+              "relation_to_root",
+              "difference"
+            ],
+            "additionalProperties": false
+          },
+          "contract": {
+            "type": "object",
+            "properties": {
+              "statement": {
+                "type": "string"
+              },
+              "domain": {
+                "type": "string"
+              },
+              "hypotheses": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "quantifiers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "statement",
+              "domain"
+            ],
+            "additionalProperties": false
+          },
+          "cited_helpers": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "source_hash": {
+                  "type": "string"
+                },
+                "contract_identity": {
+                  "type": "string"
+                },
+                "environment_hash": {
+                  "type": "string"
+                },
+                "instantiation": {
+                  "type": "string"
+                },
+                "claimed_premise": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "source_hash"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "relation_to_root": {
+            "type": "string",
+            "enum": [
+              "equivalent",
+              "sufficient",
+              "necessary",
+              "diagnostic",
+              "unknown"
+            ]
+          },
+          "route_id": {
+            "type": "string"
+          },
+          "obligation_id": {
+            "type": "string"
+          },
+          "question_revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "quantitative_budget": {
+            "type": "string"
+          },
+          "parameter_dependencies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "statement": {
             "type": "string"
           },
@@ -4804,7 +4951,7 @@ Complete native research tool descriptions and parameter schemas.
     "type": "function",
     "function": {
       "name": "read_native_research_artifact",
-      "description": "Read exact pages of archived research arguments or sources. Omit artifact_id for the complete current advice envelope, including argument and handoff links. If advice is not yet available for the active target and context, returns not_available_yet; reading does not start research.",
+      "description": "Read exact pages of archived research arguments or sources. Offset is a nonnegative integer character index (default 0); length is an integer from 1 to 12000 characters (default 6000). Follow next_offset until null to read the complete selected text. Omit artifact_id for the complete current advice envelope, including argument and handoff links. If advice is not yet available for the active target and context, returns not_available_yet; reading does not start research.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -4812,10 +4959,15 @@ Complete native research tool descriptions and parameter schemas.
             "type": "string"
           },
           "offset": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 0,
+            "default": 0
           },
           "length": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 12000,
+            "default": 6000
           },
           "path": {
             "type": "array",
@@ -4978,4 +5130,13 @@ Source: [ensemble_prover/mini_session/actions/conversation_turn.py](../ensemble_
 
 ```text
 This is the final response for this bounded root closure. Use the completed inspection results or Lean feedback to submit one complete Lean proof body. Further tool calls are unavailable in this response.
+```
+
+
+## Paused research evidence intake assignment
+
+Source: [native_intake.py](../ensemble_prover/research_claims/native_intake.py), `enqueue`. The exact evidence packet is separately attached as a paged artifact.
+
+```text
+Independently inspect this exact native evidence intake. Checked local declarations retain their stated premises; their relevance to the root is unreviewed. Proposed investigations are speculative. Read the assigned artifact as needed. Conclude with research_reorientation and investigation_warranted:true only if one concrete changed investigation is justified; otherwise use false. Supply a specific next_question, first_uncertain_inference and discriminating_check. Never claim progress credit from this intake.
 ```

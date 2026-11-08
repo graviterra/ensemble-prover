@@ -394,6 +394,55 @@ def commit_renewal(
     return validate_service_history(checked)
 
 
+def expand_admitted_structural_batch(
+    state: Mapping[str, Any], candidate: Any, *, lane_key: str,
+    helper_hashes: Sequence[str],
+) -> dict[str, Any]:
+    """Transfer an existing aggregate opportunity to its exact alternatives.
+
+    No provider or elapsed allowance is added. The aggregate remains in the
+    service history and seen set; its members retain any prior resource waits.
+    Callers still record the completed aggregate attempt normally.
+    """
+    from .mini_tactic_closer import _structural_batch_members
+
+    checked = validate_service_history(state)
+    lane = checked.get("renewal_lanes", {}).get(lane_key)
+    if lane is None or lane["helper_hashes"] != list(helper_hashes):
+        return {}
+    original = next((item for item in lane["deferred"]
+                     if item["proof"] == candidate.proof), None)
+    if (original is None or _proof_key(candidate.proof) not in lane["admitted"]
+            or any(original[field] != getattr(candidate, field)
+                   for field in ("source", "tactic", "helper"))):
+        return {}
+    members = _structural_batch_members(candidate)
+    if not 2 <= len(members) <= 8:
+        return {}
+    records = [{field: getattr(member, field)
+                for field in ("proof", "tactic", "source", "helper")}
+               for member in members]
+    member_proofs = {item["proof"] for item in records}
+    if len(member_proofs) != len(records):
+        return {}
+    pending = []
+    for item in lane["deferred"]:
+        if item["proof"] == candidate.proof:
+            pending.extend(records)
+        elif item["proof"] not in member_proofs:
+            pending.append(item)
+    original_key = _proof_key(candidate.proof)
+    member_keys = [_proof_key(member.proof) for member in members]
+    lane["deferred"] = pending
+    lane["admitted"] = list(dict.fromkeys(
+        [key for key in lane["admitted"] if key != original_key] + member_keys
+    ))
+    lane["resource_wait"] = [key for key in lane["resource_wait"] if key != original_key]
+    lane["seen"] = list(dict.fromkeys([*lane["seen"], *member_keys]))
+    validated = validate_service_history(checked)
+    return {lane_key: validated["renewal_lanes"][lane_key]} if validated else {}
+
+
 def retain_acceptance_retry(
     state: Mapping[str, Any],
     candidate: Any,

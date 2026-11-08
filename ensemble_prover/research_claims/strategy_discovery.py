@@ -338,6 +338,34 @@ class StrategyIntegration:
             )
         return True
 
+    def record_research_completion(self, job: dict[str, Any], report: dict[str, Any]) -> str:
+        """Bind a completed investigation to its original provider assignment.
+
+        Both structured reports and free-form conclusions are advisory evidence.
+        Only their independently reviewed, still-current assignment can authorize
+        a successor; completing a job does not establish mathematical progress.
+        """
+        aid = self.store.put_artifact(json_text(report).encode(), name="complete-investigation.json")
+        run = self.store.run_record()
+        run["research_report_sequence"] = run.get("research_report_sequence", 0) + 1
+        job["research_report_sequence"] = run["research_report_sequence"]
+        self.store.save_run(run)
+        # A reactivated producer must never carry an earlier response's basis
+        # onto its new conclusion when the new attempt cannot be authenticated.
+        job.pop("frontier_report_basis", None)
+        state = self.controller.snapshot()
+        if self.controller._frontier_mode(state) == "adaptive":
+            from copy import deepcopy
+
+            attempt = state["attempts"].get(job.get("frontier_response_attempt_id", ""), {})
+            if attempt.get("consumer_id") == job["job_id"] and job.get("response") in attempt.get("artifacts", []):
+                job["frontier_report_basis"] = {
+                    "attempt_id": attempt["attempt_id"], "binding": deepcopy(attempt.get("frontier_binding", {})),
+                    "response_artifact": job["response"], "report_artifact": aid,
+                }
+        job["investigation_artifact"] = aid
+        return aid
+
     def apply_action(
         self, job: dict[str, Any], action: dict[str, Any]
     ) -> dict[str, Any]:
@@ -385,25 +413,8 @@ class StrategyIntegration:
             for aid in action["evidence_artifact_ids"]:
                 self.store.read_artifact(aid)
             report["evidence_artifact_ids"] = action["evidence_artifact_ids"]
-            aid = self.store.put_artifact(
-                json_text(report).encode(),
-                name="complete-investigation.json",
-            )
             with self.store.atomic() if not self.store._applying else nullcontext():
-                run = self.store.run_record()
-                run["research_report_sequence"] = run.get("research_report_sequence", 0) + 1
-                job["research_report_sequence"] = run["research_report_sequence"]
-                self.store.save_run(run)
-                state = self.controller.snapshot()
-                if self.controller._frontier_mode(state) == "adaptive":
-                    from copy import deepcopy
-
-                    attempt = state["attempts"].get(job.get("frontier_response_attempt_id", ""), {})
-                    if attempt.get("consumer_id") == job["job_id"] and job.get("response") in attempt.get("artifacts", []):
-                        job["frontier_report_basis"] = {
-                            "attempt_id": attempt["attempt_id"], "binding": deepcopy(attempt.get("frontier_binding", {})),
-                            "response_artifact": job["response"], "report_artifact": aid,
-                        }
+                aid = self.record_research_completion(job, report)
                 if not job.get("alternative_for"):
                     job.update(status="finished", investigation_artifact=aid)
                     self.store.save_job(job)

@@ -11,7 +11,8 @@ from .math_utils import _LEAN_ID_FIRST_CHARS, _LEAN_ID_REST_CHARS
 LEAN_PLAIN_NAME_PATTERN = (
     rf"(?:[^\W\d]|[{_LEAN_ID_FIRST_CHARS}])[\w{_LEAN_ID_REST_CHARS}]*"
 )
-LEAN_NAME_COMPONENT_PATTERN = rf"(?:«[^»\r\n]+»|{LEAN_PLAIN_NAME_PATTERN})"
+# Escaped identifiers may contain line breaks; only » terminates the component.
+LEAN_NAME_COMPONENT_PATTERN = rf"(?:«[^»]+»|{LEAN_PLAIN_NAME_PATTERN})"
 LEAN_QUALIFIED_NAME_PATTERN = (
     rf"{LEAN_NAME_COMPONENT_PATTERN}(?:\.{LEAN_NAME_COMPONENT_PATTERN})*"
 )
@@ -23,8 +24,10 @@ def lean_name_components(name: str) -> tuple[str, ...]:
     """Compare quoted aliases without treating quoted dots as separators."""
     if _QUALIFIED_RE.fullmatch(name) is None:
         return ()
+    # Lean's escaped-identifier parser normalizes CRLF, but not a lone CR or
+    # Unicode line separators. Keep that distinction in semantic name keys.
     return tuple(
-        part[1:-1] if part.startswith("«") else part
+        part[1:-1].replace("\r\n", "\n") if part.startswith("«") else part
         for part in _COMPONENT_RE.findall(name)
     )
 

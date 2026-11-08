@@ -40574,6 +40574,15 @@ def _root_tactic_failure_completed_for_budget(result: Any) -> bool:
     if (
         cache_metadata.get("root_tactic_contract_transient") is True
         or cache_metadata.get("root_equivalent_preflight_contract_transient") is True
+        or cache_metadata.get("root_equivalent_helper_preflight_transient") is True
+    ):
+        return False
+    if (
+        (cache_metadata.get("direct_root_tactic_transient_failure") is True
+         or cache_metadata.get("structural_batch_expanded"))
+        and 0 <= int(getattr(result, "next_candidate_index", -1))
+        < len(getattr(result, "candidate_portfolio", ()) or ())
+        and is_transient_tactic_close_failure(result)
     ):
         return False
     attempts = [

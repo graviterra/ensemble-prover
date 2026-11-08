@@ -30,6 +30,29 @@ its premise is unresolved. Using it still requires discharging that premise.
 The number of available lemmas does not establish that the original conjecture
 has been proved.
 
+## New evidence while research is paused
+
+A paused investigation can receive an independent review of newly committed,
+locally checked declarations. The review sees exact statements, open premises,
+recorded verification context, and dependency blockers through a paged artifact.
+A declaration checked in its recorded environment may still be unavailable for
+current proof replay. Its possible relevance remains a research question.
+
+Proof workers can also use `request_native_research` with an optional
+`investigation_change` object containing `mechanism`, `first_uncertain_inference`,
+`discriminating_check`, `relation_to_root`, and `difference`. This preserves a
+concrete speculative proposal even when no new lemma has been checked.
+
+The assigned reviewer explicitly decides `investigation_warranted`. Approval
+permits one concrete successor or a distinct approach under the existing campaign
+and proof budget. Declining creates no successor. Neither outcome establishes
+mathematical progress, and approval does not reset the prior inconclusive count.
+Exact target, proof lane, question, route, evidence, and review authorization must
+remain current; paid replies wait for their original lane after interruption.
+Repeated prose objections alone are retained without funding empty research rounds.
+These admission rules apply to adaptive research; off and observation modes retain
+their configured behavior.
+
 ## Keeping arguments through formalization
 
 Before proof histories are compacted or retired, the reasoning notebook retains

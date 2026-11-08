@@ -1632,12 +1632,27 @@ def ensure_adaptive_work(integration: Any) -> bool:
             elif not paused and approach.get("blocked_reason") == "operational_recovery_required":
                 request_readmission(campaign, approach_id, now=now)
         fill_resident_slots(campaign, now=now)
+        def native_review_ready(job: dict[str, Any]) -> bool:
+            if not job.get("native_intake_id"):
+                return True
+            import json
+            from ..native_intake import scope
+            validator = getattr(getattr(integration, "research", None), "native_intake_validator", None)
+            packet = json.loads(store.read_artifact(job["native_intake_artifact"]))
+            approach = campaign["approaches"].get(packet["binding"]["approach_id"])
+            authorization = campaign["review_authorizations"].get(job.get("frontier_review_authorization", ""), {})
+            return (callable(validator) and validator(packet) is True and approach is not None
+                    and scope(campaign, approach) == packet["binding"]
+                    and authorization.get("status") == "open"
+                    and authorization.get("evidence_basis") == job["native_intake_artifact"])
         reviewer = next((
             job for job in jobs
             if job["role"] == "review" and job["status"] == "waiting"
             and job.get("last_error") in {
                 "research_control_deferred", "research_review_paused_operational", "research_review_lane_paused",
+                "native_intake_lane_unavailable",
             }
+            and native_review_ready(job)
             and not (campaign["retries"].get(job.get("frontier_operation_lineage") or "") or {}).get("paused")
             and (job.get("frontier_review_admitted") or can_admit_review(campaign))
         ), None)

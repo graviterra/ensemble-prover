@@ -303,6 +303,34 @@ def is_transient_tactic_close_failure(result: Any) -> bool:
     except (TypeError, ValueError):
         candidate_count = 0
     exit_reason = str(getattr(result, "exit_reason", "") or "").strip().lower()
+    metadata = getattr(result, "cache_metadata", None)
+    if isinstance(metadata, Mapping) and "direct_root_tactic_transient_failure" in metadata:
+        try:
+            cursor = int(getattr(result, "next_candidate_index", -1))
+            pending = len(getattr(result, "candidate_portfolio", ()) or ())
+        except (TypeError, ValueError):
+            cursor, pending = -1, 0
+        # Root preflight receipts prepend attempts and combine exit reasons.
+        # Their counts cannot consume the direct phase's unfinished suffix.
+        if metadata["direct_root_tactic_transient_failure"] is True and 0 <= cursor < pending:
+            return True
+        if (metadata["direct_root_tactic_transient_failure"] is False
+                and metadata.get("structural_batch_expanded") and cursor >= pending):
+            # A consumed aggregate infrastructure error cannot revive an
+            # exhausted direct phase. The preliminary phase may still have
+            # its own retryable failure, independently of that direct phase.
+            return metadata.get("root_equivalent_helper_preflight_transient") is True
+    if isinstance(metadata, Mapping) and metadata.get("structural_batch_expanded"):
+        try:
+            cursor = int(getattr(result, "next_candidate_index", candidate_count))
+        except (TypeError, ValueError):
+            cursor = candidate_count
+        # The recorded aggregate is not an attempt of an expanded member.
+        # Its count cannot exhaust a newly returned one-member suffix.
+        if exit_reason == "timeout" and 0 <= cursor < candidate_count:
+            return True
+        if exit_reason == "exhausted" and cursor >= candidate_count:
+            return False
     if exit_reason == "timeout" and (candidate_count <= 0 or len(attempts) < candidate_count):
         return True
     if any(
@@ -1254,6 +1282,85 @@ def _helper_lemma_blocks(
     return blocks
 
 
+def _candidate_can_be_reindented(candidate: TacticCandidate) -> bool:
+    """Keep literal contents intact when nesting a generated tactic branch.
+
+    Escaped identifiers end at the first closing guillemet. Newlines within
+    those names are literal content, so adding indentation changes identity.
+    Generated application scripts need no string literals; leave any script
+    containing quotes standalone rather than rewrite a possible literal.
+    """
+    return ('"' not in candidate.proof
+            and re.search(r"«[^»]*\n", candidate.proof) is None)
+
+
+def _bare_structural_candidate(candidate: TacticCandidate) -> bool:
+    """Recognize generated outer constructor forms, never introduced goals."""
+    source = candidate.source.removesuffix("_batch")
+    if source not in {
+        "helper_structural_pair", "helper_structural_triple", "helper_structural_or",
+        "helper_stitch_constructor", "residual_split",
+    }:
+        return False
+    lines = candidate.proof.split("\n")
+    if not lines or lines[0] != "by":
+        return False
+    if candidate.source.endswith("_batch"):
+        commands = []
+        for position, line in enumerate(lines):
+            if not line.startswith("    | "):
+                continue
+            command = line.removeprefix("    | ")
+            if command == "classical":
+                following = lines[position + 1:position + 2]
+                if not following or not following[0].startswith("      "):
+                    return False
+                command = following[0].strip()
+            commands.append(command)
+        if (lines[1:2] != ["  first"] or not commands
+                or len(commands) != lines.count("  | solve")):
+            return False
+    else:
+        commands = [line.strip() for line in lines[1:] if line.strip()]
+        if commands[:1] == ["classical"]:
+            commands = commands[1:]
+        commands = commands[:1]
+    return bool(commands) and all(
+        command.startswith(("exact ⟨", "exact Or.inl ", "exact Or.inr "))
+        or command in {"constructor", "left", "right"}
+        or command.startswith("constructor <;>")
+        for command in commands
+    )
+
+
+def _structural_batch_members(candidate: TacticCandidate) -> tuple[TacticCandidate, ...]:
+    """Recover generated alternatives when a shared check lacked resources."""
+    if (not candidate.source.endswith("_batch") or not _bare_structural_candidate(candidate)
+            or not _candidate_can_be_reindented(candidate)):
+        return ()
+    branches: list[list[str]] = []
+    for line in candidate.proof.split("\n")[2:]:
+        if line == "  | solve":
+            branches.append([])
+        elif not branches:
+            return ()
+        elif not branches[-1]:
+            if not line.startswith("    | "):
+                return ()
+            branches[-1].append("  " + line.removeprefix("    | "))
+        elif line.startswith("    "):
+            branches[-1].append(line[4:])
+        else:
+            return ()
+    if not branches or any(not branch for branch in branches):
+        return ()
+    return tuple(TacticCandidate(
+        proof="by\n" + "\n".join(branch),
+        tactic="; ".join(line.strip() for line in branch),
+        source=candidate.source.removesuffix("_batch"), helper=candidate.helper,
+    ) for branch in branches)
+
+
 def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[TacticCandidate]:
     """Amortize Lean startup for adjacent, closing-only preflight alternatives.
 
@@ -1269,6 +1376,7 @@ def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[Ta
     }
     output: list[TacticCandidate] = []
     pending: list[TacticCandidate] = []
+    pending_source = "helper_application_batch"
 
     def flush() -> None:
         if len(pending) == 1:
@@ -1276,7 +1384,7 @@ def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[Ta
         elif pending:
             lines = ["by", "  first"]
             for candidate in pending:
-                body = candidate.proof.removeprefix("by\n").splitlines()
+                body = candidate.proof.removeprefix("by\n").split("\n")
                 lines.extend(("  | solve", "    | " + body[0].removeprefix("  ")))
                 lines.extend("    " + line for line in body[1:])
             output.append(TacticCandidate(
@@ -1284,7 +1392,7 @@ def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[Ta
                 tactic="first (closing helper alternatives): " + " | ".join(
                     candidate.tactic for candidate in pending
                 ),
-                source="helper_application_batch",
+                source=pending_source,
                 helper=",".join(dict.fromkeys(
                     candidate.helper for candidate in pending if candidate.helper
                 )),
@@ -1296,9 +1404,17 @@ def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[Ta
             candidate.source == "intro_coercion"
             and candidate.proof == _proof_from_lines(("intros", "omega"))
         )
-        if (
-            candidate.source in direct_sources or quick_intro
-        ) and candidate.proof.startswith("by\n  "):
+        batch_source = (
+            "helper_application_batch" if candidate.source in direct_sources or quick_intro
+            else candidate.source + "_batch" if candidate.source in {
+                "helper_structural_pair", "helper_structural_or", "helper_structural_triple",
+            } and _bare_structural_candidate(candidate) else ""
+        )
+        if (batch_source and candidate.proof.startswith("by\n  ")
+                and _candidate_can_be_reindented(candidate)):
+            if pending and batch_source != pending_source:
+                flush()
+            pending_source = batch_source
             pending.append(candidate)
             if len(pending) >= 8:
                 flush()
@@ -2452,6 +2568,7 @@ class DeterministicTacticBackend:
                 candidates = candidates[: int(max_candidates)]
         pattern_key = ""
         failed_proofs: set[str] = set()
+        successful_candidate_proofs: set[str] = set()
         cache_metadata: dict[str, Any] = {
             "enabled": bool(self.pattern_cache is not None),
             "scope": (
@@ -2472,6 +2589,7 @@ class DeterministicTacticBackend:
             "successes_deferred": 0,
             "acceptance_vetoes": 0,
             "suppressed_filtered": 0,
+            "outer_pi_skipped": 0,
         }
 
         def add_cache_stats(stats: Mapping[str, Any]) -> None:
@@ -2495,6 +2613,9 @@ class DeterministicTacticBackend:
                 opaque_mode=opaque_mode,
                 allow_official_answer_visibility=allow_official_answer_visibility,
             )
+            preferred = self.pattern_cache.preferred_candidate(pattern_key)
+            if preferred is not None:
+                successful_candidate_proofs.add(preferred.proof)
         if self.pattern_cache is not None and not reused_portfolio:
             pattern_key = self.pattern_cache.key_for(
                 goal_statement,
@@ -2522,6 +2643,7 @@ class DeterministicTacticBackend:
             promoted: list[TacticCandidate] = []
             if preferred is not None and preferred.proof in candidate_by_proof:
                 promoted.append(candidate_by_proof[preferred.proof])
+                successful_candidate_proofs.add(preferred.proof)
                 cache_metadata["exact_success_hits"] = 1
             elif preferred is not None:
                 cache_metadata["cap_preserved_misses"] = 1
@@ -2538,6 +2660,7 @@ class DeterministicTacticBackend:
                 if any(item.proof == shape_candidate.proof for item in promoted):
                     continue
                 promoted.append(candidate_by_proof[shape_candidate.proof])
+                successful_candidate_proofs.add(shape_candidate.proof)
                 cache_metadata["shape_success_hits"] = int(
                     cache_metadata.get("shape_success_hits", 0) or 0
                 ) + 1
@@ -2640,19 +2763,28 @@ class DeterministicTacticBackend:
             allow_official_answer_visibility=allow_official_answer_visibility,
             official_answer_payload_present=official_answer_payload_present,
         )
+        outer_pi_observer = getattr(lean, "observed_statement_outer_pi", None)
+        plain_structural_context = False
+        if callable(outer_pi_observer) and not inspect.iscoroutinefunction(outer_pi_observer):
+            from .verified_helper_contract import helper_contract_context_is_plain
+
+            # A custom tactic elaborator could redefine even `constructor`.
+            # Unknown syntax contexts retain ordinary Lean checking/batching.
+            plain_structural_context = helper_contract_context_is_plain(
+                lean, preamble=preamble, context=lemma_blocks,
+            )
         attempts: list[TacticAttempt] = []
         soft_slice = float(service_slice_s or 0.0)
         if not math.isfinite(soft_slice) or soft_slice < 0:
             raise ValueError("service slice must be finite and nonnegative")
         attempt_limit = max(0, int(candidate_attempt_limit or 0))
-        candidate_stop = (
-            min(len(candidates), candidate_start + attempt_limit)
-            if attempt_limit > 0
-            else len(candidates)
-        )
+        candidate_stop = len(candidates)
         # A one-candidate scheduler quantum must not divide its available
         # check budget by the size of a portfolio it will not execute.
-        funded_candidate_count = max(1, candidate_stop - candidate_start)
+        funded_candidate_count = max(1, min(
+            candidate_stop - candidate_start,
+            attempt_limit or len(candidates),
+        ))
         timing_key = self._timing_cache.key_for(
             goal_statement, preamble, helpers, pattern_context=pattern_context,
             suppress_solution_placeholders=suppress_solution_placeholders,
@@ -2702,6 +2834,24 @@ class DeterministicTacticBackend:
                 cache_metadata["service_slice_s"] = soft_slice
                 break
             candidate = candidates[index]
+            if (plain_structural_context and _bare_structural_candidate(candidate)
+                    and candidate.proof not in successful_candidate_proofs
+                    and not (candidate_reference_confirmation_pending and index == candidate_start)):
+                # Recheck the live receipt for each candidate: an intervening
+                # check may have recycled or changed the Lean environment.
+                # Keep persisted indices and spend no check allowance for a
+                # known-incompatible form. No failure is added to proof caches.
+                try:
+                    outer_pi = outer_pi_observer(
+                        goal_statement, preamble_override=preamble,
+                        lemmas=lemma_blocks, proof_code=candidate.proof,
+                    )
+                except (AttributeError, TypeError, ValueError, RuntimeError, OSError):
+                    outer_pi = None
+                if outer_pi is True:
+                    cache_metadata["outer_pi_skipped"] += 1
+                    index += 1
+                    continue
             remaining = deadline - time.monotonic()
             # Preserve the cursor when a portfolio tail cannot fund the
             # observed backend latency. A fresh call still gets its first
@@ -2864,6 +3014,59 @@ class DeterministicTacticBackend:
             minimum_tail_budget_s = max(
                 minimum_tail_budget_s, observed_timeout_floor_s / 1.25,
             )
+            batch_members = _structural_batch_members(candidate)
+            batch_resource_failure = bool(batch_members) and not attempt.ok and (
+                attempt.error_type in {"timeout", "lean_timeout", "infra_failure", "exception"}
+                or re.search(
+                    r"heartbeats?[^\n]*(?:exceeded|reached)|maximum recursion depth|out of memory",
+                    attempt.diagnostic + "\n" + attempt.output_preview, re.IGNORECASE,
+                ) is not None
+            )
+            if batch_resource_failure and not attempt.pending_reference_confirmation:
+                # A shared budget may expire before a later branch is tried.
+                # Retain every original alternative with its own opportunity,
+                # rather than treating the whole group as a semantic failure.
+                # The completed prefix keeps its indices; the returned vector
+                # and cursor describe the newly expanded unfinished suffix.
+                expanded_members = batch_members
+                cache_metadata["structural_batch_expanded"] = len(batch_members)
+                if isinstance(pattern_context, Mapping):
+                    from .tactic_service_history import (
+                        commit_renewal, expand_admitted_structural_batch,
+                        unserved_admission_available,
+                    )
+
+                    admitted = commit_renewal(
+                        pattern_context.get("portfolio_service_history", {}), cache_metadata,
+                    )
+                    transferred = expand_admitted_structural_batch(
+                        admitted, candidate, lane_key=portfolio_lane_key,
+                        helper_hashes=[text_hash(block) for block in lemma_blocks],
+                    )
+                    if transferred:
+                        cache_metadata["portfolio_renewal_lanes"] = {
+                            **cache_metadata.get("portfolio_renewal_lanes", {}), **transferred,
+                        }
+                        updated = commit_renewal(admitted, cache_metadata)
+                        ready_members = tuple(member for member in batch_members
+                            if unserved_admission_available(
+                                updated, lane_key=portfolio_lane_key,
+                                candidates=[asdict(member)],
+                                helper_hashes=[text_hash(block) for block in lemma_blocks],
+                                allowance_s=maximum_opportunity_s,
+                            ))
+                        # Keep already-served alternatives in durable history
+                        # without letting one block an unserved sibling here.
+                        expanded_members = ready_members
+                candidates = (*candidates[:index], *expanded_members, *candidates[index + 1:])
+                return TacticCloseResult(
+                    ok=False, proof=None, attempts=[asdict(a) for a in attempts],
+                    candidate_count=len(candidates), timeout_s=float(timeout_s),
+                    elapsed_s=round(time.monotonic() - started, 3),
+                    exit_reason="timeout" if index < len(candidates) else "exhausted",
+                    cache_metadata=dict(cache_metadata),
+                    candidate_portfolio=tuple(candidates), next_candidate_index=index,
+                )
             if self.pattern_cache is not None and not attempt.pending_reference_confirmation:
                 add_cache_stats(
                     self.pattern_cache.record_attempt(

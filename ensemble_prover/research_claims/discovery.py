@@ -490,7 +490,7 @@ class DiscoveryLoop:
             self._retiring_closures.pop(identity, None)
 
     def _context(self, job: dict[str, Any]) -> dict[str, Any]:
-        if job.get("research_reorientation_for"):
+        if job.get("research_reorientation_for") or job.get("native_intake_id"):
             from .research_subject import ensure_subject
             ensure_subject(self.store, job)
         with self.store.read_snapshot():
@@ -583,7 +583,8 @@ class DiscoveryLoop:
                 }
                 context.update(self.strategy.context(job))
                 context.update(self.strategy.research.context(job))
-            if job["role"] == "review" and not job.get("strategy_review_id") and not job.get("research_reorientation_for"):
+            if (job["role"] == "review" and not job.get("strategy_review_id")
+                    and not job.get("research_reorientation_for") and not job.get("native_intake_id")):
                 evidence = next(
                     item
                     for item in self.store.history(job["claim_id"])["evidence"]
@@ -686,6 +687,9 @@ class DiscoveryLoop:
                     notifications = context.pop("prior_context_notifications", None)
                     retained = ({"prior_context_notifications": notifications}
                                 if notifications is not None else {})
+                    handoff = context.pop("native_intake_handoff", None)
+                    if handoff is not None:
+                        retained["native_intake_handoff"] = handoff
                     retained_size = len(json_text(retained)) - 1 if retained else 0
                     context = window(self.store, context, limit=limit - memory_size - retained_size)
                     # Do not archive the durable working memory again: that
@@ -1198,7 +1202,7 @@ class DiscoveryLoop:
             if kind == "formalize"
             else {"path", "offset", "length"} if kind == "read_artifact"
             else {"subject_id", "inspection_status", "substantive_progress", "competing_approach_ids", "progress_delta",
-                  "approach_decision", "approach_mechanism", "approach_difference"}
+                  "approach_decision", "approach_mechanism", "approach_difference", "investigation_warranted"}
             if kind == "research_reorientation"
             else {"mode"} if kind == "propose_diagnostic"
             else {"progress_delta"} if kind == "alternative_review"
@@ -1464,6 +1468,13 @@ class DiscoveryLoop:
                 job["status"] = "waiting"
             self.store.save_job(job)
             return True
+        if job.get("native_intake_id"):
+            validator = getattr(self.strategy.research, "native_intake_validator", None)
+            packet = self._read_json(job["native_intake_artifact"])
+            if not callable(validator) or validator(packet) is None:
+                job["frontier_response_deferred"] = "native_intake_requesting_lane_unavailable"
+                self.store.save_job(job)
+                return True
         if "frontier_response_deferred" in job:
             job.pop("frontier_response_deferred")
             self.store.save_job(job)
@@ -1852,6 +1863,14 @@ class DiscoveryLoop:
             text(action["reason"], "conclusion")
             job["status"] = "finished"
             if self.strategy is not None:
+                if (job["role"] == "research" and self.strategy.controller._frontier_mode(
+                        self.strategy.controller.snapshot()) == "adaptive"):
+                    self.strategy.record_research_completion(job, {
+                        "completion_kind": "finish", "conclusion": action["reason"],
+                        "method": job["question"], "derivation": action["reason"],
+                        "first_uncertain_inference": "", "remaining_gap": "",
+                        "evidence_artifact_ids": [],
+                    })
                 self.strategy.record_finished_alternative(job)
             self._notify(
                 job["parent_job"],

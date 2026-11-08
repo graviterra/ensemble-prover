@@ -39,6 +39,14 @@ Conclude with:
  "discriminating_check":"calculation, derivation, or source check to execute",
  "avoid":"unsupported assumptions and exhausted routes to avoid"}.
 This action allocates a new investigation; it cannot establish truth or falsity.
+For an assigned subject with origin native_evidence_intake, additionally provide
+investigation_warranted:true or false. False concludes without a successor; true
+requires a specific changed investigation justified by the exact supplied evidence
+or speculative proposal. Keep substantive_progress:false on this intake path.
+Checked local statements retain all premises and their recorded environment;
+currently_renderable:false means dependencies prevent current proof replay.
+Such statements may guide investigation but require independent checking before
+use in a proof. Intake cannot mint progress credit or reset exhausted allowances.
 When the check distinguishes competing approaches, optionally include
 "competing_approach_ids": ["approach-id", "other-approach-id"] from the frontier
 portfolio. Explain how the possible outcomes separate those approaches in the
@@ -271,10 +279,18 @@ class ResearchControl:
             "reading_is_not_mathematical_progress": True,
             "directive": job.get("research_directive"),
             "prior_checkpoint_artifact": job.get("research_prior_checkpoint"),
+            **({"native_intake_evidence_artifact": job["native_intake_evidence_artifact"],
+                "native_intake_evidence_authority": "Advisory recorded local checks and proposed relevance; read exact premises and replay blockers before use."}
+               if job.get("native_intake_evidence_artifact") else {}),
             "portfolio_checkpoint_artifacts": job.get("research_portfolio_checkpoints", []),
             **({"context_transfer": job["native_context_transfer"],
                 "context_reaudit_required": True} if job.get("native_context_transfer") else {}),
         }}
+        if job.get("native_intake_handoff_artifact"):
+            result["native_intake_handoff"] = {
+                "evidence_artifact": job["native_intake_evidence_artifact"],
+                "directive_artifact": job["native_intake_handoff_artifact"],
+                "instruction": "Read the exact reviewed directive and relevant evidence before investigating; preserve stated premises and replay blockers. This handoff grants no mathematical authority."}
         from .research_findings import comparison_packet
 
         producer_id = job.get("research_reorientation_for")
@@ -320,7 +336,7 @@ class ResearchControl:
                         },
                         "instruction": "Independently inspect this completed report for substantive NEW evidence advancing its exact assigned inference. Set substantive_progress:true only for an actual new derivation, check or useful source application and provide progress_delta; repeated facts, plans and revised wording do not qualify. Otherwise set substantive_progress:false to record that value remains uncertain. Missing metadata is unknown, not mathematical failure. A concrete reviewed successor may continue within campaign authorization without progress credit. This assessment conveys research relevance, never proof authority.",
                     }
-        if job.get("research_reorientation_for"):
+        if job.get("research_reorientation_for") or job.get("native_intake_id"):
             from .research_subject import subject_view
             result["assigned_research_subject"] = subject_view(self.store, job)
         return result
@@ -328,6 +344,31 @@ class ResearchControl:
     def before_request(self, job: dict[str, Any]) -> bool:
         with self._atomic():
             current = self.store.job(job["job_id"])
+            if current.get("native_intake_id"):
+                import json
+                validator = getattr(self, "native_intake_validator", None)
+                packet = json.loads(self.store.read_artifact(current["native_intake_artifact"]))
+                availability = validator(packet) if callable(validator) else None
+                if availability is True:
+                    from .native_intake import scope
+                    from .frontier.owner import FrontierOwner
+                    campaign = FrontierOwner(self.controller).campaign()
+                    approach = campaign["approaches"].get(packet["binding"]["approach_id"])
+                    authorization = campaign["review_authorizations"].get(current.get("frontier_review_authorization", ""), {})
+                    if (approach is None or scope(campaign, approach) != packet["binding"]
+                            or authorization.get("status") != "open"
+                            or authorization.get("evidence_basis") != current["native_intake_artifact"]
+                            or authorization.get("question_id") != packet["binding"]["question_id"]):
+                        availability = False
+                if availability is not True:
+                    if availability is False:
+                        current.update(status="superseded", native_intake_result={
+                            "status": "stale", "credit_minted": False, "kernel_verified": False})
+                        current.setdefault("research_control", {})["closed"] = True
+                    else:
+                        current.update(status="waiting", last_error="native_intake_lane_unavailable")
+                    self.store.save_job(current)
+                    return False
             state = self.controller.snapshot()
             from .frontier.hooks import bind_research_job, mode_of, prepare_research_claim
 
@@ -829,6 +870,13 @@ class ResearchControl:
                         # A stale review remains useful history, but cannot
                         # prescribe work against a newly approved question.
                         child.update(status="superseded", last_error="stale_frontier_scope")
+                    elif producer.get("research_control", {}).get("reason") == "research_result_submitted":
+                        # Older completed investigations may lack their original
+                        # assignment receipt. Do not reconstruct it from today's
+                        # question or leave an unadmitted successor waiting on
+                        # fairness. Operational retry handoffs retain their own
+                        # separately bounded continuation path below.
+                        child.update(status="superseded", last_error="unbound_research_completion")
         if reviewer.get("frontier_retry_pending") and reviewer.get("frontier_operation_lineage"):
             child["frontier_operation_lineage"] = reviewer["frontier_operation_lineage"]
             child["frontier_retry_pending"] = True
@@ -839,6 +887,9 @@ class ResearchControl:
         return child
 
     def apply_reorientation(self, job: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        if job.get("native_intake_id"):
+            from .native_intake import apply_decision
+            return apply_decision(self, job, action)
         if job["role"] != "review" or not job.get("research_reorientation_for"):
             raise ValueError("only the assigned independent checkpoint reviewer may reorient")
         if job.get("research_control", {}).get("closed"):

@@ -4358,6 +4358,7 @@ class LeanRunner:
             "check_source_declaration_type_equivalence",
             "extract_typed_residual_batch",
             "analyze_statement_contracts",
+            "observed_statement_outer_pi",
             "canonicalize_statement_types",
             "check_statement_type_raw",
             "check_proposition_type_raw",
@@ -4391,6 +4392,9 @@ class LeanRunner:
         self.cfg = cfg
         self._helper_usage_observations: dict[tuple[str, str, str, tuple[str, ...]], HelperUsageObservation] = {}
         self._declaration_usage_observations: dict[tuple, dict[str, HelperUsageObservation]] = {}
+        # Scheduling hints only: private, bounded and tied to this runner's
+        # live environment. No declaration or proof authority is stored here.
+        self._statement_outer_pi_observations: dict[str, Callable[[], bool]] = {}
         self._oracle_max_concurrent = max(1, int(oracle_max_concurrent or 1))
         # Kept only for compatibility with captured pre-indirection runners.
         # New rotations publish through the stable generation ref; teardown
@@ -10412,6 +10416,35 @@ private def {serializer_prefix}_elabType
             attempted=True,
         )
 
+    def observed_statement_outer_pi(
+        self, statement: str, *, preamble_override: str | None = None,
+        lemmas: Sequence[str] = (), proof_code: str = "",
+    ) -> bool | None:
+        """Reuse an existing Lean observation without launching another check.
+
+        Missing, changed or expired contexts remain unknown. In particular this
+        does not classify target spelling or infer that an empty telescope is
+        a particular inductive proposition.
+        """
+        if self._closed or self._quiesced:
+            return None
+        preamble = self._resolve_preamble(preamble_override, proof_code=proof_code)
+        _, scoped_prefix, omit_variables = decode_theorem_target_context(preamble)
+        if scoped_prefix or omit_variables:
+            return None
+        # Match the checker's source ordering, not a re-resolved combined file.
+        context = "\n\n".join(part.strip() for part in (
+            preamble, "\n".join(lemmas),
+        ) if part.strip())
+        key = hash_text(json.dumps([statement.strip(), context], ensure_ascii=False))
+        guard = self._statement_outer_pi_observations.get(key)
+        if guard is None:
+            return None
+        if not guard():
+            self._statement_outer_pi_observations.pop(key, None)
+            return None
+        return True
+
     async def analyze_statement_contracts(
         self,
         statements: Sequence[str],
@@ -10496,6 +10529,15 @@ private def {serializer_prefix}_elabType
             preamble = "\n\n".join(
                 part for part in (preamble, *declaration_context) if part
             )
+        # Only raw expression observations describe the goal before tactics
+        # introduce binders. Existing declarations may have generalized free
+        # variables and therefore must not populate this scheduling cache.
+        outer_pi_guard = None
+        _, scoped_prefix, omit_variables = decode_theorem_target_context(preamble)
+        if not observed_names and not kernel_checked_types and not scoped_prefix and not omit_variables:
+            from .verified_helper_contract import helper_contract_context_guard
+
+            outer_pi_guard = helper_contract_context_guard(self)
         declaration_positions = [(0, 0)] * len(observed_names)
         if observed_sources:
             from .proof_graph import _helper_decl_header, helper_decl_statement
@@ -11479,6 +11521,14 @@ private def {serializer_prefix}_contractDefeq
             )
             for statement_index, item in enumerate(analyses)
         )
+        if execution.returncode == 0 and outer_pi_guard is not None and outer_pi_guard():
+            for statement, analysis in zip(raw_statements, analyses):
+                if analysis.structural_identity and analysis.binder_sorts:
+                    key = hash_text(json.dumps([statement, preamble.strip()], ensure_ascii=False))
+                    self._statement_outer_pi_observations.pop(key, None)
+                    self._statement_outer_pi_observations[key] = outer_pi_guard
+            while len(self._statement_outer_pi_observations) > 64:
+                self._statement_outer_pi_observations.pop(next(iter(self._statement_outer_pi_observations)))
         return (
             attach_operation_receipt(analyses),
             output,
