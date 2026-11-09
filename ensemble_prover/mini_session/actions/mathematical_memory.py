@@ -662,6 +662,8 @@ class MathematicalMemoryAction:
                         partial=(result_candidate is None if replace_observations
                                  else bool(service.current_view().get("partial", False))),
                         budget=budget,
+                        observed_generation=pin.to_record() if "pin" in locals() else None,
+                        incomplete_reason=verdict if failure_type else "",
                     )
                 finally:
                     service.allocation.finish(reserved, time.monotonic() - started)

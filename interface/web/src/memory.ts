@@ -13,6 +13,7 @@ export type MemoryView = {
   allocation_id: string; research_allocation_id: string; generation: Record<string, unknown>; scope: string;
   candidates: MemoryRow[]; applications: MemoryRow[]; obstructions: MemoryRow[];
   proposals: MemoryRow[]; notes: MemoryRow[]; omitted: number | null; partial: boolean;
+  incomplete_reason: string;
   eligibility_lease_until: number;
 };
 export type MemoryRequest = { payload: Record<string, string | number>; status: string; detail: string };
@@ -51,6 +52,7 @@ export function parseMemory(value: unknown): MemoryView | undefined {
     environment_id: text(row.environment_id), policy_id: text(row.policy_id), allocation_id: text(row.allocation_id),
     research_allocation_id: text(row.research_allocation_id),
     scope: text(row.scope), generation: {}, omitted: count(row.omitted), partial: row.partial === true,
+    incomplete_reason: text(row.incomplete_reason, 1200),
     eligibility_lease_until: count(row.eligibility_lease_until) ?? 0,
   } as MemoryView;
   for (const group of groups) {

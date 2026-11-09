@@ -90,6 +90,7 @@ export function MemoryPanel({ runId, value, paused = false }: { runId: string; v
     {!current ? <p role="status">Memory evidence unavailable. Current eligibility could not be confirmed; restricted content is hidden.</p> : <>
       {paused ? <p className="meta">Observations paused. Permission checks continue.</p> : null}
       {current.partial ? <p className="meta">Coverage is partial{current.omitted != null ? `; ${current.omitted} records omitted` : ""}.</p> : null}
+      {current.incomplete_reason ? <p role="status">Memory work incomplete: {current.incomplete_reason}</p> : null}
       <label className="field"><span>Memory records</span><select value={filter} onChange={(event) => setFilter(event.target.value)}>{groups.map((group) => <option key={group} value={group}>{group[0].toUpperCase() + group.slice(1)}</option>)}</select></label>
       {rows.length ? <div className="memory-cards">{rows.map((row, index) => <article key={`${row.event_id}-${index}`}>
         <h3>{row.name || ({ notes: "Recorded research note", proposals: "Generalization proposal", applications: "Application report", candidates: "Prior theorem candidate", obstructions: "Research obstruction" } as Record<string, string>)[filter] || "Research observation"}</h3>

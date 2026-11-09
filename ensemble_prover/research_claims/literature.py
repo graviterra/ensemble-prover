@@ -358,14 +358,16 @@ class LiteratureTools:
         matches: list[dict[str, Any]] = []
         for page_number, page_text in enumerate(pages, 1):
             for line_number, line in enumerate(page_text.splitlines(), 1):
-                match = matcher.search(line)
-                if match:
+                for match in matcher.finditer(line):
                     matches.append({
                         "page": page_number if pdf else None, "line": line_number,
+                        "column": match.start() + 1,
                         "excerpt": line[max(0, match.start() - 160):match.end() + 240],
                     })
                     if len(matches) > 8:
                         break
+                if len(matches) > 8:
+                    break
             if len(matches) > 8:
                 break
         return {

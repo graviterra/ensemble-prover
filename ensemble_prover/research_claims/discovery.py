@@ -39,6 +39,7 @@ from .strategy_discovery import SYSTEM as STRATEGY_SYSTEM
 from .strategy import StrategyYield
 from .native_deadline import native_admission_deadline_only, paid_work_deadline, paid_response_deadline
 from .literature import FIELDS as LITERATURE_FIELDS, INSTRUCTIONS as LITERATURE_INSTRUCTIONS, LiteratureTools, source_context
+from ..lean_compute_tool import COMPUTE_EXAMPLES_PROPOSAL_INSTRUCTIONS
 
 
 class _ResearchRequestOptions(TypedDict, total=False):
@@ -134,6 +135,8 @@ not the theorem. Check quantifiers, hypotheses, circularity, exceptional cases,
 and quantitative losses. Identify the exact first unresolved inference. Review
 workers cannot submit their own replacement proof or review themselves.
 """
+
+SYSTEM += "\n" + COMPUTE_EXAMPLES_PROPOSAL_INSTRUCTIONS + "\n"
 
 _FIELDS = {
     "investigate": {"question", "contract"},

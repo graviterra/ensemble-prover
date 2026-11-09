@@ -74,6 +74,17 @@ COMPUTE_EXAMPLES_TOOL: Dict[str, Any] = {
 }
 
 
+COMPUTE_EXAMPLES_PROPOSAL_INSTRUCTIONS = (
+    "For propose_diagnostic, scope and expected_outcomes must each be a nonempty "
+    "string, not an array. queries must be an array of Lean expressions, not "
+    "Python or instructions asking another agent to translate a program. "
+    + COMPUTE_EXAMPLES_TOOL["function"]["parameters"]["properties"]["queries"]["description"]
+    + " " + COMPUTE_EXAMPLES_TOOL["function"]["description"]
+    + ' Example query: "(List.range 10).sum". The proposal is advisory; '
+    "the proof owner revalidates it in its actual context before execution."
+)
+
+
 _COMMAND_RE = re.compile(r"^\s*#(eval|reduce|check)(?:\s+|$)(.*)$", re.DOTALL)
 _LEAN_IDENT_RE = re.compile(r"(?:[^\W\d]|_)[\w']*", flags=re.UNICODE)
 _LEAN_DOTTED_IDENT_PATTERN = (
@@ -1343,6 +1354,17 @@ def _prepare_queries(
             )
         )
     return prepared, ""
+
+
+def validate_compute_examples_proposal(args: Mapping[str, Any]) -> str:
+    """Check portable syntax without granting execution or context authority."""
+    queries = args.get("queries")
+    if not isinstance(queries, list) or any(
+        not isinstance(query, str) or not query.strip() for query in queries
+    ):
+        return "queries must be an array of nonempty Lean expression strings"
+    _, error = _prepare_queries(args, redact_solution_refs=False)
+    return error
 
 
 def _increment_metric(dossier: Any, key: str, amount: int = 1) -> None:

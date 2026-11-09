@@ -1147,12 +1147,15 @@ class NativeResearchCoordinator:
                         helper.get(key) == current.get(key) for key in (
                             "source_hash", "contract_identity", "environment_hash")) else "stale")
                 contracts.append(packet)
+        from .lean_compute_tool import COMPUTE_EXAMPLES_PROPOSAL_INSTRUCTIONS
+
         context = {
             "original_target": self._visible_target(session), "trigger": reason,
             "research_contracts": contracts,
             "diagnostic_capabilities": {"native_experiments": False,
                 "proof_compute_examples": getattr(session.conv, "_native_compute_examples_enabled", None),
-                "routing": "Propose exact finite queries with propose_diagnostic; the proof owner executes only through its enabled existing tool."},
+                "routing": "Propose exact finite queries with propose_diagnostic; the proof owner executes only through its enabled existing tool.",
+                "query_contract": COMPUTE_EXAMPLES_PROPOSAL_INSTRUCTIONS},
             "active_target": {"statement": self._target(session.conv),
                               "scope": getattr(session, "scope", "problem"),
                               "lane": str(getattr(session, "checkpoint_lane_key", ""))},
@@ -2560,7 +2563,7 @@ def native_research_tool(name: str, payload: dict[str, Any], conv: Any) -> dict[
 
 
 _CONTRACT_SCHEMA = {"type": "object", "properties": {
-    "statement": {"type": "string"}, "domain": {"type": "string"},
+    "statement": {"type": "string", "description": "Copy the outer statement exactly; put additional assumptions in hypotheses and quantifier details in quantifiers."}, "domain": {"type": "string"},
     "hypotheses": {"type": "array", "items": {"type": "string"}},
     "quantifiers": {"type": "array", "items": {"type": "string"}}},
     "required": ["statement", "domain"], "additionalProperties": False}
@@ -2581,7 +2584,7 @@ _RESEARCH_CONTRACT_PROPERTIES = {
 
 NATIVE_TOOLS = [
     {"type": "function", "function": {"name": "request_native_research",
-     "description": "Request independent investigation of an unsupported ancestor or stalled method; never refutes or stops the run.",
+     "description": "Request independent investigation of an unsupported ancestor or stalled method; never refutes or stops the run. If contract is supplied, contract.statement must equal statement exactly. Use one identical mathematical request in both fields, not a question in one and a stronger claim in the other.",
      "parameters": {"type": "object", "properties": {**_RESEARCH_CONTRACT_PROPERTIES, "statement": {"type": "string"}, "reason": {"type": "string"}, "evidence_artifact_ids": {"type": "array", "items": {"type": "string"}}}, "required": ["statement", "reason"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "read_native_research_artifact",
      "description": "Read exact pages of archived research arguments or sources. Offset is a nonnegative integer character index (default 0); length is an integer from 1 to 12000 characters (default 6000). Follow next_offset until null to read the complete selected text. Omit artifact_id for the complete current advice envelope, including argument and handoff links. If advice is not yet available for the active target and context, returns not_available_yet; reading does not start research.",

@@ -77,6 +77,7 @@ def memory_record(value: Any, *, scope: str = "problem") -> dict:
               ("mode", "status", "goal_id", "environment_id", "policy_id", "allocation_id", "research_allocation_id")}
     generation = obj(source.get("generation"))
     result.update(scope=scope, partial=source.get("partial") is True,
+                  incomplete_reason=text(source.get("incomplete_reason"), 1200),
                   omitted=number(source.get("omitted")), generation={
                       "lineage": text(generation.get("lineage"), 160),
                       "epoch": text(generation.get("epoch"), 160),

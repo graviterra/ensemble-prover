@@ -41,7 +41,7 @@ def bind_request(payload: dict[str, Any], inventory: dict[str, dict[str, Any]], 
     contract = MathematicalContract.from_dict(payload.get("contract", {
         "statement": payload["statement"], "domain": "native research advisory obligation"}))
     if contract.statement != payload["statement"]:
-        raise ValueError("contract.statement must equal the exact research statement")
+        raise ValueError("contract.statement must equal the exact research statement; copy statement verbatim into contract.statement, or omit contract. Put extra assumptions in contract.hypotheses, not a different statement.")
     relation = payload.get("relation_to_root", "unknown")
     if relation not in RELATIONS:
         raise ValueError("unknown relation_to_root")
@@ -92,14 +92,15 @@ def diagnostic_proposal(store: Any, job: dict[str, Any], action: dict[str, Any])
     """Queue only a bounded existing-tool proposal; do not execute experiments."""
     text(action["scope"], "diagnostic scope")
     text(action["expected_outcomes"], "diagnostic outcomes")
+    from ensemble_prover.lean_compute_tool import validate_compute_examples_proposal
+
     query = action["queries"]
-    if (not isinstance(query, list) or not 1 <= len(query) <= 8
-            or any(not isinstance(item, str) or not item.strip() or len(item) > 320 for item in query)
-            or sum(map(len, query)) > 1800):
-        raise ValueError("diagnostic queries exceed compute_examples limits")
     mode = action.get("mode", "eval")
     if mode not in {"eval", "reduce", "check"}:
         raise ValueError("invalid compute_examples mode")
+    error = validate_compute_examples_proposal({"queries": query, "mode": mode})
+    if error:
+        raise ValueError(error)
     contract = MathematicalContract.from_dict(action["contract"])
     proposal = {"target_tool": "compute_examples", "scope": action["scope"],
                 "contract": asdict(contract), "expected_outcomes": action["expected_outcomes"],

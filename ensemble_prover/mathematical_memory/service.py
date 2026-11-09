@@ -3641,29 +3641,45 @@ class MathematicalMemoryService:
         proposals: list[dict[str, Any]] | None = None,
         partial: bool = False,
         budget: MemoryBudget | None = None,
+        observed_generation: Mapping[str, Any] | None = None,
+        incomplete_reason: str = "",
     ) -> dict[str, Any]:
         session = self.session()
-        if session is None or (budget is not None and budget.remaining_s() <= 0):
-            return {}
-        try:
-            pin = self.catalog.generation(
-                deadline_monotonic=(
-                    budget.deadline_monotonic if budget else time.monotonic() + 0.025
-                )
-            )
-        except (OSError, RuntimeError, sqlite3.Error):
-            self.health = "unavailable"
+        if session is None:
             return {}
         previous = self.last_view or session.mathematical_memory_state.get(
             "last_view", {}
         )
+        exhausted = budget is not None and budget.remaining_s() <= 0
+        if exhausted or (observed_generation is not None and incomplete_reason):
+            # Settlement publishes observations already obtained by this action.
+            # It must not spend a fresh catalog/Lean allocation, or silently leave
+            # the initial empty view looking complete after a preparation timeout.
+            generation = dict(observed_generation or previous.get("generation", {}))
+            partial = True
+            incomplete_reason = incomplete_reason or "allocation_exhausted"
+        else:
+            try:
+                pin = self.catalog.generation(
+                    deadline_monotonic=(
+                        budget.deadline_monotonic if budget else time.monotonic() + 0.025
+                    )
+                )
+                generation = pin.to_record()
+            except (OSError, RuntimeError, sqlite3.Error):
+                if budget is None or budget.remaining_s() > 0:
+                    self.health = "unavailable"
+                    return {}
+                generation = dict(observed_generation or previous.get("generation", {}))
+                partial = True
+                incomplete_reason = incomplete_reason or "allocation_exhausted"
         if previous.get("environment_id") != self.context_id():
             previous = {}
         view = {
             "mode": self.config.mode,
             "status": self.health,
             "persistence_diagnostic": self.persistence_diagnostic,
-            "generation": pin.to_record(),
+            "generation": generation,
             "goal_id": goal_id or previous.get("goal_id", self.context_id()),
             "environment_id": self.context_id(),
             "policy_id": self.policy_id,
@@ -3682,6 +3698,7 @@ class MathematicalMemoryService:
                 proposals if proposals is not None else previous.get("proposals", [])
             )[:32],
             "notes": [],
+            "incomplete_reason": incomplete_reason,
             "omitted": 0,
             "partial": partial,
             "scope": session.scope,

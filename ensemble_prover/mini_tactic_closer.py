@@ -1335,7 +1335,9 @@ def _bare_structural_candidate(candidate: TacticCandidate) -> bool:
 
 def _structural_batch_members(candidate: TacticCandidate) -> tuple[TacticCandidate, ...]:
     """Recover generated alternatives when a shared check lacked resources."""
-    if (not candidate.source.endswith("_batch") or not _bare_structural_candidate(candidate)
+    closing_probe_batch = candidate.source in {"intro_coercion_batch", "standalone_batch"}
+    if (not candidate.source.endswith("_batch")
+            or not (closing_probe_batch or _bare_structural_candidate(candidate))
             or not _candidate_can_be_reindented(candidate)):
         return ()
     branches: list[list[str]] = []
@@ -1357,7 +1359,8 @@ def _structural_batch_members(candidate: TacticCandidate) -> tuple[TacticCandida
     return tuple(TacticCandidate(
         proof="by\n" + "\n".join(branch),
         tactic="; ".join(line.strip() for line in branch),
-        source=candidate.source.removesuffix("_batch"), helper=candidate.helper,
+        source=candidate.source.removesuffix("_batch"),
+        helper=(candidate.helper or None) if closing_probe_batch else candidate.helper,
     ) for branch in branches)
 
 
@@ -1366,8 +1369,9 @@ def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[Ta
 
     Every original script remains in order. ``solve`` requires a branch to
     close all goals, so a partial simpa cannot hide a later successful branch.
-    The initial ``intros; omega`` probe can share the same check. Other tactics
-    (including residual-producing ones) keep separate checks.
+    Arithmetic and normalization probes that cannot supply reusable residual
+    prefixes also share checks. Resource-exhausted batches expand back to their
+    individual alternatives. Residual-producing tactics keep separate checks.
     """
 
     direct_sources = {
@@ -1389,13 +1393,16 @@ def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[Ta
                 lines.extend("    " + line for line in body[1:])
             output.append(TacticCandidate(
                 proof="\n".join(lines),
-                tactic="first (closing helper alternatives): " + " | ".join(
+                tactic=("first (closing alternatives): "
+                        if pending_source in {"intro_coercion_batch", "standalone_batch"}
+                        else "first (closing helper alternatives): ") + " | ".join(
                     candidate.tactic for candidate in pending
                 ),
                 source=pending_source,
-                helper=",".join(dict.fromkeys(
+                helper=(None if pending_source in {"intro_coercion_batch", "standalone_batch"}
+                        else ",".join(dict.fromkeys(
                     candidate.helper for candidate in pending if candidate.helper
-                )),
+                ))),
             ))
         pending.clear()
 
@@ -1406,6 +1413,12 @@ def _batch_helper_applications(candidates: Sequence[TacticCandidate]) -> list[Ta
         )
         batch_source = (
             "helper_application_batch" if candidate.source in direct_sources or quick_intro
+            else candidate.source + "_batch" if (
+                candidate.source == "intro_coercion"
+                or (candidate.source == "standalone" and candidate.tactic in {
+                    "simp", "simpa", "norm_num", "omega", "linarith", "nlinarith", "ring_nf",
+                })
+            )
             else candidate.source + "_batch" if candidate.source in {
                 "helper_structural_pair", "helper_structural_or", "helper_structural_triple",
             } and _bare_structural_candidate(candidate) else ""
