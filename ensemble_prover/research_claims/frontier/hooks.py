@@ -7,6 +7,7 @@ enter these functions.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, NoReturn
 
 from ..store import ResearchStoreError
@@ -19,7 +20,7 @@ from .approaches import (
 )
 from .persist import load_campaign, save_campaign
 from .progress import active_permit, apply_contribution, claim_permit, consume_permit, settle_mathematical
-from .records import FrontierRefusal, digest, new_id
+from .records import PERMIT_ADMISSION_WAIT_REASONS, FrontierRefusal, digest, new_id
 from .retry import authorize_execution, classify_failure, finish_lane_recovery, note_failure, note_success
 
 
@@ -641,7 +642,8 @@ def authorize_control_admission(
             _yield("research_review_paused_operational")
         if lane.get("paused") and not lane.get("recovery_open"):
             _yield("research_control_deferred")
-        if not job.get("frontier_review_admitted") and not can_admit_review(campaign):
+        review_view = review_service_view(controller, state, run, campaign)
+        if not job.get("frontier_review_admitted") and not can_admit_review(review_view):
             _yield("research_control_deferred")
         if not job.get("frontier_review_execution_started") or job.get("frontier_retry_pending"):
             lineage = job.setdefault("frontier_operation_lineage", new_id("lineage-review"))
@@ -664,7 +666,7 @@ def authorize_control_admission(
         if not job.get("frontier_review_admitted") and campaign["phase"].get("open", True):
             from .approaches import note_review_quantum
 
-            note_review_quantum(campaign)
+            note_review_quantum(review_view)
             job["frontier_review_admitted"] = True
         controller.store.save_job(job)
         _save(controller, state, run, campaign)
@@ -730,7 +732,14 @@ def authorize_control_admission(
         _yield(reason)
     if approach_is_held(campaign, approach_id):
         _yield("suspended")
-    selected, _why = select_approach(campaign)
+    prepared = active_permit(campaign, approach_id)
+    own_claim = campaign["claims"].get((prepared or {}).get("claim_id") or "")
+    if prepared is not None and prepared["status"] == "claimed" and own_claim and own_claim["owner"] == job["job_id"]:
+        try:
+            _preview_research_permit(campaign, job, controller.clock(), prepare=False)
+        except FrontierRefusal as exc:
+            _yield(exc.reason)
+    selected, _why = _select_research_approach(controller, state, run, campaign)
     if selected != approach_id:
         _yield("fairness")
     permit = active_permit(campaign, approach_id)
@@ -1188,21 +1197,12 @@ def served_receipts(controller: Any, state: dict[str, Any]) -> list[str]:
     ]
 
 
-def prepare_research_claim(controller: Any, state: dict[str, Any], job: dict[str, Any]) -> None:
-    """Claim a usable permit before dispatch. Preparation is not an admission."""
-    if job.get("role") != "research" or job.get("frontier_permit_consumed"):
-        return
-    approach_id = job.get("frontier_approach_id")
-    if not approach_id:
-        return
-    run = controller.store.run_record(scheduling=True)
-    campaign = load_campaign(controller.store, state["owner_id"])
-    if campaign is None or approach_id not in campaign["approaches"]:
-        return
+def _claim_research_permit(campaign: dict[str, Any], job: dict[str, Any], now: float) -> dict[str, Any]:
+    """Prepare an unused allowance, retaining normal lease renewal rules."""
     from .progress import expire_claims, replace_stale_permit
 
-    now = controller.clock()
     expire_claims(campaign, now)
+    approach_id = job["frontier_approach_id"]
     permit = active_permit(campaign, approach_id)
     if permit is not None and now >= permit["expires_at"]:
         approach = campaign["approaches"][approach_id]
@@ -1218,21 +1218,161 @@ def prepare_research_claim(controller: Any, state: dict[str, Any], job: dict[str
                 campaign, permit["permit_id"], now=now, still_relevant=True,
                 expires_at=now + campaign["policy"]["permit_lease_seconds"],
             )
-    if permit is None or permit["status"] != "usable":
-        _save(controller, state, run, campaign)
+    if permit is None:
+        raise FrontierRefusal("frontier_permit_required")
+    return claim_permit(
+        campaign, permit["permit_id"], owner=job["job_id"], now=now,
+        lease_seconds=campaign["policy"]["permit_lease_seconds"],
+    )
+
+
+def _preview_research_permit(campaign: dict[str, Any], job: dict[str, Any], now: float,
+                             *, prepare: bool) -> None:
+    preview = deepcopy(campaign)
+    approach_id = job["frontier_approach_id"]
+    approach = preview["approaches"][approach_id]
+    if prepare:
+        claim = _claim_research_permit(preview, job, now)
+        permit_id = claim["permit_id"]
+    else:
+        permit = active_permit(preview, approach_id)
+        if permit is None:
+            raise FrontierRefusal("frontier_permit_required")
+        permit_id = permit["permit_id"]
+    consume_permit(
+        preview, permit_id, now=now, approach_id=approach_id,
+        question_revision=preview["questions"][approach["question_id"]]["revision"],
+        route_revision=preview["routes"][approach["route_id"]]["revision"],
+        provider=True, owner=job["job_id"],
+    )
+
+
+def research_job_ready(campaign: dict[str, Any], job: dict[str, Any], now: float) -> bool:
+    """Check this consumer's funding without spending it or granting authority.
+
+    Approach eligibility includes another consumer's open quantum. Preview the
+    actual claim/consume rules on isolated state so stale evidence, lease repair,
+    and claim ownership use the same checks as transactional admission.
+    """
+    approach_id = job.get("frontier_approach_id")
+    approach = campaign["approaches"].get(approach_id or "")
+    if approach is None or (job.get("research_control") or {}).get("waiting_for"):
+        return False
+    if any(handoff["approach_id"] == approach_id and handoff["status"] in {"prepared", "active"}
+           for handoff in campaign.get("proof_handoffs", {}).values()):
+        return False
+    if job.get("frontier_permit_consumed"):
+        return bool(
+            approach.get("admitted_open")
+            and approach.get("admitted_consumer_id") == job["job_id"]
+            and approach.get("admitted_allocation_id") is None
+            and job.get("frontier_consumed_basis") == research_scope_basis(campaign, job)
+            and campaign["phase"].get("open", True)
+            and not (campaign["retries"].get(job.get("frontier_operation_lineage") or "") or {}).get("paused")
+        )
+    # A missing permit is common while another consumer awaits a proof child.
+    if active_permit(campaign, approach_id) is None:
+        return False
+    try:
+        _preview_research_permit(campaign, job, now, prepare=True)
+    except FrontierRefusal:
+        return False
+    return True
+
+
+def _research_job_can_wake(campaign: dict[str, Any], job: dict[str, Any], now: float) -> bool:
+    """Keep queue selection and the actual waiting-to-pending transition aligned."""
+    if job["status"] != "waiting":
+        return False
+    reason = job.get("last_error")
+    consumed = job.get("frontier_permit_consumed")
+    if reason == "paused_operational":
+        if _operation_budget_paused(campaign, job.get("frontier_approach_id") or ""):
+            return False
+    elif reason in {"fairness", "suspended", "frontier_permit_required"}:
+        if not consumed and (job.get("research_control") or {}).get("requests_used", 0) != 0:
+            return False
+    elif reason in PERMIT_ADMISSION_WAIT_REASONS:
+        if consumed:
+            return False
+    else:
+        # Proof children, completed tool results, and explicit research waits
+        # have their own wake owners. Funding alone cannot finish those waits.
+        return False
+    return research_job_ready(campaign, job, now)
+
+
+def _research_service_view(controller: Any, state: dict[str, Any], run: dict[str, Any],
+                           campaign: dict[str, Any]) -> dict[str, Any]:
+    """Project the serviceable queue without changing the durable campaign."""
+    from ..research_control import _focused_jobs
+    from .approaches import eligible
+
+    jobs = _focused_jobs(controller.store, run)
+    queue = []
+    for approach_id in campaign["service_queue"]:
+        if not eligible(campaign, approach_id):
+            continue
+        approach = campaign["approaches"][approach_id]
+        if controller._blocked(state, [approach.get("subject_id") or controller.root_id], approach.get("method", "")):
+            continue
+        consumers = [job for job in jobs if job["role"] == "research"
+                     and job.get("frontier_approach_id") == approach_id
+                     and job["status"] in {"pending", "waiting", "running", "responded", "tool_running"}]
+        if not consumers:
+            # A fresh job may claim a free allowance; it cannot inherit an
+            # existing consumer's admission or exclusive preparation claim.
+            consumers = [{"job_id": "", "frontier_approach_id": approach_id}]
+        if any((_research_job_can_wake(campaign, job, controller.clock())
+                if job.get("status") == "waiting" else research_job_ready(campaign, job, controller.clock()))
+               for job in consumers):
+            queue.append(approach_id)
+    return {**campaign, "service_queue": queue}
+
+
+def _select_research_approach(controller: Any, state: dict[str, Any], run: dict[str, Any],
+                              campaign: dict[str, Any]) -> tuple[str | None, str]:
+    return select_approach(_research_service_view(controller, state, run, campaign))
+
+
+def review_service_view(controller: Any, state: dict[str, Any], run: dict[str, Any],
+                        campaign: dict[str, Any]) -> dict[str, Any]:
+    """Protect available work from reviews, without counting blocked waiters.
+
+    The shallow view shares phase counters so recording a review quantum still
+    updates the real campaign. Prepared proof allocations retain their own
+    service owner and continue to count as work for the review reserve.
+    """
+    from .approaches import eligible
+
+    view = _research_service_view(controller, state, run, campaign)
+    proof_approaches = {handoff["approach_id"] for handoff in campaign.get("proof_handoffs", {}).values()
+                        if handoff["status"] in {"prepared", "active"}}
+    proof_approaches.update(approach_id for approach_id, approach in campaign["approaches"].items()
+                            if approach.get("admitted_open") and approach.get("admitted_allocation_id") is not None)
+    available = set(view["service_queue"]) | proof_approaches
+    view["service_queue"] = [approach_id for approach_id in campaign["service_queue"]
+                             if approach_id in available and eligible(campaign, approach_id)]
+    return view
+
+
+def prepare_research_claim(controller: Any, state: dict[str, Any], job: dict[str, Any]) -> None:
+    """Claim a usable permit before dispatch. Preparation is not an admission."""
+    if job.get("role") != "research" or job.get("frontier_permit_consumed"):
+        return
+    approach_id = job.get("frontier_approach_id")
+    if not approach_id:
+        return
+    run = controller.store.run_record(scheduling=True)
+    campaign = load_campaign(controller.store, state["owner_id"])
+    if campaign is None or approach_id not in campaign["approaches"]:
         return
     try:
-        claim_permit(
-            campaign,
-            permit["permit_id"],
-            owner=job["job_id"],
-            now=now,
-            lease_seconds=campaign["policy"]["permit_lease_seconds"],
-        )
+        claim = _claim_research_permit(campaign, job, controller.clock())
     except FrontierRefusal:
         _save(controller, state, run, campaign)
         return
-    job["frontier_claim_id"] = permit["claim_id"]
+    job["frontier_claim_id"] = claim["claim_id"]
     controller.store.save_job(job)
     _save(controller, state, run, campaign)
 
@@ -1645,6 +1785,7 @@ def ensure_adaptive_work(integration: Any) -> bool:
                     and scope(campaign, approach) == packet["binding"]
                     and authorization.get("status") == "open"
                     and authorization.get("evidence_basis") == job["native_intake_artifact"])
+        review_view = review_service_view(controller, state, run, campaign)
         reviewer = next((
             job for job in jobs
             if job["role"] == "review" and job["status"] == "waiting"
@@ -1654,7 +1795,7 @@ def ensure_adaptive_work(integration: Any) -> bool:
             }
             and native_review_ready(job)
             and not (campaign["retries"].get(job.get("frontier_operation_lineage") or "") or {}).get("paused")
-            and (job.get("frontier_review_admitted") or can_admit_review(campaign))
+            and (job.get("frontier_review_admitted") or can_admit_review(review_view))
         ), None)
         if reviewer is not None:
             reviewer.update(status="pending", last_error=None)
@@ -1673,15 +1814,7 @@ def ensure_adaptive_work(integration: Any) -> bool:
                 and now < approach["waiting_until"]
             ):
                 waiting = True
-        selected, _reason = select_approach(campaign)
-        if selected is not None and _operation_budget_paused(campaign, selected):
-            alternatives = [
-                approach_id
-                for approach_id in campaign["service_queue"]
-                if approach_id != selected and eligible(campaign, approach_id)
-            ]
-            if alternatives:
-                selected = alternatives[0]
+        selected, _reason = _select_research_approach(controller, state, run, campaign)
         _save(controller, state, run, campaign)
         if waiting and selected is None:
             return False
@@ -1695,28 +1828,12 @@ def ensure_adaptive_work(integration: Any) -> bool:
         ):
             from .approaches import eligible
 
-            selected_permit = active_permit(campaign, selected)
             for job in jobs:
                 if (
                     job["role"] == "research"
                     and job.get("frontier_approach_id") == selected
-                    and job["status"] == "waiting"
-                    and not (job.get("research_control") or {}).get("waiting_for")
                     and eligible(campaign, selected)
-                    and (
-                        job.get("last_error") == "paused_operational"
-                        and not _operation_budget_paused(campaign, selected)
-                        or job.get("last_error") in {"fairness", "suspended", "frontier_permit_required"}
-                        and not job.get("frontier_permit_consumed")
-                        and (job.get("research_control") or {}).get("requests_used", 0) == 0
-                        or job.get("last_error") in {
-                            "stale_permit_basis", "stale_frontier_scope", "formal_authority_revoked",
-                            "permit_expired", "claim_expired",
-                        }
-                        and not job.get("frontier_permit_consumed")
-                        and selected_permit is not None
-                        and selected_permit["permit_id"] != job.get("frontier_refused_permit_id")
-                    )
+                    and _research_job_can_wake(campaign, job, now)
                 ):
                     job.update(status="pending", last_error=None)
                     store.save_job(job)

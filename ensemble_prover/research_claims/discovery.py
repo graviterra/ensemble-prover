@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 from .discovery_store import AdmissionStopped, DiscoveryStore, provider_routes
 from .experiments import PythonSandbox
+from .frontier.records import PERMIT_ADMISSION_WAIT_REASONS
 from .model import (
     INTERNAL_JSON_NESTING,
     ClaimSpec,
@@ -1029,11 +1030,10 @@ class DiscoveryLoop:
                     elif exc.reason.startswith("research_") and self.strategy is not None:
                         self.strategy.research.handle_yield(current, exc.reason)
                         current = self.store.job(current["job_id"])
-                    elif self.strategy is not None and exc.reason in {
+                    elif self.strategy is not None and exc.reason in (PERMIT_ADMISSION_WAIT_REASONS | {
                         "fairness", "suspended", "frontier_permit_required", "paused_operational",
-                        "stale_permit_basis", "stale_frontier_scope", "formal_authority_revoked",
-                        "permit_expired", "claim_expired", "retry_exhausted", "retry_deadline",
-                    }:
+                        "retry_exhausted", "retry_deadline",
+                    }):
                         from .frontier.hooks import mode_of
 
                         if mode_of(self.strategy.controller.snapshot()) == "adaptive":

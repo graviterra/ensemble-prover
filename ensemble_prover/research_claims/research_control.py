@@ -11,6 +11,7 @@ import json
 from contextlib import nullcontext
 from typing import Any
 
+from .frontier.records import PERMIT_ADMISSION_WAIT_REASONS
 from .model import json_text
 from .strategy import StrategyYield
 
@@ -388,6 +389,7 @@ class ResearchControl:
                 state = self.controller.snapshot()
                 if current.get("role") == "review":
                     from .frontier.approaches import can_admit_review
+                    from .frontier.hooks import review_service_view
                     from .frontier.persist import load_campaign
 
                     campaign = load_campaign(self.store, state["owner_id"])
@@ -398,7 +400,8 @@ class ResearchControl:
                         if budget.get("paused"):
                             reason = "research_review_paused_operational"
                         elif (lane.get("paused") and not lane.get("recovery_open")
-                              or not current.get("frontier_review_admitted") and not can_admit_review(campaign)):
+                              or not current.get("frontier_review_admitted") and not can_admit_review(
+                                  review_service_view(self.controller, state, self.store.run_record(scheduling=True), campaign))):
                             reason = "research_control_deferred"
                         if reason is not None:
                             self.handle_yield(current, reason)
@@ -583,10 +586,9 @@ class ResearchControl:
                 campaign = load_campaign(self.store, state["owner_id"])
                 if campaign is not None and has_active_proof_allocation(state, campaign, job):
                     return
-            if adaptive and job["role"] == "research" and reason in {
-                "stale_permit_basis", "stale_frontier_scope", "formal_authority_revoked",
-                "permit_expired", "claim_expired", "retry_exhausted", "retry_deadline",
-            }:
+            if adaptive and job["role"] == "research" and reason in (
+                PERMIT_ADMISSION_WAIT_REASONS | {"retry_exhausted", "retry_deadline"}
+            ):
                 if reason == "stale_frontier_scope" and job.get("frontier_permit_consumed"):
                     from .frontier.hooks import retire_stale_research_response
 

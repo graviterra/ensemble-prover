@@ -25,6 +25,17 @@ def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
 
 
+# These refusals require changed permission or repaired preparation, not a
+# transport retry. Dispatch, waiting, and wake-up must share the same taxonomy.
+PERMIT_ADMISSION_WAIT_REASONS = frozenset({
+    "stale_permit_basis", "stale_frontier_scope", "formal_authority_revoked",
+    "permit_expired", "claim_expired", "entitlement_invalidated",
+    "distinctness_unresolved", "missing_preparation_claim", "permit_claimed_by_other",
+    "permit_not_prepared", "permit_approach_mismatch", "approach_held",
+    "entitlement_already_spent",
+})
+
+
 EVIDENCE_CLASSES = frozenset({
     "root_verified",
     "root_refuted",
